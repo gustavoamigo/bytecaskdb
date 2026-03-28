@@ -33,6 +33,13 @@ auto to_bytes(std::string_view sv) -> std::span<const std::byte> {
   return std::as_bytes(std::span{sv.data(), sv.size()});
 }
 
+auto to_string(const std::vector<std::byte> &bytes) -> std::string {
+  std::string s(bytes.size(), '\0');
+  std::ranges::transform(bytes, s.begin(),
+                         [](std::byte b) { return static_cast<char>(b); });
+  return s;
+}
+
 } // namespace
 
 // --------------------------------------------------------------------------
@@ -98,8 +105,8 @@ TEST_CASE("DataFile appends two entries with correct offsets and sequences",
 
   {
     bytecask::DataFile df{tmp};
-    const auto offset0 = df.append(to_bytes("key1"), to_bytes("val1"));
-    const auto offset1 = df.append(to_bytes("key2"), to_bytes("val2"));
+    const auto offset0 = df.append(1, to_bytes("key1"), to_bytes("val1"));
+    const auto offset1 = df.append(2, to_bytes("key2"), to_bytes("val2"));
 
     CHECK(offset0 == 0);
 
@@ -134,7 +141,34 @@ TEST_CASE("DataFile appends two entries with correct offsets and sequences",
 }
 
 // --------------------------------------------------------------------------
-// Test 3: Verify CRC32 detects corruption.
+// Test 3: read() round-trips sequence, key, and value at recorded offsets.
+// --------------------------------------------------------------------------
+TEST_CASE("DataFile::read round-trips entries at recorded offsets",
+          "[datafile]") {
+  const auto tmp =
+      std::filesystem::temp_directory_path() / "bc_test_read.data";
+  std::filesystem::remove(tmp);
+
+  bytecask::DataFile df{tmp};
+  const auto off0 = df.append(7, to_bytes("hello"), to_bytes("world"));
+  const auto off1 = df.append(8, to_bytes("foo"), to_bytes("bar"));
+  df.sync();
+
+  const auto r0 = df.read(off0);
+  CHECK(r0.sequence == 7U);
+  CHECK(to_string(r0.key) == "hello");
+  CHECK(to_string(r0.value) == "world");
+
+  const auto r1 = df.read(off1);
+  CHECK(r1.sequence == 8U);
+  CHECK(to_string(r1.key) == "foo");
+  CHECK(to_string(r1.value) == "bar");
+
+  std::filesystem::remove(tmp);
+}
+
+// --------------------------------------------------------------------------
+// Test 4: Verify CRC32 detects corruption.
 // --------------------------------------------------------------------------
 TEST_CASE("CRC32 detects single-byte payload difference", "[crc]") {
   const auto buf_clean =

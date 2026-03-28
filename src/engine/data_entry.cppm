@@ -35,6 +35,39 @@ export struct EntryHeader {
 export constexpr std::size_t kHeaderSize = 15; // fixed leading fields
 export constexpr std::size_t kCrcSize = 4;     // trailing CRC
 
+export struct ReadResult {
+  std::uint64_t sequence;
+  std::vector<std::byte> key;
+  std::vector<std::byte> value;
+};
+
+namespace {
+
+// Parse a little-endian integer of type T from a byte span at the given offset.
+template <typename T>
+auto read_le(std::span<const std::byte> buf, std::size_t offset) -> T {
+  static_assert(std::is_integral_v<T>);
+  T v{};
+  for (std::size_t i = 0; i < sizeof(T); ++i) {
+    v |= static_cast<T>(static_cast<T>(std::to_integer<std::uint8_t>(
+                            buf[offset + i]))
+                        << (8U * i));
+  }
+  return v;
+}
+
+} // namespace
+
+// Parses the fixed header fields from the first kHeaderSize bytes of buf.
+export auto parse_header(std::span<const std::byte> buf) -> EntryHeader {
+  return EntryHeader{
+      .sequence   = read_le<std::uint64_t>(buf, 0),
+      .key_size   = read_le<std::uint16_t>(buf, 8),
+      .value_size = read_le<std::uint32_t>(buf, 10),
+      .flags      = read_le<std::uint8_t>(buf, 14),
+  };
+}
+
 // Serialize a single entry into a flat byte buffer using bitsery.
 // The CRC-32 checksum covers all bytes of the entry except itself and is
 // appended as the final four bytes.
@@ -74,6 +107,40 @@ serialize_entry(std::uint64_t sequence, std::span<const std::byte> key,
   // key.size() + value.size() + kCrcSize immediately after serialization.
   raw.resize(base.writtenBytesCount());
   return raw;
+}
+
+// Deserializes a single entry from a flat byte buffer and verifies its CRC.
+// buf must span exactly one complete entry: kHeaderSize + key_size + value_size + kCrcSize bytes.
+// Throws std::runtime_error on size mismatch or CRC failure.
+export auto deserialize_entry(std::span<const std::byte> buf) -> ReadResult {
+  if (buf.size() < kHeaderSize + kCrcSize) {
+    throw std::runtime_error{"deserialize_entry: buffer too small"};
+  }
+
+  const auto header = parse_header(buf);
+
+  if (buf.size() !=
+      kHeaderSize + header.key_size + header.value_size + kCrcSize) {
+    throw std::runtime_error{"deserialize_entry: buffer size mismatch"};
+  }
+
+  // Verify CRC over all bytes except the trailing checksum.
+  Crc32 crc{};
+  crc.update(buf.subspan(0, buf.size() - kCrcSize));
+  const auto computed = crc.finalize();
+  const auto stored   = read_le<std::uint32_t>(buf, buf.size() - kCrcSize);
+  if (computed != stored) {
+    throw std::runtime_error{"deserialize_entry: CRC mismatch"};
+  }
+
+  const auto key_span = buf.subspan(kHeaderSize, header.key_size);
+  const auto val_span = buf.subspan(kHeaderSize + header.key_size, header.value_size);
+
+  return ReadResult{
+      .sequence = header.sequence,
+      .key      = {key_span.begin(), key_span.end()},
+      .value    = {val_span.begin(), val_span.end()},
+  };
 }
 
 } // namespace bytecask
