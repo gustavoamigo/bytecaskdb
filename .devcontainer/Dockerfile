@@ -1,13 +1,31 @@
-FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04
+# Use Fedora 43 for a rock-solid GCC 15 experience
+FROM fedora:43
 
-# Install xmake and common build dependencies in the image so every rebuild has it.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        xmake \
-        build-essential \
-        ninja-build \
-        git \
-        pkg-config \
-        ca-certificates \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# Install development tools and dependencies
+# Fedora 43+ uses dnf5 by default, which is significantly faster
+RUN dnf install -y \
+    gcc \
+    gcc-c++ \
+    libstdc++-devel \
+    gdb \
+    make \
+    ninja-build \
+    git \
+    pkg-config \
+    xmake \
+    clang \
+    clang-tools-extra \
+    libcxx \
+    libcxx-devel \
+    libcxx-static \
+    && dnf clean all
+
+# Verify the environment
+RUN gcc --version && xmake --version --root
+
+# Set environment variables for the compiler (helps Xmake and CMake)
+ENV CC=gcc
+ENV CXX=g++
+
+ARG USERNAME=gustavoamigo
+RUN useradd -m $USERNAME || echo "User already exists"
