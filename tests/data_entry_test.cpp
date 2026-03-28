@@ -2,6 +2,7 @@
 
 import std;
 import bytecask.data_entry;
+import bytecask.data_file;
 
 namespace {
 
@@ -28,6 +29,10 @@ auto read_file_bytes(const std::filesystem::path &p)
   return result;
 }
 
+auto to_bytes(std::string_view sv) -> std::span<const std::byte> {
+  return std::as_bytes(std::span{sv.data(), sv.size()});
+}
+
 } // namespace
 
 // --------------------------------------------------------------------------
@@ -38,7 +43,8 @@ TEST_CASE("serialize_entry produces correct byte layout", "[serialize]") {
   const std::string_view value = "world";
   const std::uint64_t seq = 42;
 
-  const auto buf = bytecask::serialize_entry(seq, key, value);
+  const auto buf =
+      bytecask::serialize_entry(seq, to_bytes(key), to_bytes(value));
 
   const std::size_t expected_size =
       bytecask::kHeaderSize + key.size() + value.size() + bytecask::kCrcSize;
@@ -72,7 +78,8 @@ TEST_CASE("serialize_entry produces correct byte layout", "[serialize]") {
   // CRC is the trailing 4 bytes; must be non-zero and deterministic
   const std::size_t crc_offset = buf.size() - bytecask::kCrcSize;
   const auto crc_first = read_le<std::uint32_t>(buf, crc_offset);
-  const auto buf2 = bytecask::serialize_entry(seq, key, value);
+  const auto buf2 =
+      bytecask::serialize_entry(seq, to_bytes(key), to_bytes(value));
   const auto crc_second =
       read_le<std::uint32_t>(buf2, buf2.size() - bytecask::kCrcSize);
   CHECK(crc_first != 0);
@@ -91,14 +98,17 @@ TEST_CASE("DataFile appends two entries with correct offsets and sequences",
 
   {
     bytecask::DataFile df{tmp};
-    const auto offset0 = df.append("key1", "val1");
-    const auto offset1 = df.append("key2", "val2");
+    const auto offset0 = df.append(to_bytes("key1"), to_bytes("val1"));
+    const auto offset1 = df.append(to_bytes("key2"), to_bytes("val2"));
 
     CHECK(offset0 == 0);
 
     const std::size_t entry0_size =
         bytecask::kHeaderSize + 4U + 4U + bytecask::kCrcSize;
     CHECK(offset1 == entry0_size);
+
+    // Explicit sync: batch both appends into one fdatasync call.
+    df.sync();
   }
 
   const auto raw = read_file_bytes(tmp);
@@ -127,9 +137,10 @@ TEST_CASE("DataFile appends two entries with correct offsets and sequences",
 // Test 3: Verify CRC32 detects corruption.
 // --------------------------------------------------------------------------
 TEST_CASE("CRC32 detects single-byte payload difference", "[crc]") {
-  const auto buf_clean = bytecask::serialize_entry(1, "abc", "xyz");
-  const auto buf_corrupt =
-      bytecask::serialize_entry(1, "abc", "xYz"); // 'Y' vs 'y'
+  const auto buf_clean =
+      bytecask::serialize_entry(1, to_bytes("abc"), to_bytes("xyz"));
+  const auto buf_corrupt = bytecask::serialize_entry(
+      1, to_bytes("abc"), to_bytes("xYz")); // 'Y' vs 'y'
 
   const auto crc_clean =
       read_le<std::uint32_t>(buf_clean, buf_clean.size() - bytecask::kCrcSize);
@@ -139,7 +150,8 @@ TEST_CASE("CRC32 detects single-byte payload difference", "[crc]") {
   CHECK(crc_clean != crc_corrupt);
 
   // Determinism: same inputs must always produce the same CRC.
-  const auto buf_clean2 = bytecask::serialize_entry(1, "abc", "xyz");
+  const auto buf_clean2 =
+      bytecask::serialize_entry(1, to_bytes("abc"), to_bytes("xyz"));
   const auto crc_clean2 = read_le<std::uint32_t>(
       buf_clean2, buf_clean2.size() - bytecask::kCrcSize);
   CHECK(crc_clean == crc_clean2);

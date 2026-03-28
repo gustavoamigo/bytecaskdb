@@ -29,6 +29,8 @@ _nothing currently in progress_
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-014 | POSIX I/O + Group Commit in DataFile | Replaced `std::ofstream` with POSIX `open`/`write`/`fdatasync`. Extracted `sync()` from `append()` to enable Group Commit batching. |
+| BC-013 | Modularize source structure | Split `data_entry.cppm` into finer-grained C++20 modules: `crc32.cppm`, `serialization.cppm`, `data_file.cppm`, and `data_entry.cppm`. |
 | BC-000 | Establish Copilot workflow | Added always-on repo instructions, living design doc, project plan, and test wiring. |
 | BC-001 | Define storage engine MVP | Defined data entry format and DataFile API as the first storage-engine component. |
 | BC-003 | Replace smoke test with behavior tests | Replaced `smoke_test.cpp` with `data_entry_test.cpp` covering serialization, append, and CRC verification. |

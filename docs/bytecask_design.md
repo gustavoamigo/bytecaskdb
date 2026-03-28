@@ -80,11 +80,26 @@ File naming uses timestamp-based names: `data_{YYYYMMDDhhmmssnnnn}.data` and `da
 
 ### DataFile API
 
-`DataFile` is the first storage-engine component. It owns a single data file and provides:
+`DataFile` (in `bytecask.data_file` module) is the primary storage-engine component. It owns a single data file and provides:
 
-- **Constructor**: Takes a `std::filesystem::path`. Opens (or creates) the file for appending.
-- **`append(key, value) -> std::uint64_t`**: Serializes a new entry with auto-incrementing sequence number, appends it to the file, and returns the byte offset where the entry starts.
-- Key and value are accepted as `std::string_view` for convenience.
+- **Constructor**: Takes a `std::filesystem::path`. Opens (or creates) the file via POSIX `open(O_WRONLY | O_CREAT | O_APPEND)`. Throws `std::system_error` on failure.
+- **`append(key, value) -> std::uint64_t`**: Serializes a new entry with auto-incrementing sequence number, writes it to the OS page cache via `::write()`, and returns the byte offset where the entry starts. Does **not** guarantee durability on its own.
+- **`sync()`**: Calls `::fdatasync()` to flush all pending writes to physical storage. Must be called explicitly to guarantee crash-safety. Decoupled from `append()` to enable Group Commit: callers can batch multiple `append()` calls before a single `sync()`.
+- Key and value are accepted as `std::span<const std::byte>` for binary safety.
+
+### I/O Back-end Rationale
+
+- **POSIX over `std::ofstream`**: `::write()` with `O_APPEND` issues a single system call per entry, skipping the buffering layers and locale state overhead of C++ streams.
+- **`fdatasync` over `fflush`/`flush()`**: `fdatasync` syncs data to physical media while skipping inode metadata updates (access time etc.), making it faster than `fsync` for a pure append-only log.
+- **Group Commit pattern**: Separating `append()` (writes to page cache) from `sync()` (forces to disk) lets future code batch hundreds of writes before a single expensive `fdatasync`, which is the primary lever for high write throughput on NVMe hardware (see `io_uring` paper reference).
+
+### Source Code Module Architecture
+
+We use fine-grained C++20 modules:
+- `bytecask.crc32`: General purpose mathematical utilities (`Crc32`, checked `narrow<To>(From)` conversion).
+- `bytecask.serialization`: Core bitsery abstractions (`CrcOutputAdapter`, legacy memory wrappers).
+- `bytecask.data_entry`: Logical entry definition and single-entry memory formatting.
+- `bytecask.data_file`: Disk I/O, writing streams sequentially to `.data` files.
 
 ### Current scope boundaries
 

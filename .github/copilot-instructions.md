@@ -47,6 +47,7 @@ These instructions apply to every repository work request in this workspace.
 - Use 2-space indentation; braces on the same line.
 
 ### Design decisions, safety, and modern idioms — follow C++ Core Guidelines
+- Follow Core Guidelines NL.1, NL.2, and NL.3 for comments: don't state in comments what can be clearly stated in code (avoid Doxygen `@param` boilerplate if the type signature is clear). Instead, use comments to state intent, constraints, thread-safety, and side effects (like I/O flushing). Keep comments crisp.
 - Prefer C++20 features when they bring clearer intent over lower-level alternatives.
   - Use `std::span` instead of raw pointer + size pairs.
   - Use `std::as_bytes` / `std::as_writable_bytes` instead of `reinterpret_cast` to raw byte pointers.
