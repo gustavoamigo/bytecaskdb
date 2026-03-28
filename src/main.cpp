@@ -1,9 +1,8 @@
-#include <iostream>
+import std;
 
-using namespace std;
-
-int main(int argc, char** argv)
-{
-    cout << "hello world!" << endl;
-    return 0;
+auto main() -> int {
+  auto words = std::vector<std::string>{"gustavo", "amigo"};
+  for (const auto &w : words) {
+    std::println("word = {} a size = {}", w, w.length());
+  }
 }

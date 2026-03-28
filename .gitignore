@@ -5,4 +5,9 @@ build/
 # MacOS Cache
 .DS_Store
 
+# Editor / LSP caches
+.cache/
+.vscode/
+compile_commands.json
+
 

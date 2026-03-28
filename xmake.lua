@@ -1,8 +1,36 @@
 add_rules("mode.debug", "mode.release")
+add_rules("plugin.compile_commands.autoupdate", {outputdir = "."})
+
+add_requires("bitsery")
+add_requires("catch2 3.x")
+
+-- Common flags shared by all targets
+local common_flags = {
+    "-Weverything", "-Wno-c++98-compat", "-Wno-padded",
+    "-Wno-reserved-macro-identifier", "-Wno-undef", "-Wno-reserved-identifier",
+    -- export keyword is the declaration for module symbols; these are false positives
+    "-Wno-missing-variable-declarations", "-Wno-missing-prototypes",
+    -- raw pointer indexing over a known-bounded span is intentional (CRC inner loop)
+    "-Wno-unsafe-buffer-usage",
+}
 
 target("bytecask")
+    set_toolchains("clang")
     set_kind("binary")
-    add_files("src/*.cpp")
+    add_files("src/*.cpp", "src/engine/*.cppm")
+    set_languages("c++23")
+    set_policy("build.c++.modules", true)
+    add_cxflags(table.unpack(common_flags))
+    add_packages("bitsery")
+
+target("bytecask_tests")
+    set_toolchains("clang")
+    set_kind("binary")
+    add_files("tests/*.cpp", "src/engine/*.cppm")
+    set_languages("c++23")
+    set_policy("build.c++.modules", true)
+    add_cxflags(table.unpack(common_flags))
+    add_packages("bitsery", "catch2")
 
 --
 -- If you want to known more usage about xmake, please see https://xmake.io
@@ -34,7 +62,7 @@ target("bytecask")
 --   $ xmake run -d [targetname]
 --
 -- 5. How to install target to the system directory or other output directory?
---
+--xm
 --   $ xmake install
 --   $ xmake install -o installdir
 --
