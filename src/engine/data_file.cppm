@@ -82,14 +82,15 @@ public:
     return *this;
   }
 
-  // Writes key-value entry with the given sequence number to the OS page cache.
-  // Returns the absolute byte offset where the entry begins.
-  // Does not guarantee durability — call sync() to flush to physical storage.
-  [[nodiscard]] auto append(std::uint64_t sequence,
+  // Writes an entry with the given sequence number and type to the OS page
+  // cache. Returns the absolute byte offset where the entry begins. BulkBegin
+  // and BulkEnd entries use empty key and value spans. Does not guarantee
+  // durability — call sync() to flush to physical storage.
+  [[nodiscard]] auto append(std::uint64_t sequence, EntryType entry_type,
                             std::span<const std::byte> key,
                             std::span<const std::byte> value) -> Offset {
     const auto entry_offset = offset_;
-    const auto buf = serialize_entry(sequence, key, value);
+    const auto buf = serialize_entry(sequence, entry_type, key, value);
 
     const auto written = ::write(fd_, buf.data(), buf.size());
     if (written != std::ssize(buf)) {

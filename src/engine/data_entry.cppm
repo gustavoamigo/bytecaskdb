@@ -12,24 +12,32 @@ import std;
 
 namespace bytecask {
 
-// Entry layout (all fields little-endian, total = 19 + key_size + value_size):
+// Entry layout (all fields little-endian, total = 15 + key_size + value_size +
+// 4):
 //
 //   Offset  0: sequence   (u64) — monotonic LSN
-//   Offset  8: key_size   (u16) — key length in bytes
-//   Offset 10: value_size (u32) — value length in bytes  (0 = tombstone)
-//   Offset 14: flags      (u8)  — bit 0: deleted; bits 1-7: reserved
+//   Offset  8: entry_type (u8)  — entry kind; 0 is always corrupt/uninitialized
+//   Offset  9: key_size   (u16) — key length in bytes (0 for BulkBegin/BulkEnd)
+//   Offset 11: value_size (u32) — value length in bytes (0 for Delete/Bulk*)
 //   Offset 15: key data   (key_size bytes)
 //   Offset 15+key_size: value data (value_size bytes)
 //   Trailing: crc32 (u32) — CRC-32/ISO-HDLC over all preceding bytes
+
+export enum class EntryType : std::uint8_t {
+  Put = 0x01,       // Standard key-value pair
+  Delete = 0x02,    // Tombstone — key present, value empty
+  BulkBegin = 0x03, // Start of atomic batch — key and value empty
+  BulkEnd = 0x04,   // End of atomic batch   — key and value empty
+};
 
 // Note: This struct is purely semantic for representing header fields in code.
 // It contains implicit padding bytes and must not be used directly for raw
 // buffer copying or mapped via memory casts (reinterpret_cast/memcpy).
 export struct EntryHeader {
   std::uint64_t sequence{};
+  EntryType entry_type{};
   std::uint16_t key_size{};
   std::uint32_t value_size{};
-  std::uint8_t flags{};
 };
 
 export constexpr std::size_t kHeaderSize = 15; // fixed leading fields
@@ -37,6 +45,7 @@ export constexpr std::size_t kCrcSize = 4;     // trailing CRC
 
 export struct ReadResult {
   std::uint64_t sequence;
+  EntryType entry_type;
   std::vector<std::byte> key;
   std::vector<std::byte> value;
 };
@@ -49,9 +58,9 @@ auto read_le(std::span<const std::byte> buf, std::size_t offset) -> T {
   static_assert(std::is_integral_v<T>);
   T v{};
   for (std::size_t i = 0; i < sizeof(T); ++i) {
-    v |= static_cast<T>(static_cast<T>(std::to_integer<std::uint8_t>(
-                            buf[offset + i]))
-                        << (8U * i));
+    v |= static_cast<T>(
+        static_cast<T>(std::to_integer<std::uint8_t>(buf[offset + i]))
+        << (8U * i));
   }
   return v;
 }
@@ -61,19 +70,19 @@ auto read_le(std::span<const std::byte> buf, std::size_t offset) -> T {
 // Parses the fixed header fields from the first kHeaderSize bytes of buf.
 export auto parse_header(std::span<const std::byte> buf) -> EntryHeader {
   return EntryHeader{
-      .sequence   = read_le<std::uint64_t>(buf, 0),
-      .key_size   = read_le<std::uint16_t>(buf, 8),
-      .value_size = read_le<std::uint32_t>(buf, 10),
-      .flags      = read_le<std::uint8_t>(buf, 14),
+      .sequence = read_le<std::uint64_t>(buf, 0),
+      .entry_type = static_cast<EntryType>(read_le<std::uint8_t>(buf, 8)),
+      .key_size = read_le<std::uint16_t>(buf, 9),
+      .value_size = read_le<std::uint32_t>(buf, 11),
   };
 }
 
 // Serialize a single entry into a flat byte buffer using bitsery.
 // The CRC-32 checksum covers all bytes of the entry except itself and is
 // appended as the final four bytes.
-export auto
-serialize_entry(std::uint64_t sequence, std::span<const std::byte> key,
-                std::span<const std::byte> value, std::uint8_t flags = 0)
+export auto serialize_entry(std::uint64_t sequence, EntryType entry_type,
+                            std::span<const std::byte> key,
+                            std::span<const std::byte> value)
     -> std::vector<std::uint8_t> {
   using Buffer = std::vector<std::uint8_t>;
   using BaseAdapter = bitsery::OutputBufferAdapter<Buffer>;
@@ -88,9 +97,9 @@ serialize_entry(std::uint64_t sequence, std::span<const std::byte> key,
 
   // Serialize the fixed header fields.
   ser.value8b(sequence);
+  ser.value1b(static_cast<std::uint8_t>(entry_type));
   ser.value2b(narrow<std::uint16_t>(key.size()));
   ser.value4b(narrow<std::uint32_t>(value.size()));
-  ser.value1b(flags);
 
   // Write the variable-length key and value bytes through the CRC adapter
   // so they are included in the checksum.
@@ -110,8 +119,8 @@ serialize_entry(std::uint64_t sequence, std::span<const std::byte> key,
 }
 
 // Deserializes a single entry from a flat byte buffer and verifies its CRC.
-// buf must span exactly one complete entry: kHeaderSize + key_size + value_size + kCrcSize bytes.
-// Throws std::runtime_error on size mismatch or CRC failure.
+// buf must span exactly one complete entry: kHeaderSize + key_size + value_size
+// + kCrcSize bytes. Throws std::runtime_error on size mismatch or CRC failure.
 export auto deserialize_entry(std::span<const std::byte> buf) -> ReadResult {
   if (buf.size() < kHeaderSize + kCrcSize) {
     throw std::runtime_error{"deserialize_entry: buffer too small"};
@@ -128,18 +137,20 @@ export auto deserialize_entry(std::span<const std::byte> buf) -> ReadResult {
   Crc32 crc{};
   crc.update(buf.subspan(0, buf.size() - kCrcSize));
   const auto computed = crc.finalize();
-  const auto stored   = read_le<std::uint32_t>(buf, buf.size() - kCrcSize);
+  const auto stored = read_le<std::uint32_t>(buf, buf.size() - kCrcSize);
   if (computed != stored) {
     throw std::runtime_error{"deserialize_entry: CRC mismatch"};
   }
 
   const auto key_span = buf.subspan(kHeaderSize, header.key_size);
-  const auto val_span = buf.subspan(kHeaderSize + header.key_size, header.value_size);
+  const auto val_span =
+      buf.subspan(kHeaderSize + header.key_size, header.value_size);
 
   return ReadResult{
       .sequence = header.sequence,
-      .key      = {key_span.begin(), key_span.end()},
-      .value    = {val_span.begin(), val_span.end()},
+      .entry_type = header.entry_type,
+      .key = {key_span.begin(), key_span.end()},
+      .value = {val_span.begin(), val_span.end()},
   };
 }
 
