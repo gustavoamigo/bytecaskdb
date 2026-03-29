@@ -100,10 +100,11 @@ public:
 
   // Serializes one hint entry and writes it to the OS page cache.
   // Does not guarantee durability — call sync() after.
-  void append(std::uint64_t sequence, std::uint64_t file_offset,
-              std::span<const std::byte> key, std::uint32_t value_size) {
-    const auto buf =
-        serialize_hint_entry(sequence, file_offset, key, value_size);
+  void append(std::uint64_t sequence, EntryType entry_type,
+              std::uint64_t file_offset, std::span<const std::byte> key,
+              std::uint32_t value_size) {
+    const auto buf = serialize_hint_entry(sequence, entry_type, file_offset,
+                                          key, value_size);
     if (::write(fd_, buf.data(), buf.size()) != std::ssize(buf)) {
       throw std::system_error{errno, std::generic_category(),
                               "HintFile::append: write failed"};
@@ -143,9 +144,11 @@ public:
 
     const auto hdr_span = std::span<const std::byte>{hdr};
     const auto sequence = read_le<std::uint64_t>(hdr_span, 0);
-    const auto file_offset_val = read_le<std::uint64_t>(hdr_span, 8);
-    const auto key_size = read_le<std::uint16_t>(hdr_span, 16);
-    const auto value_size = read_le<std::uint32_t>(hdr_span, 18);
+    const auto entry_type =
+        static_cast<EntryType>(read_le<std::uint8_t>(hdr_span, 8));
+    const auto file_offset_val = read_le<std::uint64_t>(hdr_span, 9);
+    const auto key_size = read_le<std::uint16_t>(hdr_span, 17);
+    const auto value_size = read_le<std::uint32_t>(hdr_span, 19);
 
     // Read key bytes.
     std::vector<std::byte> key(key_size);
@@ -181,6 +184,7 @@ public:
 
     const auto next_offset = offset + kHintHeaderSize + key_size + kHintCrcSize;
     return std::make_pair(HintEntry{.sequence = sequence,
+                                    .entry_type = entry_type,
                                     .file_offset = file_offset_val,
                                     .key = std::move(key),
                                     .value_size = value_size},

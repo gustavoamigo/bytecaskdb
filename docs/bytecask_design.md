@@ -10,6 +10,20 @@ This document is the living design reference for the repository. It should track
 
 Canonical location: `docs/bytecask_design.md`.
 
+## Goals
+
+- Provide a clean, minimal API surface for key-value operations.
+- Support atomic multi-operation batches.
+- Support ordered range iteration (enabled by the B-Tree key directory).
+- Be idiomatic C++23: no raw pointers, no stringly-typed errors, move-only ownership.
+
+## Non-Goals (for now)
+
+- Multi-writer access, MVCC, or snapshot isolation. ByteCask uses a SWMR model.
+- TTL or expiry.
+- Async I/O.
+- Online (background) compaction. Vacuum is a fully offline operation.
+
 ## Design Principles
 
 The design follows these core tenets in order of priority:
@@ -17,6 +31,38 @@ The design follows these core tenets in order of priority:
 1. **Correctness**: Data integrity is paramount. All design decisions prioritize correctness over performance.
 2. **Simplicity**: The architecture is kept simple to facilitate understanding and maintainability.
 3. **Performance**: Optimizations are pursued only when they don't compromise correctness or simplicity.
+
+## System Architecture
+
+### Key Directory
+
+ByteCask uses `immer::btree_map<Key, KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times.
+
+`Key` is a dedicated type alias (initially `= std::vector<std::byte>`) distinct from the generic `Bytes` type. Keys have a hard upper bound of 65 535 bytes (the `u16 key_size` field in the data file header). Keeping `Key` separate provides a single-point change if the type needs to evolve — e.g., to enforce that constraint at compile time or adopt a small-buffer-optimized representation.
+
+### Concurrency Model
+
+ByteCask follows a **single-writer / multiple-reader (SWMR)** model:
+
+- Exactly one writer may operate at a time.
+- Multiple readers may operate concurrently.
+- MVCC and snapshot isolation are not supported.
+
+### Data File Lifecycle
+
+Each data file transitions through three phases in sequence:
+
+| Phase | Description |
+|-------|-------------|
+| **Active** | The current append target; accepts all writes. |
+| **Rotating** | Closed to new writes; a companion `.hint` file is being written atomically. |
+| **Immutable** | The `.hint` file exists; the data file is sealed and read-only. |
+
+A new active data file is always created on engine startup.
+
+### Vacuum
+
+Vacuum is **fully offline**: the engine must not be running while vacuum operates. No background or online compaction. (This project uses the PostgreSQL term *vacuum*; other systems call it *compaction* or *merge*.)
 
 ## Data File Format (.data)
 
@@ -80,11 +126,26 @@ CRC is at the **end** of the entry so both write and read can be done in a singl
 
 ### Log Sequence Number (LSN)
 
-Every entry has a monotonic sequence number to determine data freshness. The `DataFile` class manages this internally, starting at 1 and incrementing per append.
+The LSN is a **globally monotonic** counter across all data files and all engine sessions — not a per-file counter. This is a correctness invariant: recovery determines which of two entries for the same key is fresher by comparing LSNs from potentially different files. Any per-file counter reset would silently allow stale data to overwrite live data.
+
+- The engine owns and increments the global LSN. `DataFile` is a passive consumer: the caller passes `sequence` to every `append` call.
+- `DataFile` does not start its own counter; it does not know or care what value the sequence starts at.
+- On startup, the engine scans all hint files and the active data file to find `max_lsn`, then seeds the new active `DataFile` at `max_lsn + 1`.
 
 ### Log-Structured Naming Convention
 
-File naming uses timestamp-based names: `data_{YYYYMMDDhhmmssnnnn}.data` and `data_{YYYYMMDDhhmmssnnnn}.hint`. Not yet implemented — callers currently provide the full file path.
+Files use a timestamp-based stem: `data_{YYYYMMDDHHmmssUUUUUU}` where `UUUUUU` is the microsecond sub-second component (zero-padded, 6 digits).
+
+Examples:
+- `data_20260329123456123456.data`
+- `data_20260329123456123456.hint`
+
+Rationale:
+- Lexicographic sort equals chronological order.
+- `std::chrono::system_clock` reliably delivers microsecond precision on Linux; nanosecond precision would add false precision since kernel clock granularity is often coarser.
+- The timestamp string serves as the unique **file ID** referenced by key directory entries.
+
+Not yet implemented — callers currently provide the full file path.
 
 ### DataFile API
 
@@ -126,7 +187,7 @@ Hint files are compact companion files to sealed (rotated) data files. Each hint
 
 ```
 +------------------+
-| Hint Header      | 22 bytes
+| Hint Header      | 23 bytes
 +------------------+
 | Key Data         | key_size bytes
 +------------------+
@@ -134,18 +195,19 @@ Hint files are compact companion files to sealed (rotated) data files. Each hint
 +------------------+
 ```
 
-Total fixed overhead per entry: **26 bytes** (22-byte header + 4-byte trailing CRC).
+Total fixed overhead per entry: **27 bytes** (23-byte header + 4-byte trailing CRC).
 
-> **Note on the 26-byte claim in the spec**: the four header fields sum to 22 bytes (u64 + u64 + u16 + u32). The "26 bytes" refers to the total fixed overhead including the trailing CRC, not the header alone. This matches the same accounting used in the data file, where `kHeaderSize + kCrcSize` is always cited together.
+> **Note on the 27-byte fixed overhead**: the five header fields sum to 23 bytes (u64 + u8 + u64 + u16 + u32). The "27 bytes" refers to the total fixed overhead including the trailing CRC, not the header alone. `BulkBegin`/`BulkEnd` data file entries are **never** written to hint files — only `Put` and `Delete` entries are included.
 
-### Hint Header (22 bytes)
+### Hint Header (23 bytes)
 
 | Offset | Size | Field       | Type   | Description                                    |
 |--------|------|-------------|--------|------------------------------------------------|
 | 0      | 8    | Sequence    | u64 LE | Entry sequence number (LSN)                    |
-| 8      | 8    | File Offset | u64 LE | Byte offset of the entry in the data file      |
-| 16     | 2    | Key Size    | u16 LE | Key length in bytes                            |
-| 18     | 4    | Value Size  | u32 LE | Value length in bytes (to rebuild the key directory without the data file) |
+| 8      | 1    | EntryType   | u8     | Entry kind: `Put` (0x01) or `Delete` (0x02) only — `BulkBegin`/`BulkEnd` are never written to hint files |
+| 9      | 8    | File Offset | u64 LE | Byte offset of the entry in the data file      |
+| 17     | 2    | Key Size    | u16 LE | Key length in bytes                            |
+| 19     | 4    | Value Size  | u32 LE | Value length in bytes (to rebuild the key directory without reading the data file) |
 
 `Value Size` is stored so the reader can compute the full on-disk entry size in the data file without reading it, enabling future space-accounting features.
 
@@ -153,25 +215,32 @@ Total fixed overhead per entry: **26 bytes** (22-byte header + 4-byte trailing C
 
 | Offset from entry start | Size | Field | Type   | Description                          |
 |-------------------------|------|-------|--------|--------------------------------------|
-| 22 + key_size           | 4    | CRC32 | u32 LE | Checksum of all preceding entry bytes |
+| 23 + key_size           | 4    | CRC32 | u32 LE | Checksum of all preceding entry bytes |
 
 CRC placement mirrors data file entries: accumulate header + key data in one sequential pass, then append the checksum at the end.
 
 ### Size Constants
 
-- `kHintHeaderSize = 22` — fixed header fields
+- `kHintHeaderSize = 23` — fixed header fields
 - `kHintCrcSize = 4` — trailing CRC
-- Total fixed overhead: `kHintHeaderSize + kHintCrcSize = 26`
+- Total fixed overhead: `kHintHeaderSize + kHintCrcSize = 27`
 - Total entry size: `kHintHeaderSize + key_size + kHintCrcSize`
 
-### Key Directory Rebuild (planned)
+### Recovery (planned)
 
-On startup, for each hint file (processed in file-name order, i.e., oldest-to-newest):
-1. Read each hint entry sequentially.
-2. Verify the trailing CRC; **abort (panic) on any CRC mismatch** — a bad checksum indicates corruption and the engine must not silently skip it. Truncation-based recovery will be layered on top later.
-3. Insert `(key → {sequence, file_id, file_offset, value_size})` into the B-Tree. If a key already exists in the tree with an **equal or higher** sequence number, skip the insert (the stored entry is fresher).
+On engine startup:
 
-After loading all hint files, scan the active data file (the one with no companion hint) to replay any entries written since the last rotation.
+1. Discard any `.hint.tmp` files — incomplete hint files from a crash mid-rotation.
+2. Read hint files oldest-to-newest. For each entry: verify the trailing CRC (**panic on any mismatch**); then apply based on `entry_type`:
+   - `Put`: insert `(key → {sequence, file_id, file_offset, value_size})` only if `entry.sequence > dir[key].sequence` (skip if a fresher entry is already present).
+   - `Delete`: remove the key from the B-Tree if `entry.sequence > dir[key].sequence`; otherwise skip.
+3. For any data file without a companion `.hint`, scan its raw bytes using the same Put/Delete rules. Skip `BulkBegin`/`BulkEnd` records. If a `BulkBegin` has no matching `BulkEnd`, discard all entries from that point onward and log a warning.
+4. Record `max_lsn` — the largest sequence number seen across all hint files and the active data file scan.
+5. Create a new active data file seeded at `max_lsn + 1`.
+
+### Incomplete Batch Recovery
+
+If the engine crashes after writing a `BulkBegin` but before the matching `BulkEnd`, the active data file contains an incomplete batch. Recovery discards all entries from the unmatched `BulkBegin` onward and logs a warning. No partial-batch entries are inserted into the key directory. Because hint files are only written for immutable (fully rotated) files, an incomplete batch can only appear in the active data file scan — never in a hint file.
 
 ### Relationship to Data Files
 
@@ -184,6 +253,16 @@ After loading all hint files, scan the active data file (the one with no compani
 
 One hint file corresponds to exactly one data file (same timestamp stem, different extension). Creation of hint files is deferred to when file rotation is implemented (BC-008).
 
+### Hint File Atomicity
+
+To guarantee hint files are either complete or absent, the rotation process uses a temp-then-rename protocol:
+
+1. Write the complete hint file to `data_{timestamp}.hint.tmp`.
+2. Call `fdatasync` to flush all bytes to physical storage.
+3. Atomically `rename(2)` to `data_{timestamp}.hint` — POSIX guarantees this rename is atomic on the same filesystem.
+
+Any `.hint.tmp` file found at startup is discarded (it represents an incomplete rotation interrupted by a crash). Recovery will re-scan the corresponding `.data` file instead.
+
 ### Module Plan
 
 `HintFile` will live in a new `bytecask.hint_file` C++20 module (`src/engine/hint_file.cppm`), symmetric with `DataFile`:
@@ -194,13 +273,199 @@ Construction uses named static factory functions to make intent explicit at the 
 - **`HintFile::OpenForRead(path) -> HintFile`** — opens an existing file with `O_RDONLY`. Read and write descriptors are kept independent so scanning a sealed hint file never interferes with an active writer.
 
 Write API:
-- **`append(sequence, file_offset, key, value_size) -> void`**: Serializes one hint entry using `CrcOutputAdapter` and writes it to the file.
+- **`append(sequence, entry_type, file_offset, key, value_size) -> void`**: Serializes one hint entry using `CrcOutputAdapter` and writes it to the file. Only `Put` and `Delete` are valid entry types; passing `BulkBegin` or `BulkEnd` is a programming error.
 - **`sync() -> void`**: `::fdatasync()` flush, decoupled from `append()` for Group Commit consistency.
 
 Read API:
 - **`read(offset) -> std::optional<std::pair<HintEntry, uint64_t>>`**: Reads the hint entry at `offset` bytes from the start of the file. Returns the parsed entry and the offset of the next entry (`offset + kHintHeaderSize + key_size + kHintCrcSize`). Pass `0` to start scanning from the beginning. Returns `std::nullopt` when `offset` equals file size (end-of-file). Panics on CRC mismatch. Typical usage: `while (auto result = file.read(offset)) { auto [entry, next] = *result; offset = next; }`.
 
-`HintEntry` is a plain struct holding `{uint64_t sequence, uint64_t file_offset, std::vector<std::byte> key, uint32_t value_size}`.
+`HintEntry` is a plain struct holding `{uint64_t sequence, EntryType entry_type, uint64_t file_offset, std::vector<std::byte> key, uint32_t value_size}`.
+
+## Engine API
+
+### Type Aliases
+
+```cpp
+// Owned byte buffer — used for return values and batch storage.
+using Bytes = std::vector<std::byte>;
+
+// Owned key — semantically distinct from a generic byte buffer.
+// Keys have an upper bound of 65 535 bytes (u16 key_size in the data file header).
+// Starting as an alias for Bytes; may be refined to enforce the size invariant.
+using Key = Bytes;
+
+// Non-owning view — used for all input parameters.
+using BytesView = std::span<const std::byte>;
+```
+
+`std::byte` makes the intent clear (raw bytes, not text) and prevents accidental arithmetic. `Key` is kept distinct from `Bytes` so the key directory type (`immer::btree_map<Key, KeyDirEntry>`) reads as its intent and provides a single point of change if the key type needs to evolve. `BytesView` as the universal input type avoids copies at call sites and accepts any contiguous range.
+
+### Batch
+
+```cpp
+struct BatchInsert {
+    Bytes key;
+    Bytes value;
+};
+
+struct BatchRemove {
+    Bytes key;
+};
+
+using BatchOperation = std::variant<BatchInsert, BatchRemove>;
+
+class Batch {
+public:
+    Batch() = default;
+    Batch(const Batch&)            = delete;
+    Batch& operator=(const Batch&) = delete;
+    Batch(Batch&&) noexcept        = default;
+    Batch& operator=(Batch&&) noexcept = default;
+
+    void insert(BytesView key, BytesView value);
+    void remove(BytesView key);
+
+    [[nodiscard]] bool empty() const noexcept;
+    [[nodiscard]] std::size_t size() const noexcept;
+
+private:
+    std::vector<BatchOperation> operations_;
+    friend class Bytecask;
+};
+```
+
+`std::variant` over an inheritance hierarchy keeps `BatchOperation` a value type (no heap allocation per item, trivially movable). `Batch` is move-only and single-use; `Bytecask::apply_batch` consumes it by move.
+
+### Iterators
+
+Both iterators satisfy `std::input_iterator`. They are forward-only and yield entries in ascending key order.
+
+```cpp
+// Yields (key, value) pairs.
+class EntryIterator {
+public:
+    using value_type      = std::pair<Bytes, Bytes>;
+    using difference_type = std::ptrdiff_t;
+
+    auto operator++() -> EntryIterator&;
+    void operator++(int);                        // advance only; no copy
+    auto operator*() const -> const value_type&;
+    auto operator==(std::default_sentinel_t) const noexcept -> bool;
+};
+
+// Yields keys only (no value I/O).
+class KeyIterator {
+public:
+    using value_type      = Bytes;
+    using difference_type = std::ptrdiff_t;
+
+    auto operator++() -> KeyIterator&;
+    void operator++(int);                        // advance only; no copy
+    auto operator*() const -> const value_type&;
+    auto operator==(std::default_sentinel_t) const noexcept -> bool;
+};
+```
+
+Both integrate with `std::ranges::subrange` so callers can use range-for directly:
+
+```cpp
+for (auto& [key, value] : db.iter_from(start_key)) { ... }
+for (auto& key : db.keys_from(prefix))              { ... }
+```
+
+- **Lazy**: `operator++` reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries.
+- **`KeyIterator` is in-memory only**: walks the B-Tree key directory without touching any data file.
+- **Error handling**: throws `std::system_error` on I/O failure.
+
+### Bytecask
+
+```cpp
+class Bytecask {
+public:
+    // Opens or creates a database rooted at `dir`.
+    // Throws std::system_error if the directory cannot be opened or recovery fails.
+    [[nodiscard]] static auto open(std::filesystem::path dir) -> Bytecask;
+
+    Bytecask(const Bytecask&)            = delete;
+    Bytecask& operator=(const Bytecask&) = delete;
+    Bytecask(Bytecask&&) noexcept        = default;
+    Bytecask& operator=(Bytecask&&) noexcept = default;
+    ~Bytecask();
+
+    // ── Primary operations ────────────────────────────────────────────────
+
+    // Returns the value for `key`, or std::nullopt if the key does not exist.
+    // Throws std::system_error on I/O failure or std::runtime_error on corruption.
+    [[nodiscard]] auto get(BytesView key) const -> std::optional<Bytes>;
+
+    // Writes `key` → `value`. Overwrites any existing value.
+    // Throws std::system_error on I/O failure.
+    void insert(BytesView key, BytesView value);
+
+    // Writes a tombstone for `key`.
+    // Returns true if the key existed and was removed, false if it was absent.
+    // Throws std::system_error on I/O failure.
+    [[nodiscard]] bool remove(BytesView key);
+
+    // Returns true if `key` exists in the index (no disk I/O).
+    [[nodiscard]] auto contains_key(BytesView key) const -> bool;
+
+    // ── Batch ─────────────────────────────────────────────────────────────
+
+    // Atomically applies all operations in `batch` wrapped in BulkBegin/BulkEnd entries.
+    // `batch` is consumed (move-only). No-op if batch.empty().
+    // Throws std::system_error on I/O failure; the database is left consistent on failure.
+    void apply_batch(Batch batch);
+
+    // ── Range iteration ───────────────────────────────────────────────────
+
+    // Returns an input range of (key, value) pairs with keys >= `from`.
+    // Pass an empty span to start from the first key. Each increment reads one
+    // value from disk (lazy). Throws std::system_error on I/O failure.
+    [[nodiscard]] auto iter_from(BytesView from = {}) const
+        -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
+
+    // Returns an input range of keys >= `from` without reading values.
+    // Walks the in-memory B-Tree only; no disk I/O.
+    [[nodiscard]] auto keys_from(BytesView from = {}) const
+        -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
+
+private:
+    explicit Bytecask(std::filesystem::path dir);
+};
+```
+
+### Usage Examples
+
+```cpp
+// Open (or create) a database.
+auto db = Bytecask::open("my_db");
+
+// Single-key operations.
+db.insert(as_bytes("user:1"), as_bytes("alice"));
+
+auto val = db.get(as_bytes("user:1"));
+if (val) { /* use *val */ }
+
+bool existed = db.remove(as_bytes("user:1")); // false if key was absent
+
+// Atomic batch.
+Batch batch;
+batch.insert(as_bytes("user:2"), as_bytes("bob"));
+batch.insert(as_bytes("user:3"), as_bytes("carol"));
+batch.remove(as_bytes("user:1"));
+db.apply_batch(std::move(batch));
+
+// Range scan.
+for (auto& [key, value] : db.iter_from(as_bytes("user:"))) {
+    // Iterates all keys >= "user:" in ascending order.
+}
+
+// Keys-only scan (no disk I/O — B-Tree walk only).
+for (auto& key : db.keys_from(as_bytes("user:"))) { ... }
+```
+
+> `as_bytes` is a small helper that converts a string literal or `std::string_view` to `BytesView`. Its exact form is TBD.
 
 ## Current implementation state
 
@@ -209,7 +474,7 @@ Read API:
 - Dependencies: bitsery v5.2.5 (header-only binary serialization)
 - Primary target: `bytecask` (includes `src/*.cpp` + `src/engine/*.cppm`)
 - Test target: `bytecask_tests` (includes `tests/*.cpp` + `src/engine/*.cppm`)
-- Status: `DataFile` append-only writer + `HintFile` writer/reader, both backed by bitsery serialization with trailing CRC32. 57 assertions, 8 test cases.
+- Status: `DataFile` append-only writer + `HintFile` writer/reader (23-byte header with `EntryType`), both backed by bitsery serialization with trailing CRC32. 60 assertions, 8 test cases.
 
 ## Current repository structure
 
@@ -235,6 +500,24 @@ Read API:
 - Architectural decisions should prefer small, composable units over logic embedded in `main.cpp`.
 - Design notes in `docs/old_bytecask_design.md` are historical reference material, not the current source of truth.
 - The living design and project tracker live under `docs/`.
+
+## Design Decisions
+
+| # | Decision |
+|---|----------|
+| D1 | **Error handling**: Throw (`std::system_error` for I/O, `std::runtime_error` for corruption). These are panic-level events the caller cannot meaningfully recover from inline. `std::optional` covers the key-not-found case for `get`. No `std::expected` at this boundary — there are no anticipated recoverable error conditions in normal operation. |
+| D2 | **Config**: Deferred — removed from the initial API scope. |
+| D3 | **Batch ownership**: `Batch` is move-only (copy constructor and copy assignment deleted). Single-use by design. |
+| D4 | **Batch size limit**: None — the caller is responsible. |
+| D5 | **Iterator strategy**: Lazy — each `operator++` reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries. |
+| D6 | **`KeyIterator` source**: In-memory only — walks the B-Tree key directory without opening any data file. |
+| D7 | **`remove` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
+| D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1 and standard C++ practice). |
+| D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. MVCC and snapshot isolation are not provided. |
+| D10 | **Vacuum**: Fully offline. The engine must not be running while vacuum operates. No background or online compaction. |
+| D11 | **File naming**: `data_{YYYYMMDDHHmmssUUUUUU}` using microsecond precision. Gives lexicographic == chronological ordering and avoids the false precision of nanosecond timestamps whose sub-microsecond bits are often zero on Linux. |
+| D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
+| D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be discarded with a logged warning. No partial-batch entries enter the key directory. |
 
 ## Working agreement
 

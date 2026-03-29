@@ -27,7 +27,7 @@ TEST_CASE("HintFile append produces correct file size", "[hintfile]") {
 
   {
     auto hf = bytecask::HintFile::OpenForWrite(tmp);
-    hf.append(1, 0, to_bytes("hello"), 5);
+    hf.append(1, bytecask::EntryType::Put, 0, to_bytes("hello"), 5);
     hf.sync();
   }
 
@@ -51,7 +51,8 @@ TEST_CASE("HintFile single entry round-trip", "[hintfile]") {
 
   {
     auto hf = bytecask::HintFile::OpenForWrite(tmp);
-    hf.append(kSeq, kFileOffset, to_bytes(key_sv), kValueSize);
+    hf.append(kSeq, bytecask::EntryType::Put, kFileOffset, to_bytes(key_sv),
+              kValueSize);
     hf.sync();
   }
 
@@ -62,6 +63,7 @@ TEST_CASE("HintFile single entry round-trip", "[hintfile]") {
   const auto &[entry, next] = *result;
 
   CHECK(entry.sequence == kSeq);
+  CHECK(entry.entry_type == bytecask::EntryType::Put);
   CHECK(entry.file_offset == kFileOffset);
   CHECK(entry.value_size == kValueSize);
   CHECK(to_string(entry.key) == key_sv);
@@ -84,8 +86,8 @@ TEST_CASE("HintFile two entries sequential scan", "[hintfile]") {
 
   {
     auto hf = bytecask::HintFile::OpenForWrite(tmp);
-    hf.append(1, 0, to_bytes("key1"), 10);
-    hf.append(2, 512, to_bytes("key22"), 20);
+    hf.append(1, bytecask::EntryType::Put, 0, to_bytes("key1"), 10);
+    hf.append(2, bytecask::EntryType::Delete, 512, to_bytes("key22"), 20);
     hf.sync();
   }
 
@@ -95,6 +97,7 @@ TEST_CASE("HintFile two entries sequential scan", "[hintfile]") {
   REQUIRE(r0.has_value());
   const auto &[e0, next0] = *r0;
   CHECK(e0.sequence == 1);
+  CHECK(e0.entry_type == bytecask::EntryType::Put);
   CHECK(e0.file_offset == 0);
   CHECK(e0.value_size == 10);
   CHECK(to_string(e0.key) == "key1");
@@ -103,6 +106,7 @@ TEST_CASE("HintFile two entries sequential scan", "[hintfile]") {
   REQUIRE(r1.has_value());
   const auto &[e1, next1] = *r1;
   CHECK(e1.sequence == 2);
+  CHECK(e1.entry_type == bytecask::EntryType::Delete);
   CHECK(e1.file_offset == 512);
   CHECK(e1.value_size == 20);
   CHECK(to_string(e1.key) == "key22");
@@ -120,7 +124,7 @@ TEST_CASE("HintFile CRC mismatch throws", "[hintfile]") {
 
   {
     auto hf = bytecask::HintFile::OpenForWrite(tmp);
-    hf.append(7, 1024, to_bytes("corrupt"), 50);
+    hf.append(7, bytecask::EntryType::Put, 1024, to_bytes("corrupt"), 50);
     hf.sync();
   }
 

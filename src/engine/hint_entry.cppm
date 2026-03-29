@@ -7,6 +7,7 @@ module;
 
 export module bytecask.hint_entry;
 
+export import bytecask.data_entry;
 import bytecask.serialization;
 import std;
 
@@ -15,20 +16,24 @@ namespace bytecask {
 // Hint entry layout (all fields little-endian):
 //
 //   Offset  0: sequence     (u64) — monotonic LSN copied from the data file
-//   Offset  8: file_offset  (u64) — byte offset of the entry in the companion
-//   .data file Offset 16: key_size     (u16) — key length in bytes Offset 18:
-//   value_size   (u32) — value length in bytes (for size tracking
-//                                   without reading data file)
-//   Offset 22: key data     (key_size bytes)
+//   Offset  8: entry_type   (u8)  — mirrors DataFile EntryType (Put/Delete/…)
+//   Offset  9: file_offset  (u64) — byte offset of the entry in the companion
+//                                   .data file
+//   Offset 17: key_size     (u16) — key length in bytes
+//   Offset 19: value_size   (u32) — value length in bytes (for size tracking
+//                                   without reading the data file)
+//   Offset 23: key data     (key_size bytes)
 //   Trailing:  crc32        (u32) — CRC-32/ISO-HDLC over all preceding bytes
 
 export constexpr std::size_t kHintHeaderSize =
-    22; // sequence(8) + file_offset(8) + key_size(2) + value_size(4)
+    23; // sequence(8) + entry_type(1) + file_offset(8) + key_size(2) +
+        // value_size(4)
 export constexpr std::size_t kHintCrcSize = 4; // trailing CRC
 
 // Parsed representation of a single hint file entry.
 export struct HintEntry {
   std::uint64_t sequence{};
+  EntryType entry_type{};
   std::uint64_t file_offset{};
   std::vector<std::byte> key;
   std::uint32_t value_size{};
@@ -37,9 +42,10 @@ export struct HintEntry {
 // Serialize one hint entry into a flat byte buffer using bitsery.
 // CRC-32 covers all bytes except itself and is appended as the final four
 // bytes.
-export auto
-serialize_hint_entry(std::uint64_t sequence, std::uint64_t file_offset,
-                     std::span<const std::byte> key, std::uint32_t value_size)
+export auto serialize_hint_entry(std::uint64_t sequence, EntryType entry_type,
+                                 std::uint64_t file_offset,
+                                 std::span<const std::byte> key,
+                                 std::uint32_t value_size)
     -> std::vector<std::uint8_t> {
   using Buffer = std::vector<std::uint8_t>;
   using BaseAdapter = bitsery::OutputBufferAdapter<Buffer>;
@@ -52,7 +58,9 @@ serialize_hint_entry(std::uint64_t sequence, std::uint64_t file_offset,
   CrcOutputAdapter<BaseAdapter> crc_adapter{base, crc};
   bitsery::Serializer<CrcOutputAdapter<BaseAdapter>> ser{crc_adapter};
 
+  auto entry_type_u8 = static_cast<std::uint8_t>(entry_type);
   ser.value8b(sequence);
+  ser.value1b(entry_type_u8);
   ser.value8b(file_offset);
   ser.value2b(narrow<std::uint16_t>(key.size()));
   ser.value4b(value_size);

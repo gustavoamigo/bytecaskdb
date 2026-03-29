@@ -20,20 +20,10 @@ _nothing currently in progress_
 | ID | Title | Note |
 | --- | --- | --- |
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
-| BC-006 | Data file read path | Read entries back from a data file for recovery and verification. |
-
-| BC-008 | File naming convention | Implement `data_{timestamp}.data` naming and file rotation. |
-| BC-010 | CrcInputAdapter for read path | Matching bitsery input adapter that accumulates CRC while deserializing; needed when BC-006 (read path) is implemented. |
-
-## Backlog
-
-| ID | Title | Note |
-| --- | --- | --- |
-| BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
-| BC-006 | Data file read path | Read entries back from a data file for recovery and verification. |
-| BC-008 | File naming convention | Implement `data_{timestamp}.data` naming and file rotation. |
-| BC-010 | CrcInputAdapter for read path | Matching bitsery input adapter that accumulates CRC while deserializing; needed when BC-006 (read path) is implemented. |
+| BC-008 | File naming + rotation | Implement `data_{YYYYMMDDHHmmssUUUUUU}` microsecond timestamp naming and file rotation (active → rotating → immutable lifecycle). |
 | BC-016 | Atomic Bulk Put | Implement bulk put (atomic batch) above DataFile using BulkBegin/BulkEnd entries. |
+| BC-018 | Bytecask engine class | Implement the `Bytecask` SWMR key-value store: `open`, `get`, `insert`, `remove`, `apply_batch`, `iter_from`, `keys_from`. Key directory backed by `immer::btree_map`. API designed in `docs/engine_api_design.md`. |
+| BC-019 | Recovery and startup | Startup procedure: discard `.hint.tmp`, read hint files oldest-to-newest, scan active data file, discard incomplete batches (warn), create new active file. |
 
 
 ## Done
@@ -49,6 +39,9 @@ _nothing currently in progress_
 | BC-005 | Data entry append to file | `DataFile` appends key-value entries with 19-byte LE header, CRC32, and auto-incrementing sequence numbers. Zero warnings. All tests pass. |
 | BC-009 | Bitsery serialization + CRC-at-end | Replaced manual LE serialization with bitsery. Moved CRC to trailing position for one-pass write. Extracted `CrcOutputAdapter<TAdapter>` (reusable bitsery wrapper) in `data_entry.cppm`. `kHeaderSize` = 15, `kCrcSize` = 4. Zero warnings. All tests pass. |
 | BC-011 | C++20/23 modernization & readability | Applied `std::span`, `std::as_bytes`, `std::to_integer`, `std::in_range`, `std::ssize`, `std::filesystem::file_size`, `is_integral_v`, `auto` consistency. Added `narrow<To>()` checked-narrowing helper and `write_bytes()` wrapper to hide `reinterpret_cast` from call sites. Updated copilot-instructions with coding guidelines. All tests pass. |
-| BC-017 | HintFile writer + reader | `bytecask.hint_file` module: `OpenForWrite`/`OpenForRead` factories, `append`/`sync`/`read` API, 22-byte header + trailing CRC. `read()` returns `std::optional`, panics on CRC mismatch. 4 new test cases, 57 total assertions pass. |
+| BC-017 | HintFile writer + reader | `bytecask.hint_file` module: `OpenForWrite`/`OpenForRead` factories, `append`/`sync`/`scan` API, 22-byte header + trailing CRC. `scan()` returns `std::optional<pair<HintEntry, Offset>>`, panics on CRC mismatch. 4 new test cases, 57 total assertions pass. |
+| BC-021 | Update HintFile format: add EntryType | Hint header 22→23 bytes: `EntryType` at offset 8; `file_offset` shifts to offset 9. Updated `kHintHeaderSize`, `append`, `HintEntry`, `serialize_hint_entry`, `scan`, and all tests. `hint_entry` now `export import`s `bytecask.data_entry` to share the enum. 60 assertions pass. |
+| BC-006 | Data file read path | `DataFile::scan()` and `read()` implemented via `deserialize_entry`. CRC verified via direct `Crc32::update()` over full buffer — no streaming adapter needed. Covered by Test 3 in `data_entry_test.cpp`. |
+| BC-010 | CrcInputAdapter for read path | Not implemented — read path uses direct `Crc32::update()` on the full entry buffer in `deserialize_entry`; no bitsery input adapter was required. |
 | BC-015 | EntryType replaces Flags in header | `flags` u8 replaced by `EntryType` enum; layout seq(8)+type(1)+key_size(2)+val_size(4); `append(seq,type,key,val)` API. 36 assertions pass. |
 | BC-012 | Migrate tests to Catch2 | Replaced hand-rolled `fail()`/`expect()` harness with Catch2 v3. `TEST_CASE`/`CHECK`/`REQUIRE` macros, Catch2's own `main()`, randomized test order. 3 test cases, 28 assertions. |
