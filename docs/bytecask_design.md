@@ -28,7 +28,7 @@ The design follows these core tenets in order of priority:
 +------------------+
 | Key Data         | key_size bytes
 +------------------+
-| Value Data       | value_size bytes (0 if deleted)
+| Value Data       | value_size bytes (0 for Delete/BulkBegin/BulkEnd)
 +------------------+
 | CRC32            | 4 bytes (trailing)
 +------------------+
@@ -36,31 +36,39 @@ The design follows these core tenets in order of priority:
 
 ### Leading Header (15 bytes)
 
-| Offset | Size | Field      | Type   | Description                              |
-|--------|------|------------|--------|------------------------------------------|
-| 0      | 8    | Sequence   | u64 LE | Monotonic sequence number                |
-| 8      | 2    | Key Size   | u16 LE | Key length (max 65,535 bytes)            |
-| 10     | 4    | Value Size | u32 LE | Value length (0 for tombstone, max 4GB)  |
-| 14     | 1    | Flags      | u8     | Bit 0: deleted flag, Bits 1-7: reserved  |
+| Offset | Size | Field      | Type   | Description                                    |
+|--------|------|------------|--------|------------------------------------------------|
+| 0      | 8    | Sequence   | u64 LE | Monotonic sequence number (LSN)                |
+| 8      | 1    | EntryType  | u8     | Entry kind (see EntryType enum)                |
+| 9      | 2    | Key Size   | u16 LE | Key length in bytes (0 for BulkBegin/BulkEnd)  |
+| 11     | 4    | Value Size | u32 LE | Value length in bytes (0 for Delete/Bulk*)     |
+
+### EntryType Enum
+
+```cpp
+enum class EntryType : uint8_t {
+    Put       = 0x01, // Standard key-value pair
+    Delete    = 0x02, // Tombstone — key present, value empty
+    BulkBegin = 0x03, // Start of atomic batch — key and value empty
+    BulkEnd   = 0x04, // End of atomic batch   — key and value empty
+};
+```
+
+A zero byte in the `EntryType` field is unambiguous corruption or an uninitialized write (no valid type maps to 0).
 
 ### Trailing CRC (4 bytes)
 
-| Offset from start of entry      | Size | Field | Type   | Description                    |
-|---------------------------------|------|-------|--------|--------------------------------|
+| Offset from start of entry      | Size | Field | Type   | Description                     |
+|---------------------------------|------|-------|--------|---------------------------------|
 | 15 + key_size + value_size      | 4    | CRC32 | u32 LE | Checksum of all preceding bytes |
 
 CRC is at the **end** of the entry so both write and read can be done in a single pass: write all fields and accumulate CRC in one loop, then append the checksum.
 
 ### Size constants
 
-- `kHeaderSize = 15` — fixed leading fields (sequence + key_size + value_size + flags)
+- `kHeaderSize = 15` — fixed leading fields (sequence + entry_type + key_size + value_size)
 - `kCrcSize = 4` — trailing CRC
 - Total entry size: `kHeaderSize + key_size + value_size + kCrcSize`
-
-### Flags Specification
-
-- Bit 0: `0x01` = Deleted (tombstone), `0x00` = Active
-- Bits 1-7: Reserved (must be 0)
 
 ### Serialization
 
@@ -83,7 +91,7 @@ File naming uses timestamp-based names: `data_{YYYYMMDDhhmmssnnnn}.data` and `da
 `DataFile` (in `bytecask.data_file` module) is the primary storage-engine component. It owns a single data file and provides:
 
 - **Constructor**: Takes a `std::filesystem::path`. Opens (or creates) the file via POSIX `open(O_WRONLY | O_CREAT | O_APPEND)`. Throws `std::system_error` on failure.
-- **`append(key, value) -> std::uint64_t`**: Serializes a new entry with auto-incrementing sequence number, writes it to the OS page cache via `::write()`, and returns the byte offset where the entry starts. Does **not** guarantee durability on its own.
+- **`append(sequence, entry_type, key, value) -> Offset`**: Serializes a new entry with the given sequence number and `EntryType`, writes it to the OS page cache via `::write()`, and returns the byte offset where the entry starts. `BulkBegin`/`BulkEnd` entries pass empty key and value spans. Does **not** guarantee durability on its own.
 - **`sync()`**: Calls `::fdatasync()` to flush all pending writes to physical storage. Must be called explicitly to guarantee crash-safety. Decoupled from `append()` to enable Group Commit: callers can batch multiple `append()` calls before a single `sync()`.
 - Key and value are accepted as `std::span<const std::byte>` for binary safety.
 
@@ -103,9 +111,9 @@ We use fine-grained C++20 modules:
 
 ### Current scope boundaries
 
-- Flags are always 0 (active) — tombstone writes are deferred.
+- `EntryType` is written and read back on `DataFile::read()`; atomic bulk semantics are enforced at a layer above `DataFile`.
 - No file rotation or size limits.
-- No read path — append-only for now.
+- No read path for the key directory — append-only for now.
 
 ## Current implementation state
 
