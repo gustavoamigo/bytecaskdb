@@ -43,29 +43,12 @@ export struct EntryHeader {
 export constexpr std::size_t kHeaderSize = 15; // fixed leading fields
 export constexpr std::size_t kCrcSize = 4;     // trailing CRC
 
-export struct ReadResult {
+export struct DataEntry {
   std::uint64_t sequence;
   EntryType entry_type;
   std::vector<std::byte> key;
   std::vector<std::byte> value;
 };
-
-namespace {
-
-// Parse a little-endian integer of type T from a byte span at the given offset.
-template <typename T>
-auto read_le(std::span<const std::byte> buf, std::size_t offset) -> T {
-  static_assert(std::is_integral_v<T>);
-  T v{};
-  for (std::size_t i = 0; i < sizeof(T); ++i) {
-    v |= static_cast<T>(
-        static_cast<T>(std::to_integer<std::uint8_t>(buf[offset + i]))
-        << (8U * i));
-  }
-  return v;
-}
-
-} // namespace
 
 // Parses the fixed header fields from the first kHeaderSize bytes of buf.
 export auto parse_header(std::span<const std::byte> buf) -> EntryHeader {
@@ -121,7 +104,7 @@ export auto serialize_entry(std::uint64_t sequence, EntryType entry_type,
 // Deserializes a single entry from a flat byte buffer and verifies its CRC.
 // buf must span exactly one complete entry: kHeaderSize + key_size + value_size
 // + kCrcSize bytes. Throws std::runtime_error on size mismatch or CRC failure.
-export auto deserialize_entry(std::span<const std::byte> buf) -> ReadResult {
+export auto deserialize_entry(std::span<const std::byte> buf) -> DataEntry {
   if (buf.size() < kHeaderSize + kCrcSize) {
     throw std::runtime_error{"deserialize_entry: buffer too small"};
   }
@@ -146,7 +129,7 @@ export auto deserialize_entry(std::span<const std::byte> buf) -> ReadResult {
   const auto val_span =
       buf.subspan(kHeaderSize + header.key_size, header.value_size);
 
-  return ReadResult{
+  return DataEntry{
       .sequence = header.sequence,
       .entry_type = header.entry_type,
       .key = {key_span.begin(), key_span.end()},

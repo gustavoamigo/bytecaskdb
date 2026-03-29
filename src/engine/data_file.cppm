@@ -102,16 +102,22 @@ public:
     return entry_offset;
   }
 
-  // Reads and deserializes the entry at the given offset.
-  // Verifies the trailing CRC; throws std::system_error on I/O failure
-  // or std::runtime_error on CRC mismatch.
-  [[nodiscard]] auto read(Offset offset) const -> ReadResult {
+  // Reads and deserializes the entry at the given offset. Returns the entry
+  // and the byte offset of the next entry. Returns std::nullopt when offset is
+  // at or past end of file. Throws std::system_error on I/O failure or
+  // std::runtime_error on CRC mismatch.
+  [[nodiscard]] auto scan(Offset offset) const
+      -> std::optional<std::pair<DataEntry, Offset>> {
+    if (offset >= offset_) {
+      return std::nullopt;
+    }
+
     // Step 1: read the fixed header to determine variable-length field sizes.
     std::array<std::byte, kHeaderSize> hdr{};
     if (::pread(fd_, hdr.data(), kHeaderSize, narrow<off_t>(offset)) !=
         std::ssize(hdr)) {
       throw std::system_error{errno, std::generic_category(),
-                              "DataFile::read: pread header failed"};
+                              "DataFile::scan: pread header failed"};
     }
 
     const auto header = parse_header(std::span{hdr});
@@ -125,10 +131,24 @@ public:
     if (::pread(fd_, tail.data(), tail.size(),
                 narrow<off_t>(offset + kHeaderSize)) != std::ssize(tail)) {
       throw std::system_error{errno, std::generic_category(),
-                              "DataFile::read: pread payload failed"};
+                              "DataFile::scan: pread payload failed"};
     }
 
-    return deserialize_entry(buf);
+    auto entry = deserialize_entry(buf);
+    const auto next = offset + static_cast<Offset>(buf.size());
+    return std::make_pair(std::move(entry), next);
+  }
+
+  // Reads and deserializes the entry at the given offset. Delegates to scan().
+  // Throws std::system_error on I/O failure, std::runtime_error on CRC
+  // mismatch or if offset is at or past end of file.
+  [[nodiscard]] auto read(Offset offset) const -> DataEntry {
+    auto result = scan(offset);
+    if (!result) {
+      throw std::runtime_error{
+          std::format("DataFile::read: offset {} is past end of file", offset)};
+    }
+    return std::move(result->first);
   }
 
   // Flushes all pending writes to physical storage via fdatasync.
