@@ -80,4 +80,17 @@ private:
   Crc32 &crc_;
 };
 
+// Parse a little-endian integer of type T from a byte span at the given offset.
+export template <typename T>
+auto read_le(std::span<const std::byte> buf, std::size_t offset) -> T {
+  static_assert(std::is_integral_v<T>);
+  T v{};
+  for (std::size_t i = 0; i < sizeof(T); ++i) {
+    v |= static_cast<T>(
+        static_cast<T>(std::to_integer<std::uint8_t>(buf[offset + i]))
+        << (8U * i));
+  }
+  return v;
+}
+
 } // namespace bytecask

@@ -35,6 +35,7 @@ _nothing currently in progress_
 | BC-010 | CrcInputAdapter for read path | Matching bitsery input adapter that accumulates CRC while deserializing; needed when BC-006 (read path) is implemented. |
 | BC-016 | Atomic Bulk Put | Implement bulk put (atomic batch) above DataFile using BulkBegin/BulkEnd entries. |
 
+
 ## Done
 
 | ID | Title | Note |
@@ -48,5 +49,6 @@ _nothing currently in progress_
 | BC-005 | Data entry append to file | `DataFile` appends key-value entries with 19-byte LE header, CRC32, and auto-incrementing sequence numbers. Zero warnings. All tests pass. |
 | BC-009 | Bitsery serialization + CRC-at-end | Replaced manual LE serialization with bitsery. Moved CRC to trailing position for one-pass write. Extracted `CrcOutputAdapter<TAdapter>` (reusable bitsery wrapper) in `data_entry.cppm`. `kHeaderSize` = 15, `kCrcSize` = 4. Zero warnings. All tests pass. |
 | BC-011 | C++20/23 modernization & readability | Applied `std::span`, `std::as_bytes`, `std::to_integer`, `std::in_range`, `std::ssize`, `std::filesystem::file_size`, `is_integral_v`, `auto` consistency. Added `narrow<To>()` checked-narrowing helper and `write_bytes()` wrapper to hide `reinterpret_cast` from call sites. Updated copilot-instructions with coding guidelines. All tests pass. |
+| BC-017 | HintFile writer + reader | `bytecask.hint_file` module: `OpenForWrite`/`OpenForRead` factories, `append`/`sync`/`read` API, 22-byte header + trailing CRC. `read()` returns `std::optional`, panics on CRC mismatch. 4 new test cases, 57 total assertions pass. |
 | BC-015 | EntryType replaces Flags in header | `flags` u8 replaced by `EntryType` enum; layout seq(8)+type(1)+key_size(2)+val_size(4); `append(seq,type,key,val)` API. 36 assertions pass. |
 | BC-012 | Migrate tests to Catch2 | Replaced hand-rolled `fail()`/`expect()` harness with Catch2 v3. `TEST_CASE`/`CHECK`/`REQUIRE` macros, Catch2's own `main()`, randomized test order. 3 test cases, 28 assertions. |
