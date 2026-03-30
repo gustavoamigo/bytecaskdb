@@ -172,6 +172,8 @@ We use fine-grained C++20 modules:
 - `bytecask.data_entry`: Logical entry definition and single-entry memory formatting.
 - `bytecask.data_file`: Disk I/O, writing streams sequentially to `.data` files.
 - `bytecask.hint_file`: Hint file writer and reader (`HintFile`, `HintEntry`).
+- `bytecask.persistent_ordered_map`: Immutable sorted map (`PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`) backed by `immer::flex_vector`; used as the key directory.
+- `bytecask.engine`: Public engine API (`Bytecask`, `Batch`, `KeyIterator`, `EntryIterator`, type aliases).
 
 ### Current scope boundaries
 
@@ -324,8 +326,8 @@ public:
     Batch(Batch&&) noexcept        = default;
     Batch& operator=(Batch&&) noexcept = default;
 
-    void insert(BytesView key, BytesView value);
-    void remove(BytesView key);
+    void put(BytesView key, BytesView value);
+    void del(BytesView key);
 
     [[nodiscard]] bool empty() const noexcept;
     [[nodiscard]] std::size_t size() const noexcept;
@@ -402,12 +404,12 @@ public:
 
     // Writes `key` → `value`. Overwrites any existing value.
     // Throws std::system_error on I/O failure.
-    void insert(BytesView key, BytesView value);
+    void put(BytesView key, BytesView value);
 
     // Writes a tombstone for `key`.
     // Returns true if the key existed and was removed, false if it was absent.
     // Throws std::system_error on I/O failure.
-    [[nodiscard]] bool remove(BytesView key);
+    [[nodiscard]] bool del(BytesView key);
 
     // Returns true if `key` exists in the index (no disk I/O).
     [[nodiscard]] auto contains_key(BytesView key) const -> bool;
@@ -444,18 +446,18 @@ private:
 auto db = Bytecask::open("my_db");
 
 // Single-key operations.
-db.insert(as_bytes("user:1"), as_bytes("alice"));
+db.put(as_bytes("user:1"), as_bytes("alice"));
 
 auto val = db.get(as_bytes("user:1"));
 if (val) { /* use *val */ }
 
-bool existed = db.remove(as_bytes("user:1")); // false if key was absent
+bool existed = db.del(as_bytes("user:1")); // false if key was absent
 
 // Atomic batch.
 Batch batch;
-batch.insert(as_bytes("user:2"), as_bytes("bob"));
-batch.insert(as_bytes("user:3"), as_bytes("carol"));
-batch.remove(as_bytes("user:1"));
+batch.put(as_bytes("user:2"), as_bytes("bob"));
+batch.put(as_bytes("user:3"), as_bytes("carol"));
+batch.del(as_bytes("user:1"));
 db.apply_batch(std::move(batch));
 
 // Range scan.
@@ -473,19 +475,25 @@ for (auto& key : db.keys_from(as_bytes("user:"))) { ... }
 
 - Language: C++23
 - Build system: xmake
-- Dependencies: bitsery v5.2.5 (header-only binary serialization)
+- Dependencies: bitsery v5.2.5 (header-only binary serialization), immer (header-only persistent data structures)
 - Primary target: `bytecask` (includes `src/*.cpp` + `src/engine/*.cppm`)
 - Test target: `bytecask_tests` (includes `tests/*.cpp` + `src/engine/*.cppm`)
-- Status: `DataFile` append-only writer + `HintFile` writer/reader (23-byte header with `EntryType`), both backed by bitsery serialization with trailing CRC32. 60 assertions, 8 test cases.
+- Status: Full `Bytecask` SWMR engine with `open`, `get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`. Key directory backed by `PersistentOrderedMap<Key, KeyDirEntry>`. `open()` always creates a fresh active data file; recovery is BC-019. 143 assertions, 34 test cases.
 
 ## Current repository structure
 
 - `src/main.cpp`: temporary executable entry point
-- `src/engine/data_entry.cppm`: C++23 module (`bytecask.data_entry`) — `EntryHeader`, `ReadResult`, serialization helpers
-- `src/engine/data_file.cppm`: C++23 module (`bytecask.data_file`) — `DataFile` POSIX I/O
-- `src/engine/hint_file.cppm`: C++23 module (`bytecask.hint_file`) — `HintFile`, `HintEntry`
+- `src/engine/crc32.cppm`: C++23 module (`bytecask.crc32`) — `Crc32` accumulator, `narrow<To>(From)` checked conversion
+- `src/engine/serialization.cppm`: C++23 module (`bytecask.serialization`) — `CrcOutputAdapter`, `write_bytes`
+- `src/engine/data_entry.cppm`: C++23 module (`bytecask.data_entry`) — `EntryType`, `EntryHeader`, `DataEntry`, serialization helpers
+- `src/engine/data_file.cppm`: C++23 module (`bytecask.data_file`) — `DataFile` POSIX I/O, `Offset`
+- `src/engine/hint_entry.cppm`: C++23 module (`bytecask.hint_entry`) — `HintEntry`, `serialize_hint_entry`
+- `src/engine/hint_file.cppm`: C++23 module (`bytecask.hint_file`) — `HintFile`, `OpenForWrite`/`OpenForRead`
+- `src/engine/persistent_ordered_map.cppm`: C++23 module (`bytecask.persistent_ordered_map`) — `PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`
+- `src/engine/bytecask.cppm`: C++23 module (`bytecask.engine`) — `Bytecask`, `Batch`, `KeyIterator`, `EntryIterator`, type aliases
 - `tests/data_entry_test.cpp`: behavior tests for data entry serialization and file append
 - `tests/hint_file_test.cpp`: behavior tests for hint file append, round-trip, and CRC panic
+- `tests/bytecask_test.cpp`: behavior tests for the full `Bytecask` engine API
 - `xmake.lua`: build and test target definitions
 - `docs/bytecask_design.md`: living design reference
 - `docs/bytecask_project_plan.md`: simple task tracker
@@ -513,7 +521,7 @@ for (auto& key : db.keys_from(as_bytes("user:"))) { ... }
 | D4 | **Batch size limit**: None — the caller is responsible. |
 | D5 | **Iterator strategy**: Lazy — each `operator++` reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries. |
 | D6 | **`KeyIterator` source**: In-memory only — walks the B-Tree key directory without opening any data file. |
-| D7 | **`remove` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
+| D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
 | D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1 and standard C++ practice). |
 | D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. MVCC and snapshot isolation are not provided. |
 | D10 | **Vacuum**: Fully offline. The engine must not be running while vacuum operates. No background or online compaction. |
