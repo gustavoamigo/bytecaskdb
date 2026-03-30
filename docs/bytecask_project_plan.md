@@ -13,14 +13,14 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 ## In Progress
 
-_nothing currently in progress_
+| ID | Title | Note |
+| --- | --- | --- |
 
 ## Backlog
 
 | ID | Title | Note |
 | --- | --- | --- |
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
-| BC-008 | File naming + rotation | Implement `data_{YYYYMMDDHHmmssUUUUUU}` microsecond timestamp naming and file rotation (active → rotating → immutable lifecycle). |
 | BC-019 | Recovery and startup | Startup procedure: discard `.hint.tmp`, read hint files oldest-to-newest, scan active data file, discard incomplete batches (warn), seed LSN from max seen sequence. |
 
 
@@ -28,7 +28,8 @@ _nothing currently in progress_
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-022 | PersistentOrderedMap wrapper | `immer::btree_map` does not exist; replaced with `PersistentOrderedMap<K,V>` backed by `immer::flex_vector<Entry>` (RBT). Provides sorted-map API (`get`, `contains`, `lower_bound`, `set`, `erase`) and `OrderedMapTransient<K,V>` for batch mutations. Module `bytecask.persistent_ordered_map`, 13 test cases. |
+| BC-023 | Copy-on-write file registry + safe EntryIterator | Replaced `std::map<uint32_t,DataFile>` with `FileRegistry` (`shared_ptr<map<uint32_t,shared_ptr<DataFile>>>`). Rotation clones inner map and replaces outer `shared_ptr` — in-flight iterators hold a snapshot with independent lifetime. `EntryIterator` holds `FileRegistry` by value instead of a raw pointer; no dangling-pointer risk on engine move. 160 assertions pass. |
+| BC-008 | File naming + rotation | Size-triggered rotation: `uint32_t` file IDs, `FileRegistry` COW registry, `sealed_` flag in `DataFile`, multi-file `get()`/`iter_from()`, deferred `flush_hints()` at close. |
 | BC-018 | Bytecask engine class | `Bytecask` SWMR engine: `open`, `get`, `insert`, `remove`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`. Key directory: `PersistentOrderedMap<Key, KeyDirEntry>`. `open()` always creates a fresh active data file. `fdatasync` after every write; transient pattern in `apply_batch`. Module `bytecask.engine`. 10 new test cases, 143 total assertions. |
 | BC-016 | Atomic Bulk Put | Superseded by BC-018: `apply_batch` wraps operations in `BulkBegin`/`BulkEnd` inside `Bytecask`. |
 

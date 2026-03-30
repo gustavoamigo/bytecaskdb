@@ -204,3 +204,149 @@ TEST_CASE("Bytecask keys_from returns all keys in ascending order",
   CHECK(keys[1] == "m");
   CHECK(keys[2] == "z");
 }
+
+// ---------------------------------------------------------------------------
+// Test 11: rotation creates a second .data file on disk
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask rotation creates new data file", "[bytecask][rotation]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  // A threshold of 1 means any write will trigger rotation.
+  auto db = bytecask::Bytecask::open(db_path, 1);
+
+  db.put(to_bytes("key"), to_bytes("value"));
+
+  // Count .data files: should be 2 (the sealed one + the new active one).
+  int data_file_count = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".data") {
+      ++data_file_count;
+    }
+  }
+  CHECK(data_file_count == 2);
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: get() resolves value from a rotated (sealed) file
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask get resolves value from rotated file",
+          "[bytecask][rotation]") {
+  TempDir td;
+  // Threshold of 1 triggers rotation after each write.
+  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+
+  db.put(to_bytes("key_a"), to_bytes("alpha"));
+  // After put, active file is now rotated. key_a lives in the sealed file.
+  db.put(to_bytes("key_b"), to_bytes("beta"));
+
+  const auto a = db.get(to_bytes("key_a"));
+  REQUIRE(a.has_value());
+  CHECK(to_string(*a) == "alpha");
+
+  const auto b = db.get(to_bytes("key_b"));
+  REQUIRE(b.has_value());
+  CHECK(to_string(*b) == "beta");
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: iter_from spans entries across multiple data files
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask iter_from spans multiple rotated files",
+          "[bytecask][rotation]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+
+  db.put(to_bytes("a"), to_bytes("av"));
+  db.put(to_bytes("b"), to_bytes("bv"));
+  db.put(to_bytes("c"), to_bytes("cv"));
+
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  for (auto &[k, v] : db.iter_from()) {
+    keys.push_back(to_string(k));
+    values.push_back(to_string(v));
+  }
+
+  REQUIRE(keys.size() == 3);
+  CHECK(keys[0] == "a");
+  CHECK(keys[1] == "b");
+  CHECK(keys[2] == "c");
+  CHECK(values[0] == "av");
+  CHECK(values[1] == "bv");
+  CHECK(values[2] == "cv");
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: flush_hints writes a .hint file for each sealed data file
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask flush_hints writes hint file for sealed file",
+          "[bytecask][rotation]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  auto db = bytecask::Bytecask::open(db_path, 1);
+
+  db.put(to_bytes("k"), to_bytes("v"));
+  // At this point one file is sealed; a new active file exists too.
+
+  db.flush_hints();
+
+  int hint_count = 0;
+  int tmp_count = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".hint") {
+      ++hint_count;
+    }
+    if (e.path().string().ends_with(".hint.tmp")) {
+      ++tmp_count;
+    }
+  }
+  CHECK(hint_count >= 1);
+  CHECK(tmp_count == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: flush_hints is idempotent — calling it twice does not error
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask flush_hints is idempotent", "[bytecask][rotation]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  auto db = bytecask::Bytecask::open(db_path, 1);
+
+  db.put(to_bytes("k"), to_bytes("v"));
+  db.flush_hints();
+
+  // Collect hint file count after first call.
+  int count_first = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".hint") ++count_first;
+  }
+
+  REQUIRE_NOTHROW(db.flush_hints());
+
+  int count_second = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".hint") ++count_second;
+  }
+
+  CHECK(count_first == count_second);
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: ~Bytecask calls flush_hints — hint file exists after scope exit
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask destructor flushes hint files", "[bytecask][rotation]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::Bytecask::open(db_path, 1);
+    db.put(to_bytes("k"), to_bytes("v"));
+    // db destroyed here — destructor should call flush_hints()
+  }
+
+  int hint_count = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".hint") ++hint_count;
+  }
+  CHECK(hint_count >= 1);
+}

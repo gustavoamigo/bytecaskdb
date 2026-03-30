@@ -1,4 +1,5 @@
 module;
+#include <cassert>
 #include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
@@ -59,7 +60,8 @@ public:
   //   DataFile a{"x.data"};          // a: fd=5
   //   DataFile b = std::move(a);     // b: fd=5, a: fd=-1 (harmless destructor)
   DataFile(DataFile &&other) noexcept
-      : path_{std::move(other.path_)}, fd_{other.fd_}, offset_{other.offset_} {
+      : path_{std::move(other.path_)}, fd_{other.fd_}, offset_{other.offset_},
+        sealed_{other.sealed_} {
     other.fd_ = -1;
   }
 
@@ -77,6 +79,7 @@ public:
       path_ = std::move(other.path_);
       fd_ = other.fd_;
       offset_ = other.offset_;
+      sealed_ = other.sealed_;
       other.fd_ = -1;
     }
     return *this;
@@ -86,9 +89,11 @@ public:
   // cache. Returns the absolute byte offset where the entry begins. BulkBegin
   // and BulkEnd entries use empty key and value spans. Does not guarantee
   // durability — call sync() to flush to physical storage.
+  // Precondition: the file must not have been sealed.
   [[nodiscard]] auto append(std::uint64_t sequence, EntryType entry_type,
                             std::span<const std::byte> key,
                             std::span<const std::byte> value) -> Offset {
+    assert(!sealed_);
     const auto entry_offset = offset_;
     const auto buf = serialize_entry(sequence, entry_type, key, value);
 
@@ -160,6 +165,13 @@ public:
     }
   }
 
+  // Returns the current file size in bytes (equal to the write offset).
+  [[nodiscard]] auto size() const noexcept -> Offset { return offset_; }
+
+  // Marks the file as sealed: no further appends are permitted.
+  // The fd remains open for reads. seal() is called by Bytecask on rotation.
+  void seal() noexcept { sealed_ = true; }
+
   [[nodiscard]] auto path() const -> const std::filesystem::path & {
     return path_;
   }
@@ -168,6 +180,7 @@ private:
   std::filesystem::path path_;
   int fd_{-1};
   Offset offset_{0};
+  bool sealed_{false};
 };
 
 } // namespace bytecask
