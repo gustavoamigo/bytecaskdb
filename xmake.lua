@@ -3,6 +3,7 @@ add_rules("plugin.compile_commands.autoupdate", {outputdir = "."})
 
 add_requires("bitsery")
 add_requires("catch2 3.x")
+add_requires("immer")
 
 -- Common flags shared by all targets
 local common_flags = {
@@ -21,7 +22,7 @@ target("bytecask")
     set_languages("c++23")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
-    add_packages("bitsery")
+    add_packages("bitsery", "immer")
 
 target("bytecask_tests")
     set_toolchains("clang")
@@ -30,7 +31,7 @@ target("bytecask_tests")
     set_languages("c++23")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
-    add_packages("bitsery", "catch2")
+    add_packages("bitsery", "catch2", "immer")
 
 --
 -- If you want to known more usage about xmake, please see https://xmake.io

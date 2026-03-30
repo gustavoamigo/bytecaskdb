@@ -36,7 +36,9 @@ The design follows these core tenets in order of priority:
 
 ### Key Directory
 
-ByteCask uses `immer::btree_map<Key, KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times.
+ByteCask uses `PersistentOrderedMap<Key, KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times.
+
+`immer::btree_map` does not exist in the immer library. The replacement is a thin wrapper, `PersistentOrderedMap<K, V>`, backed by `immer::flex_vector<Entry>` (Radix Balanced Tree). It provides the same sorted-map semantics with O(log n) get/set/erase, structural sharing across versions, and a `transient()` / `persistent()` API for batch mutations. Implemented in `bytecask.persistent_ordered_map` (`src/engine/persistent_ordered_map.cppm`).
 
 `Key` is a dedicated type alias (initially `= std::vector<std::byte>`) distinct from the generic `Bytes` type. Keys have a hard upper bound of 65 535 bytes (the `u16 key_size` field in the data file header). Keeping `Key` separate provides a single-point change if the type needs to evolve — e.g., to enforce that constraint at compile time or adopt a small-buffer-optimized representation.
 
@@ -298,7 +300,7 @@ using Key = Bytes;
 using BytesView = std::span<const std::byte>;
 ```
 
-`std::byte` makes the intent clear (raw bytes, not text) and prevents accidental arithmetic. `Key` is kept distinct from `Bytes` so the key directory type (`immer::btree_map<Key, KeyDirEntry>`) reads as its intent and provides a single point of change if the key type needs to evolve. `BytesView` as the universal input type avoids copies at call sites and accepts any contiguous range.
+`std::byte` makes the intent clear (raw bytes, not text) and prevents accidental arithmetic. `Key` is kept distinct from `Bytes` so the key directory type (`PersistentOrderedMap<Key, KeyDirEntry>`) reads as its intent and provides a single point of change if the key type needs to evolve. `BytesView` as the universal input type avoids copies at call sites and accepts any contiguous range.
 
 ### Batch
 
