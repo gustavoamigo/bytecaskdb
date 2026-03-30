@@ -30,7 +30,8 @@ The design follows these core tenets in order of priority:
 
 1. **Correctness**: Data integrity is paramount. All design decisions prioritize correctness over performance.
 2. **Simplicity**: The architecture is kept simple to facilitate understanding and maintainability.
-3. **Performance**: Optimizations are pursued only when they don't compromise correctness or simplicity.
+3. **Predictable latency over peak throughput**: Write-path operations must have bounded, predictable latency. Work that can be deferred without compromising correctness must be deferred. A steady 1 ms per write is preferable to an average of 0.1 ms with occasional 500 ms spikes. This directly influences decisions like deferring hint file writes out of the rotation path.
+4. **Performance**: Optimizations are pursued only when they don't compromise correctness or simplicity.
 
 ## System Architecture
 
@@ -49,6 +50,24 @@ ByteCask follows a **single-writer / multiple-reader (SWMR)** model:
 - Exactly one writer may operate at a time.
 - Multiple readers may operate concurrently.
 - MVCC and snapshot isolation are not supported.
+
+### File Registry
+
+The engine maintains a registry that maps a monotonic `uint32_t` file ID to an open `DataFile`. The type is:
+
+```cpp
+using FileRegistry =
+    std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>>;
+```
+
+Two levels of `shared_ptr` serve distinct purposes:
+
+- **Inner `shared_ptr<DataFile>`**: ensures a `DataFile` (and its fd) remains alive as long as any part of the system holds a reference to it, even after it has been rotated out of the current registry.
+- **Outer `shared_ptr<map<...>>`**: enables O(1) copy-on-write snapshotting. `EntryIterator` captures a copy of the outer pointer at construction, giving it an independent lifetime from the `Bytecask` instance.
+
+**Rotation** is a functional update: `rotate_active_file()` clones the inner map into a new allocation, inserts the new `DataFile`, and replaces `files_` with the new outer `shared_ptr`. Any iterator holding the previous snapshot continues reading from the old set of open files without any locking.
+
+**Why not `immer::map`**: `immer::map<K, std::shared_ptr<V>>` triggers a GCC 15 / libstdc++15 regression — the `friend` declaration inside `std::shared_ptr`'s internals is rejected when the type is instantiated from a C++20 module context.
 
 ### Data File Lifecycle
 
@@ -173,13 +192,23 @@ We use fine-grained C++20 modules:
 - `bytecask.data_file`: Disk I/O, writing streams sequentially to `.data` files.
 - `bytecask.hint_file`: Hint file writer and reader (`HintFile`, `HintEntry`).
 - `bytecask.persistent_ordered_map`: Immutable sorted map (`PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`) backed by `immer::flex_vector`; used as the key directory.
-- `bytecask.engine`: Public engine API (`Bytecask`, `Batch`, `KeyIterator`, `EntryIterator`, type aliases).
+- `bytecask.engine`: Public engine API (`Bytecask`, `Batch`, `KeyIterator`, `EntryIterator`, `FileRegistry`, type aliases).
 
 ### Current scope boundaries
 
 - `EntryType` is written and read back on `DataFile::read()`; atomic bulk semantics are enforced at a layer above `DataFile`.
 - No file rotation or size limits.
 - No read path for the key directory — append-only for now.
+
+### DataFile fd mode after rotation
+
+`DataFile` opens with `O_RDWR | O_CREAT | O_APPEND`. After a data file is rotated it is logically immutable — no new entries should be appended. The engine enforces this at a higher level; the fd mode is not downgraded to `O_RDONLY` after rotation. Rationale:
+
+- `DataFile` is an internal class; the engine exclusively controls when `append()` is called.
+- Re-opening the fd purely for semantic enforcement adds syscall overhead and complexity without improving correctness for the production path.
+- A `sealed_` flag with `assert(!sealed_)` at the top of `append()` is sufficient: it catches programming errors in debug builds at zero production cost.
+
+Contrast with `HintFile`, which uses `OpenForWrite` / `OpenForRead` factory functions. That split models two *externally visible*, non-overlapping lifecycles at different call sites: one site writes during `flush_hints()`, a completely separate site reads during recovery. Encoding that distinction in the type prevents mixing them up. `DataFile` has no equivalent external semantic split.
 
 ## Hint File Format (.hint)
 
@@ -255,17 +284,23 @@ If the engine crashes after writing a `BulkBegin` but before the matching `BulkE
 | Created | At engine open / rotation | When a data file is sealed (rotated) |
 | Read at startup | Only for the active file | For all sealed files |
 
-One hint file corresponds to exactly one data file (same timestamp stem, different extension). Creation of hint files is deferred to when file rotation is implemented (BC-008).
+One hint file corresponds to exactly one data file (same timestamp stem, different extension).
+
+**Hint files are a startup-optimization artifact, not a correctness requirement.** Recovery always falls back to scanning the raw `.data` file if no `.hint` companion exists. This makes hint file writes safe to defer out of the rotation path entirely.
+
+Hint files are written **deferred**: at engine close, or via an explicit `flush_hints()` call — never inline on the write path. This keeps write-path latency flat and bounded regardless of file size at the time of rotation. The cost is that a crash after rotation but before `flush_hints()` causes recovery to scan the `.data` file instead of the `.hint` file, which is always correct and only slower.
 
 ### Hint File Atomicity
 
-To guarantee hint files are either complete or absent, the rotation process uses a temp-then-rename protocol:
+To guarantee hint files are either complete or absent, writing uses a temp-then-rename protocol:
 
 1. Write the complete hint file to `data_{timestamp}.hint.tmp`.
 2. Call `fdatasync` to flush all bytes to physical storage.
 3. Atomically `rename(2)` to `data_{timestamp}.hint` — POSIX guarantees this rename is atomic on the same filesystem.
 
-Any `.hint.tmp` file found at startup is discarded (it represents an incomplete rotation interrupted by a crash). Recovery will re-scan the corresponding `.data` file instead.
+Any `.hint.tmp` file found at startup is discarded (it represents an incomplete write interrupted by a crash). Recovery will re-scan the corresponding `.data` file instead.
+
+Because hint file writes are deferred (see above), this protocol is exercised at engine close or during an explicit `flush_hints()` call — not inside the rotation critical path.
 
 ### Module Plan
 
