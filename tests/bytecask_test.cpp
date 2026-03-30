@@ -1,0 +1,206 @@
+#include <catch2/catch_test_macros.hpp>
+
+import std;
+import bytecask.engine;
+
+namespace {
+
+auto to_bytes(std::string_view sv) -> bytecask::BytesView {
+  return std::as_bytes(std::span{sv.data(), sv.size()});
+}
+
+auto to_string(const bytecask::Bytes &bytes) -> std::string {
+  std::string s(bytes.size(), '\0');
+  std::ranges::transform(bytes, s.begin(),
+                         [](std::byte b) { return static_cast<char>(b); });
+  return s;
+}
+
+// Creates a unique temp directory for each test, cleaned up on scope exit.
+struct TempDir {
+  std::filesystem::path path;
+
+  TempDir()
+      : path{std::filesystem::temp_directory_path() /
+             std::format(
+                 "bc_test_{}",
+                 std::chrono::system_clock::now().time_since_epoch().count())} {
+    std::filesystem::create_directories(path);
+  }
+
+  ~TempDir() { std::filesystem::remove_all(path); }
+};
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Test 1: open() creates the directory and does not throw
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask open creates directory", "[bytecask]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  REQUIRE_NOTHROW(bytecask::Bytecask::open(db_path));
+  CHECK(std::filesystem::is_directory(db_path));
+}
+
+// ---------------------------------------------------------------------------
+// Test 2: put + get round-trip
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask put and get round-trip", "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put(to_bytes("key1"), to_bytes("value1"));
+
+  const auto result = db.get(to_bytes("key1"));
+  REQUIRE(result.has_value());
+  CHECK(to_string(*result) == "value1");
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: put overwrites an existing key
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask put overwrites existing key", "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put(to_bytes("key1"), to_bytes("first"));
+  db.put(to_bytes("key1"), to_bytes("second"));
+
+  const auto result = db.get(to_bytes("key1"));
+  REQUIRE(result.has_value());
+  CHECK(to_string(*result) == "second");
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: del returns false for a key that does not exist
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask del returns false for absent key", "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  CHECK_FALSE(db.del(to_bytes("missing")));
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: del returns true; subsequent get returns nullopt
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask del existing key", "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put(to_bytes("key1"), to_bytes("value1"));
+  const bool removed = db.del(to_bytes("key1"));
+
+  CHECK(removed);
+  CHECK_FALSE(db.get(to_bytes("key1")).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: contains_key tracks puts and dels
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask contains_key tracks mutations", "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  CHECK_FALSE(db.contains_key(to_bytes("k")));
+  db.put(to_bytes("k"), to_bytes("v"));
+  CHECK(db.contains_key(to_bytes("k")));
+  CHECK(db.del(to_bytes("k")));
+  CHECK_FALSE(db.contains_key(to_bytes("k")));
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: apply_batch — mixed puts and del, all visible atomically
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask apply_batch mixed operations", "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  // Pre-insert a key that the batch will remove.
+  db.put(to_bytes("del"), to_bytes("gone"));
+
+  bytecask::Batch batch;
+  batch.put(to_bytes("a"), to_bytes("alpha"));
+  batch.put(to_bytes("b"), to_bytes("beta"));
+  batch.del(to_bytes("del"));
+  db.apply_batch(std::move(batch));
+
+  REQUIRE(db.get(to_bytes("a")).has_value());
+  CHECK(to_string(*db.get(to_bytes("a"))) == "alpha");
+  REQUIRE(db.get(to_bytes("b")).has_value());
+  CHECK(to_string(*db.get(to_bytes("b"))) == "beta");
+  CHECK_FALSE(db.get(to_bytes("del")).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: iter_from({}) returns all entries in ascending key order
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask iter_from returns entries in ascending order",
+          "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put(to_bytes("c"), to_bytes("cv"));
+  db.put(to_bytes("a"), to_bytes("av"));
+  db.put(to_bytes("b"), to_bytes("bv"));
+
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  for (auto &[k, v] : db.iter_from()) {
+    keys.push_back(to_string(k));
+    values.push_back(to_string(v));
+  }
+
+  REQUIRE(keys.size() == 3);
+  CHECK(keys[0] == "a");
+  CHECK(keys[1] == "b");
+  CHECK(keys[2] == "c");
+  CHECK(values[0] == "av");
+  CHECK(values[1] == "bv");
+  CHECK(values[2] == "cv");
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: iter_from(mid_key) starts at that key, earlier keys are absent
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask iter_from starts from given key", "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put(to_bytes("apple"), to_bytes("1"));
+  db.put(to_bytes("banana"), to_bytes("2"));
+  db.put(to_bytes("cherry"), to_bytes("3"));
+
+  std::vector<std::string> keys;
+  for (auto &[k, v] : db.iter_from(to_bytes("banana"))) {
+    keys.push_back(to_string(k));
+  }
+
+  REQUIRE(keys.size() == 2);
+  CHECK(keys[0] == "banana");
+  CHECK(keys[1] == "cherry");
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: keys_from({}) returns all keys ascending — no data file I/O
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask keys_from returns all keys in ascending order",
+          "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put(to_bytes("z"), to_bytes("zv"));
+  db.put(to_bytes("m"), to_bytes("mv"));
+  db.put(to_bytes("a"), to_bytes("av"));
+
+  std::vector<std::string> keys;
+  for (auto &k : db.keys_from()) {
+    keys.push_back(to_string(k));
+  }
+
+  REQUIRE(keys.size() == 3);
+  CHECK(keys[0] == "a");
+  CHECK(keys[1] == "m");
+  CHECK(keys[2] == "z");
+}

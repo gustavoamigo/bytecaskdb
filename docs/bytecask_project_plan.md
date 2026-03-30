@@ -21,9 +21,7 @@ _nothing currently in progress_
 | --- | --- | --- |
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-008 | File naming + rotation | Implement `data_{YYYYMMDDHHmmssUUUUUU}` microsecond timestamp naming and file rotation (active → rotating → immutable lifecycle). |
-| BC-016 | Atomic Bulk Put | Implement bulk put (atomic batch) above DataFile using BulkBegin/BulkEnd entries. |
-| BC-018 | Bytecask engine class | Implement the `Bytecask` SWMR key-value store: `open`, `get`, `insert`, `remove`, `apply_batch`, `iter_from`, `keys_from`. Key directory backed by `PersistentOrderedMap<Key, KeyDirEntry>`. API designed in `docs/engine_api_design.md`. |
-| BC-019 | Recovery and startup | Startup procedure: discard `.hint.tmp`, read hint files oldest-to-newest, scan active data file, discard incomplete batches (warn), create new active file. |
+| BC-019 | Recovery and startup | Startup procedure: discard `.hint.tmp`, read hint files oldest-to-newest, scan active data file, discard incomplete batches (warn), seed LSN from max seen sequence. |
 
 
 ## Done
@@ -31,6 +29,8 @@ _nothing currently in progress_
 | ID | Title | Note |
 | --- | --- | --- |
 | BC-022 | PersistentOrderedMap wrapper | `immer::btree_map` does not exist; replaced with `PersistentOrderedMap<K,V>` backed by `immer::flex_vector<Entry>` (RBT). Provides sorted-map API (`get`, `contains`, `lower_bound`, `set`, `erase`) and `OrderedMapTransient<K,V>` for batch mutations. Module `bytecask.persistent_ordered_map`, 13 test cases. |
+| BC-018 | Bytecask engine class | `Bytecask` SWMR engine: `open`, `get`, `insert`, `remove`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`. Key directory: `PersistentOrderedMap<Key, KeyDirEntry>`. `open()` always creates a fresh active data file. `fdatasync` after every write; transient pattern in `apply_batch`. Module `bytecask.engine`. 10 new test cases, 143 total assertions. |
+| BC-016 | Atomic Bulk Put | Superseded by BC-018: `apply_batch` wraps operations in `BulkBegin`/`BulkEnd` inside `Bytecask`. |
 
 | ID | Title | Note |
 | --- | --- | --- |
