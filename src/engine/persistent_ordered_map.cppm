@@ -52,7 +52,7 @@ public:
     return std::nullopt;
   }
 
-  // Returns true if key is present. No disk I/O.
+  // Returns true if key is present.
   [[nodiscard]] auto contains(const K &key) const -> bool {
     auto it = lower_bound(key);
     return it != data_.end() && it->key == key;
@@ -149,8 +149,8 @@ public:
       auto frozen = std::move(data_).persistent();
       auto tail = frozen.drop(idx).transient();
       data_ = frozen.take(idx)
-                   .push_back({std::move(key), std::move(value)})
-                   .transient();
+                  .push_back({std::move(key), std::move(value)})
+                  .transient();
       data_.append(tail);
     }
   }
@@ -173,7 +173,8 @@ public:
   }
 
 private:
-  using transient_type = typename PersistentOrderedMap<K, V>::flex_type::transient_type;
+  using transient_type =
+      typename PersistentOrderedMap<K, V>::flex_type::transient_type;
   transient_type data_;
 
   explicit OrderedMapTransient(transient_type data) : data_(std::move(data)) {}
