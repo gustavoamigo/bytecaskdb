@@ -4,6 +4,7 @@ module;
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <iostream>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -460,13 +461,14 @@ private:
   explicit Bytecask(std::filesystem::path dir, std::uint64_t max_file_bytes)
       : dir_{std::move(dir)}, rotation_threshold_{max_file_bytes} {
     std::filesystem::create_directories(dir_);
-    active_file_id_ = next_file_id_++;
-    const auto stem = make_data_file_stem();
     files_ =
         std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>();
+    const auto max_lsn = recover_existing_files();
+    next_lsn_ = max_lsn + 1;
+    active_file_id_ = next_file_id_++;
+    const auto stem = make_data_file_stem();
     files_->emplace(active_file_id_,
                     std::make_shared<DataFile>(dir_ / (stem + ".data")));
-    next_lsn_ = 1;
   }
 
   // Converts a BytesView (or empty span) into a Key.
@@ -476,6 +478,169 @@ private:
   auto active_file() -> DataFile & { return *files_->at(active_file_id_); }
   auto active_file() const -> const DataFile & {
     return *files_->at(active_file_id_);
+  }
+
+  // Reconstructs the key directory from existing .data and .hint files.
+  // Removes stale .hint.tmp files left by a prior crash, then scans each
+  // .data file — via its .hint companion when present, raw otherwise.
+  // LSN is the sole freshness authority; file processing order is
+  // intentionally unspecified and never relied upon for correctness.
+  // No hint files are generated here; they are produced on clean shutdown
+  // by flush_hints(). Returns the highest sequence number seen, or 0 if
+  // the directory contains no .data files.
+  auto recover_existing_files() -> std::uint64_t {
+    // Remove stale .hint.tmp files from a prior crash.
+    for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
+      const auto &p = dir_entry.path();
+      if (p.extension() == ".tmp" && p.stem().extension() == ".hint") {
+        std::filesystem::remove(p);
+      }
+    }
+
+    std::uint64_t max_lsn = 0;
+    // Single transient for the entire recovery pass: one persistent snapshot
+    // at the end instead of one per entry.
+    auto transient_key_dir = key_dir_.transient();
+    // Highest Delete sequence seen per key across all files, regardless of
+    // processing order. Prevents a stale Put (lower seq) processed after a
+    // Delete (higher seq, different file) from being incorrectly inserted.
+    std::map<Key, std::uint64_t> tombstones;
+
+    for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
+      const auto &p = dir_entry.path();
+      if (p.extension() != ".data") {
+        continue;
+      }
+
+      const auto file_id = next_file_id_++;
+      auto data_file = std::make_shared<DataFile>(p);
+      data_file->seal();
+      files_->emplace(file_id, data_file);
+
+      // LSN-based freshness: apply an entry only if it is strictly newer
+      // than what the key directory already holds for that key.
+      //
+      // apply_put also consults the tombstone map: if a Delete with a higher
+      // sequence was already processed (from another file, in any order), the
+      // Put must be suppressed even though the KeyDir has no entry for the key
+      // at this moment.
+      const auto apply_put = [&](std::uint64_t seq, std::uint64_t file_off,
+                                 std::uint32_t val_size,
+                                 const std::vector<std::byte> &key) {
+        const auto k = Key{key};
+        const auto tomb_it = tombstones.find(k);
+        if (tomb_it != tombstones.end() && tomb_it->second >= seq) {
+          // A Delete with seq >= this Put was already seen; suppress.
+          if (seq > max_lsn)
+            max_lsn = seq;
+          return;
+        }
+        const auto existing = transient_key_dir.get(k);
+        if (!existing || existing->sequence < seq) {
+          transient_key_dir.set(k,
+                                KeyDirEntry{seq, file_id, file_off, val_size});
+        }
+        if (seq > max_lsn)
+          max_lsn = seq;
+      };
+
+      const auto apply_del = [&](std::uint64_t seq,
+                                 const std::vector<std::byte> &key) {
+        const auto k = Key{key};
+        // Record the highest Delete sequence for this key so that a stale Put
+        // processed later (from another file) is correctly suppressed.
+        auto &tomb_seq = tombstones[k];
+        if (seq > tomb_seq)
+          tomb_seq = seq;
+        const auto existing = transient_key_dir.get(k);
+        if (existing && existing->sequence < seq) {
+          transient_key_dir.erase(k);
+        }
+        if (seq > max_lsn)
+          max_lsn = seq;
+      };
+
+      const auto hint_path = dir_ / (p.stem().string() + ".hint");
+
+      if (std::filesystem::exists(hint_path)) {
+        auto hint = HintFile::OpenForRead(hint_path);
+        Offset off = 0;
+        while (auto r = hint.scan(off)) {
+          const auto &[he, next] = *r;
+          if (he.entry_type == EntryType::Put) {
+            apply_put(he.sequence, he.file_offset, he.value_size, he.key);
+          } else if (he.entry_type == EntryType::Delete) {
+            apply_del(he.sequence, he.key);
+          }
+          off = next;
+        }
+      } else {
+        // Raw scan with a BulkBegin/BulkEnd batch state machine.
+        // Entries between BulkBegin and BulkEnd are buffered and applied
+        // only when BulkEnd is seen. An incomplete batch — BulkBegin with
+        // no matching BulkEnd — is discarded; it indicates a crash mid-write.
+        struct PendingEntry {
+          std::uint64_t seq;
+          EntryType type;
+          std::uint64_t file_off;
+          std::uint32_t val_size;
+          std::vector<std::byte> key;
+        };
+
+        bool in_batch = false;
+        std::vector<PendingEntry> pending;
+        Offset off = 0;
+
+        while (auto result = data_file->scan(off)) {
+          const auto entry_off = off;
+          const auto &[de, next] = *result;
+          switch (de.entry_type) {
+          case EntryType::BulkBegin:
+            in_batch = true;
+            pending.clear();
+            if (de.sequence > max_lsn)
+              max_lsn = de.sequence;
+            break;
+          case EntryType::BulkEnd:
+            for (auto &pe : pending) {
+              if (pe.type == EntryType::Put) {
+                apply_put(pe.seq, pe.file_off, pe.val_size, pe.key);
+              } else {
+                apply_del(pe.seq, pe.key);
+              }
+            }
+            pending.clear();
+            in_batch = false;
+            if (de.sequence > max_lsn)
+              max_lsn = de.sequence;
+            break;
+          case EntryType::Put:
+          case EntryType::Delete:
+            if (in_batch) {
+              pending.push_back({de.sequence, de.entry_type, entry_off,
+                                 narrow<std::uint32_t>(de.value.size()),
+                                 de.key});
+            } else if (de.entry_type == EntryType::Put) {
+              apply_put(de.sequence, entry_off,
+                        narrow<std::uint32_t>(de.value.size()), de.key);
+            } else {
+              apply_del(de.sequence, de.key);
+            }
+            break;
+          }
+          off = next;
+        }
+
+        if (in_batch) {
+          std::cerr << "bytecask: discarding incomplete batch in " << p
+                    << " — BulkBegin with no matching BulkEnd (crash "
+                       "mid-write)\n";
+        }
+      }
+    }
+
+    key_dir_ = std::move(transient_key_dir).persistent();
+    return max_lsn;
   }
 
   // Seals the active file and opens a new one if the size threshold is met.

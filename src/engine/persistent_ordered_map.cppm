@@ -159,6 +159,16 @@ public:
     }
   }
 
+  // Returns the value for key, or std::nullopt if absent.  O(log n).
+  [[nodiscard]] auto get(const K &key) const -> std::optional<V> {
+    auto it =
+        std::lower_bound(data_.begin(), data_.end(), key,
+                         [](const Entry &e, const K &k) { return e.key < k; });
+    if (it != data_.end() && it->key == key)
+      return it->value;
+    return std::nullopt;
+  }
+
   // Removes key.  No-op if absent.  O(log n).
   void erase(const K &key) {
     auto it =

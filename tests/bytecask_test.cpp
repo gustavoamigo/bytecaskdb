@@ -420,3 +420,147 @@ TEST_CASE("Bytecask WriteOptions sync=false apply_batch results visible",
   REQUIRE(db.get({}, to_bytes("y")).has_value());
   CHECK(to_string(*db.get({}, to_bytes("y"))) == "yv");
 }
+
+// ---------------------------------------------------------------------------
+// Test 20: puts survive a restart (raw scan recovery, no hint files)
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask recovery: puts survive restart", "[bytecask][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::Bytecask::open(db_path);
+    db.put({}, to_bytes("k1"), to_bytes("v1"));
+    db.put({}, to_bytes("k2"), to_bytes("v2"));
+  } // destructor syncs; no rotation so no hint files written
+
+  auto db2 = bytecask::Bytecask::open(db_path);
+  REQUIRE(db2.get({}, to_bytes("k1")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("k1"))) == "v1");
+  REQUIRE(db2.get({}, to_bytes("k2")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("k2"))) == "v2");
+}
+
+// ---------------------------------------------------------------------------
+// Test 21: delete tombstone survives restart — key absent after reopen
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask recovery: tombstone survives restart",
+          "[bytecask][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::Bytecask::open(db_path);
+    db.put({}, to_bytes("k"), to_bytes("v"));
+    std::ignore = db.del({}, to_bytes("k"));
+  }
+
+  auto db2 = bytecask::Bytecask::open(db_path);
+  CHECK_FALSE(db2.get({}, to_bytes("k")).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Test 22: last write wins — overwritten value correct after restart
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask recovery: last write wins after overwrite",
+          "[bytecask][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::Bytecask::open(db_path);
+    db.put({}, to_bytes("k"), to_bytes("first"));
+    db.put({}, to_bytes("k"), to_bytes("second"));
+  }
+
+  auto db2 = bytecask::Bytecask::open(db_path);
+  REQUIRE(db2.get({}, to_bytes("k")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("k"))) == "second");
+}
+
+// ---------------------------------------------------------------------------
+// Test 23: batch survives restart — all puts/dels from batch visible
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask recovery: batch survives restart", "[bytecask][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::Bytecask::open(db_path);
+    db.put({}, to_bytes("preexisting"), to_bytes("gone"));
+
+    bytecask::Batch batch;
+    batch.put(to_bytes("a"), to_bytes("alpha"));
+    batch.put(to_bytes("b"), to_bytes("beta"));
+    batch.del(to_bytes("preexisting"));
+    db.apply_batch({}, std::move(batch));
+  }
+
+  auto db2 = bytecask::Bytecask::open(db_path);
+  REQUIRE(db2.get({}, to_bytes("a")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("a"))) == "alpha");
+  REQUIRE(db2.get({}, to_bytes("b")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("b"))) == "beta");
+  CHECK_FALSE(db2.get({}, to_bytes("preexisting")).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Test 24: recovery via hint files — rotation writes hints on close,
+//           reopen rebuilds key directory from them
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask recovery: hint file path after rotation",
+          "[bytecask][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  // threshold=1 forces rotation after each write; destructor writes hint files
+  // for the sealed files.
+  {
+    auto db = bytecask::Bytecask::open(db_path, 1);
+    db.put({}, to_bytes("x"), to_bytes("xval"));
+    db.put({}, to_bytes("y"), to_bytes("yval"));
+  }
+
+  // Confirm hint files were written before we reopen.
+  int hint_count = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".hint")
+      ++hint_count;
+  }
+  REQUIRE(hint_count >= 1);
+
+  auto db2 = bytecask::Bytecask::open(db_path, 1);
+  REQUIRE(db2.get({}, to_bytes("x")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("x"))) == "xval");
+  REQUIRE(db2.get({}, to_bytes("y")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("y"))) == "yval");
+}
+
+// ---------------------------------------------------------------------------
+// Test: tombstone in one file suppresses stale Put in another file
+//
+// The Put and Delete for the same key land in separate .data files (forced by
+// threshold=1). Regardless of which file directory_iterator visits first,
+// the key must be absent after recovery. Without the tombstone map in
+// recover_existing_files(), this test fails when the Delete file happens to be
+// processed before the Put file, causing the stale Put to be inserted.
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask recovery: cross-file tombstone suppresses stale put",
+          "[bytecask][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    // threshold=1 forces each write into its own file.
+    auto db = bytecask::Bytecask::open(db_path, 1);
+    db.put({}, to_bytes("gone"), to_bytes("v1")); // file 0
+    db.del({}, to_bytes("gone")); // file 1 — Delete seq > Put seq
+    db.put({}, to_bytes("keep"), to_bytes("v2")); // file 2
+  }
+
+  auto db2 = bytecask::Bytecask::open(db_path, 1);
+  CHECK_FALSE(db2.contains_key(to_bytes("gone")));
+  CHECK_FALSE(db2.get({}, to_bytes("gone")).has_value());
+  REQUIRE(db2.get({}, to_bytes("keep")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("keep"))) == "v2");
+}

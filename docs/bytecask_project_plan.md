@@ -21,14 +21,16 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | ID | Title | Note |
 | --- | --- | --- |
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
-| BC-019 | Recovery and startup | Startup procedure: discard `.hint.tmp`, read hint files oldest-to-newest, scan active data file, discard incomplete batches (warn), seed LSN from max seen sequence. |
 | BC-024 | Implement PMR - Memory Allocation described in design | Note: There is a draft proposal in the bytecask_design.md
+| BC-026 | Run `flush_hints` in background after file rotate | After rotation, dispatch `flush_hints()` on the sealed file to a background thread so it does not block the write path. |
+| BC-027 | Write lock to enforce SWMR contract | Add a `std::mutex` (or file-level lock) to `Bytecask` so the SWMR contract is enforced at the engine level instead of at the call site. `WriteOptions` should gain a `bool try_lock` field (default `false` = blocking acquire) so callers can opt into a non-blocking attempt that returns an error instead of waiting. |
 
 
 ## Done
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-019 | Recovery and startup | `recover_existing_files()` in `Bytecask` constructor: removes stale `.hint.tmp` files, scans each `.data` file via its hint companion (if present) or raw otherwise, applies BulkBegin/BulkEnd batch state machine, uses LSN as sole freshness authority (no file ordering relied upon). Seeds `next_lsn_` from max seen sequence. 5 new test cases; 187 assertions pass. |
 | BC-025 | Add WriteOptions / ReadOptions to engine API | LevelDB/RocksDB-style option structs. `WriteOptions::sync` (default `true`) controls `fdatasync` on `put`, `del`, and `apply_batch`. `ReadOptions` is empty (reserved). 3 new test cases; 170 assertions pass. |
 | BC-023 | Copy-on-write file registry + safe EntryIterator | Replaced `std::map<uint32_t,DataFile>` with `FileRegistry` (`shared_ptr<map<uint32_t,shared_ptr<DataFile>>>`). Rotation clones inner map and replaces outer `shared_ptr` — in-flight iterators hold a snapshot with independent lifetime. `EntryIterator` holds `FileRegistry` by value instead of a raw pointer; no dangling-pointer risk on engine move. 160 assertions pass. |
 | BC-008 | File naming + rotation | Size-triggered rotation: `uint32_t` file IDs, `FileRegistry` COW registry, `sealed_` flag in `DataFile`, multi-file `get()`/`iter_from()`, deferred `flush_hints()` at close. |
