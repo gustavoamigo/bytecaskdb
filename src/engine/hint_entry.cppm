@@ -1,15 +1,16 @@
 module;
-// bitsery is a legacy (non-module) library; include it in the global module
-// fragment so its headers are available before the named module begins.
 #include <bitsery/adapter/buffer.h>
 #include <bitsery/bitsery.h>
 #include <bitsery/traits/vector.h>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <vector>
 
 export module bytecask.hint_entry;
 
-export import bytecask.data_entry;
+import bytecask.types;
 import bytecask.serialization;
-import std;
 
 namespace bytecask {
 

@@ -1,13 +1,24 @@
 module;
+#include <array>
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <fcntl.h>
+#include <filesystem>
+#include <format>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <system_error>
 #include <unistd.h>
+#include <utility>
+#include <vector>
 
 export module bytecask.hint_file;
 
-export import bytecask.hint_entry;
+import bytecask.hint_entry;
 import bytecask.serialization;
-import std;
+import bytecask.types;
 
 namespace bytecask {
 

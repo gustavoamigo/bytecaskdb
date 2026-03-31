@@ -1,14 +1,25 @@
 module;
+#include <array>
 #include <cassert>
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <fcntl.h>
+#include <filesystem>
+#include <format>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <system_error>
 #include <unistd.h>
+#include <utility>
+#include <vector>
 
 export module bytecask.data_file;
 
 import bytecask.crc32;
 import bytecask.data_entry;
-import std;
+import bytecask.types;
 
 namespace bytecask {
 

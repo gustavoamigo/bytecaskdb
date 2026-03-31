@@ -4,11 +4,16 @@ module;
 #include <bitsery/adapter/buffer.h>
 #include <bitsery/bitsery.h>
 #include <bitsery/traits/vector.h>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <stdexcept>
+#include <vector>
 
 export module bytecask.data_entry;
 
+import bytecask.types;
 import bytecask.serialization;
-import std;
 
 namespace bytecask {
 
@@ -22,13 +27,6 @@ namespace bytecask {
 //   Offset 15: key data   (key_size bytes)
 //   Offset 15+key_size: value data (value_size bytes)
 //   Trailing: crc32 (u32) — CRC-32/ISO-HDLC over all preceding bytes
-
-export enum class EntryType : std::uint8_t {
-  Put = 0x01,       // Standard key-value pair
-  Delete = 0x02,    // Tombstone — key present, value empty
-  BulkBegin = 0x03, // Start of atomic batch — key and value empty
-  BulkEnd = 0x04,   // End of atomic batch   — key and value empty
-};
 
 // Note: This struct is purely semantic for representing header fields in code.
 // It contains implicit padding bytes and must not be used directly for raw

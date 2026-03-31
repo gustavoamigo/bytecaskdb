@@ -22,6 +22,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | --- | --- | --- |
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-019 | Recovery and startup | Startup procedure: discard `.hint.tmp`, read hint files oldest-to-newest, scan active data file, discard incomplete batches (warn), seed LSN from max seen sequence. |
+| BC-024 | Implement PMR - Memory Allocation described in design | Note: There is a draft proposal in the bytecask_design.md
 
 
 ## Done

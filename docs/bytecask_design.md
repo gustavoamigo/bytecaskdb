@@ -322,6 +322,81 @@ Read API:
 
 ## Engine API
 
+### [Draft] PMR - Memory Allocation (BC-024)
+
+This is a solid design to add to your backlog. In the world of systems programming, this pattern is often called **"Caller-Controlled Allocation"** or the **"Arena Injection"** pattern.
+
+By decoupling the *logic* of fetching data from the *policy* of how that data's memory is managed, you’ve given Bytecask a massive performance advantage over engines that hardcode `std::allocator` (the standard heap).
+
+---
+
+## Backlog Item: Polymorphic Memory Injection (PMR)
+**Title:** Implement Configurable Memory Allocation via PMR and Function Overloading
+
+### 1. The Design Intent
+The goal is to allow `Bytecask` to remain "low-friction" for standard users (who just want the heap) while being "zero-friction" for high-performance callers (like the Vacuum process or a MySQL Bridge) who need to reuse memory to avoid GC-like pauses or heap fragmentation.
+
+### 2. Implementation Specs
+
+* **Instance Default:** The `Bytecask` instance holds a `memory_resource*` (defaulting to the system heap). This acts as the "Standard Life-cycle" manager.
+* **Signature Overloading:** * **Convenience API:** `get(key)` → Internalizes the default pool. Perfect for UI or one-off app requests.
+    * **Expert API:** `get(key, pool)` → Allows the caller to "inject" a temporary Arena. This is the **High-Performance** path.
+* **Container Binding:** All returned values must be `std::pmr::vector<std::byte>` (or your `PmrBytes` alias) to ensure the container honors the injected resource during its `resize()` and `destructor` phases.
+
+
+
+---
+
+### 3. Usage Scenarios for the Backlog
+
+| Scenario | Logic | Memory Outcome |
+| :--- | :--- | :--- |
+| **Standard App Get** | `db.get("user:1")` | Allocated on Heap. Deleted when variable goes out of scope. |
+| **Heavy Scan Loop** | `db.get(key, &local_arena)` | Allocated in a pre-allocated "scratchpad." No system calls. |
+| **Long-Running Task** | `db.get(key, &shared_pool)` | Memory is recycled into "buckets" for the next operation. |
+
+### 4. Technical Trade-offs to Note
+* **Virtual Dispatch:** Every allocation now goes through a virtual function call (`do_allocate`). In a database engine, the cost of I/O (reading the disk) so heavily outweighs a virtual call that this is essentially "free" performance.
+* **Pointer Stability:** The `memory_resource` pointer must remain valid for the entire lifetime of the returned `PmrBytes`. Since your design uses a class member or a caller-provided arena, this is safe as long as the caller doesn't destroy their arena before processing the result.
+
+
+```cpp
+export class Bytecask {
+private:
+    // This is configured in the constructor
+    std::pmr::memory_resource* default_pool_; 
+
+public:
+    // Constructor: User can pass a specific pool (like a long-lived unsynchronized_pool_resource)
+    explicit Bytecask(std::pmr::memory_resource* pool = std::pmr::get_default_resource())
+        : default_pool_(pool) {}
+
+    /**
+     * @brief Signature 1: Uses the constructor-configured pool.
+     * This is what your loop "for (auto val : db.get(key))" will use.
+     */
+    [[nodiscard]] auto get(BytesView key) const -> std::optional<PmrBytes> {
+        return get(key, default_pool_);
+    }
+
+    /**
+     * @brief Signature 2: Allows overriding the pool for a specific call.
+     * Use this for your Vacuum Pump or high-performance scans.
+     */
+    [[nodiscard]] auto get(BytesView key, std::pmr::memory_resource* pool) const 
+        -> std::optional<PmrBytes> 
+    {
+        auto meta = index_.get(key);
+        if (!meta) return std::nullopt;
+
+        PmrBytes buffer(pool); 
+        buffer.resize(meta->size);
+        file_io.read_at(meta->offset, buffer.data(), meta->size);
+        return buffer;
+    }
+};
+```
+
 ### Type Aliases
 
 ```cpp
