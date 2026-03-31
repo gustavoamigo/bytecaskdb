@@ -41,7 +41,7 @@ ByteCask uses `PersistentOrderedMap<Key, KeyDirEntry>` as the in-memory key dire
 
 `immer::btree_map` does not exist in the immer library. The replacement is a thin wrapper, `PersistentOrderedMap<K, V>`, backed by `immer::flex_vector<Entry>` (Radix Balanced Tree). It provides the same sorted-map semantics with O(log n) get/set/erase, structural sharing across versions, and a `transient()` / `persistent()` API for batch mutations. Implemented in `bytecask.persistent_ordered_map` (`src/engine/persistent_ordered_map.cppm`).
 
-`Key` is a dedicated type alias (initially `= std::vector<std::byte>`) distinct from the generic `Bytes` type. Keys have a hard upper bound of 65 535 bytes (the `u16 key_size` field in the data file header). Keeping `Key` separate provides a single-point change if the type needs to evolve — e.g., to enforce that constraint at compile time or adopt a small-buffer-optimized representation.
+`Key` is a lightweight value class wrapping `immer::array<std::byte>`, distinct from the generic `Bytes` (`std::vector<std::byte>`) type. Because the key directory is an `immer::flex_vector<Entry>`, every structural modification (set/erase) copies `Entry` objects into new tree nodes while sharing the rest. With `immer::array` as the backing store, key copies are O(1) reference-count bumps instead of O(n) heap allocations. `Key` provides `operator<=>` (lexicographic over raw byte values), `begin()`/`end()`/`size()`/`data()` accessors, and a `view()` method returning `BytesView`. Keys have a hard upper bound of 65 535 bytes (the `u16 key_size` field in the data file header).
 
 ### Concurrency Model
 

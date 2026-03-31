@@ -1,9 +1,11 @@
 module;
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <immer/array.hpp>
 #include <iostream>
 #include <iterator>
 #include <map>
@@ -35,12 +37,49 @@ namespace bytecask {
 // Owned byte buffer — for return values and batch storage.
 export using Bytes = std::vector<std::byte>;
 
-// Owned key — semantically distinct from a generic byte buffer.
-// Keys have an upper bound of 65 535 bytes (u16 key_size in the data file).
-export using Key = Bytes;
-
 // Non-owning view — used for all input parameters to avoid copies.
 export using BytesView = std::span<const std::byte>;
+
+// ---------------------------------------------------------------------------
+// Key — lightweight value wrapper around immer::array<std::byte>.
+//
+// Copies are O(1) (reference-count bump) instead of O(n) deep copies.
+// This matters because PersistentOrderedMap copies Entry objects into
+// shared tree nodes on every structural modification.
+// Keys have an upper bound of 65 535 bytes (u16 key_size in the data file).
+// ---------------------------------------------------------------------------
+export class Key {
+public:
+  Key() = default;
+
+  explicit Key(BytesView v) : data_{v.begin(), v.end()} {}
+
+  [[nodiscard]] auto begin() const { return data_.begin(); }
+  [[nodiscard]] auto end() const { return data_.end(); }
+  [[nodiscard]] auto size() const noexcept { return data_.size(); }
+  [[nodiscard]] auto empty() const noexcept { return data_.size() == 0; }
+  [[nodiscard]] auto data() const { return data_.data(); }
+
+  [[nodiscard]] auto view() const -> BytesView {
+    return {data_.data(), data_.size()};
+  }
+
+  auto operator<=>(const Key &other) const -> std::strong_ordering {
+    return std::lexicographical_compare_three_way(
+        data_.begin(), data_.end(), other.data_.begin(), other.data_.end(),
+        [](std::byte a, std::byte b) -> std::strong_ordering {
+          return std::to_integer<unsigned char>(a) <=>
+                 std::to_integer<unsigned char>(b);
+        });
+  }
+
+  auto operator==(const Key &other) const -> bool {
+    return data_ == other.data_;
+  }
+
+private:
+  immer::array<std::byte> data_;
+};
 
 // ---------------------------------------------------------------------------
 // KeyDirEntry — one slot in the in-memory key directory.
@@ -119,7 +158,7 @@ export using FileRegistry =
 // ---------------------------------------------------------------------------
 export class KeyIterator {
 public:
-  using value_type = Bytes;
+  using value_type = Key;
   using difference_type = std::ptrdiff_t;
 
   KeyIterator() = default;
@@ -156,7 +195,7 @@ private:
 // ---------------------------------------------------------------------------
 export class EntryIterator {
 public:
-  using value_type = std::pair<Bytes, Bytes>;
+  using value_type = std::pair<Key, Bytes>;
   using difference_type = std::ptrdiff_t;
 
   EntryIterator() = default;
@@ -171,7 +210,7 @@ public:
     if (!cached_) {
       auto entry =
           files_->at(cur_->value.file_id)->read(cur_->value.file_offset);
-      cached_.emplace(Bytes{cur_->key}, std::move(entry.value));
+      cached_.emplace(Key{cur_->key}, std::move(entry.value));
     }
     return *cached_;
   }
@@ -472,7 +511,7 @@ private:
   }
 
   // Converts a BytesView (or empty span) into a Key.
-  static auto to_key(BytesView v) -> Key { return Key{v.begin(), v.end()}; }
+  static auto to_key(BytesView v) -> Key { return Key{v}; }
 
   // Returns a reference to the current active DataFile.
   auto active_file() -> DataFile & { return *files_->at(active_file_id_); }

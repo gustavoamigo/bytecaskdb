@@ -24,6 +24,13 @@ auto to_string(const bytecask::Bytes &bytes) -> std::string {
   return s;
 }
 
+auto to_string(const bytecask::Key &key) -> std::string {
+  std::string s(key.size(), '\0');
+  std::ranges::transform(key, s.begin(),
+                         [](std::byte b) { return static_cast<char>(b); });
+  return s;
+}
+
 // Creates a unique temp directory for each test, cleaned up on scope exit.
 struct TempDir {
   std::filesystem::path path;
