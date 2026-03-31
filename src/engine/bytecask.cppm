@@ -1,6 +1,5 @@
 module;
 #include <chrono>
-#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -11,9 +10,7 @@ module;
 #include <optional>
 #include <ranges>
 #include <span>
-#include <stdexcept>
 #include <string>
-#include <system_error>
 #include <time.h>
 #include <utility>
 #include <variant>
@@ -230,6 +227,22 @@ export inline constexpr std::uint64_t kDefaultRotationThreshold =
     64ULL * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
+// WriteOptions / ReadOptions — modelled after LevelDB / RocksDB.
+// ---------------------------------------------------------------------------
+
+// Controls durability behaviour for write operations (put, del, apply_batch).
+export struct WriteOptions {
+  // When true (default), fdatasync is called after the write completes.
+  // Set to false to skip the sync for higher throughput at the cost of
+  // durability: data is in the OS page cache but not guaranteed on disk until
+  // the next explicit sync or clean engine shutdown.
+  bool sync{true};
+};
+
+// Reserved for future read-path controls (e.g. verify_checksums, snapshots).
+export struct ReadOptions {};
+
+// ---------------------------------------------------------------------------
 // Bytecask — SWMR key-value store
 //
 // Intent: Public engine API. open() always creates a fresh active data file.
@@ -276,7 +289,8 @@ public:
   // Routes the read to the correct data file via KeyDirEntry::file_id.
   // Throws std::system_error on I/O failure or std::runtime_error on CRC
   // mismatch.
-  [[nodiscard]] auto get(BytesView key) const -> std::optional<Bytes> {
+  [[nodiscard]] auto get(const ReadOptions & /*opts*/, BytesView key) const
+      -> std::optional<Bytes> {
     const auto kv = key_dir_.get(to_key(key));
     if (!kv) {
       return std::nullopt;
@@ -287,8 +301,9 @@ public:
 
   // Writes key → value. Overwrites any existing value.
   // Rotates the active file if it has reached the threshold.
+  // opts.sync controls whether fdatasync is called after the write.
   // Throws std::system_error on I/O failure.
-  void put(BytesView key, BytesView value) {
+  void put(const WriteOptions &opts, BytesView key, BytesView value) {
     auto k = to_key(key);
     const auto offset =
         active_file().append(next_lsn_, EntryType::Put, key, value);
@@ -297,15 +312,18 @@ public:
                             KeyDirEntry{next_lsn_, active_file_id_, offset,
                                         narrow<std::uint32_t>(value.size())});
     ++next_lsn_;
-    active_file().sync();
+    if (opts.sync) {
+      active_file().sync();
+    }
     maybe_rotate();
   }
 
   // Writes a tombstone for key.
   // Returns true if the key existed and was removed, false if it was absent.
   // Rotates the active file if it has reached the threshold.
+  // opts.sync controls whether fdatasync is called after the write.
   // Throws std::system_error on I/O failure.
-  [[nodiscard]] auto del(BytesView key) -> bool {
+  [[nodiscard]] auto del(const WriteOptions &opts, BytesView key) -> bool {
     const auto k = to_key(key);
 
     if (!key_dir_.contains(k)) {
@@ -315,7 +333,9 @@ public:
     ++next_lsn_;
 
     key_dir_ = key_dir_.erase(k);
-    active_file().sync();
+    if (opts.sync) {
+      active_file().sync();
+    }
     maybe_rotate();
     return true;
   }
@@ -329,10 +349,10 @@ public:
 
   // Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
   // batch is consumed (move-only). No-op if batch.empty().
-  // Single fdatasync at the end; no per-operation sync.
+  // opts.sync controls whether a single fdatasync is issued at the end.
   // Rotates the active file after the sync if the threshold is reached.
   // Throws std::system_error on I/O failure.
-  void apply_batch(Batch batch) {
+  void apply_batch(const WriteOptions &opts, Batch batch) {
     if (batch.empty()) {
       return;
     }
@@ -367,7 +387,9 @@ public:
     std::ignore = active_file().append(next_lsn_++, EntryType::BulkEnd, {}, {});
 
     key_dir_ = std::move(t).persistent();
-    active_file().sync();
+    if (opts.sync) {
+      active_file().sync();
+    }
     maybe_rotate();
   }
 
@@ -377,7 +399,8 @@ public:
   // Pass an empty span to start from the first key. Each increment reads one
   // value from disk (lazy), routing through the file registry.
   // Throws std::system_error on I/O failure.
-  [[nodiscard]] auto iter_from(BytesView from = {}) const
+  [[nodiscard]] auto iter_from(const ReadOptions & /*opts*/,
+                               BytesView from = {}) const
       -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
     const auto k = to_key(from);
     const auto it = from.empty() ? key_dir_.begin() : key_dir_.lower_bound(k);
@@ -387,7 +410,8 @@ public:
 
   // Returns an input range of keys >= from. Walks the in-memory key directory
   // only; no disk I/O.
-  [[nodiscard]] auto keys_from(BytesView from = {}) const
+  [[nodiscard]] auto keys_from(const ReadOptions & /*opts*/,
+                               BytesView from = {}) const
       -> std::ranges::subrange<KeyIterator, std::default_sentinel_t> {
     const auto k = to_key(from);
     const auto it = from.empty() ? key_dir_.begin() : key_dir_.lower_bound(k);

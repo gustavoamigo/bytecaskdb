@@ -7,7 +7,8 @@ add_requires("immer")
 
 -- Common flags shared by all targets
 local common_flags = {
-    "-Weverything", "-Wno-c++98-compat", "-Wno-padded",
+    "-Weverything", "-Wno-c++98-compat", "-Wno-c++98-compat-pedantic",
+    "-Wno-pre-c++20-compat-pedantic", "-Wno-padded",
     "-Wno-reserved-macro-identifier", "-Wno-undef", "-Wno-reserved-identifier",
     -- export keyword is the declaration for module symbols; these are false positives
     "-Wno-missing-variable-declarations", "-Wno-missing-prototypes",

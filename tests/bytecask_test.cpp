@@ -58,9 +58,9 @@ TEST_CASE("Bytecask put and get round-trip", "[bytecask]") {
   TempDir td;
   auto db = bytecask::Bytecask::open(td.path / "db");
 
-  db.put(to_bytes("key1"), to_bytes("value1"));
+  db.put({}, to_bytes("key1"), to_bytes("value1"));
 
-  const auto result = db.get(to_bytes("key1"));
+  const auto result = db.get({}, to_bytes("key1"));
   REQUIRE(result.has_value());
   CHECK(to_string(*result) == "value1");
 }
@@ -72,10 +72,10 @@ TEST_CASE("Bytecask put overwrites existing key", "[bytecask]") {
   TempDir td;
   auto db = bytecask::Bytecask::open(td.path / "db");
 
-  db.put(to_bytes("key1"), to_bytes("first"));
-  db.put(to_bytes("key1"), to_bytes("second"));
+  db.put({}, to_bytes("key1"), to_bytes("first"));
+  db.put({}, to_bytes("key1"), to_bytes("second"));
 
-  const auto result = db.get(to_bytes("key1"));
+  const auto result = db.get({}, to_bytes("key1"));
   REQUIRE(result.has_value());
   CHECK(to_string(*result) == "second");
 }
@@ -87,7 +87,7 @@ TEST_CASE("Bytecask del returns false for absent key", "[bytecask]") {
   TempDir td;
   auto db = bytecask::Bytecask::open(td.path / "db");
 
-  CHECK_FALSE(db.del(to_bytes("missing")));
+  CHECK_FALSE(db.del({}, to_bytes("missing")));
 }
 
 // ---------------------------------------------------------------------------
@@ -97,11 +97,11 @@ TEST_CASE("Bytecask del existing key", "[bytecask]") {
   TempDir td;
   auto db = bytecask::Bytecask::open(td.path / "db");
 
-  db.put(to_bytes("key1"), to_bytes("value1"));
-  const bool removed = db.del(to_bytes("key1"));
+  db.put({}, to_bytes("key1"), to_bytes("value1"));
+  const bool removed = db.del({}, to_bytes("key1"));
 
   CHECK(removed);
-  CHECK_FALSE(db.get(to_bytes("key1")).has_value());
+  CHECK_FALSE(db.get({}, to_bytes("key1")).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -112,9 +112,9 @@ TEST_CASE("Bytecask contains_key tracks mutations", "[bytecask]") {
   auto db = bytecask::Bytecask::open(td.path / "db");
 
   CHECK_FALSE(db.contains_key(to_bytes("k")));
-  db.put(to_bytes("k"), to_bytes("v"));
+  db.put({}, to_bytes("k"), to_bytes("v"));
   CHECK(db.contains_key(to_bytes("k")));
-  CHECK(db.del(to_bytes("k")));
+  CHECK(db.del({}, to_bytes("k")));
   CHECK_FALSE(db.contains_key(to_bytes("k")));
 }
 
@@ -126,19 +126,19 @@ TEST_CASE("Bytecask apply_batch mixed operations", "[bytecask]") {
   auto db = bytecask::Bytecask::open(td.path / "db");
 
   // Pre-insert a key that the batch will remove.
-  db.put(to_bytes("del"), to_bytes("gone"));
+  db.put({}, to_bytes("del"), to_bytes("gone"));
 
   bytecask::Batch batch;
   batch.put(to_bytes("a"), to_bytes("alpha"));
   batch.put(to_bytes("b"), to_bytes("beta"));
   batch.del(to_bytes("del"));
-  db.apply_batch(std::move(batch));
+  db.apply_batch({}, std::move(batch));
 
-  REQUIRE(db.get(to_bytes("a")).has_value());
-  CHECK(to_string(*db.get(to_bytes("a"))) == "alpha");
-  REQUIRE(db.get(to_bytes("b")).has_value());
-  CHECK(to_string(*db.get(to_bytes("b"))) == "beta");
-  CHECK_FALSE(db.get(to_bytes("del")).has_value());
+  REQUIRE(db.get({}, to_bytes("a")).has_value());
+  CHECK(to_string(*db.get({}, to_bytes("a"))) == "alpha");
+  REQUIRE(db.get({}, to_bytes("b")).has_value());
+  CHECK(to_string(*db.get({}, to_bytes("b"))) == "beta");
+  CHECK_FALSE(db.get({}, to_bytes("del")).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -149,13 +149,13 @@ TEST_CASE("Bytecask iter_from returns entries in ascending order",
   TempDir td;
   auto db = bytecask::Bytecask::open(td.path / "db");
 
-  db.put(to_bytes("c"), to_bytes("cv"));
-  db.put(to_bytes("a"), to_bytes("av"));
-  db.put(to_bytes("b"), to_bytes("bv"));
+  db.put({}, to_bytes("c"), to_bytes("cv"));
+  db.put({}, to_bytes("a"), to_bytes("av"));
+  db.put({}, to_bytes("b"), to_bytes("bv"));
 
   std::vector<std::string> keys;
   std::vector<std::string> values;
-  for (auto &[k, v] : db.iter_from()) {
+  for (auto &[k, v] : db.iter_from({})) {
     keys.push_back(to_string(k));
     values.push_back(to_string(v));
   }
@@ -176,12 +176,12 @@ TEST_CASE("Bytecask iter_from starts from given key", "[bytecask]") {
   TempDir td;
   auto db = bytecask::Bytecask::open(td.path / "db");
 
-  db.put(to_bytes("apple"), to_bytes("1"));
-  db.put(to_bytes("banana"), to_bytes("2"));
-  db.put(to_bytes("cherry"), to_bytes("3"));
+  db.put({}, to_bytes("apple"), to_bytes("1"));
+  db.put({}, to_bytes("banana"), to_bytes("2"));
+  db.put({}, to_bytes("cherry"), to_bytes("3"));
 
   std::vector<std::string> keys;
-  for (auto &[k, v] : db.iter_from(to_bytes("banana"))) {
+  for (auto &[k, v] : db.iter_from({}, to_bytes("banana"))) {
     keys.push_back(to_string(k));
   }
 
@@ -198,12 +198,12 @@ TEST_CASE("Bytecask keys_from returns all keys in ascending order",
   TempDir td;
   auto db = bytecask::Bytecask::open(td.path / "db");
 
-  db.put(to_bytes("z"), to_bytes("zv"));
-  db.put(to_bytes("m"), to_bytes("mv"));
-  db.put(to_bytes("a"), to_bytes("av"));
+  db.put({}, to_bytes("z"), to_bytes("zv"));
+  db.put({}, to_bytes("m"), to_bytes("mv"));
+  db.put({}, to_bytes("a"), to_bytes("av"));
 
   std::vector<std::string> keys;
-  for (auto &k : db.keys_from()) {
+  for (auto &k : db.keys_from({})) {
     keys.push_back(to_string(k));
   }
 
@@ -222,7 +222,7 @@ TEST_CASE("Bytecask rotation creates new data file", "[bytecask][rotation]") {
   // A threshold of 1 means any write will trigger rotation.
   auto db = bytecask::Bytecask::open(db_path, 1);
 
-  db.put(to_bytes("key"), to_bytes("value"));
+  db.put({}, to_bytes("key"), to_bytes("value"));
 
   // Count .data files: should be 2 (the sealed one + the new active one).
   int data_file_count = 0;
@@ -243,15 +243,15 @@ TEST_CASE("Bytecask get resolves value from rotated file",
   // Threshold of 1 triggers rotation after each write.
   auto db = bytecask::Bytecask::open(td.path / "db", 1);
 
-  db.put(to_bytes("key_a"), to_bytes("alpha"));
+  db.put({}, to_bytes("key_a"), to_bytes("alpha"));
   // After put, active file is now rotated. key_a lives in the sealed file.
-  db.put(to_bytes("key_b"), to_bytes("beta"));
+  db.put({}, to_bytes("key_b"), to_bytes("beta"));
 
-  const auto a = db.get(to_bytes("key_a"));
+  const auto a = db.get({}, to_bytes("key_a"));
   REQUIRE(a.has_value());
   CHECK(to_string(*a) == "alpha");
 
-  const auto b = db.get(to_bytes("key_b"));
+  const auto b = db.get({}, to_bytes("key_b"));
   REQUIRE(b.has_value());
   CHECK(to_string(*b) == "beta");
 }
@@ -264,13 +264,13 @@ TEST_CASE("Bytecask iter_from spans multiple rotated files",
   TempDir td;
   auto db = bytecask::Bytecask::open(td.path / "db", 1);
 
-  db.put(to_bytes("a"), to_bytes("av"));
-  db.put(to_bytes("b"), to_bytes("bv"));
-  db.put(to_bytes("c"), to_bytes("cv"));
+  db.put({}, to_bytes("a"), to_bytes("av"));
+  db.put({}, to_bytes("b"), to_bytes("bv"));
+  db.put({}, to_bytes("c"), to_bytes("cv"));
 
   std::vector<std::string> keys;
   std::vector<std::string> values;
-  for (auto &[k, v] : db.iter_from()) {
+  for (auto &[k, v] : db.iter_from({})) {
     keys.push_back(to_string(k));
     values.push_back(to_string(v));
   }
@@ -293,7 +293,7 @@ TEST_CASE("Bytecask flush_hints writes hint file for sealed file",
   const auto db_path = td.path / "db";
   auto db = bytecask::Bytecask::open(db_path, 1);
 
-  db.put(to_bytes("k"), to_bytes("v"));
+  db.put({}, to_bytes("k"), to_bytes("v"));
   // At this point one file is sealed; a new active file exists too.
 
   db.flush_hints();
@@ -320,7 +320,7 @@ TEST_CASE("Bytecask flush_hints is idempotent", "[bytecask][rotation]") {
   const auto db_path = td.path / "db";
   auto db = bytecask::Bytecask::open(db_path, 1);
 
-  db.put(to_bytes("k"), to_bytes("v"));
+  db.put({}, to_bytes("k"), to_bytes("v"));
   db.flush_hints();
 
   // Collect hint file count after first call.
@@ -350,7 +350,7 @@ TEST_CASE("Bytecask destructor flushes hint files", "[bytecask][rotation]") {
 
   {
     auto db = bytecask::Bytecask::open(db_path, 1);
-    db.put(to_bytes("k"), to_bytes("v"));
+    db.put({}, to_bytes("k"), to_bytes("v"));
     // db destroyed here — destructor should call flush_hints()
   }
 
@@ -360,4 +360,63 @@ TEST_CASE("Bytecask destructor flushes hint files", "[bytecask][rotation]") {
       ++hint_count;
   }
   CHECK(hint_count >= 1);
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: WriteOptions{.sync=false} — data is written but fdatasync skipped;
+//           values are still readable within the same engine instance.
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask WriteOptions sync=false data still readable",
+          "[bytecask][write_options]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  const bytecask::WriteOptions no_sync{.sync = false};
+  db.put(no_sync, to_bytes("k1"), to_bytes("v1"));
+  db.put(no_sync, to_bytes("k2"), to_bytes("v2"));
+
+  const auto r1 = db.get({}, to_bytes("k1"));
+  REQUIRE(r1.has_value());
+  CHECK(to_string(*r1) == "v1");
+
+  const auto r2 = db.get({}, to_bytes("k2"));
+  REQUIRE(r2.has_value());
+  CHECK(to_string(*r2) == "v2");
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: WriteOptions{.sync=false} on del — key is removed, no fdatasync.
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask WriteOptions sync=false del still removes key",
+          "[bytecask][write_options]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put({}, to_bytes("k"), to_bytes("v"));
+
+  const bytecask::WriteOptions no_sync{.sync = false};
+  const bool removed = db.del(no_sync, to_bytes("k"));
+
+  CHECK(removed);
+  CHECK_FALSE(db.get({}, to_bytes("k")).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Test 19: WriteOptions{.sync=false} on apply_batch — results visible.
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask WriteOptions sync=false apply_batch results visible",
+          "[bytecask][write_options]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  const bytecask::WriteOptions no_sync{.sync = false};
+  bytecask::Batch batch;
+  batch.put(to_bytes("x"), to_bytes("xv"));
+  batch.put(to_bytes("y"), to_bytes("yv"));
+  db.apply_batch(no_sync, std::move(batch));
+
+  REQUIRE(db.get({}, to_bytes("x")).has_value());
+  CHECK(to_string(*db.get({}, to_bytes("x"))) == "xv");
+  REQUIRE(db.get({}, to_bytes("y")).has_value());
+  CHECK(to_string(*db.get({}, to_bytes("y"))) == "yv");
 }

@@ -491,6 +491,26 @@ for (auto& key : db.keys_from(prefix))              { ... }
 - **`KeyIterator` is in-memory only**: walks the B-Tree key directory without touching any data file.
 - **Error handling**: throws `std::system_error` on I/O failure.
 
+### WriteOptions and ReadOptions
+
+Modelled after LevelDB/RocksDB. All write operations accept a `WriteOptions`; all read operations accept a `ReadOptions`. Both default-construct to the same behaviour as the old bare signatures.
+
+```cpp
+struct WriteOptions {
+    // When true (default), fdatasync is called after every write.
+    // Set to false to skip the sync for higher throughput at the cost of
+    // durability on crash: data is in the OS page cache but not on disk.
+    bool sync{true};
+};
+
+struct ReadOptions {
+    // No options yet. Reserved for future additions (e.g., verify_checksums,
+    // snapshot handles).
+};
+```
+
+**`sync` default of `true`**: preserves the pre-existing crash-safe behaviour. Callers that deliberately trade durability for throughput (e.g., bulk import, benchmarks) opt out explicitly by setting `sync = false`. The destructor always calls `sync()` unconditionally, so `sync = false` on individual writes does not risk losing data on clean shutdown — only on an OS/power failure between the last write and the destructor.
+
 ### Bytecask
 
 ```cpp
@@ -510,16 +530,17 @@ public:
 
     // Returns the value for `key`, or std::nullopt if the key does not exist.
     // Throws std::system_error on I/O failure or std::runtime_error on corruption.
-    [[nodiscard]] auto get(BytesView key) const -> std::optional<Bytes>;
+    [[nodiscard]] auto get(const ReadOptions& opts, BytesView key) const
+        -> std::optional<Bytes>;
 
     // Writes `key` → `value`. Overwrites any existing value.
     // Throws std::system_error on I/O failure.
-    void put(BytesView key, BytesView value);
+    void put(const WriteOptions& opts, BytesView key, BytesView value);
 
     // Writes a tombstone for `key`.
     // Returns true if the key existed and was removed, false if it was absent.
     // Throws std::system_error on I/O failure.
-    [[nodiscard]] bool del(BytesView key);
+    [[nodiscard]] bool del(const WriteOptions& opts, BytesView key);
 
     // Returns true if `key` exists in the index (no disk I/O).
     [[nodiscard]] auto contains_key(BytesView key) const -> bool;
@@ -529,19 +550,19 @@ public:
     // Atomically applies all operations in `batch` wrapped in BulkBegin/BulkEnd entries.
     // `batch` is consumed (move-only). No-op if batch.empty().
     // Throws std::system_error on I/O failure; the database is left consistent on failure.
-    void apply_batch(Batch batch);
+    void apply_batch(const WriteOptions& opts, Batch batch);
 
     // ── Range iteration ───────────────────────────────────────────────────
 
     // Returns an input range of (key, value) pairs with keys >= `from`.
     // Pass an empty span to start from the first key. Each increment reads one
     // value from disk (lazy). Throws std::system_error on I/O failure.
-    [[nodiscard]] auto iter_from(BytesView from = {}) const
+    [[nodiscard]] auto iter_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
 
     // Returns an input range of keys >= `from` without reading values.
     // Walks the in-memory B-Tree only; no disk I/O.
-    [[nodiscard]] auto keys_from(BytesView from = {}) const
+    [[nodiscard]] auto keys_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
 
 private:
