@@ -1,6 +1,14 @@
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
-
-import std;
+#include <chrono>
+#include <cstddef>
+#include <filesystem>
+#include <format>
+#include <ranges>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 import bytecask.engine;
 
 namespace {
@@ -318,14 +326,16 @@ TEST_CASE("Bytecask flush_hints is idempotent", "[bytecask][rotation]") {
   // Collect hint file count after first call.
   int count_first = 0;
   for (const auto &e : std::filesystem::directory_iterator{db_path}) {
-    if (e.path().extension() == ".hint") ++count_first;
+    if (e.path().extension() == ".hint")
+      ++count_first;
   }
 
   REQUIRE_NOTHROW(db.flush_hints());
 
   int count_second = 0;
   for (const auto &e : std::filesystem::directory_iterator{db_path}) {
-    if (e.path().extension() == ".hint") ++count_second;
+    if (e.path().extension() == ".hint")
+      ++count_second;
   }
 
   CHECK(count_first == count_second);
@@ -346,7 +356,8 @@ TEST_CASE("Bytecask destructor flushes hint files", "[bytecask][rotation]") {
 
   int hint_count = 0;
   for (const auto &e : std::filesystem::directory_iterator{db_path}) {
-    if (e.path().extension() == ".hint") ++hint_count;
+    if (e.path().extension() == ".hint")
+      ++hint_count;
   }
   CHECK(hint_count >= 1);
 }

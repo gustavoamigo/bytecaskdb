@@ -1,8 +1,17 @@
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
-
-import std;
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <ranges>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 import bytecask.data_entry;
 import bytecask.data_file;
+import bytecask.types;
 
 namespace {
 

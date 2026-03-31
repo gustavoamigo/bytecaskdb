@@ -23,6 +23,12 @@ target("bytecask")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
     add_packages("bitsery", "immer")
+    -- Patch compile_commands.json so clangd can resolve all module imports.
+    -- xmake's compile_commands generator omits some -fmodule-file= flags;
+    -- the script adds any that are missing within each target group.
+    after_build(function(target)
+        os.exec("python3 scripts/fix_compile_commands.py")
+    end)
 
 target("bytecask_tests")
     set_toolchains("clang")

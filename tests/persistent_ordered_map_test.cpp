@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
-
-import std;
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 import bytecask.persistent_ordered_map;
 
 // ---------------------------------------------------------------------------

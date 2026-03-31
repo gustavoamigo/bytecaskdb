@@ -2,11 +2,14 @@ module;
 #include <bitsery/adapter/buffer.h>
 #include <bitsery/bitsery.h>
 #include <bitsery/traits/vector.h>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <type_traits>
 
 export module bytecask.serialization;
 
 export import bytecask.crc32;
-import std;
 
 namespace bytecask {
 

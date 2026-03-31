@@ -1,6 +1,12 @@
-export module bytecask.crc32;
+module;
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <stdexcept>
+#include <utility>
 
-import std;
+export module bytecask.crc32;
 
 namespace bytecask {
 
