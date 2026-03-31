@@ -1,2 +1,5 @@
 CompileFlags:
-  Remove: [--precompile]
+  # clangd cannot act as a module pre-compiler; strip the flag so it falls
+  # back to analysing the source directly from the -fmodule-file= mappings.
+  Remove: [--precompile, -x]
+  Add: [-xc++]
