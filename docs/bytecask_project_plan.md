@@ -30,6 +30,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-028 | Key type: immer::array backing | Replaced `Key = std::vector<std::byte>` with a value class wrapping `immer::array<std::byte>`. O(1) copies inside PersistentOrderedMap instead of O(n) deep copies. 191 assertions pass. |
 | BC-019 | Recovery and startup | `recover_existing_files()` in `Bytecask` constructor: removes stale `.hint.tmp` files, scans each `.data` file via its hint companion (if present) or raw otherwise, applies BulkBegin/BulkEnd batch state machine, uses LSN as sole freshness authority (no file ordering relied upon). Seeds `next_lsn_` from max seen sequence. 5 new test cases; 187 assertions pass. |
 | BC-025 | Add WriteOptions / ReadOptions to engine API | LevelDB/RocksDB-style option structs. `WriteOptions::sync` (default `true`) controls `fdatasync` on `put`, `del`, and `apply_batch`. `ReadOptions` is empty (reserved). 3 new test cases; 170 assertions pass. |
 | BC-023 | Copy-on-write file registry + safe EntryIterator | Replaced `std::map<uint32_t,DataFile>` with `FileRegistry` (`shared_ptr<map<uint32_t,shared_ptr<DataFile>>>`). Rotation clones inner map and replaces outer `shared_ptr` — in-flight iterators hold a snapshot with independent lifetime. `EntryIterator` holds `FileRegistry` by value instead of a raw pointer; no dangling-pointer risk on engine move. 160 assertions pass. |
