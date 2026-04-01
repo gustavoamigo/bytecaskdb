@@ -250,6 +250,81 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// IntrusivePtr<T>
+//
+// Lightweight single-pointer smart pointer (8 bytes) replacing
+// std::shared_ptr (16 bytes + ~32 byte control block). Requires T to
+// provide addref() and release() methods (embedded in Node below).
+// No weak_ptr support.
+// ---------------------------------------------------------------------------
+template <typename T> class IntrusivePtr {
+public:
+  IntrusivePtr() noexcept = default;
+  IntrusivePtr(std::nullptr_t) noexcept {
+  } // NOLINT — implicit for pair{nullptr,..}
+
+  // Adopt a raw pointer. Caller must have already set refcount to 1
+  // (e.g. via make_intrusive). Does NOT addref — takes ownership.
+  static auto adopt(T *p) noexcept -> IntrusivePtr {
+    IntrusivePtr ip;
+    ip.ptr_ = p;
+    return ip;
+  }
+
+  ~IntrusivePtr() {
+    if (ptr_)
+      ptr_->release();
+  }
+
+  IntrusivePtr(const IntrusivePtr &o) noexcept : ptr_(o.ptr_) {
+    if (ptr_)
+      ptr_->addref();
+  }
+
+  IntrusivePtr(IntrusivePtr &&o) noexcept : ptr_(o.ptr_) { o.ptr_ = nullptr; }
+
+  auto operator=(const IntrusivePtr &o) noexcept -> IntrusivePtr & {
+    if (ptr_ != o.ptr_) {
+      if (ptr_)
+        ptr_->release();
+      ptr_ = o.ptr_;
+      if (ptr_)
+        ptr_->addref();
+    }
+    return *this;
+  }
+
+  auto operator=(IntrusivePtr &&o) noexcept -> IntrusivePtr & {
+    if (ptr_ != o.ptr_) {
+      if (ptr_)
+        ptr_->release();
+      ptr_ = o.ptr_;
+      o.ptr_ = nullptr;
+    }
+    return *this;
+  }
+
+  auto operator->() const noexcept -> T * { return ptr_; }
+  auto operator*() const noexcept -> T & { return *ptr_; }
+  explicit operator bool() const noexcept { return ptr_ != nullptr; }
+  [[nodiscard]] auto get() const noexcept -> T * { return ptr_; }
+
+  auto operator==(const IntrusivePtr &o) const noexcept -> bool {
+    return ptr_ == o.ptr_;
+  }
+
+private:
+  T *ptr_{nullptr};
+};
+
+template <typename T, typename... Args>
+auto make_intrusive(Args &&...args) -> IntrusivePtr<T> {
+  // new sets refcount to 1 (default member initializer); adopt() takes
+  // ownership without incrementing.
+  return IntrusivePtr<T>::adopt(new T(std::forward<Args>(args)...));
+}
+
+// ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
 export template <typename V> class TransientRadixTree;
@@ -266,14 +341,28 @@ inline std::atomic<std::uint64_t> next_edit_tag{1};
 // Node<V>
 // ---------------------------------------------------------------------------
 template <typename V> struct Node {
+  // Intrusive reference count. mutable so addref/release work through const
+  // paths (same semantics as shared_ptr's control block).
+  // Starts at 1: make_intrusive + IntrusivePtr::adopt() take ownership
+  // without incrementing.
+  mutable std::atomic<std::uint32_t> refcount_{1};
+
   // High bit of packed_tag_ = 1 means this node holds a value.
   // Low 31 bits = transient edit tag (0 = immutable).
-  // Packing both into one uint32_t saves 8 bytes vs (uint64_t tag +
-  // optional<V>).
   std::uint32_t packed_tag_{0};
   V value_{};
   SmallVector<std::byte, 24> prefix;
-  SmallVector<std::pair<std::byte, std::shared_ptr<Node>>, 1> children;
+  SmallVector<std::pair<std::byte, IntrusivePtr<Node>>, 1> children;
+
+  void addref() const noexcept {
+    refcount_.fetch_add(1, std::memory_order_relaxed);
+  }
+  void release() const noexcept {
+    // acq_rel: ensures all writes to the node are visible before the
+    // deleting thread runs the destructor.
+    if (refcount_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+      delete this;
+  }
 
   [[nodiscard]] auto has_value() const noexcept -> bool {
     return (packed_tag_ >> 31) != 0;
@@ -294,7 +383,7 @@ template <typename V> struct Node {
   // Linear scan is used because prefix compression keeps child counts small
   // (typically 1–4), where it outperforms binary search.
   [[nodiscard]] auto find_child(std::byte b) const
-      -> const std::pair<std::byte, std::shared_ptr<Node>> * {
+      -> const std::pair<std::byte, IntrusivePtr<Node>> * {
     for (auto &c : children) {
       if (c.first == b)
         return &c;
@@ -303,7 +392,7 @@ template <typename V> struct Node {
   }
 
   [[nodiscard]] auto find_child_mut(std::byte b)
-      -> std::pair<std::byte, std::shared_ptr<Node>> * {
+      -> std::pair<std::byte, IntrusivePtr<Node>> * {
     for (auto &c : children) {
       if (c.first == b)
         return &c;
@@ -312,7 +401,7 @@ template <typename V> struct Node {
   }
 
   // Insert child in sorted order by transition byte.
-  void insert_child(std::byte b, std::shared_ptr<Node> child) {
+  void insert_child(std::byte b, IntrusivePtr<Node> child) {
     auto *pos = children.begin();
     while (pos != children.end() && pos->first < b)
       ++pos;
@@ -329,8 +418,8 @@ template <typename V> struct Node {
   }
 
   // Deep clone of this node (not recursive — children are shared).
-  [[nodiscard]] auto clone() const -> std::shared_ptr<Node> {
-    auto n = std::make_shared<Node>();
+  [[nodiscard]] auto clone() const -> IntrusivePtr<Node> {
+    auto n = make_intrusive<Node>();
     // Clear edit_tag in the clone; preserve has_value bit.
     n->packed_tag_ = packed_tag_ & 0x8000'0000u;
     n->value_ = value_;
@@ -340,8 +429,7 @@ template <typename V> struct Node {
   }
 
   // Clone and stamp with edit tag for transient ownership.
-  [[nodiscard]] auto clone_for(std::uint32_t tag) const
-      -> std::shared_ptr<Node> {
+  [[nodiscard]] auto clone_for(std::uint32_t tag) const -> IntrusivePtr<Node> {
     auto n = clone();
     n->set_edit_tag(tag);
     return n;
@@ -411,14 +499,14 @@ public:
       -> RadixTreeIterator<V>;
 
 private:
-  std::shared_ptr<Node<V>> root_;
+  IntrusivePtr<Node<V>> root_;
   std::size_t size_{0};
 
-  PersistentRadixTree(std::shared_ptr<Node<V>> root, std::size_t sz)
+  PersistentRadixTree(IntrusivePtr<Node<V>> root, std::size_t sz)
       : root_{std::move(root)}, size_{sz} {}
 
   // -- get --
-  static auto get_impl(const std::shared_ptr<Node<V>> &node,
+  static auto get_impl(const IntrusivePtr<Node<V>> &node,
                        std::span<const std::byte> key) -> std::optional<V> {
     auto remaining = key;
     auto cur = node;
@@ -447,12 +535,12 @@ private:
   }
 
   // -- set (returns new root + whether a new key was inserted) --
-  static auto set_impl(const std::shared_ptr<Node<V>> &node,
+  static auto set_impl(const IntrusivePtr<Node<V>> &node,
                        std::span<const std::byte> key, V val)
-      -> std::pair<std::shared_ptr<Node<V>>, bool> {
+      -> std::pair<IntrusivePtr<Node<V>>, bool> {
     if (!node) {
       // Create a leaf.
-      auto leaf = std::make_shared<Node<V>>();
+      auto leaf = make_intrusive<Node<V>>();
       leaf->prefix = SmallVector<std::byte, 24>{};
       for (auto b : key)
         leaf->prefix.push_back(b);
@@ -467,7 +555,7 @@ private:
 
     if (cpl < prefix_span.size()) {
       // Split: divergence within this node's prefix.
-      auto split = std::make_shared<Node<V>>();
+      auto split = make_intrusive<Node<V>>();
       // Split node gets the common prefix.
       for (std::size_t i = 0; i < cpl; ++i)
         split->prefix.push_back(prefix_span[i]);
@@ -489,7 +577,7 @@ private:
         split->set_value(std::move(val));
       } else {
         auto new_transition = remaining[0];
-        auto new_leaf = std::make_shared<Node<V>>();
+        auto new_leaf = make_intrusive<Node<V>>();
         for (auto b : remaining.subspan(1))
           new_leaf->prefix.push_back(b);
         new_leaf->set_value(std::move(val));
@@ -518,7 +606,7 @@ private:
       return {std::move(new_node), inserted};
     }
     // No child for this transition — create a leaf.
-    auto leaf = std::make_shared<Node<V>>();
+    auto leaf = make_intrusive<Node<V>>();
     for (auto b : child_key)
       leaf->prefix.push_back(b);
     leaf->set_value(std::move(val));
@@ -528,9 +616,9 @@ private:
 
   // -- erase (returns new root + whether a key was removed) --
   // Also applies path compression: merges a routing node with its single child.
-  static auto erase_impl(const std::shared_ptr<Node<V>> &node,
+  static auto erase_impl(const IntrusivePtr<Node<V>> &node,
                          std::span<const std::byte> key)
-      -> std::pair<std::shared_ptr<Node<V>>, bool> {
+      -> std::pair<IntrusivePtr<Node<V>>, bool> {
     if (!node)
       return {nullptr, false};
 
@@ -599,8 +687,8 @@ private:
 
   // Merge a routing node (no value) with its single child.
   // New prefix = node.prefix + transition_byte + child.prefix
-  static auto merge_with_child(std::shared_ptr<Node<V>> node)
-      -> std::shared_ptr<Node<V>> {
+  static auto merge_with_child(IntrusivePtr<Node<V>> node)
+      -> IntrusivePtr<Node<V>> {
     assert(!node->has_value() && node->children.size() == 1);
     auto transition = node->children[0].first;
     auto child = node->children[0].second->clone();
@@ -666,21 +754,21 @@ public:
   }
 
 private:
-  std::shared_ptr<Node<V>> root_;
+  IntrusivePtr<Node<V>> root_;
   std::size_t size_{0};
   std::uint32_t tag_{0};
 
-  TransientRadixTree(std::shared_ptr<Node<V>> root, std::size_t sz,
+  TransientRadixTree(IntrusivePtr<Node<V>> root, std::size_t sz,
                      std::uint32_t tag)
       : root_{std::move(root)}, size_{sz}, tag_{tag} {}
 
   // Ensure a node is owned by this transient session.
-  static auto ensure_mutable(const std::shared_ptr<Node<V>> &node,
-                             std::uint32_t tag) -> std::shared_ptr<Node<V>> {
+  static auto ensure_mutable(const IntrusivePtr<Node<V>> &node,
+                             std::uint32_t tag) -> IntrusivePtr<Node<V>> {
     if (node && node->edit_tag() == tag)
       return node;
     if (!node) {
-      auto n = std::make_shared<Node<V>>();
+      auto n = make_intrusive<Node<V>>();
       n->set_edit_tag(tag);
       return n;
     }
@@ -688,12 +776,12 @@ private:
   }
 
   // Transient set — mutates owned nodes in-place, copies shared ones.
-  static auto set_transient(const std::shared_ptr<Node<V>> &node,
+  static auto set_transient(const IntrusivePtr<Node<V>> &node,
                             std::span<const std::byte> key, V val,
                             std::uint32_t tag)
-      -> std::pair<std::shared_ptr<Node<V>>, bool> {
+      -> std::pair<IntrusivePtr<Node<V>>, bool> {
     if (!node) {
-      auto leaf = std::make_shared<Node<V>>();
+      auto leaf = make_intrusive<Node<V>>();
       leaf->set_edit_tag(tag);
       for (auto b : key)
         leaf->prefix.push_back(b);
@@ -708,7 +796,7 @@ private:
 
     if (cpl < prefix_span.size()) {
       // Split.
-      auto split = std::make_shared<Node<V>>();
+      auto split = make_intrusive<Node<V>>();
       split->set_edit_tag(tag);
       for (std::size_t i = 0; i < cpl; ++i)
         split->prefix.push_back(prefix_span[i]);
@@ -725,7 +813,7 @@ private:
         split->set_value(std::move(val));
       } else {
         auto new_transition = remaining[0];
-        auto new_leaf = std::make_shared<Node<V>>();
+        auto new_leaf = make_intrusive<Node<V>>();
         new_leaf->set_edit_tag(tag);
         for (auto b : remaining.subspan(1))
           new_leaf->prefix.push_back(b);
@@ -751,7 +839,7 @@ private:
       existing_child->second = std::move(new_child);
       return {std::move(mutable_node), inserted};
     }
-    auto leaf = std::make_shared<Node<V>>();
+    auto leaf = make_intrusive<Node<V>>();
     leaf->set_edit_tag(tag);
     for (auto b : child_key)
       leaf->prefix.push_back(b);
@@ -761,9 +849,9 @@ private:
   }
 
   // Transient erase with path compression.
-  static auto erase_transient(const std::shared_ptr<Node<V>> &node,
+  static auto erase_transient(const IntrusivePtr<Node<V>> &node,
                               std::span<const std::byte> key, std::uint32_t tag)
-      -> std::pair<std::shared_ptr<Node<V>>, bool> {
+      -> std::pair<IntrusivePtr<Node<V>>, bool> {
     if (!node)
       return {nullptr, false};
 
@@ -817,9 +905,9 @@ private:
     return {std::move(mutable_node), true};
   }
 
-  static auto merge_with_child_transient(std::shared_ptr<Node<V>> node,
+  static auto merge_with_child_transient(IntrusivePtr<Node<V>> node,
                                          std::uint32_t tag)
-      -> std::shared_ptr<Node<V>> {
+      -> IntrusivePtr<Node<V>> {
     assert(!node->has_value() && node->children.size() == 1);
     auto transition = node->children[0].first;
     auto child = ensure_mutable(node->children[0].second, tag);
@@ -899,7 +987,7 @@ public:
 
 private:
   struct Frame {
-    std::shared_ptr<Node<V>> node;
+    IntrusivePtr<Node<V>> node;
     std::size_t child_idx; // Next child to visit.
     std::size_t key_len;   // Length of current_key_ when this frame was pushed.
   };
@@ -908,7 +996,7 @@ private:
   std::vector<std::byte> current_key_;
 
   // Construct an iterator starting at begin (visit the whole tree).
-  explicit RadixTreeIterator(std::shared_ptr<Node<V>> root) {
+  explicit RadixTreeIterator(IntrusivePtr<Node<V>> root) {
     if (!root)
       return;
     push_node(root, 0);
@@ -918,7 +1006,7 @@ private:
   }
 
   // Construct a lower_bound iterator.
-  RadixTreeIterator(std::shared_ptr<Node<V>> root,
+  RadixTreeIterator(IntrusivePtr<Node<V>> root,
                     std::span<const std::byte> target) {
     if (!root)
       return;
@@ -930,7 +1018,7 @@ private:
     advance();
   }
 
-  void push_node(const std::shared_ptr<Node<V>> &node,
+  void push_node(const IntrusivePtr<Node<V>> &node,
                  std::size_t key_len_before) {
     // Append this node's prefix to the key.
     for (std::size_t i = 0; i < node->prefix.size(); ++i) {
@@ -969,7 +1057,7 @@ private:
   // before checking divergence. On the "subtree < target" path the append is
   // undone via current_key_.resize(klb). Any refactoring must preserve this
   // append-then-undo discipline, or the key buffer will be corrupted.
-  auto seek(const std::shared_ptr<Node<V>> &root,
+  auto seek(const IntrusivePtr<Node<V>> &root,
             std::span<const std::byte> target) -> bool {
     auto remaining = target;
     auto cur = root;

@@ -25,8 +25,8 @@ A manually managed buffer pool could replicate this behaviour, but Linux's VM is
 ## 2. Core Characteristics
 *   **Key Type:** `std::span<const std::byte>` (Ingested and prefix-compressed natively).
 *   **Value Type:** Generic `V`.
-*   **Immutability:** All mutating operations return a new version of the tree. Untouched nodes are shared via `std::shared_ptr<const Node>`.
-*   **Memory Management:** Standard allocators. No `std::pmr`. PMR can be revisited if profiling shows allocation as a bottleneck, but for an in-memory index in front of millisecond-scale disk I/O the complexity of allocator propagation is not justified (design principle #2: simplicity).
+*   **Immutability:** All mutating operations return a new version of the tree. Untouched nodes are shared via intrusive reference-counted pointers (`IntrusivePtr<Node>`).
+*   **Memory Management:** Standard allocators. No `std::pmr`. Nodes embed their own reference count (`std::atomic<std::uint32_t>`) and are managed via `IntrusivePtr<T>`, a lightweight single-pointer (8 B) smart pointer that replaces `std::shared_ptr` (16 B + 32 B control block). This eliminates 32 bytes of `make_shared` control-block overhead per node and halves the pointer size in every child slot.
 *   **Prefix Compression:** Shared byte sequences are stored once in the highest common parent node.
 *   **Edit Tags (COW):** Transient mode uses epoch tags to safely mutate uniquely-owned nodes in-place, falling back to Path Copying when sharing occurs.
 
@@ -37,23 +37,24 @@ A manually managed buffer pool could replicate this behaviour, but Linux's VM is
 ### 3.1. Node Layout
 ```cpp
 struct Node {
-    uint64_t edit_tag; // 0 = persistent (immutable), >0 = owned by a transient session
+    mutable std::atomic<uint32_t> refcount; // intrusive reference count
+    uint32_t packed_tag; // high bit = has_value, low 31 bits = edit tag (0 = immutable)
 
     // Short-prefix optimization: most prefixes after a split are 1–20 bytes.
     // Inline storage up to 24 bytes avoids a heap allocation per node.
     SmallVector<std::byte, 24> prefix;
 
-    std::optional<V> value;
+    V value;
     
-    // Inline small-children optimization: most radix tree nodes have 1–3
-    // children. Inline storage for up to 8 children eliminates a heap
-    // allocation for the common case and keeps child lookups cache-local.
     // Children sorted by transition byte; linear scan (prefix compression
     // keeps C small, and benchmarking showed binary search 40-55% slower
     // on the Get path due to branch/division overhead at low C).
-    SmallVector<std::pair<std::byte, std::shared_ptr<const Node>>, 8> children;
+    // IntrusivePtr is 8 B (single raw pointer) vs shared_ptr's 16 B.
+    SmallVector<std::pair<std::byte, IntrusivePtr<Node>>, 1> children;
 };
 ```
+
+`IntrusivePtr<T>` is a lightweight single-pointer (8 bytes) smart pointer. It calls `addref()` on copy and `release()` on destruction; when the count reaches zero, the node is deleted. This eliminates the ~32-byte `make_shared` control block per node and shrinks each child slot from 24 bytes (`byte` + 7 padding + 16 `shared_ptr`) to 16 bytes (`byte` + 7 padding + 8 `IntrusivePtr`).
 
 `SmallVector<T, N>` stores up to N elements inline (no heap allocation), spilling to the heap above N. This serves design principle #3 (predictable latency): node splits on the write path are zero-allocation in the common case.
 
@@ -142,23 +143,24 @@ When removing a value (`node->value = std::nullopt`), the tree must maintain Pat
 
 ### 7.1. Node layout breakdown
 
-Each `Node<V>` is allocated via `std::make_shared`, which produces a single heap block containing both the control block and the object itself.
+Each `Node<V>` is allocated via `new` and managed by `IntrusivePtr<Node>`, which embeds the reference count inside the node itself. No separate control block is allocated.
 
 | Field | Type | Bytes |
 |---|---|---|
+| `refcount_` | `atomic<uint32_t>` | 4 |
 | `packed_tag_` | `uint32_t` | 4 |
 | `value_` | `V` (e.g. `int`) | 4 |
+| *(padding)* | | 4 |
 | `prefix` size word | `size_t` | 8 |
 | `prefix` union (inline 24 B or `std::vector`) | `union` | 24 |
 | `children` size word | `size_t` | 8 |
-| `children` union (inline 1 slot = 24 B or `std::vector`) | `union` | 24 |
-| **Node struct total** | | **72 bytes** |
-| `make_shared` control block (ref counts + deleter) | | ~32 bytes |
-| **Per-node heap cost** | | **~104 bytes** |
+| `children` union (inline 1 slot = 16 B or `std::vector`) | `union` | 24 |
+| **Node struct total** | | **80 bytes** |
+| **Per-node heap cost** | | **~80 bytes** |
 
-One children slot is `pair<byte, shared_ptr<Node>>` = 1 byte + 7 bytes padding + 16 bytes (`shared_ptr` = raw ptr + ctrl ptr) = **24 bytes**.
+One children slot is `pair<byte, IntrusivePtr<Node>>` = 1 byte + 7 bytes padding + 8 bytes (`IntrusivePtr` = raw ptr) = **16 bytes**.
 
-The prefix `SmallVector<byte, 24>` holds up to 24 bytes inline at no extra cost (the `std::vector` member in the union is itself 24 bytes, so N=24 is the maximum inline capacity that doesn't grow the struct).
+The previous design used `std::shared_ptr` (16 B pointer + ~32 B control block per node). Switching to intrusive reference counting saved ~24 B per node (no control block) and 8 B per child slot (single raw pointer instead of ptr + ctrl_ptr pair).
 
 ### 7.2. Node distribution
 
@@ -175,7 +177,7 @@ Values from `BM_MemoryFootprint` at 100k keys (measured with the global allocato
 
 | Container | Key type | B/key (generic) | B/key (prefixed UUIDv7) | Key-length sensitivity |
 |---|---|---|---|---|
-| `PersistentRadixTree` | `span<byte>` (not stored) | **129 B** | **139 B** | Low — prefix compression absorbs shared bytes |
+| `PersistentRadixTree` | `span<byte>` (not stored) | **108 B** | **116 B** | Low — prefix compression absorbs shared bytes |
 | `std::map` | `std::string` | 72 B | 117 B | High — full key copied into every node |
 | `PersistentOrderedMap` | `immer::flex_vector` entry | ~40 B\* | ~75 B\* | High — full key copied per entry |
 
@@ -186,22 +188,21 @@ Values from `BM_MemoryFootprint` at 100k keys (measured with the global allocato
 Prefix compression is not free: it replaces raw key bytes with tree structure. The trade-off is:
 
 - **What gets compressed**: bytes shared between keys with a common prefix are stored once in a routing node rather than repeated in every leaf.
-- **What gets paid**: each node carries ~104 bytes of overhead (struct + `make_shared` control block) regardless of how many bytes it compresses.
+- **What gets paid**: each node carries ~80 bytes of overhead (struct with intrusive refcount) regardless of how many bytes it compresses.
 
-For short, dissimilar keys (e.g. the generic `"key_N"` benchmark, 6–10 bytes each), compression is minimal and the per-node overhead dominates — hence ~129 B/key versus `std::map`'s 72 B/key. For long, highly-redundant keys (e.g. `"user::018f6e2c-XXXX-7000-8000-XXXXXXXXXXXX"`, 45 bytes, 5 prefixes × 20k keys), RadixTree absorbs the extra key length at only +10 B/key (+8%) while `std::map` pays +45 B/key (+63%), confirming that prefix compression is working correctly.
+For short, dissimilar keys (e.g. the generic `"key_N"` benchmark, 6–10 bytes each), compression is minimal and the per-node overhead dominates. For long, highly-redundant keys (e.g. `"user::018f6e2c-XXXX-7000-8000-XXXXXXXXXXXX"`, 45 bytes, 5 prefixes × 20k keys), RadixTree absorbs the extra key length at a modest per-key cost while `std::map` pays the full key storage, confirming that prefix compression is working correctly.
 
 ### 7.5. 100M key projections
 
-The primary concern for ByteCask is the key directory at production scale. The table below uses 1.07 nodes/key and the measured 129 B/key at 100k as the per-node baseline.
+The primary concern for ByteCask is the key directory at production scale. The table below uses 1.07 nodes/key and the measured 108 B/key at 100k as the per-node baseline.
 
 | Configuration | B/key | 100M keys |
 |---|---|---|
-| Current (N=1 children, packed tag, `make_shared`) | **129** | **~12.9 GB** |
-| + replace `SmallVector<byte,24>` prefix with arena offset+len | ~103 | ~10.3 GB |
-| + pool allocator (eliminate 32 B `make_shared` control block) | ~75 | ~7.5 GB |
+| Current (`IntrusivePtr`, N=1 children, packed tag) | **108** | **~10.8 GB** |
+| + pool allocator (batch node allocations, eliminate malloc overhead) | ~85 | ~8.5 GB |
 | `std::map` (no persistence, no prefix compression) | 72 | ~7.2 GB |
 
-The current implementation is already past the worst of the structural overhead from earlier designs (N=8 children, `uint64_t` tag + `optional<V>` was ~209 B/key). The remaining gap to `std::map` is driven entirely by the `make_shared` control block (32 B/node) and the `SmallVector` size word (8 B each × 2 = 16 B).
+The previous `shared_ptr`-based design measured 129 B/key (generic) and 139 B/key (prefixed) at 100k keys. Switching to intrusive reference counting reduced this to 108 B/key (−17%) and 116 B/key (−17%).
 
 ### 7.6. What the `OrderedMap` memory benchmark actually measures
 
