@@ -1,0 +1,334 @@
+#include <atomic>
+#include <benchmark/benchmark.h>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <map>
+#include <new>
+#include <span>
+#include <string>
+#include <vector>
+import bytecask.persistent_ordered_map;
+import bytecask.radix_tree;
+
+// ---------------------------------------------------------------------------
+// Global allocation tracker — counts bytes allocated via operator new.
+// Thread-safe (atomic), but only tracks allocations that go through the
+// replaceable global operator new, not container-internal allocators.
+// ---------------------------------------------------------------------------
+namespace alloc_tracker {
+std::atomic<std::size_t> g_allocated{0};
+std::atomic<std::size_t> g_freed{0};
+
+void reset() noexcept {
+  g_allocated.store(0, std::memory_order_relaxed);
+  g_freed.store(0, std::memory_order_relaxed);
+}
+
+auto net_bytes() noexcept -> std::size_t {
+  return g_allocated.load(std::memory_order_relaxed) -
+         g_freed.load(std::memory_order_relaxed);
+}
+} // namespace alloc_tracker
+
+// Replaceable global operator new/delete.
+void *operator new(std::size_t size) {
+  alloc_tracker::g_allocated.fetch_add(size, std::memory_order_relaxed);
+  void *p = std::malloc(size);
+  if (!p)
+    throw std::bad_alloc();
+  return p;
+}
+
+void operator delete(void *p) noexcept {
+  // We don't track per-pointer sizes here; g_freed tracks call count × 0.
+  // Net bytes is an overestimate, but relative comparison is valid.
+  std::free(p);
+}
+
+void operator delete(void *p, std::size_t size) noexcept {
+  alloc_tracker::g_freed.fetch_add(size, std::memory_order_relaxed);
+  std::free(p);
+}
+
+namespace {
+
+auto generate_keys(std::size_t n) -> std::vector<std::string> {
+  std::vector<std::string> keys;
+  keys.reserve(n);
+  for (std::size_t i = 0; i < n; ++i)
+    keys.push_back("key_" + std::to_string(i));
+  return keys;
+}
+
+auto to_bytes(const std::string &s) -> std::span<const std::byte> {
+  return std::as_bytes(std::span{s.data(), s.size()});
+}
+
+// ===========================================================================
+// Container adapters — normalize each container's API for generic benchmarks.
+// ===========================================================================
+
+struct OMapAdapter {
+  using key_type = std::vector<std::byte>;
+  using map_type = bytecask::PersistentOrderedMap<key_type, int>;
+
+  static auto make_keys(const std::vector<std::string> &strs)
+      -> std::vector<key_type> {
+    std::vector<key_type> keys;
+    keys.reserve(strs.size());
+    for (auto &s : strs) {
+      auto sp = to_bytes(s);
+      keys.emplace_back(sp.begin(), sp.end());
+    }
+    return keys;
+  }
+
+  static auto build(const std::vector<key_type> &keys) -> map_type {
+    auto m = map_type{};
+    for (std::size_t i = 0; i < keys.size(); ++i)
+      m = m.set(keys[i], static_cast<int>(i));
+    return m;
+  }
+
+  static auto transient_build(const std::vector<key_type> &keys) -> map_type {
+    auto tr = map_type{}.transient();
+    for (std::size_t i = 0; i < keys.size(); ++i)
+      tr.set(keys[i], static_cast<int>(i));
+    return std::move(tr).persistent();
+  }
+
+  static auto get(const map_type &m, const key_type &k) { return m.get(k); }
+
+  static auto lower_bound(const map_type &m, const key_type &k) {
+    return m.lower_bound(k);
+  }
+
+  static auto iterate_sum(const map_type &m) -> int {
+    int sum = 0;
+    for (auto it = m.begin(); it != m.end(); ++it)
+      sum += it->value;
+    return sum;
+  }
+};
+
+struct RTreeAdapter {
+  using key_type = std::string;
+  using map_type = bytecask::PersistentRadixTree<int>;
+  using transient_type = bytecask::TransientRadixTree<int>;
+
+  static auto make_keys(const std::vector<std::string> &strs)
+      -> std::vector<key_type> {
+    return strs;
+  }
+
+  static auto build(const std::vector<key_type> &keys) -> map_type {
+    auto t = map_type{};
+    for (std::size_t i = 0; i < keys.size(); ++i)
+      t = t.set(to_bytes(keys[i]), static_cast<int>(i));
+    return t;
+  }
+
+  static auto transient_build(const std::vector<key_type> &keys) -> map_type {
+    auto tr = map_type{}.transient();
+    for (std::size_t i = 0; i < keys.size(); ++i)
+      tr.set(to_bytes(keys[i]), static_cast<int>(i));
+    return std::move(tr).persistent();
+  }
+
+  static auto get(const map_type &m, const key_type &k) {
+    return m.get(to_bytes(k));
+  }
+
+  static auto lower_bound(const map_type &m, const key_type &k) {
+    return m.lower_bound(to_bytes(k));
+  }
+
+  static auto iterate_sum(const map_type &m) -> int {
+    int sum = 0;
+    for (auto it = m.begin(); it != m.end(); ++it) {
+      auto [k, v] = *it;
+      sum += v;
+    }
+    return sum;
+  }
+
+  static auto build_transient(const std::vector<key_type> &keys)
+      -> transient_type {
+    auto tr = map_type{}.transient();
+    for (std::size_t i = 0; i < keys.size(); ++i)
+      tr.set(to_bytes(keys[i]), static_cast<int>(i));
+    return tr;
+  }
+
+  static auto transient_get(const transient_type &tr, const key_type &k) {
+    return tr.get(to_bytes(k));
+  }
+};
+
+struct StdMapAdapter {
+  using key_type = std::string;
+  using map_type = std::map<std::string, int>;
+
+  static auto make_keys(const std::vector<std::string> &strs)
+      -> std::vector<key_type> {
+    return strs;
+  }
+
+  static auto build(const std::vector<key_type> &keys) -> map_type {
+    map_type m;
+    for (std::size_t i = 0; i < keys.size(); ++i)
+      m[keys[i]] = static_cast<int>(i);
+    return m;
+  }
+
+  static auto get(const map_type &m, const key_type &k) { return m.find(k); }
+
+  static auto lower_bound(const map_type &m, const key_type &k) {
+    return m.lower_bound(k);
+  }
+
+  static auto iterate_sum(const map_type &m) -> int {
+    int sum = 0;
+    for (auto &[k, v] : m)
+      sum += v;
+    return sum;
+  }
+};
+
+// ===========================================================================
+// Generic benchmark templates
+// ===========================================================================
+
+template <typename A> void BM_Build(benchmark::State &state) {
+  auto keys =
+      A::make_keys(generate_keys(static_cast<std::size_t>(state.range(0))));
+  for (auto _ : state)
+    benchmark::DoNotOptimize(A::build(keys));
+}
+
+template <typename A> void BM_TransientBuild(benchmark::State &state) {
+  auto keys =
+      A::make_keys(generate_keys(static_cast<std::size_t>(state.range(0))));
+  for (auto _ : state)
+    benchmark::DoNotOptimize(A::transient_build(keys));
+}
+
+template <typename A> void BM_Get(benchmark::State &state) {
+  auto keys =
+      A::make_keys(generate_keys(static_cast<std::size_t>(state.range(0))));
+  auto m = A::build(keys);
+  std::size_t idx = 0;
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(A::get(m, keys[idx % keys.size()]));
+    ++idx;
+  }
+}
+
+template <typename A> void BM_TransientGet(benchmark::State &state) {
+  auto keys =
+      A::make_keys(generate_keys(static_cast<std::size_t>(state.range(0))));
+  auto tr = A::build_transient(keys);
+  std::size_t idx = 0;
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(A::transient_get(tr, keys[idx % keys.size()]));
+    ++idx;
+  }
+}
+
+template <typename A> void BM_Iterate(benchmark::State &state) {
+  auto keys =
+      A::make_keys(generate_keys(static_cast<std::size_t>(state.range(0))));
+  auto m = A::build(keys);
+  for (auto _ : state)
+    benchmark::DoNotOptimize(A::iterate_sum(m));
+}
+
+template <typename A> void BM_LowerBound(benchmark::State &state) {
+  auto keys =
+      A::make_keys(generate_keys(static_cast<std::size_t>(state.range(0))));
+  auto m = A::build(keys);
+  std::size_t idx = 0;
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(A::lower_bound(m, keys[idx % keys.size()]));
+    ++idx;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Memory footprint: measures net heap bytes after building a container of N
+// keys.  Reports bytes/key via a custom counter.
+// ---------------------------------------------------------------------------
+template <typename A> void BM_MemoryFootprint(benchmark::State &state) {
+  auto keys =
+      A::make_keys(generate_keys(static_cast<std::size_t>(state.range(0))));
+  std::size_t net = 0;
+  for (auto _ : state) {
+    state.PauseTiming();
+    alloc_tracker::reset();
+    state.ResumeTiming();
+
+    auto m = A::build(keys);
+    benchmark::DoNotOptimize(&m);
+
+    state.PauseTiming();
+    net = alloc_tracker::net_bytes();
+    state.ResumeTiming();
+  }
+  state.counters["bytes_total"] = benchmark::Counter(static_cast<double>(net));
+  state.counters["bytes_per_key"] = benchmark::Counter(
+      static_cast<double>(net) / static_cast<double>(state.range(0)));
+}
+
+// ===========================================================================
+// Registration
+// ===========================================================================
+
+constexpr int kSmall = 1000;
+constexpr int kMedium = 10000;
+constexpr int kLarge = 100000;
+
+// clang-format off
+#define SIZES ->Arg(kSmall)->Arg(kMedium)->Arg(kLarge)
+#define ITER_SIZES ->Arg(kSmall)->Arg(kMedium)
+
+// Bulk insert
+BENCHMARK(BM_Build<OMapAdapter>)          ->Name("OrderedMap/PersistentSet") SIZES;
+BENCHMARK(BM_TransientBuild<OMapAdapter>) ->Name("OrderedMap/TransientSet")  SIZES;
+BENCHMARK(BM_Build<RTreeAdapter>)         ->Name("RadixTree/PersistentSet")  SIZES;
+BENCHMARK(BM_TransientBuild<RTreeAdapter>)->Name("RadixTree/TransientSet")   SIZES;
+BENCHMARK(BM_Build<StdMapAdapter>)        ->Name("StdMap/Set")               SIZES;
+
+// Memory footprint
+BENCHMARK(BM_MemoryFootprint<OMapAdapter>) ->Name("OrderedMap/Memory") SIZES;
+BENCHMARK(BM_MemoryFootprint<RTreeAdapter>)->Name("RadixTree/Memory")  SIZES;
+BENCHMARK(BM_MemoryFootprint<StdMapAdapter>)->Name("StdMap/Memory")    SIZES;
+
+// Point lookups
+BENCHMARK(BM_Get<OMapAdapter>)            ->Name("OrderedMap/Get")           SIZES;
+BENCHMARK(BM_Get<RTreeAdapter>)           ->Name("RadixTree/Get")            SIZES;
+BENCHMARK(BM_TransientGet<RTreeAdapter>)  ->Name("RadixTree/TransientGet")   SIZES;
+BENCHMARK(BM_Get<StdMapAdapter>)          ->Name("StdMap/Get")               SIZES;
+
+// Full iteration
+BENCHMARK(BM_Iterate<OMapAdapter>)        ->Name("OrderedMap/Iterate")       ITER_SIZES;
+BENCHMARK(BM_Iterate<RTreeAdapter>)       ->Name("RadixTree/Iterate")        ITER_SIZES;
+BENCHMARK(BM_Iterate<StdMapAdapter>)      ->Name("StdMap/Iterate")           ITER_SIZES;
+
+// lower_bound
+BENCHMARK(BM_LowerBound<OMapAdapter>)     ->Name("OrderedMap/LowerBound")    SIZES;
+BENCHMARK(BM_LowerBound<RTreeAdapter>)    ->Name("RadixTree/LowerBound")     SIZES;
+BENCHMARK(BM_LowerBound<StdMapAdapter>)   ->Name("StdMap/LowerBound")        SIZES;
+
+// Memory footprint (heap bytes after build)
+BENCHMARK(BM_MemoryFootprint<OMapAdapter>)   ->Name("OrderedMap/Memory")     SIZES;
+BENCHMARK(BM_MemoryFootprint<RTreeAdapter>)  ->Name("RadixTree/Memory")      SIZES;
+BENCHMARK(BM_MemoryFootprint<StdMapAdapter>) ->Name("StdMap/Memory")         SIZES;
+
+#undef SIZES
+#undef ITER_SIZES
+// clang-format on
+
+} // namespace
+
+BENCHMARK_MAIN();

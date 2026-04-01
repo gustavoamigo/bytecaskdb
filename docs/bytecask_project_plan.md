@@ -24,12 +24,16 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-024 | Implement PMR - Memory Allocation described in design | Note: There is a draft proposal in the bytecask_design.md
 | BC-026 | Run `flush_hints` in background after file rotate | After rotation, dispatch `flush_hints()` on the sealed file to a background thread so it does not block the write path. |
 | BC-027 | Write lock to enforce SWMR contract | Add a `std::mutex` (or file-level lock) to `Bytecask` so the SWMR contract is enforced at the engine level instead of at the call site. `WriteOptions` should gain a `bool try_lock` field (default `false` = blocking acquire) so callers can opt into a non-blocking attempt that returns an error instead of waiting. |
+| BC-030 | Radix tree engine integration | Replace `PersistentOrderedMap<Key, KeyDirEntry>` with `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. |
 
 
 ## Done
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-031 | Benchmark harness: OrderedMap vs RadixTree | Google Benchmark suite in `benchmarks/map_bench.cpp` (target `bytecask_bench`, `set_default(false)`). Compares persistent set, transient set, get, iteration, lower_bound, and memory footprint at 1k/10k/100k keys. RadixTree transient set ~2.4× faster than its persistent set at 100k keys; RadixTree get ~8× faster than OrderedMap. |
+| BC-032 | Sanitizer build mode + memory/concurrency verification | `xmake f --sanitizer=address` / `--sanitizer=thread` applies ASan/TSan to all targets via `on_load` callback. Full test suite clean under ASan+LSan (70 tests, 47,529 assertions, zero leaks). Concurrent reader/writer test (`[concurrency]` tag) verifies persistent snapshot immutability across threads. TSan blocked in Codespaces by ASLR sandbox; documented workaround. Memory footprint benchmark (`BM_MemoryFootprint`) added to `map_bench.cpp`. |
+| BC-029 | Persistent Radix Tree — core implementation | `bytecask.radix_tree` module: `PersistentRadixTree<V>`, `TransientRadixTree<V>`, DFS iterator with `lower_bound`, `SmallVector<T,N>` inline storage. Fixed SmallVector insert-at-end corruption bug, rewrote iterator `seek()` for correct lower_bound. 35 test cases, 10k-round model-based test (47,522 total assertions pass). |
 | BC-028 | Key type: immer::array backing | Replaced `Key = std::vector<std::byte>` with a value class wrapping `immer::array<std::byte>`. O(1) copies inside PersistentOrderedMap instead of O(n) deep copies. 191 assertions pass. |
 | BC-019 | Recovery and startup | `recover_existing_files()` in `Bytecask` constructor: removes stale `.hint.tmp` files, scans each `.data` file via its hint companion (if present) or raw otherwise, applies BulkBegin/BulkEnd batch state machine, uses LSN as sole freshness authority (no file ordering relied upon). Seeds `next_lsn_` from max seen sequence. 5 new test cases; 187 assertions pass. |
 | BC-025 | Add WriteOptions / ReadOptions to engine API | LevelDB/RocksDB-style option structs. `WriteOptions::sync` (default `true`) controls `fdatasync` on `put`, `del`, and `apply_batch`. `ReadOptions` is empty (reserved). 3 new test cases; 170 assertions pass. |

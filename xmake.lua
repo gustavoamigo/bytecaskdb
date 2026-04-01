@@ -3,7 +3,15 @@ add_rules("plugin.compile_commands.autoupdate", {outputdir = "."})
 
 add_requires("bitsery")
 add_requires("catch2 3.x")
+add_requires("benchmark", {optional = true})
 add_requires("immer")
+
+-- Sanitizer option: `xmake f --sanitizer=address` or `--sanitizer=thread`
+option("sanitizer")
+    set_default("")
+    set_showmenu(true)
+    set_description("Enable sanitizer (address, thread, or empty to disable)")
+option_end()
 
 -- Common flags shared by all targets
 local common_flags = {
@@ -16,6 +24,23 @@ local common_flags = {
     "-Wno-unsafe-buffer-usage",
 }
 
+-- Apply sanitizer flags to a target if the option is set.
+local function apply_sanitizer(t)
+    local san = get_config("sanitizer")
+    if san and san ~= "" then
+        -- Fedora ships compiler-rt under x86_64-redhat-linux-gnu; Clang's
+        -- default triple (x86_64-unknown-linux-gnu) doesn't match, so we
+        -- override it so the linker finds the sanitizer runtime libs.
+        t:add("cxflags", "--target=x86_64-redhat-linux-gnu", {force = true})
+        t:add("ldflags", "--target=x86_64-redhat-linux-gnu", {force = true})
+        t:add("cxflags", "-fsanitize=" .. san, {force = true})
+        t:add("ldflags", "-fsanitize=" .. san, {force = true})
+        if san == "address" then
+            t:add("cxflags", "-fno-omit-frame-pointer", {force = true})
+        end
+    end
+end
+
 target("bytecask")
     set_toolchains("clang")
     set_kind("binary")
@@ -24,6 +49,7 @@ target("bytecask")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
     add_packages("bitsery", "immer")
+    on_load(apply_sanitizer)
     -- Patch compile_commands.json so clangd can resolve all module imports.
     -- xmake's compile_commands generator omits some -fmodule-file= flags;
     -- the script adds any that are missing within each target group.
@@ -39,6 +65,19 @@ target("bytecask_tests")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
     add_packages("bitsery", "catch2", "immer")
+    on_load(apply_sanitizer)
+
+target("bytecask_bench")
+    set_toolchains("clang")
+    set_kind("binary")
+    set_default(false)
+    add_files("benchmarks/*.cpp", "src/engine/*.cppm")
+    set_languages("c++23")
+    set_policy("build.c++.modules", true)
+    add_cxflags(table.unpack(common_flags))
+    add_cxflags("-Wno-global-constructors")
+    add_packages("bitsery", "benchmark", "immer")
+    on_load(apply_sanitizer)
 
 --
 -- If you want to known more usage about xmake, please see https://xmake.io
