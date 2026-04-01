@@ -15,6 +15,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-033 | Radix tree hardening | `find_child`/`find_child_mut` keep linear scan (binary search benchmarked 40-55% slower on Get path due to small child counts from prefix compression); implicit-lifetime comment on `SmallVector::clear()`; safety comment on `seek()` prefix-append discipline; intent comment on `next_edit_tag` relaxed ordering. 10 new test cases: empty-key erase, long keys (>24 B prefix spill), binary/non-ASCII keys, lower_bound on empty tree, lower_bound before first key, wide fanout (>8 children spill), transient overwrite, transient erase path compression, iterator post-increment, tree copy/move semantics. Prefix-compression memory benchmark (`BM_PrefixedMemory`) with UUIDv7-style keys across 5 prefixes — confirms prefix sharing: 4-6× longer keys add only +7% bytes/key to RadixTree vs +63% to StdMap. 33 test cases, ~1M assertions pass. |
 
 ## Backlog
 

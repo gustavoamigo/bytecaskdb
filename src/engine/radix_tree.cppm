@@ -193,6 +193,10 @@ public:
 
   void clear() {
     destroy_all();
+    // After destroy_all() the union has no active member. Setting size_ = 0
+    // switches back to inline mode; subsequent push_back will construct_at
+    // into inline_storage_. This is valid under C++20 implicit-lifetime rules
+    // (std::byte is an implicit-lifetime type and the union provides storage).
     size_ = 0;
   }
 
@@ -252,6 +256,8 @@ export template <typename V> class TransientRadixTree;
 export template <typename V> class RadixTreeIterator;
 
 // Global edit-tag counter for transient sessions.
+// Relaxed ordering: only uniqueness is required, not inter-thread visibility
+// ordering. Each transient session gets a distinct tag via fetch_add.
 namespace detail {
 inline std::atomic<std::uint64_t> next_edit_tag{1};
 } // namespace detail
@@ -263,10 +269,11 @@ template <typename V> struct Node {
   std::uint64_t edit_tag{0};
   SmallVector<std::byte, 24> prefix;
   std::optional<V> value;
-  SmallVector<std::pair<std::byte, std::shared_ptr<Node>>, 8> children;
+  SmallVector<std::pair<std::byte, std::shared_ptr<Node>>, 4> children;
 
-  // Find child by transition byte. Returns pointer into children array or
-  // nullptr.
+  // Find child by transition byte. Children are sorted by transition byte.
+  // Linear scan is used because prefix compression keeps child counts small
+  // (typically 1–4), where it outperforms binary search.
   [[nodiscard]] auto find_child(std::byte b) const
       -> const std::pair<std::byte, std::shared_ptr<Node>> * {
     for (auto &c : children) {
@@ -927,6 +934,11 @@ private:
   // Returns true if the stack top is a node whose key >= target (caller
   // should check the value). Returns false if the stack is set up for
   // advance() to find the next valid position.
+  //
+  // IMPORTANT: each iteration appends the full node prefix to current_key_
+  // before checking divergence. On the "subtree < target" path the append is
+  // undone via current_key_.resize(klb). Any refactoring must preserve this
+  // append-then-undo discipline, or the key buffer will be corrupted.
   auto seek(const std::shared_ptr<Node<V>> &root,
             std::span<const std::byte> target) -> bool {
     auto remaining = target;

@@ -686,3 +686,238 @@ TEST_CASE("RadixTree concurrent readers with writer",
   }
   CHECK(post == expected);
 }
+
+// ---------------------------------------------------------------------------
+// Empty key: erase
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree erase empty key", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes(""), 99).set(to_bytes("a"), 1);
+  CHECK(t.size() == 2U);
+
+  auto t2 = t.erase(to_bytes(""));
+  CHECK(t2.size() == 1U);
+  CHECK_FALSE(t2.contains(to_bytes("")));
+  CHECK(*t2.get(to_bytes("a")) == 1);
+
+  // Erase the only key that is the empty key.
+  auto t3 = Tree{}.set(to_bytes(""), 42).erase(to_bytes(""));
+  CHECK(t3.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Long keys: prefix > 24 bytes triggers SmallVector<std::byte, 24> spill
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree long keys spill SmallVector prefix", "[radix_tree]") {
+  std::string long_a(50, 'x');
+  std::string long_b(50, 'x');
+  long_b += "suffix";
+
+  auto t = Tree{}.set(to_bytes(long_a), 1).set(to_bytes(long_b), 2);
+  CHECK(t.size() == 2U);
+  CHECK(*t.get(to_bytes(long_a)) == 1);
+  CHECK(*t.get(to_bytes(long_b)) == 2);
+
+  // Erase long key and verify path compression with long prefix.
+  auto t2 = t.erase(to_bytes(long_a));
+  CHECK(t2.size() == 1U);
+  CHECK(*t2.get(to_bytes(long_b)) == 2);
+
+  // 200-byte key.
+  std::string very_long(200, 'z');
+  auto t3 = t.set(to_bytes(very_long), 3);
+  CHECK(*t3.get(to_bytes(very_long)) == 3);
+}
+
+// ---------------------------------------------------------------------------
+// Binary / non-ASCII keys: byte values > 0x7F
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree binary keys", "[radix_tree]") {
+  // Build keys with high byte values.
+  auto make_key = [](std::uint8_t b0, std::uint8_t b1) {
+    std::array<std::byte, 2> k{std::byte{b0}, std::byte{b1}};
+    return k;
+  };
+
+  auto k1 = make_key(0xFF, 0x01);
+  auto k2 = make_key(0xFF, 0x80);
+  auto k3 = make_key(0x80, 0x00);
+  auto k4 = make_key(0x00, 0xFF);
+
+  auto t = Tree{}
+               .set(std::span<const std::byte>{k1}, 1)
+               .set(std::span<const std::byte>{k2}, 2)
+               .set(std::span<const std::byte>{k3}, 3)
+               .set(std::span<const std::byte>{k4}, 4);
+
+  CHECK(t.size() == 4U);
+  CHECK(*t.get(std::span<const std::byte>{k1}) == 1);
+  CHECK(*t.get(std::span<const std::byte>{k2}) == 2);
+  CHECK(*t.get(std::span<const std::byte>{k3}) == 3);
+  CHECK(*t.get(std::span<const std::byte>{k4}) == 4);
+
+  // Iteration: keys with 0x00 should come before 0x80, which comes before 0xFF.
+  std::vector<std::uint8_t> first_bytes;
+  for (auto it = t.begin(); it != t.end(); ++it) {
+    auto [k, v] = *it;
+    first_bytes.push_back(static_cast<std::uint8_t>(k[0]));
+  }
+  CHECK(std::is_sorted(first_bytes.begin(), first_bytes.end()));
+}
+
+// ---------------------------------------------------------------------------
+// Lower bound: empty tree
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree lower_bound empty tree", "[radix_tree]") {
+  const Tree t;
+  CHECK(t.lower_bound(to_bytes("anything")) == t.end());
+  CHECK(t.lower_bound(to_bytes("")) == t.end());
+}
+
+// ---------------------------------------------------------------------------
+// Lower bound: at or before first key
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree lower_bound at or before first key", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("banana"), 2).set(to_bytes("cherry"), 3);
+
+  // lower_bound("") should return the first key.
+  auto it = t.lower_bound(to_bytes(""));
+  REQUIRE(it != t.end());
+  auto [k, v] = *it;
+  CHECK(to_string(k) == "banana");
+
+  // lower_bound("aaa") — before all keys.
+  auto it2 = t.lower_bound(to_bytes("aaa"));
+  REQUIRE(it2 != t.end());
+  auto [k2, v2] = *it2;
+  CHECK(to_string(k2) == "banana");
+}
+
+// ---------------------------------------------------------------------------
+// Wide fanout: > 8 children at one node triggers SmallVector children spill
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree wide fanout spills SmallVector children", "[radix_tree]") {
+  auto t = Tree{};
+  // Create 26 children from a single root by inserting single-char keys a-z.
+  for (int i = 0; i < 26; ++i) {
+    std::string key(1, static_cast<char>('a' + i));
+    t = t.set(to_bytes(key), i);
+  }
+  CHECK(t.size() == 26U);
+
+  // Verify all present.
+  for (int i = 0; i < 26; ++i) {
+    std::string key(1, static_cast<char>('a' + i));
+    REQUIRE(t.contains(to_bytes(key)));
+    CHECK(*t.get(to_bytes(key)) == i);
+  }
+
+  // Iteration should be in sorted order.
+  std::vector<std::string> keys;
+  for (auto it = t.begin(); it != t.end(); ++it) {
+    auto [k, v] = *it;
+    keys.push_back(to_string(k));
+  }
+  CHECK(std::is_sorted(keys.begin(), keys.end()));
+  CHECK(keys.size() == 26U);
+
+  // Erase half and verify.
+  for (int i = 0; i < 13; ++i) {
+    std::string key(1, static_cast<char>('a' + i));
+    t = t.erase(to_bytes(key));
+  }
+  CHECK(t.size() == 13U);
+  CHECK_FALSE(t.contains(to_bytes("a")));
+  CHECK(t.contains(to_bytes("n")));
+}
+
+// ---------------------------------------------------------------------------
+// Transient: overwrite existing key (no size change, in-place mutation)
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree transient overwrite", "[radix_tree]") {
+  auto tr = Tree{}.transient();
+  tr.set(to_bytes("key"), 1);
+  tr.set(to_bytes("key"), 2); // Overwrite — size should stay 1.
+  tr.set(to_bytes("key"), 3); // Another overwrite.
+
+  auto t = std::move(tr).persistent();
+  CHECK(t.size() == 1U);
+  CHECK(*t.get(to_bytes("key")) == 3);
+}
+
+// ---------------------------------------------------------------------------
+// Transient: erase triggers path compression
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree transient erase path compression", "[radix_tree]") {
+  // "abc" and "abd" share prefix "ab" with transitions 'c' and 'd'.
+  // Erasing "abc" should merge the routing node with "abd".
+  auto tr = Tree{}.transient();
+  tr.set(to_bytes("abc"), 1);
+  tr.set(to_bytes("abd"), 2);
+  CHECK(tr.erase(to_bytes("abc")));
+
+  auto t = std::move(tr).persistent();
+  CHECK(t.size() == 1U);
+  CHECK(*t.get(to_bytes("abd")) == 2);
+  CHECK_FALSE(t.contains(to_bytes("abc")));
+
+  // Erase all via transient — should get empty tree.
+  auto tr2 = t.transient();
+  CHECK(tr2.erase(to_bytes("abd")));
+  auto t2 = std::move(tr2).persistent();
+  CHECK(t2.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Iterator post-increment
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree iterator post-increment", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("a"), 1).set(to_bytes("b"), 2);
+
+  auto it = t.begin();
+  auto prev = it++;
+  // prev should point to "a", it should point to "b".
+  auto [pk, pv] = *prev;
+  CHECK(to_string(pk) == "a");
+  CHECK(pv == 1);
+
+  auto [ck, cv] = *it;
+  CHECK(to_string(ck) == "b");
+  CHECK(cv == 2);
+
+  it++;
+  CHECK(it == t.end());
+}
+
+// ---------------------------------------------------------------------------
+// Tree copy and move semantics
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree copy and move semantics", "[radix_tree]") {
+  auto t1 = Tree{}.set(to_bytes("x"), 10).set(to_bytes("y"), 20);
+
+  // Copy construction.
+  auto t2 = t1; // NOLINT(performance-unnecessary-copy-initialization)
+  CHECK(t2.size() == 2U);
+  CHECK(*t2.get(to_bytes("x")) == 10);
+
+  // Mutate copy — original unaffected.
+  auto t3 = t2.set(to_bytes("z"), 30);
+  CHECK(t3.size() == 3U);
+  CHECK(t2.size() == 2U);
+
+  // Move construction.
+  auto t4 = std::move(t3);
+  CHECK(t4.size() == 3U);
+  CHECK(*t4.get(to_bytes("z")) == 30);
+
+  // Copy assignment.
+  Tree t5;
+  t5 = t1;
+  CHECK(t5.size() == 2U);
+  CHECK(*t5.get(to_bytes("y")) == 20);
+
+  // Move assignment.
+  Tree t6;
+  t6 = std::move(t4);
+  CHECK(t6.size() == 3U);
+  CHECK(t6.contains(to_bytes("z")));
+}
