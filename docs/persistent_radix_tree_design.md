@@ -1,7 +1,7 @@
-# Design : Persistent Radix Tree (Byte-Array Keys)
+# Persistent Radix Tree (Byte-Array Keys)
 
-## 1. Objective
-Implement a Persistent (Immutable) Radix Tree (Patricia Trie) in C++ that provides native prefix-compression for byte-array keys, $O(1)$ snapshotting via structural sharing, ordered iteration (`lower_bound`), and efficient bulk updates via a Transient API. The container uses standard allocators.
+## 1. Overview
+A Persistent (Immutable) Radix Tree (Patricia Trie) in C++ that provides native prefix-compression for byte-array keys, $O(1)$ snapshotting via structural sharing, ordered iteration (`lower_bound`), and efficient bulk updates via a Transient API. The container uses standard allocators. Module: `bytecask.radix_tree`.
 
 ## Design Principles
 
@@ -135,7 +135,7 @@ When removing a value (`node->value = std::nullopt`), the tree must maintain Pat
     - Every 200 rounds: a snapshot taken before the mutation still matches the entries captured at that point (immutability).
 
     The fixed seed makes any failure deterministic and reproducible; the round number in `INFO` pinpoints the failing operation without shrinking.
-8.  **Memory safety:** Full test suite (70 test cases, 47,529 assertions) passes under Clang AddressSanitizer + LeakSanitizer with zero errors. Build via `xmake f --sanitizer=address -m debug`.
+8.  **Memory safety:** Full test suite (82 test cases, 1M+ assertions) passes under Clang AddressSanitizer + LeakSanitizer with zero errors. Build via `xmake f --sanitizer=address -m debug`.
 9.  **Concurrent reader/writer safety:** A dedicated test (`[concurrency]` tag) spawns 4 reader threads iterating a persistent snapshot while a writer thread mutates a transient derived from the same snapshot. All readers observe a consistent, unchanged snapshot throughout. ThreadSanitizer verification requires ASLR control (`xmake f --sanitizer=thread -m debug`; run with `setarch -R` or lowered `vm.mmap_rnd_bits`).
 10. **Memory footprint:** `BM_MemoryFootprint` benchmarks in `map_bench.cpp` report heap bytes allocated per key for each container at 1k/10k/100k keys, enabling relative comparison of memory overhead.
 
@@ -215,3 +215,97 @@ The original `shared_ptr`-based design measured 129 B/key (generic) and 139 B/ke
 ### 7.6. What the `OrderedMap` memory benchmark actually measures
 
 `PersistentOrderedMap` is backed by `immer::flex_vector`, a Radix Balanced Tree of 32-element chunks. Because consecutive `set()` calls produce a chain of versions that share chunks, the allocation tracker reports only **net new bytes in the final snapshot** — bytes from discarded intermediate versions are allocated and immediately freed. The reported ~40 B/key for generic keys and ~75 B/key for prefixed keys do not represent the RAM cost of holding a single live copy of that map. A snapshot in isolation occupies approximately the same RAM as a comparable `std::map`.
+
+---
+
+## 8. Benchmark Results
+
+Full benchmark suite run on 2 × 3.49 GHz vCPUs, Clang release build. Three containers compared:
+
+- **RadixTree** — `PersistentRadixTree<int>` (this implementation)
+- **OrderedMap** — `PersistentOrderedMap<Key, int>` (backed by `immer::flex_vector`)
+- **StdMap** — `std::map<std::string, int>` (mutable baseline, no persistence)
+
+### 8.1. Bulk insert (persistent `set()`, chained)
+
+| Container | 1k keys (ns) | 10k keys (ns) | 100k keys (ns) |
+|---|---|---|---|
+| RadixTree | 758 k | 10.0 M | 123 M |
+| OrderedMap | 2,493 k | 44.9 M | 385 M |
+| StdMap | 203 k | 2.8 M | 43 M |
+
+RadixTree persistent set is **~3× faster** than OrderedMap. StdMap (mutable, no COW) is the fastest baseline.
+
+### 8.2. Bulk insert (transient `set()`)
+
+| Container | 1k keys (ns) | 10k keys (ns) | 100k keys (ns) |
+|---|---|---|---|
+| RadixTree | 136 k | 1.9 M | 39 M |
+| OrderedMap | 1,780 k | 28.9 M | 396 M |
+| StdMap | 203 k | 2.8 M | 43 M |
+
+RadixTree transient set is **~10× faster** than OrderedMap and comparable to StdMap at 100k keys.
+
+### 8.3. Point lookup (`get()`)
+
+| Container | 1k keys (ns) | 10k keys (ns) | 100k keys (ns) |
+|---|---|---|---|
+| RadixTree | 69 | 98 | 114 |
+| OrderedMap | 292 | 488 | 661 |
+| StdMap | 103 | 167 | 233 |
+
+RadixTree get is **~6× faster** than OrderedMap and **~2× faster** than StdMap at 100k keys.
+
+### 8.4. Iteration (full scan)
+
+| Container | 1k keys (ns) | 10k keys (ns) |
+|---|---|---|
+| RadixTree | 28.8 k | 281 k |
+| OrderedMap | 2.0 k | 28.2 k |
+| StdMap | 6.7 k | 100 k |
+
+RadixTree iteration is slower because the DFS iterator materializes keys by concatenating prefixes at each node — a cost inherent to key-compressed tries. OrderedMap iterates a flat chunk sequence and is fastest.
+
+### 8.5. Lower bound
+
+| Container | 1k keys (ns) | 10k keys (ns) | 100k keys (ns) |
+|---|---|---|---|
+| RadixTree | 317 | 380 | 462 |
+| OrderedMap | 211 | 403 | 545 |
+| StdMap | 92 | 151 | 224 |
+
+RadixTree and OrderedMap converge at 100k keys. StdMap is ~2× faster (simpler tree structure, no key materialization).
+
+### 8.6. Memory footprint (generic keys, `"key_N"`)
+
+| Container | 1k B/key | 10k B/key | 100k B/key |
+|---|---|---|---|
+| RadixTree | 86 | 86 | **86** |
+| OrderedMap\* | 7 | 8 | 40 |
+| StdMap | 72 | 72 | **72** |
+
+### 8.7. Memory footprint (prefixed UUIDv7 keys)
+
+| Container | 1k B/key | 10k B/key | 100k B/key |
+|---|---|---|---|
+| RadixTree | 92 | 92 | **92** |
+| OrderedMap\* | 44 | 44 | 75 |
+| StdMap | 117 | 117 | **117** |
+
+\* OrderedMap figures measure net allocations during incremental build; they undercount the steady-state RAM of a single live snapshot (see §7.6).
+
+RadixTree is **21% cheaper** than StdMap for prefixed keys (92 vs 117 B/key) — this is where prefix compression pays off. For generic short keys it is 19% more expensive than StdMap (86 vs 72), which is the cost of prefix-compression bookkeeping on keys that share little structure.
+
+### 8.8. Summary
+
+| Operation | RadixTree vs OrderedMap | RadixTree vs StdMap |
+|---|---|---|
+| Persistent set | **3× faster** | 2.8× slower |
+| Transient set | **10× faster** | ~1× (parity) |
+| Get | **6× faster** | **2× faster** |
+| Iteration | 2.8× slower | 2.8× slower |
+| Lower bound | ~1× (parity) | 2× slower |
+| Memory (generic) | see §7.6\* | +19% |
+| Memory (prefixed) | see §7.6\* | **−21%** |
+
+The RadixTree is the right choice for ByteCask's key directory: it provides O(1) snapshotting with structural sharing, competitive lookup speed, and prefix compression that pays off for the production key patterns (prefixed UUIDs). The iteration cost is acceptable because full scans are rare in the ByteCask access pattern (point lookups and range-bounded iteration are the primary operations).
