@@ -15,7 +15,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-034 | Intrusive reference counting for radix tree nodes | Replace `shared_ptr<Node>` with `IntrusivePtr<Node>` embedding `atomic<uint32_t> refcount_` in each node. Eliminates ~32 B `make_shared` control block per node; shrinks child slot from 24 B to 16 B. Per-node cost: ~80 B (down from ~104 B). Measured: 108 B/key generic (−17%), 116 B/key prefixed (−17%) at 100k keys. 82 tests pass (1M+ assertions). ASan clean. |
+| BC-035 | Leaf node optimization: pointer-to-children | Replace `SmallVector<..., 1> children` (32 B always) with `unique_ptr<ChildVec>` (8 B null for leaves). 94% of nodes are leaves and pay only 8 B pointer instead of 32 B empty SmallVector. Node struct: 80→56 B. Measured: 86 B/key generic (−20% from intrusive, −33% from original), 92 B/key prefixed (−21% from intrusive, −34% from original). 82 tests pass (1M+ assertions). ASan clean. |
 
 ## Backlog
 
@@ -32,6 +32,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-034 | Intrusive reference counting for radix tree nodes | Replace `shared_ptr<Node>` with `IntrusivePtr<Node>` embedding `atomic<uint32_t> refcount_` in each node. Eliminates ~32 B `make_shared` control block per node; shrinks child slot from 24 B to 16 B. Per-node cost: ~80 B (down from ~104 B). Measured: 108 B/key generic (−17%), 116 B/key prefixed (−17%) at 100k keys. 82 tests pass (1M+ assertions). ASan clean. |
 | BC-033 | Radix tree hardening + memory layout optimisation | Phase 1: linear scan kept, 3 comments added, 10 new tests (33 total, ~1M assertions). Phase 2: children N=8→N=4 (−31% memory). Phase 3: packed node layout — `uint64_t edit_tag` + `optional<V>` replaced by `uint32_t packed_tag_` (high bit = has_value) + bare `V value_`; children N=4→N=1. Combined: 184→112 B/node; measured 209→129 B/key (−38%) at 100k generic keys, 225→139 B/key (−38%) with prefixed UUIDv7 keys. 33 tests pass. |
 | BC-031 | Benchmark harness: OrderedMap vs RadixTree | Google Benchmark suite in `benchmarks/map_bench.cpp` (target `bytecask_bench`, `set_default(false)`). Compares persistent set, transient set, get, iteration, lower_bound, and memory footprint at 1k/10k/100k keys. RadixTree transient set ~2.4× faster than its persistent set at 100k keys; RadixTree get ~8× faster than OrderedMap. |
 | BC-032 | Sanitizer build mode + memory/concurrency verification | `xmake f --sanitizer=address` / `--sanitizer=thread` applies ASan/TSan to all targets via `on_load` callback. Full test suite clean under ASan+LSan (70 tests, 47,529 assertions, zero leaks). Concurrent reader/writer test (`[concurrency]` tag) verifies persistent snapshot immutability across threads. TSan blocked in Codespaces by ASLR sandbox; documented workaround. Memory footprint benchmark (`BM_MemoryFootprint`) added to `map_bench.cpp`. |

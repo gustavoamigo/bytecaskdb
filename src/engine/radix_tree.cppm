@@ -352,7 +352,13 @@ template <typename V> struct Node {
   std::uint32_t packed_tag_{0};
   V value_{};
   SmallVector<std::byte, 24> prefix;
-  SmallVector<std::pair<std::byte, IntrusivePtr<Node>>, 1> children;
+
+  // Children: null for leaf nodes, heap-allocated for internal nodes.
+  // 94% of nodes are leaves — they pay only 8 B (null pointer) instead
+  // of 32 B for an empty SmallVector.
+  using ChildSlot = std::pair<std::byte, IntrusivePtr<Node>>;
+  using ChildVec = std::vector<ChildSlot>;
+  std::unique_ptr<ChildVec> children_;
 
   void addref() const noexcept {
     refcount_.fetch_add(1, std::memory_order_relaxed);
@@ -379,21 +385,37 @@ template <typename V> struct Node {
   }
   void clear_value() noexcept { packed_tag_ &= 0x7FFF'FFFFu; }
 
+  // -- Children accessors ---------------------------------------------------
+  [[nodiscard]] auto child_count() const noexcept -> std::size_t {
+    return children_ ? children_->size() : 0;
+  }
+  [[nodiscard]] auto has_children() const noexcept -> bool {
+    return children_ && !children_->empty();
+  }
+  [[nodiscard]] auto child_at(std::size_t i) const -> const ChildSlot & {
+    return (*children_)[i];
+  }
+  [[nodiscard]] auto child_at(std::size_t i) -> ChildSlot & {
+    return (*children_)[i];
+  }
+
   // Find child by transition byte. Children are sorted by transition byte.
   // Linear scan is used because prefix compression keeps child counts small
   // (typically 1–4), where it outperforms binary search.
-  [[nodiscard]] auto find_child(std::byte b) const
-      -> const std::pair<std::byte, IntrusivePtr<Node>> * {
-    for (auto &c : children) {
+  [[nodiscard]] auto find_child(std::byte b) const -> const ChildSlot * {
+    if (!children_)
+      return nullptr;
+    for (auto &c : *children_) {
       if (c.first == b)
         return &c;
     }
     return nullptr;
   }
 
-  [[nodiscard]] auto find_child_mut(std::byte b)
-      -> std::pair<std::byte, IntrusivePtr<Node>> * {
-    for (auto &c : children) {
+  [[nodiscard]] auto find_child_mut(std::byte b) -> ChildSlot * {
+    if (!children_)
+      return nullptr;
+    for (auto &c : *children_) {
       if (c.first == b)
         return &c;
     }
@@ -402,16 +424,22 @@ template <typename V> struct Node {
 
   // Insert child in sorted order by transition byte.
   void insert_child(std::byte b, IntrusivePtr<Node> child) {
-    auto *pos = children.begin();
-    while (pos != children.end() && pos->first < b)
+    if (!children_)
+      children_ = std::make_unique<ChildVec>();
+    auto *pos = children_->data();
+    auto *end = pos + children_->size();
+    while (pos != end && pos->first < b)
       ++pos;
-    children.insert(pos, {b, std::move(child)});
+    auto idx = static_cast<std::ptrdiff_t>(pos - children_->data());
+    children_->insert(children_->begin() + idx, {b, std::move(child)});
   }
 
   void remove_child(std::byte b) {
-    for (auto *it = children.begin(); it != children.end(); ++it) {
+    if (!children_)
+      return;
+    for (auto it = children_->begin(); it != children_->end(); ++it) {
       if (it->first == b) {
-        children.erase(it);
+        children_->erase(it);
         return;
       }
     }
@@ -424,7 +452,8 @@ template <typename V> struct Node {
     n->packed_tag_ = packed_tag_ & 0x8000'0000u;
     n->value_ = value_;
     n->prefix = prefix;
-    n->children = children;
+    if (children_)
+      n->children_ = std::make_unique<ChildVec>(*children_);
     return n;
   }
 
@@ -641,11 +670,11 @@ private:
       new_node->clear_value();
 
       // Path compression.
-      if (new_node->children.empty()) {
+      if (!new_node->has_children()) {
         // No children and no value — node is dead.
         return {nullptr, true};
       }
-      if (new_node->children.size() == 1) {
+      if (new_node->child_count() == 1) {
         // Merge with sole child.
         return {merge_with_child(std::move(new_node)), true};
       }
@@ -669,10 +698,10 @@ private:
       new_node->remove_child(transition);
       // Path compression: if this node is now a routing node with 1 child and
       // no value, merge.
-      if (!new_node->has_value() && new_node->children.size() == 1) {
+      if (!new_node->has_value() && new_node->child_count() == 1) {
         return {merge_with_child(std::move(new_node)), true};
       }
-      if (!new_node->has_value() && new_node->children.empty()) {
+      if (!new_node->has_value() && !new_node->has_children()) {
         return {nullptr, true};
       }
       return {std::move(new_node), true};
@@ -689,9 +718,9 @@ private:
   // New prefix = node.prefix + transition_byte + child.prefix
   static auto merge_with_child(IntrusivePtr<Node<V>> node)
       -> IntrusivePtr<Node<V>> {
-    assert(!node->has_value() && node->children.size() == 1);
-    auto transition = node->children[0].first;
-    auto child = node->children[0].second->clone();
+    assert(!node->has_value() && node->child_count() == 1);
+    auto transition = node->child_at(0).first;
+    auto child = node->child_at(0).second->clone();
 
     SmallVector<std::byte, 24> merged_prefix;
     for (auto b : node->prefix)
@@ -870,9 +899,9 @@ private:
       auto mutable_node = ensure_mutable(node, tag);
       mutable_node->clear_value();
 
-      if (mutable_node->children.empty())
+      if (!mutable_node->has_children())
         return {nullptr, true};
-      if (mutable_node->children.size() == 1) {
+      if (mutable_node->child_count() == 1) {
         return {merge_with_child_transient(std::move(mutable_node), tag), true};
       }
       return {std::move(mutable_node), true};
@@ -892,10 +921,10 @@ private:
     auto mutable_node = ensure_mutable(node, tag);
     if (!new_child) {
       mutable_node->remove_child(transition);
-      if (!mutable_node->has_value() && mutable_node->children.size() == 1) {
+      if (!mutable_node->has_value() && mutable_node->child_count() == 1) {
         return {merge_with_child_transient(std::move(mutable_node), tag), true};
       }
-      if (!mutable_node->has_value() && mutable_node->children.empty()) {
+      if (!mutable_node->has_value() && !mutable_node->has_children()) {
         return {nullptr, true};
       }
       return {std::move(mutable_node), true};
@@ -908,9 +937,9 @@ private:
   static auto merge_with_child_transient(IntrusivePtr<Node<V>> node,
                                          std::uint32_t tag)
       -> IntrusivePtr<Node<V>> {
-    assert(!node->has_value() && node->children.size() == 1);
-    auto transition = node->children[0].first;
-    auto child = ensure_mutable(node->children[0].second, tag);
+    assert(!node->has_value() && node->child_count() == 1);
+    auto transition = node->child_at(0).first;
+    auto child = ensure_mutable(node->child_at(0).second, tag);
 
     SmallVector<std::byte, 24> merged_prefix;
     for (std::size_t i = 0; i < node->prefix.size(); ++i)
@@ -1031,8 +1060,8 @@ private:
     // Find next value-bearing node via DFS.
     while (!stack_.empty()) {
       auto &frame = stack_.back();
-      if (frame.child_idx < frame.node->children.size()) {
-        auto &[transition, child] = frame.node->children[frame.child_idx];
+      if (frame.child_idx < frame.node->child_count()) {
+        auto &[transition, child] = frame.node->child_at(frame.child_idx);
         ++frame.child_idx;
         auto key_before = current_key_.size();
         current_key_.push_back(transition);
@@ -1102,8 +1131,8 @@ private:
       auto child_remaining = remaining.subspan(1);
 
       bool descended = false;
-      for (std::size_t i = 0; i < cur->children.size(); ++i) {
-        auto cb = cur->children[i].first;
+      for (std::size_t i = 0; i < cur->child_count(); ++i) {
+        auto cb = cur->child_at(i).first;
         if (cb < target_byte)
           continue;
 
@@ -1112,7 +1141,7 @@ private:
           stack_.push_back({cur, i + 1, klb});
           klb = current_key_.size();
           current_key_.push_back(cb);
-          cur = cur->children[i].second;
+          cur = cur->child_at(i).second;
           remaining = child_remaining;
           descended = true;
           break;
@@ -1126,7 +1155,7 @@ private:
 
       if (!descended) {
         // All children < target_byte. Push exhausted frame for backtracking.
-        stack_.push_back({cur, cur->children.size(), klb});
+        stack_.push_back({cur, cur->child_count(), klb});
         return false;
       }
     }
