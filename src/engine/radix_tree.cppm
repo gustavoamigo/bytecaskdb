@@ -266,10 +266,29 @@ inline std::atomic<std::uint64_t> next_edit_tag{1};
 // Node<V>
 // ---------------------------------------------------------------------------
 template <typename V> struct Node {
-  std::uint64_t edit_tag{0};
+  // High bit of packed_tag_ = 1 means this node holds a value.
+  // Low 31 bits = transient edit tag (0 = immutable).
+  // Packing both into one uint32_t saves 8 bytes vs (uint64_t tag +
+  // optional<V>).
+  std::uint32_t packed_tag_{0};
+  V value_{};
   SmallVector<std::byte, 24> prefix;
-  std::optional<V> value;
-  SmallVector<std::pair<std::byte, std::shared_ptr<Node>>, 4> children;
+  SmallVector<std::pair<std::byte, std::shared_ptr<Node>>, 1> children;
+
+  [[nodiscard]] auto has_value() const noexcept -> bool {
+    return (packed_tag_ >> 31) != 0;
+  }
+  [[nodiscard]] auto edit_tag() const noexcept -> std::uint32_t {
+    return packed_tag_ & 0x7FFF'FFFFu;
+  }
+  void set_edit_tag(std::uint32_t tag) noexcept {
+    packed_tag_ = (packed_tag_ & 0x8000'0000u) | (tag & 0x7FFF'FFFFu);
+  }
+  void set_value(V v) {
+    value_ = std::move(v);
+    packed_tag_ |= 0x8000'0000u;
+  }
+  void clear_value() noexcept { packed_tag_ &= 0x7FFF'FFFFu; }
 
   // Find child by transition byte. Children are sorted by transition byte.
   // Linear scan is used because prefix compression keeps child counts small
@@ -312,18 +331,19 @@ template <typename V> struct Node {
   // Deep clone of this node (not recursive — children are shared).
   [[nodiscard]] auto clone() const -> std::shared_ptr<Node> {
     auto n = std::make_shared<Node>();
-    n->edit_tag = 0;
+    // Clear edit_tag in the clone; preserve has_value bit.
+    n->packed_tag_ = packed_tag_ & 0x8000'0000u;
+    n->value_ = value_;
     n->prefix = prefix;
-    n->value = value;
     n->children = children;
     return n;
   }
 
   // Clone and stamp with edit tag for transient ownership.
-  [[nodiscard]] auto clone_for(std::uint64_t tag) const
+  [[nodiscard]] auto clone_for(std::uint32_t tag) const
       -> std::shared_ptr<Node> {
     auto n = clone();
-    n->edit_tag = tag;
+    n->set_edit_tag(tag);
     return n;
   }
 };
@@ -412,7 +432,9 @@ private:
       }
       remaining = remaining.subspan(cpl);
       if (remaining.empty()) {
-        return cur->value;
+        if (cur->has_value())
+          return cur->value_;
+        return std::nullopt;
       }
       auto transition = remaining[0];
       remaining = remaining.subspan(1);
@@ -434,7 +456,7 @@ private:
       leaf->prefix = SmallVector<std::byte, 24>{};
       for (auto b : key)
         leaf->prefix.push_back(b);
-      leaf->value = std::move(val);
+      leaf->set_value(std::move(val));
       return {std::move(leaf), true};
     }
 
@@ -464,13 +486,13 @@ private:
       if (remaining.empty()) {
         // The key matches exactly the common prefix — value goes on split
         // node.
-        split->value = std::move(val);
+        split->set_value(std::move(val));
       } else {
         auto new_transition = remaining[0];
         auto new_leaf = std::make_shared<Node<V>>();
         for (auto b : remaining.subspan(1))
           new_leaf->prefix.push_back(b);
-        new_leaf->value = std::move(val);
+        new_leaf->set_value(std::move(val));
         split->insert_child(new_transition, std::move(new_leaf));
       }
       return {std::move(split), true};
@@ -480,8 +502,8 @@ private:
     auto remaining = key.subspan(cpl);
     if (remaining.empty()) {
       // Key ends exactly at this node.
-      bool was_absent = !new_node->value.has_value();
-      new_node->value = std::move(val);
+      bool was_absent = !new_node->has_value();
+      new_node->set_value(std::move(val));
       return {std::move(new_node), was_absent};
     }
 
@@ -499,7 +521,7 @@ private:
     auto leaf = std::make_shared<Node<V>>();
     for (auto b : child_key)
       leaf->prefix.push_back(b);
-    leaf->value = std::move(val);
+    leaf->set_value(std::move(val));
     new_node->insert_child(transition, std::move(leaf));
     return {std::move(new_node), true};
   }
@@ -524,11 +546,11 @@ private:
     auto remaining = key.subspan(cpl);
     if (remaining.empty()) {
       // Key matches this node.
-      if (!node->value)
+      if (!node->has_value())
         return {node, false};
 
       auto new_node = node->clone();
-      new_node->value.reset();
+      new_node->clear_value();
 
       // Path compression.
       if (new_node->children.empty()) {
@@ -559,10 +581,10 @@ private:
       new_node->remove_child(transition);
       // Path compression: if this node is now a routing node with 1 child and
       // no value, merge.
-      if (!new_node->value && new_node->children.size() == 1) {
+      if (!new_node->has_value() && new_node->children.size() == 1) {
         return {merge_with_child(std::move(new_node)), true};
       }
-      if (!new_node->value && new_node->children.empty()) {
+      if (!new_node->has_value() && new_node->children.empty()) {
         return {nullptr, true};
       }
       return {std::move(new_node), true};
@@ -579,7 +601,7 @@ private:
   // New prefix = node.prefix + transition_byte + child.prefix
   static auto merge_with_child(std::shared_ptr<Node<V>> node)
       -> std::shared_ptr<Node<V>> {
-    assert(!node->value && node->children.size() == 1);
+    assert(!node->has_value() && node->children.size() == 1);
     auto transition = node->children[0].first;
     auto child = node->children[0].second->clone();
 
@@ -646,20 +668,20 @@ public:
 private:
   std::shared_ptr<Node<V>> root_;
   std::size_t size_{0};
-  std::uint64_t tag_{0};
+  std::uint32_t tag_{0};
 
   TransientRadixTree(std::shared_ptr<Node<V>> root, std::size_t sz,
-                     std::uint64_t tag)
+                     std::uint32_t tag)
       : root_{std::move(root)}, size_{sz}, tag_{tag} {}
 
   // Ensure a node is owned by this transient session.
   static auto ensure_mutable(const std::shared_ptr<Node<V>> &node,
-                             std::uint64_t tag) -> std::shared_ptr<Node<V>> {
-    if (node && node->edit_tag == tag)
+                             std::uint32_t tag) -> std::shared_ptr<Node<V>> {
+    if (node && node->edit_tag() == tag)
       return node;
     if (!node) {
       auto n = std::make_shared<Node<V>>();
-      n->edit_tag = tag;
+      n->set_edit_tag(tag);
       return n;
     }
     return node->clone_for(tag);
@@ -668,14 +690,14 @@ private:
   // Transient set — mutates owned nodes in-place, copies shared ones.
   static auto set_transient(const std::shared_ptr<Node<V>> &node,
                             std::span<const std::byte> key, V val,
-                            std::uint64_t tag)
+                            std::uint32_t tag)
       -> std::pair<std::shared_ptr<Node<V>>, bool> {
     if (!node) {
       auto leaf = std::make_shared<Node<V>>();
-      leaf->edit_tag = tag;
+      leaf->set_edit_tag(tag);
       for (auto b : key)
         leaf->prefix.push_back(b);
-      leaf->value = std::move(val);
+      leaf->set_value(std::move(val));
       return {std::move(leaf), true};
     }
 
@@ -687,7 +709,7 @@ private:
     if (cpl < prefix_span.size()) {
       // Split.
       auto split = std::make_shared<Node<V>>();
-      split->edit_tag = tag;
+      split->set_edit_tag(tag);
       for (std::size_t i = 0; i < cpl; ++i)
         split->prefix.push_back(prefix_span[i]);
 
@@ -700,14 +722,14 @@ private:
 
       auto remaining = key.subspan(cpl);
       if (remaining.empty()) {
-        split->value = std::move(val);
+        split->set_value(std::move(val));
       } else {
         auto new_transition = remaining[0];
         auto new_leaf = std::make_shared<Node<V>>();
-        new_leaf->edit_tag = tag;
+        new_leaf->set_edit_tag(tag);
         for (auto b : remaining.subspan(1))
           new_leaf->prefix.push_back(b);
-        new_leaf->value = std::move(val);
+        new_leaf->set_value(std::move(val));
         split->insert_child(new_transition, std::move(new_leaf));
       }
       return {std::move(split), true};
@@ -715,8 +737,8 @@ private:
 
     auto remaining = key.subspan(cpl);
     if (remaining.empty()) {
-      bool was_absent = !mutable_node->value.has_value();
-      mutable_node->value = std::move(val);
+      bool was_absent = !mutable_node->has_value();
+      mutable_node->set_value(std::move(val));
       return {std::move(mutable_node), was_absent};
     }
 
@@ -730,17 +752,17 @@ private:
       return {std::move(mutable_node), inserted};
     }
     auto leaf = std::make_shared<Node<V>>();
-    leaf->edit_tag = tag;
+    leaf->set_edit_tag(tag);
     for (auto b : child_key)
       leaf->prefix.push_back(b);
-    leaf->value = std::move(val);
+    leaf->set_value(std::move(val));
     mutable_node->insert_child(transition, std::move(leaf));
     return {std::move(mutable_node), true};
   }
 
   // Transient erase with path compression.
   static auto erase_transient(const std::shared_ptr<Node<V>> &node,
-                              std::span<const std::byte> key, std::uint64_t tag)
+                              std::span<const std::byte> key, std::uint32_t tag)
       -> std::pair<std::shared_ptr<Node<V>>, bool> {
     if (!node)
       return {nullptr, false};
@@ -754,11 +776,11 @@ private:
 
     auto remaining = key.subspan(cpl);
     if (remaining.empty()) {
-      if (!node->value)
+      if (!node->has_value())
         return {node, false};
 
       auto mutable_node = ensure_mutable(node, tag);
-      mutable_node->value.reset();
+      mutable_node->clear_value();
 
       if (mutable_node->children.empty())
         return {nullptr, true};
@@ -782,10 +804,10 @@ private:
     auto mutable_node = ensure_mutable(node, tag);
     if (!new_child) {
       mutable_node->remove_child(transition);
-      if (!mutable_node->value && mutable_node->children.size() == 1) {
+      if (!mutable_node->has_value() && mutable_node->children.size() == 1) {
         return {merge_with_child_transient(std::move(mutable_node), tag), true};
       }
-      if (!mutable_node->value && mutable_node->children.empty()) {
+      if (!mutable_node->has_value() && mutable_node->children.empty()) {
         return {nullptr, true};
       }
       return {std::move(mutable_node), true};
@@ -796,9 +818,9 @@ private:
   }
 
   static auto merge_with_child_transient(std::shared_ptr<Node<V>> node,
-                                         std::uint64_t tag)
+                                         std::uint32_t tag)
       -> std::shared_ptr<Node<V>> {
-    assert(!node->value && node->children.size() == 1);
+    assert(!node->has_value() && node->children.size() == 1);
     auto transition = node->children[0].first;
     auto child = ensure_mutable(node->children[0].second, tag);
 
@@ -818,7 +840,15 @@ private:
 // Out-of-line: PersistentRadixTree::transient()
 template <typename V>
 auto PersistentRadixTree<V>::transient() const -> TransientRadixTree<V> {
-  auto tag = detail::next_edit_tag.fetch_add(1, std::memory_order_relaxed);
+  // Relaxed ordering: only uniqueness is required, not inter-thread visibility
+  // ordering. Each transient session gets a distinct tag via fetch_add.
+  // Truncate to 31 bits — tag 0 is reserved for "immutable" sentinel.
+  auto raw = detail::next_edit_tag.fetch_add(1, std::memory_order_relaxed);
+  auto tag = static_cast<std::uint32_t>(raw & 0x7FFF'FFFFu);
+  if (tag == 0) [[unlikely]]
+    tag = static_cast<std::uint32_t>(
+        detail::next_edit_tag.fetch_add(1, std::memory_order_relaxed) &
+        0x7FFF'FFFFu);
   return TransientRadixTree<V>{root_, size_, tag};
 }
 
@@ -839,7 +869,7 @@ public:
 
   auto operator*() const -> std::pair<std::span<const std::byte>, const V &> {
     return {std::span<const std::byte>{current_key_},
-            *stack_.back().node->value};
+            stack_.back().node->value_};
   }
 
   auto operator++() -> RadixTreeIterator & {
@@ -882,7 +912,7 @@ private:
     if (!root)
       return;
     push_node(root, 0);
-    if (!stack_.empty() && !stack_.back().node->value) {
+    if (!stack_.empty() && !stack_.back().node->has_value()) {
       advance();
     }
   }
@@ -895,7 +925,7 @@ private:
     auto at_target = seek(root, target);
     if (stack_.empty())
       return;
-    if (at_target && stack_.back().node->value)
+    if (at_target && stack_.back().node->has_value())
       return;
     advance();
   }
@@ -919,7 +949,7 @@ private:
         auto key_before = current_key_.size();
         current_key_.push_back(transition);
         push_node(child, key_before);
-        if (stack_.back().node->value)
+        if (stack_.back().node->has_value())
           return;
         // Continue DFS.
       } else {
