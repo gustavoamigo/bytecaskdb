@@ -135,3 +135,74 @@ When removing a value (`node->value = std::nullopt`), the tree must maintain Pat
 8.  **Memory safety:** Full test suite (70 test cases, 47,529 assertions) passes under Clang AddressSanitizer + LeakSanitizer with zero errors. Build via `xmake f --sanitizer=address -m debug`.
 9.  **Concurrent reader/writer safety:** A dedicated test (`[concurrency]` tag) spawns 4 reader threads iterating a persistent snapshot while a writer thread mutates a transient derived from the same snapshot. All readers observe a consistent, unchanged snapshot throughout. ThreadSanitizer verification requires ASLR control (`xmake f --sanitizer=thread -m debug`; run with `setarch -R` or lowered `vm.mmap_rnd_bits`).
 10. **Memory footprint:** `BM_MemoryFootprint` benchmarks in `map_bench.cpp` report heap bytes allocated per key for each container at 1k/10k/100k keys, enabling relative comparison of memory overhead.
+
+---
+
+## 7. Memory Usage
+
+### 7.1. Node layout breakdown
+
+Each `Node<V>` is allocated via `std::make_shared`, which produces a single heap block containing both the control block and the object itself.
+
+| Field | Type | Bytes |
+|---|---|---|
+| `packed_tag_` | `uint32_t` | 4 |
+| `value_` | `V` (e.g. `int`) | 4 |
+| `prefix` size word | `size_t` | 8 |
+| `prefix` union (inline 24 B or `std::vector`) | `union` | 24 |
+| `children` size word | `size_t` | 8 |
+| `children` union (inline 1 slot = 24 B or `std::vector`) | `union` | 24 |
+| **Node struct total** | | **72 bytes** |
+| `make_shared` control block (ref counts + deleter) | | ~32 bytes |
+| **Per-node heap cost** | | **~104 bytes** |
+
+One children slot is `pair<byte, shared_ptr<Node>>` = 1 byte + 7 bytes padding + 16 bytes (`shared_ptr` = raw ptr + ctrl ptr) = **24 bytes**.
+
+The prefix `SmallVector<byte, 24>` holds up to 24 bytes inline at no extra cost (the `std::vector` member in the union is itself 24 bytes, so N=24 is the maximum inline capacity that doesn't grow the struct).
+
+### 7.2. Node distribution
+
+For a typical key set with reasonable prefix compression the tree has approximately 1.07 nodes per key (a small constant overhead for routing nodes at split points). Leaf nodes (0 children) make up ~94% of nodes; internal routing nodes (~6%) spill their `children` vector to the heap because they fan out over many transition bytes (e.g. the 16 hex-digit branches of a UUID segment).
+
+| Node type | Fraction | Children storage |
+|---|---|---|
+| Leaf (0 children) | ~94% | 32 B inline, 0 wasted |
+| Internal (2+ children) | ~6% | 32 B inline header + heap vector |
+
+### 7.3. Measured footprint
+
+Values from `BM_MemoryFootprint` at 100k keys (measured with the global allocator tracker):
+
+| Container | Key type | B/key (generic) | B/key (prefixed UUIDv7) | Key-length sensitivity |
+|---|---|---|---|---|
+| `PersistentRadixTree` | `span<byte>` (not stored) | **129 B** | **139 B** | Low — prefix compression absorbs shared bytes |
+| `std::map` | `std::string` | 72 B | 117 B | High — full key copied into every node |
+| `PersistentOrderedMap` | `immer::flex_vector` entry | ~40 B\* | ~75 B\* | High — full key copied per entry |
+
+\* `PersistentOrderedMap` figures reflect structural sharing at the `immer::flex_vector` chunk level, not raw per-key key storage. A single live snapshot in isolation carries roughly the same key storage cost as `std::map`.
+
+### 7.4. Prefix compression in practice
+
+Prefix compression is not free: it replaces raw key bytes with tree structure. The trade-off is:
+
+- **What gets compressed**: bytes shared between keys with a common prefix are stored once in a routing node rather than repeated in every leaf.
+- **What gets paid**: each node carries ~104 bytes of overhead (struct + `make_shared` control block) regardless of how many bytes it compresses.
+
+For short, dissimilar keys (e.g. the generic `"key_N"` benchmark, 6–10 bytes each), compression is minimal and the per-node overhead dominates — hence ~129 B/key versus `std::map`'s 72 B/key. For long, highly-redundant keys (e.g. `"user::018f6e2c-XXXX-7000-8000-XXXXXXXXXXXX"`, 45 bytes, 5 prefixes × 20k keys), RadixTree absorbs the extra key length at only +10 B/key (+8%) while `std::map` pays +45 B/key (+63%), confirming that prefix compression is working correctly.
+
+### 7.5. 100M key projections
+
+The primary concern for ByteCask is the key directory at production scale. The table below uses 1.07 nodes/key and the measured 129 B/key at 100k as the per-node baseline.
+
+| Configuration | B/key | 100M keys |
+|---|---|---|
+| Current (N=1 children, packed tag, `make_shared`) | **129** | **~12.9 GB** |
+| + replace `SmallVector<byte,24>` prefix with arena offset+len | ~103 | ~10.3 GB |
+| + pool allocator (eliminate 32 B `make_shared` control block) | ~75 | ~7.5 GB |
+| `std::map` (no persistence, no prefix compression) | 72 | ~7.2 GB |
+
+The current implementation is already past the worst of the structural overhead from earlier designs (N=8 children, `uint64_t` tag + `optional<V>` was ~209 B/key). The remaining gap to `std::map` is driven entirely by the `make_shared` control block (32 B/node) and the `SmallVector` size word (8 B each × 2 = 16 B).
+
+### 7.6. What the `OrderedMap` memory benchmark actually measures
+
+`PersistentOrderedMap` is backed by `immer::flex_vector`, a Radix Balanced Tree of 32-element chunks. Because consecutive `set()` calls produce a chain of versions that share chunks, the allocation tracker reports only **net new bytes in the final snapshot** — bytes from discarded intermediate versions are allocated and immediately freed. The reported ~40 B/key for generic keys and ~75 B/key for prefixed keys do not represent the RAM cost of holding a single live copy of that map. A snapshot in isolation occupies approximately the same RAM as a comparable `std::map`.

@@ -139,6 +139,20 @@ struct OMapAdapter {
 
   static auto get(const map_type &m, const key_type &k) { return m.get(k); }
 
+  static auto build_transient(const std::vector<key_type> &keys)
+      -> bytecask::OrderedMapTransient<key_type, int> {
+    auto tr = map_type{}.transient();
+    for (std::size_t i = 0; i < keys.size(); ++i)
+      tr.set(keys[i], static_cast<int>(i));
+    return tr;
+  }
+
+  static auto
+  transient_get(const bytecask::OrderedMapTransient<key_type, int> &tr,
+                const key_type &k) {
+    return tr.get(k);
+  }
+
   static auto lower_bound(const map_type &m, const key_type &k) {
     return m.lower_bound(k);
   }
@@ -370,6 +384,7 @@ BENCHMARK(BM_MemoryFootprint<StdMapAdapter>)->Name("StdMap/Memory")    SIZES;
 
 // Point lookups
 BENCHMARK(BM_Get<OMapAdapter>)            ->Name("OrderedMap/Get")           SIZES;
+BENCHMARK(BM_TransientGet<OMapAdapter>)   ->Name("OrderedMap/TransientGet")  SIZES;
 BENCHMARK(BM_Get<RTreeAdapter>)           ->Name("RadixTree/Get")            SIZES;
 BENCHMARK(BM_TransientGet<RTreeAdapter>)  ->Name("RadixTree/TransientGet")   SIZES;
 BENCHMARK(BM_Get<StdMapAdapter>)          ->Name("StdMap/Get")               SIZES;
@@ -384,14 +399,10 @@ BENCHMARK(BM_LowerBound<OMapAdapter>)     ->Name("OrderedMap/LowerBound")    SIZ
 BENCHMARK(BM_LowerBound<RTreeAdapter>)    ->Name("RadixTree/LowerBound")     SIZES;
 BENCHMARK(BM_LowerBound<StdMapAdapter>)   ->Name("StdMap/LowerBound")        SIZES;
 
-// Memory footprint (heap bytes after build)
-BENCHMARK(BM_MemoryFootprint<OMapAdapter>)   ->Name("OrderedMap/Memory")     SIZES;
-BENCHMARK(BM_MemoryFootprint<RTreeAdapter>)  ->Name("RadixTree/Memory")      SIZES;
-BENCHMARK(BM_MemoryFootprint<StdMapAdapter>) ->Name("StdMap/Memory")         SIZES;
-
 // Memory footprint with prefix-heavy keys (user::uuid, order::uuid, …)
-BENCHMARK(BM_PrefixedMemory<RTreeAdapter>)   ->Name("RadixTree/PrefixedMemory") SIZES;
-BENCHMARK(BM_PrefixedMemory<StdMapAdapter>)  ->Name("StdMap/PrefixedMemory")    SIZES;
+BENCHMARK(BM_PrefixedMemory<OMapAdapter>)    ->Name("OrderedMap/PrefixedMemory") SIZES;
+BENCHMARK(BM_PrefixedMemory<RTreeAdapter>)   ->Name("RadixTree/PrefixedMemory")  SIZES;
+BENCHMARK(BM_PrefixedMemory<StdMapAdapter>)  ->Name("StdMap/PrefixedMemory")     SIZES;
 
 #undef SIZES
 #undef ITER_SIZES

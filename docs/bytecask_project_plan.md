@@ -15,7 +15,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-033 | Radix tree hardening | `find_child`/`find_child_mut` keep linear scan (binary search benchmarked 40-55% slower on Get path due to small child counts from prefix compression); implicit-lifetime comment on `SmallVector::clear()`; safety comment on `seek()` prefix-append discipline; intent comment on `next_edit_tag` relaxed ordering. 10 new test cases: empty-key erase, long keys (>24 B prefix spill), binary/non-ASCII keys, lower_bound on empty tree, lower_bound before first key, wide fanout (>8 children spill), transient overwrite, transient erase path compression, iterator post-increment, tree copy/move semantics. Prefix-compression memory benchmark (`BM_PrefixedMemory`) with UUIDv7-style keys across 5 prefixes — confirms prefix sharing: 4-6× longer keys add only +7% bytes/key to RadixTree vs +63% to StdMap. 33 test cases, ~1M assertions pass. |
+| BC-033 | Radix tree hardening + memory layout optimisation | Phase 1: linear scan kept, 3 comments added, 10 new tests (33 total, ~1M assertions). Phase 2: children N=8→N=4 (−31% memory). Phase 3 (current): packed node layout — `uint64_t edit_tag` + `optional<V>` replaced by `uint32_t packed_tag_` (high bit = has_value) + bare `V value_` (Change A, −8 B/node); children N=4→N=1 (Change B, −72 B/node weighted). Combined: 184→112 B/node; measured 209→129 B/key (−38%) at 100k generic keys, 225→139 B/key (−38%) with prefixed UUIDv7 keys; baseline 100M-key projection drops from ~20 GB to ~13 GB. 33 tests pass. |
 
 ## Backlog
 
