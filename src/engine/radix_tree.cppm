@@ -351,7 +351,9 @@ template <typename V> struct Node {
   // Low 31 bits = transient edit tag (0 = immutable).
   std::uint32_t packed_tag_{0};
   V value_{};
-  SmallVector<std::byte, 24> prefix;
+
+  using Prefix = SmallVector<std::byte, 24>;
+  Prefix prefix;
 
   // Children: null for leaf nodes, heap-allocated for internal nodes.
   // 94% of nodes are leaves — they pay only 8 B (null pointer) instead
@@ -570,7 +572,7 @@ private:
     if (!node) {
       // Create a leaf.
       auto leaf = make_intrusive<Node<V>>();
-      leaf->prefix = SmallVector<std::byte, 24>{};
+      leaf->prefix = typename Node<V>::Prefix{};
       for (auto b : key)
         leaf->prefix.push_back(b);
       leaf->set_value(std::move(val));
@@ -593,7 +595,7 @@ private:
       // the transition byte.
       auto existing_child = node->clone();
       auto old_transition = prefix_span[cpl];
-      SmallVector<std::byte, 24> old_suffix;
+      typename Node<V>::Prefix old_suffix;
       for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
         old_suffix.push_back(prefix_span[i]);
       existing_child->prefix = std::move(old_suffix);
@@ -722,7 +724,7 @@ private:
     auto transition = node->child_at(0).first;
     auto child = node->child_at(0).second->clone();
 
-    SmallVector<std::byte, 24> merged_prefix;
+    typename Node<V>::Prefix merged_prefix;
     for (auto b : node->prefix)
       merged_prefix.push_back(b);
     merged_prefix.push_back(transition);
@@ -831,7 +833,7 @@ private:
         split->prefix.push_back(prefix_span[i]);
 
       auto old_transition = prefix_span[cpl];
-      SmallVector<std::byte, 24> old_suffix;
+      typename Node<V>::Prefix old_suffix;
       for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
         old_suffix.push_back(prefix_span[i]);
       mutable_node->prefix = std::move(old_suffix);
@@ -941,7 +943,7 @@ private:
     auto transition = node->child_at(0).first;
     auto child = ensure_mutable(node->child_at(0).second, tag);
 
-    SmallVector<std::byte, 24> merged_prefix;
+    typename Node<V>::Prefix merged_prefix;
     for (std::size_t i = 0; i < node->prefix.size(); ++i)
       merged_prefix.push_back(node->prefix[i]);
     merged_prefix.push_back(transition);
