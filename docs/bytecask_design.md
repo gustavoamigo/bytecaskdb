@@ -2,7 +2,7 @@
 
 ## Purpose
 
-ByteCask is a [Bitcask](https://riak.com/assets/bitcask-intro.pdf) implementation with a key architectural difference: it uses an immutable **B-Tree** for the Key Directory instead of a Hash Table. This design choice enables efficient **range queries** and **prefix searches** while maintaining Bitcask's core strengths of fast writes and simple recovery. The name "ByteCask" reflects this hybrid approach: **Bitcask algorithm** + **B-Tree index** = **ByteCask**.
+ByteCask is a [Bitcask](https://riak.com/assets/bitcask-intro.pdf) implementation with a key architectural difference: it uses an immutable **persistent radix tree** for the Key Directory instead of a Hash Table. This design choice enables efficient **range queries** and **prefix searches** while maintaining Bitcask's core strengths of fast writes and simple recovery. The name "ByteCask" reflects this hybrid approach: **Bitcask algorithm** + **tree index** = **ByteCask**.
 
 **Fundamental Trade-off**: ByteCask keeps **all keys in memory** at all times. This enables extremely fast lookups and range queries but limits database size to available RAM. Considering a memory requirement of approximately 100 bytes per unique key (key data + metadata + tree structure overhead), 10 million keys would require around 1 GB RAM.
 
@@ -37,11 +37,13 @@ The design follows these core tenets in order of priority:
 
 ### Key Directory
 
-ByteCask uses `PersistentOrderedMap<Key, KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times.
+ByteCask uses `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times.
 
-`immer::btree_map` does not exist in the immer library. The replacement is a thin wrapper, `PersistentOrderedMap<K, V>`, backed by `immer::flex_vector<Entry>` (Radix Balanced Tree). It provides the same sorted-map semantics with O(log n) get/set/erase, structural sharing across versions, and a `transient()` / `persistent()` API for batch mutations. Implemented in `bytecask.persistent_ordered_map` (`src/engine/persistent_ordered_map.cppm`).
+The key directory is a persistent (immutable) radix tree with path-compressed nodes, intrusive reference counting, and structural sharing across versions. It provides O(k) get/set/erase (where k = key length), ordered iteration via DFS, `lower_bound()` for range queries, and a `transient()` / `persistent()` API for batch mutations. Implemented in `bytecask.radix_tree` (`src/engine/radix_tree.cppm`).
 
-`Key` is a lightweight value class wrapping `immer::array<std::byte>`, distinct from the generic `Bytes` (`std::vector<std::byte>`) type. Because the key directory is an `immer::flex_vector<Entry>`, every structural modification (set/erase) copies `Entry` objects into new tree nodes while sharing the rest. With `immer::array` as the backing store, key copies are O(1) reference-count bumps instead of O(n) heap allocations. `Key` provides `operator<=>` (lexicographic over raw byte values), `begin()`/`end()`/`size()`/`data()` accessors, and a `view()` method returning `BytesView`. Keys have a hard upper bound of 65 535 bytes (the `u16 key_size` field in the data file header).
+Keys are stored as byte sequences within the radix tree's prefix-compressed nodes. The radix tree API accepts `std::span<const std::byte>` for all key parameters — no intermediate `Key` wrapper is needed for internal operations. The public `Key` class (wrapping `immer::array<std::byte>`) is retained for the external iterator API (`KeyIterator`, `EntryIterator`) and for the recovery tombstone tracking map. `Key` provides `operator<=>` (lexicographic over raw byte values), `begin()`/`end()`/`size()`/`data()` accessors, and a `view()` method returning `BytesView`. Keys have a hard upper bound of 65 535 bytes (the `u16 key_size` field in the data file header).
+
+**Historical note**: the original key directory used `PersistentOrderedMap<Key, KeyDirEntry>`, backed by `immer::flex_vector<Entry>`. The radix tree replacement (BC-030) delivers O(k) lookups vs O(n log n) binary search, lower memory overhead via prefix compression and intrusive refcounting, and faster batch mutations via the transient API's in-place path copying. `PersistentOrderedMap` is retained in the codebase for benchmarking purposes (`benchmarks/map_bench.cpp`).
 
 ### Concurrency Model
 
@@ -191,7 +193,8 @@ We use fine-grained C++20 modules:
 - `bytecask.data_entry`: Logical entry definition and single-entry memory formatting.
 - `bytecask.data_file`: Disk I/O, writing streams sequentially to `.data` files.
 - `bytecask.hint_file`: Hint file writer and reader (`HintFile`, `HintEntry`).
-- `bytecask.persistent_ordered_map`: Immutable sorted map (`PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`) backed by `immer::flex_vector`; used as the key directory.
+- `bytecask.persistent_ordered_map`: Immutable sorted map (`PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`) backed by `immer::flex_vector`; retained for benchmarking.
+- `bytecask.radix_tree`: Persistent radix tree (`PersistentRadixTree<V>`, `TransientRadixTree<V>`, `RadixTreeIterator<V>`) with path compression and intrusive refcounting; used as the key directory.
 - `bytecask.engine`: Public engine API (`Bytecask`, `Batch`, `KeyIterator`, `EntryIterator`, `FileRegistry`, type aliases).
 
 ### Current scope boundaries

@@ -25,7 +25,7 @@ import bytecask.crc32;
 import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.hint_file;
-import bytecask.persistent_ordered_map;
+import bytecask.radix_tree;
 import bytecask.types;
 
 namespace bytecask {
@@ -41,11 +41,11 @@ export using Bytes = std::vector<std::byte>;
 export using BytesView = std::span<const std::byte>;
 
 // ---------------------------------------------------------------------------
-// Key — lightweight value wrapper around immer::array<std::byte>.
+// Key — lightweight owning byte sequence backed by immer::array<std::byte>.
 //
-// Copies are O(1) (reference-count bump) instead of O(n) deep copies.
-// This matters because PersistentOrderedMap copies Entry objects into
-// shared tree nodes on every structural modification.
+// Copies are O(1) (reference-count bump). Used by KeyIterator and
+// EntryIterator to materialise stable keys from RadixTreeIterator's
+// transient span, and by the recovery tombstone map (needs operator<=>).
 // Keys have an upper bound of 65 535 bytes (u16 key_size in the data file).
 // ---------------------------------------------------------------------------
 export class Key {
@@ -57,12 +57,6 @@ public:
   [[nodiscard]] auto begin() const { return data_.begin(); }
   [[nodiscard]] auto end() const { return data_.end(); }
   [[nodiscard]] auto size() const noexcept { return data_.size(); }
-  [[nodiscard]] auto empty() const noexcept { return data_.size() == 0; }
-  [[nodiscard]] auto data() const { return data_.data(); }
-
-  [[nodiscard]] auto view() const -> BytesView {
-    return {data_.data(), data_.size()};
-  }
 
   auto operator<=>(const Key &other) const -> std::strong_ordering {
     return std::lexicographical_compare_three_way(
@@ -155,6 +149,8 @@ export using FileRegistry =
 // KeyIterator — walks the key directory in ascending key order.
 //
 // In-memory only: no data file I/O. Satisfies std::input_iterator.
+// Wraps RadixTreeIterator<KeyDirEntry> and materializes Key objects from
+// the iterator's key span on each advance.
 // ---------------------------------------------------------------------------
 export class KeyIterator {
 public:
@@ -163,26 +159,38 @@ public:
 
   KeyIterator() = default;
 
-  KeyIterator(PersistentOrderedMap<Key, KeyDirEntry>::const_iterator cur,
-              PersistentOrderedMap<Key, KeyDirEntry>::const_iterator end)
-      : cur_{cur}, end_{end} {}
+  explicit KeyIterator(RadixTreeIterator<KeyDirEntry> cur)
+      : cur_{std::move(cur)} {
+    cache_key();
+  }
 
-  auto operator*() const -> const value_type & { return cur_->key; }
+  auto operator*() const -> const value_type & { return cached_key_; }
 
   auto operator++() -> KeyIterator & {
     ++cur_;
+    cache_key();
     return *this;
   }
 
-  void operator++(int) { ++cur_; }
+  void operator++(int) {
+    ++cur_;
+    cache_key();
+  }
 
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
-    return cur_ == end_;
+    return cur_ == std::default_sentinel;
   }
 
 private:
-  PersistentOrderedMap<Key, KeyDirEntry>::const_iterator cur_{};
-  PersistentOrderedMap<Key, KeyDirEntry>::const_iterator end_{};
+  void cache_key() {
+    if (cur_ != std::default_sentinel) {
+      auto [key_span, val] = *cur_;
+      cached_key_ = Key{key_span};
+    }
+  }
+
+  RadixTreeIterator<KeyDirEntry> cur_;
+  Key cached_key_;
 };
 
 // ---------------------------------------------------------------------------
@@ -190,6 +198,7 @@ private:
 // lazily from disk on each dereference.
 //
 // Satisfies std::input_iterator. Throws std::system_error on I/O failure.
+// Wraps RadixTreeIterator<KeyDirEntry>; materializes Key + value on demand.
 // files_ is a snapshot of the engine's registry at construction time.
 // O(1) structural sharing via immer::map; independent lifetime from Bytecask.
 // ---------------------------------------------------------------------------
@@ -200,17 +209,15 @@ public:
 
   EntryIterator() = default;
 
-  EntryIterator(PersistentOrderedMap<Key, KeyDirEntry>::const_iterator cur,
-                PersistentOrderedMap<Key, KeyDirEntry>::const_iterator end,
-                FileRegistry files)
-      : cur_{cur}, end_{end}, files_{std::move(files)} {}
+  EntryIterator(RadixTreeIterator<KeyDirEntry> cur, FileRegistry files)
+      : cur_{std::move(cur)}, files_{std::move(files)} {}
 
   // Reads the value from disk on demand (lazy). Caches the result until ++.
   auto operator*() const -> const value_type & {
     if (!cached_) {
-      auto entry =
-          files_->at(cur_->value.file_id)->read(cur_->value.file_offset);
-      cached_.emplace(Key{cur_->key}, std::move(entry.value));
+      auto [key_span, dir_entry] = *cur_;
+      auto entry = files_->at(dir_entry.file_id)->read(dir_entry.file_offset);
+      cached_.emplace(Key{key_span}, std::move(entry.value));
     }
     return *cached_;
   }
@@ -227,12 +234,11 @@ public:
   }
 
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
-    return cur_ == end_;
+    return cur_ == std::default_sentinel;
   }
 
 private:
-  PersistentOrderedMap<Key, KeyDirEntry>::const_iterator cur_{};
-  PersistentOrderedMap<Key, KeyDirEntry>::const_iterator end_{};
+  RadixTreeIterator<KeyDirEntry> cur_;
   FileRegistry files_;
   mutable std::optional<value_type> cached_;
 };
@@ -331,7 +337,7 @@ public:
   // mismatch.
   [[nodiscard]] auto get(const ReadOptions & /*opts*/, BytesView key) const
       -> std::optional<Bytes> {
-    const auto kv = key_dir_.get(to_key(key));
+    const auto kv = key_dir_.get(key);
     if (!kv) {
       return std::nullopt;
     }
@@ -344,13 +350,12 @@ public:
   // opts.sync controls whether fdatasync is called after the write.
   // Throws std::system_error on I/O failure.
   void put(const WriteOptions &opts, BytesView key, BytesView value) {
-    auto k = to_key(key);
     const auto offset =
         active_file().append(next_lsn_, EntryType::Put, key, value);
 
-    key_dir_ = key_dir_.set(std::move(k),
-                            KeyDirEntry{next_lsn_, active_file_id_, offset,
-                                        narrow<std::uint32_t>(value.size())});
+    key_dir_ =
+        key_dir_.set(key, KeyDirEntry{next_lsn_, active_file_id_, offset,
+                                      narrow<std::uint32_t>(value.size())});
     ++next_lsn_;
     if (opts.sync) {
       active_file().sync();
@@ -364,15 +369,13 @@ public:
   // opts.sync controls whether fdatasync is called after the write.
   // Throws std::system_error on I/O failure.
   [[nodiscard]] auto del(const WriteOptions &opts, BytesView key) -> bool {
-    const auto k = to_key(key);
-
-    if (!key_dir_.contains(k)) {
+    if (!key_dir_.contains(key)) {
       return false;
     }
     std::ignore = active_file().append(next_lsn_, EntryType::Delete, key, {});
     ++next_lsn_;
 
-    key_dir_ = key_dir_.erase(k);
+    key_dir_ = key_dir_.erase(key);
     if (opts.sync) {
       active_file().sync();
     }
@@ -382,7 +385,7 @@ public:
 
   // Returns true if key exists in the index (no disk I/O).
   [[nodiscard]] auto contains_key(BytesView key) const -> bool {
-    return key_dir_.contains(to_key(key));
+    return key_dir_.contains(key);
   }
 
   // ── Batch ──────────────────────────────────────────────────────────────
@@ -409,7 +412,7 @@ public:
               const auto offset = active_file().append(
                   next_lsn_, EntryType::Put, std::span<const std::byte>{o.key},
                   std::span<const std::byte>{o.value});
-              t.set(Key{o.key},
+              t.set(std::span<const std::byte>{o.key},
                     KeyDirEntry{next_lsn_, active_file_id_, offset,
                                 narrow<std::uint32_t>(o.value.size())});
               ++next_lsn_;
@@ -418,7 +421,7 @@ public:
                   active_file().append(next_lsn_, EntryType::Delete,
                                        std::span<const std::byte>{o.key}, {});
               ++next_lsn_;
-              t.erase(Key{o.key});
+              t.erase(std::span<const std::byte>{o.key});
             }
           },
           op);
@@ -442,10 +445,9 @@ public:
   [[nodiscard]] auto iter_from(const ReadOptions & /*opts*/,
                                BytesView from = {}) const
       -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
-    const auto k = to_key(from);
-    const auto it = from.empty() ? key_dir_.begin() : key_dir_.lower_bound(k);
+    auto it = from.empty() ? key_dir_.begin() : key_dir_.lower_bound(from);
     return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
-        EntryIterator{it, key_dir_.end(), files_}, std::default_sentinel};
+        EntryIterator{std::move(it), files_}, std::default_sentinel};
   }
 
   // Returns an input range of keys >= from. Walks the in-memory key directory
@@ -453,10 +455,9 @@ public:
   [[nodiscard]] auto keys_from(const ReadOptions & /*opts*/,
                                BytesView from = {}) const
       -> std::ranges::subrange<KeyIterator, std::default_sentinel_t> {
-    const auto k = to_key(from);
-    const auto it = from.empty() ? key_dir_.begin() : key_dir_.lower_bound(k);
+    auto it = from.empty() ? key_dir_.begin() : key_dir_.lower_bound(from);
     return std::ranges::subrange<KeyIterator, std::default_sentinel_t>{
-        KeyIterator{it, key_dir_.end()}, std::default_sentinel};
+        KeyIterator{std::move(it)}, std::default_sentinel};
   }
 
   // ── Hint file management ───────────────────────────────────────────────
@@ -509,9 +510,6 @@ private:
     files_->emplace(active_file_id_,
                     std::make_shared<DataFile>(dir_ / (stem + ".data")));
   }
-
-  // Converts a BytesView (or empty span) into a Key.
-  static auto to_key(BytesView v) -> Key { return Key{v}; }
 
   // Returns a reference to the current active DataFile.
   auto active_file() -> DataFile & { return *files_->at(active_file_id_); }
@@ -569,14 +567,14 @@ private:
         const auto k = Key{key};
         const auto tomb_it = tombstones.find(k);
         if (tomb_it != tombstones.end() && tomb_it->second >= seq) {
-          // A Delete with seq >= this Put was already seen; suppress.
           if (seq > max_lsn)
             max_lsn = seq;
           return;
         }
-        const auto existing = transient_key_dir.get(k);
+        const auto existing =
+            transient_key_dir.get(std::span<const std::byte>{key});
         if (!existing || existing->sequence < seq) {
-          transient_key_dir.set(k,
+          transient_key_dir.set(std::span<const std::byte>{key},
                                 KeyDirEntry{seq, file_id, file_off, val_size});
         }
         if (seq > max_lsn)
@@ -586,14 +584,13 @@ private:
       const auto apply_del = [&](std::uint64_t seq,
                                  const std::vector<std::byte> &key) {
         const auto k = Key{key};
-        // Record the highest Delete sequence for this key so that a stale Put
-        // processed later (from another file) is correctly suppressed.
         auto &tomb_seq = tombstones[k];
         if (seq > tomb_seq)
           tomb_seq = seq;
-        const auto existing = transient_key_dir.get(k);
+        const auto existing =
+            transient_key_dir.get(std::span<const std::byte>{key});
         if (existing && existing->sequence < seq) {
-          transient_key_dir.erase(k);
+          transient_key_dir.erase(std::span<const std::byte>{key});
         }
         if (seq > max_lsn)
           max_lsn = seq;
@@ -702,7 +699,7 @@ private:
   }
 
   std::filesystem::path dir_;
-  PersistentOrderedMap<Key, KeyDirEntry> key_dir_;
+  PersistentRadixTree<KeyDirEntry> key_dir_;
   // Copy-on-write registry: rotation clones the inner map and replaces
   // files_. In-flight iterators hold a copy of the outer shared_ptr and see
   // the old snapshot without any locking. The fd is never closed while any
