@@ -53,6 +53,20 @@ ByteCask follows a **single-writer / multiple-reader (SWMR)** model:
 - Multiple readers may operate concurrently.
 - MVCC and snapshot isolation are not supported.
 
+#### Write Lock
+
+The engine enforces the SWMR contract internally via a `std::shared_mutex` (`rw_mutex_`):
+
+- **Writers** (`put`, `del`, `apply_batch`) acquire a `unique_lock` — serialising all mutations.
+- **Readers** (`get`, `contains_key`, `iter_from`, `keys_from`) acquire a brief `shared_lock` to snapshot `key_dir_` (O(1) — refcount bump on persistent tree root) and `files_` (O(1) — `shared_ptr` copy), then release the lock before doing any disk I/O. Multiple readers hold shared locks concurrently with each other and, because the lock is held only for the duration of the snapshot copy, contention with writers is minimal.
+
+`WriteOptions::try_lock` (default `false`) controls write-lock acquisition behaviour:
+
+- `false` (default) — blocking acquire via `std::unique_lock`. The caller waits until the lock is available.
+- `true` — non-blocking attempt via `std::unique_lock::try_lock()`. If the lock is already held, the call throws `std::system_error` with `std::errc::resource_unavailable_try_again` instead of waiting.
+
+The shared_mutex is heap-allocated (`std::unique_ptr<std::shared_mutex>`) because `std::shared_mutex` is not movable and `Bytecask` is a move-only type.
+
 ### File Registry
 
 The engine maintains a registry that maps a monotonic `uint32_t` file ID to an open `DataFile`. The type is:

@@ -15,7 +15,6 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-035 | Leaf node optimization: pointer-to-children | Replace `SmallVector<..., 1> children` (32 B always) with `unique_ptr<ChildVec>` (8 B null for leaves). 94% of nodes are leaves and pay only 8 B pointer instead of 32 B empty SmallVector. Node struct: 80→56 B. Measured: 86 B/key generic (−20% from intrusive, −33% from original), 92 B/key prefixed (−21% from intrusive, −34% from original). 82 tests pass (1M+ assertions). ASan clean. |
 
 ## Backlog
 
@@ -24,7 +23,6 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-024 | Implement PMR - Memory Allocation described in design | Note: There is a draft proposal in the bytecask_design.md
 | BC-026 | Run `flush_hints` in background after file rotate | After rotation, dispatch `flush_hints()` on the sealed file to a background thread so it does not block the write path. |
-| BC-027 | Write lock to enforce SWMR contract | Add a `std::mutex` (or file-level lock) to `Bytecask` so the SWMR contract is enforced at the engine level instead of at the call site. `WriteOptions` should gain a `bool try_lock` field (default `false` = blocking acquire) so callers can opt into a non-blocking attempt that returns an error instead of waiting. |
 
 
 ## Done
@@ -62,3 +60,5 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-010 | CrcInputAdapter for read path | Not implemented — read path uses direct `Crc32::update()` on the full entry buffer in `deserialize_entry`; no bitsery input adapter was required. |
 | BC-015 | EntryType replaces Flags in header | `flags` u8 replaced by `EntryType` enum; layout seq(8)+type(1)+key_size(2)+val_size(4); `append(seq,type,key,val)` API. 36 assertions pass. |
 | BC-012 | Migrate tests to Catch2 | Replaced hand-rolled `fail()`/`expect()` harness with Catch2 v3. `TEST_CASE`/`CHECK`/`REQUIRE` macros, Catch2's own `main()`, randomized test order. 3 test cases, 28 assertions. |
+| BC-035 | Leaf node optimization: pointer-to-children | Replace `SmallVector<..., 1> children` (32 B always) with `unique_ptr<ChildVec>` (8 B null for leaves). 94% of nodes are leaves and pay only 8 B pointer instead of 32 B empty SmallVector. Node struct: 80→56 B. Measured: 86 B/key generic (−20% from intrusive, −33% from original), 92 B/key prefixed (−21% from intrusive, −34% from original). 82 tests pass (1M+ assertions). ASan clean. |
+| BC-027 | Write lock to enforce SWMR contract | `std::shared_mutex` (heap-allocated via `unique_ptr`) in `Bytecask`. Writers take `unique_lock`; readers take brief `shared_lock` to snapshot key_dir_ + files_ then release before I/O. `WriteOptions::try_lock` (default `false`) enables non-blocking attempts that throw `system_error(resource_unavailable_try_again)` on contention. |
