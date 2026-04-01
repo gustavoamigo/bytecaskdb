@@ -10,10 +10,13 @@ module;
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
+#include <shared_mutex>
 #include <span>
 #include <string>
+#include <system_error>
 #include <time.h>
 #include <utility>
 #include <variant>
@@ -283,6 +286,11 @@ export struct WriteOptions {
   // durability: data is in the OS page cache but not guaranteed on disk until
   // the next explicit sync or clean engine shutdown.
   bool sync{true};
+
+  // When false (default), the write lock is acquired with a blocking wait.
+  // When true, a non-blocking try_lock is attempted; if the lock is already
+  // held, throws std::system_error with errc::resource_unavailable_try_again.
+  bool try_lock{false};
 };
 
 // Reserved for future read-path controls (e.g. verify_checksums, snapshots).
@@ -298,7 +306,10 @@ export struct ReadOptions {};
 // keep write-path latency flat and bounded (predictable latency over peak
 // throughput).
 //
-// Thread safety: NOT thread-safe. Follow the SWMR contract at the call site.
+// Thread safety: write operations (put, del, apply_batch) are serialised by
+// an internal shared_mutex (exclusive). Read operations (get, contains_key,
+// iter_from, keys_from) take a brief shared lock to snapshot the key
+// directory and file registry, then release before doing I/O.
 // ---------------------------------------------------------------------------
 export class Bytecask {
 public:
@@ -337,19 +348,21 @@ public:
   // mismatch.
   [[nodiscard]] auto get(const ReadOptions & /*opts*/, BytesView key) const
       -> std::optional<Bytes> {
-    const auto kv = key_dir_.get(key);
+    auto [kd, fs] = read_snapshot();
+    const auto kv = kd.get(key);
     if (!kv) {
       return std::nullopt;
     }
-    const auto entry = files_->at(kv->file_id)->read(kv->file_offset);
+    const auto entry = fs->at(kv->file_id)->read(kv->file_offset);
     return entry.value;
   }
 
   // Writes key → value. Overwrites any existing value.
   // Rotates the active file if it has reached the threshold.
   // opts.sync controls whether fdatasync is called after the write.
-  // Throws std::system_error on I/O failure.
+  // Throws std::system_error on I/O failure or lock contention (try_lock).
   void put(const WriteOptions &opts, BytesView key, BytesView value) {
+    auto guard = acquire_write_lock(opts);
     const auto offset =
         active_file().append(next_lsn_, EntryType::Put, key, value);
 
@@ -367,8 +380,9 @@ public:
   // Returns true if the key existed and was removed, false if it was absent.
   // Rotates the active file if it has reached the threshold.
   // opts.sync controls whether fdatasync is called after the write.
-  // Throws std::system_error on I/O failure.
+  // Throws std::system_error on I/O failure or lock contention (try_lock).
   [[nodiscard]] auto del(const WriteOptions &opts, BytesView key) -> bool {
+    auto guard = acquire_write_lock(opts);
     if (!key_dir_.contains(key)) {
       return false;
     }
@@ -385,7 +399,8 @@ public:
 
   // Returns true if key exists in the index (no disk I/O).
   [[nodiscard]] auto contains_key(BytesView key) const -> bool {
-    return key_dir_.contains(key);
+    auto [kd, fs] = read_snapshot();
+    return kd.contains(key);
   }
 
   // ── Batch ──────────────────────────────────────────────────────────────
@@ -394,11 +409,12 @@ public:
   // batch is consumed (move-only). No-op if batch.empty().
   // opts.sync controls whether a single fdatasync is issued at the end.
   // Rotates the active file after the sync if the threshold is reached.
-  // Throws std::system_error on I/O failure.
+  // Throws std::system_error on I/O failure or lock contention (try_lock).
   void apply_batch(const WriteOptions &opts, Batch batch) {
     if (batch.empty()) {
       return;
     }
+    auto guard = acquire_write_lock(opts);
 
     std::ignore =
         active_file().append(next_lsn_++, EntryType::BulkBegin, {}, {});
@@ -445,9 +461,10 @@ public:
   [[nodiscard]] auto iter_from(const ReadOptions & /*opts*/,
                                BytesView from = {}) const
       -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
-    auto it = from.empty() ? key_dir_.begin() : key_dir_.lower_bound(from);
+    auto [kd, fs] = read_snapshot();
+    auto it = from.empty() ? kd.begin() : kd.lower_bound(from);
     return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
-        EntryIterator{std::move(it), files_}, std::default_sentinel};
+        EntryIterator{std::move(it), std::move(fs)}, std::default_sentinel};
   }
 
   // Returns an input range of keys >= from. Walks the in-memory key directory
@@ -455,7 +472,8 @@ public:
   [[nodiscard]] auto keys_from(const ReadOptions & /*opts*/,
                                BytesView from = {}) const
       -> std::ranges::subrange<KeyIterator, std::default_sentinel_t> {
-    auto it = from.empty() ? key_dir_.begin() : key_dir_.lower_bound(from);
+    auto [kd, fs] = read_snapshot();
+    auto it = from.empty() ? kd.begin() : kd.lower_bound(from);
     return std::ranges::subrange<KeyIterator, std::default_sentinel_t>{
         KeyIterator{std::move(it)}, std::default_sentinel};
   }
@@ -509,6 +527,30 @@ private:
     const auto stem = make_data_file_stem();
     files_->emplace(active_file_id_,
                     std::make_shared<DataFile>(dir_ / (stem + ".data")));
+  }
+
+  // Snapshots key_dir_ and files_ under a brief shared lock.
+  // Readers use this to get a consistent view without blocking writers
+  // longer than the copy (O(1) for both persistent tree and shared_ptr).
+  auto read_snapshot() const
+      -> std::pair<PersistentRadixTree<KeyDirEntry>, FileRegistry> {
+    std::shared_lock lk{*rw_mutex_};
+    return {key_dir_, files_};
+  }
+
+  // Acquires the write mutex. Blocking or try-lock based on opts.try_lock.
+  auto acquire_write_lock(const WriteOptions &opts)
+      -> std::unique_lock<std::shared_mutex> {
+    if (opts.try_lock) {
+      std::unique_lock<std::shared_mutex> lk{*rw_mutex_, std::try_to_lock};
+      if (!lk.owns_lock()) {
+        throw std::system_error{
+            std::make_error_code(std::errc::resource_unavailable_try_again),
+            "bytecask: write lock unavailable"};
+      }
+      return lk;
+    }
+    return std::unique_lock<std::shared_mutex>{*rw_mutex_};
   }
 
   // Returns a reference to the current active DataFile.
@@ -705,6 +747,11 @@ private:
   // the old snapshot without any locking. The fd is never closed while any
   // snapshot retains the inner shared_ptr<DataFile>.
   FileRegistry files_;
+  // shared_mutex: writers take unique_lock, readers take shared_lock to
+  // snapshot key_dir_ + files_. Heap-allocated because shared_mutex is
+  // not movable and Bytecask is move-only.
+  std::unique_ptr<std::shared_mutex> rw_mutex_{
+      std::make_unique<std::shared_mutex>()};
   std::uint32_t active_file_id_{0};
   std::uint32_t next_file_id_{0};
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
