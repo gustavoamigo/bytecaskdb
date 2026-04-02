@@ -23,6 +23,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-024 | Implement PMR - Memory Allocation described in design | Note: There is a draft proposal in the bytecask_design.md
 | BC-026 | Run `flush_hints` in background after file rotate | After rotation, dispatch `flush_hints()` on the sealed file to a background thread so it does not block the write path. |
+| BC-045 | `fdatasync` sealed file after rotation (async) | When a data file is rotated to immutable, schedule an `fdatasync` on it in a background thread. Ensures sealed files are durable without accumulating a large dirty-page backlog that would penalise the next `sync=true` write. Requires a background thread or thread pool (not yet implemented). |
 | BC-041 | `ReadOptions::verify_checksums` flag | Allow skipping CRC verification on bulk scans for ~5% win. Mirrors LevelDB/RocksDB `verify_checksums` option. |
 | BC-027 | Add Mixed/Sync benchmark | Added BC_Mixed_Sync and LDB_Mixed_Sync (1000 iter, 3 reps); results recorded 2026-04-02. Moved to backlog — no open work remaining. |
 
