@@ -151,6 +151,7 @@ export using FileRegistry =
 struct DirSnapshot {
   PersistentRadixTree<KeyDirEntry> key_dir;
   FileRegistry files;
+  std::uint32_t active_file_id{};
 };
 
 // ---------------------------------------------------------------------------
@@ -447,6 +448,23 @@ public:
     return kd.contains(key);
   }
 
+  // Flushes all pending writes to physical storage (fdatasync on the active
+  // file). GroupWriter calls this once after draining a group of sync=false
+  // writes so all writers in the group share a single fdatasync.
+  //
+  // Correctness: if a rotation occurred during the group's write phase, the
+  // rotated file was fdatasynced inside rotate_active_file() before being
+  // sealed, so all pre-rotation writes are already durable. This call covers
+  // any writes that landed in the new active file after rotation.
+  void sync() {
+    std::shared_ptr<DataFile> f;
+    {
+      std::lock_guard lk{*snapshot_mu_};
+      f = snapshot_.files->at(snapshot_.active_file_id);
+    }
+    f->sync();
+  }
+
   // ── Batch ──────────────────────────────────────────────────────────────
 
   // Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
@@ -581,7 +599,7 @@ private:
     const auto stem = make_data_file_stem();
     files_->emplace(active_file_id_,
                     std::make_shared<DataFile>(dir_ / (stem + ".data")));
-    snapshot_ = {key_dir_, files_};
+    snapshot_ = {key_dir_, files_, active_file_id_};
   }
 
   // Snapshots key_dir_ and files_ under a brief mutex lock.
@@ -592,11 +610,11 @@ private:
     return {snapshot_.key_dir, snapshot_.files};
   }
 
-  // Copies key_dir_ and files_ into the published snapshot.
+  // Copies key_dir_, files_, and active_file_id_ into the published snapshot.
   // Called by writers after mutating key_dir_/files_, under write_mu_.
   void publish_snapshot() {
     std::lock_guard lk{*snapshot_mu_};
-    snapshot_ = {key_dir_, files_};
+    snapshot_ = {key_dir_, files_, active_file_id_};
   }
 
   // Acquires the write mutex. Blocking or try-lock based on opts.try_lock.
@@ -783,7 +801,12 @@ private:
   }
 
   // Seals the active file and opens a new one if the size threshold is met.
+  // fdatasync is called before sealing: any writes that reached this file
+  // (including sync=false writes from GroupWriter) are durable by the time
+  // the file becomes immutable. This guarantees that Bytecask::sync() on
+  // the new active file correctly covers the entire write history.
   void rotate_active_file() {
+    active_file().sync();
     active_file().seal();
     active_file_id_ = next_file_id_++;
     const auto stem = make_data_file_stem();
