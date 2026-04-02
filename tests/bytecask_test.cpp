@@ -765,3 +765,60 @@ TEST_CASE("Bytecask reads proceed during writes", "[bytecask][concurrency]") {
     CHECK(reader_ok[r]);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Test: concurrent mixed operations (get + put + del) — no data corruption
+//
+// Exercises the full SWMR contract with multiple threads doing all three
+// operation types simultaneously. Under TSan this catches data races on the
+// key directory, file registry, and active file.
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask concurrent mixed get/put/del", "[bytecask][concurrency]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  // Pre-populate so readers and deleters have data to work with.
+  constexpr int kKeys = 200;
+  for (int i = 0; i < kKeys; ++i) {
+    auto key = std::format("k_{:04d}", i);
+    auto val = std::format("v_{:04d}", i);
+    db.put(bytecask::WriteOptions{.sync = false}, to_bytes(key), to_bytes(val));
+  }
+
+  constexpr int kThreads = 4;
+  constexpr int kOpsPerThread = 500;
+
+  auto worker = [&](int tid) {
+    for (int i = 0; i < kOpsPerThread; ++i) {
+      auto key = std::format("k_{:04d}", (tid * 50 + i) % kKeys);
+      auto op = (tid + i) % 10; // 0–7: get, 8: put, 9: del
+      if (op <= 7) {
+        // Read — value may or may not exist (concurrent deletes).
+        auto result = db.get({}, to_bytes(key));
+        (void)result;
+      } else if (op == 8) {
+        auto val = std::format("t{}_{:04d}", tid, i);
+        db.put(bytecask::WriteOptions{.sync = false}, to_bytes(key),
+               to_bytes(val));
+      } else {
+        std::ignore =
+            db.del(bytecask::WriteOptions{.sync = false}, to_bytes(key));
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t)
+    threads.emplace_back(worker, t);
+  for (auto &t : threads)
+    t.join();
+
+  // Verify no crash and that every surviving key has a valid value.
+  for (int i = 0; i < kKeys; ++i) {
+    auto key = std::format("k_{:04d}", i);
+    auto result = db.get({}, to_bytes(key));
+    if (result.has_value()) {
+      CHECK(!result->empty());
+    }
+  }
+}

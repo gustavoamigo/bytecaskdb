@@ -54,6 +54,9 @@ static constexpr std::size_t kValueSize = 1024;
 static constexpr int kRangeLen = 50;
 static constexpr int kRangeLen1000 = 1000;
 
+// Batch size: number of write operations grouped into a single atomic batch.
+static constexpr int kBatchSize = 100;
+
 static const std::size_t kDatasetSize = [] {
   const char *env = std::getenv("BC_DATASET_SIZE");
   if (env && *env) {
@@ -222,6 +225,24 @@ struct BcAdapter {
       benchmark::DoNotOptimize(entry);
     }
   }
+
+  // Batch: 90% put + 10% del in a single atomic apply_batch call.
+  static void apply_batch(Db &db, const std::vector<std::string> &keys,
+                          const std::vector<std::byte> &val,
+                          std::size_t start, int count, bool sync) {
+    bytecask::Batch batch;
+    for (int i = 0; i < count; ++i) {
+      const auto &k = keys[(start + i) % keys.size()];
+      if (i % 10 == 9) {
+        batch.del(bc_key(k));
+      } else {
+        batch.put(bc_key(k), bc_val(val));
+      }
+    }
+    bytecask::WriteOptions wo;
+    wo.sync = sync;
+    db.engine.apply_batch(wo, std::move(batch));
+  }
 };
 
 template <bool UseCache = true> struct LdbAdapter {
@@ -301,6 +322,25 @@ template <bool UseCache = true> struct LdbAdapter {
     for (; it->Valid() && count < limit; it->Next(), ++count) {
       benchmark::DoNotOptimize(it->value());
     }
+  }
+
+  // Batch: 90% put + 10% del in a single atomic WriteBatch call.
+  static void apply_batch(Db &db, const std::vector<std::string> &keys,
+                          const std::vector<std::byte> &val,
+                          std::size_t start, int count, bool sync) {
+    leveldb::WriteBatch wb;
+    for (int i = 0; i < count; ++i) {
+      const auto &k = keys[(start + i) % keys.size()];
+      if (i % 10 == 9) {
+        wb.Delete(ldb_slice(k));
+      } else {
+        wb.Put(ldb_slice(k), ldb_val_slice(val));
+      }
+    }
+    leveldb::WriteOptions wo;
+    wo.sync = sync;
+    auto s = db.raw->Write(wo, &wb);
+    benchmark::DoNotOptimize(s);
   }
 };
 
@@ -469,6 +509,98 @@ template <typename A, bool Sync> void BM_Mixed(benchmark::State &state) {
   attach_jitter(state, samples);
 }
 
+// ──────────────────────────── Mixed Batch ────────────────────────────────────
+// Measures atomic batch throughput: kBatchSize ops (90% put / 10% del) per
+// iteration, amortising lock acquisition and fsync across the batch.
+
+template <typename A, bool Sync> void BM_MixedBatch(benchmark::State &state) {
+  auto keys = generate_prefixed_keys(kDatasetSize);
+  auto val = make_value();
+  auto db = A::open_populated("batch", keys, val);
+
+  std::size_t idx = 0;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+
+  for (auto _ : state) {
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    A::apply_batch(db, keys, val, idx, kBatchSize, Sync);
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    idx += kBatchSize;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * kBatchSize);
+  state.counters["ops_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()) * kBatchSize,
+      benchmark::Counter::kIsRate);
+  state.counters["batches_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  attach_jitter(state, samples);
+}
+
+// ──────────────────────────── Mixed (multithreaded) ──────────────────────────
+// Same 80/10/10 mix but with N threads sharing one DB instance.
+// Google Benchmark's ->Threads(N) runs N copies of this function in parallel;
+// each thread gets its own State. We build the shared state in the first
+// iteration's setup and tear it down in the last thread's teardown.
+
+template <typename A, bool Sync> void BM_MixedMT(benchmark::State &state) {
+  // Shared across all threads within one benchmark invocation.
+  static std::unique_ptr<typename A::Db> shared_db;
+  static std::vector<std::string> shared_keys;
+  static std::vector<std::byte> shared_val;
+
+  // Thread 0 sets up before the hot loop.
+  if (state.thread_index() == 0) {
+    shared_keys = generate_prefixed_keys(kDatasetSize);
+    shared_val = make_value();
+    shared_db =
+        std::make_unique<typename A::Db>("mixed_mt", &shared_keys, &shared_val);
+  }
+
+  // Per-thread index offset to spread key access across threads.
+  const auto thread_offset =
+      static_cast<std::size_t>(state.thread_index()) * (kDatasetSize / 8);
+  std::size_t idx = thread_offset;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+
+  for (auto _ : state) {
+    const auto &k = shared_keys[idx % shared_keys.size()];
+    const auto op = idx % 10; // 0–7: get, 8: put, 9: del
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    if (op <= 7) {
+      A::get(*shared_db, k);
+    } else if (op == 8) {
+      A::put(*shared_db, k, shared_val, Sync);
+    } else {
+      A::del(*shared_db, k, Sync);
+    }
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    ++idx;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.counters["ops_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  attach_jitter(state, samples);
+
+  // Thread 0 tears down after all threads finish.
+  if (state.thread_index() == 0) {
+    shared_db.reset();
+    shared_keys.clear();
+    shared_val.clear();
+  }
+}
+
 // ===========================================================================
 // Registration
 // clang-format off
@@ -497,6 +629,22 @@ BENCHMARK(BM_Get<Ldb>)                 ->Name("LevelDB/Get");
 BENCHMARK(BM_Range<Ldb, kRangeLen>)    ->Name("LevelDB/Range50");
 BENCHMARK(BM_Mixed<Ldb, true>)         ->Name("LevelDB/Mixed/Sync")   ->Iterations(5000);
 BENCHMARK(BM_Mixed<Ldb, false>)        ->Name("LevelDB/Mixed/NoSync");
+
+// --- Mixed Batch ---
+BENCHMARK(BM_MixedBatch<Bc, false>)     ->Name("ByteCask/MixedBatch/NoSync");
+BENCHMARK(BM_MixedBatch<Bc, true>)      ->Name("ByteCask/MixedBatch/Sync")    ->Iterations(5000);
+BENCHMARK(BM_MixedBatch<Ldb, false>)    ->Name("LevelDB/MixedBatch/NoSync");
+BENCHMARK(BM_MixedBatch<Ldb, true>)     ->Name("LevelDB/MixedBatch/Sync")     ->Iterations(5000);
+
+// --- Multithreaded Mixed ---
+BENCHMARK(BM_MixedMT<Bc, false>)       ->Name("ByteCask/MixedMT/NoSync") ->Threads(2);
+BENCHMARK(BM_MixedMT<Bc, false>)       ->Name("ByteCask/MixedMT/NoSync") ->Threads(4);
+BENCHMARK(BM_MixedMT<Ldb, false>)      ->Name("LevelDB/MixedMT/NoSync")  ->Threads(2);
+BENCHMARK(BM_MixedMT<Ldb, false>)      ->Name("LevelDB/MixedMT/NoSync")  ->Threads(4);
+BENCHMARK(BM_MixedMT<Bc, true>)       ->Name("ByteCask/MixedMT/Sync") ->Threads(2);
+BENCHMARK(BM_MixedMT<Bc, true>)       ->Name("ByteCask/MixedMT/Sync") ->Threads(4);
+BENCHMARK(BM_MixedMT<Ldb, true>)      ->Name("LevelDB/MixedMT/Sync")  ->Threads(2);
+BENCHMARK(BM_MixedMT<Ldb, true>)      ->Name("LevelDB/MixedMT/Sync")  ->Threads(4);
 
 // clang-format on
 
