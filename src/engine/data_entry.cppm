@@ -99,40 +99,50 @@ export auto serialize_entry(std::uint64_t sequence, EntryType entry_type,
   return raw;
 }
 
-// Deserializes a single entry from a flat byte buffer and verifies its CRC.
-// buf must span exactly one complete entry: kHeaderSize + key_size + value_size
-// + kCrcSize bytes. Throws std::runtime_error on size mismatch or CRC failure.
-export auto deserialize_entry(std::span<const std::byte> buf) -> DataEntry {
+// Validates buffer size and CRC integrity. Returns the parsed header.
+// Throws std::runtime_error on size mismatch or CRC failure.
+export auto verify_entry(std::span<const std::byte> buf) -> EntryHeader {
   if (buf.size() < kHeaderSize + kCrcSize) {
-    throw std::runtime_error{"deserialize_entry: buffer too small"};
+    throw std::runtime_error{"verify_entry: buffer too small"};
   }
 
   const auto header = parse_header(buf);
 
   if (buf.size() !=
       kHeaderSize + header.key_size + header.value_size + kCrcSize) {
-    throw std::runtime_error{"deserialize_entry: buffer size mismatch"};
+    throw std::runtime_error{"verify_entry: buffer size mismatch"};
   }
 
-  // Verify CRC over all bytes except the trailing checksum.
   Crc32 crc{};
   crc.update(buf.subspan(0, buf.size() - kCrcSize));
   const auto computed = crc.finalize();
   const auto stored = read_le<std::uint32_t>(buf, buf.size() - kCrcSize);
   if (computed != stored) {
-    throw std::runtime_error{"deserialize_entry: CRC mismatch"};
+    throw std::runtime_error{"verify_entry: CRC mismatch"};
   }
 
-  const auto key_span = buf.subspan(kHeaderSize, header.key_size);
-  const auto val_span =
-      buf.subspan(kHeaderSize + header.key_size, header.value_size);
+  return header;
+}
 
+// Deserializes a complete entry from buf (CRC-verified).
+export auto deserialize_entry(std::span<const std::byte> buf) -> DataEntry {
+  const auto h = verify_entry(buf);
+  const auto key_span = buf.subspan(kHeaderSize, h.key_size);
+  const auto val_span = buf.subspan(kHeaderSize + h.key_size, h.value_size);
   return DataEntry{
-      .sequence = header.sequence,
-      .entry_type = header.entry_type,
+      .sequence = h.sequence,
+      .entry_type = h.entry_type,
       .key = {key_span.begin(), key_span.end()},
       .value = {val_span.begin(), val_span.end()},
   };
+}
+
+// Extracts only the value portion into out (CRC-verified, reuses capacity).
+export void extract_value_into(std::span<const std::byte> buf,
+                               std::vector<std::byte> &out) {
+  const auto h = verify_entry(buf);
+  const auto val_span = buf.subspan(kHeaderSize + h.key_size, h.value_size);
+  out.assign(val_span.begin(), val_span.end());
 }
 
 } // namespace bytecask

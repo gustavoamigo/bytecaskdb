@@ -137,26 +137,29 @@ public:
     }
 
     const auto header = parse_header(std::span{hdr});
-    auto entry = read_entry(offset, header.key_size, header.value_size);
-    const auto next = offset + kHeaderSize + header.key_size +
-                      header.value_size + kCrcSize;
+    std::vector<std::byte> buf;
+    read_entry(offset, header.key_size, header.value_size, buf);
+    auto entry = deserialize_entry(buf);
+    const auto next =
+        offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
     return std::make_pair(std::move(entry), next);
   }
 
-  // Single-pread fast path: the caller supplies key_size and value_size
-  // (known from KeyDirEntry), so the entire entry is read in one syscall.
-  // Used by get() and EntryIterator where sizes are already available.
-  // scan() remains the fallback for recovery where sizes are unknown.
-  [[nodiscard]] auto read_entry(Offset offset, std::uint16_t key_size,
-                                std::uint32_t value_size) const -> DataEntry {
+  // Preads the full entry at offset into io_buf (reusing existing capacity).
+  // The caller supplies key_size and value_size (known from KeyDirEntry or
+  // a prior header parse). After this call, io_buf contains a complete,
+  // CRC-verified entry that can be passed to deserialize_entry() or
+  // extract_value_into() depending on what the caller needs.
+  void read_entry(Offset offset, std::uint16_t key_size,
+                  std::uint32_t value_size,
+                  std::vector<std::byte> &io_buf) const {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    std::vector<std::byte> buf(total);
-    if (::pread(fd_, buf.data(), total, narrow<off_t>(offset)) !=
+    io_buf.resize(total);
+    if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
         narrow<ssize_t>(total)) {
       throw std::system_error{errno, std::generic_category(),
                               "DataFile::read_entry: pread failed"};
     }
-    return deserialize_entry(buf);
   }
 
   // Flushes all pending writes to physical storage via fdatasync.

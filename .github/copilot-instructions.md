@@ -54,6 +54,8 @@ These instructions apply to every repository work request in this workspace.
 - Use 2-space indentation; braces on the same line.
 
 ### Design decisions, safety, and modern idioms — follow C++ Core Guidelines
+- When adding new functionality, reuse existing internal functions instead of duplicating logic. If two code paths share the same validation, I/O, or transformation steps, factor the shared logic into a single function and have both paths call it.
+- When a function is replaced or subsumed by a new one, remove the old function. Do not leave dead or redundant methods in the codebase.
 - Follow Core Guidelines NL.1, NL.2, and NL.3 for comments: don't state in comments what can be clearly stated in code (avoid Doxygen `@param` boilerplate if the type signature is clear). Instead, use comments to state intent, constraints, thread-safety, and side effects (like I/O flushing). Keep comments crisp.
 - Prefer C++20 features when they bring clearer intent over lower-level alternatives.
   - Use `std::span` instead of raw pointer + size pairs.

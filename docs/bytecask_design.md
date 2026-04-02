@@ -191,7 +191,8 @@ Not yet implemented — callers currently provide the full file path.
 - **Constructor**: Takes a `std::filesystem::path`. Opens (or creates) the file via POSIX `open(O_WRONLY | O_CREAT | O_APPEND)`. Throws `std::system_error` on failure.
 - **`append(sequence, entry_type, key, value) -> Offset`**: Serializes a new entry with the given sequence number and `EntryType`, writes it to the OS page cache via `::write()`, and returns the byte offset where the entry starts. `BulkBegin`/`BulkEnd` entries pass empty key and value spans. Does **not** guarantee durability on its own.
 - **`sync()`**: Calls `::fdatasync()` to flush all pending writes to physical storage. Must be called explicitly to guarantee crash-safety. Decoupled from `append()` to enable Group Commit: callers can batch multiple `append()` calls before a single `sync()`.
-- **`read_entry(offset, key_size, value_size) -> DataEntry`**: Single-pread fast path. The caller supplies the key and value sizes (known from `KeyDirEntry`), so the full entry (`kHeaderSize + key_size + value_size + kCrcSize`) is read in **one** `pread` syscall. Used by `get()`, `EntryIterator`, and any path where the key directory already holds `value_size`. `scan()` (two preads) remains the fallback for recovery, where sizes are unknown.
+- **`read_entry(offset, key_size, value_size, io_buf)`**: Single-pread read primitive. Resizes `io_buf` (reusing existing capacity) and preads the full entry into it. Callers then pass `io_buf` to `deserialize_entry()` (recovery, scan) or `extract_value_into()` (get, iterator) depending on what they need. `scan()` uses this internally after its header pread.
+- **`read_value_into`** was removed — `read_entry` + `extract_value_into` replaces it with better composability.
 - Key and value are accepted as `std::span<const std::byte>` for binary safety.
 
 ### I/O Back-end Rationale
@@ -205,7 +206,7 @@ Not yet implemented — callers currently provide the full file path.
 We use fine-grained C++20 modules:
 - `bytecask.crc32`: General purpose mathematical utilities (`Crc32`, checked `narrow<To>(From)` conversion).
 - `bytecask.serialization`: Core bitsery abstractions (`CrcOutputAdapter`, legacy memory wrappers).
-- `bytecask.data_entry`: Logical entry definition and single-entry memory formatting.
+- `bytecask.data_entry`: Logical entry definition, single-entry memory formatting, and `verify_entry()` / `deserialize_entry()` / `extract_value_into()` — CRC verification is factored into `verify_entry()` and shared by both extraction functions.
 - `bytecask.data_file`: Disk I/O, writing streams sequentially to `.data` files.
 - `bytecask.hint_file`: Hint file writer and reader (`HintFile`, `HintEntry`).
 - `bytecask.persistent_ordered_map`: Immutable sorted map (`PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`) backed by `immer::flex_vector`; retained for benchmarking.
@@ -340,7 +341,7 @@ Read API:
 
 ## Range Scan: `iter_from`
 
-`iter_from` returns a lazy input range of `(Key, Bytes)` pairs in ascending key order. Each dereference issues a single `pread` via `DataFile::read_entry()` — the caller-supplied `key_size` and `value_size` (from `KeyDirEntry`) let the engine compute the total entry size upfront, halving the syscall count compared to the recovery path (`scan()`, which needs two preads because sizes are unknown).
+`iter_from` returns a lazy input range of `(Key, Bytes)` pairs in ascending key order. Each dereference issues a single `pread` via `DataFile::read_value_into()` — the caller-supplied `key_size` and `value_size` (from `KeyDirEntry`) let the engine compute the total entry size upfront, halving the syscall count compared to the recovery path (`scan()`, which needs two preads because sizes are unknown). The iterator reuses an internal I/O buffer and the cached value vector across advances, so sequential scans incur zero allocations after the first dereference.
 
 Results are always in ascending key order (radix tree iteration order).
 
@@ -556,6 +557,12 @@ public:
     // Throws std::system_error on I/O failure or std::runtime_error on corruption.
     [[nodiscard]] auto get(const ReadOptions& opts, BytesView key) const
         -> std::optional<Bytes>;
+
+    // Output-parameter variant: writes the value into `out`, reusing its
+    // existing capacity to amortize allocation across calls. Returns true
+    // if the key was found, false otherwise.
+    [[nodiscard]] auto get(const ReadOptions& opts, BytesView key,
+                           Bytes& out) const -> bool;
 
     // Writes `key` → `value`. Overwrites any existing value.
     // Throws std::system_error on I/O failure.

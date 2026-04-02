@@ -216,25 +216,27 @@ public:
       : cur_{std::move(cur)}, files_{std::move(files)} {}
 
   auto operator*() const -> const value_type & {
-    if (!cached_) {
+    if (!has_cached_) {
       auto [key_span, dir_entry] = *cur_;
-      auto entry = files_->at(dir_entry.file_id)->read_entry(
+      cached_.first = Key{key_span};
+      files_->at(dir_entry.file_id)->read_entry(
           dir_entry.file_offset, narrow<std::uint16_t>(key_span.size()),
-          dir_entry.value_size);
-      cached_.emplace(Key{key_span}, std::move(entry.value));
+          dir_entry.value_size, io_buf_);
+      extract_value_into(io_buf_, cached_.second);
+      has_cached_ = true;
     }
-    return *cached_;
+    return cached_;
   }
 
   auto operator++() -> EntryIterator & {
     ++cur_;
-    cached_.reset();
+    has_cached_ = false;
     return *this;
   }
 
   void operator++(int) {
     ++cur_;
-    cached_.reset();
+    has_cached_ = false;
   }
 
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
@@ -244,7 +246,9 @@ public:
 private:
   RadixTreeIterator<KeyDirEntry> cur_;
   FileRegistry files_;
-  mutable std::optional<value_type> cached_;
+  mutable value_type cached_;
+  mutable Bytes io_buf_;
+  mutable bool has_cached_{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -347,16 +351,31 @@ public:
   // Routes the read to the correct data file via KeyDirEntry::file_id.
   // Throws std::system_error on I/O failure or std::runtime_error on CRC
   // mismatch.
-  [[nodiscard]] auto get(const ReadOptions & /*opts*/, BytesView key) const
+  [[nodiscard]] auto get(const ReadOptions &opts, BytesView key) const
       -> std::optional<Bytes> {
+    Bytes out;
+    if (!get(opts, key, out)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  // Output-parameter variant: writes the value into out, reusing its existing
+  // capacity to amortize allocation across calls. Returns true if the key was
+  // found, false otherwise.
+  [[nodiscard]] auto get(const ReadOptions & /*opts*/, BytesView key,
+                         Bytes &out) const -> bool {
     auto [kd, fs] = read_snapshot();
     const auto kv = kd.get(key);
     if (!kv) {
-      return std::nullopt;
+      return false;
     }
-    const auto entry = fs->at(kv->file_id)->read_entry(
-        kv->file_offset, narrow<std::uint16_t>(key.size()), kv->value_size);
-    return entry.value;
+    thread_local Bytes io_buf;
+    fs->at(kv->file_id)->read_entry(
+        kv->file_offset, narrow<std::uint16_t>(key.size()), kv->value_size,
+        io_buf);
+    extract_value_into(io_buf, out);
+    return true;
   }
 
   // Writes key → value. Overwrites any existing value.
