@@ -23,6 +23,7 @@
 #include <benchmark/benchmark.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
@@ -54,7 +55,17 @@ static constexpr std::size_t kValueSize = 1024;
 static constexpr int kRangeLen = 50;
 
 // Number of prefixed keys to pre-populate the database with.
-static constexpr std::size_t kDatasetSize = 50'000;
+// Override at runtime via the BC_DATASET_SIZE environment variable
+// (set automatically by run_engine_bench.py).
+// Default: 50 000 (light run). Pass --full to run_engine_bench.py for 1 000
+// 000.
+static const std::size_t kDatasetSize = [] {
+  const char *env = std::getenv("BC_DATASET_SIZE");
+  if (env && *env) {
+    return static_cast<std::size_t>(std::stoul(env));
+  }
+  return std::size_t{50'000};
+}();
 
 // How many latency samples to collect for jitter counters.
 // Limited by benchmark iteration count; we cap at 1 M to bound memory.
@@ -422,6 +433,44 @@ static void BC_Range50(benchmark::State &state) {
 // ──────────────────────────── Mixed ───────────────────────────────────────
 // 80% get / 10% put / 10% del
 
+static void BC_Mixed_Sync(benchmark::State &state) {
+  BcStore store;
+  auto keys = generate_prefixed_keys(kDatasetSize);
+  auto val = make_value();
+  bytecask::ReadOptions ro;
+  bytecask::WriteOptions wo;
+  wo.sync = true;
+
+  std::size_t idx = 0;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+
+  for (auto _ : state) {
+    const auto &k = keys[idx % keys.size()];
+    const auto op = idx % 10; // 0–7: get, 8: put, 9: del
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    if (op <= 7) {
+      auto v = store.db.get(ro, bc_key(k));
+      benchmark::DoNotOptimize(v);
+    } else if (op == 8) {
+      store.db.put(wo, bc_key(k), bc_val(val));
+    } else {
+      std::ignore = store.db.del(wo, bc_key(k));
+    }
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    ++idx;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.counters["ops_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  attach_jitter(state, samples);
+}
+
 static void BC_Mixed_NoSync(benchmark::State &state) {
   BcStore store;
   auto keys = generate_prefixed_keys(kDatasetSize);
@@ -709,6 +758,47 @@ static void LDB_Mixed_NoSync(benchmark::State &state) {
   attach_jitter(state, samples);
 }
 
+static void LDB_Mixed_Sync(benchmark::State &state) {
+  LdbStore store;
+  auto keys = generate_prefixed_keys(kDatasetSize);
+  auto val = make_value();
+  leveldb::ReadOptions ro;
+  leveldb::WriteOptions wo;
+  wo.sync = true;
+
+  std::size_t idx = 0;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+
+  for (auto _ : state) {
+    const auto &k = keys[idx % keys.size()];
+    const auto op = idx % 10;
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    if (op <= 7) {
+      std::string value;
+      auto s = store.db->Get(ro, ldb_slice(k), &value);
+      benchmark::DoNotOptimize(value);
+    } else if (op == 8) {
+      auto s = store.db->Put(wo, ldb_slice(k), ldb_val_slice(val));
+      benchmark::DoNotOptimize(s);
+    } else {
+      auto s = store.db->Delete(wo, ldb_slice(k));
+      benchmark::DoNotOptimize(s);
+    }
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    ++idx;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.counters["ops_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  attach_jitter(state, samples);
+}
+
 // ──────────────────────────── Get (no block cache) ───────────────────────────
 // Hypothesis: with LevelDB's block cache removed, Get latency should be close
 // to ByteCask's, since both engines then go to the OS page cache per lookup.
@@ -835,6 +925,7 @@ BENCHMARK(BC_Put_Sync)      ->Name("ByteCask/Put/Sync")   ->Repetitions(3)->Repo
 BENCHMARK(BC_Get)           ->Name("ByteCask/Get");
 BENCHMARK(BC_Del_NoSync)    ->Name("ByteCask/Del/NoSync") ->Repetitions(3)->ReportAggregatesOnly(true);
 BENCHMARK(BC_Range50)       ->Name("ByteCask/Range50");
+BENCHMARK(BC_Mixed_Sync)    ->Name("ByteCask/Mixed/Sync")   ->Repetitions(3)->ReportAggregatesOnly(true)->Iterations(1000);
 BENCHMARK(BC_Mixed_NoSync)  ->Name("ByteCask/Mixed/NoSync");
 
 // --- LevelDB ---
@@ -843,6 +934,7 @@ BENCHMARK(LDB_Put_Sync)     ->Name("LevelDB/Put/Sync")    ->Repetitions(3)->Repo
 BENCHMARK(LDB_Get)          ->Name("LevelDB/Get");
 BENCHMARK(LDB_Del_NoSync)   ->Name("LevelDB/Del/NoSync")  ->Repetitions(3)->ReportAggregatesOnly(true);
 BENCHMARK(LDB_Range50)      ->Name("LevelDB/Range50");
+BENCHMARK(LDB_Mixed_Sync)   ->Name("LevelDB/Mixed/Sync")    ->Repetitions(3)->ReportAggregatesOnly(true)->Iterations(1000);
 BENCHMARK(LDB_Mixed_NoSync) ->Name("LevelDB/Mixed/NoSync");
 
 // --- LevelDB (block cache disabled) ---
@@ -851,5 +943,13 @@ BENCHMARK(LDB_Range50_NoCache)    ->Name("LevelDB_NoCache/Range50");
 BENCHMARK(LDB_Mixed_NoCache)      ->Name("LevelDB_NoCache/Mixed/NoSync");
 
 // clang-format on
+
+// Publish dataset_size into the JSON context section so the CSV tracking
+// script can record it as a column alongside git_commit and timestamp.
+// NOLINTNEXTLINE(cert-err58-cpp)
+const bool kDatasetSizeContext = [] {
+  benchmark::AddCustomContext("dataset_size", std::to_string(kDatasetSize));
+  return true;
+}();
 
 BENCHMARK_MAIN();
