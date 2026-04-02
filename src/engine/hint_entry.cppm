@@ -24,7 +24,8 @@ namespace bytecask {
 //   Offset 19: value_size   (u32) — value length in bytes (for size tracking
 //                                   without reading the data file)
 //   Offset 23: key data     (key_size bytes)
-//   Trailing:  crc32        (u32) — CRC-32/ISO-HDLC over all preceding bytes
+//   Trailing:  crc32        (u32) — CRC-32C (Castagnoli) over all preceding
+//   bytes
 
 export constexpr std::size_t kHintHeaderSize =
     23; // sequence(8) + entry_type(1) + file_offset(8) + key_size(2) +

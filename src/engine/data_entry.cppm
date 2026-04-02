@@ -26,7 +26,7 @@ namespace bytecask {
 //   Offset 11: value_size (u32) — value length in bytes (0 for Delete/Bulk*)
 //   Offset 15: key data   (key_size bytes)
 //   Offset 15+key_size: value data (value_size bytes)
-//   Trailing: crc32 (u32) — CRC-32/ISO-HDLC over all preceding bytes
+//   Trailing: crc32 (u32) — CRC-32C (Castagnoli) over all preceding bytes
 
 // Note: This struct is purely semantic for representing header fields in code.
 // It contains implicit padding bytes and must not be used directly for raw
