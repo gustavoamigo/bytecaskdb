@@ -152,7 +152,8 @@ TEST_CASE("Bytecask apply_batch mixed operations", "[bytecask]") {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8: iter_from({}) returns all entries in ascending key order
+// Test 8: iter_from with ordered=true returns all entries in ascending key
+// order
 // ---------------------------------------------------------------------------
 TEST_CASE("Bytecask iter_from returns entries in ascending order",
           "[bytecask]") {
@@ -163,9 +164,10 @@ TEST_CASE("Bytecask iter_from returns entries in ascending order",
   db.put({}, to_bytes("a"), to_bytes("av"));
   db.put({}, to_bytes("b"), to_bytes("bv"));
 
+  bytecask::ReadOptions ro;
   std::vector<std::string> keys;
   std::vector<std::string> values;
-  for (auto &[k, v] : db.iter_from({})) {
+  for (auto &[k, v] : db.iter_from(ro)) {
     keys.push_back(to_string(k));
     values.push_back(to_string(v));
   }
