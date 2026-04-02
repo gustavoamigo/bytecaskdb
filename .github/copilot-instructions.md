@@ -26,6 +26,13 @@ These instructions apply to every repository work request in this workspace.
 - Move completed work to the `Done` section instead of deleting history.
 - Add follow-up work to `Backlog` when it is discovered during implementation.
 
+## Benchmarking rules
+
+- Any change claimed to improve performance **must** include a benchmark run of `engine_bench` before and after the change. Run it with `python3 scripts/run_engine_bench.py`. Results are recorded in `benchmarks/engine_bench_results.csv`.
+- Run `python3 scripts/run_map_bench.py` (records to `benchmarks/map_bench_results.csv`) only when making changes to `radix_tree` or `persistent_ordered_map`.
+- Show the before/after CSV rows to the user as evidence of improvement.
+- If benchmarks cannot be run, state why clearly and leave the project plan updated with the blocker.
+
 ## Testing rules
 
 - Prefer the narrowest test coverage that proves the change.

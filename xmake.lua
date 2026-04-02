@@ -5,6 +5,7 @@ add_requires("bitsery")
 add_requires("catch2 3.x")
 add_requires("benchmark", {optional = true})
 add_requires("immer")
+add_requires("jemalloc")
 add_requires("leveldb", {optional = true})
 
 -- Sanitizer option: `xmake f --sanitizer=address` or `--sanitizer=thread`
@@ -51,7 +52,7 @@ target("bytecask")
     set_languages("c++23")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
-    add_packages("bitsery", "immer")
+    add_packages("bitsery", "immer", "jemalloc")
     on_load(apply_sanitizer)
     -- Patch compile_commands.json so clangd can resolve all module imports.
     -- xmake's compile_commands generator omits some -fmodule-file= flags;
@@ -67,7 +68,7 @@ target("bytecask_tests")
     set_languages("c++23")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
-    add_packages("bitsery", "catch2", "immer")
+    add_packages("bitsery", "catch2", "immer", "jemalloc")
     on_load(apply_sanitizer)
 
 target("bytecask_bench")
@@ -79,7 +80,7 @@ target("bytecask_bench")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
     add_cxflags("-Wno-global-constructors")
-    add_packages("bitsery", "benchmark", "immer")
+    add_packages("bitsery", "benchmark", "immer", "jemalloc")
     on_load(apply_sanitizer)
 
 target("engine_bench")
@@ -91,7 +92,7 @@ target("engine_bench")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
     add_cxflags("-Wno-global-constructors")
-    add_packages("bitsery", "benchmark", "immer", "leveldb")
+    add_packages("bitsery", "benchmark", "immer", "jemalloc", "leveldb")
     on_load(apply_sanitizer)
 
 --
