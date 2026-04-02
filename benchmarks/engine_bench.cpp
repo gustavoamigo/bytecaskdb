@@ -177,9 +177,11 @@ struct BcAdapter {
         : dir{tag}, engine{bytecask::Bytecask::open(dir.path)} {
       if (populate_keys) {
         bytecask::WriteOptions wo;
-        wo.sync = false;
-        for (const auto &k : *populate_keys)
-          engine.put(wo, bc_key(k), bc_val(*populate_val));
+        const auto n = populate_keys->size();
+        for (std::size_t i = 0; i < n; ++i) {
+          wo.sync = (i % 1000 == 999) || (i == n - 1);
+          engine.put(wo, bc_key((*populate_keys)[i]), bc_val(*populate_val));
+        }
       }
     }
   };
@@ -228,8 +230,8 @@ struct BcAdapter {
 
   // Batch: 90% put + 10% del in a single atomic apply_batch call.
   static void apply_batch(Db &db, const std::vector<std::string> &keys,
-                          const std::vector<std::byte> &val,
-                          std::size_t start, int count, bool sync) {
+                          const std::vector<std::byte> &val, std::size_t start,
+                          int count, bool sync) {
     bytecask::Batch batch;
     for (int i = 0; i < count; ++i) {
       const auto &k = keys[(start + i) % keys.size()];
@@ -326,8 +328,8 @@ template <bool UseCache = true> struct LdbAdapter {
 
   // Batch: 90% put + 10% del in a single atomic WriteBatch call.
   static void apply_batch(Db &db, const std::vector<std::string> &keys,
-                          const std::vector<std::byte> &val,
-                          std::size_t start, int count, bool sync) {
+                          const std::vector<std::byte> &val, std::size_t start,
+                          int count, bool sync) {
     leveldb::WriteBatch wb;
     for (int i = 0; i < count; ++i) {
       const auto &k = keys[(start + i) % keys.size()];
@@ -533,10 +535,11 @@ template <typename A, bool Sync> void BM_MixedBatch(benchmark::State &state) {
     idx += kBatchSize;
   }
 
-  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * kBatchSize);
-  state.counters["ops_per_us"] = benchmark::Counter(
-      static_cast<double>(state.iterations()) * kBatchSize,
-      benchmark::Counter::kIsRate);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) *
+                          kBatchSize);
+  state.counters["ops_per_us"] =
+      benchmark::Counter(static_cast<double>(state.iterations()) * kBatchSize,
+                         benchmark::Counter::kIsRate);
   state.counters["batches_per_us"] = benchmark::Counter(
       static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
   attach_jitter(state, samples);

@@ -12,7 +12,6 @@ module;
 #include <mutex>
 #include <optional>
 #include <ranges>
-#include <shared_mutex>
 #include <span>
 #include <string>
 #include <system_error>
@@ -146,6 +145,13 @@ private:
 // inserts the new file, then atomically replaces the outer shared_ptr.
 export using FileRegistry =
     std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>>;
+
+// Immutable snapshot of the key directory and file registry.
+// Readers copy this under a brief mutex. Both fields are O(1) to copy.
+struct DirSnapshot {
+  PersistentRadixTree<KeyDirEntry> key_dir;
+  FileRegistry files;
+};
 
 // ---------------------------------------------------------------------------
 // KeyIterator — walks the key directory in ascending key order.
@@ -313,9 +319,11 @@ export struct ReadOptions {};
 // throughput).
 //
 // Thread safety: write operations (put, del, apply_batch) are serialised by
-// an internal shared_mutex (exclusive). Read operations (get, contains_key,
-// iter_from, keys_from) take a brief shared lock to snapshot the key
-// directory and file registry, then release before doing I/O.
+// write_mu_ (plain mutex). After mutating key_dir_/files_, the writer
+// publishes a lightweight snapshot under snapshot_mu_ (~10 ns hold).
+// Readers copy the snapshot under snapshot_mu_ and then release; all
+// subsequent I/O proceeds without any lock held. Readers never block on
+// write_mu_, eliminating the writer-starvation problem of shared_mutex.
 // ---------------------------------------------------------------------------
 export class Bytecask {
 public:
@@ -398,6 +406,7 @@ public:
         file_to_sync = files_->at(active_file_id_);
       }
       maybe_rotate();
+      publish_snapshot();
     }
     if (file_to_sync) {
       file_to_sync->sync();
@@ -424,6 +433,7 @@ public:
         file_to_sync = files_->at(active_file_id_);
       }
       maybe_rotate();
+      publish_snapshot();
     }
     if (file_to_sync) {
       file_to_sync->sync();
@@ -488,6 +498,7 @@ public:
         file_to_sync = files_->at(active_file_id_);
       }
       maybe_rotate();
+      publish_snapshot();
     }
     if (file_to_sync) {
       file_to_sync->sync();
@@ -570,22 +581,29 @@ private:
     const auto stem = make_data_file_stem();
     files_->emplace(active_file_id_,
                     std::make_shared<DataFile>(dir_ / (stem + ".data")));
+    snapshot_ = {key_dir_, files_};
   }
 
-  // Snapshots key_dir_ and files_ under a brief shared lock.
-  // Readers use this to get a consistent view without blocking writers
-  // longer than the copy (O(1) for both persistent tree and shared_ptr).
+  // Snapshots key_dir_ and files_ under a brief mutex lock.
+  // Hold time is ~10 ns (two O(1) copies). Readers never block on write_mu_.
   auto read_snapshot() const
       -> std::pair<PersistentRadixTree<KeyDirEntry>, FileRegistry> {
-    std::shared_lock lk{*rw_mutex_};
-    return {key_dir_, files_};
+    std::lock_guard lk{*snapshot_mu_};
+    return {snapshot_.key_dir, snapshot_.files};
+  }
+
+  // Copies key_dir_ and files_ into the published snapshot.
+  // Called by writers after mutating key_dir_/files_, under write_mu_.
+  void publish_snapshot() {
+    std::lock_guard lk{*snapshot_mu_};
+    snapshot_ = {key_dir_, files_};
   }
 
   // Acquires the write mutex. Blocking or try-lock based on opts.try_lock.
   auto acquire_write_lock(const WriteOptions &opts)
-      -> std::unique_lock<std::shared_mutex> {
+      -> std::unique_lock<std::mutex> {
     if (opts.try_lock) {
-      std::unique_lock<std::shared_mutex> lk{*rw_mutex_, std::try_to_lock};
+      std::unique_lock<std::mutex> lk{*write_mu_, std::try_to_lock};
       if (!lk.owns_lock()) {
         throw std::system_error{
             std::make_error_code(std::errc::resource_unavailable_try_again),
@@ -593,7 +611,7 @@ private:
       }
       return lk;
     }
-    return std::unique_lock<std::shared_mutex>{*rw_mutex_};
+    return std::unique_lock<std::mutex>{*write_mu_};
   }
 
   // Returns a reference to the current active DataFile.
@@ -790,11 +808,14 @@ private:
   // the old snapshot without any locking. The fd is never closed while any
   // snapshot retains the inner shared_ptr<DataFile>.
   FileRegistry files_;
-  // shared_mutex: writers take unique_lock, readers take shared_lock to
-  // snapshot key_dir_ + files_. Heap-allocated because shared_mutex is
-  // not movable and Bytecask is move-only.
-  std::unique_ptr<std::shared_mutex> rw_mutex_{
-      std::make_unique<std::shared_mutex>()};
+  // Published snapshot: readers copy under snapshot_mu_, writers publish
+  // after mutations. Both PersistentRadixTree and FileRegistry are O(1) copies.
+  DirSnapshot snapshot_;
+  // Protects snapshot_ reads/writes. Held ~10 ns; never during I/O.
+  mutable std::unique_ptr<std::mutex> snapshot_mu_{
+      std::make_unique<std::mutex>()};
+  // Serialises writers (put, del, apply_batch). Readers never acquire this.
+  std::unique_ptr<std::mutex> write_mu_{std::make_unique<std::mutex>()};
   std::uint32_t active_file_id_{0};
   std::uint32_t next_file_id_{0};
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
