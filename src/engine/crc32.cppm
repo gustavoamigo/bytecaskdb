@@ -1,7 +1,8 @@
 module;
-#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <nmmintrin.h>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -21,40 +22,36 @@ constexpr auto narrow(From value) -> To {
 }
 
 // ---------------------------------------------------------------------------
-// CRC-32 (reflected polynomial 0xEDB88320, CRC-32/ISO-HDLC).
-// Calculated iteratively.
+// CRC-32C (Castagnoli, polynomial 0x1EDC6F41) via SSE4.2 hardware instruction.
+//
+// Uses _mm_crc32_u64 to process 8 bytes per cycle, then _mm_crc32_u8 for the
+// trailing remainder. The result is not compatible with CRC-32/ISO-HDLC
+// (polynomial 0xEDB88320) used in earlier versions of ByteCask.
+//
+// Requires: x86-64 with SSE4.2 (compile with -msse4.2).
 // ---------------------------------------------------------------------------
-namespace {
 
-constexpr auto make_crc32_table() noexcept -> std::array<std::uint32_t, 256> {
-  std::array<std::uint32_t, 256> table{};
-  for (std::uint32_t i = 0; i < 256; ++i) {
-    std::uint32_t crc = i;
-    for (int bit = 0; bit < 8; ++bit) {
-      if (crc & 1U) {
-        crc = (crc >> 1U) ^ 0xEDB88320U;
-      } else {
-        crc >>= 1U;
-      }
-    }
-    table[i] = crc;
-  }
-  return table;
-}
-
-constexpr auto crc32_table = make_crc32_table();
-
-} // anonymous namespace
-
-// Stateful CRC-32 accumulator fed byte-by-byte via update().
+// Stateful CRC-32C accumulator. Feed chunks via update(), read via finalize().
 export class Crc32 {
 public:
   void update(std::span<const std::byte> data) noexcept {
-    for (const auto b : data) {
-      const auto idx = static_cast<std::uint8_t>(
-          (state_ ^ std::to_integer<std::uint32_t>(b)) & 0xFFU);
-      state_ = (state_ >> 8U) ^ crc32_table[idx];
+    const auto *ptr = data.data();
+    auto len = data.size();
+    std::uint64_t crc64 = state_; // widen; upper 32 bits are zero
+    while (len >= 8) {
+      std::uint64_t word{};
+      std::memcpy(&word, ptr, 8);
+      crc64 = _mm_crc32_u64(crc64, word);
+      ptr += 8;
+      len -= 8;
     }
+    auto crc32 = static_cast<std::uint32_t>(crc64);
+    while (len > 0) {
+      crc32 = _mm_crc32_u8(crc32, std::to_integer<std::uint8_t>(*ptr));
+      ++ptr;
+      --len;
+    }
+    state_ = crc32;
   }
 
   [[nodiscard]] auto finalize() const noexcept -> std::uint32_t {

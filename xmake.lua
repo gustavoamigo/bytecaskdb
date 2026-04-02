@@ -5,6 +5,7 @@ add_requires("bitsery")
 add_requires("catch2 3.x")
 add_requires("benchmark", {optional = true})
 add_requires("immer")
+add_requires("leveldb", {optional = true})
 
 -- Sanitizer option: `xmake f --sanitizer=address` or `--sanitizer=thread`
 option("sanitizer")
@@ -22,6 +23,8 @@ local common_flags = {
     "-Wno-missing-variable-declarations", "-Wno-missing-prototypes",
     -- raw pointer indexing over a known-bounded span is intentional (CRC inner loop)
     "-Wno-unsafe-buffer-usage",
+    -- SSE4.2 required for hardware CRC-32C (_mm_crc32_u64 / _mm_crc32_u8)
+    "-msse4.2",
 }
 
 -- Apply sanitizer flags to a target if the option is set.
@@ -71,12 +74,24 @@ target("bytecask_bench")
     set_toolchains("clang")
     set_kind("binary")
     set_default(false)
-    add_files("benchmarks/*.cpp", "src/engine/*.cppm")
+    add_files("benchmarks/map_bench.cpp", "src/engine/*.cppm")
     set_languages("c++23")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
     add_cxflags("-Wno-global-constructors")
     add_packages("bitsery", "benchmark", "immer")
+    on_load(apply_sanitizer)
+
+target("engine_bench")
+    set_toolchains("clang")
+    set_kind("binary")
+    set_default(false)
+    add_files("benchmarks/engine_bench.cpp", "src/engine/*.cppm")
+    set_languages("c++23")
+    set_policy("build.c++.modules", true)
+    add_cxflags(table.unpack(common_flags))
+    add_cxflags("-Wno-global-constructors")
+    add_packages("bitsery", "benchmark", "immer", "leveldb")
     on_load(apply_sanitizer)
 
 --
