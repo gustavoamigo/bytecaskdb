@@ -20,6 +20,9 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-046 | Implement conservative online vacuum | `Bytecask::vacuum(VacuumOptions)` → `VacuumStats`. One sealed file per call; waste-ratio threshold selection; atomic commit under `write_mu_`; tombstones always copied. See design doc Vacuum section. |
+| BC-047 | Vacuum: absorb tiny compacted files into active file | After the 1:1 rewrite, if the compacted file falls below a `min_file_bytes` threshold, append its live entries (preserving original LSNs) to the active file under `write_mu_` instead of leaving a tiny standalone sealed file. Reduces fd count and recovery time. `write_mu_` hold time increases proportionally to surviving entry count \u2014 only appropriate for very small files. |
+| BC-048 | Full vacuum (multi-file merge with tombstone elision) | Process all sealed files in a single commit. Safe to drop tombstones because no unprocessed Put for any deleted key can survive. Separate from conservative vacuum. |
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-024 | Implement PMR - Memory Allocation described in design | Note: There is a draft proposal in the bytecask_design.md
 | BC-026 | Run `flush_hints` in background after file rotate | After rotation, dispatch `flush_hints()` on the sealed file to a background thread so it does not block the write path. |
