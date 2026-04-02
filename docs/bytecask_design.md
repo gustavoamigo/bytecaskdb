@@ -57,7 +57,7 @@ ByteCask follows a **single-writer / multiple-reader (SWMR)** model:
 
 The engine enforces the SWMR contract internally via a `std::shared_mutex` (`rw_mutex_`):
 
-- **Writers** (`put`, `del`, `apply_batch`) acquire a `unique_lock` — serialising all mutations.
+- **Writers** (`put`, `del`, `apply_batch`) acquire a `unique_lock` for the mutation (append to data file + key directory update + rotation check), then release the lock before calling `fdatasync`. The `fdatasync` call still blocks the caller — when `put(sync=true)` returns, the data is durable — but readers are not blocked during the sync. This is safe because: (1) the data is in the OS page cache and the key directory is updated before lock release, so readers see the new value immediately; (2) `fdatasync` flushes all dirty pages for the file descriptor, so concurrent fdatasync calls on the same fd are idempotent; (3) the `shared_ptr<DataFile>` captured before lock release keeps the file alive even if rotation occurs under the next writer's lock.
 - **Readers** (`get`, `contains_key`, `iter_from`, `keys_from`) acquire a brief `shared_lock` to snapshot `key_dir_` (O(1) — refcount bump on persistent tree root) and `files_` (O(1) — `shared_ptr` copy), then release the lock before doing any disk I/O. Multiple readers hold shared locks concurrently with each other and, because the lock is held only for the duration of the snapshot copy, contention with writers is minimal.
 
 `WriteOptions::try_lock` (default `false`) controls write-lock acquisition behaviour:

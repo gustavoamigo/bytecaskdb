@@ -15,7 +15,6 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-042 | Buffer-reusing `get()` overload and iterator | `Bytes&` output-param `get()` + `read_value_into` on DataFile + iterator buffer reuse. |
 
 ## Backlog
 
@@ -32,6 +31,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-043 | Move fdatasync outside write lock | `put`, `del`, `apply_batch` now release the exclusive lock before calling `fdatasync`. Readers are no longer blocked during sync I/O. Captures `shared_ptr<DataFile>` under the lock to keep the file alive post-rotation. Correctness: durability guarantee preserved (caller still blocks until fdatasync returns). 87 tests pass (1M+ assertions). Mixed/Sync ~10% improvement in single-threaded bench; primary benefit is multi-threaded concurrency. |
 | BC-034 | Intrusive reference counting for radix tree nodes | Replace `shared_ptr<Node>` with `IntrusivePtr<Node>` embedding `atomic<uint32_t> refcount_` in each node. Eliminates ~32 B `make_shared` control block per node; shrinks child slot from 24 B to 16 B. Per-node cost: ~80 B (down from ~104 B). Measured: 108 B/key generic (−17%), 116 B/key prefixed (−17%) at 100k keys. 82 tests pass (1M+ assertions). ASan clean. |
 | BC-039 | Single-pread read path (`DataFile::read_entry`) | Use `KeyDirEntry.value_size` + key size to issue one `pread` instead of two. Get +53% (1.18M ops/µs), Range50 +66% (28.2k scans/µs). ByteCask Get now 12% faster than LevelDB. Chunked I/O strategy (BC-038) removed — offset-sort overhead exceeded benefit on warm cache. 86 tests pass (1M+ assertions). |
 | BC-038 | iter_from: chunked I/O strategy (removed) | Attempted chunked strategy (collect KeyDirEntries, sort by offset, read in order). Benchmarked worse than lazy path on warm cache due to sort + collect overhead. Removed; `ReadOptions` simplified to empty struct. |

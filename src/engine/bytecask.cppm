@@ -219,9 +219,10 @@ public:
     if (!has_cached_) {
       auto [key_span, dir_entry] = *cur_;
       cached_.first = Key{key_span};
-      files_->at(dir_entry.file_id)->read_entry(
-          dir_entry.file_offset, narrow<std::uint16_t>(key_span.size()),
-          dir_entry.value_size, io_buf_);
+      files_->at(dir_entry.file_id)
+          ->read_entry(dir_entry.file_offset,
+                       narrow<std::uint16_t>(key_span.size()),
+                       dir_entry.value_size, io_buf_);
       extract_value_into(io_buf_, cached_.second);
       has_cached_ = true;
     }
@@ -371,9 +372,9 @@ public:
       return false;
     }
     thread_local Bytes io_buf;
-    fs->at(kv->file_id)->read_entry(
-        kv->file_offset, narrow<std::uint16_t>(key.size()), kv->value_size,
-        io_buf);
+    fs->at(kv->file_id)
+        ->read_entry(kv->file_offset, narrow<std::uint16_t>(key.size()),
+                     kv->value_size, io_buf);
     extract_value_into(io_buf, out);
     return true;
   }
@@ -383,18 +384,24 @@ public:
   // opts.sync controls whether fdatasync is called after the write.
   // Throws std::system_error on I/O failure or lock contention (try_lock).
   void put(const WriteOptions &opts, BytesView key, BytesView value) {
-    auto guard = acquire_write_lock(opts);
-    const auto offset =
-        active_file().append(next_lsn_, EntryType::Put, key, value);
+    std::shared_ptr<DataFile> file_to_sync;
+    {
+      auto guard = acquire_write_lock(opts);
+      const auto offset =
+          active_file().append(next_lsn_, EntryType::Put, key, value);
 
-    key_dir_ =
-        key_dir_.set(key, KeyDirEntry{next_lsn_, active_file_id_, offset,
-                                      narrow<std::uint32_t>(value.size())});
-    ++next_lsn_;
-    if (opts.sync) {
-      active_file().sync();
+      key_dir_ =
+          key_dir_.set(key, KeyDirEntry{next_lsn_, active_file_id_, offset,
+                                        narrow<std::uint32_t>(value.size())});
+      ++next_lsn_;
+      if (opts.sync) {
+        file_to_sync = files_->at(active_file_id_);
+      }
+      maybe_rotate();
     }
-    maybe_rotate();
+    if (file_to_sync) {
+      file_to_sync->sync();
+    }
   }
 
   // Writes a tombstone for key.
@@ -403,18 +410,24 @@ public:
   // opts.sync controls whether fdatasync is called after the write.
   // Throws std::system_error on I/O failure or lock contention (try_lock).
   [[nodiscard]] auto del(const WriteOptions &opts, BytesView key) -> bool {
-    auto guard = acquire_write_lock(opts);
-    if (!key_dir_.contains(key)) {
-      return false;
-    }
-    std::ignore = active_file().append(next_lsn_, EntryType::Delete, key, {});
-    ++next_lsn_;
+    std::shared_ptr<DataFile> file_to_sync;
+    {
+      auto guard = acquire_write_lock(opts);
+      if (!key_dir_.contains(key)) {
+        return false;
+      }
+      std::ignore = active_file().append(next_lsn_, EntryType::Delete, key, {});
+      ++next_lsn_;
 
-    key_dir_ = key_dir_.erase(key);
-    if (opts.sync) {
-      active_file().sync();
+      key_dir_ = key_dir_.erase(key);
+      if (opts.sync) {
+        file_to_sync = files_->at(active_file_id_);
+      }
+      maybe_rotate();
     }
-    maybe_rotate();
+    if (file_to_sync) {
+      file_to_sync->sync();
+    }
     return true;
   }
 
@@ -435,42 +448,50 @@ public:
     if (batch.empty()) {
       return;
     }
-    auto guard = acquire_write_lock(opts);
+    std::shared_ptr<DataFile> file_to_sync;
+    {
+      auto guard = acquire_write_lock(opts);
 
-    std::ignore =
-        active_file().append(next_lsn_++, EntryType::BulkBegin, {}, {});
+      std::ignore =
+          active_file().append(next_lsn_++, EntryType::BulkBegin, {}, {});
 
-    auto t = key_dir_.transient();
-    for (auto &op : batch.operations_) {
-      std::visit(
-          [&](auto &o) {
-            using T = std::decay_t<decltype(o)>;
-            if constexpr (std::is_same_v<T, BatchInsert>) {
-              const auto offset = active_file().append(
-                  next_lsn_, EntryType::Put, std::span<const std::byte>{o.key},
-                  std::span<const std::byte>{o.value});
-              t.set(std::span<const std::byte>{o.key},
-                    KeyDirEntry{next_lsn_, active_file_id_, offset,
-                                narrow<std::uint32_t>(o.value.size())});
-              ++next_lsn_;
-            } else if constexpr (std::is_same_v<T, BatchRemove>) {
-              std::ignore =
-                  active_file().append(next_lsn_, EntryType::Delete,
-                                       std::span<const std::byte>{o.key}, {});
-              ++next_lsn_;
-              t.erase(std::span<const std::byte>{o.key});
-            }
-          },
-          op);
+      auto t = key_dir_.transient();
+      for (auto &op : batch.operations_) {
+        std::visit(
+            [&](auto &o) {
+              using T = std::decay_t<decltype(o)>;
+              if constexpr (std::is_same_v<T, BatchInsert>) {
+                const auto offset =
+                    active_file().append(next_lsn_, EntryType::Put,
+                                         std::span<const std::byte>{o.key},
+                                         std::span<const std::byte>{o.value});
+                t.set(std::span<const std::byte>{o.key},
+                      KeyDirEntry{next_lsn_, active_file_id_, offset,
+                                  narrow<std::uint32_t>(o.value.size())});
+                ++next_lsn_;
+              } else if constexpr (std::is_same_v<T, BatchRemove>) {
+                std::ignore =
+                    active_file().append(next_lsn_, EntryType::Delete,
+                                         std::span<const std::byte>{o.key}, {});
+                ++next_lsn_;
+                t.erase(std::span<const std::byte>{o.key});
+              }
+            },
+            op);
+      }
+
+      std::ignore =
+          active_file().append(next_lsn_++, EntryType::BulkEnd, {}, {});
+
+      key_dir_ = std::move(t).persistent();
+      if (opts.sync) {
+        file_to_sync = files_->at(active_file_id_);
+      }
+      maybe_rotate();
     }
-
-    std::ignore = active_file().append(next_lsn_++, EntryType::BulkEnd, {}, {});
-
-    key_dir_ = std::move(t).persistent();
-    if (opts.sync) {
-      active_file().sync();
+    if (file_to_sync) {
+      file_to_sync->sync();
     }
-    maybe_rotate();
   }
 
   // ── Range iteration ────────────────────────────────────────────────────
