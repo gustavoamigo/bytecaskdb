@@ -1,5 +1,4 @@
 add_rules("mode.debug", "mode.release")
-add_rules("plugin.compile_commands.autoupdate", {outputdir = "."})
 
 add_requires("bitsery")
 add_requires("catch2 3.x")
@@ -54,12 +53,7 @@ target("bytecask")
     add_cxflags(table.unpack(common_flags))
     add_packages("bitsery", "immer", "jemalloc")
     on_load(apply_sanitizer)
-    -- Patch compile_commands.json so clangd can resolve all module imports.
-    -- xmake's compile_commands generator omits some -fmodule-file= flags;
-    -- the script adds any that are missing within each target group.
-    after_build(function(target)
-        os.exec("python3 scripts/fix_compile_commands.py")
-    end)
+    -- For VS Code / clangd support, run: scripts/gen_compile_commands.sh
 
 target("bytecask_tests")
     set_toolchains("clang")
