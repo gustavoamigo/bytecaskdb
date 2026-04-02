@@ -76,6 +76,30 @@ TEST_CASE("Bytecask put and get round-trip", "[bytecask]") {
 }
 
 // ---------------------------------------------------------------------------
+// Test 2b: get output-param overload reuses buffer
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask get output-param round-trip", "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put({}, to_bytes("k1"), to_bytes("v1"));
+  db.put({}, to_bytes("k2"), to_bytes("value_two"));
+
+  bytecask::Bytes out;
+
+  CHECK(db.get({}, to_bytes("k1"), out));
+  CHECK(to_string(out) == "v1");
+
+  // Second call reuses the same buffer (capacity retained).
+  CHECK(db.get({}, to_bytes("k2"), out));
+  CHECK(to_string(out) == "value_two");
+
+  // Missing key returns false and does not modify out.
+  CHECK_FALSE(db.get({}, to_bytes("absent"), out));
+  CHECK(to_string(out) == "value_two");
+}
+
+// ---------------------------------------------------------------------------
 // Test 3: put overwrites an existing key
 // ---------------------------------------------------------------------------
 TEST_CASE("Bytecask put overwrites existing key", "[bytecask]") {

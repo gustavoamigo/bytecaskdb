@@ -15,7 +15,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-027 | Add Mixed/Sync benchmark | Added BC_Mixed_Sync and LDB_Mixed_Sync (1000 iter, 3 reps); results recorded 2026-04-02. |
+| BC-042 | Buffer-reusing `get()` overload and iterator | `Bytes&` output-param `get()` + `read_value_into` on DataFile + iterator buffer reuse. |
 
 ## Backlog
 
@@ -25,6 +25,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-024 | Implement PMR - Memory Allocation described in design | Note: There is a draft proposal in the bytecask_design.md
 | BC-026 | Run `flush_hints` in background after file rotate | After rotation, dispatch `flush_hints()` on the sealed file to a background thread so it does not block the write path. |
 | BC-041 | `ReadOptions::verify_checksums` flag | Allow skipping CRC verification on bulk scans for ~5% win. Mirrors LevelDB/RocksDB `verify_checksums` option. |
+| BC-027 | Add Mixed/Sync benchmark | Added BC_Mixed_Sync and LDB_Mixed_Sync (1000 iter, 3 reps); results recorded 2026-04-02. Moved to backlog — no open work remaining. |
 
 
 ## Done
@@ -34,6 +35,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-034 | Intrusive reference counting for radix tree nodes | Replace `shared_ptr<Node>` with `IntrusivePtr<Node>` embedding `atomic<uint32_t> refcount_` in each node. Eliminates ~32 B `make_shared` control block per node; shrinks child slot from 24 B to 16 B. Per-node cost: ~80 B (down from ~104 B). Measured: 108 B/key generic (−17%), 116 B/key prefixed (−17%) at 100k keys. 82 tests pass (1M+ assertions). ASan clean. |
 | BC-039 | Single-pread read path (`DataFile::read_entry`) | Use `KeyDirEntry.value_size` + key size to issue one `pread` instead of two. Get +53% (1.18M ops/µs), Range50 +66% (28.2k scans/µs). ByteCask Get now 12% faster than LevelDB. Chunked I/O strategy (BC-038) removed — offset-sort overhead exceeded benefit on warm cache. 86 tests pass (1M+ assertions). |
 | BC-038 | iter_from: chunked I/O strategy (removed) | Attempted chunked strategy (collect KeyDirEntries, sort by offset, read in order). Benchmarked worse than lazy path on warm cache due to sort + collect overhead. Removed; `ReadOptions` simplified to empty struct. |
+| BC-042 | Buffer-reusing `get()` and iterator | Added `Bytes&` output-param `get()` overload (convenience `get` delegates to it), `DataFile::read_entry(io_buf)` as single read primitive, `verify_entry()` factored from duplicated CRC logic. Removed `read_value_into` (replaced by `read_entry` + `extract_value_into`). `EntryIterator` reuses internal I/O + value buffers across advances. Get: ~flat (pread-dominated). Range50: **−16%** CPU time (37 µs → 31 µs at 50K keys). 87 tests pass (1M+ assertions). |
 | BC-030 | Radix tree engine integration | Replaced `PersistentOrderedMap<Key, KeyDirEntry>` with `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. `KeyIterator` and `EntryIterator` now wrap `RadixTreeIterator<KeyDirEntry>`. All engine operations (`get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`) and recovery pass byte spans directly to the radix tree API. 82 tests pass (1M+ assertions). ASan clean. |
 | BC-033 | Radix tree hardening + memory layout optimisation | Phase 1: linear scan kept, 3 comments added, 10 new tests (33 total, ~1M assertions). Phase 2: children N=8→N=4 (−31% memory). Phase 3: packed node layout — `uint64_t edit_tag` + `optional<V>` replaced by `uint32_t packed_tag_` (high bit = has_value) + bare `V value_`; children N=4→N=1. Combined: 184→112 B/node; measured 209→129 B/key (−38%) at 100k generic keys, 225→139 B/key (−38%) with prefixed UUIDv7 keys. 33 tests pass. |
 | BC-036 | jemalloc as global allocator | `add_requires("jemalloc")` + `add_packages` on all four targets. Replaces glibc ptmalloc2 via symbol interposition. No regression in `engine_bench` (results within noise; load avg was 5.56 on the after run). Fragmentation benefit visible only in long-running workloads. |

@@ -326,6 +326,7 @@ static void BC_Get(benchmark::State &state) {
   BcStore store;
   auto keys = generate_prefixed_keys(kDatasetSize);
   bytecask::ReadOptions ro;
+  bytecask::Bytes value;
 
   std::size_t idx = 0;
   std::vector<double> samples;
@@ -334,9 +335,10 @@ static void BC_Get(benchmark::State &state) {
   for (auto _ : state) {
     const auto &k = keys[idx % keys.size()];
     const auto t0 = std::chrono::high_resolution_clock::now();
-    auto v = store.db.get(ro, bc_key(k));
+    auto found = store.db.get(ro, bc_key(k), value);
     const auto t1 = std::chrono::high_resolution_clock::now();
-    benchmark::DoNotOptimize(v);
+    benchmark::DoNotOptimize(found);
+    benchmark::DoNotOptimize(value.data());
     if (samples.size() < kMaxSamples)
       samples.push_back(static_cast<double>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
