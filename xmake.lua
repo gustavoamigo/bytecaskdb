@@ -81,6 +81,12 @@ target("bytecask_bench")
     add_cxflags(table.unpack(common_flags))
     add_cxflags("-Wno-global-constructors")
     add_packages("bitsery", "benchmark", "immer", "jemalloc")
+    -- map_bench.cpp defines operator new/delete for allocation tracking.
+    -- jemalloc's static archive (jemalloc_cpp.o) also defines them.
+    -- --allow-multiple-definition lets the linker keep the first definition
+    -- encountered (the .o file, which comes before the archive), so the
+    -- custom allocator tracker in map_bench.cpp wins as intended.
+    add_ldflags("-Wl,--allow-multiple-definition", {force = true})
     on_load(apply_sanitizer)
 
 target("engine_bench")

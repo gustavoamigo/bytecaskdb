@@ -15,6 +15,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-027 | Add Mixed/Sync benchmark | Added BC_Mixed_Sync and LDB_Mixed_Sync (1000 iter, 3 reps); results recorded 2026-04-02. |
 
 ## Backlog
 
