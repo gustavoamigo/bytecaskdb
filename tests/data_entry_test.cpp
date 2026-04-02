@@ -166,17 +166,19 @@ TEST_CASE("DataFile::read round-trips entries at recorded offsets",
       df.append(8, bytecask::EntryType::Put, to_bytes("foo"), to_bytes("bar"));
   df.sync();
 
-  const auto r0 = df.read(off0);
-  CHECK(r0.sequence == 7U);
-  CHECK(r0.entry_type == bytecask::EntryType::Put);
-  CHECK(to_string(r0.key) == "hello");
-  CHECK(to_string(r0.value) == "world");
+  const auto r0 = df.scan(off0);
+  REQUIRE(r0.has_value());
+  CHECK(r0->first.sequence == 7U);
+  CHECK(r0->first.entry_type == bytecask::EntryType::Put);
+  CHECK(to_string(r0->first.key) == "hello");
+  CHECK(to_string(r0->first.value) == "world");
 
-  const auto r1 = df.read(off1);
-  CHECK(r1.sequence == 8U);
-  CHECK(r1.entry_type == bytecask::EntryType::Put);
-  CHECK(to_string(r1.key) == "foo");
-  CHECK(to_string(r1.value) == "bar");
+  const auto r1 = df.scan(off1);
+  REQUIRE(r1.has_value());
+  CHECK(r1->first.sequence == 8U);
+  CHECK(r1->first.entry_type == bytecask::EntryType::Put);
+  CHECK(to_string(r1->first.key) == "foo");
+  CHECK(to_string(r1->first.value) == "bar");
 
   std::filesystem::remove(tmp);
 }

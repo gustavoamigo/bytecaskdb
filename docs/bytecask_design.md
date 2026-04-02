@@ -191,6 +191,7 @@ Not yet implemented — callers currently provide the full file path.
 - **Constructor**: Takes a `std::filesystem::path`. Opens (or creates) the file via POSIX `open(O_WRONLY | O_CREAT | O_APPEND)`. Throws `std::system_error` on failure.
 - **`append(sequence, entry_type, key, value) -> Offset`**: Serializes a new entry with the given sequence number and `EntryType`, writes it to the OS page cache via `::write()`, and returns the byte offset where the entry starts. `BulkBegin`/`BulkEnd` entries pass empty key and value spans. Does **not** guarantee durability on its own.
 - **`sync()`**: Calls `::fdatasync()` to flush all pending writes to physical storage. Must be called explicitly to guarantee crash-safety. Decoupled from `append()` to enable Group Commit: callers can batch multiple `append()` calls before a single `sync()`.
+- **`read_entry(offset, key_size, value_size) -> DataEntry`**: Single-pread fast path. The caller supplies the key and value sizes (known from `KeyDirEntry`), so the full entry (`kHeaderSize + key_size + value_size + kCrcSize`) is read in **one** `pread` syscall. Used by `get()`, `EntryIterator`, and any path where the key directory already holds `value_size`. `scan()` (two preads) remains the fallback for recovery, where sizes are unknown.
 - Key and value are accepted as `std::span<const std::byte>` for binary safety.
 
 ### I/O Back-end Rationale
@@ -337,7 +338,14 @@ Read API:
 
 `HintEntry` is a plain struct holding `{uint64_t sequence, EntryType entry_type, uint64_t file_offset, std::vector<std::byte> key, uint32_t value_size}`.
 
-## Engine API
+## Range Scan: `iter_from`
+
+`iter_from` returns a lazy input range of `(Key, Bytes)` pairs in ascending key order. Each dereference issues a single `pread` via `DataFile::read_entry()` — the caller-supplied `key_size` and `value_size` (from `KeyDirEntry`) let the engine compute the total entry size upfront, halving the syscall count compared to the recovery path (`scan()`, which needs two preads because sizes are unknown).
+
+Results are always in ascending key order (radix tree iteration order).
+
+`ReadOptions` is currently an empty struct reserved for future knobs (e.g. `verify_checksums`).
+
 
 ### [Draft] PMR - Memory Allocation (BC-024)
 
@@ -521,8 +529,7 @@ struct WriteOptions {
 };
 
 struct ReadOptions {
-    // No options yet. Reserved for future additions (e.g., verify_checksums,
-    // snapshot handles).
+    // Placeholder for future read-path knobs (e.g. verify_checksums).
 };
 ```
 

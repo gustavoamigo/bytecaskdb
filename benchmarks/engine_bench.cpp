@@ -423,8 +423,43 @@ static void BC_Range50(benchmark::State &state) {
     ++idx;
   }
 
-  // Each iteration scans up to kRangeLen items.
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * kRangeLen);
+  state.counters["scans_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  attach_jitter(state, samples);
+}
+
+static constexpr int kRangeLen1000 = 1000;
+
+static void BC_Range1000(benchmark::State &state) {
+  BcStore store;
+  auto keys = generate_prefixed_keys(kDatasetSize);
+  bytecask::ReadOptions ro;
+
+  std::size_t idx = 0;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+
+  for (auto _ : state) {
+    const auto &start_key = keys[idx % keys.size()];
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    auto range = store.db.iter_from(ro, bc_key(start_key));
+    int count = 0;
+    for (auto it = range.begin(); it != range.end() && count < kRangeLen1000;
+         ++it, ++count) {
+      auto entry = *it;
+      benchmark::DoNotOptimize(entry);
+    }
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    ++idx;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) *
+                          kRangeLen1000);
   state.counters["scans_per_us"] = benchmark::Counter(
       static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
   attach_jitter(state, samples);
@@ -715,6 +750,39 @@ static void LDB_Range50(benchmark::State &state) {
   attach_jitter(state, samples);
 }
 
+static void LDB_Range1000(benchmark::State &state) {
+  LdbStore store;
+  auto keys = generate_prefixed_keys(kDatasetSize);
+  leveldb::ReadOptions ro;
+
+  std::size_t idx = 0;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+
+  for (auto _ : state) {
+    const auto &start_key = keys[idx % keys.size()];
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    std::unique_ptr<leveldb::Iterator> it{store.db->NewIterator(ro)};
+    it->Seek(ldb_slice(start_key));
+    int count = 0;
+    for (; it->Valid() && count < kRangeLen1000; it->Next(), ++count) {
+      benchmark::DoNotOptimize(it->value());
+    }
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    ++idx;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) *
+                          kRangeLen1000);
+  state.counters["scans_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  attach_jitter(state, samples);
+}
+
 // ──────────────────────────── Mixed ───────────────────────────────────────
 
 static void LDB_Mixed_NoSync(benchmark::State &state) {
@@ -924,7 +992,8 @@ BENCHMARK(BC_Put_NoSync)    ->Name("ByteCask/Put/NoSync") ->Repetitions(3)->Repo
 BENCHMARK(BC_Put_Sync)      ->Name("ByteCask/Put/Sync")   ->Repetitions(3)->ReportAggregatesOnly(true)->Iterations(200);
 BENCHMARK(BC_Get)           ->Name("ByteCask/Get");
 BENCHMARK(BC_Del_NoSync)    ->Name("ByteCask/Del/NoSync") ->Repetitions(3)->ReportAggregatesOnly(true);
-BENCHMARK(BC_Range50)       ->Name("ByteCask/Range50");
+BENCHMARK(BC_Range50)           ->Name("ByteCask/Range50");
+BENCHMARK(BC_Range1000)         ->Name("ByteCask/Range1000");
 BENCHMARK(BC_Mixed_Sync)    ->Name("ByteCask/Mixed/Sync")   ->Repetitions(3)->ReportAggregatesOnly(true)->Iterations(1000);
 BENCHMARK(BC_Mixed_NoSync)  ->Name("ByteCask/Mixed/NoSync");
 
@@ -933,7 +1002,8 @@ BENCHMARK(LDB_Put_NoSync)   ->Name("LevelDB/Put/NoSync")  ->Repetitions(3)->Repo
 BENCHMARK(LDB_Put_Sync)     ->Name("LevelDB/Put/Sync")    ->Repetitions(3)->ReportAggregatesOnly(true)->Iterations(200);
 BENCHMARK(LDB_Get)          ->Name("LevelDB/Get");
 BENCHMARK(LDB_Del_NoSync)   ->Name("LevelDB/Del/NoSync")  ->Repetitions(3)->ReportAggregatesOnly(true);
-BENCHMARK(LDB_Range50)      ->Name("LevelDB/Range50");
+BENCHMARK(LDB_Range50)       ->Name("LevelDB/Range50");
+BENCHMARK(LDB_Range1000)     ->Name("LevelDB/Range1000");
 BENCHMARK(LDB_Mixed_Sync)   ->Name("LevelDB/Mixed/Sync")    ->Repetitions(3)->ReportAggregatesOnly(true)->Iterations(1000);
 BENCHMARK(LDB_Mixed_NoSync) ->Name("LevelDB/Mixed/NoSync");
 

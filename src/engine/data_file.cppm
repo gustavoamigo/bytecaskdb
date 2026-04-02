@@ -128,7 +128,7 @@ public:
       return std::nullopt;
     }
 
-    // Step 1: read the fixed header to determine variable-length field sizes.
+    // Read the fixed header to determine variable-length field sizes.
     std::array<std::byte, kHeaderSize> hdr{};
     if (::pread(fd_, hdr.data(), kHeaderSize, narrow<off_t>(offset)) !=
         std::ssize(hdr)) {
@@ -137,34 +137,26 @@ public:
     }
 
     const auto header = parse_header(std::span{hdr});
-
-    // Step 2: allocate full entry buffer, copy header, then read the rest.
-    std::vector<std::byte> buf(kHeaderSize + header.key_size +
-                               header.value_size + kCrcSize);
-    std::ranges::copy(hdr, buf.begin());
-
-    const auto tail = std::span{buf}.subspan(kHeaderSize);
-    if (::pread(fd_, tail.data(), tail.size(),
-                narrow<off_t>(offset + kHeaderSize)) != std::ssize(tail)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "DataFile::scan: pread payload failed"};
-    }
-
-    auto entry = deserialize_entry(buf);
-    const auto next = offset + static_cast<Offset>(buf.size());
+    auto entry = read_entry(offset, header.key_size, header.value_size);
+    const auto next = offset + kHeaderSize + header.key_size +
+                      header.value_size + kCrcSize;
     return std::make_pair(std::move(entry), next);
   }
 
-  // Reads and deserializes the entry at the given offset. Delegates to scan().
-  // Throws std::system_error on I/O failure, std::runtime_error on CRC
-  // mismatch or if offset is at or past end of file.
-  [[nodiscard]] auto read(Offset offset) const -> DataEntry {
-    auto result = scan(offset);
-    if (!result) {
-      throw std::runtime_error{
-          std::format("DataFile::read: offset {} is past end of file", offset)};
+  // Single-pread fast path: the caller supplies key_size and value_size
+  // (known from KeyDirEntry), so the entire entry is read in one syscall.
+  // Used by get() and EntryIterator where sizes are already available.
+  // scan() remains the fallback for recovery where sizes are unknown.
+  [[nodiscard]] auto read_entry(Offset offset, std::uint16_t key_size,
+                                std::uint32_t value_size) const -> DataEntry {
+    const auto total = kHeaderSize + key_size + value_size + kCrcSize;
+    std::vector<std::byte> buf(total);
+    if (::pread(fd_, buf.data(), total, narrow<off_t>(offset)) !=
+        narrow<ssize_t>(total)) {
+      throw std::system_error{errno, std::generic_category(),
+                              "DataFile::read_entry: pread failed"};
     }
-    return std::move(result->first);
+    return deserialize_entry(buf);
   }
 
   // Flushes all pending writes to physical storage via fdatasync.

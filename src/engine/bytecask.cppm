@@ -1,5 +1,4 @@
 module;
-#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -197,13 +196,14 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// EntryIterator — walks key directory in ascending order, reading values
-// lazily from disk on each dereference.
+// EntryIterator — walks the key directory in ascending key order, reading
+// values lazily from disk on each dereference.
 //
 // Satisfies std::input_iterator. Throws std::system_error on I/O failure.
-// Wraps RadixTreeIterator<KeyDirEntry>; materializes Key + value on demand.
-// files_ is a snapshot of the engine's registry at construction time.
-// O(1) structural sharing via immer::map; independent lifetime from Bytecask.
+// Wraps RadixTreeIterator<KeyDirEntry>; materializes Key + value on demand
+// via a single pread per entry (read_entry). files_ is a snapshot of the
+// engine's registry at construction time — independent lifetime from
+// Bytecask via shared_ptr.
 // ---------------------------------------------------------------------------
 export class EntryIterator {
 public:
@@ -215,11 +215,12 @@ public:
   EntryIterator(RadixTreeIterator<KeyDirEntry> cur, FileRegistry files)
       : cur_{std::move(cur)}, files_{std::move(files)} {}
 
-  // Reads the value from disk on demand (lazy). Caches the result until ++.
   auto operator*() const -> const value_type & {
     if (!cached_) {
       auto [key_span, dir_entry] = *cur_;
-      auto entry = files_->at(dir_entry.file_id)->read(dir_entry.file_offset);
+      auto entry = files_->at(dir_entry.file_id)->read_entry(
+          dir_entry.file_offset, narrow<std::uint16_t>(key_span.size()),
+          dir_entry.value_size);
       cached_.emplace(Key{key_span}, std::move(entry.value));
     }
     return *cached_;
@@ -293,7 +294,7 @@ export struct WriteOptions {
   bool try_lock{false};
 };
 
-// Reserved for future read-path controls (e.g. verify_checksums, snapshots).
+// ReadOptions — placeholder for future read-path knobs (e.g. verify_checksums).
 export struct ReadOptions {};
 
 // ---------------------------------------------------------------------------
@@ -353,7 +354,8 @@ public:
     if (!kv) {
       return std::nullopt;
     }
-    const auto entry = fs->at(kv->file_id)->read(kv->file_offset);
+    const auto entry = fs->at(kv->file_id)->read_entry(
+        kv->file_offset, narrow<std::uint16_t>(key.size()), kv->value_size);
     return entry.value;
   }
 
@@ -455,8 +457,9 @@ public:
   // ── Range iteration ────────────────────────────────────────────────────
 
   // Returns an input range of (key, value) pairs with keys >= from.
-  // Pass an empty span to start from the first key. Each increment reads one
-  // value from disk (lazy), routing through the file registry.
+  // Pass an empty span to start from the first key. Each dereference reads
+  // one value from disk via a single pread (lazy). Results are in ascending
+  // key order.
   // Throws std::system_error on I/O failure.
   [[nodiscard]] auto iter_from(const ReadOptions & /*opts*/,
                                BytesView from = {}) const
