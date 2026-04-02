@@ -22,7 +22,8 @@ Canonical location: `docs/bytecask_design.md`.
 - Multi-writer access, MVCC, or snapshot isolation. ByteCask uses a SWMR model.
 - TTL or expiry.
 - Async I/O.
-- Online (background) compaction. Vacuum is a fully offline operation.
+- Fully online/background compaction that keeps pace with a high-throughput write stream. Conservative online vacuum (see below) is in scope; real-time compaction is not.
+- Tombstone elision during partial vacuum. Removing tombstones requires a full vacuum of all sealed files and is not part of the conservative strategy.
 
 ## Design Principles
 
@@ -99,7 +100,75 @@ A new active data file is always created on engine startup.
 
 ### Vacuum
 
-Vacuum is **fully offline**: the engine must not be running while vacuum operates. No background or online compaction. (This project uses the PostgreSQL term *vacuum*; other systems call it *compaction* or *merge*.)
+(This project uses the PostgreSQL term *vacuum*; other systems call it *compaction* or *merge*.)
+
+ByteCask implements a **conservative online vacuum**: the engine continues to serve reads and writes while vacuum rewrites sealed data files. "Conservative" means the design prioritises write-path non-interference and correctness over maximum space reclamation efficiency:
+
+- Only sealed (immutable) data files are considered — the active file is never touched.
+- Only files that exceed a configurable waste threshold are processed; files below the threshold are left alone.
+- One file (or a small batch) is processed per vacuum cycle to limit I/O interference.
+- Tombstones are never dropped during partial compaction (see *Tombstone handling* below).
+- A new compacted file is fully written and `fdatasync`-ed before any old file is removed.
+
+| Property | Conservative Online Vacuum |
+|---|---|
+| Engine state during vacuum | Running (reads and writes continue) |
+| Write-path impact | Zero — vacuum reads sealed files without holding any write lock |
+| Trigger | Threshold-based (manual call or optional post-rotation check) |
+| File selection | Sealed files above waste threshold; highest-waste file first |
+| Tombstone elision | Never during partial compaction |
+| Atomicity | Key-dir update + file-registry swap under `write_mu_` |
+| Concurrent vacuums | Prevented by `vacuum_mu_` |
+
+#### Waste Ratio
+
+The waste ratio of a sealed data file is the fraction of disk space occupied by dead entries — entries whose key no longer maps back to that file in the key directory:
+
+```
+waste_ratio = 1 - (live_bytes / file_size)
+
+live_bytes = Σ (kHeaderSize + key_size + value_size + kCrcSize)
+             for all KeyDirEntries where entry.file_id == this_file
+```
+
+A waste ratio above `VacuumOptions::waste_threshold` (default `0.5`) means the file qualifies for compaction.
+
+#### Vacuum Procedure
+
+1. **Acquire `vacuum_mu_`** — prevents two vacuum calls from running concurrently.
+2. **Snapshot the key directory** — read the current `DirSnapshot{key_dir, files}` under `snapshot_mu_`. This is the authoritative view of which entries are live.
+3. **Select target files** — iterate sealed files, compute waste ratios from the snapshot, keep those above `waste_threshold`. Pick at most `max_files_per_cycle` files, preferring the one(s) with the highest waste ratio.
+4. **Rewrite each target file** — for each qualifying file:
+   a. Open a new data file for writing (new timestamp stem, same directory).
+   b. Scan the old data file entry by entry.
+   c. For each `Put` entry: check whether the **step-2 snapshot's** key directory entry for that key points to the old file at this offset and has the same sequence number. If yes, the entry is live → write it to the new file at its new offset, recording the mapping `(key → new_file_id, new_offset)`. If no, the entry is dead → skip.
+   d. For each `Delete` entry: **always copy it to the new file** (see *Tombstone handling* below). `BulkBegin`/`BulkEnd` entries are always skipped — they are crash-recovery markers not needed in an already-committed sealed file.
+   e. After scanning, `fdatasync` the new file. Write a hint file for it using the same temp-then-rename protocol as rotation.
+5. **Atomic commit** (under `write_mu_`):
+   a. Snapshot the *current* key directory again (it may have advanced since step 2 due to concurrent writes).
+   b. Build a `TransientRadixTree` from it.
+   c. For each live entry copied to a new file, look up the key in the current key directory. If the sequence number still matches (the key has not been updated by a concurrent writer since step 2), update its `KeyDirEntry` to the new `file_id` and `file_offset`. If the sequence number differs, skip — the concurrent writer's version takes precedence.
+   d. Call `persistent()` on the transient tree to obtain the new immutable key directory.
+   e. Build an updated `FileRegistry`: add the new compacted files, remove the old files.
+   f. Call `publish_snapshot()` to atomically replace the observable state for all readers.
+6. **Release `write_mu_`**.
+7. **Delete old files** — once published, the old sealed files are removed from the `FileRegistry`. Any in-flight `EntryIterator` still holds a `shared_ptr` to the old `FileRegistry` snapshot, keeping the old `DataFile` fds alive until the iterator is destroyed. Vacuum deletes the on-disk files immediately after the commit; the fds remain valid until their last `shared_ptr` drops.
+8. **Release `vacuum_mu_`**.
+9. **Return `VacuumStats`** summarising files examined, files compacted, and bytes reclaimed.
+
+#### Tombstone Handling
+
+Tombstone (`Delete`) entries record that a key was explicitly removed. They **must be copied** to the compacted output during partial vacuum. The reason is resurrection risk: if an older data file (not being compacted in this cycle) contains a `Put` for the same key, recovery would see that `Put` and add the key back to the key directory — unless the `Delete` entry survives in some file to overrule it.
+
+Conservative online vacuum therefore **always copies `Delete` entries verbatim** to the new compacted file (same sequence number, same key). A deleted key is not present in the key directory, so no key-directory update is needed for tombstones — they are pure pass-through copies.
+
+The practical consequence is that **waste reclaimed by partial vacuum comes entirely from superseded `Put` entries** (old versions of keys that have since been overwritten or deleted). Tombstones occupy space in the compacted file until a full-vacuum pass eliminates them.
+
+Full tombstone elision (dropping `Delete` entries entirely) is only safe when compacting *all* sealed files in a single commit, guaranteeing that no unprocessed `Put` for any deleted key can survive in any remaining file. Full vacuum is a separate, user-triggered operation distinct from the conservative online vacuum described here.
+
+#### Auto Vacuum (Backlog)
+
+An optional background thread may run vacuum automatically. After each file rotation, if any sealed file exceeds the waste threshold, vacuum is dispatched on a background thread. Rate-limiting (e.g., a configurable I/O budget per second) prevents vacuum from stealing throughput from the write path. Auto vacuum requires background thread infrastructure (see BC-045) and is tracked separately as a backlog item.
 
 ## Data File Format (.data)
 
@@ -536,6 +605,31 @@ struct ReadOptions {
 
 **`sync` default of `true`**: preserves the pre-existing crash-safe behaviour. Callers that deliberately trade durability for throughput (e.g., bulk import, benchmarks) opt out explicitly by setting `sync = false`. The destructor always calls `sync()` unconditionally, so `sync = false` on individual writes does not risk losing data on clean shutdown — only on an OS/power failure between the last write and the destructor.
 
+### VacuumOptions and VacuumStats
+
+```cpp
+struct VacuumOptions {
+    // Minimum fraction of dead bytes in a file before it qualifies for
+    // compaction. 0.0 means every sealed file is a candidate; 1.0 means
+    // no file ever qualifies. Default 0.5 (compact files that are at
+    // least 50% dead space).
+    double waste_threshold{0.5};
+
+    // Maximum number of sealed files to compact in a single vacuum() call.
+    // 0 means compact all qualifying files. Default 1 (conservative: one
+    // file per call to limit I/O interference with the write path).
+    std::size_t max_files_per_cycle{1};
+};
+
+struct VacuumStats {
+    std::size_t files_examined;   // Total sealed files inspected
+    std::size_t files_compacted;  // Files that exceeded the waste threshold
+    uint64_t    bytes_before;     // Sum of old file sizes (compacted files only)
+    uint64_t    bytes_after;      // Sum of new compacted file sizes
+    uint64_t    bytes_reclaimed;  // bytes_before - bytes_after
+};
+```
+
 ### Bytecask
 
 ```cpp
@@ -595,6 +689,17 @@ public:
     // Walks the in-memory B-Tree only; no disk I/O.
     [[nodiscard]] auto keys_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
+
+    // ── Vacuum ────────────────────────────────────────────────────────────
+
+    // Compacts sealed data files whose waste ratio exceeds opts.waste_threshold.
+    // Processes at most opts.max_files_per_cycle files per call.
+    // The engine continues to serve reads and writes concurrently; vacuum
+    // acquires write_mu_ only for the brief atomic commit at the end.
+    // Only one vacuum may run at a time; a concurrent call blocks until the
+    // first completes.
+    // Throws std::system_error on I/O failure; the database is left consistent.
+    [[nodiscard]] auto vacuum(const VacuumOptions& opts = {}) -> VacuumStats;
 
 private:
     explicit Bytecask(std::filesystem::path dir);
@@ -686,7 +791,7 @@ for (auto& key : db.keys_from(as_bytes("user:"))) { ... }
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
 | D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1 and standard C++ practice). |
 | D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. MVCC and snapshot isolation are not provided. |
-| D10 | **Vacuum**: Fully offline. The engine must not be running while vacuum operates. No background or online compaction. |
+| D10 | **Vacuum**: Conservative online. Vacuum runs concurrently with the engine (reads and writes continue) by operating only on sealed, immutable data files. Tombstones are never dropped during partial compaction. The atomic commit (key-dir update + file-registry swap) is brief and happens under `write_mu_`. Only one vacuum may run at a time (enforced by `vacuum_mu_`). |
 | D11 | **File naming**: `data_{YYYYMMDDHHmmssUUUUUU}` using microsecond precision. Gives lexicographic == chronological ordering and avoids the false precision of nanosecond timestamps whose sub-microsecond bits are often zero on Linux. |
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be discarded with a logged warning. No partial-batch entries enter the key directory. |

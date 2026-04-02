@@ -15,11 +15,14 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-046 | Conservative online vacuum — design | Design documented in `bytecask_design.md` (Vacuum section, VacuumOptions/VacuumStats API, D10). No implementation yet. |
 
 ## Backlog
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-047 | Implement conservative online vacuum | Implement `Bytecask::vacuum(VacuumOptions)` per design in `bytecask_design.md`. Requires: waste-ratio calculation from key-dir snapshot, new data-file + hint-file write, atomic key-dir + file-registry commit under `write_mu_`, old-file deletion. |
+| BC-048 | Auto vacuum after rotation | After each file rotation, dispatch vacuum on a background thread if any sealed file exceeds `waste_threshold`. Depends on BC-047 (vacuum) and BC-045 (background thread infrastructure). |
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-024 | Implement PMR - Memory Allocation described in design | Note: There is a draft proposal in the bytecask_design.md
 | BC-026 | Run `flush_hints` in background after file rotate | After rotation, dispatch `flush_hints()` on the sealed file to a background thread so it does not block the write path. |
