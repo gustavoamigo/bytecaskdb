@@ -53,9 +53,9 @@ ByteCask follows a **single-writer / multiple-reader (SWMR)** model:
 - Multiple readers may operate concurrently.
 - MVCC and snapshot isolation are not supported.
 
-#### Lock-free strategy
+#### Concurrency strategy
 
-ByteCask's read path is designed so that **readers never acquire a mutex** and never spin. The strategy combines two ideas:
+ByteCask's read path is designed so that **readers never acquire the write mutex**. The strategy combines two ideas:
 
 1. **A single writer mutex** (`write_mu_`) that serialises mutations — readers are completely unaffected by it.
 2. **An immutable, copy-on-write snapshot** (`EngineState`) published via `std::atomic<std::shared_ptr<EngineState>>` — readers capture the current snapshot without blocking the writer.
@@ -74,7 +74,7 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
   │  write_mu_      std::mutex (heap-allocated)                 │  ← writers only
   │                                                             │
   │  state_         atomic<shared_ptr<EngineState>>             │  ← writer stores,
-  │                                                             │    readers load (lock-free)
+  │                                                             │    readers load (no write_mu_)
   └─────────────────────────────────────────────────────────────┘
 
   EngineState  (heap, reference-counted, never mutated in place)
@@ -127,7 +127,7 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
         the reader holds its shared_ptr reference
 ```
 
-The read path is fully lock-free. `std::atomic<std::shared_ptr>` guarantees that `load()` always returns a valid, self-consistent snapshot. Multiple readers can call `load()` concurrently with zero contention.
+The read path never acquires `write_mu_`. `std::atomic<std::shared_ptr>` guarantees that `load()` always returns a valid, self-consistent snapshot. Note: current implementations of `atomic<shared_ptr>` use an internal spinlock, so `load()` is not technically lock-free — but readers never contend with each other for long, and never block on `write_mu_`.
 
 **Same-thread guarantee**: a `put` followed by a `get` on the **same thread** always observes the put — the `store()` in step [4] is sequenced before the `load()` in the subsequent `get()`.
 
@@ -374,7 +374,6 @@ We use fine-grained C++20 modules:
 - `bytecask.hint_file`: Hint file writer and reader (`HintFile`, `HintEntry`).
 - `bytecask.persistent_ordered_map`: Immutable sorted map (`PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`) backed by `immer::flex_vector`; retained for benchmarking.
 - `bytecask.radix_tree`: Persistent radix tree (`PersistentRadixTree<V>`, `TransientRadixTree<V>`, `RadixTreeIterator<V>`) with path compression and intrusive refcounting; used as the key directory.
-- `bytecask.rcu_var`: Generic SWMR publish/subscribe primitive (`RcuVar<T>`); TLS-cached lock-free reads, atomic `shared_ptr` publication.
 - `bytecask.engine`: Public engine API (`Bytecask`, `EngineState`, `Batch`, `KeyIterator`, `EntryIterator`, `FileRegistry`, type aliases).
 
 ### Current scope boundaries

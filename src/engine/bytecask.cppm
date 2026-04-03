@@ -377,7 +377,7 @@ export struct ReadOptions {};
 // Thread safety: write operations (put, del, apply_batch) are serialised by
 // write_mu_ (plain mutex). After producing a new EngineState via pure
 // transition methods, the writer publishes it via state_.store().
-// Readers call state_.load() — lock-free, never acquiring write_mu_.
+// Readers call state_.load() without acquiring write_mu_.
 // State is published via std::atomic<std::shared_ptr<EngineState>>.
 // ---------------------------------------------------------------------------
 export class Bytecask {
@@ -829,7 +829,7 @@ private:
 
   std::filesystem::path dir_;
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
-  // All mutable state — lock-free SWMR. Writers publish via state_.store()
+  // All mutable state — SWMR. Writers publish via state_.store()
   // under write_mu_; readers call state_.load() (never acquiring write_mu_).
   std::atomic<std::shared_ptr<EngineState>> state_;
   // Serialises writers (put, del, apply_batch). Readers never acquire this.
