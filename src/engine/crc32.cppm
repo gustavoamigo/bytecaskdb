@@ -1,8 +1,7 @@
 module;
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <nmmintrin.h>
+#include <crc32c/crc32c.h>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -22,44 +21,27 @@ constexpr auto narrow(From value) -> To {
 }
 
 // ---------------------------------------------------------------------------
-// CRC-32C (Castagnoli, polynomial 0x1EDC6F41) via SSE4.2 hardware instruction.
+// CRC-32C (Castagnoli, polynomial 0x1EDC6F41) via google/crc32c library.
 //
-// Uses _mm_crc32_u64 to process 8 bytes per cycle, then _mm_crc32_u8 for the
-// trailing remainder. The result is not compatible with CRC-32/ISO-HDLC
-// (polynomial 0xEDB88320) used in earlier versions of ByteCask.
-//
-// Requires: x86-64 with SSE4.2 (compile with -msse4.2).
+// The library auto-detects hardware acceleration at runtime (SSE4.2 on x86-64,
+// CRC instructions on AArch64) and falls back to a software implementation
+// when neither is available.
 // ---------------------------------------------------------------------------
 
 // Stateful CRC-32C accumulator. Feed chunks via update(), read via finalize().
 export class Crc32 {
 public:
   void update(std::span<const std::byte> data) noexcept {
-    const auto *ptr = data.data();
-    auto len = data.size();
-    std::uint64_t crc64 = state_; // widen; upper 32 bits are zero
-    while (len >= 8) {
-      std::uint64_t word{};
-      std::memcpy(&word, ptr, 8);
-      crc64 = _mm_crc32_u64(crc64, word);
-      ptr += 8;
-      len -= 8;
-    }
-    auto crc32 = static_cast<std::uint32_t>(crc64);
-    while (len > 0) {
-      crc32 = _mm_crc32_u8(crc32, std::to_integer<std::uint8_t>(*ptr));
-      ++ptr;
-      --len;
-    }
-    state_ = crc32;
+    state_ = crc32c::Extend(state_,
+        reinterpret_cast<const uint8_t *>(data.data()), data.size());
   }
 
   [[nodiscard]] auto finalize() const noexcept -> std::uint32_t {
-    return state_ ^ 0xFFFFFFFFU;
+    return state_;
   }
 
 private:
-  std::uint32_t state_ = 0xFFFFFFFFU;
+  std::uint32_t state_ = 0;
 };
 
 } // namespace bytecask
