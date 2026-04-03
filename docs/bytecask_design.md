@@ -248,7 +248,7 @@ CRC is at the **end** of the entry so both write and read can be done in a singl
 
 - Little-endian byte order throughout.
 - Serialization backend: [bitsery](https://github.com/fraillt/bitsery) v5.2.5 (header-only, `add_requires("bitsery")` in xmake).
-- CRC32 uses polynomial `0xEDB88320` (standard reflected CRC-32/ISO-HDLC).
+- CRC-32C uses the Castagnoli polynomial `0x1EDC6F41` via the [google/crc32c](https://github.com/google/crc32c) library, which auto-detects hardware acceleration at runtime (SSE4.2 on x86-64, CRC instructions on AArch64) and falls back to a software implementation when neither is available.
 - CRC32 is computed over **all bytes of the entry except the trailing CRC field itself** (i.e., the leading header + key data + value data).
 - `CrcOutputAdapter<TAdapter>` (in `data_entry.cppm`, anonymous namespace) wraps any bitsery output adapter and accumulates CRC as bytes are written. It is reusable: any future component that needs a running CRC while writing can use the same adapter without re-implementing the checksum logic.
 
@@ -295,7 +295,7 @@ Not yet implemented — callers currently provide the full file path.
 ### Source Code Module Architecture
 
 We use fine-grained C++20 modules:
-- `bytecask.crc32`: General purpose mathematical utilities (`Crc32`, checked `narrow<To>(From)` conversion).
+- `bytecask.crc32`: CRC-32C accumulator (`Crc32`, backed by google/crc32c) and checked `narrow<To>(From)` conversion.
 - `bytecask.serialization`: Core bitsery abstractions (`CrcOutputAdapter`, legacy memory wrappers).
 - `bytecask.data_entry`: Logical entry definition, single-entry memory formatting, and `verify_entry()` / `deserialize_entry()` / `extract_value_into()` — CRC verification is factored into `verify_entry()` and shared by both extraction functions.
 - `bytecask.data_file`: Disk I/O, writing streams sequentially to `.data` files.
@@ -741,7 +741,7 @@ The full design and implementation are preserved in git history (see BC-049 in t
 
 - Language: C++23
 - Build system: xmake
-- Dependencies: bitsery v5.2.5 (header-only binary serialization), immer (header-only persistent data structures)
+- Dependencies: bitsery v5.2.5 (header-only binary serialization), crc32c (google/crc32c, hardware-accelerated CRC-32C), immer (header-only persistent data structures)
 - Primary target: `bytecask` (includes `src/*.cpp` + `src/engine/*.cppm`)
 - Test target: `bytecask_tests` (includes `tests/*.cpp` + `src/engine/*.cppm`)
 - Status: Full `Bytecask` SWMR engine with `open`, `get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`. Key directory backed by `PersistentOrderedMap<Key, KeyDirEntry>`. `open()` always creates a fresh active data file; recovery is BC-019. 143 assertions, 34 test cases.
@@ -749,7 +749,7 @@ The full design and implementation are preserved in git history (see BC-049 in t
 ## Current repository structure
 
 - `src/main.cpp`: temporary executable entry point
-- `src/engine/crc32.cppm`: C++23 module (`bytecask.crc32`) — `Crc32` accumulator, `narrow<To>(From)` checked conversion
+- `src/engine/crc32.cppm`: C++23 module (`bytecask.crc32`) — `Crc32` accumulator (google/crc32c), `narrow<To>(From)` checked conversion
 - `src/engine/serialization.cppm`: C++23 module (`bytecask.serialization`) — `CrcOutputAdapter`, `write_bytes`
 - `src/engine/data_entry.cppm`: C++23 module (`bytecask.data_entry`) — `EntryType`, `EntryHeader`, `DataEntry`, serialization helpers
 - `src/engine/data_file.cppm`: C++23 module (`bytecask.data_file`) — `DataFile` POSIX I/O, `Offset`

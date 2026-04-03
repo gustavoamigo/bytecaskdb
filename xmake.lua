@@ -6,6 +6,7 @@ add_requires("benchmark", {optional = true})
 add_requires("immer")
 add_requires("jemalloc")
 add_requires("leveldb", {optional = true})
+add_requires("crc32c")
 
 -- Sanitizer option: `xmake f --sanitizer=address` or `--sanitizer=thread`
 option("sanitizer")
@@ -21,10 +22,8 @@ local common_flags = {
     "-Wno-reserved-macro-identifier", "-Wno-undef", "-Wno-reserved-identifier",
     -- export keyword is the declaration for module symbols; these are false positives
     "-Wno-missing-variable-declarations", "-Wno-missing-prototypes",
-    -- raw pointer indexing over a known-bounded span is intentional (CRC inner loop)
+    -- raw pointer indexing over a known-bounded span is intentional in I/O paths
     "-Wno-unsafe-buffer-usage",
-    -- SSE4.2 required for hardware CRC-32C (_mm_crc32_u64 / _mm_crc32_u8)
-    "-msse4.2",
 }
 
 -- Apply sanitizer flags to a target if the option is set.
@@ -51,7 +50,7 @@ target("bytecask")
     set_languages("c++23")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
-    add_packages("bitsery", "immer", "jemalloc")
+    add_packages("bitsery", "crc32c", "immer", "jemalloc")
     on_load(apply_sanitizer)
     -- For VS Code / clangd support, run: scripts/gen_compile_commands.sh
 
@@ -62,7 +61,7 @@ target("bytecask_tests")
     set_languages("c++23")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
-    add_packages("bitsery", "catch2", "immer", "jemalloc")
+    add_packages("bitsery", "catch2", "crc32c", "immer", "jemalloc")
     on_load(apply_sanitizer)
 
 target("bytecask_bench")
@@ -74,7 +73,7 @@ target("bytecask_bench")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
     add_cxflags("-Wno-global-constructors")
-    add_packages("bitsery", "benchmark", "immer", "jemalloc")
+    add_packages("bitsery", "benchmark", "crc32c", "immer", "jemalloc")
     -- map_bench.cpp defines operator new/delete for allocation tracking.
     -- jemalloc's static archive (jemalloc_cpp.o) also defines them.
     -- --allow-multiple-definition lets the linker keep the first definition
@@ -92,7 +91,7 @@ target("engine_bench")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
     add_cxflags("-Wno-global-constructors")
-    add_packages("bitsery", "benchmark", "immer", "jemalloc", "leveldb")
+    add_packages("bitsery", "benchmark", "crc32c", "immer", "jemalloc", "leveldb")
     on_load(apply_sanitizer)
 
 --
