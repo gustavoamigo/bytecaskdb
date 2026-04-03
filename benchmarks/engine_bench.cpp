@@ -132,9 +132,9 @@ auto percentile(std::vector<double> &samples, double pct) -> double {
 
 void attach_jitter(benchmark::State &state, std::vector<double> &samples) {
   state.counters["lat_p50_ns"] = benchmark::Counter(
-      percentile(samples, 50.0), benchmark::Counter::kAvgIterations);
+      percentile(samples, 50.0), benchmark::Counter::kDefaults);
   state.counters["lat_p99_ns"] = benchmark::Counter(
-      percentile(samples, 99.0), benchmark::Counter::kAvgIterations);
+      percentile(samples, 99.0), benchmark::Counter::kDefaults);
 }
 
 // ---------------------------------------------------------------------------
@@ -744,35 +744,39 @@ template <typename A, bool Sync> void BM_PutMT(benchmark::State &state) {
 // clang-format off
 // ===========================================================================
 
+// All benchmarks use wall-clock time so that I/O-wait (fdatasync) is
+// reflected in throughput counters instead of being hidden by CPU-time.
+#define BENCH(...) BENCHMARK(__VA_ARGS__)->UseRealTime()
+
 using Bc  = BcAdapter;
 using Ldb = LdbAdapter<true>;
 using LdbNC = LdbAdapter<false>;
 
 // --- ByteCask ---
-BENCHMARK(BM_Put<Bc, false>)          ->Name("ByteCask/Put/NoSync");
-BENCHMARK(BM_Put<Bc, true>)           ->Name("ByteCask/Put/Sync")      ->Iterations(5000);
-BENCHMARK(BM_Del<Bc, false>)          ->Name("ByteCask/Del/NoSync");
-BENCHMARK(BM_Del<Bc, true>)           ->Name("ByteCask/Del/Sync")      ->Iterations(5000);
-BENCHMARK(BM_Get<Bc>)                 ->Name("ByteCask/Get");
-BENCHMARK(BM_Range<Bc, kRangeLen>)    ->Name("ByteCask/Range50");
-BENCHMARK(BM_Mixed<Bc, true>)         ->Name("ByteCask/Mixed/Sync")    ->Iterations(5000);
-BENCHMARK(BM_Mixed<Bc, false>)        ->Name("ByteCask/Mixed/NoSync");
+BENCH(BM_Put<Bc, false>)          ->Name("ByteCask/Put/NoSync");
+BENCH(BM_Put<Bc, true>)           ->Name("ByteCask/Put/Sync");
+BENCH(BM_Del<Bc, false>)          ->Name("ByteCask/Del/NoSync");
+BENCH(BM_Del<Bc, true>)           ->Name("ByteCask/Del/Sync");
+BENCH(BM_Get<Bc>)                 ->Name("ByteCask/Get");
+BENCH(BM_Range<Bc, kRangeLen>)    ->Name("ByteCask/Range50");
+BENCH(BM_Mixed<Bc, true>)         ->Name("ByteCask/Mixed/Sync");
+BENCH(BM_Mixed<Bc, false>)        ->Name("ByteCask/Mixed/NoSync");
 
 // --- LevelDB ---
-BENCHMARK(BM_Put<Ldb, false>)          ->Name("LevelDB/Put/NoSync");
-BENCHMARK(BM_Put<Ldb, true>)           ->Name("LevelDB/Put/Sync")     ->Iterations(5000);
-BENCHMARK(BM_Del<Ldb, false>)          ->Name("LevelDB/Del/NoSync");
-BENCHMARK(BM_Del<Ldb, true>)           ->Name("LevelDB/Del/Sync")     ->Iterations(5000);
-BENCHMARK(BM_Get<Ldb>)                 ->Name("LevelDB/Get");
-BENCHMARK(BM_Range<Ldb, kRangeLen>)    ->Name("LevelDB/Range50");
-BENCHMARK(BM_Mixed<Ldb, true>)         ->Name("LevelDB/Mixed/Sync")   ->Iterations(5000);
-BENCHMARK(BM_Mixed<Ldb, false>)        ->Name("LevelDB/Mixed/NoSync");
+BENCH(BM_Put<Ldb, false>)          ->Name("LevelDB/Put/NoSync");
+BENCH(BM_Put<Ldb, true>)           ->Name("LevelDB/Put/Sync");
+BENCH(BM_Del<Ldb, false>)          ->Name("LevelDB/Del/NoSync");
+BENCH(BM_Del<Ldb, true>)           ->Name("LevelDB/Del/Sync");
+BENCH(BM_Get<Ldb>)                 ->Name("LevelDB/Get");
+BENCH(BM_Range<Ldb, kRangeLen>)    ->Name("LevelDB/Range50");
+BENCH(BM_Mixed<Ldb, true>)         ->Name("LevelDB/Mixed/Sync");
+BENCH(BM_Mixed<Ldb, false>)        ->Name("LevelDB/Mixed/NoSync");
 
 // --- Mixed Batch ---
-BENCHMARK(BM_MixedBatch<Bc, false>)     ->Name("ByteCask/MixedBatch/NoSync");
-BENCHMARK(BM_MixedBatch<Bc, true>)      ->Name("ByteCask/MixedBatch/Sync")    ->Iterations(5000);
-BENCHMARK(BM_MixedBatch<Ldb, false>)    ->Name("LevelDB/MixedBatch/NoSync");
-BENCHMARK(BM_MixedBatch<Ldb, true>)     ->Name("LevelDB/MixedBatch/Sync")     ->Iterations(5000);
+BENCH(BM_MixedBatch<Bc, false>)     ->Name("ByteCask/MixedBatch/NoSync");
+BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCask/MixedBatch/Sync");
+BENCH(BM_MixedBatch<Ldb, false>)    ->Name("LevelDB/MixedBatch/NoSync");
+BENCH(BM_MixedBatch<Ldb, true>)     ->Name("LevelDB/MixedBatch/Sync");
 
 using Gw0   = GwAdapter<0>;     // no yield (baseline)
 using Gw10  = GwAdapter<10>;    // 10 µs
@@ -781,32 +785,49 @@ using Gw500 = GwAdapter<500>;   // 500 µs
 using Gw    = Gw100;            // default alias used elsewhere
 
 // --- Multithreaded Mixed ---
-BENCHMARK(BM_MixedMT<Bc, false>)       ->Name("ByteCask/MixedMT/NoSync") ->Threads(2);
-BENCHMARK(BM_MixedMT<Bc, false>)       ->Name("ByteCask/MixedMT/NoSync") ->Threads(4);
-BENCHMARK(BM_MixedMT<Ldb, false>)      ->Name("LevelDB/MixedMT/NoSync")  ->Threads(2);
-BENCHMARK(BM_MixedMT<Ldb, false>)      ->Name("LevelDB/MixedMT/NoSync")  ->Threads(4);
-BENCHMARK(BM_MixedMT<Bc, true>)        ->Name("ByteCask/MixedMT/Sync")   ->Threads(2)->Iterations(1000);
-BENCHMARK(BM_MixedMT<Bc, true>)        ->Name("ByteCask/MixedMT/Sync")   ->Threads(4)->Iterations(1000);
-BENCHMARK(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(2)->Iterations(1000);
-BENCHMARK(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(4)->Iterations(1000);
+BENCH(BM_MixedMT<Bc, false>)       ->Name("ByteCask/MixedMT/NoSync") ->Threads(2);
+BENCH(BM_MixedMT<Bc, false>)       ->Name("ByteCask/MixedMT/NoSync") ->Threads(4);
+BENCH(BM_MixedMT<Ldb, false>)      ->Name("LevelDB/MixedMT/NoSync")  ->Threads(2);
+BENCH(BM_MixedMT<Ldb, false>)      ->Name("LevelDB/MixedMT/NoSync")  ->Threads(4);
+
+BENCH(BM_MixedMT<Bc, true>)        ->Name("ByteCask/MixedMT/Sync")   ->Threads(2);
+BENCH(BM_MixedMT<Bc, true>)        ->Name("ByteCask/MixedMT/Sync")   ->Threads(4);
+BENCH(BM_MixedMT<Bc, true>)        ->Name("ByteCask/MixedMT/Sync")   ->Threads(8);
+BENCH(BM_MixedMT<Bc, true>)        ->Name("ByteCask/MixedMT/Sync")   ->Threads(16);
+BENCH(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(2);
+BENCH(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(4);
+BENCH(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(8);
+BENCH(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(16);
+BENCH(BM_MixedMT<Gw0, true>)       ->Name("GroupWriter/MixedMT/Sync")    ->Threads(2);
+BENCH(BM_MixedMT<Gw0, true>)       ->Name("GroupWriter/MixedMT/Sync")    ->Threads(4);
+BENCH(BM_MixedMT<Gw0, true>)       ->Name("GroupWriter/MixedMT/Sync")    ->Threads(8);
+BENCH(BM_MixedMT<Gw0, true>)       ->Name("GroupWriter/MixedMT/Sync")    ->Threads(16);
 
 // --- Multithreaded Put (pure write throughput under concurrency) ---
-BENCHMARK(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(2)->Iterations(1000);
-BENCHMARK(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(4)->Iterations(1000);
-BENCHMARK(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(2)->Iterations(1000);
-BENCHMARK(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(4)->Iterations(1000);
+BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(2);
+BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(4);
+BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(8);
+BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(16);
+BENCH(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(2);
+BENCH(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(4);
+BENCH(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(8);
+BENCH(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(16);
+BENCH(BM_PutMT<Gw0, true>)       ->Name("GroupWriter/PutMT/Sync")   ->Threads(2);
+BENCH(BM_PutMT<Gw0, true>)       ->Name("GroupWriter/PutMT/Sync")   ->Threads(4);
+BENCH(BM_PutMT<Gw0, true>)       ->Name("GroupWriter/PutMT/Sync")   ->Threads(8);
+BENCH(BM_PutMT<Gw0, true>)       ->Name("GroupWriter/PutMT/Sync")   ->Threads(16);
 
 // --- GroupWriter yield sweep: PutMT/Sync at threads:4 ---
-BENCHMARK(BM_PutMT<Gw0,   true>)       ->Name("GroupWriter/PutMT/Sync/yield:0us")   ->Threads(4)->Iterations(1000);
-BENCHMARK(BM_PutMT<Gw10,  true>)       ->Name("GroupWriter/PutMT/Sync/yield:10us")  ->Threads(4)->Iterations(1000);
-BENCHMARK(BM_PutMT<Gw100, true>)       ->Name("GroupWriter/PutMT/Sync/yield:100us") ->Threads(4)->Iterations(1000);
-BENCHMARK(BM_PutMT<Gw500, true>)       ->Name("GroupWriter/PutMT/Sync/yield:500us") ->Threads(4)->Iterations(1000);
+BENCH(BM_PutMT<Gw0,   true>)       ->Name("GroupWriter/PutMT/Sync/yield:0us")   ->Threads(16);
+BENCH(BM_PutMT<Gw10,  true>)       ->Name("GroupWriter/PutMT/Sync/yield:10us")  ->Threads(16);
+BENCH(BM_PutMT<Gw100, true>)       ->Name("GroupWriter/PutMT/Sync/yield:100us") ->Threads(16);
+BENCH(BM_PutMT<Gw500, true>)       ->Name("GroupWriter/PutMT/Sync/yield:500us") ->Threads(16);
 
-// --- GroupWriter yield sweep: MixedMT/Sync at threads:4 ---
-BENCHMARK(BM_MixedMT<Gw0,   true>)     ->Name("GroupWriter/MixedMT/Sync/yield:0us")   ->Threads(4)->Iterations(1000);
-BENCHMARK(BM_MixedMT<Gw10,  true>)     ->Name("GroupWriter/MixedMT/Sync/yield:10us")  ->Threads(4)->Iterations(1000);
-BENCHMARK(BM_MixedMT<Gw100, true>)     ->Name("GroupWriter/MixedMT/Sync/yield:100us") ->Threads(4)->Iterations(1000);
-BENCHMARK(BM_MixedMT<Gw500, true>)     ->Name("GroupWriter/MixedMT/Sync/yield:500us") ->Threads(4)->Iterations(1000);
+// --- GroupWriter yield sweep: MixedMT/Sync at threads:4 --- 
+BENCH(BM_MixedMT<Gw0,   true>)     ->Name("GroupWriter/MixedMT/Sync/yield:0us")   ->Threads(16);
+BENCH(BM_MixedMT<Gw10,  true>)     ->Name("GroupWriter/MixedMT/Sync/yield:10us")  ->Threads(16);
+BENCH(BM_MixedMT<Gw100, true>)     ->Name("GroupWriter/MixedMT/Sync/yield:100us") ->Threads(16);
+BENCH(BM_MixedMT<Gw500, true>)     ->Name("GroupWriter/MixedMT/Sync/yield:500us") ->Threads(16);
 
 // clang-format on
 
