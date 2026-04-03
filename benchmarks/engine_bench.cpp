@@ -880,6 +880,10 @@ BENCH(BM_GetMT<Ldb>)               ->Name("LevelDB/GetMT")           ->Threads(2
 BENCH(BM_GetMT<Ldb>)               ->Name("LevelDB/GetMT")           ->Threads(4);
 BENCH(BM_GetMT<Ldb>)               ->Name("LevelDB/GetMT")           ->Threads(8);
 BENCH(BM_GetMT<Ldb>)               ->Name("LevelDB/GetMT")           ->Threads(16);
+BENCH(BM_GetMT<Ldb>)               ->Name("RocksDB/GetMT")           ->Threads(2);
+BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(4);
+BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(8);
+BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(16);
 
 // --- Multithreaded Mixed ---
 BENCH(BM_MixedMT<Bc, false>)       ->Name("ByteCask/MixedMT/NoSync") ->Threads(2);
