@@ -9,9 +9,7 @@ module;
 #include <iterator>
 #include <map>
 #include <memory>
-#include <atomic>
 #include <mutex>
-#include <shared_mutex>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -29,6 +27,7 @@ import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.hint_file;
 import bytecask.radix_tree;
+import bytecask.rcu_var;
 import bytecask.types;
 
 namespace bytecask {
@@ -148,12 +147,91 @@ private:
 export using FileRegistry =
     std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>>;
 
-// Immutable snapshot of the key directory and file registry.
-// Readers copy this under a brief mutex. Both fields are O(1) to copy.
-struct DirSnapshot {
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+namespace {
+
+// Generates a data file stem using a microsecond-precision UTC timestamp.
+// Format: "data_{YYYYMMDDHHmmssUUUUUU}"  (D11)
+auto make_data_file_stem() -> std::string {
+  const auto now = std::chrono::system_clock::now();
+  const auto us_total = std::chrono::duration_cast<std::chrono::microseconds>(
+                            now.time_since_epoch())
+                            .count();
+  const auto subsec_us = us_total % 1'000'000;
+
+  const auto tt = std::chrono::system_clock::to_time_t(now);
+  std::tm tm_buf{};
+  ::gmtime_r(&tt, &tm_buf);
+
+  return std::format("data_{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}{:06d}",
+                     tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+                     tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, subsec_us);
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// EngineState — immutable snapshot of all mutable engine state.
+//
+// Each write produces a new EngineState via a pure transition method
+// (apply_put, apply_del, apply_rotation). The old state stays alive as long
+// as any reader holds a shared_ptr reference. next_file_id and next_lsn
+// are writer-only fields, but including them here makes transitions
+// self-contained.
+// ---------------------------------------------------------------------------
+struct EngineState {
   PersistentRadixTree<KeyDirEntry> key_dir;
   FileRegistry files;
   std::uint32_t active_file_id{};
+  std::uint32_t next_file_id{};
+  std::uint64_t next_lsn{1};
+
+  [[nodiscard]] auto active_file() -> DataFile & {
+    return *files->at(active_file_id);
+  }
+
+  [[nodiscard]] auto active_file() const -> const DataFile & {
+    return *files->at(active_file_id);
+  }
+
+  // Pure transition: insert or overwrite a key after the I/O has been done.
+  // offset is the byte position returned by DataFile::append().
+  [[nodiscard]] auto apply_put(BytesView key, std::uint64_t offset,
+                               std::uint32_t value_size) const
+      -> EngineState {
+    auto s = *this;
+    s.key_dir =
+        s.key_dir.set(key, KeyDirEntry{s.next_lsn, s.active_file_id, offset,
+                                       value_size});
+    ++s.next_lsn;
+    return s;
+  }
+
+  // Pure transition: remove a key.
+  [[nodiscard]] auto apply_del(BytesView key) const -> EngineState {
+    auto s = *this;
+    ++s.next_lsn;
+    s.key_dir = s.key_dir.erase(key);
+    return s;
+  }
+
+  // Pure transition: seal the active file and open a new one.
+  [[nodiscard]] auto apply_rotation(
+      const std::filesystem::path &dir) const -> EngineState {
+    auto s = *this;
+    s.active_file_id = s.next_file_id++;
+    const auto stem = make_data_file_stem();
+    auto next_files =
+        std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>(
+            *s.files);
+    next_files->emplace(
+        s.active_file_id,
+        std::make_shared<DataFile>(dir / (stem + ".data")));
+    s.files = std::move(next_files);
+    return s;
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -261,31 +339,6 @@ private:
   mutable bool has_cached_{false};
 };
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-namespace {
-
-// Generates a data file stem using a microsecond-precision UTC timestamp.
-// Format: "data_{YYYYMMDDHHmmssUUUUUU}"  (D11)
-auto make_data_file_stem() -> std::string {
-  const auto now = std::chrono::system_clock::now();
-  const auto us_total = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now.time_since_epoch())
-                            .count();
-  const auto subsec_us = us_total % 1'000'000;
-
-  const auto tt = std::chrono::system_clock::to_time_t(now);
-  std::tm tm_buf{};
-  ::gmtime_r(&tt, &tm_buf);
-
-  return std::format("data_{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}{:06d}",
-                     tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
-                     tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, subsec_us);
-}
-
-} // namespace
-
 // Default active-file size threshold: 64 MiB.
 export inline constexpr std::uint64_t kDefaultRotationThreshold =
     64ULL * 1024 * 1024;
@@ -322,16 +375,12 @@ export struct ReadOptions {};
 // throughput).
 //
 // Thread safety: write operations (put, del, apply_batch) are serialised by
-// write_mu_ (plain mutex). After mutating key_dir_/files_, the writer stores
-// a new shared_ptr<DirSnapshot> atomically into snapshot_ (release) and then
-// bumps snapshot_gen_ (release). On x86-64 the atomic store uses CMPXCHG16B
-// and is truly lock-free.
-// Readers check their thread-local cached generation against snapshot_gen_
-// (one lock-free acquire load). On a match the cached shared_ptr is returned
-// with no further synchronisation — throughput scales with thread count.
-// On a mismatch the reader does a single relaxed atomic load of snapshot_
-// (safe via the acquire on snapshot_gen_) and refreshes its TLS cache.
-// Readers never acquire write_mu_, eliminating writer-starvation.
+// write_mu_ (plain mutex). After producing a new EngineState via pure
+// transition methods, the writer publishes it via state_.store()
+// (RcuVar<EngineState>). Readers call state_.load() — a TLS-cached,
+// lock-free operation that scales linearly with thread count. See RcuVar
+// for the memory ordering proof. Readers never acquire write_mu_,
+// eliminating writer-starvation.
 // ---------------------------------------------------------------------------
 export class Bytecask {
 public:
@@ -352,10 +401,11 @@ public:
 
   // Flush hints and sync the active file before destruction.
   ~Bytecask() {
-    if (files_ && !files_->empty()) {
+    auto s = state_.load();
+    if (s->files && !s->files->empty()) {
       try {
-        files_->at(active_file_id_)->sync();
-        flush_hints();
+        s->files->at(s->active_file_id)->sync();
+        flush_hints(*s);
       } catch (...) {
         // Best-effort: swallow errors in destructors.
       }
@@ -382,13 +432,13 @@ public:
   // found, false otherwise.
   [[nodiscard]] auto get(const ReadOptions & /*opts*/, BytesView key,
                          Bytes &out) const -> bool {
-    auto snap = read_snapshot();
-    const auto kv = snap->key_dir.get(key);
+    auto s = state_.load();
+    const auto kv = s->key_dir.get(key);
     if (!kv) {
       return false;
     }
     thread_local Bytes io_buf;
-    snap->files->at(kv->file_id)
+    s->files->at(kv->file_id)
         ->read_entry(kv->file_offset, narrow<std::uint16_t>(key.size()),
                      kv->value_size, io_buf);
     extract_value_into(io_buf, out);
@@ -403,18 +453,16 @@ public:
     std::shared_ptr<DataFile> file_to_sync;
     {
       auto guard = acquire_write_lock(opts);
+      auto s = *state_.load();
       const auto offset =
-          active_file().append(next_lsn_, EntryType::Put, key, value);
+          s.active_file().append(s.next_lsn, EntryType::Put, key, value);
 
-      key_dir_ =
-          key_dir_.set(key, KeyDirEntry{next_lsn_, active_file_id_, offset,
-                                        narrow<std::uint32_t>(value.size())});
-      ++next_lsn_;
+      s = s.apply_put(key, offset, narrow<std::uint32_t>(value.size()));
       if (opts.sync) {
-        file_to_sync = files_->at(active_file_id_);
+        file_to_sync = s.files->at(s.active_file_id);
       }
-      maybe_rotate();
-      publish_snapshot();
+      s = maybe_rotate(std::move(s));
+      state_.store(std::make_shared<EngineState>(std::move(s)));
     }
     if (file_to_sync) {
       file_to_sync->sync();
@@ -430,18 +478,19 @@ public:
     std::shared_ptr<DataFile> file_to_sync;
     {
       auto guard = acquire_write_lock(opts);
-      if (!key_dir_.contains(key)) {
+      auto s = *state_.load();
+      if (!s.key_dir.contains(key)) {
         return false;
       }
-      std::ignore = active_file().append(next_lsn_, EntryType::Delete, key, {});
-      ++next_lsn_;
+      std::ignore =
+          s.active_file().append(s.next_lsn, EntryType::Delete, key, {});
 
-      key_dir_ = key_dir_.erase(key);
+      s = s.apply_del(key);
       if (opts.sync) {
-        file_to_sync = files_->at(active_file_id_);
+        file_to_sync = s.files->at(s.active_file_id);
       }
-      maybe_rotate();
-      publish_snapshot();
+      s = maybe_rotate(std::move(s));
+      state_.store(std::make_shared<EngineState>(std::move(s)));
     }
     if (file_to_sync) {
       file_to_sync->sync();
@@ -451,8 +500,8 @@ public:
 
   // Returns true if key exists in the index (no disk I/O).
   [[nodiscard]] auto contains_key(BytesView key) const -> bool {
-    auto snap = read_snapshot();
-    return snap->key_dir.contains(key);
+    auto s = state_.load();
+    return s->key_dir.contains(key);
   }
 
   // ── Batch ──────────────────────────────────────────────────────────────
@@ -469,29 +518,30 @@ public:
     std::shared_ptr<DataFile> file_to_sync;
     {
       auto guard = acquire_write_lock(opts);
+      auto s = *state_.load();
 
       std::ignore =
-          active_file().append(next_lsn_++, EntryType::BulkBegin, {}, {});
+          s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
 
-      auto t = key_dir_.transient();
+      auto t = s.key_dir.transient();
       for (auto &op : batch.operations_) {
         std::visit(
             [&](auto &o) {
               using T = std::decay_t<decltype(o)>;
               if constexpr (std::is_same_v<T, BatchInsert>) {
                 const auto offset =
-                    active_file().append(next_lsn_, EntryType::Put,
+                    s.active_file().append(s.next_lsn, EntryType::Put,
                                          std::span<const std::byte>{o.key},
                                          std::span<const std::byte>{o.value});
                 t.set(std::span<const std::byte>{o.key},
-                      KeyDirEntry{next_lsn_, active_file_id_, offset,
+                      KeyDirEntry{s.next_lsn, s.active_file_id, offset,
                                   narrow<std::uint32_t>(o.value.size())});
-                ++next_lsn_;
+                ++s.next_lsn;
               } else if constexpr (std::is_same_v<T, BatchRemove>) {
                 std::ignore =
-                    active_file().append(next_lsn_, EntryType::Delete,
+                    s.active_file().append(s.next_lsn, EntryType::Delete,
                                          std::span<const std::byte>{o.key}, {});
-                ++next_lsn_;
+                ++s.next_lsn;
                 t.erase(std::span<const std::byte>{o.key});
               }
             },
@@ -499,14 +549,14 @@ public:
       }
 
       std::ignore =
-          active_file().append(next_lsn_++, EntryType::BulkEnd, {}, {});
+          s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
 
-      key_dir_ = std::move(t).persistent();
+      s.key_dir = std::move(t).persistent();
       if (opts.sync) {
-        file_to_sync = files_->at(active_file_id_);
+        file_to_sync = s.files->at(s.active_file_id);
       }
-      maybe_rotate();
-      publish_snapshot();
+      s = maybe_rotate(std::move(s));
+      state_.store(std::make_shared<EngineState>(std::move(s)));
     }
     if (file_to_sync) {
       file_to_sync->sync();
@@ -523,10 +573,10 @@ public:
   [[nodiscard]] auto iter_from(const ReadOptions & /*opts*/,
                                BytesView from = {}) const
       -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
-    auto snap = read_snapshot();
-    auto it = from.empty() ? snap->key_dir.begin() : snap->key_dir.lower_bound(from);
+    auto s = state_.load();
+    auto it = from.empty() ? s->key_dir.begin() : s->key_dir.lower_bound(from);
     return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
-        EntryIterator{std::move(it), snap->files}, std::default_sentinel};
+        EntryIterator{std::move(it), s->files}, std::default_sentinel};
   }
 
   // Returns an input range of keys >= from. Walks the in-memory key directory
@@ -534,8 +584,8 @@ public:
   [[nodiscard]] auto keys_from(const ReadOptions & /*opts*/,
                                BytesView from = {}) const
       -> std::ranges::subrange<KeyIterator, std::default_sentinel_t> {
-    auto snap = read_snapshot();
-    auto it = from.empty() ? snap->key_dir.begin() : snap->key_dir.lower_bound(from);
+    auto s = state_.load();
+    auto it = from.empty() ? s->key_dir.begin() : s->key_dir.lower_bound(from);
     return std::ranges::subrange<KeyIterator, std::default_sentinel_t>{
         KeyIterator{std::move(it)}, std::default_sentinel};
   }
@@ -549,8 +599,14 @@ public:
   //
   // Hint files are never written on the write path (predictable latency).
   void flush_hints() {
-    for (auto &file : *files_) {
-      if (file.first == active_file_id_) {
+    flush_hints(*state_.load());
+  }
+
+private:
+  // Writes hint files for all sealed data files in the given state.
+  void flush_hints(const EngineState &s) {
+    for (auto &file : *s.files) {
+      if (file.first == s.active_file_id) {
         continue;
       }
       const auto stem = file.second->path().stem().string();
@@ -577,63 +633,19 @@ public:
     }
   }
 
-private:
   explicit Bytecask(std::filesystem::path dir, std::uint64_t max_file_bytes)
-      : dir_{std::move(dir)}, rotation_threshold_{max_file_bytes} {
+      : dir_{std::move(dir)}, rotation_threshold_{max_file_bytes},
+        state_{std::make_shared<EngineState>()} {
     std::filesystem::create_directories(dir_);
-    files_ =
+    EngineState s;
+    s.files =
         std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>();
-    const auto max_lsn = recover_existing_files();
-    next_lsn_ = max_lsn + 1;
-    active_file_id_ = next_file_id_++;
+    s = recover_existing_files(std::move(s));
+    s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
-    files_->emplace(active_file_id_,
-                    std::make_shared<DataFile>(dir_ / (stem + ".data")));
-    snapshot_.store(
-        std::make_shared<DirSnapshot>(key_dir_, files_, active_file_id_),
-        std::memory_order_release);
-  }
-
-  // Fast path (gen match): one lock-free acquire load + one shared_ptr copy.
-  // Slow path (first call or after a write): one lock-free atomic load of
-  // snapshot_ — no mutex, no thundering herd when a write invalidates all
-  // TLS caches. On x86-64 the load uses CMPXCHG16B and is truly lock-free.
-  //
-  // instance_id_ prevents cross-instance TLS contamination when the allocator
-  // reuses an address for a new Bytecask that coincidentally reaches the same
-  // snapshot_gen_ value as the previous occupant of that address.
-  //
-  // Memory ordering: the acquire load of snapshot_gen_ synchronizes-with the
-  // release fetch_add in publish_snapshot(). Everything sequenced-before that
-  // fetch_add — including the release store of snapshot_ — happens-before
-  // this acquire load, so the subsequent relaxed load of snapshot_ is safe.
-  auto read_snapshot() const -> std::shared_ptr<DirSnapshot> {
-    struct TlCache {
-      std::uint64_t instance_id{std::numeric_limits<std::uint64_t>::max()};
-      std::uint64_t gen{0};
-      std::shared_ptr<DirSnapshot> snap;
-    };
-    thread_local TlCache cache;
-    const auto current_gen = snapshot_gen_.load(std::memory_order_acquire);
-    if (cache.instance_id == instance_id_ && cache.gen == current_gen) {
-      return cache.snap;
-    }
-    cache.instance_id = instance_id_;
-    cache.snap = snapshot_.load(std::memory_order_relaxed);
-    cache.gen = current_gen;
-    return cache.snap;
-  }
-
-  // Publishes a new snapshot and bumps the generation counter.
-  // Called by writers after mutating key_dir_/files_, under write_mu_.
-  // The release store on snapshot_ is sequenced before the release
-  // fetch_add on snapshot_gen_, establishing the happens-before required
-  // by read_snapshot()'s acquire load.
-  void publish_snapshot() {
-    snapshot_.store(
-        std::make_shared<DirSnapshot>(key_dir_, files_, active_file_id_),
-        std::memory_order_release);
-    snapshot_gen_.fetch_add(1, std::memory_order_release);
+    s.files->emplace(s.active_file_id,
+                     std::make_shared<DataFile>(dir_ / (stem + ".data")));
+    state_.store(std::make_shared<EngineState>(std::move(s)));
   }
 
   // Acquires the write mutex. Blocking or try-lock based on opts.try_lock.
@@ -651,21 +663,10 @@ private:
     return std::unique_lock<std::mutex>{*write_mu_};
   }
 
-  // Returns a reference to the current active DataFile.
-  auto active_file() -> DataFile & { return *files_->at(active_file_id_); }
-  auto active_file() const -> const DataFile & {
-    return *files_->at(active_file_id_);
-  }
-
   // Reconstructs the key directory from existing .data and .hint files.
-  // Removes stale .hint.tmp files left by a prior crash, then scans each
-  // .data file — via its .hint companion when present, raw otherwise.
-  // LSN is the sole freshness authority; file processing order is
-  // intentionally unspecified and never relied upon for correctness.
-  // No hint files are generated here; they are produced on clean shutdown
-  // by flush_hints(). Returns the highest sequence number seen, or 0 if
-  // the directory contains no .data files.
-  auto recover_existing_files() -> std::uint64_t {
+  // Returns a new EngineState with key_dir populated and next_lsn set to
+  // max_seen + 1. next_file_id is advanced for each recovered file.
+  auto recover_existing_files(EngineState s) -> EngineState {
     // Remove stale .hint.tmp files from a prior crash.
     for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
       const auto &p = dir_entry.path();
@@ -675,12 +676,7 @@ private:
     }
 
     std::uint64_t max_lsn = 0;
-    // Single transient for the entire recovery pass: one persistent snapshot
-    // at the end instead of one per entry.
-    auto transient_key_dir = key_dir_.transient();
-    // Highest Delete sequence seen per key across all files, regardless of
-    // processing order. Prevents a stale Put (lower seq) processed after a
-    // Delete (higher seq, different file) from being incorrectly inserted.
+    auto transient_key_dir = s.key_dir.transient();
     std::map<Key, std::uint64_t> tombstones;
 
     for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
@@ -689,10 +685,10 @@ private:
         continue;
       }
 
-      const auto file_id = next_file_id_++;
+      const auto file_id = s.next_file_id++;
       auto data_file = std::make_shared<DataFile>(p);
       data_file->seal();
-      files_->emplace(file_id, data_file);
+      s.files->emplace(file_id, data_file);
 
       // LSN-based freshness: apply an entry only if it is strictly newer
       // than what the key directory already holds for that key.
@@ -815,63 +811,33 @@ private:
       }
     }
 
-    key_dir_ = std::move(transient_key_dir).persistent();
-    return max_lsn;
+    s.key_dir = std::move(transient_key_dir).persistent();
+    s.next_lsn = max_lsn + 1;
+    return s;
   }
 
-  // Seals the active file and opens a new one if the size threshold is met.
-  // fdatasync is called before sealing: any writes that reached this file
-  // (including prior sync=false writes) are durable by the time the file
-  // becomes immutable.
-  void rotate_active_file() {
-    active_file().sync();
-    active_file().seal();
-    active_file_id_ = next_file_id_++;
-    const auto stem = make_data_file_stem();
-    auto next =
-        std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>(
-            *files_);
-    next->emplace(active_file_id_,
-                  std::make_shared<DataFile>(dir_ / (stem + ".data")));
-    files_ = std::move(next);
+  // Seals the active file and opens a new one. Returns a new EngineState.
+  [[nodiscard]] auto rotate_active_file(EngineState s) const -> EngineState {
+    s.active_file().sync();
+    s.active_file().seal();
+    return s.apply_rotation(dir_);
   }
 
-  void maybe_rotate() {
-    if (active_file().size() >= rotation_threshold_) {
-      rotate_active_file();
+  [[nodiscard]] auto maybe_rotate(EngineState s) const -> EngineState {
+    if (s.active_file().size() >= rotation_threshold_) {
+      return rotate_active_file(std::move(s));
     }
+    return s;
   }
-
-  static inline std::atomic<std::uint64_t> next_instance_id_{0};
 
   std::filesystem::path dir_;
-  PersistentRadixTree<KeyDirEntry> key_dir_;
-  // Copy-on-write registry: rotation clones the inner map and replaces
-  // files_. In-flight iterators hold a copy of the outer shared_ptr and see
-  // the old snapshot without any locking. The fd is never closed while any
-  // snapshot retains the inner shared_ptr<DataFile>.
-  FileRegistry files_;
-  // Globally unique ID for this instance. Immune to address reuse: even if
-  // the allocator places a new Bytecask at an old address, the instance_id_
-  // will differ, preventing the TLS cache from serving a stale snapshot.
-  const std::uint64_t instance_id_{
-      next_instance_id_.fetch_add(1, std::memory_order_relaxed)};
-  // Published snapshot. Writers store a freshly allocated shared_ptr<DirSnapshot>
-  // here atomically (CMPXCHG16B on x86-64 — truly lock-free). Readers do a
-  // single relaxed atomic load, safe because the acquire on snapshot_gen_
-  // already establishes happens-before with the writer's release store here.
-  mutable std::atomic<std::shared_ptr<DirSnapshot>> snapshot_;
-  // Incremented by publish_snapshot() after the snapshot_ store. Readers
-  // compare against their thread-local cached generation for a lock-free fast
-  // path: on a hit the shared_ptr is returned without any atomic load of
-  // snapshot_.
-  mutable std::atomic<std::uint64_t> snapshot_gen_{1};
+  std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
+  // All mutable state — lock-free SWMR via RcuVar. Writers produce a new
+  // EngineState via pure transitions and call state_.store() under write_mu_;
+  // readers call state_.load() (no mutex, TLS-cached).
+  RcuVar<EngineState> state_;
   // Serialises writers (put, del, apply_batch). Readers never acquire this.
   std::unique_ptr<std::mutex> write_mu_{std::make_unique<std::mutex>()};
-  std::uint32_t active_file_id_{0};
-  std::uint32_t next_file_id_{0};
-  std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
-  std::uint64_t next_lsn_{1};
 };
 
 } // namespace bytecask
