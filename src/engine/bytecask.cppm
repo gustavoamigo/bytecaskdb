@@ -9,6 +9,7 @@ module;
 #include <iterator>
 #include <map>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <ranges>
@@ -321,10 +322,13 @@ export struct ReadOptions {};
 //
 // Thread safety: write operations (put, del, apply_batch) are serialised by
 // write_mu_ (plain mutex). After mutating key_dir_/files_, the writer
-// publishes a lightweight snapshot under snapshot_mu_ (~10 ns hold).
-// Readers copy the snapshot under snapshot_mu_ and then release; all
-// subsequent I/O proceeds without any lock held. Readers never block on
-// write_mu_, eliminating the writer-starvation problem of shared_mutex.
+// publishes a snapshot under snapshot_mu_ and bumps snapshot_gen_.
+// Readers check their thread-local cached generation against snapshot_gen_
+// (one lock-free acquire load). On a match the cached key_dir/files are used
+// directly — no shared state is modified, so throughput scales with thread
+// count. On a mismatch (first call, or after a write) the reader acquires
+// snapshot_mu_ briefly, refreshes the cache, and continues lock-free.
+// Readers never acquire write_mu_, eliminating writer-starvation.
 // ---------------------------------------------------------------------------
 export class Bytecask {
 public:
@@ -340,8 +344,8 @@ public:
 
   Bytecask(const Bytecask &) = delete;
   Bytecask &operator=(const Bytecask &) = delete;
-  Bytecask(Bytecask &&) noexcept = default;
-  Bytecask &operator=(Bytecask &&) noexcept = default;
+  Bytecask(Bytecask &&) = delete;
+  Bytecask &operator=(Bytecask &&) = delete;
 
   // Flush hints and sync the active file before destruction.
   ~Bytecask() {
@@ -602,19 +606,40 @@ private:
     snapshot_ = {key_dir_, files_, active_file_id_};
   }
 
-  // Snapshots key_dir_ and files_ under a brief mutex lock.
-  // Hold time is ~10 ns (two O(1) copies). Readers never block on write_mu_.
+  // Returns the current snapshot. Fast path: if the thread-local cached
+  // generation matches the published generation (a single lock-free acquire
+  // load), the cached key_dir and files are returned with no shared state
+  // modified — zero contention regardless of thread count.
+  // Slow path (first call or after a write): acquires snapshot_mu_ briefly,
+  // copies the snapshot, then updates the thread-local cache.
   auto read_snapshot() const
       -> std::pair<PersistentRadixTree<KeyDirEntry>, FileRegistry> {
+    struct TlCache {
+      std::uint64_t gen{0};
+      PersistentRadixTree<KeyDirEntry> key_dir;
+      FileRegistry files;
+    };
+    thread_local TlCache cache;
+    const auto current_gen = snapshot_gen_.load(std::memory_order_acquire);
+    if (cache.gen == current_gen) {
+      return {cache.key_dir, cache.files};
+    }
     std::lock_guard lk{*snapshot_mu_};
-    return {snapshot_.key_dir, snapshot_.files};
+    cache.key_dir = snapshot_.key_dir;
+    cache.files = snapshot_.files;
+    cache.gen = snapshot_gen_.load(std::memory_order_relaxed);
+    return {cache.key_dir, cache.files};
   }
 
-  // Copies key_dir_, files_, and active_file_id_ into the published snapshot.
+  // Copies key_dir_, files_, and active_file_id_ into the published snapshot,
+  // then bumps the generation counter so readers invalidate their caches.
   // Called by writers after mutating key_dir_/files_, under write_mu_.
   void publish_snapshot() {
-    std::lock_guard lk{*snapshot_mu_};
-    snapshot_ = {key_dir_, files_, active_file_id_};
+    {
+      std::lock_guard lk{*snapshot_mu_};
+      snapshot_ = {key_dir_, files_, active_file_id_};
+    }
+    snapshot_gen_.fetch_add(1, std::memory_order_release);
   }
 
   // Acquires the write mutex. Blocking or try-lock based on opts.try_lock.
@@ -833,6 +858,10 @@ private:
   // Published snapshot: readers copy under snapshot_mu_, writers publish
   // after mutations. Both PersistentRadixTree and FileRegistry are O(1) copies.
   DirSnapshot snapshot_;
+  // Incremented by publish_snapshot() after each write. Readers compare
+  // against their thread-local cached generation to skip the mutex entirely
+  // on the fast path.
+  mutable std::atomic<std::uint64_t> snapshot_gen_{1};
   // Protects snapshot_ reads/writes. Held ~10 ns; never during I/O.
   mutable std::unique_ptr<std::mutex> snapshot_mu_{
       std::make_unique<std::mutex>()};
