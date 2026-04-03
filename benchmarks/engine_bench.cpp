@@ -1,4 +1,4 @@
-// Benchmarks comparing ByteCask against LevelDB across:
+// Benchmarks comparing ByteCask against LevelDB and RocksDB across:
 //  - Put throughput (ops/µs)
 //  - Get throughput (ops/µs)
 //  - Del throughput (ops/µs)
@@ -42,6 +42,11 @@
 // LevelDB
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
+
+// RocksDB
+#include <rocksdb/db.h>
+#include <rocksdb/table.h>
+#include <rocksdb/write_batch.h>
 
 // ByteCask (C++20 modules)
 import bytecask.engine;
@@ -113,8 +118,22 @@ auto ldb_slice(const std::string &s) -> leveldb::Slice {
   return {s.data(), s.size()};
 }
 
+// Wraps the reinterpret_cast needed to view a byte vector as a C char array.
+// Both LevelDB and RocksDB accept their respective Slice via const char*.
+auto bytes_to_chars(const std::vector<std::byte> &v) -> const char * {
+  return reinterpret_cast<const char *>(v.data());
+}
+
 auto ldb_val_slice(const std::vector<std::byte> &v) -> leveldb::Slice {
-  return {reinterpret_cast<const char *>(v.data()), v.size()};
+  return {bytes_to_chars(v), v.size()};
+}
+
+auto rdb_slice(const std::string &s) -> rocksdb::Slice {
+  return {s.data(), s.size()};
+}
+
+auto rdb_val_slice(const std::vector<std::byte> &v) -> rocksdb::Slice {
+  return {bytes_to_chars(v), v.size()};
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +360,109 @@ template <bool UseCache = true> struct LdbAdapter {
       }
     }
     leveldb::WriteOptions wo;
+    wo.sync = sync;
+    auto s = db.raw->Write(wo, &wb);
+    benchmark::DoNotOptimize(s);
+  }
+};
+
+template <bool UseCache = true> struct RdbAdapter {
+  struct Db {
+    TmpDir dir;
+    rocksdb::DB *raw{nullptr};
+
+    Db(std::string_view tag, const std::vector<std::string> *populate_keys,
+       const std::vector<std::byte> *populate_val)
+        : dir{tag} {
+      rocksdb::Options opts;
+      opts.create_if_missing = true;
+      opts.compression = rocksdb::kNoCompression;
+      if constexpr (!UseCache) {
+        rocksdb::BlockBasedTableOptions table_opts;
+        table_opts.no_block_cache = true;
+        opts.table_factory.reset(
+            rocksdb::NewBlockBasedTableFactory(table_opts));
+      }
+      auto s = rocksdb::DB::Open(opts, dir.path.string(), &raw);
+      if (!s.ok())
+        throw std::runtime_error{"RocksDB open failed: " + s.ToString()};
+
+      if (populate_keys) {
+        rocksdb::WriteOptions wo;
+        wo.sync = false;
+        for (const auto &k : *populate_keys) {
+          s = raw->Put(wo, rdb_slice(k), rdb_val_slice(*populate_val));
+          if (!s.ok())
+            throw std::runtime_error{"RocksDB put failed: " + s.ToString()};
+        }
+      }
+    }
+
+    ~Db() { delete raw; }
+    Db(const Db &) = delete;
+    Db &operator=(const Db &) = delete;
+  };
+
+  static auto open_empty(std::string_view tag) -> Db {
+    return Db{tag, nullptr, nullptr};
+  }
+
+  static auto open_populated(std::string_view tag,
+                             const std::vector<std::string> &keys,
+                             const std::vector<std::byte> &val) -> Db {
+    return Db{tag, &keys, &val};
+  }
+
+  static void put(Db &db, const std::string &k, const std::vector<std::byte> &v,
+                  bool sync) {
+    rocksdb::WriteOptions wo;
+    wo.sync = sync;
+    auto s = db.raw->Put(wo, rdb_slice(k), rdb_val_slice(v));
+    benchmark::DoNotOptimize(s);
+  }
+
+  static void get(Db &db, const std::string &k) {
+    rocksdb::ReadOptions ro;
+    if constexpr (!UseCache)
+      ro.fill_cache = false;
+    std::string value;
+    auto s = db.raw->Get(ro, rdb_slice(k), &value);
+    benchmark::DoNotOptimize(value);
+  }
+
+  static void del(Db &db, const std::string &k, bool sync) {
+    rocksdb::WriteOptions wo;
+    wo.sync = sync;
+    auto s = db.raw->Delete(wo, rdb_slice(k));
+    benchmark::DoNotOptimize(s);
+  }
+
+  static void range(Db &db, const std::string &k, int limit) {
+    rocksdb::ReadOptions ro;
+    if constexpr (!UseCache)
+      ro.fill_cache = false;
+    std::unique_ptr<rocksdb::Iterator> it{db.raw->NewIterator(ro)};
+    it->Seek(rdb_slice(k));
+    int count = 0;
+    for (; it->Valid() && count < limit; it->Next(), ++count) {
+      benchmark::DoNotOptimize(it->value());
+    }
+  }
+
+  // Batch: 90% put + 10% del in a single atomic WriteBatch call.
+  static void apply_batch(Db &db, const std::vector<std::string> &keys,
+                          const std::vector<std::byte> &val, std::size_t start,
+                          int count, bool sync) {
+    rocksdb::WriteBatch wb;
+    for (int i = 0; i < count; ++i) {
+      const auto &k = keys[(start + i) % keys.size()];
+      if (i % 10 == 9) {
+        std::ignore = wb.Delete(rdb_slice(k));
+      } else {
+        std::ignore = wb.Put(rdb_slice(k), rdb_val_slice(val));
+      }
+    }
+    rocksdb::WriteOptions wo;
     wo.sync = sync;
     auto s = db.raw->Write(wo, &wb);
     benchmark::DoNotOptimize(s);
@@ -751,6 +873,8 @@ template <typename A, bool Sync> void BM_PutMT(benchmark::State &state) {
 using Bc  = BcAdapter;
 using Ldb = LdbAdapter<true>;
 using LdbNC = LdbAdapter<false>;
+using Rdb = RdbAdapter<true>;
+using RdbNC = RdbAdapter<false>;
 
 // --- ByteCask ---
 BENCH(BM_Put<Bc, false>)          ->Name("ByteCask/Put/NoSync");
@@ -772,11 +896,23 @@ BENCH(BM_Range<Ldb, kRangeLen>)    ->Name("LevelDB/Range50");
 BENCH(BM_Mixed<Ldb, true>)         ->Name("LevelDB/Mixed/Sync");
 BENCH(BM_Mixed<Ldb, false>)        ->Name("LevelDB/Mixed/NoSync");
 
+// --- RocksDB ---
+BENCH(BM_Put<Rdb, false>)          ->Name("RocksDB/Put/NoSync");
+BENCH(BM_Put<Rdb, true>)           ->Name("RocksDB/Put/Sync");
+BENCH(BM_Del<Rdb, false>)          ->Name("RocksDB/Del/NoSync");
+BENCH(BM_Del<Rdb, true>)           ->Name("RocksDB/Del/Sync");
+BENCH(BM_Get<Rdb>)                 ->Name("RocksDB/Get");
+BENCH(BM_Range<Rdb, kRangeLen>)    ->Name("RocksDB/Range50");
+BENCH(BM_Mixed<Rdb, true>)         ->Name("RocksDB/Mixed/Sync");
+BENCH(BM_Mixed<Rdb, false>)        ->Name("RocksDB/Mixed/NoSync");
+
 // --- Mixed Batch ---
 BENCH(BM_MixedBatch<Bc, false>)     ->Name("ByteCask/MixedBatch/NoSync");
 BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCask/MixedBatch/Sync");
 BENCH(BM_MixedBatch<Ldb, false>)    ->Name("LevelDB/MixedBatch/NoSync");
 BENCH(BM_MixedBatch<Ldb, true>)     ->Name("LevelDB/MixedBatch/Sync");
+BENCH(BM_MixedBatch<Rdb, false>)    ->Name("RocksDB/MixedBatch/NoSync");
+BENCH(BM_MixedBatch<Rdb, true>)     ->Name("RocksDB/MixedBatch/Sync");
 
 using Gw0   = GwAdapter<0>;     // no yield (baseline)
 using Gw10  = GwAdapter<10>;    // 10 µs
@@ -789,6 +925,8 @@ BENCH(BM_MixedMT<Bc, false>)       ->Name("ByteCask/MixedMT/NoSync") ->Threads(2
 BENCH(BM_MixedMT<Bc, false>)       ->Name("ByteCask/MixedMT/NoSync") ->Threads(4);
 BENCH(BM_MixedMT<Ldb, false>)      ->Name("LevelDB/MixedMT/NoSync")  ->Threads(2);
 BENCH(BM_MixedMT<Ldb, false>)      ->Name("LevelDB/MixedMT/NoSync")  ->Threads(4);
+BENCH(BM_MixedMT<Rdb, false>)      ->Name("RocksDB/MixedMT/NoSync")  ->Threads(2);
+BENCH(BM_MixedMT<Rdb, false>)      ->Name("RocksDB/MixedMT/NoSync")  ->Threads(4);
 
 BENCH(BM_MixedMT<Bc, true>)        ->Name("ByteCask/MixedMT/Sync")   ->Threads(2);
 BENCH(BM_MixedMT<Bc, true>)        ->Name("ByteCask/MixedMT/Sync")   ->Threads(4);
@@ -798,6 +936,10 @@ BENCH(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(2
 BENCH(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(4);
 BENCH(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(8);
 BENCH(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(16);
+BENCH(BM_MixedMT<Rdb, true>)       ->Name("RocksDB/MixedMT/Sync")    ->Threads(2);
+BENCH(BM_MixedMT<Rdb, true>)       ->Name("RocksDB/MixedMT/Sync")    ->Threads(4);
+BENCH(BM_MixedMT<Rdb, true>)       ->Name("RocksDB/MixedMT/Sync")    ->Threads(8);
+BENCH(BM_MixedMT<Rdb, true>)       ->Name("RocksDB/MixedMT/Sync")    ->Threads(16);
 BENCH(BM_MixedMT<Gw0, true>)       ->Name("GroupWriter/MixedMT/Sync")    ->Threads(2);
 BENCH(BM_MixedMT<Gw0, true>)       ->Name("GroupWriter/MixedMT/Sync")    ->Threads(4);
 BENCH(BM_MixedMT<Gw0, true>)       ->Name("GroupWriter/MixedMT/Sync")    ->Threads(8);
@@ -812,6 +954,10 @@ BENCH(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(2
 BENCH(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(4);
 BENCH(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(8);
 BENCH(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(16);
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(2);
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(4);
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(8);
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(16);
 BENCH(BM_PutMT<Gw0, true>)       ->Name("GroupWriter/PutMT/Sync")   ->Threads(2);
 BENCH(BM_PutMT<Gw0, true>)       ->Name("GroupWriter/PutMT/Sync")   ->Threads(4);
 BENCH(BM_PutMT<Gw0, true>)       ->Name("GroupWriter/PutMT/Sync")   ->Threads(8);

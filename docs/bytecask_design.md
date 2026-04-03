@@ -62,6 +62,8 @@ The engine uses two mutexes instead of one `std::shared_mutex`, eliminating writ
 
 This two-lock design removes the `shared_mutex` reader-preference starvation that caused ByteCask/MixedMT/Sync to be 700× slower than LevelDB. Both mutexes are heap-allocated (`std::unique_ptr`) because `std::mutex` is not movable and `Bytecask` is a move-only type.
 
+`engine_bench` compares ByteCask against LevelDB and RocksDB across Put, Get, Del, Range50, Mixed, MixedBatch, PutMT, and MixedMT benchmarks at both NoSync and Sync durability levels. RocksDB compression is disabled (`kNoCompression`) and values are 1 KiB of random (incompressible) bytes so neither LevelDB nor RocksDB gains an advantage from Snappy/block-cache effects.
+
 `WriteOptions::try_lock` (default `false`) controls write-lock acquisition behaviour:
 
 - `false` (default) — blocking acquire via `std::unique_lock`. The caller waits until the lock is available.
