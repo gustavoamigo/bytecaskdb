@@ -1,9 +1,5 @@
 module;
-// bitsery is a legacy (non-module) library; include it in the global module
-// fragment so its headers are available before the named module begins.
-#include <bitsery/adapter/buffer.h>
-#include <bitsery/bitsery.h>
-#include <bitsery/traits/vector.h>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -58,44 +54,47 @@ export auto parse_header(std::span<const std::byte> buf) -> EntryHeader {
   };
 }
 
-// Serialize a single entry into a flat byte buffer using bitsery.
-// The CRC-32 checksum covers all bytes of the entry except itself and is
-// appended as the final four bytes.
+// Fills hdr_crc (19 bytes) with the 15-byte LE header at [0..14] and the
+// 4-byte CRC at [15..18]. CRC covers header + key + value.
+// All format knowledge (field layout, byte order, CRC scope) lives here.
+export void serialize_header_and_crc(
+    std::span<std::byte, kHeaderSize + kCrcSize> hdr_crc,
+    std::uint64_t sequence, EntryType entry_type,
+    std::span<const std::byte> key,
+    std::span<const std::byte> value) {
+  write_le(hdr_crc, 0, sequence);
+  hdr_crc[8] = static_cast<std::byte>(entry_type);
+  write_le(hdr_crc, 9, narrow<std::uint16_t>(key.size()));
+  write_le(hdr_crc, 11, narrow<std::uint32_t>(value.size()));
+
+  Crc32 crc{};
+  crc.update(hdr_crc.first<kHeaderSize>());
+  crc.update(key);
+  crc.update(value);
+  write_le(hdr_crc, kHeaderSize, crc.finalize());
+}
+
+// Serialize a single entry into a contiguous byte buffer.
+// Used by tests and any path that needs a complete in-memory entry.
 export auto serialize_entry(std::uint64_t sequence, EntryType entry_type,
                             std::span<const std::byte> key,
                             std::span<const std::byte> value)
     -> std::vector<std::uint8_t> {
-  using Buffer = std::vector<std::uint8_t>;
-  using BaseAdapter = bitsery::OutputBufferAdapter<Buffer>;
+  std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc{};
+  serialize_header_and_crc(hdr_crc, sequence, entry_type, key, value);
 
-  Buffer raw;
+  std::vector<std::uint8_t> raw;
   raw.reserve(kHeaderSize + key.size() + value.size() + kCrcSize);
 
-  Crc32 crc{};
-  BaseAdapter base{raw};
-  CrcOutputAdapter<BaseAdapter> crc_adapter{base, crc};
-  bitsery::Serializer<CrcOutputAdapter<BaseAdapter>> ser{crc_adapter};
-
-  // Serialize the fixed header fields.
-  ser.value8b(sequence);
-  ser.value1b(static_cast<std::uint8_t>(entry_type));
-  ser.value2b(narrow<std::uint16_t>(key.size()));
-  ser.value4b(narrow<std::uint32_t>(value.size()));
-
-  // Write the variable-length key and value bytes through the CRC adapter
-  // so they are included in the checksum.
-  write_bytes(ser, key);
-  write_bytes(ser, value);
-
-  // Append the trailing CRC directly through the base adapter (bypassing the
-  // CRC adapter so the checksum does not include itself).
-  const auto final_crc = crc.finalize();
-  base.template writeBytes<4, std::uint32_t>(final_crc);
-
-  // Trim the buffer to the exact written size: bitsery over-allocates using a
-  // cache-line-aligned growth strategy, so raw.size() may exceed kHeaderSize +
-  // key.size() + value.size() + kCrcSize immediately after serialization.
-  raw.resize(base.writtenBytesCount());
+  const auto push = [&raw](std::span<const std::byte> s) {
+    for (auto b : s) {
+      raw.push_back(std::to_integer<std::uint8_t>(b));
+    }
+  };
+  push(std::span<const std::byte>{hdr_crc.data(), kHeaderSize});
+  push(key);
+  push(value);
+  push(std::span<const std::byte>{hdr_crc.data() + kHeaderSize, kCrcSize});
   return raw;
 }
 
