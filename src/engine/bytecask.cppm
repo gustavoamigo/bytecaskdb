@@ -449,10 +449,10 @@ public:
   }
 
   // Flushes all pending writes to physical storage (fdatasync on the active
-  // file). GroupWriter calls this once after draining a group of sync=false
-  // writes so all writers in the group share a single fdatasync.
+  // file). Useful for callers that issue multiple sync=false writes and then
+  // want a single fdatasync to cover them all.
   //
-  // Correctness: if a rotation occurred during the group's write phase, the
+  // Correctness: if a rotation occurred during a batch of writes, the
   // rotated file was fdatasynced inside rotate_active_file() before being
   // sealed, so all pre-rotation writes are already durable. This call covers
   // any writes that landed in the new active file after rotation.
@@ -802,9 +802,8 @@ private:
 
   // Seals the active file and opens a new one if the size threshold is met.
   // fdatasync is called before sealing: any writes that reached this file
-  // (including sync=false writes from GroupWriter) are durable by the time
-  // the file becomes immutable. This guarantees that Bytecask::sync() on
-  // the new active file correctly covers the entire write history.
+  // (including prior sync=false writes) are durable by the time the file
+  // becomes immutable.
   void rotate_active_file() {
     active_file().sync();
     active_file().seal();

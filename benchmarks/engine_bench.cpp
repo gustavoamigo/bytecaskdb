@@ -45,7 +45,6 @@
 
 // ByteCask (C++20 modules)
 import bytecask.engine;
-import bytecask.group_writer;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -347,93 +346,6 @@ template <bool UseCache = true> struct LdbAdapter {
   }
 };
 
-// GroupWriter adapter: writes go through GroupWriter (shared fdatasync),
-// reads go directly to the engine (reads are unaffected by GroupWriter).
-// YieldUs controls the leader's yield window passed to GroupWriter.
-template <std::uint32_t YieldUs = bytecask::kDefaultGroupYieldUs>
-struct GwAdapter {
-  struct Db {
-    TmpDir dir;
-    bytecask::Bytecask engine;
-    bytecask::GroupWriter gw;
-
-    Db(std::string_view tag, const std::vector<std::string> *populate_keys,
-       const std::vector<std::byte> *populate_val)
-        : dir{tag}, engine{bytecask::Bytecask::open(dir.path)},
-          gw{engine, YieldUs} {
-      if (populate_keys) {
-        bytecask::WriteOptions wo;
-        const auto n = populate_keys->size();
-        for (std::size_t i = 0; i < n; ++i) {
-          wo.sync = (i % 1000 == 999) || (i == n - 1);
-          engine.put(wo, bc_key((*populate_keys)[i]), bc_val(*populate_val));
-        }
-      }
-    }
-
-    // Non-movable: gw holds a reference to engine; moving engine would dangle.
-    Db(const Db &) = delete;
-    Db &operator=(const Db &) = delete;
-    Db(Db &&) = delete;
-    Db &operator=(Db &&) = delete;
-  };
-
-  static auto open_empty(std::string_view tag) -> Db {
-    return Db{tag, nullptr, nullptr};
-  }
-
-  static auto open_populated(std::string_view tag,
-                             const std::vector<std::string> &keys,
-                             const std::vector<std::byte> &val) -> Db {
-    return Db{tag, &keys, &val};
-  }
-
-  // Writes always use GroupWriter (sync parameter is intentionally ignored:
-  // GroupWriter always issues exactly one fdatasync per group).
-  static void put(Db &db, const std::string &k, const std::vector<std::byte> &v,
-                  bool /*sync*/) {
-    db.gw.put(bc_key(k), bc_val(v));
-  }
-
-  static void get(Db &db, const std::string &k) {
-    bytecask::ReadOptions ro;
-    bytecask::Bytes value;
-    auto found = db.engine.get(ro, bc_key(k), value);
-    benchmark::DoNotOptimize(found);
-    benchmark::DoNotOptimize(value.data());
-  }
-
-  static void del(Db &db, const std::string &k, bool /*sync*/) {
-    std::ignore = db.gw.del(bc_key(k));
-  }
-
-  static void range(Db &db, const std::string &k, int limit) {
-    bytecask::ReadOptions ro;
-    auto range = db.engine.iter_from(ro, bc_key(k));
-    int count = 0;
-    for (auto it = range.begin(); it != range.end() && count < limit;
-         ++it, ++count) {
-      auto entry = *it;
-      benchmark::DoNotOptimize(entry);
-    }
-  }
-
-  static void apply_batch(Db &db, const std::vector<std::string> &keys,
-                          const std::vector<std::byte> &val, std::size_t start,
-                          int count, bool /*sync*/) {
-    bytecask::Batch batch;
-    for (int i = 0; i < count; ++i) {
-      const auto &k = keys[(start + i) % keys.size()];
-      if (i % 10 == 9) {
-        batch.del(bc_key(k));
-      } else {
-        batch.put(bc_key(k), bc_val(val));
-      }
-    }
-    db.gw.apply_batch(std::move(batch));
-  }
-};
-
 // ===========================================================================
 // Generic benchmark templates
 // ===========================================================================
@@ -692,6 +604,52 @@ template <typename A, bool Sync> void BM_MixedMT(benchmark::State &state) {
   }
 }
 
+// ────────────────────────── Get (multithreaded) ───────────────────────────
+// N threads each issuing continuous gets against a shared pre-populated DB.
+// Measures read throughput scaling and tail latency under concurrency.
+
+template <typename A> void BM_GetMT(benchmark::State &state) {
+  static std::unique_ptr<typename A::Db> shared_db;
+  static std::vector<std::string> shared_keys;
+  static std::vector<std::byte> shared_val;
+
+  if (state.thread_index() == 0) {
+    shared_keys = generate_prefixed_keys(kDatasetSize);
+    shared_val = make_value();
+    shared_db =
+        std::make_unique<typename A::Db>("get_mt", &shared_keys, &shared_val);
+  }
+
+  const auto thread_offset =
+      static_cast<std::size_t>(state.thread_index()) * (kDatasetSize / 8);
+  std::size_t idx = thread_offset;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+
+  for (auto _ : state) {
+    const auto &k = shared_keys[idx % shared_keys.size()];
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    A::get(*shared_db, k);
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    ++idx;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.counters["ops_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  attach_jitter(state, samples);
+
+  if (state.thread_index() == 0) {
+    shared_db.reset();
+    shared_keys.clear();
+    shared_val.clear();
+  }
+}
+
 // ────────────────────────── Put (multithreaded) ───────────────────────────
 // N threads each issuing continuous puts against a shared DB instance.
 // Measures the per-thread put throughput and tail latency under concurrency.
@@ -778,11 +736,15 @@ BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCask/MixedBatch/Sync");
 BENCH(BM_MixedBatch<Ldb, false>)    ->Name("LevelDB/MixedBatch/NoSync");
 BENCH(BM_MixedBatch<Ldb, true>)     ->Name("LevelDB/MixedBatch/Sync");
 
-using Gw0   = GwAdapter<0>;     // no yield (baseline)
-using Gw10  = GwAdapter<10>;    // 10 µs
-using Gw100 = GwAdapter<100>;   // 100 µs (RocksDB default)
-using Gw500 = GwAdapter<500>;   // 500 µs
-using Gw    = Gw100;            // default alias used elsewhere
+// --- Multithreaded Get (pure read throughput under concurrency) ---
+BENCH(BM_GetMT<Bc>)                ->Name("ByteCask/GetMT")          ->Threads(2);
+BENCH(BM_GetMT<Bc>)                ->Name("ByteCask/GetMT")          ->Threads(4);
+BENCH(BM_GetMT<Bc>)                ->Name("ByteCask/GetMT")          ->Threads(8);
+BENCH(BM_GetMT<Bc>)                ->Name("ByteCask/GetMT")          ->Threads(16);
+BENCH(BM_GetMT<Ldb>)               ->Name("LevelDB/GetMT")           ->Threads(2);
+BENCH(BM_GetMT<Ldb>)               ->Name("LevelDB/GetMT")           ->Threads(4);
+BENCH(BM_GetMT<Ldb>)               ->Name("LevelDB/GetMT")           ->Threads(8);
+BENCH(BM_GetMT<Ldb>)               ->Name("LevelDB/GetMT")           ->Threads(16);
 
 // --- Multithreaded Mixed ---
 BENCH(BM_MixedMT<Bc, false>)       ->Name("ByteCask/MixedMT/NoSync") ->Threads(2);
@@ -798,10 +760,6 @@ BENCH(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(2
 BENCH(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(4);
 BENCH(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(8);
 BENCH(BM_MixedMT<Ldb, true>)       ->Name("LevelDB/MixedMT/Sync")    ->Threads(16);
-BENCH(BM_MixedMT<Gw0, true>)       ->Name("GroupWriter/MixedMT/Sync")    ->Threads(2);
-BENCH(BM_MixedMT<Gw0, true>)       ->Name("GroupWriter/MixedMT/Sync")    ->Threads(4);
-BENCH(BM_MixedMT<Gw0, true>)       ->Name("GroupWriter/MixedMT/Sync")    ->Threads(8);
-BENCH(BM_MixedMT<Gw0, true>)       ->Name("GroupWriter/MixedMT/Sync")    ->Threads(16);
 
 // --- Multithreaded Put (pure write throughput under concurrency) ---
 BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(2);
@@ -812,22 +770,6 @@ BENCH(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(2
 BENCH(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(4);
 BENCH(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(8);
 BENCH(BM_PutMT<Ldb, true>)         ->Name("LevelDB/PutMT/Sync")      ->Threads(16);
-BENCH(BM_PutMT<Gw0, true>)       ->Name("GroupWriter/PutMT/Sync")   ->Threads(2);
-BENCH(BM_PutMT<Gw0, true>)       ->Name("GroupWriter/PutMT/Sync")   ->Threads(4);
-BENCH(BM_PutMT<Gw0, true>)       ->Name("GroupWriter/PutMT/Sync")   ->Threads(8);
-BENCH(BM_PutMT<Gw0, true>)       ->Name("GroupWriter/PutMT/Sync")   ->Threads(16);
-
-// --- GroupWriter yield sweep: PutMT/Sync at threads:4 ---
-BENCH(BM_PutMT<Gw0,   true>)       ->Name("GroupWriter/PutMT/Sync/yield:0us")   ->Threads(16);
-BENCH(BM_PutMT<Gw10,  true>)       ->Name("GroupWriter/PutMT/Sync/yield:10us")  ->Threads(16);
-BENCH(BM_PutMT<Gw100, true>)       ->Name("GroupWriter/PutMT/Sync/yield:100us") ->Threads(16);
-BENCH(BM_PutMT<Gw500, true>)       ->Name("GroupWriter/PutMT/Sync/yield:500us") ->Threads(16);
-
-// --- GroupWriter yield sweep: MixedMT/Sync at threads:4 --- 
-BENCH(BM_MixedMT<Gw0,   true>)     ->Name("GroupWriter/MixedMT/Sync/yield:0us")   ->Threads(16);
-BENCH(BM_MixedMT<Gw10,  true>)     ->Name("GroupWriter/MixedMT/Sync/yield:10us")  ->Threads(16);
-BENCH(BM_MixedMT<Gw100, true>)     ->Name("GroupWriter/MixedMT/Sync/yield:100us") ->Threads(16);
-BENCH(BM_MixedMT<Gw500, true>)     ->Name("GroupWriter/MixedMT/Sync/yield:500us") ->Threads(16);
 
 // clang-format on
 
