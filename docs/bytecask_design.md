@@ -53,25 +53,133 @@ ByteCask follows a **single-writer / multiple-reader (SWMR)** model:
 - Multiple readers may operate concurrently.
 - MVCC and snapshot isolation are not supported.
 
-#### Write Lock
+#### Lock-free strategy
 
-The engine uses two mutexes instead of one `std::shared_mutex`, eliminating writer-starvation under concurrent readers:
+ByteCask's read path is designed so that **readers never acquire a mutex** and never spin. The strategy combines three ideas:
 
-- **`write_mu_`** (`std::mutex`): serialises writers (`put`, `del`, `apply_batch`). The writer appends to the data file and updates `key_dir_`/`files_` under this lock, then calls `publish_snapshot()` (see below) before releasing it. `fdatasync` still happens **outside** the lock — the `shared_ptr<DataFile>` captured before release keeps the file alive even if rotation occurs under the next writer's lock.
-- **`snapshot_mu_`** (`std::mutex`, `mutable`): protects a light `DirSnapshot{key_dir, files, active_file_id}` that is the sole state readers observe. Writers publish into it after each mutation and then bump `snapshot_gen_`; readers use `snapshot_gen_` to avoid the mutex entirely on the fast path (see Thread-local snapshot cache below). Hold time under the lock is ~10 ns for both sides (two O(1) copies).
+1. **A single writer mutex** (`write_mu_`) that serialises mutations — readers are completely unaffected by it.
+2. **An immutable, copy-on-write snapshot** (`DirSnapshot`) published via an atomic `shared_ptr` — readers capture the current snapshot without blocking the writer.
+3. **A thread-local generation cache** — on the common path a reader performs only a single atomic integer comparison and returns immediately, touching no shared state at all.
 
-Both mutexes are heap-allocated (`std::unique_ptr`) because `std::mutex` is not movable. `Bytecask` is non-movable and non-copyable (move/copy constructors are deleted) because it holds mutexes and an atomic generation counter.
+##### Shared state layout
 
-#### Thread-local snapshot cache
+```
+  Bytecask object
+  ┌─────────────────────────────────────────────────────────────┐
+  │  write_mu_      std::mutex (heap-allocated)                 │  ← writers only
+  │                                                             │
+  │  snapshot_      atomic<shared_ptr<DirSnapshot>>             │  ← written by writer
+  │                                                             │    read (relaxed) on slow path
+  │  snapshot_gen_  atomic<uint64_t>                            │  ← bumped by writer (release)
+  └─────────────────────────────────────────────────────────────┘    loaded by readers (acquire)
 
-Each reader thread maintains a `thread_local` cache of `{generation, key_dir, files}`. On every `read_snapshot()` call:
+  DirSnapshot  (heap, reference-counted, never mutated in place)
+  ┌─────────────────────────────────────────────────┐
+  │  key_dir        shared_ptr<RadixTree>            │  key → (file_id, offset, seq)
+  │  files          shared_ptr<FileMap>              │  file_id → open DataFile fd
+  │  active_file_id uint32_t                         │
+  └─────────────────────────────────────────────────┘
+```
 
-1. **Fast path** — load `snapshot_gen_` with `acquire` semantics (one 64-bit atomic load). If the cached generation matches, return the cached `key_dir` and `files` immediately. No shared state is modified; the lock is never acquired. This path scales to any number of reader threads with zero contention.
-2. **Slow path** — on mismatch (first call per thread, or after a write), acquire `snapshot_mu_`, copy `key_dir` and `files` into the thread-local cache, reload `snapshot_gen_` under the lock, release, and return the fresh copies.
+`DirSnapshot` is immutable once published. Old snapshots stay alive as long as any reader holds a `shared_ptr` reference — the writer always allocates a fresh snapshot and never mutates one in place.
 
-`publish_snapshot()` updates `snapshot_` under `snapshot_mu_`, releases the lock, then does `snapshot_gen_.fetch_add(1, release)`. The acquire/release pairing guarantees that any reader that observes the new generation will also observe the fully-updated snapshot.
+##### Write path
 
-**Consistency guarantee**: a `put` followed by a `get` on the **same thread** always observes the put's value — the generation bump in `publish_snapshot` is sequentially ordered before the generation load in the subsequent `read_snapshot` on the same thread. Across **different threads**, the guarantee is release-acquire: if a reader observes the new generation it sees the complete snapshot; but it may briefly observe a stale snapshot in the short window between the snapshot update and the generation bump. This matches the consistency level of the prior mutex-only design.
+```
+  Writer thread
+  ─────────────
+  1. acquire write_mu_
+     └─ serialises concurrent writers; readers never touch this mutex
+
+  2. append entry to active DataFile   (I/O, under write_mu_)
+
+  3. update key_dir_ and files_        (in-memory, under write_mu_)
+
+  4. publish_snapshot()
+     │
+     ├─ a. snapshot_.store( make_shared<DirSnapshot>(key_dir_, files_, ...) , release )
+     │        └─ allocates a fresh, immutable snapshot; release ensures all
+     │           preceding writes are visible before the store completes
+     │
+     └─ b. snapshot_gen_.fetch_add( 1 , release )
+              └─ bumps the generation counter; the release fence here
+                 synchronizes-with any reader's subsequent acquire load
+
+  5. release write_mu_
+
+  6. fdatasync()   ← outside write_mu_; DataFile kept alive by a captured shared_ptr
+```
+
+Step 4a is sequenced before step 4b. This ordering is the foundation of the entire lock-free read protocol.
+
+##### Read path — fast path (no lock, no atomic write)
+
+Every reader thread has a `thread_local` cache containing its last-seen generation and the corresponding snapshot.
+
+```
+  Reader thread N  (thread-local storage, private to this thread)
+  ┌─────────────────────────────────────────────────────────────┐
+  │  TlCache                                                    │
+  │   instance_id   uint64_t                ← which Bytecask   │
+  │   gen           uint64_t                ← last seen gen     │
+  │   snap          shared_ptr<DirSnapshot> ← cached snapshot   │
+  └─────────────────────────────────────────────────────────────┘
+
+  read_snapshot() logic:
+
+  ┌─ 1. current_gen = snapshot_gen_.load(acquire)   ← ONE atomic read
+  │
+  ├── instance_id matches AND gen == current_gen?
+  │         │
+  │        YES ──────────────────────────────────────> return tls.snap
+  │                                                    (no shared-state writes,
+  │                                                     no mutex, no CAS, no spin)
+  │
+  └── NO  (first call on this thread, or a write happened since last call)
+           │
+           ├─ 2. snap = snapshot_.load(relaxed)   ← one atomic read, no mutex
+           │         └─ safe: the acquire on snapshot_gen_ already establishes
+           │               happens-before with the writer's release store
+           │
+           ├─ 3. update tls: { instance_id, current_gen, snap }
+           │
+           └─────────────────────────────────────────> return snap
+```
+
+On the **fast path** the only shared-memory operation is a single 64-bit `acquire` load. All other work is pure thread-local. Any number of readers can race down this path simultaneously — they never modify shared state, so there is literally nothing to contend on.
+
+On the **slow path** (gen mismatch) the reader does one relaxed atomic load of `snapshot_`. No mutex, no CAS, no spinning. It is still fully lock-free.
+
+##### Why the relaxed `snapshot_` load is safe
+
+The acquire on `snapshot_gen_` **synchronizes-with** the release `fetch_add` the writer performed. Because that `fetch_add` is sequenced after the release store on `snapshot_`, the standard's happens-before chain guarantees:
+
+```
+  WRITER                                    READER (slow path)
+  ────────────────────────────────────      ──────────────────────────────────────
+  [1] mutate key_dir_, files_
+       │ sequenced-before
+       ▼
+  [2] snapshot_.store(S, release)
+       │ sequenced-before
+       ▼
+  [3] snapshot_gen_.fetch_add(release)
+                │                                    synchronizes-with
+                └──────────────────────────> [4] snapshot_gen_.load(acquire)
+                                                  (observes new gen → takes slow path)
+                                                      │ safe: [1],[2] happen-before [4]
+                                                      ▼
+                                             [5] snapshot_.load(relaxed)
+                                                  (guaranteed to observe S from [2])
+```
+
+Because [1]→[2]→[3] happens-before [4], and [4] is sequenced before [5], the reader is guaranteed to observe the fully-updated snapshot that the writer published.
+
+##### The brief stale-snapshot window
+
+Between [2] and [3] in the writer there is a tiny window where `snapshot_` already holds new data but `snapshot_gen_` has not been bumped yet. A reader that loads the generation in that window sees the old value and continues using its cached snapshot — coherent, but one write behind. This is exactly the consistency level of a `shared_mutex` design: the snapshot is never torn, just momentarily stale. Once [3] completes every subsequent reader will take the slow path and refresh.
+
+**Same-thread guarantee**: a `put` followed by a `get` on the **same thread** always observes the put — the release `fetch_add` in step [3] is sequenced before the acquire load in the next `read_snapshot` call on the same thread, so the fast-path gen check always misses and the thread refreshes immediately.
 
 #### Read-scaling behaviour
 
@@ -162,7 +270,7 @@ The active file's `live_bytes` may be non-zero (it holds the current live writes
 #### Vacuum procedure
 
 1. **Acquire `vacuum_mu_`** — prevents two `vacuum()` calls from running concurrently.
-2. **Snapshot the key directory** — read the current `DirSnapshot{key_dir, files}` under `snapshot_mu_`. This is the authoritative view of which entries are live.
+2. **Snapshot the key directory** — call `read_snapshot()` to obtain the current `DirSnapshot{key_dir, files}`. This is the authoritative view of which entries are live.
 3. **Select a target file** — iterate sealed files, compute `waste_ratio = 1 - (live_bytes / total_bytes)` from `file_stats_` (O(1) per file, no I/O), pick the highest-waste sealed file above `waste_threshold`. If no file qualifies, return immediately.
 4. **Rewrite the target file** — open a new data file for writing (new timestamp stem, same directory). Scan the old data file entry by entry:
    - *Put entry*: check whether the snapshot's key directory entry for that key points to the old file at this offset with the same sequence number. If yes (live), write it to the new file at its new offset, recording `(key → new_file_id, new_offset)`. If no (dead), skip.
@@ -741,9 +849,8 @@ for (auto& key : db.keys_from(as_bytes("user:"))) { ... }
 
 `GroupWriter` was a leader/follower group-commit helper that coalesced concurrent `fdatasync` calls. It was implemented (BC-049), benchmarked, and removed (BC-051) because benchmarks showed it provided no measurable throughput benefit: on fast storage `fdatasync` is already cheap enough that grouping saves nothing; on slow storage LevelDB's internal WAL batching achieves similar amortisation without an extra abstraction.
 
-Two improvements originally introduced for `GroupWriter` were **retained** because they are independently valuable:
+One improvement originally introduced for `GroupWriter` was **retained** because it is independently valuable:
 
-- **`Bytecask::sync()`** — public method that calls `fdatasync` on the active file. Useful for callers that issue multiple `sync=false` writes and then want a single barrier.
 - **`rotate_active_file()` always fdatasyncs before sealing** — ensures prior `sync=false` writes are durable before the file becomes immutable.
 
 The full design and implementation are preserved in git history (see BC-049 in the project plan).

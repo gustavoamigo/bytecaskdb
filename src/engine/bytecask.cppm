@@ -11,6 +11,7 @@ module;
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -321,13 +322,15 @@ export struct ReadOptions {};
 // throughput).
 //
 // Thread safety: write operations (put, del, apply_batch) are serialised by
-// write_mu_ (plain mutex). After mutating key_dir_/files_, the writer
-// publishes a snapshot under snapshot_mu_ and bumps snapshot_gen_.
+// write_mu_ (plain mutex). After mutating key_dir_/files_, the writer stores
+// a new shared_ptr<DirSnapshot> atomically into snapshot_ (release) and then
+// bumps snapshot_gen_ (release). On x86-64 the atomic store uses CMPXCHG16B
+// and is truly lock-free.
 // Readers check their thread-local cached generation against snapshot_gen_
-// (one lock-free acquire load). On a match the cached key_dir/files are used
-// directly — no shared state is modified, so throughput scales with thread
-// count. On a mismatch (first call, or after a write) the reader acquires
-// snapshot_mu_ briefly, refreshes the cache, and continues lock-free.
+// (one lock-free acquire load). On a match the cached shared_ptr is returned
+// with no further synchronisation — throughput scales with thread count.
+// On a mismatch the reader does a single relaxed atomic load of snapshot_
+// (safe via the acquire on snapshot_gen_) and refreshes its TLS cache.
 // Readers never acquire write_mu_, eliminating writer-starvation.
 // ---------------------------------------------------------------------------
 export class Bytecask {
@@ -379,13 +382,13 @@ public:
   // found, false otherwise.
   [[nodiscard]] auto get(const ReadOptions & /*opts*/, BytesView key,
                          Bytes &out) const -> bool {
-    auto [kd, fs] = read_snapshot();
-    const auto kv = kd.get(key);
+    auto snap = read_snapshot();
+    const auto kv = snap->key_dir.get(key);
     if (!kv) {
       return false;
     }
     thread_local Bytes io_buf;
-    fs->at(kv->file_id)
+    snap->files->at(kv->file_id)
         ->read_entry(kv->file_offset, narrow<std::uint16_t>(key.size()),
                      kv->value_size, io_buf);
     extract_value_into(io_buf, out);
@@ -448,25 +451,8 @@ public:
 
   // Returns true if key exists in the index (no disk I/O).
   [[nodiscard]] auto contains_key(BytesView key) const -> bool {
-    auto [kd, fs] = read_snapshot();
-    return kd.contains(key);
-  }
-
-  // Flushes all pending writes to physical storage (fdatasync on the active
-  // file). Useful for callers that issue multiple sync=false writes and then
-  // want a single fdatasync to cover them all.
-  //
-  // Correctness: if a rotation occurred during a batch of writes, the
-  // rotated file was fdatasynced inside rotate_active_file() before being
-  // sealed, so all pre-rotation writes are already durable. This call covers
-  // any writes that landed in the new active file after rotation.
-  void sync() {
-    std::shared_ptr<DataFile> f;
-    {
-      std::lock_guard lk{*snapshot_mu_};
-      f = snapshot_.files->at(snapshot_.active_file_id);
-    }
-    f->sync();
+    auto snap = read_snapshot();
+    return snap->key_dir.contains(key);
   }
 
   // ── Batch ──────────────────────────────────────────────────────────────
@@ -537,10 +523,10 @@ public:
   [[nodiscard]] auto iter_from(const ReadOptions & /*opts*/,
                                BytesView from = {}) const
       -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
-    auto [kd, fs] = read_snapshot();
-    auto it = from.empty() ? kd.begin() : kd.lower_bound(from);
+    auto snap = read_snapshot();
+    auto it = from.empty() ? snap->key_dir.begin() : snap->key_dir.lower_bound(from);
     return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
-        EntryIterator{std::move(it), std::move(fs)}, std::default_sentinel};
+        EntryIterator{std::move(it), snap->files}, std::default_sentinel};
   }
 
   // Returns an input range of keys >= from. Walks the in-memory key directory
@@ -548,8 +534,8 @@ public:
   [[nodiscard]] auto keys_from(const ReadOptions & /*opts*/,
                                BytesView from = {}) const
       -> std::ranges::subrange<KeyIterator, std::default_sentinel_t> {
-    auto [kd, fs] = read_snapshot();
-    auto it = from.empty() ? kd.begin() : kd.lower_bound(from);
+    auto snap = read_snapshot();
+    auto it = from.empty() ? snap->key_dir.begin() : snap->key_dir.lower_bound(from);
     return std::ranges::subrange<KeyIterator, std::default_sentinel_t>{
         KeyIterator{std::move(it)}, std::default_sentinel};
   }
@@ -603,42 +589,50 @@ private:
     const auto stem = make_data_file_stem();
     files_->emplace(active_file_id_,
                     std::make_shared<DataFile>(dir_ / (stem + ".data")));
-    snapshot_ = {key_dir_, files_, active_file_id_};
+    snapshot_.store(
+        std::make_shared<DirSnapshot>(key_dir_, files_, active_file_id_),
+        std::memory_order_release);
   }
 
-  // Returns the current snapshot. Fast path: if the thread-local cached
-  // generation matches the published generation (a single lock-free acquire
-  // load), the cached key_dir and files are returned with no shared state
-  // modified — zero contention regardless of thread count.
-  // Slow path (first call or after a write): acquires snapshot_mu_ briefly,
-  // copies the snapshot, then updates the thread-local cache.
-  auto read_snapshot() const
-      -> std::pair<PersistentRadixTree<KeyDirEntry>, FileRegistry> {
+  // Fast path (gen match): one lock-free acquire load + one shared_ptr copy.
+  // Slow path (first call or after a write): one lock-free atomic load of
+  // snapshot_ — no mutex, no thundering herd when a write invalidates all
+  // TLS caches. On x86-64 the load uses CMPXCHG16B and is truly lock-free.
+  //
+  // instance_id_ prevents cross-instance TLS contamination when the allocator
+  // reuses an address for a new Bytecask that coincidentally reaches the same
+  // snapshot_gen_ value as the previous occupant of that address.
+  //
+  // Memory ordering: the acquire load of snapshot_gen_ synchronizes-with the
+  // release fetch_add in publish_snapshot(). Everything sequenced-before that
+  // fetch_add — including the release store of snapshot_ — happens-before
+  // this acquire load, so the subsequent relaxed load of snapshot_ is safe.
+  auto read_snapshot() const -> std::shared_ptr<DirSnapshot> {
     struct TlCache {
+      std::uint64_t instance_id{std::numeric_limits<std::uint64_t>::max()};
       std::uint64_t gen{0};
-      PersistentRadixTree<KeyDirEntry> key_dir;
-      FileRegistry files;
+      std::shared_ptr<DirSnapshot> snap;
     };
     thread_local TlCache cache;
     const auto current_gen = snapshot_gen_.load(std::memory_order_acquire);
-    if (cache.gen == current_gen) {
-      return {cache.key_dir, cache.files};
+    if (cache.instance_id == instance_id_ && cache.gen == current_gen) {
+      return cache.snap;
     }
-    std::lock_guard lk{*snapshot_mu_};
-    cache.key_dir = snapshot_.key_dir;
-    cache.files = snapshot_.files;
-    cache.gen = snapshot_gen_.load(std::memory_order_relaxed);
-    return {cache.key_dir, cache.files};
+    cache.instance_id = instance_id_;
+    cache.snap = snapshot_.load(std::memory_order_relaxed);
+    cache.gen = current_gen;
+    return cache.snap;
   }
 
-  // Copies key_dir_, files_, and active_file_id_ into the published snapshot,
-  // then bumps the generation counter so readers invalidate their caches.
+  // Publishes a new snapshot and bumps the generation counter.
   // Called by writers after mutating key_dir_/files_, under write_mu_.
+  // The release store on snapshot_ is sequenced before the release
+  // fetch_add on snapshot_gen_, establishing the happens-before required
+  // by read_snapshot()'s acquire load.
   void publish_snapshot() {
-    {
-      std::lock_guard lk{*snapshot_mu_};
-      snapshot_ = {key_dir_, files_, active_file_id_};
-    }
+    snapshot_.store(
+        std::make_shared<DirSnapshot>(key_dir_, files_, active_file_id_),
+        std::memory_order_release);
     snapshot_gen_.fetch_add(1, std::memory_order_release);
   }
 
@@ -848,6 +842,8 @@ private:
     }
   }
 
+  static inline std::atomic<std::uint64_t> next_instance_id_{0};
+
   std::filesystem::path dir_;
   PersistentRadixTree<KeyDirEntry> key_dir_;
   // Copy-on-write registry: rotation clones the inner map and replaces
@@ -855,16 +851,21 @@ private:
   // the old snapshot without any locking. The fd is never closed while any
   // snapshot retains the inner shared_ptr<DataFile>.
   FileRegistry files_;
-  // Published snapshot: readers copy under snapshot_mu_, writers publish
-  // after mutations. Both PersistentRadixTree and FileRegistry are O(1) copies.
-  DirSnapshot snapshot_;
-  // Incremented by publish_snapshot() after each write. Readers compare
-  // against their thread-local cached generation to skip the mutex entirely
-  // on the fast path.
+  // Globally unique ID for this instance. Immune to address reuse: even if
+  // the allocator places a new Bytecask at an old address, the instance_id_
+  // will differ, preventing the TLS cache from serving a stale snapshot.
+  const std::uint64_t instance_id_{
+      next_instance_id_.fetch_add(1, std::memory_order_relaxed)};
+  // Published snapshot. Writers store a freshly allocated shared_ptr<DirSnapshot>
+  // here atomically (CMPXCHG16B on x86-64 — truly lock-free). Readers do a
+  // single relaxed atomic load, safe because the acquire on snapshot_gen_
+  // already establishes happens-before with the writer's release store here.
+  mutable std::atomic<std::shared_ptr<DirSnapshot>> snapshot_;
+  // Incremented by publish_snapshot() after the snapshot_ store. Readers
+  // compare against their thread-local cached generation for a lock-free fast
+  // path: on a hit the shared_ptr is returned without any atomic load of
+  // snapshot_.
   mutable std::atomic<std::uint64_t> snapshot_gen_{1};
-  // Protects snapshot_ reads/writes. Held ~10 ns; never during I/O.
-  mutable std::unique_ptr<std::mutex> snapshot_mu_{
-      std::make_unique<std::mutex>()};
   // Serialises writers (put, del, apply_batch). Readers never acquire this.
   std::unique_ptr<std::mutex> write_mu_{std::make_unique<std::mutex>()};
   std::uint32_t active_file_id_{0};
