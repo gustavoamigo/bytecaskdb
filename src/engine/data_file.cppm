@@ -147,9 +147,9 @@ public:
 
   // Preads the full entry at offset into io_buf (reusing existing capacity).
   // The caller supplies key_size and value_size (known from KeyDirEntry or
-  // a prior header parse). After this call, io_buf contains a complete,
-  // CRC-verified entry that can be passed to deserialize_entry() or
-  // extract_value_into() depending on what the caller needs.
+  // a prior header parse). After this call, io_buf contains a complete
+  // entry that can be passed to deserialize_entry() or extract_value_into()
+  // depending on what the caller needs.
   void read_entry(Offset offset, std::uint16_t key_size,
                   std::uint32_t value_size,
                   std::vector<std::byte> &io_buf) const {
@@ -160,6 +160,17 @@ public:
       throw std::system_error{errno, std::generic_category(),
                               "DataFile::read_entry: pread failed"};
     }
+  }
+
+  // High-level read: preads the entry, verifies CRC, and extracts only the
+  // value into out. io_buf is a caller-owned scratch buffer whose capacity
+  // is reused across calls to amortize allocation.
+  void read_value(Offset offset, std::uint16_t key_size,
+                  std::uint32_t value_size,
+                  std::vector<std::byte> &io_buf,
+                  std::vector<std::byte> &out) const {
+    read_entry(offset, key_size, value_size, io_buf);
+    extract_value_into(io_buf, out);
   }
 
   // Flushes all pending writes to physical storage via fdatasync.

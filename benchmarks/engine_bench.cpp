@@ -276,9 +276,6 @@ template <bool UseCache = true> struct LdbAdapter {
         : dir{tag} {
       leveldb::Options opts;
       opts.create_if_missing = true;
-      opts.compression = leveldb::kNoCompression;
-      if constexpr (!UseCache)
-        opts.block_cache = nullptr;
       auto s = leveldb::DB::Open(opts, dir.path.string(), &raw);
       if (!s.ok())
         throw std::runtime_error{"LevelDB open failed: " + s.ToString()};
@@ -375,13 +372,6 @@ template <bool UseCache = true> struct RdbAdapter {
         : dir{tag} {
       rocksdb::Options opts;
       opts.create_if_missing = true;
-      opts.compression = rocksdb::kNoCompression;
-      if constexpr (!UseCache) {
-        rocksdb::BlockBasedTableOptions table_opts;
-        table_opts.no_block_cache = true;
-        opts.table_factory.reset(
-            rocksdb::NewBlockBasedTableFactory(table_opts));
-      }
       auto s = rocksdb::DB::Open(opts, dir.path.string(), &raw);
       if (!s.ok())
         throw std::runtime_error{"RocksDB open failed: " + s.ToString()};

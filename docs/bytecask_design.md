@@ -55,31 +55,16 @@ ByteCask follows a **single-writer / multiple-reader (SWMR)** model:
 
 #### Lock-free strategy
 
-ByteCask's read path is designed so that **readers never acquire a mutex** and never spin. The strategy combines three ideas:
+ByteCask's read path is designed so that **readers never acquire a mutex** and never spin. The strategy combines two ideas:
 
 1. **A single writer mutex** (`write_mu_`) that serialises mutations — readers are completely unaffected by it.
-2. **An immutable, copy-on-write snapshot** (`EngineState`) published via an atomic `shared_ptr` — readers capture the current snapshot without blocking the writer.
-3. **A thread-local generation cache** — on the common path a reader performs only a single atomic integer comparison and returns immediately, touching no shared state at all.
+2. **An immutable, copy-on-write snapshot** (`EngineState`) published via `std::atomic<std::shared_ptr<EngineState>>` — readers capture the current snapshot without blocking the writer.
 
-##### RcuVar<T> — reusable SWMR publish/subscribe primitive
+##### State publication via std::atomic<shared_ptr>
 
-The lock-free publish/subscribe mechanism (atomic `shared_ptr`, generation counter, TLS cache, instance ID) is extracted into a generic template `RcuVar<T>` in the `bytecask.rcu_var` module. `RcuVar` implements the **Read-Copy-Update (RCU)** pattern: the writer produces new immutable values via `store()`, and readers obtain a reference-counted snapshot via `load()`.
+The engine state is published through `std::atomic<std::shared_ptr<EngineState>>`. Writers call `state_.store()` to publish a new immutable snapshot; readers call `state_.load()` to obtain a reference-counted copy. The atomic `shared_ptr` guarantees that `load()` always returns a valid, self-consistent snapshot. Old snapshots stay alive as long as any reader holds a reference.
 
-```cpp
-template <typename T>
-class RcuVar {
-public:
-  explicit RcuVar(std::shared_ptr<T> initial);
-
-  // Writer: publish a new value. Not thread-safe — external serialisation required.
-  void store(std::shared_ptr<T> value);
-
-  // Reader: load the current value. Lock-free, scales with thread count.
-  auto load() const -> std::shared_ptr<T>;
-};
-```
-
-`Bytecask` uses `RcuVar<EngineState>` for its published state. The `write_mu_` mutex serialises writers; `RcuVar::load()` is the readers' only access point.
+`Bytecask` uses `std::atomic<std::shared_ptr<EngineState>>` for its published state. The `write_mu_` mutex serialises writers; `state_.load()` is the readers' only access point.
 
 ##### Shared state layout
 
@@ -88,17 +73,9 @@ public:
   ┌─────────────────────────────────────────────────────────────┐
   │  write_mu_      std::mutex (heap-allocated)                 │  ← writers only
   │                                                             │
-  │  state_         RcuVar<EngineState>                         │  ← writer stores,
+  │  state_         atomic<shared_ptr<EngineState>>             │  ← writer stores,
   │                                                             │    readers load (lock-free)
   └─────────────────────────────────────────────────────────────┘
-
-  RcuVar<T> internals
-  ┌─────────────────────────────────────────────────────────────┐
-  │  value_         atomic<shared_ptr<T>>                       │  ← written by store()
-  │                                                             │    read (relaxed) on slow path
-  │  gen_           atomic<uint64_t>                            │  ← bumped by store() (release)
-  │  instance_id_   uint64_t (globally unique)                  │  ← prevents TLS aliasing
-  └─────────────────────────────────────────────────────────────┘    loaded by readers (acquire)
 
   EngineState  (heap, reference-counted, never mutated in place)
   ┌─────────────────────────────────────────────────┐
@@ -127,103 +104,45 @@ public:
   3. produce new EngineState via pure transition (e.g. state.apply_put(...))
 
   4. state_.store( make_shared<EngineState>(new_state) )
-     │
-     ├─ a. value_.store( ptr , release )
-     │        └─ allocates a fresh, immutable snapshot; release ensures all
-     │           preceding writes are visible before the store completes
-     │
-     └─ b. gen_.fetch_add( 1 , release )
-              └─ bumps the generation counter; the release fence here
-                 synchronizes-with any reader's subsequent acquire load
+     └─ atomically publishes the new immutable snapshot;
+        any subsequent state_.load() on any thread is
+        guaranteed to observe this or a later value
 
   5. release write_mu_
 
   6. fdatasync()   ← outside write_mu_; DataFile kept alive by a captured shared_ptr
 ```
 
-Step 4a is sequenced before step 4b. This ordering is the foundation of the entire lock-free read protocol.
-
-##### Read path — fast path (no lock, no atomic write)
-
-Every reader thread has a `thread_local` cache containing its last-seen generation and the corresponding snapshot.
+##### Read path (no lock, no mutex)
 
 ```
-  Reader thread N  (thread-local storage, private to this thread)
-  ┌─────────────────────────────────────────────────────────────┐
-  │  TlCache                                                    │
-  │   instance_id   uint64_t                ← which RcuVar     │
-  │   gen           uint64_t                ← last seen gen     │
-  │   snap          shared_ptr<EngineState> ← cached snapshot  │
-  └─────────────────────────────────────────────────────────────┘
+  Reader thread N
 
-  RcuVar::load() logic:
+  1. snap = state_.load()
+     └─ atomic load of shared_ptr; returns a reference-counted
+        snapshot. No mutex, no CAS, no spinning.
 
-  ┌─ 1. current_gen = gen_.load(acquire)   ← ONE atomic read
-  │
-  ├── instance_id matches AND gen == current_gen?
-  │         │
-  │        YES ──────────────────────────────────────> return tls.snap
-  │                                                    (no shared-state writes,
-  │                                                     no mutex, no CAS, no spin)
-  │
-  └── NO  (first call on this thread, or a write happened since last call)
-           │
-           ├─ 2. snap = value_.load(relaxed)   ← one atomic read, no mutex
-           │         └─ safe: the acquire on gen_ already establishes
-           │               happens-before with the writer's release store
-           │
-           ├─ 3. update tls: { instance_id, current_gen, snap }
-           │
-           └─────────────────────────────────────────> return snap
+  2. use snap->key_dir / snap->files as needed
+     └─ the snapshot is immutable and stays alive as long as
+        the reader holds its shared_ptr reference
 ```
 
-On the **fast path** the only shared-memory operation is a single 64-bit `acquire` load. All other work is pure thread-local. Any number of readers can race down this path simultaneously — they never modify shared state, so there is literally nothing to contend on.
+The read path is fully lock-free. `std::atomic<std::shared_ptr>` guarantees that `load()` always returns a valid, self-consistent snapshot. Multiple readers can call `load()` concurrently with zero contention.
 
-On the **slow path** (gen mismatch) the reader does one relaxed atomic load of `snapshot_`. No mutex, no CAS, no spinning. It is still fully lock-free.
-
-##### Why the relaxed `snapshot_` load is safe
-
-The acquire on `snapshot_gen_` **synchronizes-with** the release `fetch_add` the writer performed. Because that `fetch_add` is sequenced after the release store on `snapshot_`, the standard's happens-before chain guarantees:
-
-```
-  WRITER                                    READER (slow path)
-  ────────────────────────────────────      ──────────────────────────────────────
-  [1] mutate key_dir_, files_
-       │ sequenced-before
-       ▼
-  [2] value_.store(S, release)
-       │ sequenced-before
-       ▼
-  [3] gen_.fetch_add(release)
-                │                                    synchronizes-with
-                └──────────────────────────> [4] gen_.load(acquire)
-                                                  (observes new gen → takes slow path)
-                                                      │ safe: [1],[2] happen-before [4]
-                                                      ▼
-                                             [5] value_.load(relaxed)
-                                                  (guaranteed to observe S from [2])
-```
-
-Because [1]→[2]→[3] happens-before [4], and [4] is sequenced before [5], the reader is guaranteed to observe the fully-updated snapshot that the writer published.
-
-##### The brief stale-snapshot window
-
-Between [2] and [3] in the writer there is a tiny window where `value_` already holds new data but `gen_` has not been bumped yet. A reader that loads the generation in that window sees the old value and continues using its cached snapshot — coherent, but one write behind. This is exactly the consistency level of a `shared_mutex` design: the snapshot is never torn, just momentarily stale. Once [3] completes every subsequent reader will take the slow path and refresh.
-
-**Same-thread guarantee**: a `put` followed by a `get` on the **same thread** always observes the put — the release `fetch_add` in step [3] is sequenced before the acquire load in the next `RcuVar::load()` call on the same thread, so the fast-path gen check always misses and the thread refreshes immediately.
+**Same-thread guarantee**: a `put` followed by a `get` on the **same thread** always observes the put — the `store()` in step [4] is sequenced before the `load()` in the subsequent `get()`.
 
 #### Read-scaling behaviour
 
-Thread-local caching eliminates all shared-state contention on the read fast path. Benchmarks on a 22-vCPU instance (50k keys, 1 KiB random values):
+Benchmarks on a 22-vCPU instance (50k keys, 1 KiB random values):
 
-| Threads | Before (mutex only) | After (TL cache) | Improvement |
-|---------|---------------------|------------------|-------------|
-| 2       | 1.66 M ops/s        | 2.16 M ops/s     | +30%        |
-| 4       | 1.73 M ops/s        | 3.01 M ops/s     | +74%        |
-| 8       | 1.74 M ops/s        | 3.57 M ops/s     | +105%       |
-| 16      | 1.91 M ops/s        | 3.67 M ops/s     | +92%        |
+| Threads | Before (mutex only) | After (atomic shared_ptr) | Improvement |
+|---------|---------------------|--------------------------|-------------|
+| 2       | 1.66 M ops/s        | 2.16 M ops/s             | +30%        |
+| 4       | 1.73 M ops/s        | 3.01 M ops/s             | +74%        |
+| 8       | 1.74 M ops/s        | 3.57 M ops/s             | +105%       |
+| 16      | 1.91 M ops/s        | 3.67 M ops/s             | +92%        |
 
-Throughput now scales near-linearly with thread count for read-heavy workloads.
+Throughput scales near-linearly with thread count for read-heavy workloads.
 
 `engine_bench` compares ByteCask against LevelDB and RocksDB across Put, Get, Del, Range50, Mixed, MixedBatch, PutMT, and MixedMT benchmarks at both NoSync and Sync durability levels. RocksDB compression is disabled (`kNoCompression`) and values are 1 KiB of random (incompressible) bytes so neither LevelDB nor RocksDB gains an advantage from Snappy/block-cache effects.
 
@@ -434,8 +353,9 @@ Not yet implemented — callers currently provide the full file path.
 - **Constructor**: Takes a `std::filesystem::path`. Opens (or creates) the file via POSIX `open(O_WRONLY | O_CREAT | O_APPEND)`. Throws `std::system_error` on failure.
 - **`append(sequence, entry_type, key, value) -> Offset`**: Serializes a new entry with the given sequence number and `EntryType`, writes it to the OS page cache via `::write()`, and returns the byte offset where the entry starts. `BulkBegin`/`BulkEnd` entries pass empty key and value spans. Does **not** guarantee durability on its own.
 - **`sync()`**: Calls `::fdatasync()` to flush all pending writes to physical storage. Must be called explicitly to guarantee crash-safety. Decoupled from `append()` to enable Group Commit: callers can batch multiple `append()` calls before a single `sync()`.
-- **`read_entry(offset, key_size, value_size, io_buf)`**: Single-pread read primitive. Resizes `io_buf` (reusing existing capacity) and preads the full entry into it. Callers then pass `io_buf` to `deserialize_entry()` (recovery, scan) or `extract_value_into()` (get, iterator) depending on what they need. `scan()` uses this internally after its header pread.
-- **`read_value_into`** was removed — `read_entry` + `extract_value_into` replaces it with better composability.
+- **`read_entry(offset, key_size, value_size, io_buf)`**: Single-pread read primitive. Resizes `io_buf` (reusing existing capacity) and preads the full entry into it. Callers then pass `io_buf` to `deserialize_entry()` (recovery, scan) depending on what they need. `scan()` uses this internally after its header pread.
+- **`read_value(offset, key_size, value_size, io_buf, out)`**: High-level read primitive. Calls `read_entry` then `extract_value_into` to pread, CRC-verify, and extract only the value into `out`. Both `io_buf` (scratch) and `out` reuse existing capacity across calls. Used by `Bytecask::get()` and `EntryIterator`.
+- **`read_value_into`** was removed — `read_entry` + `extract_value_into` replaced it; `read_value` now provides the combined convenience API.
 - Key and value are accepted as `std::span<const std::byte>` for binary safety.
 
 ### I/O Back-end Rationale

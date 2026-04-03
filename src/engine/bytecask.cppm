@@ -1,4 +1,5 @@
 module;
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -27,7 +28,6 @@ import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.hint_file;
 import bytecask.radix_tree;
-import bytecask.rcu_var;
 import bytecask.types;
 
 namespace bytecask {
@@ -299,18 +299,18 @@ public:
 
   EntryIterator() = default;
 
-  EntryIterator(RadixTreeIterator<KeyDirEntry> cur, FileRegistry files)
-      : cur_{std::move(cur)}, files_{std::move(files)} {}
+  EntryIterator(std::shared_ptr<const EngineState> state,
+                RadixTreeIterator<KeyDirEntry> cur)
+      : state_{std::move(state)}, cur_{std::move(cur)} {}
 
   auto operator*() const -> const value_type & {
     if (!has_cached_) {
       auto [key_span, dir_entry] = *cur_;
       cached_.first = Key{key_span};
-      files_->at(dir_entry.file_id)
-          ->read_entry(dir_entry.file_offset,
+      state_->files->at(dir_entry.file_id)
+          ->read_value(dir_entry.file_offset,
                        narrow<std::uint16_t>(key_span.size()),
-                       dir_entry.value_size, io_buf_);
-      extract_value_into(io_buf_, cached_.second);
+                       dir_entry.value_size, io_buf_, cached_.second);
       has_cached_ = true;
     }
     return cached_;
@@ -332,8 +332,8 @@ public:
   }
 
 private:
+  std::shared_ptr<const EngineState> state_;
   RadixTreeIterator<KeyDirEntry> cur_;
-  FileRegistry files_;
   mutable value_type cached_;
   mutable Bytes io_buf_;
   mutable bool has_cached_{false};
@@ -376,11 +376,9 @@ export struct ReadOptions {};
 //
 // Thread safety: write operations (put, del, apply_batch) are serialised by
 // write_mu_ (plain mutex). After producing a new EngineState via pure
-// transition methods, the writer publishes it via state_.store()
-// (RcuVar<EngineState>). Readers call state_.load() — a TLS-cached,
-// lock-free operation that scales linearly with thread count. See RcuVar
-// for the memory ordering proof. Readers never acquire write_mu_,
-// eliminating writer-starvation.
+// transition methods, the writer publishes it via state_.store().
+// Readers call state_.load() — lock-free, never acquiring write_mu_.
+// State is published via std::atomic<std::shared_ptr<EngineState>>.
 // ---------------------------------------------------------------------------
 export class Bytecask {
 public:
@@ -439,9 +437,8 @@ public:
     }
     thread_local Bytes io_buf;
     s->files->at(kv->file_id)
-        ->read_entry(kv->file_offset, narrow<std::uint16_t>(key.size()),
-                     kv->value_size, io_buf);
-    extract_value_into(io_buf, out);
+        ->read_value(kv->file_offset, narrow<std::uint16_t>(key.size()),
+                     kv->value_size, io_buf, out);
     return true;
   }
 
@@ -576,7 +573,7 @@ public:
     auto s = state_.load();
     auto it = from.empty() ? s->key_dir.begin() : s->key_dir.lower_bound(from);
     return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
-        EntryIterator{std::move(it), s->files}, std::default_sentinel};
+        EntryIterator{s, std::move(it)}, std::default_sentinel};
   }
 
   // Returns an input range of keys >= from. Walks the in-memory key directory
@@ -832,10 +829,9 @@ private:
 
   std::filesystem::path dir_;
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
-  // All mutable state — lock-free SWMR via RcuVar. Writers produce a new
-  // EngineState via pure transitions and call state_.store() under write_mu_;
-  // readers call state_.load() (no mutex, TLS-cached).
-  RcuVar<EngineState> state_;
+  // All mutable state — lock-free SWMR. Writers publish via state_.store()
+  // under write_mu_; readers call state_.load() (never acquiring write_mu_).
+  std::atomic<std::shared_ptr<EngineState>> state_;
   // Serialises writers (put, del, apply_batch). Readers never acquire this.
   std::unique_ptr<std::mutex> write_mu_{std::make_unique<std::mutex>()};
 };
