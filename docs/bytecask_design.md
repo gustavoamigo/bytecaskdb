@@ -62,6 +62,19 @@ The engine uses two mutexes instead of one `std::shared_mutex`, eliminating writ
 
 This two-lock design removes the `shared_mutex` reader-preference starvation that caused ByteCask/MixedMT/Sync to be 700× slower than LevelDB. Both mutexes are heap-allocated (`std::unique_ptr`) because `std::mutex` is not movable and `Bytecask` is a move-only type.
 
+#### Read-scaling behaviour
+
+Because `snapshot_mu_` is acquired only briefly to copy two `shared_ptr`s (~10 ns) and readers never touch `write_mu_`, concurrent reads scale with zero contention overhead. Benchmarks on a 2-vCPU Codespaces instance (50k keys, 1 KiB random values, `--benchmark_min_time=30s`) confirm this:
+
+| Threads | ByteCask (M ops/s) | LevelDB (M ops/s) | BC advantage |
+|---------|--------------------|--------------------|--------------|
+| 2       | 1.437              | 1.202              | +20%         |
+| 4       | 1.381              | 1.217              | +13%         |
+| 8       | 1.296              | 1.018              | +27%         |
+| 16      | 1.386              | 0.849              | **+63%**     |
+
+ByteCask CPU-time-per-op holds at ~1 275 ns regardless of thread count — all wall-time growth comes from OS scheduling on 2 physical cores, not lock contention. LevelDB's CPU-time-per-op creeps from 1 498 → 1 771 ns at 16 threads, indicating internal lock pressure (table cache / block cache mutex). ByteCask p99 latency scales linearly with oversubscription (32 µs at 16 threads vs LevelDB's 56 µs), further confirming the absence of reader-side contention.
+
 `WriteOptions::try_lock` (default `false`) controls write-lock acquisition behaviour:
 
 - `false` (default) — blocking acquire via `std::unique_lock`. The caller waits until the lock is available.
@@ -711,111 +724,16 @@ for (auto& key : db.keys_from(as_bytes("user:"))) { ... }
 
 > `as_bytes` is a small helper that converts a string literal or `std::string_view` to `BytesView`. Its exact form is TBD.
 
-## GroupWriter — Group Commit for Concurrent Writers
+## GroupWriter (Removed)
 
-### Purpose
+`GroupWriter` was a leader/follower group-commit helper that coalesced concurrent `fdatasync` calls. It was implemented (BC-049), benchmarked, and removed (BC-051) because benchmarks showed it provided no measurable throughput benefit: on fast storage `fdatasync` is already cheap enough that grouping saves nothing; on slow storage LevelDB's internal WAL batching achieves similar amortisation without an extra abstraction.
 
-Each `put`, `del`, and `apply_batch` call that uses `WriteOptions::sync = true` pays one `fdatasync` (~0.5–2 ms on NVMe). When N threads write concurrently, they serialize on `write_mu_` and each pay that cost independently, for a total of N × `fdatasync` latency.
+Two improvements originally introduced for `GroupWriter` were **retained** because they are independently valuable:
 
-`GroupWriter` is an **external helper** (not part of `Bytecask`) that coalesces concurrent write requests so that N queued writes share a single `fdatasync`. The engine is not modified except to expose one new public `sync()` method. The group commit logic — leader election, follower notification, error propagation — lives entirely in `GroupWriter`.
+- **`Bytecask::sync()`** — public method that calls `fdatasync` on the active file. Useful for callers that issue multiple `sync=false` writes and then want a single barrier.
+- **`rotate_active_file()` always fdatasyncs before sealing** — ensures prior `sync=false` writes are durable before the file becomes immutable.
 
-### Required engine changes
-
-**`Bytecask::sync()`** — one new public method:
-
-```cpp
-// Calls fdatasync on the current active file.
-// GroupWriter calls this once on behalf of all writers in a group.
-// Thread safety: safe to call outside write_mu_ (see DataFile::sync()).
-void sync();
-```
-
-This is correct because POSIX guarantees that `fdatasync` on a given fd is a barrier for **all** prior `write()` calls on that fd, regardless of which thread issued them. A thread that has already appended its entry under `write_mu_` and then waits for the leader's `sync()` call is guaranteed full durability once the leader's `fdatasync` returns.
-
-**`rotate_active_file()` always syncs before sealing** — rotation calls `fdatasync` on the file being retired before calling `seal()`. This closes the correctness gap that would otherwise exist when a data-file rotation occurs mid-group: any `sync=false` writes that landed in the pre-rotation file are already durable when `seal()` is called. The subsequent `engine_.sync()` from `GroupWriter` then only needs to cover the new active file. Cost: one extra `fdatasync` spike at rotation time (the file is at or above the 64 MiB threshold at that point, so the kernel dirty-page flush is expected regardless).
-
-### Concurrency model
-
-`GroupWriter` operates on top of the existing `Bytecask` lock hierarchy without changing it:
-
-1. Each caller submits a request (put / del / apply_batch) and goes to sleep on a `std::future`.
-2. The first thread to arrive at an empty queue becomes the **leader** for this group. Subsequent arrivals while the leader is in flight become **followers** and wait.
-3. The leader:
-   a. Drains every queued request, calling `engine_.put/del/apply_batch` with `sync = false` (acquires `write_mu_` per call, as normal).
-   b. Calls `engine_.sync()` once — `fdatasync` covers all entries written by all threads in step (a).
-   c. Fulfills every follower's `std::promise` with its result (or exception).
-4. The leader then checks for newly arrived requests; if any exist it processes them as the next group. If the queue is empty the leader role is released.
-5. Each follower unblocks on its future, which either returns the result or rethrows the leader's exception.
-
-The single `write_mu_` inside `Bytecask` still serialises each individual write. `GroupWriter` does not add another global lock around the group; the leader processes requests one by one in submission order.
-
-### API
-
-```cpp
-// Wraps a Bytecask engine, coalescing concurrent writes into shared fdatasyncs.
-// Non-copyable; constructing multiple GroupWriters over the same engine is
-// supported but each instance manages its own group independently.
-class GroupWriter {
-public:
-  explicit GroupWriter(Bytecask &engine);
-
-  GroupWriter(const GroupWriter &) = delete;
-  GroupWriter &operator=(const GroupWriter &) = delete;
-
-  // Submits a put, blocks until the leader's fdatasync covers this write.
-  // Throws std::system_error on I/O failure.
-  void put(BytesView key, BytesView value);
-
-  // Submits a del, blocks until the leader's fdatasync covers this write
-  // (or the key was found to be absent).
-  // Returns true if the key existed and was removed, false if absent.
-  // Throws std::system_error on I/O failure.
-  [[nodiscard]] bool del(BytesView key);
-
-  // Submits a batch, blocks until the leader's fdatasync covers this batch.
-  // Per-batch BulkBegin/BulkEnd atomicity is preserved: each submission
-  // retains its own fence entries in the data file.
-  // Throws std::system_error on I/O failure.
-  void apply_batch(Batch batch);
-
-private:
-  // ...
-};
-```
-
-`ReadOptions`/`WriteOptions` are not exposed — `GroupWriter` always uses `sync = false` on individual writes and issues its own `sync()` call at the end of each group. Callers that need fine-grained write options should use `Bytecask` directly.
-
-### Request types
-
-Three distinct request types are queued as a `std::variant`. Each carries owned copies of its data (needed because the submitting thread's stack may be live but the data must survive until the leader processes it) and a typed `std::promise`:
-
-```cpp
-struct PutRequest   { Bytes key; Bytes value; std::promise<void> result; };
-struct DelRequest   { Bytes key;              std::promise<bool> result; };
-struct BatchRequest { Batch batch;            std::promise<void> result; };
-
-using Request = std::variant<PutRequest, DelRequest, BatchRequest>;
-```
-
-`del` uses `std::promise<bool>` because `Bytecask::del` returns `bool` (key-existed flag) and that result must be propagated back to the caller.
-
-### `del` no-op handling
-
-If `engine_.del(sync=false)` returns `false` (key absent), no bytes were appended to the data file. If **all** requests in a group are absent-key `del`s, no `fdatasync` is needed — there is nothing on disk to flush. The leader may skip the `sync()` call in this case.
-
-In practice, mixed groups (puts and dels) always have at least one append, so the optimisation matters only for pure-del groups where every key is absent.
-
-### Error propagation
-
-If the leader encounters an exception (e.g. `std::system_error` from `fdatasync`), it stores the exception in all pending promises via `promise::set_exception`. Every follower's `future::get()` rethrows the original exception. The engine remains consistent: any write that completed before the exception (under `write_mu_`) is durable only if `sync()` succeeded; otherwise it is in the OS page cache and will be durable on the next successful sync or clean shutdown.
-
-### Per-batch atomicity
-
-Each `apply_batch` submission writes its own `BulkBegin`/`BulkEnd` fence in the data file (via the existing `Bytecask::apply_batch` implementation). Writing multiple batches through a `GroupWriter` produces N independent `BulkBegin`…`BulkEnd` blocks in the file, covered by one shared `fdatasync`. Recovery still treats each block as individually atomic.
-
-### Where it lives
-
-`GroupWriter` is implemented as a new C++20 module `bytecask.group_writer` in `src/engine/group_writer.cppm`, importing `bytecask.engine`. It has no dependency on internal `Bytecask` state beyond the public API (`put`, `del`, `apply_batch`, `sync`).
+The full design and implementation are preserved in git history (see BC-049 in the project plan).
 
 ---
 
