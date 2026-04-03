@@ -369,8 +369,8 @@ Not yet implemented — callers currently provide the full file path.
 
 We use fine-grained C++20 modules:
 - `bytecask.crc32`: CRC-32C accumulator (`Crc32`, backed by google/crc32c) and checked `narrow<To>(From)` conversion.
-- `bytecask.serialization`: Core bitsery abstractions (`CrcOutputAdapter`, legacy memory wrappers).
-- `bytecask.data_entry`: Logical entry definition, single-entry memory formatting, and `verify_entry()` / `deserialize_entry()` / `extract_value_into()` — CRC verification is factored into `verify_entry()` and shared by both extraction functions.
+- `bytecask.serialization`: Core serialization primitives (`read_le`, `write_le`, `CrcOutputAdapter`, `write_bytes`) and re-exports `bytecask.crc32`.
+- `bytecask.data_entry`: Logical entry definition, `serialize_header_and_crc()` (fills a fixed 19-byte buffer with LE header + CRC for zero-copy I/O), `serialize_entry()` (complete in-memory entry for tests/recovery), `verify_entry()` / `deserialize_entry()` / `extract_value_into()` — CRC verification is factored into `verify_entry()` and shared by both extraction functions.
 - `bytecask.data_file`: Disk I/O, writing streams sequentially to `.data` files.
 - `bytecask.hint_file`: Hint file writer and reader (`HintFile`, `HintEntry`).
 - `bytecask.persistent_ordered_map`: Immutable sorted map (`PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`) backed by `immer::flex_vector`; retained for benchmarking.

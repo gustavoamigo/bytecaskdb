@@ -97,12 +97,9 @@ public:
     return *this;
   }
 
-  // Writes an entry with the given sequence number and type to the OS page
-  // cache via writev(). Returns the absolute byte offset where the entry
-  // begins. BulkBegin and BulkEnd entries use empty key and value spans. Does
-  // not guarantee durability — call sync() to flush to physical storage.
-  // Zero-copy: header + CRC are built in hdr_crc_buf_; key and value are
-  // passed as iovecs pointing directly at the caller's buffers.
+  // Writes an entry via writev(). Header and CRC are serialized into
+  // hdr_crc_buf_ by data_entry; key and value are passed as direct iovecs.
+  // No heap allocation, no copy of key/value data.
   // Precondition: the file must not have been sealed.
   [[nodiscard]] auto append(std::uint64_t sequence, EntryType entry_type,
                             std::span<const std::byte> key,
@@ -110,22 +107,9 @@ public:
     assert(!sealed_);
     const auto entry_offset = offset_;
 
-    // Serialize the 15-byte header into the fixed member buffer.
-    write_le(hdr_crc_buf_, 0, sequence);
-    hdr_crc_buf_[8] = static_cast<std::byte>(entry_type);
-    write_le(hdr_crc_buf_, 9, narrow<std::uint16_t>(key.size()));
-    write_le(hdr_crc_buf_, 11, narrow<std::uint32_t>(value.size()));
-
-    // Compute CRC over header + key + value in one pass.
-    Crc32 crc{};
-    crc.update(std::span<const std::byte>{hdr_crc_buf_.data(), kHeaderSize});
-    crc.update(key);
-    crc.update(value);
-    const auto crc_val = crc.finalize();
-    write_le(hdr_crc_buf_, kHeaderSize, crc_val);
+    serialize_header_and_crc(hdr_crc_buf_, sequence, entry_type, key, value);
 
     // Scatter-gather write: [header(15), key, value, crc(4)].
-    // Key and value iovecs are empty for BulkBegin/BulkEnd entries.
     const std::array<::iovec, 4> iov{{
         {hdr_crc_buf_.data(), kHeaderSize},
         {const_cast<std::byte *>(key.data()), key.size()},
@@ -219,16 +203,6 @@ public:
   }
 
 private:
-  // Writes a little-endian integer of type T into buf at byte offset off.
-  template <typename T>
-  static void write_le(std::array<std::byte, kHeaderSize + kCrcSize> &buf,
-                       std::size_t off, T v) {
-    static_assert(std::is_integral_v<T>);
-    for (std::size_t i = 0; i < sizeof(T); ++i) {
-      buf[off + i] = static_cast<std::byte>((v >> (8U * i)) & 0xFFU);
-    }
-  }
-
   std::filesystem::path path_;
   int fd_{-1};
   Offset offset_{0};

@@ -96,4 +96,13 @@ auto read_le(std::span<const std::byte> buf, std::size_t offset) -> T {
   return v;
 }
 
+// Write a little-endian integer of type T into a byte span at the given offset.
+export template <typename T>
+void write_le(std::span<std::byte> buf, std::size_t offset, T v) {
+  static_assert(std::is_integral_v<T>);
+  for (std::size_t i = 0; i < sizeof(T); ++i) {
+    buf[offset + i] = static_cast<std::byte>((v >> (8U * i)) & 0xFFU);
+  }
+}
+
 } // namespace bytecask
