@@ -7,6 +7,7 @@ add_requires("immer")
 add_requires("jemalloc")
 add_requires("leveldb", {optional = true})
 add_requires("crc32c")
+add_requires("rocksdb", {optional = true})
 
 -- Sanitizer option: `xmake f --sanitizer=address` or `--sanitizer=thread`
 option("sanitizer")
@@ -91,7 +92,7 @@ target("engine_bench")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
     add_cxflags("-Wno-global-constructors")
-    add_packages("bitsery", "benchmark", "crc32c", "immer", "jemalloc", "leveldb")
+    add_packages("bitsery", "benchmark", "crc32c", "immer", "jemalloc", "leveldb", "rocksdb")
     on_load(apply_sanitizer)
 
 --
