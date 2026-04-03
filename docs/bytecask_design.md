@@ -58,8 +58,28 @@ ByteCask follows a **single-writer / multiple-reader (SWMR)** model:
 ByteCask's read path is designed so that **readers never acquire a mutex** and never spin. The strategy combines three ideas:
 
 1. **A single writer mutex** (`write_mu_`) that serialises mutations — readers are completely unaffected by it.
-2. **An immutable, copy-on-write snapshot** (`DirSnapshot`) published via an atomic `shared_ptr` — readers capture the current snapshot without blocking the writer.
+2. **An immutable, copy-on-write snapshot** (`EngineState`) published via an atomic `shared_ptr` — readers capture the current snapshot without blocking the writer.
 3. **A thread-local generation cache** — on the common path a reader performs only a single atomic integer comparison and returns immediately, touching no shared state at all.
+
+##### RcuVar<T> — reusable SWMR publish/subscribe primitive
+
+The lock-free publish/subscribe mechanism (atomic `shared_ptr`, generation counter, TLS cache, instance ID) is extracted into a generic template `RcuVar<T>` in the `bytecask.rcu_var` module. `RcuVar` implements the **Read-Copy-Update (RCU)** pattern: the writer produces new immutable values via `store()`, and readers obtain a reference-counted snapshot via `load()`.
+
+```cpp
+template <typename T>
+class RcuVar {
+public:
+  explicit RcuVar(std::shared_ptr<T> initial);
+
+  // Writer: publish a new value. Not thread-safe — external serialisation required.
+  void store(std::shared_ptr<T> value);
+
+  // Reader: load the current value. Lock-free, scales with thread count.
+  auto load() const -> std::shared_ptr<T>;
+};
+```
+
+`Bytecask` uses `RcuVar<EngineState>` for its published state. The `write_mu_` mutex serialises writers; `RcuVar::load()` is the readers' only access point.
 
 ##### Shared state layout
 
@@ -68,20 +88,31 @@ ByteCask's read path is designed so that **readers never acquire a mutex** and n
   ┌─────────────────────────────────────────────────────────────┐
   │  write_mu_      std::mutex (heap-allocated)                 │  ← writers only
   │                                                             │
-  │  snapshot_      atomic<shared_ptr<DirSnapshot>>             │  ← written by writer
+  │  state_         RcuVar<EngineState>                         │  ← writer stores,
+  │                                                             │    readers load (lock-free)
+  └─────────────────────────────────────────────────────────────┘
+
+  RcuVar<T> internals
+  ┌─────────────────────────────────────────────────────────────┐
+  │  value_         atomic<shared_ptr<T>>                       │  ← written by store()
   │                                                             │    read (relaxed) on slow path
-  │  snapshot_gen_  atomic<uint64_t>                            │  ← bumped by writer (release)
+  │  gen_           atomic<uint64_t>                            │  ← bumped by store() (release)
+  │  instance_id_   uint64_t (globally unique)                  │  ← prevents TLS aliasing
   └─────────────────────────────────────────────────────────────┘    loaded by readers (acquire)
 
-  DirSnapshot  (heap, reference-counted, never mutated in place)
+  EngineState  (heap, reference-counted, never mutated in place)
   ┌─────────────────────────────────────────────────┐
-  │  key_dir        shared_ptr<RadixTree>            │  key → (file_id, offset, seq)
+  │  key_dir        PersistentRadixTree<KeyDirEntry> │  key → (file_id, offset, seq)
   │  files          shared_ptr<FileMap>              │  file_id → open DataFile fd
   │  active_file_id uint32_t                         │
+  │  next_file_id   uint32_t                         │  writer-only; monotonic file counter
+  │  next_lsn       uint64_t                         │  writer-only; monotonic sequence counter
   └─────────────────────────────────────────────────┘
 ```
 
-`DirSnapshot` is immutable once published. Old snapshots stay alive as long as any reader holds a `shared_ptr` reference — the writer always allocates a fresh snapshot and never mutates one in place.
+`EngineState` bundles all mutable engine state into a single immutable value. Each write operation produces a new `EngineState` via pure transition methods (`apply_put`, `apply_del`, `apply_rotation`). The old state stays alive as long as any reader holds a `shared_ptr` reference — the writer always allocates a fresh state and never mutates one in place.
+
+`next_file_id` and `next_lsn` are writer-only fields (readers never inspect them), but including them in `EngineState` makes transitions self-contained: `apply_put` bumps `next_lsn` internally, `apply_rotation` bumps `next_file_id`, so the writer never manages loose counters.
 
 ##### Write path
 
@@ -93,15 +124,15 @@ ByteCask's read path is designed so that **readers never acquire a mutex** and n
 
   2. append entry to active DataFile   (I/O, under write_mu_)
 
-  3. update key_dir_ and files_        (in-memory, under write_mu_)
+  3. produce new EngineState via pure transition (e.g. state.apply_put(...))
 
-  4. publish_snapshot()
+  4. state_.store( make_shared<EngineState>(new_state) )
      │
-     ├─ a. snapshot_.store( make_shared<DirSnapshot>(key_dir_, files_, ...) , release )
+     ├─ a. value_.store( ptr , release )
      │        └─ allocates a fresh, immutable snapshot; release ensures all
      │           preceding writes are visible before the store completes
      │
-     └─ b. snapshot_gen_.fetch_add( 1 , release )
+     └─ b. gen_.fetch_add( 1 , release )
               └─ bumps the generation counter; the release fence here
                  synchronizes-with any reader's subsequent acquire load
 
@@ -120,14 +151,14 @@ Every reader thread has a `thread_local` cache containing its last-seen generati
   Reader thread N  (thread-local storage, private to this thread)
   ┌─────────────────────────────────────────────────────────────┐
   │  TlCache                                                    │
-  │   instance_id   uint64_t                ← which Bytecask   │
+  │   instance_id   uint64_t                ← which RcuVar     │
   │   gen           uint64_t                ← last seen gen     │
-  │   snap          shared_ptr<DirSnapshot> ← cached snapshot   │
+  │   snap          shared_ptr<EngineState> ← cached snapshot  │
   └─────────────────────────────────────────────────────────────┘
 
-  read_snapshot() logic:
+  RcuVar::load() logic:
 
-  ┌─ 1. current_gen = snapshot_gen_.load(acquire)   ← ONE atomic read
+  ┌─ 1. current_gen = gen_.load(acquire)   ← ONE atomic read
   │
   ├── instance_id matches AND gen == current_gen?
   │         │
@@ -137,8 +168,8 @@ Every reader thread has a `thread_local` cache containing its last-seen generati
   │
   └── NO  (first call on this thread, or a write happened since last call)
            │
-           ├─ 2. snap = snapshot_.load(relaxed)   ← one atomic read, no mutex
-           │         └─ safe: the acquire on snapshot_gen_ already establishes
+           ├─ 2. snap = value_.load(relaxed)   ← one atomic read, no mutex
+           │         └─ safe: the acquire on gen_ already establishes
            │               happens-before with the writer's release store
            │
            ├─ 3. update tls: { instance_id, current_gen, snap }
@@ -160,16 +191,16 @@ The acquire on `snapshot_gen_` **synchronizes-with** the release `fetch_add` the
   [1] mutate key_dir_, files_
        │ sequenced-before
        ▼
-  [2] snapshot_.store(S, release)
+  [2] value_.store(S, release)
        │ sequenced-before
        ▼
-  [3] snapshot_gen_.fetch_add(release)
+  [3] gen_.fetch_add(release)
                 │                                    synchronizes-with
-                └──────────────────────────> [4] snapshot_gen_.load(acquire)
+                └──────────────────────────> [4] gen_.load(acquire)
                                                   (observes new gen → takes slow path)
                                                       │ safe: [1],[2] happen-before [4]
                                                       ▼
-                                             [5] snapshot_.load(relaxed)
+                                             [5] value_.load(relaxed)
                                                   (guaranteed to observe S from [2])
 ```
 
@@ -177,9 +208,9 @@ Because [1]→[2]→[3] happens-before [4], and [4] is sequenced before [5], the
 
 ##### The brief stale-snapshot window
 
-Between [2] and [3] in the writer there is a tiny window where `snapshot_` already holds new data but `snapshot_gen_` has not been bumped yet. A reader that loads the generation in that window sees the old value and continues using its cached snapshot — coherent, but one write behind. This is exactly the consistency level of a `shared_mutex` design: the snapshot is never torn, just momentarily stale. Once [3] completes every subsequent reader will take the slow path and refresh.
+Between [2] and [3] in the writer there is a tiny window where `value_` already holds new data but `gen_` has not been bumped yet. A reader that loads the generation in that window sees the old value and continues using its cached snapshot — coherent, but one write behind. This is exactly the consistency level of a `shared_mutex` design: the snapshot is never torn, just momentarily stale. Once [3] completes every subsequent reader will take the slow path and refresh.
 
-**Same-thread guarantee**: a `put` followed by a `get` on the **same thread** always observes the put — the release `fetch_add` in step [3] is sequenced before the acquire load in the next `read_snapshot` call on the same thread, so the fast-path gen check always misses and the thread refreshes immediately.
+**Same-thread guarantee**: a `put` followed by a `get` on the **same thread** always observes the put — the release `fetch_add` in step [3] is sequenced before the acquire load in the next `RcuVar::load()` call on the same thread, so the fast-path gen check always misses and the thread refreshes immediately.
 
 #### Read-scaling behaviour
 
@@ -270,7 +301,7 @@ The active file's `live_bytes` may be non-zero (it holds the current live writes
 #### Vacuum procedure
 
 1. **Acquire `vacuum_mu_`** — prevents two `vacuum()` calls from running concurrently.
-2. **Snapshot the key directory** — call `read_snapshot()` to obtain the current `DirSnapshot{key_dir, files}`. This is the authoritative view of which entries are live.
+2. **Snapshot the key directory** — call `state_.load()` to obtain the current `EngineState`. This is the authoritative view of which entries are live.
 3. **Select a target file** — iterate sealed files, compute `waste_ratio = 1 - (live_bytes / total_bytes)` from `file_stats_` (O(1) per file, no I/O), pick the highest-waste sealed file above `waste_threshold`. If no file qualifies, return immediately.
 4. **Rewrite the target file** — open a new data file for writing (new timestamp stem, same directory). Scan the old data file entry by entry:
    - *Put entry*: check whether the snapshot's key directory entry for that key points to the old file at this offset with the same sequence number. If yes (live), write it to the new file at its new offset, recording `(key → new_file_id, new_offset)`. If no (dead), skip.
@@ -423,7 +454,8 @@ We use fine-grained C++20 modules:
 - `bytecask.hint_file`: Hint file writer and reader (`HintFile`, `HintEntry`).
 - `bytecask.persistent_ordered_map`: Immutable sorted map (`PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`) backed by `immer::flex_vector`; retained for benchmarking.
 - `bytecask.radix_tree`: Persistent radix tree (`PersistentRadixTree<V>`, `TransientRadixTree<V>`, `RadixTreeIterator<V>`) with path compression and intrusive refcounting; used as the key directory.
-- `bytecask.engine`: Public engine API (`Bytecask`, `Batch`, `KeyIterator`, `EntryIterator`, `FileRegistry`, type aliases).
+- `bytecask.rcu_var`: Generic SWMR publish/subscribe primitive (`RcuVar<T>`); TLS-cached lock-free reads, atomic `shared_ptr` publication.
+- `bytecask.engine`: Public engine API (`Bytecask`, `EngineState`, `Batch`, `KeyIterator`, `EntryIterator`, `FileRegistry`, type aliases).
 
 ### Current scope boundaries
 
