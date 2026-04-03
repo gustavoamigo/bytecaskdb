@@ -75,6 +75,8 @@ Because `snapshot_mu_` is acquired only briefly to copy two `shared_ptr`s (~10 n
 
 ByteCask CPU-time-per-op holds at ~1 275 ns regardless of thread count — all wall-time growth comes from OS scheduling on 2 physical cores, not lock contention. LevelDB's CPU-time-per-op creeps from 1 498 → 1 771 ns at 16 threads, indicating internal lock pressure (table cache / block cache mutex). ByteCask p99 latency scales linearly with oversubscription (32 µs at 16 threads vs LevelDB's 56 µs), further confirming the absence of reader-side contention.
 
+`engine_bench` compares ByteCask against LevelDB and RocksDB across Put, Get, Del, Range50, Mixed, MixedBatch, PutMT, and MixedMT benchmarks at both NoSync and Sync durability levels. RocksDB compression is disabled (`kNoCompression`) and values are 1 KiB of random (incompressible) bytes so neither LevelDB nor RocksDB gains an advantage from Snappy/block-cache effects.
+
 `WriteOptions::try_lock` (default `false`) controls write-lock acquisition behaviour:
 
 - `false` (default) — blocking acquire via `std::unique_lock`. The caller waits until the lock is available.
