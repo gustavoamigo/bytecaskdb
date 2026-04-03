@@ -184,6 +184,39 @@ TEST_CASE("DataFile::read round-trips entries at recorded offsets",
 }
 
 // --------------------------------------------------------------------------
+// Test 4a: DataFile::append produces bytes identical to serialize_entry.
+// Ensures the writev-based write path encodes the same on-disk layout as the
+// reference serializer used by tests and recovery.
+// --------------------------------------------------------------------------
+TEST_CASE("DataFile::append byte layout matches serialize_entry", "[datafile]") {
+  const auto tmp =
+      std::filesystem::temp_directory_path() / "bc_test_layout.data";
+  std::filesystem::remove(tmp);
+
+  const std::string_view key = "greet";
+  const std::string_view value = "hello world";
+  constexpr std::uint64_t seq = 99U;
+
+  // Reference: serialize_entry produces the canonical byte layout.
+  const auto expected = bytecask::serialize_entry(
+      seq, bytecask::EntryType::Put, to_bytes(key), to_bytes(value));
+
+  // DataFile::append via writev must produce identical bytes on disk.
+  {
+    bytecask::DataFile df{tmp};
+    [[maybe_unused]] auto off =
+        df.append(seq, bytecask::EntryType::Put, to_bytes(key), to_bytes(value));
+    df.sync();
+  }
+
+  const auto actual = read_file_bytes(tmp);
+  REQUIRE(actual.size() == expected.size());
+  CHECK(actual == expected);
+
+  std::filesystem::remove(tmp);
+}
+
+// --------------------------------------------------------------------------
 // Test 4: Verify CRC32 detects corruption.
 // --------------------------------------------------------------------------
 TEST_CASE("CRC32 detects single-byte payload difference", "[crc]") {
