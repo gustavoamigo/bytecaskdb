@@ -725,8 +725,11 @@ private:
   // The hot path is a single relaxed load of state_time_ (plain MOV on x86).
   // The snapshot is refreshed only when the last write timestamp exceeds
   // staleness_tolerance (session mode: tolerance=0, refreshes on every write).
+  // Returns a reference to the thread-local snapshot. The snapshot stays
+  // alive until the same thread calls load_state again, so callers must
+  // not stash the reference across a second load_state call.
   [[nodiscard]] auto load_state(const ReadOptions &opts) const
-      -> std::shared_ptr<const EngineState> {
+      -> const std::shared_ptr<const EngineState> & {
     struct TlState {
       std::shared_ptr<const EngineState> snapshot;
       std::int64_t last_write_time{0};

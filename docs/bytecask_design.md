@@ -140,16 +140,22 @@ the dominant bottleneck for concurrent writes.
 ```
   Reader thread N
 
-  1. snap = state_.load()
-     └─ atomic load of shared_ptr; returns a reference-counted
-        snapshot. No mutex, no CAS, no spinning.
+  1. snap = load_state(opts)  // const ref to thread-local shared_ptr
+     └─ no refcount bump — returns a const& to the TL cache.
+        The shared_ptr stays alive until the same thread
+        calls load_state again.
 
-  2. use snap->key_dir / snap->files as needed
-     └─ the snapshot is immutable and stays alive as long as
-        the reader holds its shared_ptr reference
+  2. tree lookup via raw const Node* pointers
+     └─ no IntrusivePtr copies, no atomic refcount traffic.
+        Safe: snap owns root IntrusivePtr → keeps all
+        descendants alive. Transient (write path) clones
+        shared nodes before mutating — old nodes stay intact.
+
+  3. pread(fd, ...) for value retrieval
+     └─ stateless, no synchronisation.
 ```
 
-The read path never acquires `write_mu_`. `std::atomic<std::shared_ptr>` guarantees that `load()` always returns a valid, self-consistent snapshot. Note: current implementations of `atomic<shared_ptr>` use an internal spinlock, so `load()` is not technically lock-free — but readers never contend with each other for long, and never block on `write_mu_`.
+The read path never acquires `write_mu_`. `load_state` returns a `const&` to a thread-local `shared_ptr<const EngineState>`, avoiding the refcount increment/decrement that `atomic<shared_ptr>::load()` would impose on every read. The radix tree lookup uses raw `const Node*` pointers instead of `IntrusivePtr` copies, eliminating per-level `acq_rel` atomic traffic. Both optimisations are safe because the thread-local snapshot anchors the entire node tree for the duration of the `get()` call.
 
 **Same-thread guarantee**: a `put` followed by a `get` on the **same thread** always observes the put — the `store()` in step [4] is sequenced before the `load()` in the subsequent `get()`.
 
