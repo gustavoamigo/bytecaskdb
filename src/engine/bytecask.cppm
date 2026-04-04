@@ -5,7 +5,6 @@ module;
 #include <cstdint>
 #include <filesystem>
 #include <format>
-#include <immer/array.hpp>
 #include <iostream>
 #include <iterator>
 #include <map>
@@ -43,11 +42,11 @@ export using Bytes = std::vector<std::byte>;
 export using BytesView = std::span<const std::byte>;
 
 // ---------------------------------------------------------------------------
-// Key — lightweight owning byte sequence backed by immer::array<std::byte>.
+// Key — lightweight owning byte sequence backed by std::vector<std::byte>.
 //
-// Copies are O(1) (reference-count bump). Used by KeyIterator and
-// EntryIterator to materialise stable keys from RadixTreeIterator's
-// transient span, and by the recovery tombstone map (needs operator<=>).
+// Used by KeyIterator and EntryIterator to materialise stable keys from
+// RadixTreeIterator's transient span, and by the recovery tombstone map
+// (needs operator<=>).
 // Keys have an upper bound of 65 535 bytes (u16 key_size in the data file).
 // ---------------------------------------------------------------------------
 export class Key {
@@ -74,7 +73,7 @@ public:
   }
 
 private:
-  immer::array<std::byte> data_;
+  std::vector<std::byte> data_;
 };
 
 // ---------------------------------------------------------------------------

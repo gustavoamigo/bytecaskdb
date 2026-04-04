@@ -41,7 +41,7 @@ ByteCask uses `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory.
 
 The key directory is a persistent (immutable) radix tree with path-compressed nodes, intrusive reference counting, and structural sharing across versions. It provides O(k) get/set/erase (where k = key length), ordered iteration via DFS, `lower_bound()` for range queries, and a `transient()` / `persistent()` API for batch mutations. Implemented in `bytecask.radix_tree` (`src/engine/radix_tree.cppm`).
 
-Keys are stored as byte sequences within the radix tree's prefix-compressed nodes. The radix tree API accepts `std::span<const std::byte>` for all key parameters — no intermediate `Key` wrapper is needed for internal operations. The public `Key` class (wrapping `immer::array<std::byte>`) is retained for the external iterator API (`KeyIterator`, `EntryIterator`) and for the recovery tombstone tracking map. `Key` provides `operator<=>` (lexicographic over raw byte values), `begin()`/`end()`/`size()`/`data()` accessors, and a `view()` method returning `BytesView`. Keys have a hard upper bound of 65 535 bytes (the `u16 key_size` field in the data file header).
+Keys are stored as byte sequences within the radix tree's prefix-compressed nodes. The radix tree API accepts `std::span<const std::byte>` for all key parameters — no intermediate `Key` wrapper is needed for internal operations. The public `Key` class (backed by `std::vector<std::byte>`) is retained for the external iterator API (`KeyIterator`, `EntryIterator`) and for the recovery tombstone tracking map. `Key` provides `operator<=>` (lexicographic over raw byte values) and `begin()`/`end()`/`size()` accessors. Keys have a hard upper bound of 65 535 bytes (the `u16 key_size` field in the data file header).
 
 **Historical note**: the original key directory used `PersistentOrderedMap<Key, KeyDirEntry>`, backed by `immer::flex_vector<Entry>`. The radix tree replacement (BC-030) delivers O(k) lookups vs O(n log n) binary search, lower memory overhead via prefix compression and intrusive refcounting, and faster batch mutations via the transient API's in-place path copying. `PersistentOrderedMap` is retained in the codebase for benchmarking purposes (`benchmarks/map_bench.cpp`).
 
@@ -813,7 +813,7 @@ The full design and implementation are preserved in git history (see BC-049 in t
 
 - Language: C++23
 - Build system: xmake
-- Dependencies: crc32c (google/crc32c, hardware-accelerated CRC-32C), immer (header-only persistent data structures)
+- Dependencies: crc32c (google/crc32c, hardware-accelerated CRC-32C)
 - Primary target: `bytecask` (includes `src/*.cpp` + `src/engine/*.cppm`)
 - Test target: `bytecask_tests` (includes `tests/*.cpp` + `src/engine/*.cppm`)
 - Status: Full `Bytecask` SWMR engine with `open`, `get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`. Key directory backed by `PersistentOrderedMap<Key, KeyDirEntry>`. `open()` always creates a fresh active data file; recovery is BC-019. 143 assertions, 34 test cases.
