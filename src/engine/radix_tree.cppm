@@ -1041,6 +1041,8 @@ private:
   // Construct a lower_bound iterator.
   RadixTreeIterator(IntrusivePtr<Node<V>> root,
                     std::span<const std::byte> target) {
+    stack_.reserve(16);
+    current_key_.reserve(128);
     if (!root)
       return;
     auto at_target = seek(root, target);
