@@ -15,7 +15,6 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-064 | Group commit (`SyncGroup`) for concurrent sync writes | `SyncGroup` batches concurrent `fdatasync` calls: leader syncs, followers wait on epoch bump. Replaces per-writer `file->sync()` in `put`, `del`, `apply_batch`. Re-implements BC-051's group commit — original was removed because tmpfs benchmarks showed no benefit; real-disk benchmarks show ~2ms fdatasync serialisation as the dominant bottleneck. |
 | BC-065 | Reduce atomic traffic on read path | `load_state` returns `const&` to thread-local snapshot (no shared_ptr refcount bump). `get_impl` uses raw `const Node*` pointers (no IntrusivePtr acq_rel traffic per tree level). Both safe: TL snapshot anchors root, persistent tree never mutates shared nodes. |
 | BC-059 | Replace bitsery with ByteWriter/ByteReader | Unify serialization: add cursor-based `ByteWriter`/`ByteReader` to `serialization.cppm`, migrate `data_entry.cppm` and `hint_entry.cppm` + `hint_file.cppm` scan, remove bitsery dependency. |
 
@@ -38,6 +37,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-064 | Group commit (`SyncGroup`) for concurrent sync writes | Ticket-based group commit: each writer takes a monotonic ticket after writev; leader snapshots watermark, calls fdatasync once covering all tickets. Also includes exception safety fix to avoid permanent deadlocks on I/O throws. |
 | BC-066 | Static benchmark setup to avoid repeated DB creation | Made `keys`, `val`, and `db` `static` in all single-threaded benchmark templates (`BM_Put`, `BM_Get`, `BM_Del`, `BM_Range`, `BM_Mixed`, `BM_MixedBatch`). Google Benchmark calls the function multiple times during iteration calibration; the previous non-static setup re-created and re-populated the DB (1M keys × 1 KiB) on every call. The multithreaded templates already used `static`. |
 | BC-062 | `ReadOptions::consistent_read` stale-read mode | Added `consistent_read{true}` to `ReadOptions`. `load_state()` uses a version-check approach: writers bump `state_version_` (`atomic<uint64_t>`, release) after `state_.store()`; stale readers compare with a thread-local `local_version` via a single relaxed load (plain MOV on x86). Snapshot refreshes only when state has actually changed — zero locked instructions on the hot path. Benchmarked: +1.7% at 2T, +8% at 4T, +18% at 8T, +201% at 16T; p99 at 16T: 816 µs → 100 µs. |
 | BC-063 | Simplify `ReadOptions` to two-mode consistency | Removed `consistent_read` bool; `ReadOptions` now has a single field `staleness_tolerance{0}`. Two modes: **Session** (`tolerance = 0`, default) — read-your-writes, analogous to RocksDB `SuperVersion` caching; **Bounded staleness** (`tolerance > 0`) — opt-in for write-heavy workloads. Dropped the three-mode model (strong/session/bounded) as the strong mode (unconditional `state_.load()`) has no precedent in LevelDB or RocksDB and is only useful for inter-thread signaling — outside the scope of a storage engine. |

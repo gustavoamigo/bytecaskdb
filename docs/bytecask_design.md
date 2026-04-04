@@ -116,15 +116,29 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
 ##### Group commit (`SyncGroup`)
 
 After releasing `write_mu_`, the writer calls `sync_group_.sync(file)` instead
-of `file->sync()` directly. `SyncGroup` batches concurrent writers so that a
-single `fdatasync` covers all of them:
+of `file->sync()` directly. `SyncGroup` uses a ticket-based protocol to batch
+concurrent `fdatasync` calls:
 
-- The first writer to arrive after the previous sync becomes the **leader**.
-- Subsequent writers that arrive while the leader's `fdatasync` is in flight
-  **wait** on a condition variable — their data is already in the page cache,
-  so the leader's `fdatasync` covers them.
-- When `fdatasync` returns, the leader bumps a monotonic epoch and wakes all
-  waiters.
+1. **Phase 1 — Take a ticket.**  The writer increments a monotonic counter
+   (`next_ticket_`) under the SyncGroup mutex, registering that its `writev`
+   has completed and its data is in the page cache.
+
+2. **Phase 2 — Wait or lead.**  The writer waits until either
+   (a) `current_synced_ticket_ >= my_ticket` — a later sync already covered
+   its data, so it returns immediately; or
+   (b) `!syncing_` — no `fdatasync` is in flight, so it becomes the leader.
+
+3. **Phase 3 — Sync.**  The leader snapshots `next_ticket_ - 1` as the batch
+   watermark, releases the lock, and calls `fdatasync` (wrapped in a try/catch
+   block to gracefully handle I/O exceptions by waking waiters before throwing).
+   Every ticket issued up to that watermark has a completed `writev`, so one syscall
+   covers them all. On return the leader advances `current_synced_ticket_` and
+   wakes all waiters.
+
+**Invariant**: a writer's data is never assumed durable until an `fdatasync`
+that started *after* the writer's `writev` has completed. Writers can never
+piggyback on an in-flight sync that may have started before their data reached
+the page cache.
 
 This amortises the ~2 ms `fdatasync` cost across N concurrent writers instead
 of serialising N × 2 ms.
