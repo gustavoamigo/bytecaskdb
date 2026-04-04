@@ -318,10 +318,9 @@ CRC is at the **end** of the entry so both write and read can be done in a singl
 ### Serialization
 
 - Little-endian byte order throughout.
-- Serialization backend: [bitsery](https://github.com/fraillt/bitsery) v5.2.5 (header-only, `add_requires("bitsery")` in xmake).
+- Serialization uses an internal cursor-based API (`ByteWriter` / `ByteReader` in `serialization.cppm`). Both wrap the low-level `write_le` / `read_le` helpers with an auto-advancing offset so callers never compute byte positions by hand. `ByteWriter` optionally accepts a `Crc32*`; when non-null every `put()` / `put_bytes()` call also feeds the written bytes into the CRC accumulator, giving one-pass write + checksum with zero ceremony.
 - CRC-32C uses the Castagnoli polynomial `0x1EDC6F41` via the [google/crc32c](https://github.com/google/crc32c) library, which auto-detects hardware acceleration at runtime (SSE4.2 on x86-64, CRC instructions on AArch64) and falls back to a software implementation when neither is available.
 - CRC32 is computed over **all bytes of the entry except the trailing CRC field itself** (i.e., the leading header + key data + value data).
-- `CrcOutputAdapter<TAdapter>` (in `data_entry.cppm`, anonymous namespace) wraps any bitsery output adapter and accumulates CRC as bytes are written. It is reusable: any future component that needs a running CRC while writing can use the same adapter without re-implementing the checksum logic.
 
 ### Log Sequence Number (LSN)
 
@@ -369,10 +368,11 @@ Not yet implemented — callers currently provide the full file path.
 
 We use fine-grained C++20 modules:
 - `bytecask.crc32`: CRC-32C accumulator (`Crc32`, backed by google/crc32c) and checked `narrow<To>(From)` conversion.
-- `bytecask.serialization`: Core serialization primitives (`read_le`, `write_le`, `CrcOutputAdapter`, `write_bytes`) and re-exports `bytecask.crc32`.
-- `bytecask.data_entry`: Logical entry definition, `serialize_header_and_crc()` (fills a fixed 19-byte buffer with LE header + CRC for zero-copy I/O), `serialize_entry()` (complete in-memory entry for tests/recovery), `verify_entry()` / `deserialize_entry()` / `extract_value_into()` — CRC verification is factored into `verify_entry()` and shared by both extraction functions.
+- `bytecask.serialization`: Core serialization primitives (`ByteWriter`, `ByteReader`, `read_le`, `write_le`) and re-exports `bytecask.crc32`.
+- `bytecask.data_entry`: Logical entry definition, `write_header_and_crc()` (fills a fixed 19-byte buffer with LE header + CRC for zero-copy I/O), `serialize_entry()` (complete in-memory entry for tests/recovery), `parse_header_and_verify()` / `deserialize_entry()` / `extract_value_into()` — CRC verification is factored into `parse_header_and_verify()` and shared by both extraction functions.
 - `bytecask.data_file`: Disk I/O, writing streams sequentially to `.data` files.
-- `bytecask.hint_file`: Hint file writer and reader (`HintFile`, `HintEntry`).
+- `bytecask.hint_entry`: `HintEntry`, `serialize_entry()`, `deserialize_entry()` — symmetric read/write for hint entries.
+- `bytecask.hint_file`: Hint file writer and reader (`HintFile`).
 - `bytecask.persistent_ordered_map`: Immutable sorted map (`PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`) backed by `immer::flex_vector`; retained for benchmarking.
 - `bytecask.radix_tree`: Persistent radix tree (`PersistentRadixTree<V>`, `TransientRadixTree<V>`, `RadixTreeIterator<V>`) with path compression and intrusive refcounting; used as the key directory.
 - `bytecask.engine`: Public engine API (`Bytecask`, `EngineState`, `Batch`, `KeyIterator`, `EntryIterator`, `FileRegistry`, type aliases).
@@ -813,7 +813,7 @@ The full design and implementation are preserved in git history (see BC-049 in t
 
 - Language: C++23
 - Build system: xmake
-- Dependencies: bitsery v5.2.5 (header-only binary serialization), crc32c (google/crc32c, hardware-accelerated CRC-32C), immer (header-only persistent data structures)
+- Dependencies: crc32c (google/crc32c, hardware-accelerated CRC-32C), immer (header-only persistent data structures)
 - Primary target: `bytecask` (includes `src/*.cpp` + `src/engine/*.cppm`)
 - Test target: `bytecask_tests` (includes `tests/*.cpp` + `src/engine/*.cppm`)
 - Status: Full `Bytecask` SWMR engine with `open`, `get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`. Key directory backed by `PersistentOrderedMap<Key, KeyDirEntry>`. `open()` always creates a fresh active data file; recovery is BC-019. 143 assertions, 34 test cases.
@@ -822,10 +822,10 @@ The full design and implementation are preserved in git history (see BC-049 in t
 
 - `src/main.cpp`: temporary executable entry point
 - `src/engine/crc32.cppm`: C++23 module (`bytecask.crc32`) — `Crc32` accumulator (google/crc32c), `narrow<To>(From)` checked conversion
-- `src/engine/serialization.cppm`: C++23 module (`bytecask.serialization`) — `CrcOutputAdapter`, `write_bytes`
+- `src/engine/serialization.cppm`: C++23 module (`bytecask.serialization`) — `ByteWriter`, `ByteReader`, `read_le`, `write_le`
 - `src/engine/data_entry.cppm`: C++23 module (`bytecask.data_entry`) — `EntryType`, `EntryHeader`, `DataEntry`, serialization helpers
 - `src/engine/data_file.cppm`: C++23 module (`bytecask.data_file`) — `DataFile` POSIX I/O, `Offset`
-- `src/engine/hint_entry.cppm`: C++23 module (`bytecask.hint_entry`) — `HintEntry`, `serialize_hint_entry`
+- `src/engine/hint_entry.cppm`: C++23 module (`bytecask.hint_entry`) — `HintEntry`, `serialize_entry`, `deserialize_entry`
 - `src/engine/hint_file.cppm`: C++23 module (`bytecask.hint_file`) — `HintFile`, `OpenForWrite`/`OpenForRead`
 - `src/engine/persistent_ordered_map.cppm`: C++23 module (`bytecask.persistent_ordered_map`) — `PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`
 - `src/engine/bytecask.cppm`: C++23 module (`bytecask.engine`) — `Bytecask`, `Batch`, `KeyIterator`, `EntryIterator`, type aliases
