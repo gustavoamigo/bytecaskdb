@@ -11,7 +11,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-import bytecask.persistent_ordered_map;
 import bytecask.radix_tree;
 
 // ---------------------------------------------------------------------------
@@ -107,63 +106,6 @@ auto to_bytes(const std::string &s) -> std::span<const std::byte> {
 // ===========================================================================
 // Container adapters — normalize each container's API for generic benchmarks.
 // ===========================================================================
-
-struct OMapAdapter {
-  using key_type = std::vector<std::byte>;
-  using map_type = bytecask::PersistentOrderedMap<key_type, int>;
-
-  static auto make_keys(const std::vector<std::string> &strs)
-      -> std::vector<key_type> {
-    std::vector<key_type> keys;
-    keys.reserve(strs.size());
-    for (auto &s : strs) {
-      auto sp = to_bytes(s);
-      keys.emplace_back(sp.begin(), sp.end());
-    }
-    return keys;
-  }
-
-  static auto build(const std::vector<key_type> &keys) -> map_type {
-    auto m = map_type{};
-    for (std::size_t i = 0; i < keys.size(); ++i)
-      m = m.set(keys[i], static_cast<int>(i));
-    return m;
-  }
-
-  static auto transient_build(const std::vector<key_type> &keys) -> map_type {
-    auto tr = map_type{}.transient();
-    for (std::size_t i = 0; i < keys.size(); ++i)
-      tr.set(keys[i], static_cast<int>(i));
-    return std::move(tr).persistent();
-  }
-
-  static auto get(const map_type &m, const key_type &k) { return m.get(k); }
-
-  static auto build_transient(const std::vector<key_type> &keys)
-      -> bytecask::OrderedMapTransient<key_type, int> {
-    auto tr = map_type{}.transient();
-    for (std::size_t i = 0; i < keys.size(); ++i)
-      tr.set(keys[i], static_cast<int>(i));
-    return tr;
-  }
-
-  static auto
-  transient_get(const bytecask::OrderedMapTransient<key_type, int> &tr,
-                const key_type &k) {
-    return tr.get(k);
-  }
-
-  static auto lower_bound(const map_type &m, const key_type &k) {
-    return m.lower_bound(k);
-  }
-
-  static auto iterate_sum(const map_type &m) -> int {
-    int sum = 0;
-    for (auto it = m.begin(); it != m.end(); ++it)
-      sum += it->value;
-    return sum;
-  }
-};
 
 struct RTreeAdapter {
   using key_type = std::string;
@@ -371,36 +313,28 @@ constexpr int kLarge = 100000;
 #define ITER_SIZES ->Arg(kSmall)->Arg(kMedium)
 
 // Bulk insert
-BENCHMARK(BM_Build<OMapAdapter>)          ->Name("OrderedMap/PersistentSet") SIZES;
-BENCHMARK(BM_TransientBuild<OMapAdapter>) ->Name("OrderedMap/TransientSet")  SIZES;
 BENCHMARK(BM_Build<RTreeAdapter>)         ->Name("RadixTree/PersistentSet")  SIZES;
 BENCHMARK(BM_TransientBuild<RTreeAdapter>)->Name("RadixTree/TransientSet")   SIZES;
 BENCHMARK(BM_Build<StdMapAdapter>)        ->Name("StdMap/Set")               SIZES;
 
 // Memory footprint
-BENCHMARK(BM_MemoryFootprint<OMapAdapter>) ->Name("OrderedMap/Memory") SIZES;
 BENCHMARK(BM_MemoryFootprint<RTreeAdapter>)->Name("RadixTree/Memory")  SIZES;
 BENCHMARK(BM_MemoryFootprint<StdMapAdapter>)->Name("StdMap/Memory")    SIZES;
 
 // Point lookups
-BENCHMARK(BM_Get<OMapAdapter>)            ->Name("OrderedMap/Get")           SIZES;
-BENCHMARK(BM_TransientGet<OMapAdapter>)   ->Name("OrderedMap/TransientGet")  SIZES;
 BENCHMARK(BM_Get<RTreeAdapter>)           ->Name("RadixTree/Get")            SIZES;
 BENCHMARK(BM_TransientGet<RTreeAdapter>)  ->Name("RadixTree/TransientGet")   SIZES;
 BENCHMARK(BM_Get<StdMapAdapter>)          ->Name("StdMap/Get")               SIZES;
 
 // Full iteration
-BENCHMARK(BM_Iterate<OMapAdapter>)        ->Name("OrderedMap/Iterate")       ITER_SIZES;
 BENCHMARK(BM_Iterate<RTreeAdapter>)       ->Name("RadixTree/Iterate")        ITER_SIZES;
 BENCHMARK(BM_Iterate<StdMapAdapter>)      ->Name("StdMap/Iterate")           ITER_SIZES;
 
 // lower_bound
-BENCHMARK(BM_LowerBound<OMapAdapter>)     ->Name("OrderedMap/LowerBound")    SIZES;
 BENCHMARK(BM_LowerBound<RTreeAdapter>)    ->Name("RadixTree/LowerBound")     SIZES;
 BENCHMARK(BM_LowerBound<StdMapAdapter>)   ->Name("StdMap/LowerBound")        SIZES;
 
 // Memory footprint with prefix-heavy keys (user::uuid, order::uuid, …)
-BENCHMARK(BM_PrefixedMemory<OMapAdapter>)    ->Name("OrderedMap/PrefixedMemory") SIZES;
 BENCHMARK(BM_PrefixedMemory<RTreeAdapter>)   ->Name("RadixTree/PrefixedMemory")  SIZES;
 BENCHMARK(BM_PrefixedMemory<StdMapAdapter>)  ->Name("StdMap/PrefixedMemory")     SIZES;
 

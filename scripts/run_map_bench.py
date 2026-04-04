@@ -3,7 +3,7 @@
 results to benchmarks/map_bench_results.csv for longitudinal performance
 tracking.
 
-Run this benchmark when making changes to radix_tree or persistent_ordered_map.
+Run this benchmark when making changes to radix_tree.
 
 Usage:
     python3 scripts/run_map_bench.py [--skip-build] [-- <extra benchmark flags>]
