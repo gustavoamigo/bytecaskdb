@@ -144,6 +144,81 @@ Benchmarks on a 22-vCPU instance (50k keys, 1 KiB random values):
 
 Throughput scales near-linearly with thread count for read-heavy workloads.
 
+#### Stale reads (`ReadOptions`)
+
+`ReadOptions` controls consistency behaviour for read operations (`get`, `contains_key`).
+
+```cpp
+struct ReadOptions {
+  bool consistent_read{true};
+  std::chrono::milliseconds staleness_tolerance{100};
+};
+```
+
+##### Mechanism
+
+The writer timestamps every state publication. After every `state_.store()`, the writer calls `steady_clock::now()` and stores the result in `atomic<int64_t> state_time_` with `memory_order_release`. The stale-read hot path is a single `relaxed` load of `state_time_` (plain `MOV` on x86) — no clock call on the reader side, no locked instruction, no refcount traffic until a refresh is needed.
+
+```
+  Writer:  state_.store(S1, seq_cst)             ← new immutable snapshot
+           state_time_.store(now_ns(), release)   ← timestamp the publication
+
+  Reader:  wt = state_time_.load(relaxed)         ← single MOV on x86
+           if wt - tl.last_write_time > tolerance:
+               tl.snapshot = state_.load()        ← refresh (refcount bump)
+               tl.last_write_time = wt
+           return tl.snapshot
+```
+
+##### Consistency guarantees by mode
+
+| Mode | Same-thread `put` → `get` | Cross-thread staleness | Hot-path cost |
+|------|--------------------------|------------------------|---------------|
+| `consistent_read = true` | Always sees the put. Every call does a fresh `state_.load()`. | None | `state_.load()` (internal spinlock in `atomic<shared_ptr>`) on every call |
+| `consistent_read = false`, `staleness_tolerance = 0` | Always sees the put. Refreshes whenever `state_time_` changes — i.e. after any new write, including one just performed by this thread. | A nanosecond-scale window between the two writer stores (see below). | Single `MOV` + integer compare when cached |
+| `consistent_read = false`, `staleness_tolerance > 0` | **May not see the put.** If a previous write occurred within `staleness_tolerance`, the condition `wt − tl.last_write_time > tolerance` is false and the stale cached snapshot is returned — even for the thread that just called `put()`. | Up to `staleness_tolerance` after each write. | Single `MOV` + integer compare when cached |
+
+##### Same-thread guarantee
+
+A `put()` followed by a `get()` on the **same thread** always observes the put when `consistent_read = true` or `staleness_tolerance = 0`.
+
+With `consistent_read = false` and `staleness_tolerance > 0`, the same-thread guarantee does **not** hold. The refresh condition `wt − tl.last_write_time > tolerance` compares the new write's timestamp against the timestamp of the last snapshot refresh. If another write occurred within `tolerance` of the current one, the condition is false, and the thread returns its cached snapshot — which predates the just-completed `put()`.
+
+Example with `staleness_tolerance = 100ms`:
+
+```
+t=0 ms   put("a", "v1")   → state_time_ = T0, tl refreshes, tl.last_write_time = T0
+t=50 ms  put("b", "v2")   → state_time_ = T1 (T1 − T0 = 50ms)
+t=50 ms  get("b")          → wt = T1, T1 − T0 = 50ms ≤ 100ms → condition false
+                              ↳ returns stale snapshot; "b" not found
+```
+
+The cross-thread staleness window described below (for `tolerance = 0`) can only be observed by reader threads running concurrently on other CPUs, not by the writer thread itself.
+
+##### Cross-thread staleness window (`tolerance = 0`)
+
+The writer performs two separate stores in sequence:
+
+```
+  state_.store(S1)                ← step A: publish new state
+  state_time_.store(T1, release)  ← step B: publish new timestamp
+```
+
+A reader that samples `state_time_` between steps A and B sees the old timestamp `T0`, computes `T0 − T0 = 0 > 0` as false, and returns the old snapshot — even though `S1` is already visible in `state_`. This window is a few nanoseconds wide (two consecutive stores on the same CPU). `memory_order_release` on step B ensures that once a reader observes `T1`, `state_.load()` is guaranteed to see `S1` (via acquire semantics).
+
+With `tolerance > 0` the window is irrelevant: the snapshot is held for at least `tolerance` regardless.
+
+**Benchmark results** (22-vCPU, 50k keys, 1 KiB values, 1 background writer, `tolerance = 0`):
+
+| Threads | Consistent ops/s | StaleRead ops/s | Speedup | p99 Consistent | p99 StaleRead |
+|---------|-----------------|-----------------|---------|----------------|---------------|
+| 2       | 812k            | 791k            | −3%     | 16.6 µs        | 21.9 µs       |
+| 4       | 1.54 M          | 1.39 M          | −10%    | 33.0 µs        | 47.2 µs       |
+| 8       | 1.39 M          | 1.98 M          | +42%    | 193 µs         | 129 µs        |
+| 16      | 846k            | 2.44 M          | +188%   | 1809 µs        | 536 µs        |
+
+The benefit is pronounced at high thread counts where consistent readers contend for the internal spinlock inside `atomic<shared_ptr>` on every call.
+
 `engine_bench` compares ByteCask against LevelDB and RocksDB across Put, Get, Del, Range50, Mixed, MixedBatch, PutMT, and MixedMT benchmarks at both NoSync and Sync durability levels. RocksDB compression is disabled (`kNoCompression`) and values are 1 KiB of random (incompressible) bytes so neither LevelDB nor RocksDB gains an advantage from Snappy/block-cache effects.
 
 `WriteOptions::try_lock` (default `false`) controls write-lock acquisition behaviour:
