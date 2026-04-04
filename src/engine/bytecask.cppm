@@ -169,6 +169,15 @@ auto make_data_file_stem() -> std::string {
                      tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, subsec_us);
 }
 
+// Nanoseconds since steady_clock epoch. Called on the write path to
+// timestamp state publications; the read path compares against this
+// with a single relaxed load (plain MOV on x86).
+auto now_ns() -> std::int64_t {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -360,8 +369,23 @@ export struct WriteOptions {
   bool try_lock{false};
 };
 
-// ReadOptions — placeholder for future read-path knobs (e.g. verify_checksums).
-export struct ReadOptions {};
+// Controls consistency behaviour for read operations (get, contains_key).
+export struct ReadOptions {
+  // When true (default), every call does a fresh atomic load of the engine
+  // state — always sees the latest write. When false, each thread caches
+  // the state snapshot in a thread-local and refreshes it only when the
+  // last write is older than staleness_tolerance. The hot path is a single
+  // relaxed load of an int64_t (plain MOV on x86) — no refcount traffic,
+  // no locked instructions, no clock read on the reader side.
+  bool consistent_read{true};
+
+  // Maximum age of the cached snapshot before the reader refreshes it.
+  // Only meaningful when consistent_read is false; ignored otherwise.
+  // The writer timestamps each state publication with steady_clock::now();
+  // the reader compares that timestamp via a cheap relaxed load, never
+  // calling the clock itself.
+  std::chrono::milliseconds staleness_tolerance{100};
+};
 
 // ---------------------------------------------------------------------------
 // Bytecask — SWMR key-value store
@@ -427,9 +451,9 @@ public:
   // Output-parameter variant: writes the value into out, reusing its existing
   // capacity to amortize allocation across calls. Returns true if the key was
   // found, false otherwise.
-  [[nodiscard]] auto get(const ReadOptions & /*opts*/, BytesView key,
+  [[nodiscard]] auto get(const ReadOptions &opts, BytesView key,
                          Bytes &out) const -> bool {
-    auto s = state_.load();
+    auto s = load_state(opts);
     const auto kv = s->key_dir.get(key);
     if (!kv) {
       return false;
@@ -459,6 +483,7 @@ public:
       }
       s = maybe_rotate(std::move(s));
       state_.store(std::make_shared<EngineState>(std::move(s)));
+      state_time_.store(now_ns(), std::memory_order_release);
     }
     if (file_to_sync) {
       file_to_sync->sync();
@@ -487,6 +512,7 @@ public:
       }
       s = maybe_rotate(std::move(s));
       state_.store(std::make_shared<EngineState>(std::move(s)));
+      state_time_.store(now_ns(), std::memory_order_release);
     }
     if (file_to_sync) {
       file_to_sync->sync();
@@ -553,6 +579,7 @@ public:
       }
       s = maybe_rotate(std::move(s));
       state_.store(std::make_shared<EngineState>(std::move(s)));
+      state_time_.store(now_ns(), std::memory_order_release);
     }
     if (file_to_sync) {
       file_to_sync->sync();
@@ -642,6 +669,33 @@ private:
     s.files->emplace(s.active_file_id,
                      std::make_shared<DataFile>(dir_ / (stem + ".data")));
     state_.store(std::make_shared<EngineState>(std::move(s)));
+    state_time_.store(now_ns(), std::memory_order_release);
+  }
+
+  // Returns the engine state, either fresh or from a thread-local cache.
+  // When consistent_read is false, the hot path is a single relaxed load of
+  // state_time_ (plain MOV on x86). The snapshot is refreshed only when the
+  // last write timestamp exceeds staleness_tolerance.
+  [[nodiscard]] auto load_state(const ReadOptions &opts) const
+      -> std::shared_ptr<const EngineState> {
+    if (opts.consistent_read) {
+      return state_.load();
+    }
+    struct TlState {
+      std::shared_ptr<const EngineState> snapshot;
+      std::int64_t last_write_time{0};
+    };
+    thread_local TlState tl;
+    const auto wt = state_time_.load(std::memory_order_relaxed);
+    const auto tolerance =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            opts.staleness_tolerance)
+            .count();
+    if (wt - tl.last_write_time > tolerance) {
+      tl.snapshot = state_.load();
+      tl.last_write_time = wt;
+    }
+    return tl.snapshot;
   }
 
   // Acquires the write mutex. Blocking or try-lock based on opts.try_lock.
@@ -831,6 +885,10 @@ private:
   // All mutable state — SWMR. Writers publish via state_.store()
   // under write_mu_; readers call state_.load() (never acquiring write_mu_).
   std::atomic<std::shared_ptr<EngineState>> state_;
+  // Written (release) by every state_.store() with steady_clock::now().
+  // Stale readers compare this against a thread-local timestamp with a
+  // single relaxed load (plain MOV on x86) to decide whether to refresh.
+  std::atomic<std::int64_t> state_time_{0};
   // Serialises writers (put, del, apply_batch). Readers never acquire this.
   std::unique_ptr<std::mutex> write_mu_{std::make_unique<std::mutex>()};
 };

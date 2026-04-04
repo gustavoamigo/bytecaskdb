@@ -36,6 +36,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-062 | `ReadOptions::consistent_read` stale-read mode | Added `consistent_read{true}` to `ReadOptions`. `load_state()` uses a version-check approach: writers bump `state_version_` (`atomic<uint64_t>`, release) after `state_.store()`; stale readers compare with a thread-local `local_version` via a single relaxed load (plain MOV on x86). Snapshot refreshes only when state has actually changed — zero locked instructions on the hot path. Benchmarked: +1.7% at 2T, +8% at 4T, +18% at 8T, +201% at 16T; p99 at 16T: 816 µs → 100 µs. |
 | BC-061 | Remove immer dependency | Replaced `immer::array<std::byte>` in `Key` with `std::vector<std::byte>`. Removed `add_requires("immer")` and all `add_packages(... "immer" ...)` entries from `xmake.lua`. immer was the only remaining use after BC-060 removed `PersistentOrderedMap`. All tests pass. |
 | BC-060 | Remove PersistentOrderedMap | Deleted `persistent_ordered_map.cppm`, `persistent_ordered_map_test.cpp`, and `OMapAdapter` benchmarks from `map_bench.cpp`. Engine uses `PersistentRadixTree` exclusively.  |
 | BC-058 | Zero-copy `append()` via `writev()` | Replaced `serialize_entry` + `::write()` with `::writev()` scatter-gather. Header + CRC in fixed 19-byte member buffer; key and value as direct iovecs — no heap alloc, no memcpy of key/value. Mixed/NoSync +31%, Mixed/Sync +55%, MixedBatch/Sync +60%, MixedMT/Sync/16T +105%, Del/NoSync +41%. Single-writer Put within noise. 89 tests pass (1M+ assertions). |
