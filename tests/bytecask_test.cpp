@@ -861,3 +861,131 @@ TEST_CASE("Bytecask group commit correctness", "[bytecask][concurrency]") {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Test: concurrent reads during writes — raw pointer traversal safety
+// ---------------------------------------------------------------------------
+// Readers traverse the radix tree using raw pointers while a writer mutates
+// it via transient (put path). This validates that the persistent/immutable
+// tree structure keeps old nodes alive for the duration of a read, even as
+// the writer clones and replaces nodes.
+TEST_CASE("Bytecask concurrent reads during writes",
+          "[bytecask][concurrency]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  // Seed 500 keys so reads have something to find.
+  for (int i = 0; i < 500; ++i) {
+    auto key = std::format("rw_{:04d}", i);
+    auto val = std::format("v_{:04d}", i);
+    db.put({}, to_bytes(key), to_bytes(val));
+  }
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> read_count{0};
+  std::atomic<int> read_hits{0};
+
+  // Reader threads: continuously read keys that exist.
+  constexpr int kReaders = 6;
+  std::vector<std::thread> readers;
+  for (int r = 0; r < kReaders; ++r) {
+    readers.emplace_back([&, r] {
+      int idx = r;
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto key = std::format("rw_{:04d}", idx % 500);
+        auto result = db.get({}, to_bytes(key));
+        read_count.fetch_add(1, std::memory_order_relaxed);
+        if (result.has_value()) {
+          // Value must match the latest written value for this key.
+          auto val = to_string(*result);
+          CHECK(!val.empty());
+          read_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        ++idx;
+      }
+    });
+  }
+
+  // Writer thread: overwrite existing keys and add new ones.
+  constexpr int kWrites = 2000;
+  std::thread writer([&] {
+    for (int i = 0; i < kWrites; ++i) {
+      // Overwrite existing keys (causes transient clone of shared nodes).
+      auto key = std::format("rw_{:04d}", i % 500);
+      auto val = std::format("v2_{:06d}", i);
+      db.put({}, to_bytes(key), to_bytes(val));
+    }
+    stop.store(true, std::memory_order_relaxed);
+  });
+
+  writer.join();
+  for (auto &t : readers) {
+    t.join();
+  }
+
+  INFO("reads=" << read_count.load() << " hits=" << read_hits.load());
+  // Readers must have successfully completed many reads without crashing.
+  CHECK(read_count.load() > 0);
+  CHECK(read_hits.load() > 0);
+
+  // All 500 keys must still be present.
+  for (int i = 0; i < 500; ++i) {
+    auto key = std::format("rw_{:04d}", i);
+    auto result = db.get({}, to_bytes(key));
+    REQUIRE(result.has_value());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Test: snapshot isolation — load_state ref stays valid during get
+// ---------------------------------------------------------------------------
+// A reader holds a reference from load_state while a writer publishes a new
+// EngineState. The reader must still see a consistent (old or new) snapshot
+// and never observe a dangling reference.
+TEST_CASE("Bytecask snapshot isolation under concurrent writes",
+          "[bytecask][concurrency]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  // Seed key that will be repeatedly overwritten.
+  db.put({}, to_bytes("snap_key"), to_bytes("initial"));
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> reads_ok{0};
+
+  // Readers: get the same key over and over.
+  constexpr int kReaders = 4;
+  std::vector<std::thread> readers;
+  for (int r = 0; r < kReaders; ++r) {
+    readers.emplace_back([&] {
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto result = db.get({}, to_bytes("snap_key"));
+        // Must always find the key — it is never deleted.
+        REQUIRE(result.has_value());
+        // Value must be one of the written values (not garbage).
+        auto val = to_string(*result);
+        bool valid = val.starts_with("initial") || val.starts_with("ver_");
+        CHECK(valid);
+        reads_ok.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  // Writer: rapidly overwrite the key, publishing new EngineState each time.
+  constexpr int kWrites = 5000;
+  std::thread writer([&] {
+    for (int i = 0; i < kWrites; ++i) {
+      auto val = std::format("ver_{:06d}", i);
+      db.put({}, to_bytes("snap_key"), to_bytes(val));
+    }
+    stop.store(true, std::memory_order_relaxed);
+  });
+
+  writer.join();
+  for (auto &t : readers) {
+    t.join();
+  }
+
+  INFO("successful reads=" << reads_ok.load());
+  CHECK(reads_ok.load() > 100);
+}

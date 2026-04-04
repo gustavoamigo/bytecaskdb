@@ -536,10 +536,13 @@ private:
       : root_{std::move(root)}, size_{sz} {}
 
   // -- get --
+  // Uses raw pointers during traversal to avoid IntrusivePtr refcount
+  // traffic. Safe because the caller's IntrusivePtr to the root keeps the
+  // entire node tree alive (parents own IntrusivePtr children).
   static auto get_impl(const IntrusivePtr<Node<V>> &node,
                        std::span<const std::byte> key) -> std::optional<V> {
     auto remaining = key;
-    auto cur = node;
+    const Node<V> *cur = node.get();
     while (cur) {
       auto prefix_span =
           std::span<const std::byte>{cur->prefix.data(), cur->prefix.size()};
@@ -559,7 +562,7 @@ private:
       auto *child = cur->find_child(transition);
       if (!child)
         return std::nullopt;
-      cur = child->second;
+      cur = child->second.get();
     }
     return std::nullopt;
   }
