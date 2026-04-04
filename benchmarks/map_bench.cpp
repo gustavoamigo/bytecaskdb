@@ -159,6 +159,17 @@ struct RTreeAdapter {
   static auto transient_get(const transient_type &tr, const key_type &k) {
     return tr.get(to_bytes(k));
   }
+
+  // Snapshot an existing persistent tree, update all keys, return a new
+  // persistent tree. Exercises the persistent -> transient -> mutate path
+  // and the refcount==1 fast path in ensure_mutable.
+  static auto transient_update(const map_type &base,
+                               const std::vector<key_type> &keys) -> map_type {
+    auto tr = base.transient();
+    for (std::size_t i = 0; i < keys.size(); ++i)
+      tr.set(to_bytes(keys[i]), static_cast<int>(i) + 1);
+    return std::move(tr).persistent();
+  }
 };
 
 struct StdMapAdapter {
@@ -207,6 +218,26 @@ template <typename A> void BM_TransientBuild(benchmark::State &state) {
       A::make_keys(generate_keys(static_cast<std::size_t>(state.range(0))));
   for (auto _ : state)
     benchmark::DoNotOptimize(A::transient_build(keys));
+}
+
+// Transient build with prefix-heavy keys — matches the ByteCask recovery path
+// where all keys share a common type prefix (e.g. "user::", "order::").
+void BM_TransientBuildPrefixed(benchmark::State &state) {
+  auto keys = RTreeAdapter::make_keys(
+      generate_prefixed_keys(static_cast<std::size_t>(state.range(0))));
+  for (auto _ : state)
+    benchmark::DoNotOptimize(RTreeAdapter::transient_build(keys));
+}
+
+// Persistent -> transient -> update all keys -> persistent.
+// The persistent tree is pre-built outside the loop; only the transient
+// mutation round-trip is measured.
+void BM_TransientUpdate(benchmark::State &state) {
+  auto keys = RTreeAdapter::make_keys(
+      generate_prefixed_keys(static_cast<std::size_t>(state.range(0))));
+  auto base = RTreeAdapter::transient_build(keys);
+  for (auto _ : state)
+    benchmark::DoNotOptimize(RTreeAdapter::transient_update(base, keys));
 }
 
 template <typename A> void BM_Get(benchmark::State &state) {
@@ -313,9 +344,11 @@ constexpr int kLarge = 100000;
 #define ITER_SIZES ->Arg(kSmall)->Arg(kMedium)
 
 // Bulk insert
-BENCHMARK(BM_Build<RTreeAdapter>)         ->Name("RadixTree/PersistentSet")  SIZES;
-BENCHMARK(BM_TransientBuild<RTreeAdapter>)->Name("RadixTree/TransientSet")   SIZES;
-BENCHMARK(BM_Build<StdMapAdapter>)        ->Name("StdMap/Set")               SIZES;
+BENCHMARK(BM_Build<RTreeAdapter>)         ->Name("RadixTree/PersistentSet")        SIZES;
+BENCHMARK(BM_TransientBuild<RTreeAdapter>)->Name("RadixTree/TransientSet")         SIZES;
+BENCHMARK(BM_TransientBuildPrefixed)      ->Name("RadixTree/TransientSetPrefixed") SIZES;
+BENCHMARK(BM_TransientUpdate)             ->Name("RadixTree/TransientUpdate")      SIZES;
+BENCHMARK(BM_Build<StdMapAdapter>)        ->Name("StdMap/Set")                     SIZES;
 
 // Memory footprint
 BENCHMARK(BM_MemoryFootprint<RTreeAdapter>)->Name("RadixTree/Memory")  SIZES;
