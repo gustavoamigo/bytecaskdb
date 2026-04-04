@@ -15,6 +15,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-064 | Group commit (`SyncGroup`) for concurrent sync writes | `SyncGroup` batches concurrent `fdatasync` calls: leader syncs, followers wait on epoch bump. Replaces per-writer `file->sync()` in `put`, `del`, `apply_batch`. Re-implements BC-051's group commit — original was removed because tmpfs benchmarks showed no benefit; real-disk benchmarks show ~2ms fdatasync serialisation as the dominant bottleneck. |
 | BC-059 | Replace bitsery with ByteWriter/ByteReader | Unify serialization: add cursor-based `ByteWriter`/`ByteReader` to `serialization.cppm`, migrate `data_entry.cppm` and `hint_entry.cppm` + `hint_file.cppm` scan, remove bitsery dependency. |
 
 ## Backlog
