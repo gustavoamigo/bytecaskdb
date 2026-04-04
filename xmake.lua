@@ -1,6 +1,5 @@
 add_rules("mode.debug", "mode.release")
 
-add_requires("bitsery")
 add_requires("catch2 3.x")
 add_requires("benchmark", {optional = true})
 add_requires("immer")
@@ -51,7 +50,7 @@ target("bytecask")
     set_languages("c++23")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
-    add_packages("bitsery", "crc32c", "immer", "jemalloc")
+    add_packages("crc32c", "immer", "jemalloc")
     on_load(apply_sanitizer)
     -- For VS Code / clangd support, run: scripts/gen_compile_commands.sh
 
@@ -62,7 +61,7 @@ target("bytecask_tests")
     set_languages("c++23")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
-    add_packages("bitsery", "catch2", "crc32c", "immer", "jemalloc")
+    add_packages("catch2", "crc32c", "immer", "jemalloc")
     on_load(apply_sanitizer)
 
 target("bytecask_bench")
@@ -74,7 +73,7 @@ target("bytecask_bench")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
     add_cxflags("-Wno-global-constructors")
-    add_packages("bitsery", "benchmark", "crc32c", "immer", "jemalloc")
+    add_packages("benchmark", "crc32c", "immer", "jemalloc")
     -- map_bench.cpp defines operator new/delete for allocation tracking.
     -- jemalloc's static archive (jemalloc_cpp.o) also defines them.
     -- --allow-multiple-definition lets the linker keep the first definition
@@ -92,7 +91,7 @@ target("engine_bench")
     set_policy("build.c++.modules", true)
     add_cxflags(table.unpack(common_flags))
     add_cxflags("-Wno-global-constructors")
-    add_packages("bitsery", "benchmark", "crc32c", "immer", "jemalloc", "leveldb", "rocksdb")
+    add_packages("benchmark", "crc32c", "immer", "jemalloc", "leveldb", "rocksdb")
     on_load(apply_sanitizer)
 
 --

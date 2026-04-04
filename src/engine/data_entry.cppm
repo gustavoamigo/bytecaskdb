@@ -44,34 +44,38 @@ export struct DataEntry {
   std::vector<std::byte> value;
 };
 
-// Parses the fixed header fields from the first kHeaderSize bytes of buf.
-export auto parse_header(std::span<const std::byte> buf) -> EntryHeader {
+// Reads the fixed header fields from the first kHeaderSize bytes of buf.
+export auto read_header(std::span<const std::byte> buf) -> EntryHeader {
+  ByteReader r{buf};
   return EntryHeader{
-      .sequence = read_le<std::uint64_t>(buf, 0),
-      .entry_type = static_cast<EntryType>(read_le<std::uint8_t>(buf, 8)),
-      .key_size = read_le<std::uint16_t>(buf, 9),
-      .value_size = read_le<std::uint32_t>(buf, 11),
+      .sequence = r.get<std::uint64_t>(),
+      .entry_type = static_cast<EntryType>(r.get<std::uint8_t>()),
+      .key_size = r.get<std::uint16_t>(),
+      .value_size = r.get<std::uint32_t>(),
   };
 }
 
 // Fills hdr_crc (19 bytes) with the 15-byte LE header at [0..14] and the
 // 4-byte CRC at [15..18]. CRC covers header + key + value.
 // All format knowledge (field layout, byte order, CRC scope) lives here.
-export void serialize_header_and_crc(
+export void write_header_and_crc(
     std::span<std::byte, kHeaderSize + kCrcSize> hdr_crc,
     std::uint64_t sequence, EntryType entry_type,
     std::span<const std::byte> key,
     std::span<const std::byte> value) {
-  write_le(hdr_crc, 0, sequence);
-  hdr_crc[8] = static_cast<std::byte>(entry_type);
-  write_le(hdr_crc, 9, narrow<std::uint16_t>(key.size()));
-  write_le(hdr_crc, 11, narrow<std::uint32_t>(value.size()));
-
   Crc32 crc{};
-  crc.update(hdr_crc.first<kHeaderSize>());
+  ByteWriter w{hdr_crc, &crc};
+  w.put(sequence);
+  w.put(static_cast<std::uint8_t>(entry_type));
+  w.put(narrow<std::uint16_t>(key.size()));
+  w.put(narrow<std::uint32_t>(value.size()));
+
+  // Key and value are not in hdr_crc but are covered by the CRC.
   crc.update(key);
   crc.update(value);
-  write_le(hdr_crc, kHeaderSize, crc.finalize());
+
+  // Append CRC after the header (not CRC-covered).
+  w.put(crc.finalize());
 }
 
 // Serialize a single entry into a contiguous byte buffer.
@@ -79,37 +83,32 @@ export void serialize_header_and_crc(
 export auto serialize_entry(std::uint64_t sequence, EntryType entry_type,
                             std::span<const std::byte> key,
                             std::span<const std::byte> value)
-    -> std::vector<std::uint8_t> {
+    -> std::vector<std::byte> {
   std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc{};
-  serialize_header_and_crc(hdr_crc, sequence, entry_type, key, value);
+  write_header_and_crc(hdr_crc, sequence, entry_type, key, value);
 
-  std::vector<std::uint8_t> raw;
-  raw.reserve(kHeaderSize + key.size() + value.size() + kCrcSize);
-
-  const auto push = [&raw](std::span<const std::byte> s) {
-    for (auto b : s) {
-      raw.push_back(std::to_integer<std::uint8_t>(b));
-    }
-  };
-  push(std::span<const std::byte>{hdr_crc.data(), kHeaderSize});
-  push(key);
-  push(value);
-  push(std::span<const std::byte>{hdr_crc.data() + kHeaderSize, kCrcSize});
-  return raw;
+  const auto total = kHeaderSize + key.size() + value.size() + kCrcSize;
+  std::vector<std::byte> buf(total);
+  ByteWriter w{buf};
+  w.put_bytes({hdr_crc.data(), kHeaderSize});
+  w.put_bytes(key);
+  w.put_bytes(value);
+  w.put_bytes({hdr_crc.data() + kHeaderSize, kCrcSize});
+  return buf;
 }
 
 // Validates buffer size and CRC integrity. Returns the parsed header.
 // Throws std::runtime_error on size mismatch or CRC failure.
-export auto verify_entry(std::span<const std::byte> buf) -> EntryHeader {
+export auto parse_header_and_verify(std::span<const std::byte> buf) -> EntryHeader {
   if (buf.size() < kHeaderSize + kCrcSize) {
-    throw std::runtime_error{"verify_entry: buffer too small"};
+    throw std::runtime_error{"parse_header_and_verify: buffer too small"};
   }
 
-  const auto header = parse_header(buf);
+  const auto header = read_header(buf);
 
   if (buf.size() !=
       kHeaderSize + header.key_size + header.value_size + kCrcSize) {
-    throw std::runtime_error{"verify_entry: buffer size mismatch"};
+    throw std::runtime_error{"parse_header_and_verify: buffer size mismatch"};
   }
 
   Crc32 crc{};
@@ -117,7 +116,7 @@ export auto verify_entry(std::span<const std::byte> buf) -> EntryHeader {
   const auto computed = crc.finalize();
   const auto stored = read_le<std::uint32_t>(buf, buf.size() - kCrcSize);
   if (computed != stored) {
-    throw std::runtime_error{"verify_entry: CRC mismatch"};
+    throw std::runtime_error{"parse_header_and_verify: CRC mismatch"};
   }
 
   return header;
@@ -125,9 +124,10 @@ export auto verify_entry(std::span<const std::byte> buf) -> EntryHeader {
 
 // Deserializes a complete entry from buf (CRC-verified).
 export auto deserialize_entry(std::span<const std::byte> buf) -> DataEntry {
-  const auto h = verify_entry(buf);
-  const auto key_span = buf.subspan(kHeaderSize, h.key_size);
-  const auto val_span = buf.subspan(kHeaderSize + h.key_size, h.value_size);
+  const auto h = parse_header_and_verify(buf);
+  ByteReader r{buf.subspan(kHeaderSize)};
+  auto key_span = r.get_bytes(h.key_size);
+  auto val_span = r.get_bytes(h.value_size);
   return DataEntry{
       .sequence = h.sequence,
       .entry_type = h.entry_type,
@@ -139,8 +139,10 @@ export auto deserialize_entry(std::span<const std::byte> buf) -> DataEntry {
 // Extracts only the value portion into out (CRC-verified, reuses capacity).
 export void extract_value_into(std::span<const std::byte> buf,
                                std::vector<std::byte> &out) {
-  const auto h = verify_entry(buf);
-  const auto val_span = buf.subspan(kHeaderSize + h.key_size, h.value_size);
+  const auto h = parse_header_and_verify(buf);
+  ByteReader r{buf.subspan(kHeaderSize)};
+  r.get_bytes(h.key_size); // skip key
+  auto val_span = r.get_bytes(h.value_size);
   out.assign(val_span.begin(), val_span.end());
 }
 

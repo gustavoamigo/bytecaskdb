@@ -114,7 +114,7 @@ public:
   void append(std::uint64_t sequence, EntryType entry_type,
               std::uint64_t file_offset, std::span<const std::byte> key,
               std::uint32_t value_size) {
-    const auto buf = serialize_hint_entry(sequence, entry_type, file_offset,
+    const auto buf = serialize_entry(sequence, entry_type, file_offset,
                                           key, value_size);
     if (::write(fd_, buf.data(), buf.size()) != std::ssize(buf)) {
       throw std::system_error{errno, std::generic_category(),
@@ -145,7 +145,7 @@ public:
       return std::nullopt;
     }
 
-    // Read the fixed header.
+    // Read the fixed header to learn the key size.
     std::array<std::byte, kHintHeaderSize> hdr{};
     if (::pread(fd_, hdr.data(), kHintHeaderSize, narrow<off_t>(offset)) !=
         std::ssize(hdr)) {
@@ -153,53 +153,24 @@ public:
                               "HintFile::scan: pread header failed"};
     }
 
-    const auto hdr_span = std::span<const std::byte>{hdr};
-    const auto sequence = read_le<std::uint64_t>(hdr_span, 0);
-    const auto entry_type =
-        static_cast<EntryType>(read_le<std::uint8_t>(hdr_span, 8));
-    const auto file_offset_val = read_le<std::uint64_t>(hdr_span, 9);
-    const auto key_size = read_le<std::uint16_t>(hdr_span, 17);
-    const auto value_size = read_le<std::uint32_t>(hdr_span, 19);
+    ByteReader hdr_reader{std::span<const std::byte>{hdr}};
+    hdr_reader.get<std::uint64_t>(); // sequence
+    hdr_reader.get<std::uint8_t>();  // entry_type
+    hdr_reader.get<std::uint64_t>(); // file_offset
+    const auto key_size = hdr_reader.get<std::uint16_t>();
 
-    // Read key bytes.
-    std::vector<std::byte> key(key_size);
-    if (key_size > 0) {
-      if (::pread(fd_, key.data(), key_size,
-                  narrow<off_t>(offset + kHintHeaderSize)) != std::ssize(key)) {
-        throw std::system_error{errno, std::generic_category(),
-                                "HintFile::scan: pread key failed"};
-      }
-    }
-
-    // Read trailing CRC.
-    std::array<std::byte, kHintCrcSize> crc_buf{};
-    if (::pread(fd_, crc_buf.data(), kHintCrcSize,
-                narrow<off_t>(offset + kHintHeaderSize + key_size)) !=
-        std::ssize(crc_buf)) {
+    // Read the full entry (header + key + CRC) into a contiguous buffer.
+    const auto entry_size = kHintHeaderSize + key_size + kHintCrcSize;
+    std::vector<std::byte> buf(entry_size);
+    if (::pread(fd_, buf.data(), entry_size, narrow<off_t>(offset)) !=
+        narrow<ssize_t>(entry_size)) {
       throw std::system_error{errno, std::generic_category(),
-                              "HintFile::scan: pread CRC failed"};
+                              "HintFile::scan: pread entry failed"};
     }
 
-    // Verify CRC over header + key — same bytes that serialize_hint_entry fed
-    // through CrcOutputAdapter.
-    Crc32 crc{};
-    crc.update(hdr_span);
-    crc.update(std::span<const std::byte>{key});
-    const auto computed = crc.finalize();
-    const auto stored =
-        read_le<std::uint32_t>(std::span<const std::byte>{crc_buf}, 0);
-    if (computed != stored) {
-      throw std::runtime_error{
-          std::format("HintFile::scan: CRC mismatch at offset {}", offset)};
-    }
-
-    const auto next_offset = offset + kHintHeaderSize + key_size + kHintCrcSize;
-    return std::make_pair(HintEntry{.sequence = sequence,
-                                    .entry_type = entry_type,
-                                    .file_offset = file_offset_val,
-                                    .key = std::move(key),
-                                    .value_size = value_size},
-                          next_offset);
+    auto entry = deserialize_entry(std::span<const std::byte>{buf});
+    const auto next_offset = offset + entry_size;
+    return std::make_pair(std::move(entry), next_offset);
   }
 
   [[nodiscard]] auto path() const -> const std::filesystem::path & {

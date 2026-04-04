@@ -17,22 +17,22 @@ namespace {
 
 // Read a little-endian value of type T from a byte buffer at offset.
 template <typename T>
-auto read_le(const std::vector<std::uint8_t> &buf, std::size_t offset) -> T {
+auto read_le(const std::vector<std::byte> &buf, std::size_t offset) -> T {
   T v{};
   for (std::size_t i = 0; i < sizeof(T); ++i) {
-    v |= static_cast<T>(static_cast<T>(buf[offset + i]) << (8U * i));
+    v |= static_cast<T>(static_cast<T>(std::to_integer<std::uint8_t>(buf[offset + i])) << (8U * i));
   }
   return v;
 }
 
 // Read a binary file into a byte vector.
 auto read_file_bytes(const std::filesystem::path &p)
-    -> std::vector<std::uint8_t> {
+    -> std::vector<std::byte> {
   std::ifstream in{p, std::ios::binary | std::ios::ate};
   REQUIRE(in.is_open());
   const auto size = static_cast<std::size_t>(in.tellg());
   in.seekg(0, std::ios::beg);
-  std::vector<std::uint8_t> result(size);
+  std::vector<std::byte> result(size);
   in.read(reinterpret_cast<char *>(result.data()),
           static_cast<std::streamsize>(size));
   return result;
@@ -70,7 +70,7 @@ TEST_CASE("serialize_entry produces correct byte layout", "[serialize]") {
   CHECK(read_le<std::uint64_t>(buf, 0) == seq);
 
   // EntryType at offset 8 should be Put (0x01)
-  CHECK(static_cast<std::uint8_t>(buf[8]) == 0x01U);
+  CHECK(buf[8] == std::byte{0x01U});
 
   // Key size at offset 9
   CHECK(read_le<std::uint16_t>(buf, 9) ==
@@ -82,13 +82,13 @@ TEST_CASE("serialize_entry produces correct byte layout", "[serialize]") {
 
   // Key bytes at offset 15 (kHeaderSize)
   for (std::size_t i = 0; i < key.size(); ++i) {
-    CHECK(buf[bytecask::kHeaderSize + i] == static_cast<std::uint8_t>(key[i]));
+    CHECK(buf[bytecask::kHeaderSize + i] == static_cast<std::byte>(key[i]));
   }
 
   // Value bytes immediately after key
   for (std::size_t i = 0; i < value.size(); ++i) {
     CHECK(buf[bytecask::kHeaderSize + key.size() + i] ==
-          static_cast<std::uint8_t>(value[i]));
+          static_cast<std::byte>(value[i]));
   }
 
   // CRC is the trailing 4 bytes; must be non-zero and deterministic
@@ -141,12 +141,12 @@ TEST_CASE("DataFile appends two entries with correct offsets and sequences",
   CHECK(read_le<std::uint64_t>(raw, entry_size) == 2U);
 
   // Key bytes of first entry
-  CHECK(raw[bytecask::kHeaderSize] == static_cast<std::uint8_t>('k'));
-  CHECK(raw[bytecask::kHeaderSize + 3U] == static_cast<std::uint8_t>('1'));
+  CHECK(raw[bytecask::kHeaderSize] == static_cast<std::byte>('k'));
+  CHECK(raw[bytecask::kHeaderSize + 3U] == static_cast<std::byte>('1'));
 
   // Key bytes of second entry
   CHECK(raw[entry_size + bytecask::kHeaderSize + 3U] ==
-        static_cast<std::uint8_t>('2'));
+        static_cast<std::byte>('2'));
 
   std::filesystem::remove(tmp);
 }

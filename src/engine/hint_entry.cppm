@@ -1,10 +1,9 @@
 module;
-#include <bitsery/adapter/buffer.h>
-#include <bitsery/bitsery.h>
-#include <bitsery/traits/vector.h>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 export module bytecask.hint_entry;
@@ -41,38 +40,58 @@ export struct HintEntry {
   std::uint32_t value_size{};
 };
 
-// Serialize one hint entry into a flat byte buffer using bitsery.
+// Serialize one hint entry into a flat byte buffer.
 // CRC-32 covers all bytes except itself and is appended as the final four
 // bytes.
-export auto serialize_hint_entry(std::uint64_t sequence, EntryType entry_type,
-                                 std::uint64_t file_offset,
-                                 std::span<const std::byte> key,
-                                 std::uint32_t value_size)
-    -> std::vector<std::uint8_t> {
-  using Buffer = std::vector<std::uint8_t>;
-  using BaseAdapter = bitsery::OutputBufferAdapter<Buffer>;
-
-  Buffer raw;
-  raw.reserve(kHintHeaderSize + key.size() + kHintCrcSize);
+export auto serialize_entry(std::uint64_t sequence, EntryType entry_type,
+                            std::uint64_t file_offset,
+                            std::span<const std::byte> key,
+                            std::uint32_t value_size)
+    -> std::vector<std::byte> {
+  const auto total = kHintHeaderSize + key.size() + kHintCrcSize;
+  std::vector<std::byte> buf(total);
 
   Crc32 crc{};
-  BaseAdapter base{raw};
-  CrcOutputAdapter<BaseAdapter> crc_adapter{base, crc};
-  bitsery::Serializer<CrcOutputAdapter<BaseAdapter>> ser{crc_adapter};
+  ByteWriter w{buf, &crc};
+  w.put(sequence);
+  w.put(static_cast<std::uint8_t>(entry_type));
+  w.put(file_offset);
+  w.put(narrow<std::uint16_t>(key.size()));
+  w.put(value_size);
+  w.put_bytes(key);
 
-  auto entry_type_u8 = static_cast<std::uint8_t>(entry_type);
-  ser.value8b(sequence);
-  ser.value1b(entry_type_u8);
-  ser.value8b(file_offset);
-  ser.value2b(narrow<std::uint16_t>(key.size()));
-  ser.value4b(value_size);
-  write_bytes(ser, key);
+  // CRC itself is NOT covered by the checksum — write through a bare writer.
+  ByteWriter tail{std::span{buf}.subspan(w.pos())};
+  tail.put(crc.finalize());
+  return buf;
+}
 
-  // Append the trailing CRC directly through the base adapter so it is not
-  // included in the checksum.
-  base.template writeBytes<4, std::uint32_t>(crc.finalize());
-  raw.resize(base.writtenBytesCount());
-  return raw;
+// Deserialize a hint entry from a contiguous buffer (header + key + CRC).
+// Verifies CRC integrity. Throws std::runtime_error on CRC mismatch.
+export auto deserialize_entry(std::span<const std::byte> buf) -> HintEntry {
+  ByteReader r{buf};
+  const auto sequence = r.get<std::uint64_t>();
+  const auto entry_type = static_cast<EntryType>(r.get<std::uint8_t>());
+  const auto file_offset_val = r.get<std::uint64_t>();
+  const auto key_size = r.get<std::uint16_t>();
+  const auto value_size = r.get<std::uint32_t>();
+  auto key_span = r.get_bytes(key_size);
+
+  // CRC covers everything before the trailing 4 bytes.
+  Crc32 crc{};
+  crc.update(buf.subspan(0, buf.size() - kHintCrcSize));
+  const auto computed = crc.finalize();
+  const auto stored = read_le<std::uint32_t>(buf, buf.size() - kHintCrcSize);
+  if (computed != stored) {
+    throw std::runtime_error{
+        std::format("deserialize_entry (hint): CRC mismatch")};
+  }
+
+  return HintEntry{.sequence = sequence,
+                   .entry_type = entry_type,
+                   .file_offset = file_offset_val,
+                   .key = {key_span.begin(), key_span.end()},
+                   .value_size = value_size};
 }
 
 } // namespace bytecask

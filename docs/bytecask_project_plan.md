@@ -15,6 +15,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-059 | Replace bitsery with ByteWriter/ByteReader | Unify serialization: add cursor-based `ByteWriter`/`ByteReader` to `serialization.cppm`, migrate `data_entry.cppm` and `hint_entry.cppm` + `hint_file.cppm` scan, remove bitsery dependency. |
 
 ## Backlog
 

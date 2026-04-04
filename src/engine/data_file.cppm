@@ -9,7 +9,6 @@ module;
 #include <format>
 #include <optional>
 #include <span>
-#include <stdexcept>
 #include <sys/uio.h>
 #include <system_error>
 #include <unistd.h>
@@ -107,7 +106,7 @@ public:
     assert(!sealed_);
     const auto entry_offset = offset_;
 
-    serialize_header_and_crc(hdr_crc_buf_, sequence, entry_type, key, value);
+    write_header_and_crc(hdr_crc_buf_, sequence, entry_type, key, value);
 
     // Scatter-gather write: [header(15), key, value, crc(4)].
     const std::array<::iovec, 4> iov{{
@@ -145,7 +144,7 @@ public:
                               "DataFile::scan: pread header failed"};
     }
 
-    const auto header = parse_header(std::span{hdr});
+    const auto header = read_header(std::span{hdr});
     std::vector<std::byte> buf;
     read_entry(offset, header.key_size, header.value_size, buf);
     auto entry = deserialize_entry(buf);
