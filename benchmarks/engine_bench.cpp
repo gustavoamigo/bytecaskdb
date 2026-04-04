@@ -486,9 +486,9 @@ template <bool UseCache = true> struct RdbAdapter {
 // ──────────────────────────── Put ────────────────────────────────────────────
 
 template <typename A, bool Sync> void BM_Put(benchmark::State &state) {
-  auto db = A::open_empty("put");
-  auto keys = generate_prefixed_keys(kDatasetSize);
-  auto val = make_value();
+  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto val = make_value();
+  static auto db = A::open_empty("put");
 
   std::size_t idx = 0;
   std::vector<double> samples;
@@ -518,9 +518,9 @@ template <typename A, bool Sync> void BM_Put(benchmark::State &state) {
 // ──────────────────────────── Get ────────────────────────────────────────────
 
 template <typename A> void BM_Get(benchmark::State &state) {
-  auto keys = generate_prefixed_keys(kDatasetSize);
-  auto val = make_value();
-  auto db = A::open_populated("get", keys, val);
+  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto val = make_value();
+  static auto db = A::open_populated("get", keys, val);
 
   std::size_t idx = 0;
   std::vector<double> samples;
@@ -547,9 +547,9 @@ template <typename A> void BM_Get(benchmark::State &state) {
 // ──────────────────────────── Del ────────────────────────────────────────────
 
 template <typename A, bool Sync> void BM_Del(benchmark::State &state) {
-  auto keys = generate_prefixed_keys(kDatasetSize);
-  auto val = make_value();
-  auto db = A::open_populated("del", keys, val);
+  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto val = make_value();
+  static auto db = A::open_populated("del", keys, val);
 
   std::size_t idx = 0;
   std::vector<double> samples;
@@ -581,9 +581,9 @@ template <typename A, bool Sync> void BM_Del(benchmark::State &state) {
 // ──────────────────────────── Range ──────────────────────────────────────────
 
 template <typename A, int RangeLen> void BM_Range(benchmark::State &state) {
-  auto keys = generate_prefixed_keys(kDatasetSize);
-  auto val = make_value();
-  auto db = A::open_populated("range", keys, val);
+  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto val = make_value();
+  static auto db = A::open_populated("range", keys, val);
 
   std::size_t idx = 0;
   std::vector<double> samples;
@@ -611,9 +611,9 @@ template <typename A, int RangeLen> void BM_Range(benchmark::State &state) {
 // 80% get / 10% put / 10% del
 
 template <typename A, bool Sync> void BM_Mixed(benchmark::State &state) {
-  auto keys = generate_prefixed_keys(kDatasetSize);
-  auto val = make_value();
-  auto db = A::open_populated("mixed", keys, val);
+  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto val = make_value();
+  static auto db = A::open_populated("mixed", keys, val);
 
   std::size_t idx = 0;
   std::vector<double> samples;
@@ -649,9 +649,9 @@ template <typename A, bool Sync> void BM_Mixed(benchmark::State &state) {
 // iteration, amortising lock acquisition and fsync across the batch.
 
 template <typename A, bool Sync> void BM_MixedBatch(benchmark::State &state) {
-  auto keys = generate_prefixed_keys(kDatasetSize);
-  auto val = make_value();
-  auto db = A::open_populated("batch", keys, val);
+  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto val = make_value();
+  static auto db = A::open_populated("batch", keys, val);
 
   std::size_t idx = 0;
   std::vector<double> samples;
@@ -681,22 +681,14 @@ template <typename A, bool Sync> void BM_MixedBatch(benchmark::State &state) {
 // ──────────────────────────── Mixed (multithreaded) ──────────────────────────
 // Same 80/10/10 mix but with N threads sharing one DB instance.
 // Google Benchmark's ->Threads(N) runs N copies of this function in parallel;
-// each thread gets its own State. We build the shared state in the first
-// iteration's setup and tear it down in the last thread's teardown.
+// each thread gets its own State. Shared state is created once (static) and
+// reused across calibration calls to avoid expensive re-population.
 
 template <typename A, bool Sync> void BM_MixedMT(benchmark::State &state) {
-  // Shared across all threads within one benchmark invocation.
-  static std::unique_ptr<typename A::Db> shared_db;
-  static std::vector<std::string> shared_keys;
-  static std::vector<std::byte> shared_val;
-
-  // Thread 0 sets up before the hot loop.
-  if (state.thread_index() == 0) {
-    shared_keys = generate_prefixed_keys(kDatasetSize);
-    shared_val = make_value();
-    shared_db =
-        std::make_unique<typename A::Db>("mixed_mt", &shared_keys, &shared_val);
-  }
+  static std::vector<std::string> shared_keys = generate_prefixed_keys(kDatasetSize);
+  static std::vector<std::byte> shared_val = make_value();
+  static auto shared_db =
+      std::make_unique<typename A::Db>("mixed_mt", &shared_keys, &shared_val);
 
   // Per-thread index offset to spread key access across threads.
   const auto thread_offset =
@@ -728,13 +720,6 @@ template <typename A, bool Sync> void BM_MixedMT(benchmark::State &state) {
   state.counters["ops_per_us"] = benchmark::Counter(
       static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
   attach_jitter(state, samples);
-
-  // Thread 0 tears down after all threads finish.
-  if (state.thread_index() == 0) {
-    shared_db.reset();
-    shared_keys.clear();
-    shared_val.clear();
-  }
 }
 
 // ────────────────────────── Get (multithreaded) ───────────────────────────
@@ -742,16 +727,10 @@ template <typename A, bool Sync> void BM_MixedMT(benchmark::State &state) {
 // Measures read throughput scaling and tail latency under concurrency.
 
 template <typename A> void BM_GetMT(benchmark::State &state) {
-  static std::unique_ptr<typename A::Db> shared_db;
-  static std::vector<std::string> shared_keys;
-  static std::vector<std::byte> shared_val;
-
-  if (state.thread_index() == 0) {
-    shared_keys = generate_prefixed_keys(kDatasetSize);
-    shared_val = make_value();
-    shared_db =
-        std::make_unique<typename A::Db>("get_mt", &shared_keys, &shared_val);
-  }
+  static std::vector<std::string> shared_keys = generate_prefixed_keys(kDatasetSize);
+  static std::vector<std::byte> shared_val = make_value();
+  static auto shared_db =
+      std::make_unique<typename A::Db>("get_mt", &shared_keys, &shared_val);
 
   const auto thread_offset =
       static_cast<std::size_t>(state.thread_index()) * (kDatasetSize / 8);
@@ -775,12 +754,6 @@ template <typename A> void BM_GetMT(benchmark::State &state) {
   state.counters["ops_per_us"] = benchmark::Counter(
       static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
   attach_jitter(state, samples);
-
-  if (state.thread_index() == 0) {
-    shared_db.reset();
-    shared_keys.clear();
-    shared_val.clear();
-  }
 }
 
 // ────────────────────────── Put (multithreaded) ───────────────────────────
@@ -790,15 +763,10 @@ template <typename A> void BM_GetMT(benchmark::State &state) {
 // others choose per WriteOptions).
 
 template <typename A, bool Sync> void BM_PutMT(benchmark::State &state) {
-  static std::unique_ptr<typename A::Db> shared_db;
-  static std::vector<std::string> shared_keys;
-  static std::vector<std::byte> shared_val;
-
-  if (state.thread_index() == 0) {
-    shared_keys = generate_prefixed_keys(kDatasetSize);
-    shared_val = make_value();
-    shared_db = std::make_unique<typename A::Db>("put_mt", nullptr, nullptr);
-  }
+  static std::vector<std::string> shared_keys = generate_prefixed_keys(kDatasetSize);
+  static std::vector<std::byte> shared_val = make_value();
+  static auto shared_db =
+      std::make_unique<typename A::Db>("put_mt", nullptr, nullptr);
 
   const auto thread_offset =
       static_cast<std::size_t>(state.thread_index()) * (kDatasetSize / 8);
@@ -822,12 +790,6 @@ template <typename A, bool Sync> void BM_PutMT(benchmark::State &state) {
   state.counters["ops_per_us"] = benchmark::Counter(
       static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
   attach_jitter(state, samples);
-
-  if (state.thread_index() == 0) {
-    shared_db.reset();
-    shared_keys.clear();
-    shared_val.clear();
-  }
 }
 
 // ──────────── ReadWhileWriting (read throughput with background writer) ────
@@ -838,17 +800,15 @@ template <typename A, bool Sync> void BM_PutMT(benchmark::State &state) {
 
 template <typename A, bool Sync>
 void BM_ReadWhileWriting(benchmark::State &state) {
-  static std::unique_ptr<typename A::Db> shared_db;
-  static std::vector<std::string> shared_keys;
-  static std::vector<std::byte> shared_val;
+  static std::vector<std::string> shared_keys = generate_prefixed_keys(kDatasetSize);
+  static std::vector<std::byte> shared_val = make_value();
+  static auto shared_db = std::make_unique<typename A::Db>(
+      "rww", &shared_keys, &shared_val);
   static std::atomic<bool> writer_stop{false};
   static std::thread writer_thread;
 
+  // Start background writer per benchmark invocation (thread 0 only).
   if (state.thread_index() == 0) {
-    shared_keys = generate_prefixed_keys(kDatasetSize);
-    shared_val = make_value();
-    shared_db = std::make_unique<typename A::Db>(
-        "rww", &shared_keys, &shared_val);
     writer_stop.store(false, std::memory_order_relaxed);
     writer_thread = std::thread([] {
       std::size_t wi = 0;
@@ -883,12 +843,10 @@ void BM_ReadWhileWriting(benchmark::State &state) {
       static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
   attach_jitter(state, samples);
 
+  // Stop background writer (thread 0 only); DB persists across calibration.
   if (state.thread_index() == 0) {
     writer_stop.store(true, std::memory_order_relaxed);
     writer_thread.join();
-    shared_db.reset();
-    shared_keys.clear();
-    shared_val.clear();
   }
 }
 

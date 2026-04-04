@@ -356,6 +356,7 @@ private:
 // calls fdatasync; all others wait on the epoch advance. This amortises the
 // ~2 ms fdatasync cost across N concurrent writers.
 // ---------------------------------------------------------------------------
+// TODO: I wonder if this shouldn't be moved to data_file
 class SyncGroup {
 public:
   void sync(DataFile &file) {
@@ -917,7 +918,7 @@ private:
 
   // Seals the active file and opens a new one. Returns a new EngineState.
   [[nodiscard]] auto rotate_active_file(EngineState s) const -> EngineState {
-    s.active_file().sync();
+    s.active_file().sync(); // shouldn't we use SyncGroup for this? 
     s.active_file().seal();
     return s.apply_rotation(dir_);
   }
