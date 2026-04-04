@@ -349,39 +349,55 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// SyncGroup — group commit primitive for fdatasync.
+// SyncGroup — amortises fdatasync across concurrent writers.
 //
-// Multiple writers that appended to the same file share a single fdatasync.
-// The first writer to arrive after the previous sync becomes the leader and
-// calls fdatasync; all others wait on the epoch advance. This amortises the
-// ~2 ms fdatasync cost across N concurrent writers.
+// fdatasync is expensive (~2 ms). When N writers finish their writev at
+// roughly the same time, one fdatasync can cover all of them. SyncGroup
+// batches those writers so only one actually issues the syscall fdatasync 
+// while the rest wait and piggyback on its result.
+//
+// Precondition: callers must have completed their writev before entering
+// sync(). fdatasync only flushes data already in the page cache.
+//
+// Invariant: sync() does not return to a caller until an fdatasync that
+// started *after* that caller's writev has completed successfully.
 // ---------------------------------------------------------------------------
-// TODO: I wonder if this shouldn't be moved to data_file
 class SyncGroup {
 public:
   void sync(DataFile &file) {
     std::unique_lock lk{mu_};
-    const auto my_epoch = epoch_;
-    if (syncing_) {
-      if (syncing_file_ == &file) {
-        // Same file — the in-flight fdatasync covers our append.
-        cv_.wait(lk, [&] { return epoch_ > my_epoch; });
-        return;
-      }
-      // Different file (rotation happened) — wait for current sync to finish,
-      // then become leader for our own file.
-      cv_.wait(lk, [&] { return !syncing_; });
-    }
+
+    // Phase 1: take a ticket — our writev is done, data is in page cache.
+    const auto my_ticket = next_ticket_++;
+
+    // Phase 2: wait until covered by a completed sync, or become leader.
+    cv_.wait(lk, [&] {
+      return current_synced_ticket_ >= my_ticket || !syncing_;
+    });
+
+    // A sync that started after our writev already covered us.
+    if (current_synced_ticket_ >= my_ticket) return;
+
+    // Phase 3: we are the leader — snapshot the watermark, sync, notify.
     syncing_ = true;
-    syncing_file_ = &file;
+    const auto batch_end = next_ticket_ - 1;
     lk.unlock();
 
-    file.sync();
+    try {
+      file.sync();
+    } catch (...) {
+      // If sync fails, reset the syncing flag and wake up waiters so they can 
+      // retry (or handle their own failure). Do not advance the synced ticket.
+      lk.lock();
+      syncing_ = false;
+      lk.unlock();
+      cv_.notify_all();
+      throw; // Rethrow the exception to the caller
+    }
 
     lk.lock();
-    ++epoch_;
+    current_synced_ticket_ = batch_end;
     syncing_ = false;
-    syncing_file_ = nullptr;
     lk.unlock();
     cv_.notify_all();
   }
@@ -389,9 +405,9 @@ public:
 private:
   std::mutex mu_;
   std::condition_variable cv_;
-  std::uint64_t epoch_{0};
-  bool syncing_{false};
-  DataFile *syncing_file_{nullptr};
+  std::uint64_t next_ticket_{1};            // next ticket to hand out
+  std::uint64_t current_synced_ticket_{0};  // highest ticket on disk
+  bool syncing_{false};                     // is an fdatasync in flight?
 };
 
 // Default active-file size threshold: 64 MiB.
@@ -918,7 +934,7 @@ private:
 
   // Seals the active file and opens a new one. Returns a new EngineState.
   [[nodiscard]] auto rotate_active_file(EngineState s) const -> EngineState {
-    s.active_file().sync(); // shouldn't we use SyncGroup for this? 
+    s.active_file().sync();
     s.active_file().seal();
     return s.apply_rotation(dir_);
   }
