@@ -268,13 +268,12 @@ struct BcAdapter {
   }
 };
 
-// BcAdapterStale: identical to BcAdapter but get() uses consistent_read=false
-// (thread-local snapshot refreshed every snapshot_ttl). Lets BM_GetMT compare
-// the atomic-per-call path vs the TTL-cached path under concurrency.
+// BcAdapterStale: identical to BcAdapter but get() uses bounded staleness
+// (thread-local snapshot refreshed every staleness_tolerance). Lets BM_GetMT
+// compare the session path vs the bounded-staleness path under concurrency.
 struct BcAdapterStale : BcAdapter {
   static void get(Db &db, const std::string &k) {
     bytecask::ReadOptions ro;
-    ro.consistent_read = false;
     ro.staleness_tolerance = std::chrono::milliseconds{100};
     bytecask::Bytes value;
     auto found = db.engine.get(ro, bc_key(k), value);
@@ -952,7 +951,7 @@ BENCH(BM_GetMT<Bc>)                ->Name("ByteCask/GetMT")                ->Thr
 BENCH(BM_GetMT<Bc>)                ->Name("ByteCask/GetMT")                ->Threads(8);
 BENCH(BM_GetMT<Bc>)                ->Name("ByteCask/GetMT")                ->Threads(16);
 BENCH(BM_GetMT<Bc>)                ->Name("ByteCask/GetMT")                ->Threads(32);
-// consistent_read=false: thread-local snapshot, refreshed after staleness_tolerance.
+// Bounded staleness: thread-local snapshot, refreshed after staleness_tolerance.
 BENCH(BM_GetMT<BcAdapterStale>)    ->Name("ByteCask/GetMT/StaleRead")     ->Threads(2);
 BENCH(BM_GetMT<BcAdapterStale>)    ->Name("ByteCask/GetMT/StaleRead")     ->Threads(4);
 BENCH(BM_GetMT<BcAdapterStale>)    ->Name("ByteCask/GetMT/StaleRead")     ->Threads(8);
