@@ -72,3 +72,7 @@ These instructions apply to every repository work request in this workspace.
 - Wrap ugly or unsafe low-level calls (e.g. `reinterpret_cast` through a legacy C-style API) in a small named function so the cast appears once and call sites stay readable (C++ Core Guidelines ES.50 / T.69).
 - Use `std::ssize` (C++20) instead of casting `.size()` to a signed type.
 - Prefer `std::filesystem` utilities over manual file-handle tricks (e.g. `std::filesystem::file_size`).
+
+## Tips
+
+* xmake can take a while to run, wait for the build to run before trying to do something else. 
