@@ -110,8 +110,30 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
 
   5. release write_mu_
 
-  6. fdatasync()   ← outside write_mu_; DataFile kept alive by a captured shared_ptr
+  6. sync_group_.sync(file)   ← group commit; see below
 ```
+
+##### Group commit (`SyncGroup`)
+
+After releasing `write_mu_`, the writer calls `sync_group_.sync(file)` instead
+of `file->sync()` directly. `SyncGroup` batches concurrent writers so that a
+single `fdatasync` covers all of them:
+
+- The first writer to arrive after the previous sync becomes the **leader**.
+- Subsequent writers that arrive while the leader's `fdatasync` is in flight
+  **wait** on a condition variable — their data is already in the page cache,
+  so the leader's `fdatasync` covers them.
+- When `fdatasync` returns, the leader bumps a monotonic epoch and wakes all
+  waiters.
+
+This amortises the ~2 ms `fdatasync` cost across N concurrent writers instead
+of serialising N × 2 ms.
+
+**Historical note**: BC-051 removed an earlier `GroupWriter` implementation
+because benchmarks showed no benefit. Those benchmarks ran on tmpfs where
+`fdatasync` is a no-op (~0 ns). Re-benchmarking on a real block device
+(ext4 on NVMe) confirmed that `fdatasync` costs ~2 ms and serialised syncs are
+the dominant bottleneck for concurrent writes.
 
 ##### Read path (no lock, no mutex)
 

@@ -822,3 +822,42 @@ TEST_CASE("Bytecask concurrent mixed get/put/del", "[bytecask][concurrency]") {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Test: group commit — concurrent sync writers produce correct results
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask group commit correctness", "[bytecask][concurrency]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  constexpr int kWritesPerThread = 50;
+  constexpr int kThreads = 8;
+
+  auto worker = [&](int thread_id) {
+    for (int i = 0; i < kWritesPerThread; ++i) {
+      auto key = std::format("gc_t{}_{:04d}", thread_id, i);
+      auto val = std::format("gv_t{}_{:04d}", thread_id, i);
+      db.put(bytecask::WriteOptions{.sync = true}, to_bytes(key),
+             to_bytes(val));
+    }
+  };
+
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back(worker, t);
+  }
+  for (auto &t : threads) {
+    t.join();
+  }
+
+  // All keys must be present with correct values.
+  for (int t = 0; t < kThreads; ++t) {
+    for (int i = 0; i < kWritesPerThread; ++i) {
+      auto key = std::format("gc_t{}_{:04d}", t, i);
+      auto expected_val = std::format("gv_t{}_{:04d}", t, i);
+      auto result = db.get({}, to_bytes(key));
+      REQUIRE(result.has_value());
+      CHECK(to_string(*result) == expected_val);
+    }
+  }
+}

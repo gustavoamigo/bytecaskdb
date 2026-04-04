@@ -3,11 +3,12 @@
 benchmarks/engine_bench_results.csv for longitudinal performance tracking.
 
 Usage:
-    python3 scripts/run_engine_bench.py [--skip-build] [--full] [--dataset-size N] [-- <extra benchmark flags>]
+    python3 scripts/run_engine_bench.py [--skip-build] [--full] [--dataset-size N] [--tmpdir DIR] [-- <extra benchmark flags>]
 
     --skip-build      Skip the xmake build step (binary must already exist).
     --full            Run with 1 000 000 keys (full benchmark). Default is 50 000 (light).
     --dataset-size N  Run with exactly N keys.
+    --tmpdir DIR      Override TMPDIR for benchmark data (default: ./.tmp).
     Extra flags after '--' are forwarded to the benchmark binary.
 
 CSV columns:
@@ -21,6 +22,7 @@ CSV columns:
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -91,7 +93,7 @@ def build(skip: bool) -> None:
     subprocess.run(["xmake", "build", BENCH_TARGET], check=True, cwd=REPO_ROOT)
 
 
-def run_benchmark(extra_flags: list[str], dataset_size: int) -> dict:
+def run_benchmark(extra_flags: list[str], dataset_size: int, tmpdir: str) -> dict:
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         out_path = tmp.name
     try:
@@ -102,7 +104,8 @@ def run_benchmark(extra_flags: list[str], dataset_size: int) -> dict:
         ] + extra_flags
         env = os.environ.copy()
         env["BC_DATASET_SIZE"] = str(dataset_size)
-        print(f"Running: BC_DATASET_SIZE={dataset_size} {' '.join(cmd)}")
+        env["TMPDIR"] = tmpdir
+        print(f"Running: TMPDIR={tmpdir} BC_DATASET_SIZE={dataset_size} {' '.join(cmd)}")
         subprocess.run(cmd, check=True, cwd=REPO_ROOT, env=env)
         with open(out_path, encoding="utf-8") as f:
             return json.load(f)
@@ -189,6 +192,8 @@ def main() -> None:
     else:
         dataset_size = 50_000
 
+    tmpdir = str(REPO_ROOT / ".tmp")
+
     for arg in list(args):
         if arg.startswith("--dataset-size="):
             dataset_size = int(arg.split("=", 1)[1])
@@ -198,6 +203,16 @@ def main() -> None:
             dataset_size = int(args[idx + 1])
             args.remove(args[idx + 1])
             args.remove(arg)
+        elif arg.startswith("--tmpdir="):
+            tmpdir = arg.split("=", 1)[1]
+            args.remove(arg)
+        elif arg == "--tmpdir":
+            idx = args.index(arg)
+            tmpdir = args[idx + 1]
+            args.remove(args[idx + 1])
+            args.remove(arg)
+
+    os.makedirs(tmpdir, exist_ok=True)
 
     # Strip leading '--' separator for extra benchmark flags.
     if "--" in args:
@@ -209,8 +224,12 @@ def main() -> None:
     build(skip_build)
     git_commit = get_git_commit()
     memory_gb = get_memory_gb()
-    data = run_benchmark(extra_flags, dataset_size)
-    append_results(data, git_commit, memory_gb)
+    try:
+        data = run_benchmark(extra_flags, dataset_size, tmpdir)
+        append_results(data, git_commit, memory_gb)
+    finally:
+        if os.path.isdir(tmpdir):
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

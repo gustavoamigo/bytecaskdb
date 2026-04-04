@@ -1,6 +1,7 @@
 module;
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -347,6 +348,51 @@ private:
   mutable bool has_cached_{false};
 };
 
+// ---------------------------------------------------------------------------
+// SyncGroup — group commit primitive for fdatasync.
+//
+// Multiple writers that appended to the same file share a single fdatasync.
+// The first writer to arrive after the previous sync becomes the leader and
+// calls fdatasync; all others wait on the epoch advance. This amortises the
+// ~2 ms fdatasync cost across N concurrent writers.
+// ---------------------------------------------------------------------------
+class SyncGroup {
+public:
+  void sync(DataFile &file) {
+    std::unique_lock lk{mu_};
+    const auto my_epoch = epoch_;
+    if (syncing_) {
+      if (syncing_file_ == &file) {
+        // Same file — the in-flight fdatasync covers our append.
+        cv_.wait(lk, [&] { return epoch_ > my_epoch; });
+        return;
+      }
+      // Different file (rotation happened) — wait for current sync to finish,
+      // then become leader for our own file.
+      cv_.wait(lk, [&] { return !syncing_; });
+    }
+    syncing_ = true;
+    syncing_file_ = &file;
+    lk.unlock();
+
+    file.sync();
+
+    lk.lock();
+    ++epoch_;
+    syncing_ = false;
+    syncing_file_ = nullptr;
+    lk.unlock();
+    cv_.notify_all();
+  }
+
+private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::uint64_t epoch_{0};
+  bool syncing_{false};
+  DataFile *syncing_file_{nullptr};
+};
+
 // Default active-file size threshold: 64 MiB.
 export inline constexpr std::uint64_t kDefaultRotationThreshold =
     64ULL * 1024 * 1024;
@@ -489,7 +535,7 @@ public:
       state_time_.store(now_ns(), std::memory_order_release);
     }
     if (file_to_sync) {
-      file_to_sync->sync();
+      sync_group_.sync(*file_to_sync);
     }
   }
 
@@ -518,7 +564,7 @@ public:
       state_time_.store(now_ns(), std::memory_order_release);
     }
     if (file_to_sync) {
-      file_to_sync->sync();
+      sync_group_.sync(*file_to_sync);
     }
     return true;
   }
@@ -585,7 +631,7 @@ public:
       state_time_.store(now_ns(), std::memory_order_release);
     }
     if (file_to_sync) {
-      file_to_sync->sync();
+      sync_group_.sync(*file_to_sync);
     }
   }
 
@@ -891,6 +937,9 @@ private:
   std::atomic<std::int64_t> state_time_{0};
   // Serialises writers (put, del, apply_batch). Readers never acquire this.
   std::unique_ptr<std::mutex> write_mu_{std::make_unique<std::mutex>()};
+  // Group commit: batches concurrent fdatasync calls so one sync covers
+  // multiple writers. See design doc "Group commit" section.
+  SyncGroup sync_group_;
 };
 
 } // namespace bytecask
