@@ -6,16 +6,19 @@ module;
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <ranges>
 #include <span>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <time.h>
 #include <utility>
 #include <variant>
@@ -410,6 +413,90 @@ private:
   bool syncing_{false};                     // is an fdatasync in flight?
 };
 
+// ---------------------------------------------------------------------------
+// BackgroundWorker — single persistent background thread for deferred work.
+//
+// Tasks are enqueued via dispatch() and executed in FIFO order. dispatch() is
+// non-blocking; the caller returns immediately after enqueuing. Exceptions
+// thrown by tasks are caught, logged to stderr, and swallowed — hint file
+// writes are correctness-safe to drop (recovery falls back to raw data scan).
+//
+// Lifecycle: the thread starts at construction and joins at destruction.
+// drain() blocks until the queue is empty and the last task has finished.
+//
+// Declare BackgroundWorker as the LAST member of any owning class so that
+// it destructs first, ensuring the background thread joins before any other
+// member (e.g. dir_, state_) is destroyed.
+// ---------------------------------------------------------------------------
+class BackgroundWorker {
+public:
+  BackgroundWorker() : thread_{[this] { run(); }} {}
+
+  ~BackgroundWorker() {
+    {
+      std::unique_lock lk{mu_};
+      stop_ = true;
+    }
+    cv_task_.notify_one();
+    thread_.join();
+  }
+
+  BackgroundWorker(const BackgroundWorker &) = delete;
+  BackgroundWorker &operator=(const BackgroundWorker &) = delete;
+
+  // Enqueue a task. Non-blocking; returns immediately.
+  void dispatch(std::function<void()> task) {
+    {
+      std::unique_lock lk{mu_};
+      queue_.push(std::move(task));
+    }
+    cv_task_.notify_one();
+  }
+
+  // Block until the queue is empty and the running task (if any) has finished.
+  void drain() {
+    std::unique_lock lk{mu_};
+    cv_idle_.wait(lk, [this] { return queue_.empty() && active_ == 0; });
+  }
+
+private:
+  void run() {
+    while (true) {
+      std::function<void()> task;
+      {
+        std::unique_lock lk{mu_};
+        cv_task_.wait(lk, [this] { return stop_ || !queue_.empty(); });
+        if (stop_ && queue_.empty())
+          return;
+        task = std::move(queue_.front());
+        queue_.pop();
+        ++active_;
+      }
+      try {
+        task();
+      } catch (const std::exception &e) {
+        std::cerr << "bytecask: background worker exception: " << e.what()
+                  << "\n";
+      } catch (...) {
+        std::cerr << "bytecask: background worker: unknown exception\n";
+      }
+      {
+        std::unique_lock lk{mu_};
+        --active_;
+      }
+      cv_idle_.notify_all();
+    }
+  }
+
+  std::mutex mu_;
+  std::condition_variable cv_task_;
+  std::condition_variable cv_idle_;
+  std::queue<std::function<void()>> queue_;
+  std::size_t active_{0};
+  bool stop_{false};
+  std::thread thread_;
+};
+
 // Default active-file size threshold: 64 MiB.
 export inline constexpr std::uint64_t kDefaultRotationThreshold =
     64ULL * 1024 * 1024;
@@ -486,13 +573,15 @@ public:
   Bytecask(Bytecask &&) = delete;
   Bytecask &operator=(Bytecask &&) = delete;
 
-  // Flush hints and sync the active file before destruction.
+  // Sync the active file before destruction.
+  // hint files for sealed files are handled by the BackgroundWorker, which
+  // destructs first (declared last) and drains all pending tasks before any
+  // other member is destroyed.
   ~Bytecask() {
     auto s = state_.load();
     if (s->files && !s->files->empty()) {
       try {
         s->files->at(s->active_file_id)->sync();
-        flush_hints(*s);
       } catch (...) {
         // Best-effort: swallow errors in destructors.
       }
@@ -687,38 +776,49 @@ public:
   // ".hint" are skipped. Called automatically at engine close (~Bytecask).
   //
   // Hint files are never written on the write path (predictable latency).
+  // Drains all background hint tasks first, then writes any remaining files
+  // synchronously. Draining before the synchronous loop avoids racing with
+  // in-flight background tasks on the same .hint.tmp file.
   void flush_hints() {
+    worker_.drain();
     flush_hints(*state_.load());
   }
 
 private:
+  // Writes the hint file for a single sealed data file using the temp-then-rename
+  // protocol. Idempotent: skips files whose .hint already exists.
+  static void flush_hints_for(const std::shared_ptr<DataFile> &file,
+                              const std::filesystem::path &dir) {
+    const auto stem = file->path().stem().string();
+    const auto hint_path = dir / (stem + ".hint");
+    const auto tmp_path = dir / (stem + ".hint.tmp");
+
+    if (std::filesystem::exists(hint_path)) {
+      return;
+    }
+
+    auto hint = HintFile::OpenForWrite(tmp_path);
+    Offset off = 0;
+    while (auto result = file->scan(off)) {
+      const auto &[entry, next] = *result;
+      if (entry.entry_type == EntryType::Put ||
+          entry.entry_type == EntryType::Delete) {
+        hint.append(entry.sequence, entry.entry_type, off, entry.key,
+                    narrow<std::uint32_t>(entry.value.size()));
+      }
+      off = next;
+    }
+    hint.sync();
+    std::filesystem::rename(tmp_path, hint_path);
+  }
+
   // Writes hint files for all sealed data files in the given state.
   void flush_hints(const EngineState &s) {
-    for (auto &file : *s.files) {
-      if (file.first == s.active_file_id) {
+    for (auto &[file_id, file] : *s.files) {
+      if (file_id == s.active_file_id) {
         continue;
       }
-      const auto stem = file.second->path().stem().string();
-      const auto hint_path = dir_ / (stem + ".hint");
-      const auto tmp_path = dir_ / (stem + ".hint.tmp");
-
-      if (std::filesystem::exists(hint_path)) {
-        continue;
-      }
-
-      auto hint = HintFile::OpenForWrite(tmp_path);
-      Offset off = 0;
-      while (auto result = file.second->scan(off)) {
-        const auto &[entry, next] = *result;
-        if (entry.entry_type == EntryType::Put ||
-            entry.entry_type == EntryType::Delete) {
-          hint.append(entry.sequence, entry.entry_type, off, entry.key,
-                      narrow<std::uint32_t>(entry.value.size()));
-        }
-        off = next;
-      }
-      hint.sync();
-      std::filesystem::rename(tmp_path, hint_path);
+      flush_hints_for(file, dir_);
     }
   }
 
@@ -815,7 +915,7 @@ private:
       // at this moment.
       const auto apply_put = [&](std::uint64_t seq, std::uint64_t file_off,
                                  std::uint32_t val_size,
-                                 const std::vector<std::byte> &key) {
+                                 std::span<const std::byte> key) {
         const auto k = Key{key};
         const auto tomb_it = tombstones.find(k);
         if (tomb_it != tombstones.end() && tomb_it->second >= seq) {
@@ -834,7 +934,7 @@ private:
       };
 
       const auto apply_del = [&](std::uint64_t seq,
-                                 const std::vector<std::byte> &key) {
+                                 std::span<const std::byte> key) {
         const auto k = Key{key};
         auto &tomb_seq = tombstones[k];
         if (seq > tomb_seq)
@@ -853,7 +953,7 @@ private:
       if (std::filesystem::exists(hint_path)) {
         auto hint = HintFile::OpenForRead(hint_path);
         Offset off = 0;
-        while (auto r = hint.scan(off)) {
+        while (auto r = hint.scan_view(off)) {
           const auto &[he, next] = *r;
           if (he.entry_type == EntryType::Put) {
             apply_put(he.sequence, he.file_offset, he.value_size, he.key);
@@ -932,10 +1032,18 @@ private:
     return s;
   }
 
-  // Seals the active file and opens a new one. Returns a new EngineState.
+  // Seals the active file, opens a new one, and dispatches hint file writing
+  // for the now-sealed file to the background worker. Returns a new EngineState.
+  // fdatasync on the sealed file remains synchronous for durability correctness.
   [[nodiscard]] auto rotate_active_file(EngineState s) const -> EngineState {
     s.active_file().sync();
     s.active_file().seal();
+    // Capture the sealed file before apply_rotation changes active_file_id.
+    auto sealed = s.files->at(s.active_file_id);
+    auto dir = dir_;
+    worker_.dispatch([f = std::move(sealed), d = std::move(dir)] {
+      flush_hints_for(f, d);
+    });
     return s.apply_rotation(dir_);
   }
 
@@ -960,6 +1068,10 @@ private:
   // Group commit: batches concurrent fdatasync calls so one sync covers
   // multiple writers. See design doc "Group commit" section.
   SyncGroup sync_group_;
+  // Background worker for deferred hint file writes (BC-026).
+  // Declared last so it destructs first, joining the background thread before
+  // any other member (dir_, state_, files) is destroyed.
+  mutable BackgroundWorker worker_;
 };
 
 } // namespace bytecask

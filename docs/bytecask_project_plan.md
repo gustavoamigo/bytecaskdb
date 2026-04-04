@@ -15,8 +15,6 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-065 | Reduce atomic traffic on read path | `load_state` returns `const&` to thread-local snapshot (no shared_ptr refcount bump). `get_impl` uses raw `const Node*` pointers (no IntrusivePtr acq_rel traffic per tree level). Both safe: TL snapshot anchors root, persistent tree never mutates shared nodes. |
-| BC-059 | Replace bitsery with ByteWriter/ByteReader | Unify serialization: add cursor-based `ByteWriter`/`ByteReader` to `serialization.cppm`, migrate `data_entry.cppm` and `hint_entry.cppm` + `hint_file.cppm` scan, remove bitsery dependency. |
 
 ## Backlog
 
@@ -26,17 +24,18 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-047 | Vacuum: absorb tiny compacted files into active file | After the 1:1 rewrite, if the compacted file falls below a `min_file_bytes` threshold, append its live entries (preserving original LSNs) to the active file under `write_mu_` instead of leaving a tiny standalone sealed file. Reduces fd count and recovery time. `write_mu_` hold time increases proportionally to surviving entry count \u2014 only appropriate for very small files. |
 | BC-048 | Full vacuum (multi-file merge with tombstone elision) | Process all sealed files in a single commit. Safe to drop tombstones because no unprocessed Put for any deleted key can survive. Separate from conservative vacuum. |
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
-| BC-024 | Implement PMR - Memory Allocation described in design | Note: There is a draft proposal in the bytecask_design.md
-| BC-026 | Run `flush_hints` in background after file rotate | After rotation, dispatch `flush_hints()` on the sealed file to a background thread so it does not block the write path. Also review the synchronous `fdatasync` added to `rotate_active_file()` — it adds tail-latency spikes to `sync=false` writes that hit the rotation threshold. Consider making it async (ties into BC-045). |
-| BC-045 | `fdatasync` sealed file after rotation (async) | When a data file is rotated to immutable, schedule an `fdatasync` on it in a background thread. Ensures sealed files are durable without accumulating a large dirty-page backlog that would penalise the next `sync=true` write. Requires a background thread or thread pool (not yet implemented). Note: rotation now always does a sync synchronously; this item is about making it async. |
 | BC-041 | `ReadOptions::verify_checksums` flag | Allow skipping CRC verification on bulk scans for ~5% win. Mirrors LevelDB/RocksDB `verify_checksums` option. |
-| BC-027 | Add Mixed/Sync benchmark | Added BC_Mixed_Sync and LDB_Mixed_Sync (1000 iter, 3 reps); results recorded 2026-04-02. Moved to backlog — no open work remaining. |
 
 
 ## Done
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-067 | HintFile scan_view + read mode exploration | Added `scan_view()` (zero-copy `HintEntryView` with span key); recovery path switched to `scan_view()`. Explored `OpenForReadMmap` (−44% isolated scan, SIGBUS risk) and `OpenForReadDirect` (−9%); both removed from production — mmap is unsafe, O_DIRECT offers no benefit warm. `BM_HintFileScan` benchmark (pread + scan_view) retained. Recovery bottleneck is tree construction, not parsing. 76 tests pass. |
+| --- | --- | --- |
+| BC-026 | Run `flush_hints` in background after file rotate | Added `BackgroundWorker` (single persistent thread, FIFO dispatch, drain on destruct) to `bytecask.engine`. Extracted `flush_hints_for(shared_ptr<DataFile>, path)` helper; `rotate_active_file()` dispatches it to the worker after sealing. Destructor no longer calls `flush_hints()` — worker drains before any member destructs (declared last). `fdatasync` stays synchronous per BC-045 decision. Added `BM_Recovery/WithHints` and `BM_Recovery/NoHints` benchmarks; baseline: 173 ms / 80 ms at 50k keys / 1 MiB threshold. 76 tests pass (1.1M+ assertions). |
+| BC-065 | Reduce atomic traffic on read path | `load_state` returns `const&` to thread-local snapshot (no shared_ptr refcount bump). `get_impl` uses raw `const Node*` pointers (no IntrusivePtr acq_rel traffic per tree level). Both safe: TL snapshot anchors root, persistent tree never mutates shared nodes. |
+| BC-059 | Replace bitsery with ByteWriter/ByteReader | Unify serialization: add cursor-based `ByteWriter`/`ByteReader` to `serialization.cppm`, migrate `data_entry.cppm` and `hint_entry.cppm` + `hint_file.cppm` scan, remove bitsery dependency. |
 | BC-064 | Group commit (`SyncGroup`) for concurrent sync writes | Ticket-based group commit: each writer takes a monotonic ticket after writev; leader snapshots watermark, calls fdatasync once covering all tickets. Also includes exception safety fix to avoid permanent deadlocks on I/O throws. |
 | BC-066 | Static benchmark setup to avoid repeated DB creation | Made `keys`, `val`, and `db` `static` in all single-threaded benchmark templates (`BM_Put`, `BM_Get`, `BM_Del`, `BM_Range`, `BM_Mixed`, `BM_MixedBatch`). Google Benchmark calls the function multiple times during iteration calibration; the previous non-static setup re-created and re-populated the DB (1M keys × 1 KiB) on every call. The multithreaded templates already used `static`. |
 | BC-062 | `ReadOptions::consistent_read` stale-read mode | Added `consistent_read{true}` to `ReadOptions`. `load_state()` uses a version-check approach: writers bump `state_version_` (`atomic<uint64_t>`, release) after `state_.store()`; stale readers compare with a thread-local `local_version` via a single relaxed load (plain MOV on x86). Snapshot refreshes only when state has actually changed — zero locked instructions on the hot path. Benchmarked: +1.7% at 2T, +8% at 4T, +18% at 8T, +201% at 16T; p99 at 16T: 816 µs → 100 µs. |
@@ -93,3 +92,10 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-012 | Migrate tests to Catch2 | Replaced hand-rolled `fail()`/`expect()` harness with Catch2 v3. `TEST_CASE`/`CHECK`/`REQUIRE` macros, Catch2's own `main()`, randomized test order. 3 test cases, 28 assertions. |
 | BC-035 | Leaf node optimization: pointer-to-children | Replace `SmallVector<..., 1> children` (32 B always) with `unique_ptr<ChildVec>` (8 B null for leaves). 94% of nodes are leaves and pay only 8 B pointer instead of 32 B empty SmallVector. Node struct: 80→56 B. Measured: 86 B/key generic (−20% from intrusive, −33% from original), 92 B/key prefixed (−21% from intrusive, −34% from original). 82 tests pass (1M+ assertions). ASan clean. |
 | BC-027 | Write lock to enforce SWMR contract | `std::shared_mutex` (heap-allocated via `unique_ptr`) in `Bytecask`. Writers take `unique_lock`; readers take brief `shared_lock` to snapshot key_dir_ + files_ then release before I/O. `WriteOptions::try_lock` (default `false`) enables non-blocking attempts that throw `system_error(resource_unavailable_try_again)` on contention. |
+
+## Archive
+
+| ID | Title | Note |
+| --- | --- | --- |
+| BC-045 | `fdatasync` sealed file after rotation (async) | Archived — `fdatasync` in `rotate_active_file()` stays synchronous for correctness and simplicity. Background hint flush (BC-026) defers the expensive I/O work instead. |
+| BC-024 | Implement PMR - Memory Allocation described in design | Note: There is a draft proposal in the bytecask_design.md

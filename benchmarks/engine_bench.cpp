@@ -52,6 +52,9 @@
 
 // ByteCask (C++20 modules)
 import bytecask.engine;
+import bytecask.hint_entry;
+import bytecask.hint_file;
+import bytecask.types;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -850,6 +853,134 @@ void BM_ReadWhileWriting(benchmark::State &state) {
   }
 }
 
+// ──────────────────────────── Recovery ───────────────────────────────────────
+// Measures startup recovery time: Bytecask::open() on a pre-populated
+// directory. All timing is on the open() call only; setup and teardown are in
+// PauseTiming regions.
+//
+// Two variants:
+//   WithHints  (true)  — all sealed files have a companion .hint file.
+//                        Recovery reads the compact 27-byte-per-entry hint
+//                        entries instead of the full data file.
+//   NoHints    (false) — .hint files are deleted before each open().
+//                        Recovery falls back to raw .data scan.
+//
+// Static setup (runs once):
+//   Opens a fresh DB with a 1 MiB rotation threshold to seat ~dataset_size/1024
+//   files, populates it, calls flush_hints(), then closes.
+//
+// Per-iteration:
+//   NoHints: deletes all .hint files in PauseTiming so open() must raw-scan.
+//   Both:    times only Bytecask::open(). The DB is destructed in PauseTiming
+//            to exclude any close-time hint writing from the measurement. The
+//            destructor re-writes any missing hint files, restoring the
+//            directory for the next WithHints iteration.
+
+namespace {
+void delete_hint_files(const std::filesystem::path &dir) {
+  for (const auto &e : std::filesystem::directory_iterator{dir}) {
+    if (e.path().extension() == ".hint")
+      std::filesystem::remove(e.path());
+  }
+}
+} // namespace
+
+template <bool WithHints> void BM_Recovery(benchmark::State &state) {
+  // 1 MiB threshold → each file holds ~1024 keys (1 KiB values).
+  static constexpr std::uint64_t kRecoveryThreshold = 64ULL * 1024 * 1024;
+  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto val = make_value();
+  static TmpDir recovery_dir{"recovery"};
+
+  // One-time setup: populate the directory and write all hint files.
+  static const bool kSetupDone = [&] {
+    {
+      auto db = bytecask::Bytecask::open(recovery_dir.path, kRecoveryThreshold);
+      bytecask::WriteOptions wo;
+      const auto n = keys.size();
+      for (std::size_t i = 0; i < n; ++i) {
+        wo.sync = (i % 1000 == 999) || (i == n - 1);
+        db.put(wo, bc_key(keys[i]), bc_val(val));
+      }
+      db.flush_hints();
+      // db destructs here, closing fds; hint files already written.
+    }
+    return true;
+  }();
+  (void)kSetupDone;
+
+  // Bytecask is non-movable, so std::optional cannot emplace from open()'s
+  // return value. This thin wrapper copy-initialises the Bytecask member,
+  // triggering mandatory copy elision (C++17), avoiding any move/copy.
+  struct Handle {
+    bytecask::Bytecask db;
+    explicit Handle(const std::filesystem::path &p, std::uint64_t threshold)
+        : db{bytecask::Bytecask::open(p, threshold)} {}
+  };
+
+  std::unique_ptr<Handle> handle;
+
+  for (auto _ : state) {
+    state.PauseTiming();
+    if constexpr (!WithHints)
+      delete_hint_files(recovery_dir.path);
+    state.ResumeTiming();
+
+    // Timed: open() performs recovery by scanning hint or data files.
+    handle = std::make_unique<Handle>(recovery_dir.path, kRecoveryThreshold);
+
+    state.PauseTiming();
+    // Destruct outside the timed region. The destructor re-writes any missing
+    // hint files (idempotent for WithHints; restores state for NoHints).
+    handle.reset();
+    state.ResumeTiming();
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.counters["opens_per_s"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+}
+
+// ──────────── HintFile Scan ──────────────────────────────────────────────────
+// Measures the combined cost of opening a pre-written hint file and scanning
+// all entries to completion via pread + scan_view() — matching the production
+// recovery path. File is warm in the OS page cache after the first iteration.
+void BM_HintFileScan(benchmark::State &state) {
+  static TmpDir scan_dir{"hint_scan_pread"};
+  static std::filesystem::path hint_path;
+  static const bool kSetupDone = [&] {
+    hint_path = scan_dir.path / "scan.hint";
+    auto hf = bytecask::HintFile::OpenForWrite(hint_path);
+    for (std::size_t i = 0; i < kDatasetSize; ++i) {
+      const auto key = std::to_string(i);
+      hf.append(static_cast<std::uint64_t>(i), bytecask::EntryType::Put,
+                static_cast<std::uint64_t>(i) * (kValueSize + 27ULL),
+                std::as_bytes(std::span{key.data(), key.size()}),
+                static_cast<std::uint32_t>(kValueSize));
+    }
+    hf.sync();
+    return true;
+  }();
+  (void)kSetupDone;
+
+  std::int64_t total = 0;
+  for (auto _ : state) {
+    auto hf = bytecask::HintFile::OpenForRead(hint_path);
+    bytecask::Offset off = 0;
+    std::int64_t n = 0;
+    while (auto r = hf.scan_view(off)) {
+      off = r->second;
+      ++n;
+    }
+    benchmark::DoNotOptimize(off);
+    total += n;
+  }
+  state.SetItemsProcessed(total);
+  state.counters["entries_per_iter"] = benchmark::Counter(
+      static_cast<double>(total) / static_cast<double>(state.iterations()),
+      benchmark::Counter::kDefaults);
+}
+
 // ===========================================================================
 // Registration
 // clang-format off
@@ -872,6 +1003,13 @@ BENCH(BM_Del<Bc, true>)           ->Name("ByteCask/Del/Sync");
 BENCH(BM_Get<Bc>)                 ->Name("ByteCask/Get");
 BENCH(BM_Range<Bc, kRangeLen>)    ->Name("ByteCask/Range50");
 BENCH(BM_Mixed<Bc, true>)         ->Name("ByteCask/Mixed/Sync");
+
+// --- Recovery (startup time) ---
+BENCH(BM_Recovery<true>)  ->Name("ByteCask/Recovery/WithHints");
+BENCH(BM_Recovery<false>) ->Name("ByteCask/Recovery/NoHints");
+
+// --- HintFile Scan ---
+BENCH(BM_HintFileScan)->Name("ByteCask/HintFile/Scan");
 
 // --- LevelDB ---
 BENCH(BM_Put<Ldb, false>)          ->Name("LevelDB/Put/NoSync");

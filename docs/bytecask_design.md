@@ -297,7 +297,7 @@ Each data file transitions through three phases in sequence:
 | Phase | Description |
 |-------|-------------|
 | **Active** | The current append target; accepts all writes. |
-| **Rotating** | Closed to new writes; a companion `.hint` file is being written atomically. |
+| **Rotating** | Sealed (`fdatasync` + `seal()`); a companion `.hint` file is being written by the background worker. |
 | **Immutable** | The `.hint` file exists; the data file is sealed and read-only. |
 
 A new active data file is always created on engine startup.
@@ -512,7 +512,17 @@ We use fine-grained C++20 modules:
 - Re-opening the fd purely for semantic enforcement adds syscall overhead and complexity without improving correctness for the production path.
 - A `sealed_` flag with `assert(!sealed_)` at the top of `append()` is sufficient: it catches programming errors in debug builds at zero production cost.
 
-Contrast with `HintFile`, which uses `OpenForWrite` / `OpenForRead` factory functions. That split models two *externally visible*, non-overlapping lifecycles at different call sites: one site writes during `flush_hints()`, a completely separate site reads during recovery. Encoding that distinction in the type prevents mixing them up. `DataFile` has no equivalent external semantic split.
+Contrast with `HintFile`, which uses `OpenForWrite` / `OpenForRead` factory functions. That split models externally visible, non-overlapping lifecycles at different call sites: one site writes during `flush_hints()`, a completely separate site reads during recovery. Encoding that distinction in the type prevents mixing them up. `DataFile` has no equivalent external semantic split.
+
+### HintFile read modes
+
+`HintFile` exposes one read-only factory function used in the production recovery path:
+
+| Factory | Mechanism | Key alloc | I/O error handling |
+|---|---|---|---|
+| `OpenForRead` | Single `pread` into heap `vector` | per `scan()` call | `std::system_error` |
+
+`HintFile::scan_view()` returns a `HintEntryView` whose `key` is a `std::span<const std::byte>` into the backing buffer — zero allocation per entry. The production recovery path uses `scan_view()` so that every hint entry parsed during `Bytecask::open()` avoids a heap allocation for the key. `scan()` (owning `HintEntry`, `key` as `std::vector`) is retained for tests and any caller that needs to outlive the `HintFile`.
 
 ## Hint File Format (.hint)
 
@@ -927,6 +937,40 @@ One improvement originally introduced for `GroupWriter` was **retained** because
 - **`rotate_active_file()` always fdatasyncs before sealing** — ensures prior `sync=false` writes are durable before the file becomes immutable.
 
 The full design and implementation are preserved in git history (see BC-049 in the project plan).
+
+---
+
+## Background Worker
+
+`BackgroundWorker` is a non-exported internal class in `bytecask.engine`. It maintains a single persistent background thread that processes tasks in FIFO order.
+
+### API
+
+```cpp
+class BackgroundWorker {
+public:
+  BackgroundWorker();
+  ~BackgroundWorker();                        // drains, then joins thread
+  void dispatch(std::function<void()> task);  // non-blocking enqueue
+  void drain();                               // block until idle
+};
+```
+
+### Lifetime invariant
+
+`BackgroundWorker` is declared as the **last member** of `Bytecask`. C++ destruction order is reverse of declaration order, so `worker_` destructs first — its destructor sets `stop_ = true`, notifies the worker thread, and joins it. This guarantees the background thread has finished all tasks before any other `Bytecask` member (`dir_`, `state_`, `write_mu_`, etc.) is destroyed. There is no risk of the background thread accessing freed memory.
+
+### Exception handling
+
+Exceptions thrown by background tasks are caught per-task, logged to `stderr`, and swallowed. Hint file writes are correctness-safe to drop: recovery always falls back to scanning the raw `.data` file if no `.hint` companion exists.
+
+### BC-026: deferred hint file writes
+
+After `rotate_active_file()` seals a data file, it captures a `shared_ptr<DataFile>` to the sealed file and dispatches `flush_hints_for(file, dir)` to the worker. The `shared_ptr` keeps the `DataFile` fd alive for the duration of the background task regardless of what the engine state does subsequently.
+
+The synchronous path in `flush_hints(EngineState&)` (called by the public `flush_hints()` method) reuses the same `flush_hints_for` helper, guaranteeing consistent hint-writing behaviour between the background and synchronous paths.
+
+The `~Bytecask()` destructor no longer calls `flush_hints()` explicitly. Because `worker_` destructs first and drains all pending tasks, every sealed file that was rotated during the engine's lifetime will have had its hint file written (or the write attempted) before the engine shuts down.
 
 ---
 

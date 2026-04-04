@@ -151,3 +151,5 @@ TEST_CASE("HintFile CRC mismatch throws", "[hintfile]") {
   auto hf = bytecask::HintFile::OpenForRead(tmp);
   CHECK_THROWS_AS(hf.scan(0), std::runtime_error);
 }
+
+
