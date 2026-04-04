@@ -370,20 +370,23 @@ export struct WriteOptions {
 };
 
 // Controls consistency behaviour for read operations (get, contains_key).
+// Two modes:
+//   Session (default, staleness_tolerance = 0): read-your-writes guaranteed.
+//     Thread-local snapshot refreshes whenever any write occurs.
+//   Bounded staleness (staleness_tolerance > 0): snapshot may be up to
+//     staleness_tolerance old. Same-thread put→get may return stale data.
+//     Use for write-heavy workloads where read throughput matters more than
+//     freshness.
 export struct ReadOptions {
-  // When true (default), every call does a fresh atomic load of the engine
-  // state — always sees the latest write. When false, each thread caches
-  // the state snapshot in a thread-local and refreshes it only when the
-  // last write is older than staleness_tolerance. The hot path is a single
-  // relaxed load of an int64_t (plain MOV on x86) — no refcount traffic,
-  // no locked instructions, no clock read on the reader side.
-  bool consistent_read{false};
-
   // Maximum age of the cached snapshot before the reader refreshes it.
-  // Only meaningful when consistent_read is false; ignored otherwise.
+  // 0 (default): refresh on every write — session consistency.
+  // > 0: refresh only when the last write is older than this value —
+  //      bounded staleness.
   // The writer timestamps each state publication with steady_clock::now();
   // the reader compares that timestamp via a cheap relaxed load, never
-  // calling the clock itself.
+  // calling the clock itself. The hot path is a single relaxed load of an
+  // int64_t (plain MOV on x86) — no refcount traffic, no locked
+  // instructions, no clock read on the reader side.
   std::chrono::milliseconds staleness_tolerance{0};
 };
 
@@ -672,15 +675,12 @@ private:
     state_time_.store(now_ns(), std::memory_order_release);
   }
 
-  // Returns the engine state, either fresh or from a thread-local cache.
-  // When consistent_read is false, the hot path is a single relaxed load of
-  // state_time_ (plain MOV on x86). The snapshot is refreshed only when the
-  // last write timestamp exceeds staleness_tolerance.
+  // Returns the engine state from a thread-local cache.
+  // The hot path is a single relaxed load of state_time_ (plain MOV on x86).
+  // The snapshot is refreshed only when the last write timestamp exceeds
+  // staleness_tolerance (session mode: tolerance=0, refreshes on every write).
   [[nodiscard]] auto load_state(const ReadOptions &opts) const
       -> std::shared_ptr<const EngineState> {
-    if (opts.consistent_read) {
-      return state_.load();
-    }
     struct TlState {
       std::shared_ptr<const EngineState> snapshot;
       std::int64_t last_write_time{0};
