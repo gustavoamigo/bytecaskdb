@@ -275,7 +275,7 @@ struct BcAdapterStale : BcAdapter {
   static void get(Db &db, const std::string &k) {
     bytecask::ReadOptions ro;
     ro.consistent_read = false;
-    ro.staleness_tolerance = std::chrono::milliseconds{0};
+    ro.staleness_tolerance = std::chrono::milliseconds{100};
     bytecask::Bytes value;
     auto found = db.engine.get(ro, bc_key(k), value);
     benchmark::DoNotOptimize(found);

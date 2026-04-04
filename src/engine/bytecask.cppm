@@ -377,14 +377,14 @@ export struct ReadOptions {
   // last write is older than staleness_tolerance. The hot path is a single
   // relaxed load of an int64_t (plain MOV on x86) — no refcount traffic,
   // no locked instructions, no clock read on the reader side.
-  bool consistent_read{true};
+  bool consistent_read{false};
 
   // Maximum age of the cached snapshot before the reader refreshes it.
   // Only meaningful when consistent_read is false; ignored otherwise.
   // The writer timestamps each state publication with steady_clock::now();
   // the reader compares that timestamp via a cheap relaxed load, never
   // calling the clock itself.
-  std::chrono::milliseconds staleness_tolerance{100};
+  std::chrono::milliseconds staleness_tolerance{0};
 };
 
 // ---------------------------------------------------------------------------
