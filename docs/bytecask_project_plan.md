@@ -36,6 +36,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-061 | Remove immer dependency | Replaced `immer::array<std::byte>` in `Key` with `std::vector<std::byte>`. Removed `add_requires("immer")` and all `add_packages(... "immer" ...)` entries from `xmake.lua`. immer was the only remaining use after BC-060 removed `PersistentOrderedMap`. All tests pass. |
 | BC-060 | Remove PersistentOrderedMap | Deleted `persistent_ordered_map.cppm`, `persistent_ordered_map_test.cpp`, and `OMapAdapter` benchmarks from `map_bench.cpp`. Engine uses `PersistentRadixTree` exclusively.  |
 | BC-058 | Zero-copy `append()` via `writev()` | Replaced `serialize_entry` + `::write()` with `::writev()` scatter-gather. Header + CRC in fixed 19-byte member buffer; key and value as direct iovecs — no heap alloc, no memcpy of key/value. Mixed/NoSync +31%, Mixed/Sync +55%, MixedBatch/Sync +60%, MixedMT/Sync/16T +105%, Del/NoSync +41%. Single-writer Put within noise. 89 tests pass (1M+ assertions). |
 | BC-056 | `DataFile::read_value` high-level read method | Added `read_value(offset, key_size, value_size, io_buf, out)` to `DataFile` — combines `read_entry` + `extract_value_into` into a single call. Updated `Bytecask::get()` and `EntryIterator` to use it, removing the two-step pattern and the TODO. `extract_value_into` remains exported from `data_entry` for other uses but is no longer called from the engine module. 88 tests pass (1M+ assertions). |
