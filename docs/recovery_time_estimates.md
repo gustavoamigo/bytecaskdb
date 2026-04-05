@@ -86,11 +86,24 @@ then a pairwise fan-in merge combines results in ⌈log₂(W)⌉ rounds.
 | 8 | 567 | 5.04× | 0.71% |
 | 16 | 503 | 5.68× | 4.56% |
 
-Scaling is sub-linear: the sequential fan-in merge phase grows with total
-keys, and memory bandwidth saturates beyond 8 threads. The practical sweet
-spot is **8 threads** (~5× speedup with low variance). The 1T serial
-baseline routes through `recover_existing_files()` (original serial path),
-not the parallel path with 1 worker.
+Scaling is sub-linear: the pairwise fan-in merge grows with total keys and
+the radix tree's pointer-chasing insertion is cache-miss-bound at large
+dataset sizes. The practical sweet spot is the **physical core count** of the
+recovery machine:
+
+- **8-core machine (16 vCPU, local):** 16T achieves 5.68× at 10M keys,
+  marginally better than 8T's 5.04×. HT threads help slightly because tree
+  insertions generate L3 cache misses that HT can hide.
+- **16-core machine (32 vCPU, AWS):** 32T achieves **8.66×** at 10M keys.
+  For smaller datasets (1M) that fit in L3, 16T is the sweet spot (6.49×)
+  and 32T regresses because there are no stalls for HT to hide.
+
+General rule: set `recovery_threads` to physical core count for small-to-medium
+datasets; for very large datasets (≥10M keys, tree spills L3) the full vCPU
+count can provide additional gain.
+
+The 1T serial baseline routes through `recover_existing_files()` (original
+serial path), not the parallel path with 1 worker.
 
 ---
 
@@ -105,36 +118,58 @@ The model used for serial extrapolation:
 
 $$T_{\text{serial}}(N) \approx 277\,\text{ms} \times \left(\frac{N}{10^6}\right)^{1.05}$$
 
-For parallel recovery at 8 threads (measured 5.04× at 10M keys):
+For parallel recovery, speedup scales with physical core count. Measured
+speedups at 10M keys:
 
-$$T_{\text{8T}}(N) \approx \frac{T_{\text{serial}}(N)}{5}$$
+| Machine | Threads | Speedup |
+|---------|---------|--------|
+| 8-core / 16 vCPU (local, SATA SSD) | 8T | 5.0× |
+| 8-core / 16 vCPU (local, SATA SSD) | 16T | 5.7× |
+| 16-core / 32 vCPU (AWS, SATA-speed NVMe) | 32T | 8.7× |
+
+$$T_{\text{parallel}}(N, W) \approx \frac{T_{\text{serial}}(N)}{S(W)}$$
+
+where $S(W)$ is the measured speedup for $W$ threads on the target machine.
+Use $S \approx 5$ for 8 physical cores; speedup scales approximately linearly
+with physical core count (measured ~8.7× on 16 physical cores at 10M keys).
 
 Cold-cache I/O adds hint file read time on top. Hint file size is
 $N \times 65\,\text{bytes}$.
 
 | Storage tier | Sequential read bandwidth | Cold-start I/O overhead |
 |---|---|---|
-| NVMe SSD | ~3 GB/s | $N \times 65\,\text{B} \div 3\,\text{GB/s}$ |
+| NVMe SSD (datacenter / consumer) | ~3 GB/s | $N \times 65\,\text{B} \div 3\,\text{GB/s}$ |
 | SATA SSD | ~500 MB/s | $N \times 65\,\text{B} \div 500\,\text{MB/s}$ |
+| AWS instance store NVMe (small instances) | ~400–500 MB/s | treat as SATA tier |
+
+> **Note on AWS instance store:** measured at 437 MB/s sequential write with
+> `oflag=direct` on a 32-vCPU instance. AWS throttles instance store I/O
+> per-instance rather than exposing raw device speed; only larger instance
+> types (e.g. `c5d.4xlarge`+) approach 2+ GB/s. Use the SATA column for
+> cold-start estimates on small-to-medium AWS instances.
 
 ---
 
 ## Estimates for target database sizes
 
-Values assume 1 KB average value size. All times round to the nearest
-second for large figures. "Serial" is recovery_threads=1, "8T" is
-recovery_threads=8 (~5× speedup).
+Values assume 1 KB average value size. All times round to the nearest second
+for large figures. "Serial" is recovery_threads=1. "16T" uses the measured
+5.68× speedup on the **8-core test machine** (recovery_threads=16). "32T†"
+uses the measured 8.66× speedup from a 16-core/32-vCPU AWS machine at 10M
+keys — larger-dataset rows are extrapolated from that point.
 
-### WithHints (normal restart)
+† Requires recovery_threads=32 on a ≥16-core machine.
 
-| DB size | Keys | Serial | 8T parallel | + NVMe I/O (serial) | + NVMe I/O (8T) |
-|---------|------|--------|-------------|---------------------|-----------------|
-| 10 GB   | 9.2 M   | ~2.9 s   | ~0.6 s  | **3.1 s**  | **0.8 s**  |
-| 100 GB  | 92 M    | ~32 s    | ~6.4 s  | **34 s**   | **8.4 s**  |
-| 1 TB    | 922 M   | ~6 min   | ~72 s   | **~6.3 min** | **~92 s**  |
-| 2 TB    | 1.84 B  | ~12.4 min | ~2.5 min | **~13 min** | **~3.2 min** |
+### WithHints (normal restart) - Estimation based on Benchmarks
 
-### NoHints (hint files missing or corrupted — scans raw data files)
+| DB size | Keys | Serial | 16T | 32T† | + NVMe I/O (serial) | + NVMe I/O (16T) | + NVMe I/O (32T†) |
+|---------|------|--------|-----|------|---------------------|------------------|-------------------|
+| 10 GB   | 9.2 M   | ~2.9 s   | ~0.5 s | ~0.3 s | **3.1 s**  | **0.7 s**  | **0.5 s**  |
+| 100 GB  | 92 M    | ~32 s    | ~5.6 s | ~3.7 s | **34 s**   | **7.6 s**  | **5.7 s**  |
+| 1 TB    | 922 M   | ~6 min   | ~63 s  | ~42 s  | **~6.3 min** | **~83 s** | **~62 s**  |
+| 2 TB    | 1.84 B  | ~12.4 min | ~2.2 min | ~86 s | **~13 min** | **~2.8 min** | **~2.1 min** |
+
+### NoHints (hint files missing or corrupted — scans raw data files) - Estimation based on Benchmarks
 
 NoHints recovery is ~6× slower at scale because data files are 16× larger than
 hint files, and every entry is fully deserialised including the value header.
@@ -149,7 +184,7 @@ Parallel recovery does not apply to NoHints (it operates on hint files only).
 
 ---
 
-## Memory requirement: the real ceiling
+## Memory requirement: the real ceiling - Estimation based on Benchmarks
 
 ByteCask holds the entire key directory in RAM. The radix tree uses
 approximately **80–120 bytes per key** accounting for key bytes and internal
@@ -173,15 +208,12 @@ The key/memory relationship does not change with value size — larger values
 reduce key count for the same DB size, making ByteCask *more* practical at
 scale. For example:
 
-| Average value size | Keys in 1 TB | Key directory RAM | Serial recovery | 8T parallel |
-|---|---|---|---|---|
-| 1 KB   | 922 M | ~80–100 GB | ~6.3 min (NVMe) | ~92 s (NVMe) |
-| 64 KB  | 14.5 M | ~1.3 GB    | ~5 s (NVMe) | ~1 s (NVMe) |
-| 1 MB   | 953 k  | ~85 MB     | < 1 s (NVMe) | < 1 s (NVMe) |
+| Average value size | Keys in 1 TB | Key directory RAM | Serial recovery | 16T | 32T† |
+|---|---|---|---|---|---|
+| 1 KB   | 922 M | ~80–100 GB | ~6.3 min (NVMe) | ~83 s (NVMe) | ~62 s (NVMe) |
+| 64 KB  | 14.5 M | ~1.3 GB    | ~5 s (NVMe) | ~1.2 s (NVMe) | ~0.9 s (NVMe) |
+| 1 MB   | 953 k  | ~85 MB     | < 1 s (NVMe) | < 1 s (NVMe) | < 1 s (NVMe) |
 
-ByteCask is best suited to **value-heavy workloads** where the value/key
-byte ratio is large and the total unique-key count stays well within available
-RAM.
 
 ---
 
