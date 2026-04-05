@@ -921,3 +921,263 @@ TEST_CASE("RadixTree copy and move semantics", "[radix_tree]") {
   CHECK(t6.size() == 3U);
   CHECK(t6.contains(to_bytes("z")));
 }
+
+// ---------------------------------------------------------------------------
+// merge: disjoint trees — no key conflicts
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree merge disjoint trees", "[radix_tree][merge]") {
+  auto a = Tree{}.set(to_bytes("apple"), 1).set(to_bytes("avocado"), 2);
+  auto b = Tree{}.set(to_bytes("banana"), 3).set(to_bytes("blueberry"), 4);
+
+  auto merged = Tree::merge(a, b, [](int, int r) { return r; });
+
+  CHECK(merged.size() == 4U);
+  CHECK(*merged.get(to_bytes("apple")) == 1);
+  CHECK(*merged.get(to_bytes("avocado")) == 2);
+  CHECK(*merged.get(to_bytes("banana")) == 3);
+  CHECK(*merged.get(to_bytes("blueberry")) == 4);
+
+  // Originals unmodified.
+  CHECK(a.size() == 2U);
+  CHECK(b.size() == 2U);
+}
+
+// ---------------------------------------------------------------------------
+// merge: conflicting key — resolver picks b
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree merge conflict resolver picks b", "[radix_tree][merge]") {
+  auto a = Tree{}.set(to_bytes("key"), 1).set(to_bytes("only_a"), 10);
+  auto b = Tree{}.set(to_bytes("key"), 2).set(to_bytes("only_b"), 20);
+
+  auto merged = Tree::merge(a, b, [](int, int bv) { return bv; });
+
+  CHECK(merged.size() == 3U);
+  CHECK(*merged.get(to_bytes("key")) == 2);   // b wins
+  CHECK(*merged.get(to_bytes("only_a")) == 10);
+  CHECK(*merged.get(to_bytes("only_b")) == 20);
+}
+
+// ---------------------------------------------------------------------------
+// merge: conflicting key — resolver picks a
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree merge conflict resolver picks a", "[radix_tree][merge]") {
+  auto a = Tree{}.set(to_bytes("key"), 100);
+  auto b = Tree{}.set(to_bytes("key"), 999);
+
+  auto merged = Tree::merge(a, b, [](int av, int) { return av; });
+
+  CHECK(merged.size() == 1U);
+  CHECK(*merged.get(to_bytes("key")) == 100);  // a wins
+}
+
+// ---------------------------------------------------------------------------
+// merge: empty inputs
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree merge with empty trees", "[radix_tree][merge]") {
+  const Tree empty;
+  auto t = Tree{}.set(to_bytes("x"), 7);
+  auto resolve = [](int, int r) { return r; };
+
+  auto m1 = Tree::merge(empty, t, resolve);
+  CHECK(m1.size() == 1U);
+  CHECK(*m1.get(to_bytes("x")) == 7);
+
+  auto m2 = Tree::merge(t, empty, resolve);
+  CHECK(m2.size() == 1U);
+  CHECK(*m2.get(to_bytes("x")) == 7);
+
+  auto m3 = Tree::merge(empty, empty, resolve);
+  CHECK(m3.empty());
+}
+
+// ---------------------------------------------------------------------------
+// merge: key is prefix of another key across trees
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree merge prefix relationship across trees",
+          "[radix_tree][merge]") {
+  auto a = Tree{}.set(to_bytes("abc"), 1);
+  auto b = Tree{}.set(to_bytes("abcdef"), 2);
+
+  auto merged = Tree::merge(a, b, [](int, int r) { return r; });
+
+  CHECK(merged.size() == 2U);
+  CHECK(*merged.get(to_bytes("abc")) == 1);
+  CHECK(*merged.get(to_bytes("abcdef")) == 2);
+}
+
+// ---------------------------------------------------------------------------
+// merge: overlapping prefix/suffix split
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree merge overlapping prefix split", "[radix_tree][merge]") {
+  // a has "foo" and "foobar"; b has "foo" (conflict) and "foobaz"
+  auto a = Tree{}.set(to_bytes("foo"), 1).set(to_bytes("foobar"), 2);
+  auto b = Tree{}.set(to_bytes("foo"), 99).set(to_bytes("foobaz"), 3);
+
+  auto merged = Tree::merge(a, b, [](int, int bv) { return bv; });
+
+  CHECK(merged.size() == 3U);
+  CHECK(*merged.get(to_bytes("foo")) == 99);    // b wins conflict
+  CHECK(*merged.get(to_bytes("foobar")) == 2);
+  CHECK(*merged.get(to_bytes("foobaz")) == 3);
+}
+
+// ---------------------------------------------------------------------------
+// merge: result is sorted (iterator visits keys in order)
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree merge result is ordered", "[radix_tree][merge]") {
+  auto a = Tree{}.set(to_bytes("cherry"), 3).set(to_bytes("apple"), 1);
+  auto b = Tree{}.set(to_bytes("banana"), 2).set(to_bytes("date"), 4);
+
+  auto merged = Tree::merge(a, b, [](int, int r) { return r; });
+
+  std::vector<std::string> keys;
+  for (auto [k, v] : merged)
+    keys.push_back(to_string(k));
+
+  CHECK(keys == std::vector<std::string>{"apple", "banana", "cherry", "date"});
+}
+
+// ---------------------------------------------------------------------------
+// merge: large overlapping sets — size consistency
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree merge large overlapping sets", "[radix_tree][merge]") {
+  // Build two trees with significant overlap by using a transient for speed.
+  auto ta = Tree{}.transient();
+  auto tb = Tree{}.transient();
+  for (int i = 0; i < 500; ++i) {
+    auto k = std::to_string(i);
+    ta.set(to_bytes(k), i);
+    if (i % 2 == 0)
+      tb.set(to_bytes(k), i + 1000);  // 250 conflicts
+    else
+      tb.set(to_bytes(std::to_string(i + 500)), i + 500);  // 250 disjoint
+  }
+  auto a = std::move(ta).persistent();
+  auto b = std::move(tb).persistent();
+
+  auto merged = Tree::merge(a, b, [](int, int bv) { return bv; });
+
+  // All 500 a-keys present + 250 disjoint b-keys.
+  CHECK(merged.size() == 750U);
+  // Spot-check: conflicting keys should have b's value.
+  CHECK(*merged.get(to_bytes("0")) == 1000);
+  CHECK(*merged.get(to_bytes("2")) == 1002);
+  // Disjoint b key: when i=1, key="501", value=i+500=501.
+  CHECK(*merged.get(to_bytes("501")) == 501);
+}
+
+// ---------------------------------------------------------------------------
+// merge: model-based property test against std::map oracle
+//
+// Two trees (and two maps) are populated with random keys using the same
+// seed. The trees are merged with the same resolver as the maps. Every
+// invariant — size, key presence, values, iteration order, lower_bound —
+// is verified against the oracle.
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree merge model-based", "[radix_tree][merge]") {
+  std::uint32_t seed = 0xABCD1234u;
+  auto next_rand = [&]() -> std::uint32_t {
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;
+    return seed;
+  };
+
+  auto rand_key = [&]() -> std::string {
+    auto len = (next_rand() % 8) + 1;
+    std::string k;
+    for (std::uint32_t i = 0; i < len; ++i)
+      k += static_cast<char>('a' + (next_rand() % 6));
+    return k;
+  };
+
+  // Resolver: higher value wins (analogous to higher-LSN wins).
+  auto resolve = [](int av, int bv) { return bv > av ? bv : av; };
+
+  // Run multiple rounds with different tree sizes.
+  for (int n : {10, 100, 500, 2000}) {
+    std::map<std::string, int> map_a, map_b;
+    auto ta = Tree{}.transient();
+    auto tb = Tree{}.transient();
+
+    for (int i = 0; i < n; ++i) {
+      auto ka = rand_key();
+      int  va = static_cast<int>(next_rand() % 10000);
+      ta.set(to_bytes(ka), va);
+      map_a[ka] = va;
+
+      auto kb = rand_key();
+      int  vb = static_cast<int>(next_rand() % 10000);
+      tb.set(to_bytes(kb), vb);
+      map_b[kb] = vb;
+    }
+
+    auto tree_a = std::move(ta).persistent();
+    auto tree_b = std::move(tb).persistent();
+
+    // Build oracle: merge map_a and map_b with the same resolver.
+    std::map<std::string, int> oracle = map_a;
+    for (auto& [k, v] : map_b) {
+      auto it = oracle.find(k);
+      if (it == oracle.end())
+        oracle[k] = v;
+      else
+        it->second = resolve(it->second, v);
+    }
+
+    auto merged = Tree::merge(tree_a, tree_b, resolve);
+
+    INFO("n=" << n);
+
+    // Size.
+    CHECK(merged.size() == oracle.size());
+
+    // Every oracle key present with correct value.
+    for (auto& [k, v] : oracle) {
+      INFO("key=" << k);
+      REQUIRE(merged.contains(to_bytes(k)));
+      CHECK(*merged.get(to_bytes(k)) == v);
+    }
+
+    // No extra keys in the tree.
+    for (auto it = merged.begin(); it != merged.end(); ++it) {
+      auto [k, v] = *it;
+      auto s = to_string(k);
+      INFO("tree key=" << s);
+      REQUIRE(oracle.count(s) > 0);
+      CHECK(oracle.at(s) == v);
+    }
+
+    // Iteration order matches oracle.
+    {
+      auto tree_it = merged.begin();
+      for (auto& [ok, ov] : oracle) {
+        REQUIRE(tree_it != merged.end());
+        auto [tk, tv] = *tree_it;
+        CHECK(to_string(tk) == ok);
+        CHECK(tv == ov);
+        ++tree_it;
+      }
+      CHECK(tree_it == merged.end());
+    }
+
+    // lower_bound: spot-check 20 random probes against the oracle.
+    for (int p = 0; p < 20; ++p) {
+      auto probe = rand_key();
+      auto t_lb  = merged.lower_bound(to_bytes(probe));
+      auto o_lb  = oracle.lower_bound(probe);
+      if (o_lb == oracle.end()) {
+        CHECK(t_lb == merged.end());
+      } else {
+        REQUIRE(t_lb != merged.end());
+        auto [tk, tv] = *t_lb;
+        CHECK(to_string(tk) == o_lb->first);
+        CHECK(tv == o_lb->second);
+      }
+    }
+
+    // Originals unchanged.
+    CHECK(tree_a.size() == map_a.size());
+    CHECK(tree_b.size() == map_b.size());
+  }
+}

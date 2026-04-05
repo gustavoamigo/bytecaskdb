@@ -962,7 +962,7 @@ private:
           }
           off = next;
         }
-      } else {
+      } else { // TODO: I think this part is unnecessary, we should generate the missing hint files before start recovery. It's a lot easier and the code is already there. 
         // Raw scan with a BulkBegin/BulkEnd batch state machine.
         // Entries between BulkBegin and BulkEnd are buffered and applied
         // only when BulkEnd is seen. An incomplete batch — BulkBegin with

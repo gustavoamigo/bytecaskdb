@@ -519,6 +519,15 @@ public:
 
   [[nodiscard]] auto transient() const -> TransientRadixTree<V>;
 
+  // Merge two trees. On key conflicts, resolve(a_val, b_val) picks the winner.
+  // Disjoint subtrees are shared in O(1) via IntrusivePtr copy.
+  // Size of the result is computed in O(N) after the merge.
+  template <typename ResolveFunc>
+  [[nodiscard]] static auto merge(const PersistentRadixTree &a,
+                                  const PersistentRadixTree &b,
+                                  ResolveFunc &&resolve)
+      -> PersistentRadixTree;
+
   // Iteration
   [[nodiscard]] auto begin() const -> RadixTreeIterator<V>;
   [[nodiscard]] auto end() const -> std::default_sentinel_t {
@@ -734,6 +743,128 @@ private:
       merged_prefix.push_back(child->prefix[i]);
     child->prefix = std::move(merged_prefix);
     return child;
+  }
+
+  // -- merge_impl --
+  // Recursively merges two subtrees rooted at `a` and `b`.
+  // Disjoint subtrees are shared in O(1) via IntrusivePtr copy (no clone).
+  // Size of the merged tree is computed by the caller via count_keys().
+  template <typename ResolveFunc>
+  static auto merge_impl(const IntrusivePtr<Node<V>> &a,
+                         const IntrusivePtr<Node<V>> &b,
+                         ResolveFunc &&resolve) -> IntrusivePtr<Node<V>> {
+    if (!a)
+      return b;
+    if (!b)
+      return a;
+
+    // Align the two nodes on their common prefix.
+    auto pa = std::span<const std::byte>{a->prefix.data(), a->prefix.size()};
+    auto pb = std::span<const std::byte>{b->prefix.data(), b->prefix.size()};
+    auto cpl = common_prefix_length(pa, pb);
+
+    if (cpl < pa.size() && cpl < pb.size()) {
+      // The two prefixes diverge — build a split node with the common prefix,
+      // then place trimmed a and trimmed b as its two children.
+      auto split = make_intrusive<Node<V>>();
+      for (std::size_t i = 0; i < cpl; ++i)
+        split->prefix.push_back(pa[i]);
+
+      auto a_trimmed = a->clone();
+      typename Node<V>::Prefix a_suffix;
+      for (std::size_t i = cpl + 1; i < pa.size(); ++i)
+        a_suffix.push_back(pa[i]);
+      a_trimmed->prefix = std::move(a_suffix);
+      split->insert_child(pa[cpl], std::move(a_trimmed));
+
+      auto b_trimmed = b->clone();
+      typename Node<V>::Prefix b_suffix;
+      for (std::size_t i = cpl + 1; i < pb.size(); ++i)
+        b_suffix.push_back(pb[i]);
+      b_trimmed->prefix = std::move(b_suffix);
+      split->insert_child(pb[cpl], std::move(b_trimmed));
+
+      return split;
+    }
+
+    if (cpl < pa.size()) {
+      // b's prefix is fully consumed — b's node sits *above* a in the trie.
+      // Build result based on b; insert a under b at transition pa[cpl].
+      auto new_b = b->clone();
+      auto a_trimmed = a->clone();
+      typename Node<V>::Prefix a_suffix;
+      for (std::size_t i = cpl + 1; i < pa.size(); ++i)
+        a_suffix.push_back(pa[i]);
+      a_trimmed->prefix = std::move(a_suffix);
+
+      auto *existing = new_b->find_child_mut(pa[cpl]);
+      if (existing) {
+        existing->second = merge_impl(a_trimmed, existing->second,
+                                      std::forward<ResolveFunc>(resolve));
+      } else {
+        new_b->insert_child(pa[cpl], std::move(a_trimmed));
+      }
+      return new_b;
+    }
+
+    if (cpl < pb.size()) {
+      // a's prefix is fully consumed — a's node sits *above* b in the trie.
+      // Build result based on a; insert b under a at transition pb[cpl].
+      auto new_a = a->clone();
+      auto b_trimmed = b->clone();
+      typename Node<V>::Prefix b_suffix;
+      for (std::size_t i = cpl + 1; i < pb.size(); ++i)
+        b_suffix.push_back(pb[i]);
+      b_trimmed->prefix = std::move(b_suffix);
+
+      auto *existing = new_a->find_child_mut(pb[cpl]);
+      if (existing) {
+        existing->second = merge_impl(existing->second, b_trimmed,
+                                      std::forward<ResolveFunc>(resolve));
+      } else {
+        new_a->insert_child(pb[cpl], std::move(b_trimmed));
+      }
+      return new_a;
+    }
+
+    // Full prefix match — both nodes share the same compressed key prefix.
+    // Clone a and fold b's value + children into it.
+    auto merged = a->clone();
+
+    if (b->has_value()) {
+      if (merged->has_value())
+        merged->set_value(resolve(merged->value_, b->value_));
+      else
+        merged->set_value(b->value_);
+    }
+
+    if (b->has_children()) {
+      for (std::size_t i = 0; i < b->child_count(); ++i) {
+        auto [tb, child_b] = b->child_at(i);
+        auto *slot = merged->find_child_mut(tb);
+        if (slot) {
+          slot->second = merge_impl(slot->second, child_b,
+                                    std::forward<ResolveFunc>(resolve));
+        } else {
+          // Disjoint subtree — share it in O(1), no clone needed.
+          merged->insert_child(tb, child_b);
+        }
+      }
+    }
+
+    return merged;
+  }
+
+  // Count all value-bearing nodes in a subtree.
+  static auto count_keys(const IntrusivePtr<Node<V>> &node) -> std::size_t {
+    if (!node)
+      return 0;
+    std::size_t n = node->has_value() ? 1 : 0;
+    if (node->has_children()) {
+      for (std::size_t i = 0; i < node->child_count(); ++i)
+        n += count_keys(node->child_at(i).second);
+    }
+    return n;
   }
 
   friend class TransientRadixTree<V>;
@@ -957,6 +1088,23 @@ private:
 
   friend class PersistentRadixTree<V>;
 };
+
+// Out-of-line: PersistentRadixTree::merge()
+template <typename V>
+template <typename ResolveFunc>
+auto PersistentRadixTree<V>::merge(const PersistentRadixTree &a,
+                                   const PersistentRadixTree &b,
+                                   ResolveFunc &&resolve)
+    -> PersistentRadixTree {
+  if (!a.root_)
+    return b;
+  if (!b.root_)
+    return a;
+  auto new_root =
+      merge_impl(a.root_, b.root_, std::forward<ResolveFunc>(resolve));
+  auto sz = count_keys(new_root);
+  return PersistentRadixTree{std::move(new_root), sz};
+}
 
 // Out-of-line: PersistentRadixTree::transient()
 template <typename V>
