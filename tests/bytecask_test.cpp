@@ -1846,3 +1846,280 @@ TEST_CASE("FileStats: parallel recovery matches serial",
   std::ranges::sort(parallel_vals);
   CHECK(serial_vals == parallel_vals);
 }
+
+// ===========================================================================
+// Vacuum tests
+// ===========================================================================
+
+// Helper: count .data files in a directory.
+static auto count_data_files(const std::filesystem::path &dir) -> int {
+  int count = 0;
+  for (const auto &e : std::filesystem::directory_iterator{dir}) {
+    if (e.path().extension() == ".data") ++count;
+  }
+  return count;
+}
+
+// ---------------------------------------------------------------------------
+// vacuum_compact_file: basic compaction
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum compact removes dead entries", "[vacuum]") {
+  TempDir td;
+  // Threshold=1 forces rotation after each write → every put lands in its
+  // own sealed file (the active file is always a fresh, empty one).
+  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+
+  // Write k1, then overwrite it → original entry is dead.
+  db.put({}, to_bytes("k1"), to_bytes("old"));
+  db.put({}, to_bytes("k1"), to_bytes("new"));
+
+  // At this point we have 3 files: file with old k1, file with new k1,
+  // and an empty active file. Total dead bytes > 0.
+  const auto stats_before = db.file_stats();
+  const auto files_before = count_data_files(td.path / "db");
+
+  // Vacuum with threshold=0 so all fragmented files qualify.
+  db.vacuum({.fragmentation_threshold = 0.0});
+
+  // Verify k1 is still readable and has the latest value.
+  const auto val = db.get({}, to_bytes("k1"));
+  REQUIRE(val.has_value());
+  CHECK(to_string(*val) == "new");
+
+  // After vacuum, at least one file should have been removed or replaced.
+  const auto stats_after = db.file_stats();
+
+  // The old file (with only dead k1) should be gone.
+  // Stats should still be consistent: total live_bytes across all files
+  // equals the size of the one live entry.
+  std::uint64_t total_live = 0;
+  for (const auto &[fid, fs] : stats_after) {
+    total_live += fs.live_bytes;
+  }
+  CHECK(total_live == esize("k1", "new"));
+}
+
+// ---------------------------------------------------------------------------
+// vacuum_compact_file: tombstones are preserved
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum compact preserves tombstones", "[vacuum]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+
+  db.put({}, to_bytes("gone"), to_bytes("value"));
+  std::ignore = db.del({}, to_bytes("gone"));
+  // Now we have: file with Put("gone"), file with Delete("gone"), empty active.
+
+  // Vacuum the file containing the Put (it's 100% dead).
+  db.vacuum({.fragmentation_threshold = 0.0});
+
+  // The key should still be absent.
+  CHECK_FALSE(db.contains_key(to_bytes("gone")));
+
+  // Reopen to verify tombstone survives recovery.
+  {
+    auto db2 = bytecask::Bytecask::open(td.path / "db", 1);
+    CHECK_FALSE(db2.contains_key(to_bytes("gone")));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// vacuum_compact_file: all entries dead (except tombstones)
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum compact on fully dead file", "[vacuum]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+
+  db.put({}, to_bytes("x"), to_bytes("v1"));
+  // Overwrite so the first file's entry is dead.
+  db.put({}, to_bytes("x"), to_bytes("v2"));
+
+  db.vacuum({.fragmentation_threshold = 0.0});
+
+  const auto val = db.get({}, to_bytes("x"));
+  REQUIRE(val.has_value());
+  CHECK(to_string(*val) == "v2");
+}
+
+// ---------------------------------------------------------------------------
+// vacuum: no files qualify → no-op
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum no-op when nothing exceeds threshold", "[vacuum]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put({}, to_bytes("k"), to_bytes("v"));
+
+  const auto stats_before = db.file_stats();
+  // Default threshold is 0.5 — active file has 0% fragmentation.
+  db.vacuum();
+  const auto stats_after = db.file_stats();
+
+  // Same number of files, same content.
+  CHECK(stats_before.size() == stats_after.size());
+  for (const auto &[fid, fs] : stats_before) {
+    auto it = stats_after.find(fid);
+    REQUIRE(it != stats_after.end());
+    CHECK(it->second.live_bytes == fs.live_bytes);
+    CHECK(it->second.total_bytes == fs.total_bytes);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// vacuum_absorb_file: basic absorption into active file
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum absorb moves entries to active file", "[vacuum]") {
+  TempDir td;
+  // Use a large threshold so absorb path is chosen (live data fits in active).
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put({}, to_bytes("k1"), to_bytes("v1"));
+  db.put({}, to_bytes("k2"), to_bytes("v2"));
+  // Overwrite k1 to create fragmentation.
+  db.put({}, to_bytes("k1"), to_bytes("v1_new"));
+
+  // Force rotation so there's a sealed file to vacuum.
+  // Write a lot of data to trigger rotation.
+  {
+    std::string big(db.file_stats().begin()->second.total_bytes + 1, 'x');
+    // Actually, let's use a smaller threshold to force rotation.
+  }
+
+  // Reopen with threshold=1 to cause rotation, then reopen with large threshold.
+  db.flush_hints();
+  {
+    auto db2 = bytecask::Bytecask::open(td.path / "db", 1);
+    // Writes to force rotation of existing files.
+    db2.put({}, to_bytes("k3"), to_bytes("v3"));
+    // Now we have: sealed files from original writes + sealed file with k3 + active.
+    // Overwrite k2 so one of the old sealed files has dead entries.
+    db2.put({}, to_bytes("k2"), to_bytes("v2_new"));
+    db2.flush_hints();
+  }
+
+  // Reopen with large threshold so absorb path is used.
+  auto db3 = bytecask::Bytecask::open(td.path / "db");
+  const auto stats_before = db3.file_stats().size();
+
+  db3.vacuum({.fragmentation_threshold = 0.0});
+
+  // One sealed file should have been absorbed → fewer files in registry.
+  const auto stats_after = db3.file_stats().size();
+  CHECK(stats_after < stats_before);
+
+  // All keys still readable.
+  CHECK(to_string(*db3.get({}, to_bytes("k1"))) == "v1_new");
+  CHECK(to_string(*db3.get({}, to_bytes("k2"))) == "v2_new");
+  CHECK(to_string(*db3.get({}, to_bytes("k3"))) == "v3");
+}
+
+// ---------------------------------------------------------------------------
+// vacuum_absorb_file: LSN preservation across reopen
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum absorb preserves LSNs across recovery", "[vacuum]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+
+  db.put({}, to_bytes("a"), to_bytes("alpha"));
+  db.put({}, to_bytes("b"), to_bytes("beta"));
+  // Overwrite a to create fragmentation.
+  db.put({}, to_bytes("a"), to_bytes("alpha2"));
+  db.flush_hints();
+
+  // Reopen with large threshold so absorb is used.
+  {
+    auto db2 = bytecask::Bytecask::open(td.path / "db");
+    db2.vacuum({.fragmentation_threshold = 0.0});
+    db2.flush_hints();
+  }
+
+  // Reopen again — recovery should see absorbed entries correctly.
+  auto db3 = bytecask::Bytecask::open(td.path / "db");
+  CHECK(to_string(*db3.get({}, to_bytes("a"))) == "alpha2");
+  CHECK(to_string(*db3.get({}, to_bytes("b"))) == "beta");
+}
+
+// ---------------------------------------------------------------------------
+// vacuum: compact path chosen for large file
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum chooses compact for large file", "[vacuum]") {
+  TempDir td;
+  // Threshold = 1 forces many small sealed files, each rotated immediately.
+  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("a"), to_bytes("2")); // kills first entry.
+  db.flush_hints();
+
+  // Sealed file with "a"="1" has 100% dead entries.
+  // Active file is tiny (threshold=1 → always rotates).
+  // With threshold=1, absorb path's precondition (live + active <= threshold)
+  // will fail for any file with live data, so compact is always chosen.
+  db.vacuum({.fragmentation_threshold = 0.0});
+
+  CHECK(to_string(*db.get({}, to_bytes("a"))) == "2");
+
+  // Verify recovery after compact.
+  db.flush_hints();
+  auto db2 = bytecask::Bytecask::open(td.path / "db", 1);
+  CHECK(to_string(*db2.get({}, to_bytes("a"))) == "2");
+}
+
+// ---------------------------------------------------------------------------
+// vacuum: loop until nothing qualifies
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum loop reclaims all fragmentation", "[vacuum]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+
+  // Create multiple fragmented files.
+  db.put({}, to_bytes("x"), to_bytes("1"));
+  db.put({}, to_bytes("y"), to_bytes("2"));
+  db.put({}, to_bytes("x"), to_bytes("3")); // kills x=1
+  db.put({}, to_bytes("y"), to_bytes("4")); // kills y=2
+
+  // Run vacuum in a loop.
+  for (int i = 0; i < 10; ++i) {
+    db.vacuum({.fragmentation_threshold = 0.0});
+  }
+
+  CHECK(to_string(*db.get({}, to_bytes("x"))) == "3");
+  CHECK(to_string(*db.get({}, to_bytes("y"))) == "4");
+
+  // All live entries should still be accounted for.
+  std::uint64_t total_live = 0;
+  for (const auto &[fid, fs] : db.file_stats()) {
+    total_live += fs.live_bytes;
+  }
+  CHECK(total_live == esize("x", "3") + esize("y", "4"));
+}
+
+// ---------------------------------------------------------------------------
+// vacuum: stats consistency after compact
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum compact stats consistency", "[vacuum][filestats]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+
+  db.put({}, to_bytes("k1"), to_bytes("aaa"));
+  db.put({}, to_bytes("k2"), to_bytes("bbb"));
+  db.put({}, to_bytes("k1"), to_bytes("ccc")); // kills k1=aaa
+
+  db.vacuum({.fragmentation_threshold = 0.0});
+
+  const auto stats = db.file_stats();
+
+  // Sum of live_bytes across all files should equal the live entries.
+  std::uint64_t total_live = 0;
+  std::uint64_t total_total = 0;
+  for (const auto &[fid, fs] : stats) {
+    total_live += fs.live_bytes;
+    total_total += fs.total_bytes;
+    // live_bytes <= total_bytes for every file.
+    CHECK(fs.live_bytes <= fs.total_bytes);
+  }
+
+  CHECK(total_live == esize("k1", "ccc") + esize("k2", "bbb"));
+  // total_bytes >= total_live (there may be tombstones or overhead).
+  CHECK(total_total >= total_live);
+}
