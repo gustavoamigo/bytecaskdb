@@ -1111,8 +1111,11 @@ The `~Bytecask()` destructor no longer calls `flush_hints()` explicitly. Because
 - `src/engine/data_file.cppm`: C++23 module (`bytecask.data_file`) — `DataFile` POSIX I/O, `Offset`
 - `src/engine/hint_entry.cppm`: C++23 module (`bytecask.hint_entry`) — `HintEntry`, `serialize_entry`, `deserialize_entry`
 - `src/engine/hint_file.cppm`: C++23 module (`bytecask.hint_file`) — `HintFile`, `OpenForWrite`/`OpenForRead`
-- `src/engine/persistent_ordered_map.cppm`: C++23 module (`bytecask.persistent_ordered_map`) — `PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`
-- `src/engine/bytecask.cppm`: C++23 module (`bytecask.engine`) — `Bytecask`, `Batch`, `KeyIterator`, `EntryIterator`, type aliases
+- `src/engine/radix_tree.cppm`: C++23 module (`bytecask.radix_tree`) — `PersistentRadixTree<V>`, `RadixTreeIterator<V>`
+- `src/engine/concurrency.cppm`: C++23 module (`bytecask.concurrency`) — `SyncGroup`, `BackgroundWorker`
+- `src/engine/internals.cppm`: internal partition `bytecask.engine:internals` — `EngineState`, `FileStats`, `KeyDirEntry`, `FileRegistry`, `Key`, `StaleFile`, `VacuumMapping`, `VacuumScanResult`, `RecoveredFile`, `RecoveryResult`, `entry_size`
+- `src/engine/bytecask.cppm`: primary interface unit `bytecask.engine` — public types (`Bytes`, `BytesView`, `VacuumOptions`, `Batch`, `WriteOptions`, `ReadOptions`, `Options`, `KeyIterator`, `EntryIterator`) and `Bytecask` class declaration
+- `src/engine/bytecask.cpp`: implementation unit `bytecask.engine` — all `Bytecask` method bodies, recovery, vacuum, hint, rotation logic
 - `tests/data_entry_test.cpp`: behavior tests for data entry serialization and file append
 - `tests/hint_file_test.cpp`: behavior tests for hint file append, round-trip, and CRC panic
 - `tests/bytecask_test.cpp`: behavior tests for the full `Bytecask` engine API
