@@ -1380,7 +1380,7 @@ private:
     for (auto &[file_id, data_file, hint_path, tb] : files) {
       auto hint = HintFile::OpenForRead(hint_path);
       Offset off = 0;
-      while (auto r = hint.scan_view(off)) {
+      while (auto r = hint.scan(off)) {
         const auto &[he, next] = *r;
         if (he.entry_type == EntryType::Put) {
           const auto k = Key{he.key};
@@ -1506,7 +1506,7 @@ private:
     for (auto &[file_id, data_file, hint_path, tb] : files) {
       auto hint = HintFile::OpenForRead(hint_path);
       Offset off = 0;
-      while (auto r = hint.scan_view(off)) {
+      while (auto r = hint.scan(off)) {
         const auto &[he, next] = *r;
         if (he.entry_type == EntryType::Put) {
           const auto k = Key{he.key};

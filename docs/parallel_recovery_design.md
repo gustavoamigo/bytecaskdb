@@ -54,7 +54,7 @@ This gives two properties that unlock efficient parallelism:
                                     v  F files, IDs 0..F-1 known
     +-------------------------------------------------------------------+
     |  Reader thread pool (R threads)                                   |
-    |  Scan hint files via scan_view(). For each entry compute          |
+    |  Scan hint files via scan(). For each entry compute               |
     |  p = hash(key) % P and push into queue[p].                        |
     +-------------------------------------------------------------------+
         | queue[0]           | queue[1]   ...    | queue[P-1]
@@ -90,7 +90,7 @@ All builder threads reference it without synchronisation.
 R reader threads (default: `min(hardware_concurrency, num_hint_files)`) each:
 
 1. Open their assigned hint files via `HintFile::OpenForRead`.
-2. Scan with `scan_view()` — zero heap allocation per entry.
+2. Scan with `scan()` — zero heap allocation per entry.
 3. For each entry compute `p = fnv1a(key) % P`.
 4. Push the entry into `queues[p]`.
 
@@ -413,7 +413,7 @@ Each worker runs independently, building its own `RecoveryResult`:
 
 ```
 for each assigned (file_id, hint_path):
-    scan hint_path with HintFile::scan_view()
+    scan hint_path with HintFile::scan()
     for each hint entry:
         if Put:  apply_put(seq, file_id, file_off, val_size, key)
         if Del:  apply_del(seq, key)

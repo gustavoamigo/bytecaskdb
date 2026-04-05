@@ -31,20 +31,10 @@ export constexpr std::size_t kHintHeaderSize =
         // value_size(4)
 export constexpr std::size_t kHintCrcSize = 4; // trailing CRC
 
-// Parsed representation of a single hint file entry.
-export struct HintEntry {
-  std::uint64_t sequence{};
-  EntryType entry_type{};
-  std::uint64_t file_offset{};
-  std::vector<std::byte> key;
-  std::uint32_t value_size{};
-};
-
-// Zero-copy view of a single hint file entry.
+// Parsed hint file entry (zero-copy).
 // key is a span into the HintFile's backing buffer; valid only while the
-// HintFile is alive and scan_view() has not been called again on the same
-// offset. Use in tight scan loops where ownership is not needed.
-export struct HintEntryView {
+// HintFile is alive.
+export struct HintEntry {
   std::uint64_t sequence{};
   EntryType entry_type{};
   std::uint64_t file_offset{};
@@ -79,37 +69,10 @@ export auto serialize_entry(std::uint64_t sequence, EntryType entry_type,
 }
 
 // Deserialize a hint entry from a contiguous buffer (header + key + CRC).
-// Verifies CRC integrity. Throws std::runtime_error on CRC mismatch.
-export auto deserialize_entry(std::span<const std::byte> buf) -> HintEntry {
-  ByteReader r{buf};
-  const auto sequence = r.get<std::uint64_t>();
-  const auto entry_type = static_cast<EntryType>(r.get<std::uint8_t>());
-  const auto file_offset_val = r.get<std::uint64_t>();
-  const auto key_size = r.get<std::uint16_t>();
-  const auto value_size = r.get<std::uint32_t>();
-  auto key_span = r.get_bytes(key_size);
-
-  // CRC covers everything before the trailing 4 bytes.
-  Crc32 crc{};
-  crc.update(buf.subspan(0, buf.size() - kHintCrcSize));
-  const auto computed = crc.finalize();
-  const auto stored = read_le<std::uint32_t>(buf, buf.size() - kHintCrcSize);
-  if (computed != stored) {
-    throw std::runtime_error{
-        std::format("deserialize_entry (hint): CRC mismatch")};
-  }
-
-  return HintEntry{.sequence = sequence,
-                   .entry_type = entry_type,
-                   .file_offset = file_offset_val,
-                   .key = {key_span.begin(), key_span.end()},
-                   .value_size = value_size};
-}
-
-// Zero-copy variant: key is a span directly into buf. buf must outlive the
-// returned HintEntryView. CRC is still verified.
-export auto deserialize_entry_view(std::span<const std::byte> buf)
-    -> HintEntryView {
+// Zero-copy: key is a span directly into buf. buf must outlive the returned
+// HintEntry. CRC is verified; throws std::runtime_error on mismatch.
+export auto deserialize_entry(std::span<const std::byte> buf)
+    -> HintEntry {
   ByteReader r{buf};
   const auto sequence = r.get<std::uint64_t>();
   const auto entry_type = static_cast<EntryType>(r.get<std::uint8_t>());
@@ -124,10 +87,10 @@ export auto deserialize_entry_view(std::span<const std::byte> buf)
   const auto stored = read_le<std::uint32_t>(buf, buf.size() - kHintCrcSize);
   if (computed != stored) {
     throw std::runtime_error{
-        std::format("deserialize_entry_view (hint): CRC mismatch")};
+        std::format("deserialize_entry (hint): CRC mismatch")};
   }
 
-  return HintEntryView{.sequence = sequence,
+  return HintEntry{.sequence = sequence,
                        .entry_type = entry_type,
                        .file_offset = file_offset_val,
                        .key = key_span,

@@ -20,7 +20,7 @@ auto to_bytes(std::string_view sv) -> std::span<const std::byte> {
   return std::as_bytes(std::span{sv.data(), sv.size()});
 }
 
-auto to_string(const std::vector<std::byte> &bytes) -> std::string {
+auto to_string(std::span<const std::byte> bytes) -> std::string {
   std::string s(bytes.size(), '\0');
   std::ranges::transform(bytes, s.begin(),
                          [](std::byte b) { return static_cast<char>(b); });
