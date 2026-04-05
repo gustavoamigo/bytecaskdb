@@ -564,8 +564,9 @@ public:
   // Throws std::system_error if the directory cannot be prepared.
   [[nodiscard]] static auto
   open(std::filesystem::path dir,
-       std::uint64_t max_file_bytes = kDefaultRotationThreshold) -> Bytecask {
-    return Bytecask{std::move(dir), max_file_bytes};
+       std::uint64_t max_file_bytes = kDefaultRotationThreshold,
+       unsigned recovery_threads = 1) -> Bytecask {
+    return Bytecask{std::move(dir), max_file_bytes, recovery_threads};
   }
 
   Bytecask(const Bytecask &) = delete;
@@ -862,14 +863,19 @@ private:
     }
   }
 
-  explicit Bytecask(std::filesystem::path dir, std::uint64_t max_file_bytes)
+  explicit Bytecask(std::filesystem::path dir, std::uint64_t max_file_bytes,
+                    unsigned recovery_threads)
       : dir_{std::move(dir)}, rotation_threshold_{max_file_bytes},
         state_{std::make_shared<EngineState>()} {
     std::filesystem::create_directories(dir_);
     EngineState s;
     s.files =
         std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>();
-    s = recover_existing_files(std::move(s));
+    if (recovery_threads <= 1) {
+      s = recover_existing_files(std::move(s));
+    } else {
+      s = parallel_recover_existing_files(std::move(s), recovery_threads);
+    }
     s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
     s.files->emplace(s.active_file_id,
@@ -919,12 +925,24 @@ private:
     return std::unique_lock<std::mutex>{*write_mu_};
   }
 
-  // Reconstructs the key directory from hint files.
-  // Pre-generates missing hint files from raw data scans (batch-aware),
-  // then recovers exclusively from hints — single code path.
-  // Returns a new EngineState with key_dir populated and next_lsn set to
-  // max_seen + 1. next_file_id is advanced for each recovered file.
-  auto recover_existing_files(EngineState s) -> EngineState {
+  // Intermediate result produced by each recovery worker and consumed
+  // by the fan-in merge.
+  struct RecoveryResult {
+    PersistentRadixTree<KeyDirEntry> key_dir;
+    std::map<Key, std::uint64_t> tombstones;
+    std::uint64_t max_lsn{0};
+  };
+
+  struct RecoveredFile {
+    std::uint32_t file_id;
+    std::shared_ptr<DataFile> data_file;
+    std::filesystem::path hint_path;
+  };
+
+  // Phase 1 shared by serial and parallel recovery: remove stale .hint.tmp
+  // files, open all data files, seal them, register in s.files, and
+  // generate missing hint files. Returns the RecoveredFile list.
+  auto open_and_prepare_files(EngineState &s) -> std::vector<RecoveredFile> {
     // Remove stale .hint.tmp files from a prior crash.
     for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
       const auto &p = dir_entry.path();
@@ -933,12 +951,6 @@ private:
       }
     }
 
-    // Phase 1: open all data files and generate missing hint files.
-    struct RecoveredFile {
-      std::uint32_t file_id;
-      std::shared_ptr<DataFile> data_file;
-      std::filesystem::path hint_path;
-    };
     std::vector<RecoveredFile> files;
 
     for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
@@ -960,62 +972,206 @@ private:
       files.push_back({file_id, std::move(data_file), hint_path});
     }
 
-    // Phase 2: recover from hint files only.
+    return files;
+  }
+
+  // Builds a RecoveryResult from a subset of hint files.
+  // Each worker calls this independently — no shared mutable state.
+  static auto build_from_hints(std::span<RecoveredFile> files)
+      -> RecoveryResult {
     std::uint64_t max_lsn = 0;
-    auto transient_key_dir = s.key_dir.transient();
+    auto t = PersistentRadixTree<KeyDirEntry>{}.transient();
     std::map<Key, std::uint64_t> tombstones;
 
     for (auto &[file_id, data_file, hint_path] : files) {
-      const auto apply_put = [&](std::uint64_t seq, std::uint64_t file_off,
-                                 std::uint32_t val_size,
-                                 std::span<const std::byte> key) {
-        const auto k = Key{key};
-        const auto tomb_it = tombstones.find(k);
-        if (tomb_it != tombstones.end() && tomb_it->second >= seq) {
-          if (seq > max_lsn)
-            max_lsn = seq;
-          return;
-        }
-        const auto existing =
-            transient_key_dir.get(std::span<const std::byte>{key});
-        if (!existing || existing->sequence < seq) {
-          transient_key_dir.set(std::span<const std::byte>{key},
-                                KeyDirEntry{seq, file_id, file_off, val_size});
-        }
-        if (seq > max_lsn)
-          max_lsn = seq;
-      };
-
-      const auto apply_del = [&](std::uint64_t seq,
-                                 std::span<const std::byte> key) {
-        const auto k = Key{key};
-        auto &tomb_seq = tombstones[k];
-        if (seq > tomb_seq)
-          tomb_seq = seq;
-        const auto existing =
-            transient_key_dir.get(std::span<const std::byte>{key});
-        if (existing && existing->sequence < seq) {
-          transient_key_dir.erase(std::span<const std::byte>{key});
-        }
-        if (seq > max_lsn)
-          max_lsn = seq;
-      };
-
       auto hint = HintFile::OpenForRead(hint_path);
       Offset off = 0;
       while (auto r = hint.scan_view(off)) {
         const auto &[he, next] = *r;
         if (he.entry_type == EntryType::Put) {
-          apply_put(he.sequence, he.file_offset, he.value_size, he.key);
+          const auto k = Key{he.key};
+          const auto tomb_it = tombstones.find(k);
+          if (tomb_it != tombstones.end() && tomb_it->second >= he.sequence) {
+            if (he.sequence > max_lsn) max_lsn = he.sequence;
+            off = next;
+            continue;
+          }
+          const auto existing = t.get(he.key);
+          if (!existing || existing->sequence < he.sequence) {
+            t.set(he.key,
+                  KeyDirEntry{he.sequence, file_id, he.file_offset,
+                              he.value_size});
+          }
         } else if (he.entry_type == EntryType::Delete) {
-          apply_del(he.sequence, he.key);
+          const auto k = Key{he.key};
+          auto &tomb_seq = tombstones[k];
+          if (he.sequence > tomb_seq) tomb_seq = he.sequence;
+          const auto existing = t.get(he.key);
+          if (existing && existing->sequence < he.sequence) {
+            t.erase(he.key);
+          }
         }
+        if (he.sequence > max_lsn) max_lsn = he.sequence;
+        off = next;
+      }
+    }
+
+    return {std::move(t).persistent(), std::move(tombstones), max_lsn};
+  }
+
+  // Merges two RecoveryResults. Tree merge uses LSN-based conflict
+  // resolution, then tombstones from both sides are cross-applied to
+  // suppress stale PUTs. Tombstone maps are unioned for subsequent rounds.
+  static auto merge_results(RecoveryResult a, RecoveryResult b)
+      -> RecoveryResult {
+    auto lsn_resolver = [](const KeyDirEntry &x, const KeyDirEntry &y) {
+      return (x.sequence >= y.sequence) ? x : y;
+    };
+
+    auto merged = PersistentRadixTree<KeyDirEntry>::merge(
+        a.key_dir, b.key_dir, lsn_resolver);
+
+    // Cross-apply B's tombstones to suppress stale PUTs from A.
+    for (const auto &[key, tomb_seq] : b.tombstones) {
+      std::span<const std::byte> key_span{key.begin(), key.size()};
+      const auto entry = merged.get(key_span);
+      if (entry && entry->sequence < tomb_seq) {
+        merged = merged.erase(key_span);
+      }
+    }
+
+    // Cross-apply A's tombstones to suppress stale PUTs from B.
+    for (const auto &[key, tomb_seq] : a.tombstones) {
+      std::span<const std::byte> key_span{key.begin(), key.size()};
+      const auto entry = merged.get(key_span);
+      if (entry && entry->sequence < tomb_seq) {
+        merged = merged.erase(key_span);
+      }
+    }
+
+    // Union tombstone maps (max seq per key) for subsequent rounds.
+    auto &merged_tombs = a.tombstones;
+    for (auto &[key, seq] : b.tombstones) {
+      auto &existing = merged_tombs[key];
+      if (seq > existing) existing = seq;
+    }
+
+    return {std::move(merged), std::move(merged_tombs),
+            std::max(a.max_lsn, b.max_lsn)};
+  }
+
+  // Reconstructs the key directory from hint files (serial path).
+  // Pre-generates missing hint files from raw data scans (batch-aware),
+  // then recovers exclusively from hints — single code path.
+  // Returns a new EngineState with key_dir populated and next_lsn set to
+  // max_seen + 1. next_file_id is advanced for each recovered file.
+  auto recover_existing_files(EngineState s) -> EngineState {
+    auto files = open_and_prepare_files(s);
+
+    // Recover from hint files only.
+    std::uint64_t max_lsn = 0;
+    auto transient_key_dir = s.key_dir.transient();
+    std::map<Key, std::uint64_t> tombstones;
+
+    for (auto &[file_id, data_file, hint_path] : files) {
+      auto hint = HintFile::OpenForRead(hint_path);
+      Offset off = 0;
+      while (auto r = hint.scan_view(off)) {
+        const auto &[he, next] = *r;
+        if (he.entry_type == EntryType::Put) {
+          const auto k = Key{he.key};
+          const auto tomb_it = tombstones.find(k);
+          if (tomb_it != tombstones.end() && tomb_it->second >= he.sequence) {
+            if (he.sequence > max_lsn) max_lsn = he.sequence;
+            off = next;
+            continue;
+          }
+          const auto existing = transient_key_dir.get(he.key);
+          if (!existing || existing->sequence < he.sequence) {
+            transient_key_dir.set(
+                he.key,
+                KeyDirEntry{he.sequence, file_id, he.file_offset,
+                            he.value_size});
+          }
+        } else if (he.entry_type == EntryType::Delete) {
+          const auto k = Key{he.key};
+          auto &tomb_seq = tombstones[k];
+          if (he.sequence > tomb_seq) tomb_seq = he.sequence;
+          const auto existing = transient_key_dir.get(he.key);
+          if (existing && existing->sequence < he.sequence) {
+            transient_key_dir.erase(he.key);
+          }
+        }
+        if (he.sequence > max_lsn) max_lsn = he.sequence;
         off = next;
       }
     }
 
     s.key_dir = std::move(transient_key_dir).persistent();
     s.next_lsn = max_lsn + 1;
+    return s;
+  }
+
+  // Parallel recovery (v1): file-level partitioning with fan-in merge.
+  // Round-robin assigns files to W workers, each builds a RecoveryResult,
+  // then pairwise merges reduce to a single result in ⌈log₂(W)⌉ rounds.
+  auto parallel_recover_existing_files(EngineState s, unsigned recovery_threads)
+      -> EngineState {
+    auto files = open_and_prepare_files(s);
+
+    if (files.empty()) {
+      return s;
+    }
+
+    auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
+    if (W == 0) W = 1;
+
+    // Round-robin file assignment to W workers.
+    std::vector<std::vector<RecoveredFile>> worker_files(W);
+    for (unsigned i = 0; i < files.size(); ++i) {
+      worker_files[i % W].push_back(std::move(files[i]));
+    }
+
+    // Phase 2: parallel build.
+    std::vector<RecoveryResult> results(W);
+    {
+      std::vector<std::jthread> threads;
+      threads.reserve(W);
+      for (unsigned i = 0; i < W; ++i) {
+        threads.emplace_back([&results, &worker_files, i] {
+          results[i] = build_from_hints(worker_files[i]);
+        });
+      }
+    }
+
+    // Phase 3: parallel fan-in merge.
+    while (results.size() > 1) {
+      const auto count = results.size();
+      const auto pairs = count / 2;
+      std::vector<RecoveryResult> next(pairs);
+
+      {
+        std::vector<std::jthread> threads;
+        threads.reserve(pairs);
+        for (std::size_t i = 0; i < pairs; ++i) {
+          threads.emplace_back([&results, &next, i] {
+            next[i] = merge_results(std::move(results[i * 2]),
+                                    std::move(results[i * 2 + 1]));
+          });
+        }
+      }
+
+      // Odd element carries forward.
+      if (count % 2 != 0) {
+        next.push_back(std::move(results.back()));
+      }
+
+      results = std::move(next);
+    }
+
+    // Phase 4: assembly.
+    s.key_dir = std::move(results[0].key_dir);
+    s.next_lsn = results[0].max_lsn + 1;
     return s;
   }
 
