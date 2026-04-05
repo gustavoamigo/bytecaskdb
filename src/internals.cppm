@@ -9,7 +9,7 @@ module;
 #include <span>
 #include <vector>
 
-export module bytecask.engine:internals;
+export module bytecask:internals;
 
 import bytecask.data_entry;
 import bytecask.data_file;
@@ -19,7 +19,7 @@ import bytecask.util;
 
 namespace bytecask {
 
-// Forward-declared in the primary interface; defined here so the Bytecask
+// Forward-declared in the primary interface; defined here so the DB
 // class definition (in bytecask.cppm) can use them as member types.
 
 // ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ struct FileStats {
 
 // File registry: a copy-on-write map from file_id to shared DataFile.
 // The outer shared_ptr is copied into iterators at construction — O(1),
-// independent lifetime from Bytecask. Rotation clones the inner map,
+// independent lifetime from DB. Rotation clones the inner map,
 // inserts the new file, then atomically replaces the outer shared_ptr.
 export using FileRegistry =
     std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>>;
@@ -49,7 +49,7 @@ export using FileRegistry =
 // ---------------------------------------------------------------------------
 // KeyDirEntry — one slot in the in-memory key directory.
 //
-// file_id is a monotonic integer handle, assigned by Bytecask, that indexes
+// file_id is a monotonic integer handle, assigned by DB, that indexes
 // into the engine's file registry. Using a compact integer avoids pointer-
 // stability hazards (pointers into a growing container would be invalidated)
 // and keeps each entry to a fixed small size.

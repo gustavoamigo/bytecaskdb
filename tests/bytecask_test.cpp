@@ -14,7 +14,7 @@
 #include <system_error>
 #include <thread>
 #include <vector>
-import bytecask.engine;
+import bytecask;
 import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.types;
@@ -41,7 +41,7 @@ auto to_string(const bytecask::Key &key) -> std::string {
 
 // Convenience wrapper: reads key into a temporary buffer and returns it as
 // optional. Used by tests that don't need to reuse the output buffer.
-auto get_val(const bytecask::Bytecask &db, bytecask::BytesView key)
+auto get_val(const bytecask::DB &db, bytecask::BytesView key)
     -> std::optional<bytecask::Bytes> {
   bytecask::Bytes out;
   if (!db.get({}, key, out)) return std::nullopt;
@@ -68,19 +68,19 @@ struct TempDir {
 // ---------------------------------------------------------------------------
 // Test 1: open() creates the directory and does not throw
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask open creates directory", "[bytecask]") {
+TEST_CASE("DB open creates directory", "[bytecask]") {
   TempDir td;
   const auto db_path = td.path / "db";
-  REQUIRE_NOTHROW(bytecask::Bytecask::open(db_path));
+  REQUIRE_NOTHROW(bytecask::DB::open(db_path));
   CHECK(std::filesystem::is_directory(db_path));
 }
 
 // ---------------------------------------------------------------------------
 // Test 2: put + get round-trip
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask put and get round-trip", "[bytecask]") {
+TEST_CASE("DB put and get round-trip", "[bytecask]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("key1"), to_bytes("value1"));
 
@@ -92,9 +92,9 @@ TEST_CASE("Bytecask put and get round-trip", "[bytecask]") {
 // ---------------------------------------------------------------------------
 // Test 2b: get output-param overload reuses buffer
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask get output-param round-trip", "[bytecask]") {
+TEST_CASE("DB get output-param round-trip", "[bytecask]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("k1"), to_bytes("v1"));
   db.put({}, to_bytes("k2"), to_bytes("value_two"));
@@ -116,9 +116,9 @@ TEST_CASE("Bytecask get output-param round-trip", "[bytecask]") {
 // ---------------------------------------------------------------------------
 // Test 3: put overwrites an existing key
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask put overwrites existing key", "[bytecask]") {
+TEST_CASE("DB put overwrites existing key", "[bytecask]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("key1"), to_bytes("first"));
   db.put({}, to_bytes("key1"), to_bytes("second"));
@@ -131,9 +131,9 @@ TEST_CASE("Bytecask put overwrites existing key", "[bytecask]") {
 // ---------------------------------------------------------------------------
 // Test 4: del returns false for a key that does not exist
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask del returns false for absent key", "[bytecask]") {
+TEST_CASE("DB del returns false for absent key", "[bytecask]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   CHECK_FALSE(db.del({}, to_bytes("missing")));
 }
@@ -141,9 +141,9 @@ TEST_CASE("Bytecask del returns false for absent key", "[bytecask]") {
 // ---------------------------------------------------------------------------
 // Test 5: del returns true; subsequent get returns nullopt
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask del existing key", "[bytecask]") {
+TEST_CASE("DB del existing key", "[bytecask]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("key1"), to_bytes("value1"));
   const bool removed = db.del({}, to_bytes("key1"));
@@ -155,9 +155,9 @@ TEST_CASE("Bytecask del existing key", "[bytecask]") {
 // ---------------------------------------------------------------------------
 // Test 6: contains_key tracks puts and dels
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask contains_key tracks mutations", "[bytecask]") {
+TEST_CASE("DB contains_key tracks mutations", "[bytecask]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   CHECK_FALSE(db.contains_key(to_bytes("k")));
   db.put({}, to_bytes("k"), to_bytes("v"));
@@ -169,9 +169,9 @@ TEST_CASE("Bytecask contains_key tracks mutations", "[bytecask]") {
 // ---------------------------------------------------------------------------
 // Test 7: apply_batch — mixed puts and del, all visible atomically
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask apply_batch mixed operations", "[bytecask]") {
+TEST_CASE("DB apply_batch mixed operations", "[bytecask]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   // Pre-insert a key that the batch will remove.
   db.put({}, to_bytes("del"), to_bytes("gone"));
@@ -193,10 +193,10 @@ TEST_CASE("Bytecask apply_batch mixed operations", "[bytecask]") {
 // Test 8: iter_from with ordered=true returns all entries in ascending key
 // order
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask iter_from returns entries in ascending order",
+TEST_CASE("DB iter_from returns entries in ascending order",
           "[bytecask]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("c"), to_bytes("cv"));
   db.put({}, to_bytes("a"), to_bytes("av"));
@@ -222,9 +222,9 @@ TEST_CASE("Bytecask iter_from returns entries in ascending order",
 // ---------------------------------------------------------------------------
 // Test 9: iter_from(mid_key) starts at that key, earlier keys are absent
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask iter_from starts from given key", "[bytecask]") {
+TEST_CASE("DB iter_from starts from given key", "[bytecask]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("apple"), to_bytes("1"));
   db.put({}, to_bytes("banana"), to_bytes("2"));
@@ -243,10 +243,10 @@ TEST_CASE("Bytecask iter_from starts from given key", "[bytecask]") {
 // ---------------------------------------------------------------------------
 // Test 10: keys_from({}) returns all keys ascending — no data file I/O
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask keys_from returns all keys in ascending order",
+TEST_CASE("DB keys_from returns all keys in ascending order",
           "[bytecask]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("z"), to_bytes("zv"));
   db.put({}, to_bytes("m"), to_bytes("mv"));
@@ -266,11 +266,11 @@ TEST_CASE("Bytecask keys_from returns all keys in ascending order",
 // ---------------------------------------------------------------------------
 // Test 11: rotation creates a second .data file on disk
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask rotation creates new data file", "[bytecask][rotation]") {
+TEST_CASE("DB rotation creates new data file", "[bytecask][rotation]") {
   TempDir td;
   const auto db_path = td.path / "db";
   // A threshold of 1 means any write will trigger rotation.
-  auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
 
   db.put({}, to_bytes("key"), to_bytes("value"));
 
@@ -287,11 +287,11 @@ TEST_CASE("Bytecask rotation creates new data file", "[bytecask][rotation]") {
 // ---------------------------------------------------------------------------
 // Test 12: get() resolves value from a rotated (sealed) file
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask get resolves value from rotated file",
+TEST_CASE("DB get resolves value from rotated file",
           "[bytecask][rotation]") {
   TempDir td;
   // Threshold of 1 triggers rotation after each write.
-  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
 
   db.put({}, to_bytes("key_a"), to_bytes("alpha"));
   // After put, active file is now rotated. key_a lives in the sealed file.
@@ -309,10 +309,10 @@ TEST_CASE("Bytecask get resolves value from rotated file",
 // ---------------------------------------------------------------------------
 // Test 13: iter_from spans entries across multiple data files
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask iter_from spans multiple rotated files",
+TEST_CASE("DB iter_from spans multiple rotated files",
           "[bytecask][rotation]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
 
   db.put({}, to_bytes("a"), to_bytes("av"));
   db.put({}, to_bytes("b"), to_bytes("bv"));
@@ -337,12 +337,12 @@ TEST_CASE("Bytecask iter_from spans multiple rotated files",
 // ---------------------------------------------------------------------------
 // Test 14: close (destructor) writes hint files for sealed data files
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask close writes hint file for sealed file",
+TEST_CASE("DB close writes hint file for sealed file",
           "[bytecask][rotation]") {
   TempDir td;
   const auto db_path = td.path / "db";
   {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("k"), to_bytes("v"));
     // db destroyed here — background worker drains, hints written
   }
@@ -363,14 +363,14 @@ TEST_CASE("Bytecask close writes hint file for sealed file",
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// Test 15: ~Bytecask calls flush_hints — hint file exists after scope exit
+// Test 15: ~DB calls flush_hints — hint file exists after scope exit
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask destructor flushes hint files", "[bytecask][rotation]") {
+TEST_CASE("DB destructor flushes hint files", "[bytecask][rotation]") {
   TempDir td;
   const auto db_path = td.path / "db";
 
   {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("k"), to_bytes("v"));
     // db destroyed here — destructor should call flush_hints()
   }
@@ -387,10 +387,10 @@ TEST_CASE("Bytecask destructor flushes hint files", "[bytecask][rotation]") {
 // Test 17: WriteOptions{.sync=false} — data is written but fdatasync skipped;
 //           values are still readable within the same engine instance.
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask WriteOptions sync=false data still readable",
+TEST_CASE("DB WriteOptions sync=false data still readable",
           "[bytecask][write_options]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   const bytecask::WriteOptions no_sync{.sync = false};
   db.put(no_sync, to_bytes("k1"), to_bytes("v1"));
@@ -408,10 +408,10 @@ TEST_CASE("Bytecask WriteOptions sync=false data still readable",
 // ---------------------------------------------------------------------------
 // Test 18: WriteOptions{.sync=false} on del — key is removed, no fdatasync.
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask WriteOptions sync=false del still removes key",
+TEST_CASE("DB WriteOptions sync=false del still removes key",
           "[bytecask][write_options]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("k"), to_bytes("v"));
 
@@ -425,10 +425,10 @@ TEST_CASE("Bytecask WriteOptions sync=false del still removes key",
 // ---------------------------------------------------------------------------
 // Test 19: WriteOptions{.sync=false} on apply_batch — results visible.
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask WriteOptions sync=false apply_batch results visible",
+TEST_CASE("DB WriteOptions sync=false apply_batch results visible",
           "[bytecask][write_options]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   const bytecask::WriteOptions no_sync{.sync = false};
   bytecask::Batch batch;
@@ -445,17 +445,17 @@ TEST_CASE("Bytecask WriteOptions sync=false apply_batch results visible",
 // ---------------------------------------------------------------------------
 // Test 20: puts survive a restart (raw scan recovery, no hint files)
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask recovery: puts survive restart", "[bytecask][recovery]") {
+TEST_CASE("DB recovery: puts survive restart", "[bytecask][recovery]") {
   TempDir td;
   const auto db_path = td.path / "db";
 
   {
-    auto db = bytecask::Bytecask::open(db_path);
+    auto db = bytecask::DB::open(db_path);
     db.put({}, to_bytes("k1"), to_bytes("v1"));
     db.put({}, to_bytes("k2"), to_bytes("v2"));
   } // destructor syncs; no rotation so no hint files written
 
-  auto db2 = bytecask::Bytecask::open(db_path);
+  auto db2 = bytecask::DB::open(db_path);
   REQUIRE(get_val(db2, to_bytes("k1")).has_value());
   CHECK(to_string(*get_val(db2, to_bytes("k1"))) == "v1");
   REQUIRE(get_val(db2, to_bytes("k2")).has_value());
@@ -465,36 +465,36 @@ TEST_CASE("Bytecask recovery: puts survive restart", "[bytecask][recovery]") {
 // ---------------------------------------------------------------------------
 // Test 21: delete tombstone survives restart — key absent after reopen
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask recovery: tombstone survives restart",
+TEST_CASE("DB recovery: tombstone survives restart",
           "[bytecask][recovery]") {
   TempDir td;
   const auto db_path = td.path / "db";
 
   {
-    auto db = bytecask::Bytecask::open(db_path);
+    auto db = bytecask::DB::open(db_path);
     db.put({}, to_bytes("k"), to_bytes("v"));
     std::ignore = db.del({}, to_bytes("k"));
   }
 
-  auto db2 = bytecask::Bytecask::open(db_path);
+  auto db2 = bytecask::DB::open(db_path);
   CHECK_FALSE(get_val(db2, to_bytes("k")).has_value());
 }
 
 // ---------------------------------------------------------------------------
 // Test 22: last write wins — overwritten value correct after restart
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask recovery: last write wins after overwrite",
+TEST_CASE("DB recovery: last write wins after overwrite",
           "[bytecask][recovery]") {
   TempDir td;
   const auto db_path = td.path / "db";
 
   {
-    auto db = bytecask::Bytecask::open(db_path);
+    auto db = bytecask::DB::open(db_path);
     db.put({}, to_bytes("k"), to_bytes("first"));
     db.put({}, to_bytes("k"), to_bytes("second"));
   }
 
-  auto db2 = bytecask::Bytecask::open(db_path);
+  auto db2 = bytecask::DB::open(db_path);
   REQUIRE(get_val(db2, to_bytes("k")).has_value());
   CHECK(to_string(*get_val(db2, to_bytes("k"))) == "second");
 }
@@ -502,12 +502,12 @@ TEST_CASE("Bytecask recovery: last write wins after overwrite",
 // ---------------------------------------------------------------------------
 // Test 23: batch survives restart — all puts/dels from batch visible
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask recovery: batch survives restart", "[bytecask][recovery]") {
+TEST_CASE("DB recovery: batch survives restart", "[bytecask][recovery]") {
   TempDir td;
   const auto db_path = td.path / "db";
 
   {
-    auto db = bytecask::Bytecask::open(db_path);
+    auto db = bytecask::DB::open(db_path);
     db.put({}, to_bytes("preexisting"), to_bytes("gone"));
 
     bytecask::Batch batch;
@@ -517,7 +517,7 @@ TEST_CASE("Bytecask recovery: batch survives restart", "[bytecask][recovery]") {
     db.apply_batch({}, std::move(batch));
   }
 
-  auto db2 = bytecask::Bytecask::open(db_path);
+  auto db2 = bytecask::DB::open(db_path);
   REQUIRE(get_val(db2, to_bytes("a")).has_value());
   CHECK(to_string(*get_val(db2, to_bytes("a"))) == "alpha");
   REQUIRE(get_val(db2, to_bytes("b")).has_value());
@@ -529,7 +529,7 @@ TEST_CASE("Bytecask recovery: batch survives restart", "[bytecask][recovery]") {
 // Test 24: recovery via hint files — rotation writes hints on close,
 //           reopen rebuilds key directory from them
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask recovery: hint file path after rotation",
+TEST_CASE("DB recovery: hint file path after rotation",
           "[bytecask][recovery]") {
   TempDir td;
   const auto db_path = td.path / "db";
@@ -537,7 +537,7 @@ TEST_CASE("Bytecask recovery: hint file path after rotation",
   // threshold=1 forces rotation after each write; destructor writes hint files
   // for the sealed files.
   {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("x"), to_bytes("xval"));
     db.put({}, to_bytes("y"), to_bytes("yval"));
   }
@@ -550,7 +550,7 @@ TEST_CASE("Bytecask recovery: hint file path after rotation",
   }
   REQUIRE(hint_count >= 1);
 
-  auto db2 = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+  auto db2 = bytecask::DB::open(db_path, {.max_file_bytes = 1});
   REQUIRE(get_val(db2, to_bytes("x")).has_value());
   CHECK(to_string(*get_val(db2, to_bytes("x"))) == "xval");
   REQUIRE(get_val(db2, to_bytes("y")).has_value());
@@ -566,20 +566,20 @@ TEST_CASE("Bytecask recovery: hint file path after rotation",
 // recover_existing_files(), this test fails when the Delete file happens to be
 // processed before the Put file, causing the stale Put to be inserted.
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask recovery: cross-file tombstone suppresses stale put",
+TEST_CASE("DB recovery: cross-file tombstone suppresses stale put",
           "[bytecask][recovery]") {
   TempDir td;
   const auto db_path = td.path / "db";
 
   {
     // threshold=1 forces each write into its own file.
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("gone"), to_bytes("v1")); // file 0
     db.del({}, to_bytes("gone")); // file 1 — Delete seq > Put seq
     db.put({}, to_bytes("keep"), to_bytes("v2")); // file 2
   }
 
-  auto db2 = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+  auto db2 = bytecask::DB::open(db_path, {.max_file_bytes = 1});
   CHECK_FALSE(db2.contains_key(to_bytes("gone")));
   CHECK_FALSE(get_val(db2, to_bytes("gone")).has_value());
   REQUIRE(get_val(db2, to_bytes("keep")).has_value());
@@ -592,7 +592,7 @@ TEST_CASE("Bytecask recovery: cross-file tombstone suppresses stale put",
 // BulkEnd directly to a data file. Recovery generates a hint file from the
 // raw data (batch-aware) and only the standalone entries survive.
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask recovery: incomplete batch is discarded",
+TEST_CASE("DB recovery: incomplete batch is discarded",
           "[bytecask][recovery]") {
   TempDir td;
   const auto db_path = td.path / "db";
@@ -615,7 +615,7 @@ TEST_CASE("Bytecask recovery: incomplete batch is discarded",
   }
 
   // Open engine — should generate hint file and recover only "good".
-  auto db = bytecask::Bytecask::open(db_path);
+  auto db = bytecask::DB::open(db_path);
   REQUIRE(get_val(db, to_bytes("good")).has_value());
   CHECK(to_string(*get_val(db, to_bytes("good"))) == "value1");
   CHECK_FALSE(get_val(db, to_bytes("orphan_a")).has_value());
@@ -637,7 +637,7 @@ TEST_CASE("Bytecask recovery: incomplete batch is discarded",
 // sorts alphabetically first, and in the other it sorts last. Both must
 // yield the same result: "gone" absent, "alive" present.
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask recovery: order-independent tombstone",
+TEST_CASE("DB recovery: order-independent tombstone",
           "[bytecask][recovery]") {
   // Sub-case A: delete file sorts BEFORE put file (alphabetically).
   // Sub-case B: delete file sorts AFTER put file.
@@ -665,7 +665,7 @@ TEST_CASE("Bytecask recovery: order-independent tombstone",
       df.sync();
     }
 
-    auto db = bytecask::Bytecask::open(db_path);
+    auto db = bytecask::DB::open(db_path);
     CHECK_FALSE(get_val(db, to_bytes("gone")).has_value());
     REQUIRE(get_val(db, to_bytes("alive")).has_value());
     CHECK(to_string(*get_val(db, to_bytes("alive"))) == "v2");
@@ -682,7 +682,7 @@ TEST_CASE("Bytecask recovery: order-independent tombstone",
 // ---------------------------------------------------------------------------
 // Parallel recovery: same result as serial for basic puts
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask parallel recovery: puts survive restart",
+TEST_CASE("DB parallel recovery: puts survive restart",
           "[bytecask][recovery][parallel]") {
   TempDir td;
   const auto db_path = td.path / "db";
@@ -690,14 +690,14 @@ TEST_CASE("Bytecask parallel recovery: puts survive restart",
   // threshold=1 forces each write into its own file, giving multiple files
   // for parallel workers to split across.
   {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("a"), to_bytes("1"));
     db.put({}, to_bytes("b"), to_bytes("2"));
     db.put({}, to_bytes("c"), to_bytes("3"));
     db.put({}, to_bytes("d"), to_bytes("4"));
   }
 
-  auto db2 = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
+  auto db2 = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
   REQUIRE(get_val(db2, to_bytes("a")).has_value());
   CHECK(to_string(*get_val(db2, to_bytes("a"))) == "1");
   REQUIRE(get_val(db2, to_bytes("b")).has_value());
@@ -711,13 +711,13 @@ TEST_CASE("Bytecask parallel recovery: puts survive restart",
 // ---------------------------------------------------------------------------
 // Parallel recovery: cross-worker tombstone suppresses stale put
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask parallel recovery: cross-worker tombstone",
+TEST_CASE("DB parallel recovery: cross-worker tombstone",
           "[bytecask][recovery][parallel]") {
   TempDir td;
   const auto db_path = td.path / "db";
 
   {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("gone"), to_bytes("v1"));   // file 0
     std::ignore = db.del({}, to_bytes("gone"));      // file 1
     db.put({}, to_bytes("keep"), to_bytes("v2"));    // file 2
@@ -725,7 +725,7 @@ TEST_CASE("Bytecask parallel recovery: cross-worker tombstone",
   }
 
   // 4 files, 4 workers — PUT and DELETE for "gone" land in different workers.
-  auto db2 = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
+  auto db2 = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
   CHECK_FALSE(get_val(db2, to_bytes("gone")).has_value());
   REQUIRE(get_val(db2, to_bytes("keep")).has_value());
   CHECK(to_string(*get_val(db2, to_bytes("keep"))) == "v2");
@@ -736,18 +736,18 @@ TEST_CASE("Bytecask parallel recovery: cross-worker tombstone",
 // ---------------------------------------------------------------------------
 // Parallel recovery: last write wins across workers
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask parallel recovery: last write wins",
+TEST_CASE("DB parallel recovery: last write wins",
           "[bytecask][recovery][parallel]") {
   TempDir td;
   const auto db_path = td.path / "db";
 
   {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("k"), to_bytes("old"));
     db.put({}, to_bytes("k"), to_bytes("new"));
   }
 
-  auto db2 = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 2});
+  auto db2 = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 2});
   REQUIRE(get_val(db2, to_bytes("k")).has_value());
   CHECK(to_string(*get_val(db2, to_bytes("k"))) == "new");
 }
@@ -760,14 +760,14 @@ TEST_CASE("Bytecask parallel recovery: last write wins",
 // once with 1 thread (serial), once with 4 threads (parallel), then
 // compares every key.
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask parallel recovery: matches serial result",
+TEST_CASE("DB parallel recovery: matches serial result",
           "[bytecask][recovery][parallel]") {
   TempDir td;
   const auto db_path = td.path / "db";
 
   // Build a database with many files, overwrites, and deletes.
   {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
     for (int i = 0; i < 50; ++i) {
       auto key = std::format("key_{:03d}", i);
       auto val = std::format("val_{:03d}_v1", i);
@@ -787,7 +787,7 @@ TEST_CASE("Bytecask parallel recovery: matches serial result",
   }
 
   // Recover serially.
-  auto serial = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
+  auto serial = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
 
   // Collect serial results.
   std::map<std::string, std::string> serial_kv;
@@ -796,7 +796,7 @@ TEST_CASE("Bytecask parallel recovery: matches serial result",
   }
 
   // Recover in parallel.
-  auto parallel = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
+  auto parallel = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
 
   // Collect parallel results.
   std::map<std::string, std::string> parallel_kv;
@@ -816,7 +816,7 @@ TEST_CASE("Bytecask parallel recovery: matches serial result",
 // Model-based recovery: random workload with oracle comparison.
 //
 // A random sequence of puts, deletes, overwrites, and batches is applied to
-// both a Bytecask instance and a std::map oracle. The DB uses a tiny rotation
+// both a DB instance and a std::map oracle. The DB uses a tiny rotation
 // threshold (1 byte) so every write triggers file rotation, maximising the
 // number of files and exercising cross-file recovery thoroughly.
 //
@@ -865,7 +865,7 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
 
   {
     // threshold=1 forces rotation after every write.
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
 
     constexpr int kOps = 2000;
     for (int i = 0; i < kOps; ++i) {
@@ -905,8 +905,8 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
   }
   // DB is closed — all files sealed, hints flushed via background worker.
 
-  // Helper: collect all (key, value) from a Bytecask into a map.
-  auto collect = [](bytecask::Bytecask &db) {
+  // Helper: collect all (key, value) from a DB into a map.
+  auto collect = [](bytecask::DB &db) {
     std::map<std::string, std::string> kv;
     for (auto [key, val] : db.iter_from({})) {
       kv[to_string(key)] = to_string(val);
@@ -936,17 +936,17 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
   REQUIRE(data_file_count > 1);
 
   SECTION("serial recovery") {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
   }
 
   SECTION("parallel recovery (2 workers)") {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 2});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 2});
     verify("parallel/2", collect(db));
   }
 
   SECTION("parallel recovery (W = file count)") {
-    auto db = bytecask::Bytecask::open(
+    auto db = bytecask::DB::open(
         db_path, {.max_file_bytes = 1,
                   .recovery_threads = static_cast<unsigned>(data_file_count)});
     verify("parallel/max", collect(db));
@@ -985,7 +985,7 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
   std::map<std::string, std::string> oracle;
 
   {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
 
     for (int i = 0; i < 1000; ++i) {
       const auto op = std::uniform_int_distribution<int>(0, 9)(gen);
@@ -1023,7 +1023,7 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
     }
   }
 
-  auto collect = [](bytecask::Bytecask &db) {
+  auto collect = [](bytecask::DB &db) {
     std::map<std::string, std::string> kv;
     for (auto [key, val] : db.iter_from({})) {
       kv[to_string(key)] = to_string(val);
@@ -1044,12 +1044,12 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
   };
 
   SECTION("serial") {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
   }
 
   SECTION("parallel (4 workers)") {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
     verify("parallel/4", collect(db));
   }
 }
@@ -1070,7 +1070,7 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
   std::map<std::string, std::string> oracle;
 
   {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
 
     // Write 500 keys.
     for (int i = 0; i < 500; ++i) {
@@ -1096,7 +1096,7 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
     }
   }
 
-  auto collect = [](bytecask::Bytecask &db) {
+  auto collect = [](bytecask::DB &db) {
     std::map<std::string, std::string> kv;
     for (auto [key, val] : db.iter_from({})) {
       kv[to_string(key)] = to_string(val);
@@ -1123,17 +1123,17 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
   }
 
   SECTION("serial") {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
   }
 
   SECTION("parallel (3 workers)") {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 3});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 3});
     verify("parallel/3", collect(db));
   }
 
   SECTION("parallel (W = file count)") {
-    auto db = bytecask::Bytecask::open(
+    auto db = bytecask::DB::open(
         db_path, {.max_file_bytes = 1,
                   .recovery_threads = static_cast<unsigned>(data_file_count)});
     verify("parallel/max", collect(db));
@@ -1143,10 +1143,10 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
 // ---------------------------------------------------------------------------
 // Test: try_lock throws when the write lock is already held
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask try_lock throws when lock held",
+TEST_CASE("DB try_lock throws when lock held",
           "[bytecask][concurrency]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   // Use a background thread to hold the write lock via a blocking put.
   // Thread 1: hold the write lock by doing a slow batch of puts.
@@ -1189,10 +1189,10 @@ TEST_CASE("Bytecask try_lock throws when lock held",
 // ---------------------------------------------------------------------------
 // Test: concurrent blocking writers are serialised — no data corruption
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask blocking writes are serialised",
+TEST_CASE("DB blocking writes are serialised",
           "[bytecask][concurrency]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   constexpr int kWritesPerThread = 200;
   constexpr int kThreads = 4;
@@ -1230,10 +1230,10 @@ TEST_CASE("Bytecask blocking writes are serialised",
 // Test: try_lock on del and apply_batch — non-blocking semantics work for
 // all write operations, not just put.
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask try_lock works for del and apply_batch",
+TEST_CASE("DB try_lock works for del and apply_batch",
           "[bytecask][concurrency]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("k"), to_bytes("v"));
 
@@ -1252,9 +1252,9 @@ TEST_CASE("Bytecask try_lock works for del and apply_batch",
 // ---------------------------------------------------------------------------
 // Test: reads proceed concurrently with a writer (true SWMR)
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask reads proceed during writes", "[bytecask][concurrency]") {
+TEST_CASE("DB reads proceed during writes", "[bytecask][concurrency]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   // Pre-populate data for readers.
   for (int i = 0; i < 100; ++i) {
@@ -1312,9 +1312,9 @@ TEST_CASE("Bytecask reads proceed during writes", "[bytecask][concurrency]") {
 // operation types simultaneously. Under TSan this catches data races on the
 // key directory, file registry, and active file.
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask concurrent mixed get/put/del", "[bytecask][concurrency]") {
+TEST_CASE("DB concurrent mixed get/put/del", "[bytecask][concurrency]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   // Pre-populate so readers and deleters have data to work with.
   constexpr int kKeys = 200;
@@ -1365,9 +1365,9 @@ TEST_CASE("Bytecask concurrent mixed get/put/del", "[bytecask][concurrency]") {
 // ---------------------------------------------------------------------------
 // Test: group commit — concurrent sync writers produce correct results
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask group commit correctness", "[bytecask][concurrency]") {
+TEST_CASE("DB group commit correctness", "[bytecask][concurrency]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   constexpr int kWritesPerThread = 50;
   constexpr int kThreads = 8;
@@ -1408,10 +1408,10 @@ TEST_CASE("Bytecask group commit correctness", "[bytecask][concurrency]") {
 // it via transient (put path). This validates that the persistent/immutable
 // tree structure keeps old nodes alive for the duration of a read, even as
 // the writer clones and replaces nodes.
-TEST_CASE("Bytecask concurrent reads during writes",
+TEST_CASE("DB concurrent reads during writes",
           "[bytecask][concurrency]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   // Seed 500 keys so reads have something to find.
   for (int i = 0; i < 500; ++i) {
@@ -1481,10 +1481,10 @@ TEST_CASE("Bytecask concurrent reads during writes",
 // A reader holds a reference from load_state while a writer publishes a new
 // EngineState. The reader must still see a consistent (old or new) snapshot
 // and never observe a dangling reference.
-TEST_CASE("Bytecask snapshot isolation under concurrent writes",
+TEST_CASE("DB snapshot isolation under concurrent writes",
           "[bytecask][concurrency]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   // Seed key that will be repeatedly overwritten.
   db.put({}, to_bytes("snap_key"), to_bytes("initial"));
@@ -1551,7 +1551,7 @@ static auto tombstone_size(std::string_view key) -> std::uint64_t {
 TEST_CASE("FileStats: put tracks live_bytes and total_bytes",
           "[bytecask][filestats]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("k1"), to_bytes("v1"));
   db.put({}, to_bytes("k2"), to_bytes("val2"));
@@ -1572,7 +1572,7 @@ TEST_CASE("FileStats: put tracks live_bytes and total_bytes",
 TEST_CASE("FileStats: overwrite decrements old live_bytes",
           "[bytecask][filestats]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("k"), to_bytes("old_value"));
   db.put({}, to_bytes("k"), to_bytes("new_value"));
@@ -1592,7 +1592,7 @@ TEST_CASE("FileStats: overwrite decrements old live_bytes",
 TEST_CASE("FileStats: del decrements live_bytes, tombstone in total_bytes",
           "[bytecask][filestats]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("k"), to_bytes("value"));
   db.del({}, to_bytes("k"));
@@ -1611,7 +1611,7 @@ TEST_CASE("FileStats: del decrements live_bytes, tombstone in total_bytes",
 TEST_CASE("FileStats: apply_batch tracks stats with bulk markers",
           "[bytecask][filestats]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   bytecask::Batch batch;
   batch.put(to_bytes("a"), to_bytes("va"));
@@ -1635,7 +1635,7 @@ TEST_CASE("FileStats: apply_batch tracks stats with bulk markers",
 TEST_CASE("FileStats: batch del decrements live_bytes",
           "[bytecask][filestats]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("k"), to_bytes("val"));
 
@@ -1657,7 +1657,7 @@ TEST_CASE("FileStats: cross-file overwrite decrements old file",
           "[bytecask][filestats]") {
   TempDir td;
   // Threshold of 1 triggers rotation after each write.
-  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
 
   db.put({}, to_bytes("k"), to_bytes("old_value"));
   // After this put, file rotated. Now write to new active file.
@@ -1680,7 +1680,7 @@ TEST_CASE("FileStats: cross-file overwrite decrements old file",
 // ---------------------------------------------------------------------------
 TEST_CASE("FileStats: fragmentation computation", "[bytecask][filestats]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   // Write two entries of equal size, then overwrite the first.
   db.put({}, to_bytes("k1"), to_bytes("value"));
@@ -1713,7 +1713,7 @@ TEST_CASE("FileStats: recovery reconstructs stats", "[bytecask][filestats]") {
   std::map<std::uint32_t, bytecask::FileStats> pre_stats;
   {
     // Threshold of 1 triggers rotation after every write.
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("a"), to_bytes("v1"));
     db.put({}, to_bytes("b"), to_bytes("v2"));
     db.put({}, to_bytes("a"), to_bytes("v3")); // overwrite across files
@@ -1721,7 +1721,7 @@ TEST_CASE("FileStats: recovery reconstructs stats", "[bytecask][filestats]") {
   }
 
   // Reopen — recovery from hint files.
-  auto db2 = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+  auto db2 = bytecask::DB::open(db_path, {.max_file_bytes = 1});
   auto post_stats = db2.file_stats();
 
   // Verify live_bytes and total_bytes per sealed file match.
@@ -1757,7 +1757,7 @@ TEST_CASE("FileStats: parallel recovery matches serial",
   const auto db_path = td.path / "db";
 
   {
-    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
     for (int i = 0; i < 50; ++i) {
       auto k = std::format("key{:04d}", i);
       auto v = std::format("val{:04d}", i);
@@ -1785,11 +1785,11 @@ TEST_CASE("FileStats: parallel recovery matches serial",
                         std::filesystem::copy_options::recursive);
 
   // Serial recovery.
-  auto db_serial = bytecask::Bytecask::open(serial_path, {.max_file_bytes = 1, .recovery_threads = 1});
+  auto db_serial = bytecask::DB::open(serial_path, {.max_file_bytes = 1, .recovery_threads = 1});
   auto serial_stats = db_serial.file_stats();
 
   // Parallel recovery (4 threads).
-  auto db_parallel = bytecask::Bytecask::open(parallel_path, {.max_file_bytes = 1, .recovery_threads = 4});
+  auto db_parallel = bytecask::DB::open(parallel_path, {.max_file_bytes = 1, .recovery_threads = 4});
   auto parallel_stats = db_parallel.file_stats();
 
   // Sum of live_bytes must match.
@@ -1847,7 +1847,7 @@ TEST_CASE("vacuum compact removes dead entries", "[vacuum]") {
   TempDir td;
   // Threshold=1 forces rotation after each write → every put lands in its
   // own sealed file (the active file is always a fresh, empty one).
-  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
 
   // Write k1, then overwrite it → original entry is dead.
   db.put({}, to_bytes("k1"), to_bytes("old"));
@@ -1884,7 +1884,7 @@ TEST_CASE("vacuum compact removes dead entries", "[vacuum]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum compact preserves tombstones", "[vacuum]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
 
   db.put({}, to_bytes("gone"), to_bytes("value"));
   std::ignore = db.del({}, to_bytes("gone"));
@@ -1898,7 +1898,7 @@ TEST_CASE("vacuum compact preserves tombstones", "[vacuum]") {
 
   // Reopen to verify tombstone survives recovery.
   {
-    auto db2 = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+    auto db2 = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
     CHECK_FALSE(db2.contains_key(to_bytes("gone")));
   }
 }
@@ -1908,7 +1908,7 @@ TEST_CASE("vacuum compact preserves tombstones", "[vacuum]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum compact on fully dead file", "[vacuum]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
 
   db.put({}, to_bytes("x"), to_bytes("v1"));
   // Overwrite so the first file's entry is dead.
@@ -1926,7 +1926,7 @@ TEST_CASE("vacuum compact on fully dead file", "[vacuum]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum no-op when nothing exceeds threshold", "[vacuum]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db");
+  auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("k"), to_bytes("v"));
 
@@ -1952,7 +1952,7 @@ TEST_CASE("vacuum absorb moves entries to active file", "[vacuum]") {
   TempDir td;
   // Use a large threshold so absorb path is chosen (live data fits in active).
   {
-    auto db = bytecask::Bytecask::open(td.path / "db");
+    auto db = bytecask::DB::open(td.path / "db");
     db.put({}, to_bytes("k1"), to_bytes("v1"));
     db.put({}, to_bytes("k2"), to_bytes("v2"));
     // Overwrite k1 to create fragmentation.
@@ -1960,7 +1960,7 @@ TEST_CASE("vacuum absorb moves entries to active file", "[vacuum]") {
     // db destroyed here — background worker drains, hints written
   }
   {
-    auto db2 = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+    auto db2 = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
     // Writes to force rotation of existing files.
     db2.put({}, to_bytes("k3"), to_bytes("v3"));
     // Now we have: sealed files from original writes + sealed file with k3 + active.
@@ -1970,7 +1970,7 @@ TEST_CASE("vacuum absorb moves entries to active file", "[vacuum]") {
   }
 
   // Reopen with large threshold so absorb path is used.
-  auto db3 = bytecask::Bytecask::open(td.path / "db");
+  auto db3 = bytecask::DB::open(td.path / "db");
   const auto stats_before = db3.file_stats().size();
 
   db3.vacuum({.fragmentation_threshold = 0.0});
@@ -1991,7 +1991,7 @@ TEST_CASE("vacuum absorb moves entries to active file", "[vacuum]") {
 TEST_CASE("vacuum absorb preserves LSNs across recovery", "[vacuum]") {
   TempDir td;
   {
-    auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
     db.put({}, to_bytes("a"), to_bytes("alpha"));
     db.put({}, to_bytes("b"), to_bytes("beta"));
     // Overwrite a to create fragmentation.
@@ -2001,13 +2001,13 @@ TEST_CASE("vacuum absorb preserves LSNs across recovery", "[vacuum]") {
 
   // Reopen with large threshold so absorb is used.
   {
-    auto db2 = bytecask::Bytecask::open(td.path / "db");
+    auto db2 = bytecask::DB::open(td.path / "db");
     db2.vacuum({.fragmentation_threshold = 0.0});
     // db2 destroyed here — background worker drains, hints written
   }
 
   // Reopen again — recovery should see absorbed entries correctly.
-  auto db3 = bytecask::Bytecask::open(td.path / "db");
+  auto db3 = bytecask::DB::open(td.path / "db");
   CHECK(to_string(*get_val(db3, to_bytes("a"))) == "alpha2");
   CHECK(to_string(*get_val(db3, to_bytes("b"))) == "beta");
 }
@@ -2019,7 +2019,7 @@ TEST_CASE("vacuum chooses compact for large file", "[vacuum]") {
   TempDir td;
   // Threshold = 1 forces many small sealed files, each rotated immediately.
   {
-    auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+    auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
     db.put({}, to_bytes("a"), to_bytes("1"));
     db.put({}, to_bytes("a"), to_bytes("2")); // kills first entry.
 
@@ -2035,7 +2035,7 @@ TEST_CASE("vacuum chooses compact for large file", "[vacuum]") {
   }
 
   // Verify recovery after compact.
-  auto db2 = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+  auto db2 = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
   CHECK(to_string(*get_val(db2, to_bytes("a"))) == "2");
 }
 
@@ -2044,7 +2044,7 @@ TEST_CASE("vacuum chooses compact for large file", "[vacuum]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum loop reclaims all fragmentation", "[vacuum]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
 
   // Create multiple fragmented files.
   db.put({}, to_bytes("x"), to_bytes("1"));
@@ -2071,7 +2071,7 @@ TEST_CASE("vacuum loop reclaims all fragmentation", "[vacuum]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum compact stats consistency", "[vacuum][filestats]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
 
   db.put({}, to_bytes("k1"), to_bytes("aaa"));
   db.put({}, to_bytes("k2"), to_bytes("bbb"));

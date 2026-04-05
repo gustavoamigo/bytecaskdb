@@ -22,7 +22,7 @@ module;
 #include <variant>
 #include <vector>
 
-module bytecask.engine;
+module bytecask;
 
 import bytecask.concurrency;
 import :internals;
@@ -89,7 +89,7 @@ auto EngineState::apply_rotation(const std::filesystem::path &dir) const
 // Opens dir, runs recovery, creates initial active data file.
 // Initialises file_stats_ for the new active file.
 // Throws std::system_error if the directory cannot be prepared.
-Bytecask::Bytecask(std::filesystem::path dir, Options opts)
+DB::DB(std::filesystem::path dir, Options opts)
     : dir_{std::move(dir)}, rotation_threshold_{opts.max_file_bytes},
       state_{std::make_shared<EngineState>()} {
   std::filesystem::create_directories(dir_);
@@ -119,7 +119,7 @@ Bytecask::Bytecask(std::filesystem::path dir, Options opts)
 // destructs first (declared last) and drains all pending tasks before any
 // other member is destroyed.
 // At destruction no readers are active — purge all stale files.
-Bytecask::~Bytecask() {
+DB::~DB() {
   auto s = state_.load();
   if (s->files && !s->files->empty()) {
     try {
@@ -146,7 +146,7 @@ Bytecask::~Bytecask() {
 // Routes the read to the correct data file via KeyDirEntry::file_id.
 // Throws std::system_error on I/O failure or std::runtime_error on CRC
 // mismatch.
-auto Bytecask::get(const ReadOptions &opts, BytesView key,
+auto DB::get(const ReadOptions &opts, BytesView key,
                    Bytes &out) const -> bool {
   auto s = load_state(opts);
   const auto kv = s->key_dir.get(key);
@@ -164,7 +164,7 @@ auto Bytecask::get(const ReadOptions &opts, BytesView key,
 // Rotates the active file if it has reached the threshold.
 // opts.sync controls whether fdatasync is called after the write.
 // Throws std::system_error on I/O failure or lock contention (try_lock).
-void Bytecask::put(const WriteOptions &opts, BytesView key, BytesView value) {
+void DB::put(const WriteOptions &opts, BytesView key, BytesView value) {
   std::shared_ptr<DataFile> file_to_sync;
   {
     auto guard = acquire_write_lock(opts);
@@ -195,7 +195,7 @@ void Bytecask::put(const WriteOptions &opts, BytesView key, BytesView value) {
 // Rotates the active file if it has reached the threshold.
 // opts.sync controls whether fdatasync is called after the write.
 // Throws std::system_error on I/O failure or lock contention (try_lock).
-auto Bytecask::del(const WriteOptions &opts, BytesView key) -> bool {
+auto DB::del(const WriteOptions &opts, BytesView key) -> bool {
   std::shared_ptr<DataFile> file_to_sync;
   {
     auto guard = acquire_write_lock(opts);
@@ -224,7 +224,7 @@ auto Bytecask::del(const WriteOptions &opts, BytesView key) -> bool {
   return true;
 }
 
-auto Bytecask::contains_key(BytesView key) const -> bool {
+auto DB::contains_key(BytesView key) const -> bool {
   auto s = state_.load();
   return s->key_dir.contains(key);
 }
@@ -234,7 +234,7 @@ auto Bytecask::contains_key(BytesView key) const -> bool {
 // opts.sync controls whether a single fdatasync is issued at the end.
 // Rotates the active file after the sync if the threshold is reached.
 // Throws std::system_error on I/O failure or lock contention (try_lock).
-void Bytecask::apply_batch(const WriteOptions &opts, Batch batch) {
+void DB::apply_batch(const WriteOptions &opts, Batch batch) {
   if (batch.empty()) {
     return;
   }
@@ -307,7 +307,7 @@ void Bytecask::apply_batch(const WriteOptions &opts, Batch batch) {
 // one value from disk via a single pread (lazy). Results are in ascending
 // key order.
 // Throws std::system_error on I/O failure.
-auto Bytecask::iter_from(const ReadOptions & /*opts*/, BytesView from) const
+auto DB::iter_from(const ReadOptions & /*opts*/, BytesView from) const
     -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
   auto s = state_.load();
   auto it = from.empty() ? s->key_dir.begin() : s->key_dir.lower_bound(from);
@@ -317,7 +317,7 @@ auto Bytecask::iter_from(const ReadOptions & /*opts*/, BytesView from) const
 
 // Returns an input range of keys >= from. Walks the in-memory key directory
 // only; no disk I/O.
-auto Bytecask::keys_from(const ReadOptions & /*opts*/, BytesView from) const
+auto DB::keys_from(const ReadOptions & /*opts*/, BytesView from) const
     -> std::ranges::subrange<KeyIterator, std::default_sentinel_t> {
   auto s = state_.load();
   auto it = from.empty() ? s->key_dir.begin() : s->key_dir.lower_bound(from);
@@ -333,7 +333,7 @@ auto Bytecask::keys_from(const ReadOptions & /*opts*/, BytesView from) const
 // from write_mu_, so normal put/del/apply_batch calls are not blocked while
 // vacuum scans and rewrites data — only the brief commit step acquires
 // write_mu_.
-auto Bytecask::vacuum(VacuumOptions opts) -> bool {
+auto DB::vacuum(VacuumOptions opts) -> bool {
   std::lock_guard vg{*vacuum_mu_};
 
   // Drain in-flight background hint writes so that vacuum's
@@ -390,7 +390,7 @@ auto Bytecask::vacuum(VacuumOptions opts) -> bool {
 // and written only when BulkEnd is seen; an incomplete batch (crash
 // mid-write) is silently discarded. Idempotent: skips files whose .hint
 // already exists.
-void Bytecask::flush_hints_for(const std::shared_ptr<DataFile> &file,
+void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
                                const std::filesystem::path &dir) {
   const auto stem = file->path().stem().string();
   const auto hint_path = dir / (stem + ".hint");
@@ -453,7 +453,7 @@ void Bytecask::flush_hints_for(const std::shared_ptr<DataFile> &file,
 }
 
 // Writes hint files for all sealed data files in the given state.
-void Bytecask::flush_hints(const EngineState &s) {
+void DB::flush_hints(const EngineState &s) {
   for (auto &[file_id, file] : *s.files) {
     if (file_id == s.active_file_id) {
       continue;
@@ -463,7 +463,7 @@ void Bytecask::flush_hints(const EngineState &s) {
 }
 
 // Drains background hint tasks then writes hint files for all sealed files.
-void Bytecask::flush_hints() {
+void DB::flush_hints() {
   worker_.drain();
   flush_hints(*state_.load());
 }
@@ -476,7 +476,7 @@ void Bytecask::flush_hints() {
 // snap->key_dir for source_file_id) and all tombstones into dest_file.
 // Entries inside BulkBegin..BulkEnd are buffered and emitted only on
 // BulkEnd; incomplete batches at EOF are silently discarded.
-auto Bytecask::vacuum_scan_and_copy(
+auto DB::vacuum_scan_and_copy(
     const std::shared_ptr<const EngineState> &snap,
     const DataFile &source_file, DataFile &dest_file,
     std::uint32_t source_file_id) -> VacuumScanResult {
@@ -555,7 +555,7 @@ auto Bytecask::vacuum_scan_and_copy(
 
 // Purge stale files whose DataFile is only held by stale_files_ (no
 // in-flight readers). Called at the start of vacuum() under vacuum_mu_.
-void Bytecask::vacuum_purge_stale_files() {
+void DB::vacuum_purge_stale_files() {
   std::erase_if(stale_files_, [](StaleFile &sf) {
     if (sf.data_file.use_count() == 1) {
       auto path = sf.data_file->path();
@@ -574,7 +574,7 @@ void Bytecask::vacuum_purge_stale_files() {
 // If new_sealed_file is non-null (compact), a fresh file-id is
 // allocated and the new file is registered. Otherwise (absorb),
 // the active file's stats are incremented.
-void Bytecask::vacuum_commit(std::uint32_t old_file_id,
+void DB::vacuum_commit(std::uint32_t old_file_id,
                              const VacuumScanResult &scan,
                              std::shared_ptr<DataFile> new_sealed_file) {
   auto s = *state_.load();
@@ -620,7 +620,7 @@ void Bytecask::vacuum_commit(std::uint32_t old_file_id,
 
 // Stashes the old data file and its hint path for deferred removal
 // once no in-flight readers reference it.
-void Bytecask::vacuum_defer_old_file(
+void DB::vacuum_defer_old_file(
     const std::shared_ptr<const EngineState> &snap, std::uint32_t file_id) {
   auto old_data_file = snap->files->at(file_id);
   auto old_hint_path =
@@ -632,7 +632,7 @@ void Bytecask::vacuum_defer_old_file(
 // entries and tombstones. Called under vacuum_mu_, not write_mu_.
 // The new data file is written to .data.tmp, then renamed atomically.
 // The old file is deferred for cleanup when no readers reference it.
-void Bytecask::vacuum_compact_file(std::uint32_t file_id) {
+void DB::vacuum_compact_file(std::uint32_t file_id) {
   auto snap = state_.load();
   const auto &old_file = *snap->files->at(file_id);
 
@@ -665,7 +665,7 @@ void Bytecask::vacuum_compact_file(std::uint32_t file_id) {
 // scan_and_copy appends to the shared active DataFile, which is
 // NOT thread-safe (requires external synchronization).
 // The old file is deferred for cleanup when no readers reference it.
-void Bytecask::vacuum_absorb_file(std::uint32_t file_id) {
+void DB::vacuum_absorb_file(std::uint32_t file_id) {
   auto snap = state_.load();
   const auto &old_file = *snap->files->at(file_id);
 
@@ -684,12 +684,12 @@ void Bytecask::vacuum_absorb_file(std::uint32_t file_id) {
 #pragma region FileStats helpers
 
 // Marks an existing entry as dead in its file's stats.
-void Bytecask::stats_retire_entry(BytesView key, const KeyDirEntry &old) {
+void DB::stats_retire_entry(BytesView key, const KeyDirEntry &old) {
   file_stats_[old.file_id].live_bytes -= entry_size(key.size(), old.value_size);
 }
 
 // Records a new Put entry: live + total on the active file.
-void Bytecask::stats_publish_put(std::uint32_t active_file_id, BytesView key,
+void DB::stats_publish_put(std::uint32_t active_file_id, BytesView key,
                                  BytesView value) {
   const auto sz = entry_size(key.size(), value.size());
   auto &st = file_stats_[active_file_id];
@@ -698,13 +698,13 @@ void Bytecask::stats_publish_put(std::uint32_t active_file_id, BytesView key,
 }
 
 // Records a tombstone (Delete): total only on the active file.
-void Bytecask::stats_publish_tombstone(std::uint32_t active_file_id,
+void DB::stats_publish_tombstone(std::uint32_t active_file_id,
                                        BytesView key) {
   file_stats_[active_file_id].total_bytes += entry_size(key.size(), 0);
 }
 
 // Records a bulk marker (BulkBegin / BulkEnd): total only.
-void Bytecask::stats_publish_bulk_marker(std::uint32_t active_file_id) {
+void DB::stats_publish_bulk_marker(std::uint32_t active_file_id) {
   file_stats_[active_file_id].total_bytes += kHeaderSize + kCrcSize;
 }
 
@@ -719,7 +719,7 @@ void Bytecask::stats_publish_bulk_marker(std::uint32_t active_file_id) {
 // Returns a reference to the thread-local snapshot. The snapshot stays
 // alive until the same thread calls load_state again, so callers must
 // not stash the reference across a second load_state call.
-auto Bytecask::load_state(const ReadOptions &opts) const
+auto DB::load_state(const ReadOptions &opts) const
     -> const std::shared_ptr<const EngineState> & {
   struct TlState {
     std::shared_ptr<const EngineState> snapshot;
@@ -739,7 +739,7 @@ auto Bytecask::load_state(const ReadOptions &opts) const
 }
 
 // Acquires the write mutex. Blocking or try-lock based on opts.try_lock.
-auto Bytecask::acquire_write_lock(const WriteOptions &opts)
+auto DB::acquire_write_lock(const WriteOptions &opts)
     -> std::unique_lock<std::mutex> {
   if (opts.try_lock) {
     std::unique_lock<std::mutex> lk{*write_mu_, std::try_to_lock};
@@ -760,7 +760,7 @@ auto Bytecask::acquire_write_lock(const WriteOptions &opts)
 // Seals the active file, opens a new one, and dispatches hint file writing
 // for the now-sealed file to the background worker. Returns a new EngineState.
 // fdatasync on the sealed file remains synchronous for durability correctness.
-auto Bytecask::rotate_active_file(EngineState s) -> EngineState {
+auto DB::rotate_active_file(EngineState s) -> EngineState {
   s.active_file().sync();
   s.active_file().seal();
   auto sealed = s.files->at(s.active_file_id);
@@ -773,7 +773,7 @@ auto Bytecask::rotate_active_file(EngineState s) -> EngineState {
   return s;
 }
 
-auto Bytecask::rotate_if_needed(EngineState s) -> EngineState {
+auto DB::rotate_if_needed(EngineState s) -> EngineState {
   if (s.active_file().size() >= rotation_threshold_) {
     return rotate_active_file(std::move(s));
   }
@@ -787,7 +787,7 @@ auto Bytecask::rotate_if_needed(EngineState s) -> EngineState {
 // Phase 1 shared by serial and parallel recovery: remove stale .hint.tmp
 // files, open all data files, seal them, register in s.files, and
 // generate missing hint files. Returns the RecoveredFile list.
-auto Bytecask::recovery_prepare_files(EngineState &s)
+auto DB::recovery_prepare_files(EngineState &s)
     -> std::vector<RecoveredFile> {
   for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
     const auto &p = dir_entry.path();
@@ -824,7 +824,7 @@ auto Bytecask::recovery_prepare_files(EngineState &s)
 
 // Builds a RecoveryResult from a subset of hint files.
 // Each worker calls this independently — no shared mutable state.
-auto Bytecask::recovery_build_from_hints(std::span<RecoveredFile> files)
+auto DB::recovery_build_from_hints(std::span<RecoveredFile> files)
     -> RecoveryResult {
   std::uint64_t max_lsn = 0;
   auto t = PersistentRadixTree<KeyDirEntry>{}.transient();
@@ -884,7 +884,7 @@ auto Bytecask::recovery_build_from_hints(std::span<RecoveredFile> files)
 // suppress stale PUTs. Tombstone maps and file_stats are unioned.
 // live_bytes are recomputed from the merged tree after all conflict
 // resolution (the merge resolver doesn't have access to key sizes).
-auto Bytecask::recovery_merge_results(RecoveryResult a, RecoveryResult b)
+auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 -> RecoveryResult {
   auto &merged_stats = a.file_stats;
   for (auto &[fid, fs] : b.file_stats) {
@@ -938,7 +938,7 @@ auto Bytecask::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 // then recovers exclusively from hints — single code path.
 // Returns a new EngineState with key_dir populated and next_lsn set to
 // max_seen + 1. next_file_id is advanced for each recovered file.
-auto Bytecask::recovery_load_serial(EngineState s) -> EngineState {
+auto DB::recovery_load_serial(EngineState s) -> EngineState {
   auto files = recovery_prepare_files(s);
 
   for (const auto &rf : files) {
@@ -998,7 +998,7 @@ auto Bytecask::recovery_load_serial(EngineState s) -> EngineState {
 // Parallel recovery (v1): file-level partitioning with fan-in merge.
 // Round-robin assigns files to W workers, each builds a RecoveryResult,
 // then pairwise merges reduce to a single result in ⌈log₂(W)⌉ rounds.
-auto Bytecask::recovery_load_parallel(EngineState s,
+auto DB::recovery_load_parallel(EngineState s,
                                       unsigned recovery_threads) -> EngineState {
   auto files = recovery_prepare_files(s);
 

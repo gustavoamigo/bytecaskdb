@@ -194,7 +194,7 @@ public:
   [[nodiscard]] auto size() const noexcept -> Offset { return offset_; }
 
   // Marks the file as sealed: no further appends are permitted.
-  // The fd remains open for reads. seal() is called by Bytecask on rotation.
+  // The fd remains open for reads. seal() is called by DB on rotation.
   void seal() noexcept { sealed_ = true; }
 
   [[nodiscard]] auto path() const -> const std::filesystem::path & {

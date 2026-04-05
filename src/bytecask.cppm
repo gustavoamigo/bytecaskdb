@@ -13,7 +13,7 @@ module;
 #include <variant>
 #include <vector>
 
-export module bytecask.engine;
+export module bytecask;
 
 export import :internals;
 import bytecask.concurrency;
@@ -63,7 +63,7 @@ export struct BatchRemove {
 export using BatchOperation = std::variant<BatchInsert, BatchRemove>;
 
 // Move-only, single-use container of operations submitted atomically.
-// Consumed by Bytecask::apply_batch().
+// Consumed by DB::apply_batch().
 export class Batch {
 public:
   Batch() = default;
@@ -91,7 +91,7 @@ public:
 
 private:
   std::vector<BatchOperation> operations_;
-  friend class Bytecask;
+  friend class DB;
 };
 
 // Default active-file size threshold: 64 MiB.
@@ -137,7 +137,7 @@ export struct ReadOptions {
   std::chrono::milliseconds staleness_tolerance{0};
 };
 
-// Options passed to Bytecask::open().
+// Options passed to DB::open().
 export struct Options {
   // Active-file rotation threshold in bytes (default 64 MiB). When the active
   // file reaches this size it is sealed and a new one is opened.
@@ -246,28 +246,28 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Bytecask — SWMR key-value store
+// DB — SWMR key-value store
 //
 // Thread safety: write operations (put, del, apply_batch) are serialised by
 // write_mu_. After producing a new EngineState, the writer publishes it via
 // state_.store(). Readers call state_.load() without acquiring write_mu_.
 // ---------------------------------------------------------------------------
-export class Bytecask {
+export class DB {
 public:
   // Opens or creates a database rooted at dir.
   // Always creates a new active data file.
   // Throws std::system_error if the directory cannot be prepared.
   [[nodiscard]] static auto open(std::filesystem::path dir,
-                                 Options opts = {}) -> Bytecask {
-    return Bytecask{std::move(dir), std::move(opts)};
+                                 Options opts = {}) -> DB {
+    return DB{std::move(dir), std::move(opts)};
   }
 
-  Bytecask(const Bytecask &) = delete;
-  Bytecask &operator=(const Bytecask &) = delete;
-  Bytecask(Bytecask &&) = delete;
-  Bytecask &operator=(Bytecask &&) = delete;
+  DB(const DB &) = delete;
+  DB &operator=(const DB &) = delete;
+  DB(DB &&) = delete;
+  DB &operator=(DB &&) = delete;
 
-  ~Bytecask();
+  ~DB();
 
   // Writes the value for key into out, reusing its existing capacity to
   // amortize allocation across calls. Returns true if the key was found,
@@ -346,7 +346,7 @@ public:
   [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
 
 private:
-  explicit Bytecask(std::filesystem::path dir, Options opts);
+  explicit DB(std::filesystem::path dir, Options opts);
 
   // Hint file management
   // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint exists.
