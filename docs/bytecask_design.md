@@ -573,21 +573,23 @@ CRC placement mirrors data file entries: accumulate header + key data in one seq
 - Total fixed overhead: `kHintHeaderSize + kHintCrcSize = 27`
 - Total entry size: `kHintHeaderSize + key_size + kHintCrcSize`
 
-### Recovery (planned)
+### Recovery
 
 On engine startup:
 
 1. Discard any `.hint.tmp` files — incomplete hint files from a crash mid-rotation.
-2. Read hint files oldest-to-newest. For each entry: verify the trailing CRC (**panic on any mismatch**); then apply based on `entry_type`:
+2. Open all `.data` files and seal them. For any data file without a companion `.hint`, generate one via `flush_hints_for()` (batch-aware: buffers entries between BulkBegin/BulkEnd, discards incomplete batches, logs a warning).
+3. Recover exclusively from hint files. For each hint entry:
    - `Put`: insert `(key → {sequence, file_id, file_offset, value_size})` only if `entry.sequence > dir[key].sequence` (skip if a fresher entry is already present).
-   - `Delete`: remove the key from the B-Tree if `entry.sequence > dir[key].sequence`; otherwise skip.
-3. For any data file without a companion `.hint`, scan its raw bytes using the same Put/Delete rules. Skip `BulkBegin`/`BulkEnd` records. If a `BulkBegin` has no matching `BulkEnd`, discard all entries from that point onward and log a warning.
-4. Record `max_lsn` — the largest sequence number seen across all hint files and the active data file scan.
+   - `Delete`: remove the key from the tree if `entry.sequence > dir[key].sequence`; otherwise skip.
+4. Record `max_lsn` — the largest sequence number seen across all hint entries.
 5. Create a new active data file seeded at `max_lsn + 1`.
+
+This is a single code path: `flush_hints_for()` is the same function used by rotation and background hint writes. No raw-scan recovery logic exists — recovery always goes through hints.
 
 ### Incomplete Batch Recovery
 
-If the engine crashes after writing a `BulkBegin` but before the matching `BulkEnd`, the active data file contains an incomplete batch. Recovery discards all entries from the unmatched `BulkBegin` onward and logs a warning. No partial-batch entries are inserted into the key directory. Because hint files are only written for immutable (fully rotated) files, an incomplete batch can only appear in the active data file scan — never in a hint file.
+If the engine crashes after writing a `BulkBegin` but before the matching `BulkEnd`, the data file contains an incomplete batch. `flush_hints_for()` detects this (BulkBegin with no matching BulkEnd), discards the buffered entries, and logs a warning. No partial-batch entries appear in the generated hint file, so they are never inserted into the key directory.
 
 ### Relationship to Data Files
 
@@ -595,14 +597,14 @@ If the engine crashes after writing a `BulkBegin` but before the matching `BulkE
 |---|---|---|
 | Extension | `.data` | `.hint` |
 | Contents | Full key + value | Key + location metadata only |
-| Created | At engine open / rotation | When a data file is sealed (rotated) |
-| Read at startup | Only for the active file | For all sealed files |
+| Created | At engine open / rotation | When a data file is sealed (rotated), or on startup for files missing hints |
+| Read at startup | Never directly — hints are generated first if absent | For all sealed files |
 
 One hint file corresponds to exactly one data file (same timestamp stem, different extension).
 
-**Hint files are a startup-optimization artifact, not a correctness requirement.** Recovery always falls back to scanning the raw `.data` file if no `.hint` companion exists. This makes hint file writes safe to defer out of the rotation path entirely.
+**Hint files are a correctness-carrying artifact for recovery.** On startup, any data file without a companion `.hint` has one generated via the batch-aware `flush_hints_for()`. Recovery then reads only hint files — there is no separate raw-scan fallback path.
 
-Hint files are written **deferred**: at engine close, or via an explicit `flush_hints()` call — never inline on the write path. This keeps write-path latency flat and bounded regardless of file size at the time of rotation. The cost is that a crash after rotation but before `flush_hints()` causes recovery to scan the `.data` file instead of the `.hint` file, which is always correct and only slower.
+Hint files are written **deferred**: at engine close, or via an explicit `flush_hints()` call — never inline on the write path. This keeps write-path latency flat and bounded regardless of file size at the time of rotation. The cost is that a crash after rotation but before `flush_hints()` causes recovery to generate the hint file on startup, which is always correct and only slower.
 
 ### Hint File Atomicity
 

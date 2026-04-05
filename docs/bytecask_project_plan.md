@@ -16,6 +16,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | ID | Title | Note |
 | --- | --- | --- |
 | BC-068a | `PersistentRadixTree::merge` + tests | Implement `merge(a, b, resolve)` on `PersistentRadixTree`. Recursive structural-sharing merge: disjoint subtrees shared O(1), conflicting leaves resolved by caller-supplied callback. Branch: `feature/parallel-recovery`. |
+| BC-069 | Batch-aware hint generation + recovery simplification | Fix `flush_hints_for()` to handle BulkBegin/BulkEnd (buffer entries, discard incomplete batches). Recovery pre-generates missing hints then reads hints only — eliminates duplicate raw-scan code path. New test: incomplete batch discarded during recovery. |
 
 ## Backlog
 
