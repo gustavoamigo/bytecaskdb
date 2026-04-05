@@ -262,12 +262,103 @@ interference between builders and the merge step is possible.
 
 ---
 
-## 8. Implementation order
+## 8. Merge benchmark findings
 
-Tracked as **BC-068: Parallel recovery via key-partitioned tree build**.
+Run on 16 × 4427 MHz, Clang release. `PersistentRadixTree<int>`, generic `"key_N"` keys, 3 repetitions (mean reported).
 
-1. `PersistentRadixTree::merge_disjoint` + unit tests in `radix_tree_test.cpp`
-2. `BM_MergeDisjoint` micro-benchmark in `map_bench.cpp`
-3. Parallel `recover_existing_files` behind a `recovery_threads` parameter (default 1 = serial)
-4. `BM_RecoveryParallel` in `engine_bench.cpp` alongside `BM_Recovery/WithHints`
+### 8.1. Merge-only cost (N total keys, two pre-built N/2-key trees)
+
+| Scenario | 1k (µs) | 10k (µs) | 100k (µs) |
+|---|---|---|---|
+| Disjoint (0% overlap) | 23 | 261 | 2,779 |
+| Overlapping (50% overlap) | 44 | 454 | 6,208 |
+
+Overlapping merges are ~2× more expensive — every shared key forces a node clone + resolver call.
+
+### 8.2. Split-build-merge vs linear build (sequential)
+
+End-to-end: `build(N/2) + build(N/2) + merge(N)` measured sequentially, compared to `TransientSet(N)`.
+
+| Benchmark | 100k (µs) | vs linear |
+|---|---|---|
+| TransientSet (linear baseline) | 14,583 | 1.0× |
+| SplitBuildMerge (disjoint) | 19,820 | 1.36× |
+| SplitBuildMergeOverlapping (20%) | 24,744 | 1.70× |
+| SplitBuildMergePrefixed (disjoint) | 17,468 | 1.20× |
+
+### 8.3. Parallel projection (2 threads)
+
+With 2 threads the build phases overlap, so wall-clock ≈ `build(N/2) + merge`.
+
+| Scenario | Estimated parallel (µs) | vs linear | Speedup |
+|---|---|---|---|
+| Disjoint, generic | 8,521 + 2,779 = 11,300 | 14,583 | **1.29×** |
+| 20% overlap, generic | ~10,000 + ~4,744 = ~14,744 | 14,583 | ~1.0× (break-even) |
+| Disjoint, prefixed | ~7,292 + ~2,885 = ~10,177 | 15,636* | **1.54×** |
+
+\* Prefixed linear baseline = `TransientSetPrefixed/100000`.
+
+### 8.4. Implications for the fan-in merge tree
+
+In a log₂(P) fan-in with P workers:
+
+- **Round 1** (P/2 merges): each merge combines two per-file trees. Keys are mostly disjoint — a key typically appears in only one hint file. Cost per merge ≈ disjoint rate.
+- **Round 2+**: merged trees cover increasingly overlapping key ranges. In an update-heavy database, later rounds approach the 20% overlap case.
+- **Final round**: single serial merge of two ~N/2 trees. Overlap depends on workload.
+
+The build phase dominates total cost. Merge rounds 1–3 are parallel and cheap (disjoint subtree adoption). Only the final round is serial and potentially overlapping.
+
+---
+
+## 9. Strategy decision: hash-partition vs file-level split
+
+The original design (§2) proposes `hash(key) % P` partitioning to guarantee **fully disjoint** trees, enabling `merge_disjoint` with zero conflict resolution.
+
+An alternative is **file-level partitioning**: assign each hint file to a worker round-robin, each builds a full-key-range tree, and merge with a general `merge(a, b, resolve)` using LSN-based conflict resolution.
+
+### 9.1. Hash-partition (original design)
+
+| Pro | Con |
+|---|---|
+| Guaranteed disjoint — merge is O(shared spine) | Requires MPSC queues, hash dispatch |
+| No resolver needed — simpler merge primitive | Reader → builder pipeline adds latency |
+| Merge 2× faster at high overlap | Partition imbalance if key distribution skewed |
+| `count_keys` can sum partition sizes instead of walking | More infrastructure to build |
+
+### 9.2. File-level partition
+
+| Pro | Con |
+|---|---|
+| Trivial to implement — each worker reads its files and builds | Later merge rounds face ~20% overlap |
+| No queues, no hashing, no dispatch | Resolver needed (LSN comparison) |
+| Work-stealing straightforward | Merge ~2× slower in overlapping rounds |
+| Already have `merge(a, b, resolve)` implemented and tested | `count_keys` O(N) walk after each merge |
+
+### 9.3. Benchmark-informed recommendation
+
+The merge benchmarks show:
+
+1. **Disjoint merge is 2× cheaper** than 50%-overlapping merge, but even the overlapping merge is only 34% of linear build cost at 100k keys. The merge phase is not the bottleneck — build is.
+2. **At 2 threads, disjoint split+merge gives 29% speedup**, overlapping breaks even. At 4+ threads the build phase dominates enough that both strategies win.
+3. **Prefixed keys** (realistic workload) show only +20% sequential overhead for split+merge, making parallel a clear win even at 2 threads.
+
+Given that:
+- `merge(a, b, resolve)` is **already implemented and tested** (9 test cases, 25k assertions, model-based oracle)
+- File-level partitioning requires **zero new infrastructure** (no queues, no hash dispatch)
+- The performance gap between disjoint and general merge is **dominated by build cost** and shrinks with more workers
+- Real workloads are closer to the disjoint case in early rounds (most keys appear in one file)
+
+**Recommendation: start with file-level partitioning** using the existing general `merge(a, b, resolve)` with an LSN resolver. If profiling of the merge phase at >1B keys shows it becoming a bottleneck, upgrade to hash-partitioned disjoint merge.
+
+---
+
+## 10. Implementation order
+
+Tracked as **BC-068: Parallel recovery**.
+
+1. ~~`PersistentRadixTree::merge(a, b, resolve)` + unit tests~~ — **Done** (BC-068a)
+2. ~~Merge benchmarks in `map_bench.cpp`~~ — **Done** (disjoint, overlapping, split-build-merge)
+3. Parallel `recover_existing_files` with file-level partitioning behind `recovery_threads` param (default 1 = serial)
+4. `BM_RecoveryParallel` in `engine_bench.cpp`
 5. Make parallel the default when `hardware_concurrency >= 4`
+6. **(Optional)** If merge proves bottleneck at >1B keys: hash-partition variant with `merge_disjoint`

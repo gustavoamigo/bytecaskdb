@@ -76,3 +76,5 @@ These instructions apply to every repository work request in this workspace.
 ## Tips
 
 * xmake can take a while to run, wait for the build to run before trying to do something else. 
+* Don't run any command while the terminal is running as the integration with terminal is sending a ^C killing the previous process when you send a new command.
+* After running a long command (build, benchmark, test suite), do NOT immediately send another command. Wait for the command to finish and return output before proceeding. If the output is truncated or the command appears to still be running, ask the user to confirm completion rather than sending a follow-up command. 

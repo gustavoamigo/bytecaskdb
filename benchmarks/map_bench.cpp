@@ -332,6 +332,96 @@ template <typename A> void BM_PrefixedMemory(benchmark::State &state) {
 }
 
 // ===========================================================================
+// Merge benchmarks — disjoint vs overlapping, and split-build-merge vs linear
+// ===========================================================================
+
+// Merge-only: two disjoint N/2-key trees (zero overlap).
+// Measures the cost of structural merge when all subtrees are adopted by
+// pointer (best case — no conflict resolution).
+void BM_MergeDisjoint(benchmark::State &state) {
+  auto n = static_cast<std::size_t>(state.range(0));
+  auto all = generate_keys(n);
+  std::vector<std::string> ka(all.begin(), all.begin() + std::ssize(all) / 2);
+  std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
+  auto ta = RTreeAdapter::transient_build(ka);
+  auto tb = RTreeAdapter::transient_build(kb);
+  auto resolve = [](const int &, const int &b) { return b; };
+  for (auto _ : state)
+    benchmark::DoNotOptimize(
+        bytecask::PersistentRadixTree<int>::merge(ta, tb, resolve));
+}
+
+// Merge-only: two N/2-key trees with ~50% key overlap (worst realistic case).
+// Half the keys exist in both trees and require conflict resolution.
+void BM_MergeOverlapping(benchmark::State &state) {
+  auto n = static_cast<std::size_t>(state.range(0));
+  auto all = generate_keys(n);
+  auto quarter = std::ssize(all) / 4;
+  std::vector<std::string> ka(all.begin(), all.begin() + quarter * 3);
+  std::vector<std::string> kb(all.begin() + quarter, all.end());
+  auto ta = RTreeAdapter::transient_build(ka);
+  auto tb = RTreeAdapter::transient_build(kb);
+  auto resolve = [](const int &, const int &b) { return b; };
+  for (auto _ : state)
+    benchmark::DoNotOptimize(
+        bytecask::PersistentRadixTree<int>::merge(ta, tb, resolve));
+}
+
+// Full parallel-recovery simulation (measured sequentially):
+//   build(N/2) + build(N/2) + merge
+// Compare against TransientSet(N) to decide if split+merge is worthwhile.
+// In true parallel execution, build times overlap → real time ≈ build(N/2) +
+// merge.
+void BM_SplitBuildMerge(benchmark::State &state) {
+  auto n = static_cast<std::size_t>(state.range(0));
+  auto all = generate_keys(n);
+  std::vector<std::string> ka(all.begin(), all.begin() + std::ssize(all) / 2);
+  std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
+  auto resolve = [](const int &, const int &b) { return b; };
+  for (auto _ : state) {
+    auto ta = RTreeAdapter::transient_build(ka);
+    auto tb = RTreeAdapter::transient_build(kb);
+    benchmark::DoNotOptimize(
+        bytecask::PersistentRadixTree<int>::merge(ta, tb, resolve));
+  }
+}
+
+// Split-build-merge with ~20% key overlap — simulates later rounds in the
+// fan-in merge tree where partial overlap is expected (e.g. hot keys updated
+// across multiple data files).
+void BM_SplitBuildMergeOverlapping(benchmark::State &state) {
+  auto n = static_cast<std::size_t>(state.range(0));
+  auto all = generate_keys(n);
+  // 10% overlap on each side → 20% of keys shared between the two halves.
+  auto overlap = std::ssize(all) / 10;
+  auto mid = std::ssize(all) / 2;
+  std::vector<std::string> ka(all.begin(), all.begin() + mid + overlap);
+  std::vector<std::string> kb(all.begin() + mid - overlap, all.end());
+  auto resolve = [](const int &, const int &b) { return b; };
+  for (auto _ : state) {
+    auto ta = RTreeAdapter::transient_build(ka);
+    auto tb = RTreeAdapter::transient_build(kb);
+    benchmark::DoNotOptimize(
+        bytecask::PersistentRadixTree<int>::merge(ta, tb, resolve));
+  }
+}
+
+// Same as above but with prefix-heavy keys — realistic recovery workload.
+void BM_SplitBuildMergePrefixed(benchmark::State &state) {
+  auto n = static_cast<std::size_t>(state.range(0));
+  auto all = generate_prefixed_keys(n);
+  std::vector<std::string> ka(all.begin(), all.begin() + std::ssize(all) / 2);
+  std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
+  auto resolve = [](const int &, const int &b) { return b; };
+  for (auto _ : state) {
+    auto ta = RTreeAdapter::transient_build(ka);
+    auto tb = RTreeAdapter::transient_build(kb);
+    benchmark::DoNotOptimize(
+        bytecask::PersistentRadixTree<int>::merge(ta, tb, resolve));
+  }
+}
+
+// ===========================================================================
 // Registration
 // ===========================================================================
 
@@ -370,6 +460,13 @@ BENCHMARK(BM_LowerBound<StdMapAdapter>)   ->Name("StdMap/LowerBound")        SIZ
 // Memory footprint with prefix-heavy keys (user::uuid, order::uuid, …)
 BENCHMARK(BM_PrefixedMemory<RTreeAdapter>)   ->Name("RadixTree/PrefixedMemory")  SIZES;
 BENCHMARK(BM_PrefixedMemory<StdMapAdapter>)  ->Name("StdMap/PrefixedMemory")     SIZES;
+
+// Merge
+BENCHMARK(BM_MergeDisjoint)                  ->Name("RadixTree/MergeDisjoint")           SIZES;
+BENCHMARK(BM_MergeOverlapping)               ->Name("RadixTree/MergeOverlapping")        SIZES;
+BENCHMARK(BM_SplitBuildMerge)                ->Name("RadixTree/SplitBuildMerge")              SIZES;
+BENCHMARK(BM_SplitBuildMergeOverlapping)     ->Name("RadixTree/SplitBuildMergeOverlapping")   SIZES;
+BENCHMARK(BM_SplitBuildMergePrefixed)        ->Name("RadixTree/SplitBuildMergePrefixed")      SIZES;
 
 #undef SIZES
 #undef ITER_SIZES

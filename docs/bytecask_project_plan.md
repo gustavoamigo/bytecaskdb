@@ -15,6 +15,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-068a | `PersistentRadixTree::merge` + tests | Implement `merge(a, b, resolve)` on `PersistentRadixTree`. Recursive structural-sharing merge: disjoint subtrees shared O(1), conflicting leaves resolved by caller-supplied callback. Branch: `feature/parallel-recovery`. |
 
 ## Backlog
 
