@@ -8,7 +8,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 # Generate for each default target (bench targets are excluded because
 # xmake's C++ module scanner crashes on targets whose BMIs weren't built).
-for target in bytecask bytecask_tests; do
+for target in bytecask_tests; do
   xmake project -k compile_commands -t "$target" .
 done
 

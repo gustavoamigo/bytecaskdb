@@ -51,7 +51,7 @@
 #include <rocksdb/write_batch.h>
 
 // ByteCask (C++20 modules)
-import bytecask.engine;
+import bytecask;
 import bytecask.hint_entry;
 import bytecask.hint_file;
 import bytecask.types;
@@ -194,11 +194,11 @@ struct TmpDir {
 struct BcAdapter {
   struct Db {
     TmpDir dir;
-    bytecask::Bytecask engine;
+    bytecask::DB engine;
 
     Db(std::string_view tag, const std::vector<std::string> *populate_keys,
        const std::vector<std::byte> *populate_val)
-        : dir{tag}, engine{bytecask::Bytecask::open(dir.path)} {
+        : dir{tag}, engine{bytecask::DB::open(dir.path)} {
       if (populate_keys) {
         bytecask::WriteOptions wo;
         const auto n = populate_keys->size();
@@ -854,7 +854,7 @@ void BM_ReadWhileWriting(benchmark::State &state) {
 }
 
 // ──────────────────────────── Recovery ───────────────────────────────────────
-// Measures startup recovery time: Bytecask::open() on a pre-populated
+// Measures startup recovery time: DB::open() on a pre-populated
 // directory. All timing is on the open() call only; setup and teardown are in
 // PauseTiming regions.
 //
@@ -871,7 +871,7 @@ void BM_ReadWhileWriting(benchmark::State &state) {
 //
 // Per-iteration:
 //   NoHints: deletes all .hint files in PauseTiming so open() must raw-scan.
-//   Both:    times only Bytecask::open(). The DB is destructed in PauseTiming
+//   Both:    times only DB::open(). The DB is destructed in PauseTiming
 //            to exclude any close-time hint writing from the measurement. The
 //            destructor re-writes any missing hint files, restoring the
 //            directory for the next WithHints iteration.
@@ -895,7 +895,7 @@ template <bool WithHints> void BM_Recovery(benchmark::State &state) {
   // One-time setup: populate the directory and write all hint files.
   static const bool kSetupDone = [&] {
     {
-      auto db = bytecask::Bytecask::open(recovery_dir.path, {.max_file_bytes = kRecoveryThreshold});
+      auto db = bytecask::DB::open(recovery_dir.path, {.max_file_bytes = kRecoveryThreshold});
       bytecask::WriteOptions wo;
       const auto n = keys.size();
       for (std::size_t i = 0; i < n; ++i) {
@@ -909,13 +909,13 @@ template <bool WithHints> void BM_Recovery(benchmark::State &state) {
   }();
   (void)kSetupDone;
 
-  // Bytecask is non-movable, so std::optional cannot emplace from open()'s
-  // return value. This thin wrapper copy-initialises the Bytecask member,
+  // DB is non-movable, so std::optional cannot emplace from open()'s
+  // return value. This thin wrapper copy-initialises the DB member,
   // triggering mandatory copy elision (C++17), avoiding any move/copy.
   struct Handle {
-    bytecask::Bytecask db;
+    bytecask::DB db;
     explicit Handle(const std::filesystem::path &p, std::uint64_t threshold)
-        : db{bytecask::Bytecask::open(p, {.max_file_bytes = threshold})} {}
+        : db{bytecask::DB::open(p, {.max_file_bytes = threshold})} {}
   };
 
   std::unique_ptr<Handle> handle;
@@ -994,7 +994,7 @@ struct ParRecoverySetup {
   std::vector<std::string> keys;
 
   ParRecoverySetup() : keys{generate_prefixed_keys(kDatasetSize)} {
-    auto db = bytecask::Bytecask::open(dir.path, {.max_file_bytes = kParRecoveryThreshold});
+    auto db = bytecask::DB::open(dir.path, {.max_file_bytes = kParRecoveryThreshold});
     bytecask::WriteOptions wo;
     static const std::vector<std::byte> tiny_val{std::byte{0x42}};
     const auto n = keys.size();
@@ -1017,10 +1017,10 @@ void BM_RecoveryParallel(benchmark::State &state) {
   auto threads = static_cast<unsigned>(state.range(0));
 
   struct Handle {
-    bytecask::Bytecask db;
+    bytecask::DB db;
     explicit Handle(const std::filesystem::path &p, std::uint64_t th,
                     unsigned t)
-        : db{bytecask::Bytecask::open(p, {.max_file_bytes = th, .recovery_threads = t})} {}
+        : db{bytecask::DB::open(p, {.max_file_bytes = th, .recovery_threads = t})} {}
   };
 
   std::unique_ptr<Handle> handle;
