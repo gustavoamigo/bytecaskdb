@@ -97,6 +97,21 @@ export struct KeyDirEntry {
 };
 
 // ---------------------------------------------------------------------------
+// FileStats — per-file live/total byte counters for fragmentation tracking.
+// Updated under write_mu_ on every write; rebuilt during recovery.
+// ---------------------------------------------------------------------------
+export struct FileStats {
+  std::uint64_t live_bytes{0};
+  std::uint64_t total_bytes{0};
+};
+
+// Returns the on-disk size of a data file entry given key and value sizes.
+inline constexpr auto entry_size(std::size_t key_size,
+                                std::size_t value_size) -> std::uint64_t {
+  return kHeaderSize + key_size + value_size + kCrcSize;
+}
+
+// ---------------------------------------------------------------------------
 // Batch
 // ---------------------------------------------------------------------------
 
@@ -630,6 +645,11 @@ public:
     {
       auto guard = acquire_write_lock(opts);
       auto s = *state_.load();
+
+      const auto existing = s.key_dir.get(key);
+      if (existing) stats_retire_entry(key, *existing);
+      stats_publish_put(s.active_file_id, key, value);
+
       const auto offset =
           s.active_file().append(s.next_lsn, EntryType::Put, key, value);
 
@@ -656,9 +676,14 @@ public:
     {
       auto guard = acquire_write_lock(opts);
       auto s = *state_.load();
-      if (!s.key_dir.contains(key)) {
+      const auto existing = s.key_dir.get(key);
+      if (!existing) {
         return false;
       }
+
+      stats_retire_entry(key, *existing);
+      stats_publish_tombstone(s.active_file_id, key);
+
       std::ignore =
           s.active_file().append(s.next_lsn, EntryType::Delete, key, {});
 
@@ -682,6 +707,14 @@ public:
     return s->key_dir.contains(key);
   }
 
+  // Returns a snapshot of per-file stats (under write_mu_).
+  // Useful for monitoring fragmentation and testing stats consistency.
+  [[nodiscard]] auto file_stats() const
+      -> std::map<std::uint32_t, FileStats> {
+    std::lock_guard lk{*write_mu_};
+    return file_stats_;
+  }
+
   // ── Batch ──────────────────────────────────────────────────────────────
 
   // Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
@@ -698,6 +731,7 @@ public:
       auto guard = acquire_write_lock(opts);
       auto s = *state_.load();
 
+      stats_publish_bulk_marker(s.active_file_id);
       std::ignore =
           s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
 
@@ -707,25 +741,37 @@ public:
             [&](auto &o) {
               using T = std::decay_t<decltype(o)>;
               if constexpr (std::is_same_v<T, BatchInsert>) {
+                const std::span<const std::byte> key_span{o.key};
+                const auto existing = t.get(key_span);
+                if (existing) stats_retire_entry(key_span, *existing);
+                stats_publish_put(s.active_file_id, key_span,
+                           std::span<const std::byte>{o.value});
+
                 const auto offset =
                     s.active_file().append(s.next_lsn, EntryType::Put,
-                                         std::span<const std::byte>{o.key},
+                                         key_span,
                                          std::span<const std::byte>{o.value});
-                t.set(std::span<const std::byte>{o.key},
+                t.set(key_span,
                       KeyDirEntry{s.next_lsn, s.active_file_id, offset,
                                   narrow<std::uint32_t>(o.value.size())});
                 ++s.next_lsn;
               } else if constexpr (std::is_same_v<T, BatchRemove>) {
+                const std::span<const std::byte> key_span{o.key};
+                const auto existing = t.get(key_span);
+                if (existing) stats_retire_entry(key_span, *existing);
+                stats_publish_tombstone(s.active_file_id, key_span);
+
                 std::ignore =
                     s.active_file().append(s.next_lsn, EntryType::Delete,
-                                         std::span<const std::byte>{o.key}, {});
+                                         key_span, {});
                 ++s.next_lsn;
-                t.erase(std::span<const std::byte>{o.key});
+                t.erase(key_span);
               }
             },
             op);
       }
 
+      stats_publish_bulk_marker(s.active_file_id);
       std::ignore =
           s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
 
@@ -863,6 +909,36 @@ private:
     }
   }
 
+  // ── FileStats helpers (called under write_mu_) ─────────────────────────
+
+  // Marks an existing entry as dead in its file's stats.
+  void stats_retire_entry(BytesView key,
+                          const KeyDirEntry &old) {
+    file_stats_[old.file_id].live_bytes -=
+        entry_size(key.size(), old.value_size);
+  }
+
+  // Records a new Put entry: live + total on the active file.
+  void stats_publish_put(std::uint32_t active_file_id,
+                  BytesView key, BytesView value) {
+    const auto sz = entry_size(key.size(), value.size());
+    auto &st = file_stats_[active_file_id];
+    st.live_bytes += sz;
+    st.total_bytes += sz;
+  }
+
+  // Records a tombstone (Delete): total only on the active file.
+  void stats_publish_tombstone(std::uint32_t active_file_id, BytesView key) {
+    file_stats_[active_file_id].total_bytes += entry_size(key.size(), 0);
+  }
+
+  // Records a bulk marker (BulkBegin / BulkEnd): total only.
+  void stats_publish_bulk_marker(std::uint32_t active_file_id) {
+    file_stats_[active_file_id].total_bytes += kHeaderSize + kCrcSize;
+  }
+
+  // ── Construction ───────────────────────────────────────────────────────
+
   explicit Bytecask(std::filesystem::path dir, std::uint64_t max_file_bytes,
                     unsigned recovery_threads)
       : dir_{std::move(dir)}, rotation_threshold_{max_file_bytes},
@@ -880,6 +956,8 @@ private:
     const auto stem = make_data_file_stem();
     s.files->emplace(s.active_file_id,
                      std::make_shared<DataFile>(dir_ / (stem + ".data")));
+    // Initialize stats for the new active file.
+    file_stats_[s.active_file_id] = FileStats{};
     state_.store(std::make_shared<EngineState>(std::move(s)));
     state_time_.store(now_ns(), std::memory_order_release);
   }
@@ -931,12 +1009,14 @@ private:
     PersistentRadixTree<KeyDirEntry> key_dir;
     std::map<Key, std::uint64_t> tombstones;
     std::uint64_t max_lsn{0};
+    std::map<std::uint32_t, FileStats> file_stats;
   };
 
   struct RecoveredFile {
     std::uint32_t file_id;
     std::shared_ptr<DataFile> data_file;
     std::filesystem::path hint_path;
+    std::uint64_t total_bytes{0};
   };
 
   // Phase 1 shared by serial and parallel recovery: remove stale .hint.tmp
@@ -969,7 +1049,8 @@ private:
         flush_hints_for(data_file, dir_);
       }
 
-      files.push_back({file_id, std::move(data_file), hint_path});
+      files.push_back({file_id, std::move(data_file), hint_path,
+                       std::filesystem::file_size(p)});
     }
 
     return files;
@@ -982,8 +1063,14 @@ private:
     std::uint64_t max_lsn = 0;
     auto t = PersistentRadixTree<KeyDirEntry>{}.transient();
     std::map<Key, std::uint64_t> tombstones;
+    std::map<std::uint32_t, FileStats> fstats;
 
-    for (auto &[file_id, data_file, hint_path] : files) {
+    // Seed total_bytes for each file from the filesystem.
+    for (const auto &rf : files) {
+      fstats[rf.file_id].total_bytes = rf.total_bytes;
+    }
+
+    for (auto &[file_id, data_file, hint_path, tb] : files) {
       auto hint = HintFile::OpenForRead(hint_path);
       Offset off = 0;
       while (auto r = hint.scan_view(off)) {
@@ -998,6 +1085,13 @@ private:
           }
           const auto existing = t.get(he.key);
           if (!existing || existing->sequence < he.sequence) {
+            // Displace loser if overwriting.
+            if (existing) {
+              fstats[existing->file_id].live_bytes -=
+                  entry_size(he.key.size(), existing->value_size);
+            }
+            fstats[file_id].live_bytes +=
+                entry_size(he.key.size(), he.value_size);
             t.set(he.key,
                   KeyDirEntry{he.sequence, file_id, he.file_offset,
                               he.value_size});
@@ -1008,6 +1102,8 @@ private:
           if (he.sequence > tomb_seq) tomb_seq = he.sequence;
           const auto existing = t.get(he.key);
           if (existing && existing->sequence < he.sequence) {
+            fstats[existing->file_id].live_bytes -=
+                entry_size(he.key.size(), existing->value_size);
             t.erase(he.key);
           }
         }
@@ -1016,14 +1112,24 @@ private:
       }
     }
 
-    return {std::move(t).persistent(), std::move(tombstones), max_lsn};
+    return {std::move(t).persistent(), std::move(tombstones), max_lsn,
+            std::move(fstats)};
   }
 
   // Merges two RecoveryResults. Tree merge uses LSN-based conflict
   // resolution, then tombstones from both sides are cross-applied to
-  // suppress stale PUTs. Tombstone maps are unioned for subsequent rounds.
+  // suppress stale PUTs. Tombstone maps and file_stats are unioned.
+  // live_bytes are recomputed from the merged tree after all conflict
+  // resolution (the merge resolver doesn't have access to key sizes).
   static auto merge_results(RecoveryResult a, RecoveryResult b)
       -> RecoveryResult {
+    // Union file_stats (file IDs are disjoint across workers).
+    // Preserve total_bytes from both sides; live_bytes will be recomputed.
+    auto &merged_stats = a.file_stats;
+    for (auto &[fid, fs] : b.file_stats) {
+      merged_stats[fid] = fs;
+    }
+
     auto lsn_resolver = [](const KeyDirEntry &x, const KeyDirEntry &y) {
       return (x.sequence >= y.sequence) ? x : y;
     };
@@ -1049,6 +1155,18 @@ private:
       }
     }
 
+    // Recompute live_bytes from the merged tree. The merge resolver and
+    // tombstone cross-application may have displaced entries whose key sizes
+    // are not available inside the resolver callback.
+    for (auto &[fid, fs] : merged_stats) {
+      fs.live_bytes = 0;
+    }
+    for (auto it = merged.begin(); it != std::default_sentinel; ++it) {
+      const auto &[key_span, kde] = *it;
+      merged_stats[kde.file_id].live_bytes +=
+          entry_size(key_span.size(), kde.value_size);
+    }
+
     // Union tombstone maps (max seq per key) for subsequent rounds.
     auto &merged_tombs = a.tombstones;
     for (auto &[key, seq] : b.tombstones) {
@@ -1057,7 +1175,7 @@ private:
     }
 
     return {std::move(merged), std::move(merged_tombs),
-            std::max(a.max_lsn, b.max_lsn)};
+            std::max(a.max_lsn, b.max_lsn), std::move(merged_stats)};
   }
 
   // Reconstructs the key directory from hint files (serial path).
@@ -1068,12 +1186,17 @@ private:
   auto recover_existing_files(EngineState s) -> EngineState {
     auto files = open_and_prepare_files(s);
 
+    // Seed total_bytes for each file from the filesystem.
+    for (const auto &rf : files) {
+      file_stats_[rf.file_id].total_bytes = rf.total_bytes;
+    }
+
     // Recover from hint files only.
     std::uint64_t max_lsn = 0;
     auto transient_key_dir = s.key_dir.transient();
     std::map<Key, std::uint64_t> tombstones;
 
-    for (auto &[file_id, data_file, hint_path] : files) {
+    for (auto &[file_id, data_file, hint_path, tb] : files) {
       auto hint = HintFile::OpenForRead(hint_path);
       Offset off = 0;
       while (auto r = hint.scan_view(off)) {
@@ -1088,6 +1211,12 @@ private:
           }
           const auto existing = transient_key_dir.get(he.key);
           if (!existing || existing->sequence < he.sequence) {
+            if (existing) {
+              file_stats_[existing->file_id].live_bytes -=
+                  entry_size(he.key.size(), existing->value_size);
+            }
+            file_stats_[file_id].live_bytes +=
+                entry_size(he.key.size(), he.value_size);
             transient_key_dir.set(
                 he.key,
                 KeyDirEntry{he.sequence, file_id, he.file_offset,
@@ -1099,6 +1228,8 @@ private:
           if (he.sequence > tomb_seq) tomb_seq = he.sequence;
           const auto existing = transient_key_dir.get(he.key);
           if (existing && existing->sequence < he.sequence) {
+            file_stats_[existing->file_id].live_bytes -=
+                entry_size(he.key.size(), existing->value_size);
             transient_key_dir.erase(he.key);
           }
         }
@@ -1172,13 +1303,14 @@ private:
     // Phase 4: assembly.
     s.key_dir = std::move(results[0].key_dir);
     s.next_lsn = results[0].max_lsn + 1;
+    file_stats_ = std::move(results[0].file_stats);
     return s;
   }
 
   // Seals the active file, opens a new one, and dispatches hint file writing
   // for the now-sealed file to the background worker. Returns a new EngineState.
   // fdatasync on the sealed file remains synchronous for durability correctness.
-  [[nodiscard]] auto rotate_active_file(EngineState s) const -> EngineState {
+  [[nodiscard]] auto rotate_active_file(EngineState s) -> EngineState {
     s.active_file().sync();
     s.active_file().seal();
     // Capture the sealed file before apply_rotation changes active_file_id.
@@ -1187,10 +1319,13 @@ private:
     worker_.dispatch([f = std::move(sealed), d = std::move(dir)] {
       flush_hints_for(f, d);
     });
-    return s.apply_rotation(dir_);
+    s = s.apply_rotation(dir_);
+    // Initialize stats for the new active file.
+    file_stats_[s.active_file_id] = FileStats{};
+    return s;
   }
 
-  [[nodiscard]] auto maybe_rotate(EngineState s) const -> EngineState {
+  [[nodiscard]] auto maybe_rotate(EngineState s) -> EngineState {
     if (s.active_file().size() >= rotation_threshold_) {
       return rotate_active_file(std::move(s));
     }
@@ -1211,6 +1346,9 @@ private:
   // Group commit: batches concurrent fdatasync calls so one sync covers
   // multiple writers. See design doc "Group commit" section.
   SyncGroup sync_group_;
+  // Per-file live/total byte counters for vacuum fragmentation tracking.
+  // Updated under write_mu_ on every write; rebuilt during recovery.
+  std::map<std::uint32_t, FileStats> file_stats_;
   // Background worker for deferred hint file writes (BC-026).
   // Declared last so it destructs first, joining the background thread before
   // any other member (dir_, state_, files) is destroyed.

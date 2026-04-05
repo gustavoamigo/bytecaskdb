@@ -73,6 +73,8 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
   ┌─────────────────────────────────────────────────────────────┐
   │  write_mu_      std::mutex (heap-allocated)                 │  ← writers only
   │                                                             │
+  │  file_stats_    map<uint32_t, FileStats>                    │  ← writers only (under write_mu_)
+  │                                                             │
   │  state_         atomic<shared_ptr<EngineState>>             │  ← writer stores,
   │                                                             │    readers load (no write_mu_)
   └─────────────────────────────────────────────────────────────┘
@@ -311,38 +313,80 @@ ByteeCask implements a **conservative online vacuum**: the engine continues to s
 #### Constraints
 
 - Only sealed (immutable) data files are considered — the active file is never touched.
-- Only files whose waste ratio exceeds a configurable threshold are processed; files below the threshold are left alone.
+- Only files whose fragmentation exceeds a configurable threshold are processed; files below the threshold are left alone.
 - One file is processed per `vacuum()` call. Callers that want to process multiple files call in a loop.
 - Tombstones (Delete entries) are never dropped during partial compaction (see **Tombstone handling** below).
 - A new compacted file is fully written and `fdatasync`-ed before any old file is removed.
 
-#### Waste ratio
+#### Fragmentation
 
-The waste ratio of a sealed data file is the fraction of disk space occupied by dead entries:
+The fragmentation of a sealed data file is the fraction of disk space occupied by dead entries:
 
 ```
-waste_ratio = 1 - (live_bytes / total_bytes)
+fragmentation = 1 − live_bytes / total_bytes
 ```
 
-A file qualifies for vacuum when `waste_ratio >= VacuumOptions::waste_threshold` (default `0.5`).
+- `total_bytes` — physical file size: all appended bytes, including dead puts, tombstones, and BulkBegin/BulkEnd markers.
+- `live_bytes` — sum of entry sizes (`kHeaderSize + key_size + value_size + kCrcSize`) for Put entries currently referenced by the key directory.
+- Tombstones always contribute to `total_bytes` but never to `live_bytes` — they genuinely increase fragmentation. BulkBegin/BulkEnd markers likewise contribute only to `total_bytes`; vacuum strips them from the compacted output.
 
-#### Online waste stats
+A file qualifies for vacuum when `fragmentation >= VacuumOptions::fragmentation_threshold` (default `0.5`).
 
-Rather than computing `live_bytes` at vacuum time (which would require a full key-directory traversal — O(total_keys)), the engine maintains `live_bytes` and `total_bytes` per file as a pair of `uint64_t` counters in a `std::map<uint32_t, FileStats>` (`file_stats_`), updated under `write_mu_` on every write operation:
+#### Live fragmentation tracking
 
-- **On `put(key, value)`**: if the key already exists, subtract `kHeaderSize + key.size() + old_entry.value_size + kCrcSize` from `file_stats_[old_entry.file_id].live_bytes`. Add the new entry size to `file_stats_[active_file_id_].live_bytes` and to `.total_bytes`.
-- **On `del(key)`**: subtract the old Put entry size from `file_stats_[old_entry.file_id].live_bytes`. Advance `.total_bytes` of the active file by the tombstone size (`kHeaderSize + key.size() + kCrcSize`). The tombstone itself is never added to `live_bytes` — tombstones are never referenced by the key directory.
-- **On rotation**: the active file's `total_bytes` counter is already accurate; it becomes the frozen `total_bytes` for the new sealed file. A fresh `FileStats{0, 0}` is inserted for the new active file.
+Rather than computing `live_bytes` at vacuum time (which would require a full key-directory traversal — O(total_keys) — or scanning sealed data files), the engine maintains per-file stats updated incrementally.
 
-At vacuum time the waste ratio is an O(1) integer division per file — no scanning, no I/O, no additional lock contention.
+```cpp
+struct FileStats {
+  std::uint64_t live_bytes{0};
+  std::uint64_t total_bytes{0};
+};
+```
 
-The active file's `live_bytes` may be non-zero (it holds the current live writes), but the active file is never a vacuum candidate, so its waste ratio is never evaluated. The stats for the active file are used only to seed the new sealed file's `total_bytes` on rotation.
+`file_stats_` is a `std::map<uint32_t, FileStats>` member of `Bytecask` (not inside `EngineState`). It is updated under `write_mu_` on every write operation. Keeping it outside `EngineState` avoids an O(files) map copy on every write — `EngineState` is an immutable snapshot published via `atomic<shared_ptr>`, so embedding a `std::map` in it would force a deep copy on every transition.
+
+The helper `entry_size(key_size, value_size)` returns `kHeaderSize + key_size + value_size + kCrcSize` and is used everywhere stats are updated.
+
+##### Write-path updates
+
+- **On `put(key, value)`**: if the key already exists (overwrite), subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats_[old_entry.file_id].live_bytes`. Add `entry_size(key.size(), value.size())` to `file_stats_[active_file_id].live_bytes` and to `.total_bytes`.
+- **On `del(key)`**: if the key exists, subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats_[old_entry.file_id].live_bytes`. Add the tombstone size (`kHeaderSize + key.size() + kCrcSize`) to `file_stats_[active_file_id].total_bytes`. The tombstone is never added to `live_bytes` — tombstones are never referenced by the key directory.
+- **On `apply_batch`**: same per-operation logic as `put`/`del`. BulkBegin and BulkEnd markers each add `kHeaderSize + kCrcSize` to the active file's `total_bytes` only — they are never referenced by the key directory.
+- **On rotation**: the active file's stats are already accurate. Insert `FileStats{0, 0}` for the new active file.
+
+At vacuum time fragmentation is an O(1) integer division per file — no scanning, no I/O, no additional lock contention.
+
+The active file's `live_bytes` may be non-zero (it holds the current live writes), but the active file is never a vacuum candidate, so its fragmentation is never evaluated.
+
+##### Recovery stats reconstruction
+
+`file_stats_` must be rebuilt on startup. Both `total_bytes` and `live_bytes` are reconstructed without scanning data files or traversing the key directory:
+
+- **`total_bytes`**: computed via `std::filesystem::file_size(path)` per sealed file in `open_and_prepare_files()`. Exact for append-only files. O(1) per file, no I/O beyond a `stat` call.
+- **`live_bytes`**: reconstructed as a side-effect of the existing hint-file recovery pass. The hint entry carries `key_size` (from `key.size()`) and `value_size`, so `entry_size(key_size, value_size)` is computable without touching the data file.
+
+The displacement logic mirrors write-path updates:
+
+```
+for each hint entry h (processed in arbitrary file order, LSN wins):
+  if h.type == Put and h wins over existing entry o:
+    file_stats[o.file_id].live_bytes -= entry_size(o.key_size, o.value_size)
+    file_stats[h.file_id].live_bytes += entry_size(h.key_size, h.value_size)
+
+  if h.type == Delete and h wins over existing entry o:
+    file_stats[o.file_id].live_bytes -= entry_size(o.key_size, o.value_size)
+    // tombstone never enters live_bytes
+```
+
+Processing order across files does not matter — LSN comparison always picks the correct winner, so `live_bytes` converges to the right values.
+
+**Parallel recovery**: `RecoveryResult` includes a `file_stats` map alongside `key_dir`, `tombstones`, and `max_lsn`. Each worker builds its own `file_stats` during Phase 2 using the algorithm above. During Phase 3 fan-in: file IDs are disjoint across workers (files are partitioned by round-robin), so `file_stats` maps are unioned without summing. When the LSN resolver discards a losing entry during tree merge or tombstone cross-application, the loser's size is subtracted from its file's `live_bytes`.
 
 #### Vacuum procedure
 
 1. **Acquire `vacuum_mu_`** — prevents two `vacuum()` calls from running concurrently.
 2. **Snapshot the key directory** — call `state_.load()` to obtain the current `EngineState`. This is the authoritative view of which entries are live.
-3. **Select a target file** — iterate sealed files, compute `waste_ratio = 1 - (live_bytes / total_bytes)` from `file_stats_` (O(1) per file, no I/O), pick the highest-waste sealed file above `waste_threshold`. If no file qualifies, return immediately.
+3. **Select a target file** — copy `file_stats_` under a brief `write_mu_` acquisition (O(sealed files), then release). Iterate sealed files, compute `fragmentation = 1 − live_bytes / total_bytes` (O(1) per file, no I/O), pick the highest-fragmentation sealed file above `fragmentation_threshold`. If no file qualifies, return immediately.
 4. **Rewrite the target file** — open a new data file for writing (new timestamp stem, same directory). Scan the old data file entry by entry:
    - *Put entry*: check whether the snapshot's key directory entry for that key points to the old file at this offset with the same sequence number. If yes (live), write it to the new file at its new offset, recording `(key → new_file_id, new_offset)`. If no (dead), skip.
    - *Delete entry*: always copy to the new file verbatim (same sequence number, same key). See **Tombstone handling** below.
@@ -353,7 +397,7 @@ The active file's `live_bytes` may be non-zero (it holds the current live writes
    b. For each live Put entry copied to the new file, look up the key in the current key directory. If the sequence number still matches (no concurrent write superseded it), update `KeyDirEntry` to the new `file_id` and `file_offset`. If the sequence number differs, skip — the concurrent writer's version takes precedence.
    c. Call `persistent()` to obtain the new immutable key directory.
    d. Build an updated `FileRegistry`: add the new compacted file, remove the old file.
-   e. Update `file_stats_`: remove the old file's entry; insert a new entry for the compacted file where `live_bytes == total_bytes` (every surviving entry is live by construction) and `total_bytes` is the physical size of the new file.
+   e. Update `file_stats_`: remove the old file's entry. Insert a new entry for the compacted file using the exact `compacted_live_bytes` tracked during step 4 — for each entry whose key-dir sequence no longer matched in step 6b (concurrent write won), its `entry_size` was subtracted from the running total. `total_bytes` is the physical size of the new file. (Note: `compacted_live_bytes` may be less than `total_bytes` because the new file also contains tombstones that are never counted as live, and entries superseded by concurrent writes during the I/O phase.)
    f. Call `publish_snapshot()` to atomically replace the observable state for all readers.
 7. **Release `write_mu_`**.
 8. **Delete the old file** — once published, the old sealed file is removed from disk. Any in-flight `EntryIterator` still holds a `shared_ptr` to the old `FileRegistry` snapshot, keeping the old `DataFile` fd alive until the iterator is destroyed.
@@ -592,8 +636,8 @@ This is a single code path: `flush_hints_for()` is the same function used by rot
 `Bytecask::open(dir, max_file_bytes, recovery_threads)` accepts an optional `recovery_threads` parameter (default 1 = serial). When `recovery_threads > 1`, recovery uses `parallel_recover_existing_files`:
 
 1. **Phase 1 (serial, shared)**: same as above — open files, generate missing hints. Factored into `open_and_prepare_files()`, shared by both paths.
-2. **Phase 2 (parallel build)**: round-robin assign files to W workers. Each builds a `RecoveryResult{key_dir, tombstones, max_lsn}` independently.
-3. **Phase 3 (parallel fan-in)**: pairwise merge in ⌈log₂(W)⌉ rounds. Each merge uses `PersistentRadixTree::merge(a, b, lsn_resolver)` then cross-applies tombstones from both sides to suppress stale PUTs, and unions tombstone maps for subsequent rounds.
+2. **Phase 2 (parallel build)**: round-robin assign files to W workers. Each builds a `RecoveryResult{key_dir, tombstones, max_lsn, file_stats}` independently.
+3. **Phase 3 (parallel fan-in)**: pairwise merge in ⌈log₂(W)⌉ rounds. Each merge uses `PersistentRadixTree::merge(a, b, lsn_resolver)` then cross-applies tombstones from both sides to suppress stale PUTs, unions tombstone maps and `file_stats` maps for subsequent rounds. Losing entries' sizes are subtracted from their file's `live_bytes`.
 4. **Phase 4 (serial assembly)**: `s.key_dir = final.key_dir; s.next_lsn = final.max_lsn + 1`.
 
 See `docs/parallel_recovery_design.md` §11 for the full v1 algorithm.
@@ -1006,7 +1050,7 @@ The `~Bytecask()` destructor no longer calls `flush_hints()` explicitly. Because
 - Dependencies: crc32c (google/crc32c, hardware-accelerated CRC-32C)
 - Primary target: `bytecask` (includes `src/*.cpp` + `src/engine/*.cppm`)
 - Test target: `bytecask_tests` (includes `tests/*.cpp` + `src/engine/*.cppm`)
-- Status: Full `Bytecask` SWMR engine with `open`, `get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`. Key directory backed by `PersistentOrderedMap<Key, KeyDirEntry>`. `open()` always creates a fresh active data file; recovery is BC-019. 143 assertions, 34 test cases.
+- Status: Full `Bytecask` SWMR engine with `open`, `get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`. Key directory backed by `PersistentRadixTree<KeyDirEntry>`. Per-file fragmentation tracking via `FileStats` (`live_bytes`, `total_bytes`) maintained on every write and reconstructed during recovery. `open()` always creates a fresh active data file; recovery from hint files (serial and parallel). 1.2M+ assertions, 103 test cases.
 
 ## Current repository structure
 
@@ -1052,7 +1096,7 @@ The `~Bytecask()` destructor no longer calls `flush_hints()` explicitly. Because
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
 | D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1 and standard C++ practice). |
 | D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. MVCC and snapshot isolation are not provided. |
-| D10 | **Vacuum**: Conservative online 1:1 rewrite. One sealed file per `vacuum()` call. Engine continues serving reads and writes. Write-path impact is zero — `write_mu_` is held only for the in-memory commit step. Tombstones are always copied (never elided) during partial vacuum to prevent key resurrection across unprocessed files. Full vacuum (drop tombstones, multi-file merge) is a separate future operation. |
+| D10 | **Vacuum**: Conservative online 1:1 rewrite. One sealed file per `vacuum()` call. Engine continues serving reads and writes. Write-path impact is zero — `write_mu_` is held only for the in-memory commit step. Tombstones are always copied (never elided) during partial vacuum to prevent key resurrection across unprocessed files. Full vacuum (drop tombstones, multi-file merge) is a separate future operation. File selection uses `fragmentation >= fragmentation_threshold` computed from incrementally maintained `FileStats` (`live_bytes`, `total_bytes`) — O(1) per file, no scanning. Stats are reconstructed during recovery as a side-effect of the hint-file pass. |
 | D11 | **File naming**: `data_{YYYYMMDDHHmmssUUUUUU}` using microsecond precision. Gives lexicographic == chronological ordering and avoids the false precision of nanosecond timestamps whose sub-microsecond bits are often zero on Linux. |
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be discarded with a logged warning. No partial-batch entries enter the key directory. |
