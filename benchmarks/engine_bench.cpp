@@ -981,6 +981,63 @@ void BM_HintFileScan(benchmark::State &state) {
       benchmark::Counter::kDefaults);
 }
 
+// ──────────── Parallel Recovery ──────────────────────────────────────────────
+// Measures startup recovery with varying thread counts.
+// Uses kDatasetSize keys with 1-byte values so hint-file parsing dominates.
+// 256 KiB rotation threshold → many data files for meaningful parallelism.
+
+static constexpr std::uint64_t kParRecoveryThreshold = 256ULL * 1024;
+
+namespace {
+struct ParRecoverySetup {
+  TmpDir dir{"par_recovery"};
+  std::vector<std::string> keys;
+
+  ParRecoverySetup() : keys{generate_prefixed_keys(kDatasetSize)} {
+    auto db = bytecask::Bytecask::open(dir.path, kParRecoveryThreshold);
+    bytecask::WriteOptions wo;
+    static const std::vector<std::byte> tiny_val{std::byte{0x42}};
+    const auto n = keys.size();
+    for (std::size_t i = 0; i < n; ++i) {
+      wo.sync = (i % 10'000 == 9'999) || (i == n - 1);
+      db.put(wo, bc_key(keys[i]), bc_val(tiny_val));
+    }
+    db.flush_hints();
+  }
+};
+
+auto &par_recovery_setup() {
+  static ParRecoverySetup instance;
+  return instance;
+}
+} // namespace
+
+void BM_RecoveryParallel(benchmark::State &state) {
+  auto &setup = par_recovery_setup();
+  auto threads = static_cast<unsigned>(state.range(0));
+
+  struct Handle {
+    bytecask::Bytecask db;
+    explicit Handle(const std::filesystem::path &p, std::uint64_t th,
+                    unsigned t)
+        : db{bytecask::Bytecask::open(p, th, t)} {}
+  };
+
+  std::unique_ptr<Handle> handle;
+
+  for (auto _ : state) {
+    handle = std::make_unique<Handle>(setup.dir.path,
+                                     kParRecoveryThreshold, threads);
+    state.PauseTiming();
+    handle.reset();
+    state.ResumeTiming();
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.counters["recovery_threads"] = static_cast<double>(threads);
+  state.counters["num_keys"] = static_cast<double>(kDatasetSize);
+}
+
 // ===========================================================================
 // Registration
 // clang-format off
@@ -1010,6 +1067,13 @@ BENCH(BM_Recovery<false>) ->Name("ByteCask/Recovery/NoHints");
 
 // --- HintFile Scan ---
 BENCH(BM_HintFileScan)->Name("ByteCask/HintFile/Scan");
+
+// --- Parallel Recovery (1M keys, 1-byte values, hint-only) ---
+BENCH(BM_RecoveryParallel)->Arg(1) ->Name("ByteCask/Recovery/Parallel");
+BENCH(BM_RecoveryParallel)->Arg(2) ->Name("ByteCask/Recovery/Parallel");
+BENCH(BM_RecoveryParallel)->Arg(4) ->Name("ByteCask/Recovery/Parallel");
+BENCH(BM_RecoveryParallel)->Arg(8) ->Name("ByteCask/Recovery/Parallel");
+BENCH(BM_RecoveryParallel)->Arg(16)->Name("ByteCask/Recovery/Parallel");
 
 // --- LevelDB ---
 BENCH(BM_Put<Ldb, false>)          ->Name("LevelDB/Put/NoSync");

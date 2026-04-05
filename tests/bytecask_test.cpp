@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <filesystem>
 #include <format>
+#include <map>
+#include <random>
 #include <ranges>
 #include <span>
 #include <string>
@@ -693,6 +695,467 @@ TEST_CASE("Bytecask recovery: order-independent tombstone",
   }
   SECTION("delete file sorts after put file") {
     run("data_aaa", "data_bbb");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel recovery: same result as serial for basic puts
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask parallel recovery: puts survive restart",
+          "[bytecask][recovery][parallel]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  // threshold=1 forces each write into its own file, giving multiple files
+  // for parallel workers to split across.
+  {
+    auto db = bytecask::Bytecask::open(db_path, 1);
+    db.put({}, to_bytes("a"), to_bytes("1"));
+    db.put({}, to_bytes("b"), to_bytes("2"));
+    db.put({}, to_bytes("c"), to_bytes("3"));
+    db.put({}, to_bytes("d"), to_bytes("4"));
+  }
+
+  auto db2 = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/4);
+  REQUIRE(db2.get({}, to_bytes("a")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("a"))) == "1");
+  REQUIRE(db2.get({}, to_bytes("b")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("b"))) == "2");
+  REQUIRE(db2.get({}, to_bytes("c")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("c"))) == "3");
+  REQUIRE(db2.get({}, to_bytes("d")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("d"))) == "4");
+}
+
+// ---------------------------------------------------------------------------
+// Parallel recovery: cross-worker tombstone suppresses stale put
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask parallel recovery: cross-worker tombstone",
+          "[bytecask][recovery][parallel]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::Bytecask::open(db_path, 1);
+    db.put({}, to_bytes("gone"), to_bytes("v1"));   // file 0
+    std::ignore = db.del({}, to_bytes("gone"));      // file 1
+    db.put({}, to_bytes("keep"), to_bytes("v2"));    // file 2
+    db.put({}, to_bytes("also"), to_bytes("v3"));    // file 3
+  }
+
+  // 4 files, 4 workers — PUT and DELETE for "gone" land in different workers.
+  auto db2 = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/4);
+  CHECK_FALSE(db2.get({}, to_bytes("gone")).has_value());
+  REQUIRE(db2.get({}, to_bytes("keep")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("keep"))) == "v2");
+  REQUIRE(db2.get({}, to_bytes("also")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("also"))) == "v3");
+}
+
+// ---------------------------------------------------------------------------
+// Parallel recovery: last write wins across workers
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask parallel recovery: last write wins",
+          "[bytecask][recovery][parallel]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::Bytecask::open(db_path, 1);
+    db.put({}, to_bytes("k"), to_bytes("old"));
+    db.put({}, to_bytes("k"), to_bytes("new"));
+  }
+
+  auto db2 = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/2);
+  REQUIRE(db2.get({}, to_bytes("k")).has_value());
+  CHECK(to_string(*db2.get({}, to_bytes("k"))) == "new");
+}
+
+// ---------------------------------------------------------------------------
+// Parallel recovery: produces identical result to serial recovery
+//
+// Uses a larger dataset with overwrites and deletes to exercise the full
+// merge + tombstone cross-application path. Opens the same data dir twice:
+// once with 1 thread (serial), once with 4 threads (parallel), then
+// compares every key.
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask parallel recovery: matches serial result",
+          "[bytecask][recovery][parallel]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  // Build a database with many files, overwrites, and deletes.
+  {
+    auto db = bytecask::Bytecask::open(db_path, 1);
+    for (int i = 0; i < 50; ++i) {
+      auto key = std::format("key_{:03d}", i);
+      auto val = std::format("val_{:03d}_v1", i);
+      db.put({}, to_bytes(key), to_bytes(val));
+    }
+    // Overwrite some keys.
+    for (int i = 0; i < 50; i += 3) {
+      auto key = std::format("key_{:03d}", i);
+      auto val = std::format("val_{:03d}_v2", i);
+      db.put({}, to_bytes(key), to_bytes(val));
+    }
+    // Delete some keys.
+    for (int i = 1; i < 50; i += 5) {
+      auto key = std::format("key_{:03d}", i);
+      std::ignore = db.del({}, to_bytes(key));
+    }
+  }
+
+  // Recover serially.
+  auto serial = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/1);
+
+  // Collect serial results.
+  std::map<std::string, std::string> serial_kv;
+  for (auto [key, val] : serial.iter_from({})) {
+    serial_kv[to_string(key)] = to_string(val);
+  }
+
+  // Recover in parallel.
+  auto parallel = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/4);
+
+  // Collect parallel results.
+  std::map<std::string, std::string> parallel_kv;
+  for (auto [key, val] : parallel.iter_from({})) {
+    parallel_kv[to_string(key)] = to_string(val);
+  }
+
+  REQUIRE(serial_kv.size() == parallel_kv.size());
+  for (const auto &[k, v] : serial_kv) {
+    auto it = parallel_kv.find(k);
+    REQUIRE(it != parallel_kv.end());
+    CHECK(it->second == v);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Model-based recovery: random workload with oracle comparison.
+//
+// A random sequence of puts, deletes, overwrites, and batches is applied to
+// both a Bytecask instance and a std::map oracle. The DB uses a tiny rotation
+// threshold (1 byte) so every write triggers file rotation, maximising the
+// number of files and exercising cross-file recovery thoroughly.
+//
+// After closing the engine, the data directory is recovered three ways:
+//   1. Serial recovery (recovery_threads=1)
+//   2. Parallel recovery with 2 workers
+//   3. Parallel recovery with many workers (number of files)
+// All three must produce a key directory identical to the oracle.
+//
+// The test uses a fixed seed for reproducibility. Catch2 reports the seed
+// so failures are deterministic to reproduce.
+// ---------------------------------------------------------------------------
+TEST_CASE("Recovery model-based: random workload matches oracle",
+          "[bytecask][recovery][parallel][model]") {
+  // Deterministic PRNG — Catch2 prints "Randomness seeded to:" for us,
+  // but we use our own seed for workload reproducibility.
+  std::mt19937 gen(98765);
+
+  auto rand_key = [&]() -> std::string {
+    // Short keys with prefix overlap to stress the radix tree.
+    static constexpr std::string_view alphabet = "abcdef";
+    const auto len = std::uniform_int_distribution<int>(1, 6)(gen);
+    std::string k;
+    for (int i = 0; i < len; ++i) {
+      k += alphabet[std::uniform_int_distribution<int>(
+          0, static_cast<int>(alphabet.size()) - 1)(gen)];
+    }
+    return k;
+  };
+
+  auto rand_value = [&]() -> std::string {
+    const auto len = std::uniform_int_distribution<int>(1, 32)(gen);
+    std::string v(static_cast<std::size_t>(len), 'x');
+    for (auto &c : v) {
+      c = static_cast<char>(
+          std::uniform_int_distribution<int>('A', 'z')(gen));
+    }
+    return v;
+  };
+
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  // Oracle: ground truth of what the DB should contain after recovery.
+  std::map<std::string, std::string> oracle;
+
+  {
+    // threshold=1 forces rotation after every write.
+    auto db = bytecask::Bytecask::open(db_path, /*max_file_bytes=*/1);
+
+    constexpr int kOps = 2000;
+    for (int i = 0; i < kOps; ++i) {
+      const auto op = std::uniform_int_distribution<int>(0, 9)(gen);
+
+      if (op < 5) {
+        // 50% chance: put (including overwrites)
+        auto key = rand_key();
+        auto val = rand_value();
+        db.put({}, to_bytes(key), to_bytes(val));
+        oracle[key] = val;
+      } else if (op < 8) {
+        // 30% chance: delete
+        auto key = rand_key();
+        std::ignore = db.del({}, to_bytes(key));
+        oracle.erase(key);
+      } else {
+        // 20% chance: batch (2–5 operations)
+        const auto batch_size =
+            std::uniform_int_distribution<int>(2, 5)(gen);
+        bytecask::Batch batch;
+        for (int b = 0; b < batch_size; ++b) {
+          if (std::uniform_int_distribution<int>(0, 3)(gen) == 0) {
+            auto key = rand_key();
+            batch.del(to_bytes(key));
+            oracle.erase(key);
+          } else {
+            auto key = rand_key();
+            auto val = rand_value();
+            batch.put(to_bytes(key), to_bytes(val));
+            oracle[key] = val;
+          }
+        }
+        db.apply_batch({}, std::move(batch));
+      }
+    }
+  }
+  // DB is closed — all files sealed, hints flushed via background worker.
+
+  // Helper: collect all (key, value) from a Bytecask into a map.
+  auto collect = [](bytecask::Bytecask &db) {
+    std::map<std::string, std::string> kv;
+    for (auto [key, val] : db.iter_from({})) {
+      kv[to_string(key)] = to_string(val);
+    }
+    return kv;
+  };
+
+  // Helper: compare recovered map against oracle.
+  auto verify = [&](const std::string &label,
+                    const std::map<std::string, std::string> &recovered) {
+    INFO(label);
+    REQUIRE(recovered.size() == oracle.size());
+    for (const auto &[k, v] : oracle) {
+      INFO("key=\"" << k << "\"");
+      auto it = recovered.find(k);
+      REQUIRE(it != recovered.end());
+      CHECK(it->second == v);
+    }
+  };
+
+  // Count data files for the max-parallelism test.
+  int data_file_count = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".data")
+      ++data_file_count;
+  }
+  REQUIRE(data_file_count > 1);
+
+  SECTION("serial recovery") {
+    auto db = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/1);
+    verify("serial", collect(db));
+  }
+
+  SECTION("parallel recovery (2 workers)") {
+    auto db = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/2);
+    verify("parallel/2", collect(db));
+  }
+
+  SECTION("parallel recovery (W = file count)") {
+    auto db = bytecask::Bytecask::open(
+        db_path, 1,
+        /*recovery_threads=*/static_cast<unsigned>(data_file_count));
+    verify("parallel/max", collect(db));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Model-based recovery: large batch-heavy workload.
+//
+// Exercises the batch code path (BulkBegin/BulkEnd) extensively — most
+// operations are batches of varying sizes. Verifies serial and parallel
+// recovery produce identical results to the oracle.
+// ---------------------------------------------------------------------------
+TEST_CASE("Recovery model-based: batch-heavy workload",
+          "[bytecask][recovery][parallel][model]") {
+  std::mt19937 gen(54321);
+
+  auto rand_key = [&]() -> std::string {
+    static constexpr std::string_view alphabet = "ghijkl";
+    const auto len = std::uniform_int_distribution<int>(1, 5)(gen);
+    std::string k;
+    for (int i = 0; i < len; ++i) {
+      k += alphabet[std::uniform_int_distribution<int>(
+          0, static_cast<int>(alphabet.size()) - 1)(gen)];
+    }
+    return k;
+  };
+
+  auto rand_value = [&]() -> std::string {
+    const auto len = std::uniform_int_distribution<int>(4, 16)(gen);
+    return std::string(static_cast<std::size_t>(len), 'V');
+  };
+
+  TempDir td;
+  const auto db_path = td.path / "db";
+  std::map<std::string, std::string> oracle;
+
+  {
+    auto db = bytecask::Bytecask::open(db_path, /*max_file_bytes=*/1);
+
+    for (int i = 0; i < 1000; ++i) {
+      const auto op = std::uniform_int_distribution<int>(0, 9)(gen);
+
+      if (op < 2) {
+        // 20% single put
+        auto key = rand_key();
+        auto val = rand_value();
+        db.put({}, to_bytes(key), to_bytes(val));
+        oracle[key] = val;
+      } else if (op < 3) {
+        // 10% single delete
+        auto key = rand_key();
+        std::ignore = db.del({}, to_bytes(key));
+        oracle.erase(key);
+      } else {
+        // 70% batch (3-8 operations)
+        const auto batch_size =
+            std::uniform_int_distribution<int>(3, 8)(gen);
+        bytecask::Batch batch;
+        for (int b = 0; b < batch_size; ++b) {
+          if (std::uniform_int_distribution<int>(0, 4)(gen) == 0) {
+            auto key = rand_key();
+            batch.del(to_bytes(key));
+            oracle.erase(key);
+          } else {
+            auto key = rand_key();
+            auto val = rand_value();
+            batch.put(to_bytes(key), to_bytes(val));
+            oracle[key] = val;
+          }
+        }
+        db.apply_batch({}, std::move(batch));
+      }
+    }
+  }
+
+  auto collect = [](bytecask::Bytecask &db) {
+    std::map<std::string, std::string> kv;
+    for (auto [key, val] : db.iter_from({})) {
+      kv[to_string(key)] = to_string(val);
+    }
+    return kv;
+  };
+
+  auto verify = [&](const std::string &label,
+                    const std::map<std::string, std::string> &recovered) {
+    INFO(label);
+    REQUIRE(recovered.size() == oracle.size());
+    for (const auto &[k, v] : oracle) {
+      INFO("key=\"" << k << "\"");
+      auto it = recovered.find(k);
+      REQUIRE(it != recovered.end());
+      CHECK(it->second == v);
+    }
+  };
+
+  SECTION("serial") {
+    auto db = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/1);
+    verify("serial", collect(db));
+  }
+
+  SECTION("parallel (4 workers)") {
+    auto db = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/4);
+    verify("parallel/4", collect(db));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Model-based recovery: delete-heavy workload.
+//
+// Most keys are written then deleted. Stresses tombstone handling — both
+// within a single worker (serial) and across workers (parallel fan-in
+// tombstone cross-application).
+// ---------------------------------------------------------------------------
+TEST_CASE("Recovery model-based: delete-heavy workload",
+          "[bytecask][recovery][parallel][model]") {
+  std::mt19937 gen(11111);
+
+  TempDir td;
+  const auto db_path = td.path / "db";
+  std::map<std::string, std::string> oracle;
+
+  {
+    auto db = bytecask::Bytecask::open(db_path, /*max_file_bytes=*/1);
+
+    // Write 500 keys.
+    for (int i = 0; i < 500; ++i) {
+      auto key = std::format("dk_{:03d}", i);
+      auto val = std::format("dv_{:03d}", i);
+      db.put({}, to_bytes(key), to_bytes(val));
+      oracle[key] = val;
+    }
+    // Delete 375 of them, interleaved with a few overwrites.
+    for (int i = 0; i < 500; ++i) {
+      if (i % 4 != 0) {
+        // 75% deleted
+        auto key = std::format("dk_{:03d}", i);
+        std::ignore = db.del({}, to_bytes(key));
+        oracle.erase(key);
+      } else {
+        // 25% overwritten
+        auto key = std::format("dk_{:03d}", i);
+        auto val = std::format("dv_{:03d}_v2", i);
+        db.put({}, to_bytes(key), to_bytes(val));
+        oracle[key] = val;
+      }
+    }
+  }
+
+  auto collect = [](bytecask::Bytecask &db) {
+    std::map<std::string, std::string> kv;
+    for (auto [key, val] : db.iter_from({})) {
+      kv[to_string(key)] = to_string(val);
+    }
+    return kv;
+  };
+
+  auto verify = [&](const std::string &label,
+                    const std::map<std::string, std::string> &recovered) {
+    INFO(label);
+    REQUIRE(recovered.size() == oracle.size());
+    for (const auto &[k, v] : oracle) {
+      INFO("key=\"" << k << "\"");
+      auto it = recovered.find(k);
+      REQUIRE(it != recovered.end());
+      CHECK(it->second == v);
+    }
+  };
+
+  int data_file_count = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".data")
+      ++data_file_count;
+  }
+
+  SECTION("serial") {
+    auto db = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/1);
+    verify("serial", collect(db));
+  }
+
+  SECTION("parallel (3 workers)") {
+    auto db = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/3);
+    verify("parallel/3", collect(db));
+  }
+
+  SECTION("parallel (W = file count)") {
+    auto db = bytecask::Bytecask::open(
+        db_path, 1,
+        /*recovery_threads=*/static_cast<unsigned>(data_file_count));
+    verify("parallel/max", collect(db));
   }
 }
 

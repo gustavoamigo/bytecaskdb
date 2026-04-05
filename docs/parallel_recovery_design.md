@@ -358,7 +358,207 @@ Tracked as **BC-068: Parallel recovery**.
 
 1. ~~`PersistentRadixTree::merge(a, b, resolve)` + unit tests~~ — **Done** (BC-068a)
 2. ~~Merge benchmarks in `map_bench.cpp`~~ — **Done** (disjoint, overlapping, split-build-merge)
-3. Parallel `recover_existing_files` with file-level partitioning behind `recovery_threads` param (default 1 = serial)
+3. ~~Parallel `recover_existing_files` with file-level partitioning behind `recovery_threads` param (default 1 = serial)~~ — **Done** (BC-068)
 4. `BM_RecoveryParallel` in `engine_bench.cpp`
 5. Make parallel the default when `hardware_concurrency >= 4`
 6. **(Optional)** If merge proves bottleneck at >1B keys: hash-partition variant with `merge_disjoint`
+
+---
+
+## 11. Parallel Recovery v1 — file-level partitioning with fan-in merge
+
+This section describes the first parallel recovery algorithm. It uses
+file-level partitioning with the existing general `merge(a, b, resolve)` and
+a parallel fan-in reduction. The serial `recover_existing_files` serves as
+the baseline; this v1 algorithm is the first parallel alternative.
+
+### 11.1. Data structures
+
+```cpp
+struct RecoveryResult {
+  PersistentRadixTree<KeyDirEntry> key_dir;
+  std::map<Key, std::uint64_t> tombstones;  // key → highest DELETE seq
+  std::uint64_t max_lsn{0};
+};
+```
+
+Each worker produces a `RecoveryResult`. The fan-in merge consumes pairs of
+`RecoveryResult`s and produces a single merged `RecoveryResult` at each step.
+
+### 11.2. Algorithm
+
+#### Phase 1 — serial pre-pass (unchanged)
+
+Runs exactly as the current serial path:
+
+1. Remove stale `.hint.tmp` files.
+2. Directory scan: collect all `.data` paths.
+3. For each data file: assign `file_id`, construct `DataFile`, seal, register
+   in `s.files`.
+4. Generate missing hint files via `flush_hints_for()` (batch-aware).
+5. Build the `RecoveredFile` vector: `{file_id, data_file, hint_path}`.
+
+The file registry is read-only from this point. All subsequent phases
+reference it without synchronisation.
+
+#### Phase 2 — parallel build (W workers)
+
+Assign files to W workers via round-robin on the sorted `RecoveredFile` list:
+
+```
+worker[i] ← files where (file_index % W) == i
+```
+
+Each worker runs independently, building its own `RecoveryResult`:
+
+```
+for each assigned (file_id, hint_path):
+    scan hint_path with HintFile::scan_view()
+    for each hint entry:
+        if Put:  apply_put(seq, file_id, file_off, val_size, key)
+        if Del:  apply_del(seq, key)
+    track max_lsn
+
+persist the transient tree → RecoveryResult{tree, tombstones, max_lsn}
+```
+
+The `apply_put` / `apply_del` logic is identical to the serial path — check
+tombstone map, compare sequence numbers, set/erase in transient tree.
+
+W defaults to `std::thread::hardware_concurrency()`, clamped to the file
+count. When W = 1, this degenerates to the serial path.
+
+#### Phase 3 — parallel fan-in merge (log₂(W) rounds)
+
+Merge the W `RecoveryResult`s pairwise in parallel rounds:
+
+```
+Round 1:  merge(R0,R1)  merge(R2,R3)  merge(R4,R5)  ...   → W/2 results
+Round 2:  merge(R01,R23)  merge(R45,R67)  ...              → W/4 results
+  ...
+Round k:  merge(left, right)                               → 1 result
+```
+
+Each pair merge within a round is independent and runs on its own thread.
+An odd result at the end of any round carries forward unpaired.
+
+Total rounds: ⌈log₂(W)⌉. Threads per round: ⌊count/2⌋.
+Threading uses `std::jthread` — join on scope exit.
+
+#### Phase 4 — serial assembly
+
+```cpp
+s.key_dir   = final_result.key_dir;
+s.next_lsn  = final_result.max_lsn + 1;
+```
+
+Tombstones are no longer needed after assembly — they are intermediate
+bookkeeping only.
+
+### 11.3. Tombstone cross-application in merge
+
+This is the central correctness concern that distinguishes file-level
+partitioning from hash-partitioning. With hash-partitioning every PUT and
+its superseding DELETE land in the same partition; with file-level
+partitioning they may be in different workers.
+
+**The problem.** `merge(A, B, resolve)` fires the resolver only when the
+same key exists in both trees. A DELETE removes the key from the tree, so
+a stale PUT in the other tree has no counterpart to conflict with — the
+merge adopts it unconditionally.
+
+Example:
+- Worker A processes file 1: `PUT "x" seq=5` → tree has `"x"`.
+- Worker B processes file 2: `DEL "x" seq=8` → tree has no `"x"`,
+  tombstones has `{"x": 8}`.
+- `merge(A.tree, B.tree, resolve)` sees `"x"` only in A → adopts it.
+  The stale PUT survives incorrectly.
+
+**The fix.** After tree merge, iterate both tombstone maps and erase entries
+whose sequence number is lower than the tombstone:
+
+```
+merge_results(A, B) → RecoveryResult:
+    1. merged_tree = merge(A.key_dir, B.key_dir, lsn_resolver)
+
+    2. for (key, tomb_seq) in B.tombstones:
+           if entry = merged_tree.get(key):
+               if entry.sequence < tomb_seq:
+                   merged_tree = merged_tree.erase(key)
+
+    3. for (key, tomb_seq) in A.tombstones:
+           if entry = merged_tree.get(key):
+               if entry.sequence < tomb_seq:
+                   merged_tree = merged_tree.erase(key)
+
+    4. merged_tombstones = union(A.tombstones, B.tombstones)
+       // per-key: max(A.seq, B.seq)
+
+    5. max_lsn = max(A.max_lsn, B.max_lsn)
+
+    return {merged_tree, merged_tombstones, max_lsn}
+```
+
+Step 4 is essential: merged tombstones must propagate through subsequent
+fan-in rounds. A tombstone from round 1 may need to suppress a PUT that
+only enters the merge tree in round 3.
+
+**Correctness argument.** Every DELETE in the database is recorded in
+exactly one worker's tombstone map. The fan-in produces a running union of
+all tombstone maps seen so far. At round k, the merged tombstone map
+contains every DELETE from all 2^k input workers. The cross-application
+step (2–3) erases any PUT with a lower sequence number. After the final
+round, every DELETE has had a chance to suppress every PUT — identical
+result to the serial path.
+
+### 11.4. LSN resolver
+
+The resolver passed to `merge()` picks the entry with the higher sequence
+number (most recent write wins):
+
+```cpp
+auto lsn_resolver = [](const KeyDirEntry& a, const KeyDirEntry& b) {
+    return (a.sequence >= b.sequence) ? a : b;
+};
+```
+
+This handles the case where both workers have a PUT for the same key
+(update-heavy workload, key written in multiple files).
+
+### 11.5. Thread count selection
+
+```cpp
+auto W = std::min(
+    static_cast<unsigned>(files.size()),
+    std::thread::hardware_concurrency());
+if (W == 0) W = 1;  // fallback
+```
+
+When `W == 1`, skip Phase 2/3 entirely and run the existing serial path.
+This is the default (no regression risk) until parallel is validated.
+
+A future `recovery_threads` parameter on `Bytecask::open()` will allow
+explicit control. Default: 0 = auto (use hardware_concurrency).
+
+### 11.6. Comparison with serial baseline
+
+| Aspect | Serial (current) | Parallel v1 |
+|--------|-------------------|-------------|
+| Build | 1 thread, 1 transient tree | W threads, W transient trees |
+| Merge | — | ⌈log₂(W)⌉ rounds, pairwise parallel |
+| Tombstone handling | Single map, immediate | Per-worker map + cross-application at merge |
+| Infrastructure | — | `RecoveryResult`, `merge_results()`, fan-in loop |
+| Key conflicts | N/A (one tree) | Resolved by LSN in `merge()` |
+| Tombstone conflicts | N/A (one map) | Cross-applied after each merge step |
+| Correctness | Trivial (serial) | Proven equivalent via tombstone propagation |
+
+### 11.7. Future improvements (not in v1)
+
+- **Hash-partitioning (v2):** If merge-phase profiling at >1B keys shows
+  it dominating, switch to `hash(key) % P` routing with `merge_disjoint`
+  (zero conflict, zero tombstone cross-application). Requires MPSC queues.
+- **Work stealing:** If file sizes are uneven, round-robin may leave some
+  workers idle. A work-stealing queue could balance the load.
+- **Streaming merge:** Overlap Phase 2 and Phase 3 by starting round 1
+  merges as soon as the first two workers finish, rather than waiting for
+  all W workers.

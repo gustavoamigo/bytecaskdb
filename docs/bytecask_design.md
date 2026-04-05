@@ -587,6 +587,29 @@ On engine startup:
 
 This is a single code path: `flush_hints_for()` is the same function used by rotation and background hint writes. No raw-scan recovery logic exists — recovery always goes through hints.
 
+### Parallel Recovery
+
+`Bytecask::open(dir, max_file_bytes, recovery_threads)` accepts an optional `recovery_threads` parameter (default 1 = serial). When `recovery_threads > 1`, recovery uses `parallel_recover_existing_files`:
+
+1. **Phase 1 (serial, shared)**: same as above — open files, generate missing hints. Factored into `open_and_prepare_files()`, shared by both paths.
+2. **Phase 2 (parallel build)**: round-robin assign files to W workers. Each builds a `RecoveryResult{key_dir, tombstones, max_lsn}` independently.
+3. **Phase 3 (parallel fan-in)**: pairwise merge in ⌈log₂(W)⌉ rounds. Each merge uses `PersistentRadixTree::merge(a, b, lsn_resolver)` then cross-applies tombstones from both sides to suppress stale PUTs, and unions tombstone maps for subsequent rounds.
+4. **Phase 4 (serial assembly)**: `s.key_dir = final.key_dir; s.next_lsn = final.max_lsn + 1`.
+
+See `docs/parallel_recovery_design.md` §11 for the full v1 algorithm.
+
+**Benchmark** (`BM_RecoveryParallel`, prefixed keys, 1-byte values, 256 KiB rotation, hint-only, disk-backed TMPDIR):
+
+| Threads | 1M keys (ms) | Speedup | 10M keys (ms) | Speedup |
+|---------|-------------|---------|--------------|---------|
+| 1       | 262         | 1.00×   | 2858         | 1.00×   |
+| 2       | 153         | 1.71×   | 1647         | 1.73×   |
+| 4       | 91          | 2.88×   | 962          | 2.97×   |
+| 8       | 58          | 4.51×   | 567          | 5.04×   |
+| 16      | 52          | 5.04×   | 503          | 5.68×   |
+
+Scaling is sub-linear due to fan-in merge overhead and memory bandwidth saturation beyond 8 threads. At 10M keys, recovery drops from 2.86s (serial) to 503ms (16 threads).
+
 ### Incomplete Batch Recovery
 
 If the engine crashes after writing a `BulkBegin` but before the matching `BulkEnd`, the data file contains an incomplete batch. `flush_hints_for()` detects this (BulkBegin with no matching BulkEnd), discards the buffered entries, and logs a warning. No partial-batch entries appear in the generated hint file, so they are never inserted into the key directory.
