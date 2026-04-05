@@ -785,8 +785,11 @@ public:
   }
 
 private:
-  // Writes the hint file for a single sealed data file using the temp-then-rename
-  // protocol. Idempotent: skips files whose .hint already exists.
+  // Writes the hint file for a single data file using the temp-then-rename
+  // protocol. Batch-aware: entries between BulkBegin and BulkEnd are buffered
+  // and written only when BulkEnd is seen; an incomplete batch (crash
+  // mid-write) is silently discarded. Idempotent: skips files whose .hint
+  // already exists.
   static void flush_hints_for(const std::shared_ptr<DataFile> &file,
                               const std::filesystem::path &dir) {
     const auto stem = file->path().stem().string();
@@ -797,17 +800,54 @@ private:
       return;
     }
 
+    struct PendingHint {
+      std::uint64_t seq;
+      EntryType type;
+      std::uint64_t file_off;
+      std::uint32_t val_size;
+      std::vector<std::byte> key;
+    };
+
     auto hint = HintFile::OpenForWrite(tmp_path);
+    bool in_batch = false;
+    std::vector<PendingHint> pending;
     Offset off = 0;
+
     while (auto result = file->scan(off)) {
+      const auto entry_off = off;
       const auto &[entry, next] = *result;
-      if (entry.entry_type == EntryType::Put ||
-          entry.entry_type == EntryType::Delete) {
-        hint.append(entry.sequence, entry.entry_type, off, entry.key,
-                    narrow<std::uint32_t>(entry.value.size()));
+      switch (entry.entry_type) {
+      case EntryType::BulkBegin:
+        in_batch = true;
+        pending.clear();
+        break;
+      case EntryType::BulkEnd:
+        for (auto &pe : pending) {
+          hint.append(pe.seq, pe.type, pe.file_off, pe.key, pe.val_size);
+        }
+        pending.clear();
+        in_batch = false;
+        break;
+      case EntryType::Put:
+      case EntryType::Delete:
+        if (in_batch) {
+          pending.push_back({entry.sequence, entry.entry_type, entry_off,
+                             narrow<std::uint32_t>(entry.value.size()),
+                             entry.key});
+        } else {
+          hint.append(entry.sequence, entry.entry_type, entry_off, entry.key,
+                      narrow<std::uint32_t>(entry.value.size()));
+        }
+        break;
       }
       off = next;
     }
+
+    if (in_batch) {
+      std::cerr << "bytecask: discarding incomplete batch in "
+                << file->path() << " while generating hint file\n";
+    }
+
     hint.sync();
     std::filesystem::rename(tmp_path, hint_path);
   }
@@ -879,7 +919,9 @@ private:
     return std::unique_lock<std::mutex>{*write_mu_};
   }
 
-  // Reconstructs the key directory from existing .data and .hint files.
+  // Reconstructs the key directory from hint files.
+  // Pre-generates missing hint files from raw data scans (batch-aware),
+  // then recovers exclusively from hints — single code path.
   // Returns a new EngineState with key_dir populated and next_lsn set to
   // max_seen + 1. next_file_id is advanced for each recovered file.
   auto recover_existing_files(EngineState s) -> EngineState {
@@ -891,9 +933,13 @@ private:
       }
     }
 
-    std::uint64_t max_lsn = 0;
-    auto transient_key_dir = s.key_dir.transient();
-    std::map<Key, std::uint64_t> tombstones;
+    // Phase 1: open all data files and generate missing hint files.
+    struct RecoveredFile {
+      std::uint32_t file_id;
+      std::shared_ptr<DataFile> data_file;
+      std::filesystem::path hint_path;
+    };
+    std::vector<RecoveredFile> files;
 
     for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
       const auto &p = dir_entry.path();
@@ -906,13 +952,20 @@ private:
       data_file->seal();
       s.files->emplace(file_id, data_file);
 
-      // LSN-based freshness: apply an entry only if it is strictly newer
-      // than what the key directory already holds for that key.
-      //
-      // apply_put also consults the tombstone map: if a Delete with a higher
-      // sequence was already processed (from another file, in any order), the
-      // Put must be suppressed even though the KeyDir has no entry for the key
-      // at this moment.
+      const auto hint_path = dir_ / (p.stem().string() + ".hint");
+      if (!std::filesystem::exists(hint_path)) {
+        flush_hints_for(data_file, dir_);
+      }
+
+      files.push_back({file_id, std::move(data_file), hint_path});
+    }
+
+    // Phase 2: recover from hint files only.
+    std::uint64_t max_lsn = 0;
+    auto transient_key_dir = s.key_dir.transient();
+    std::map<Key, std::uint64_t> tombstones;
+
+    for (auto &[file_id, data_file, hint_path] : files) {
       const auto apply_put = [&](std::uint64_t seq, std::uint64_t file_off,
                                  std::uint32_t val_size,
                                  std::span<const std::byte> key) {
@@ -948,82 +1001,16 @@ private:
           max_lsn = seq;
       };
 
-      const auto hint_path = dir_ / (p.stem().string() + ".hint");
-
-      if (std::filesystem::exists(hint_path)) {
-        auto hint = HintFile::OpenForRead(hint_path);
-        Offset off = 0;
-        while (auto r = hint.scan_view(off)) {
-          const auto &[he, next] = *r;
-          if (he.entry_type == EntryType::Put) {
-            apply_put(he.sequence, he.file_offset, he.value_size, he.key);
-          } else if (he.entry_type == EntryType::Delete) {
-            apply_del(he.sequence, he.key);
-          }
-          off = next;
+      auto hint = HintFile::OpenForRead(hint_path);
+      Offset off = 0;
+      while (auto r = hint.scan_view(off)) {
+        const auto &[he, next] = *r;
+        if (he.entry_type == EntryType::Put) {
+          apply_put(he.sequence, he.file_offset, he.value_size, he.key);
+        } else if (he.entry_type == EntryType::Delete) {
+          apply_del(he.sequence, he.key);
         }
-      } else { // TODO: I think this part is unnecessary, we should generate the missing hint files before start recovery. It's a lot easier and the code is already there. 
-        // Raw scan with a BulkBegin/BulkEnd batch state machine.
-        // Entries between BulkBegin and BulkEnd are buffered and applied
-        // only when BulkEnd is seen. An incomplete batch — BulkBegin with
-        // no matching BulkEnd — is discarded; it indicates a crash mid-write.
-        struct PendingEntry {
-          std::uint64_t seq;
-          EntryType type;
-          std::uint64_t file_off;
-          std::uint32_t val_size;
-          std::vector<std::byte> key;
-        };
-
-        bool in_batch = false;
-        std::vector<PendingEntry> pending;
-        Offset off = 0;
-
-        while (auto result = data_file->scan(off)) {
-          const auto entry_off = off;
-          const auto &[de, next] = *result;
-          switch (de.entry_type) {
-          case EntryType::BulkBegin:
-            in_batch = true;
-            pending.clear();
-            if (de.sequence > max_lsn)
-              max_lsn = de.sequence;
-            break;
-          case EntryType::BulkEnd:
-            for (auto &pe : pending) {
-              if (pe.type == EntryType::Put) {
-                apply_put(pe.seq, pe.file_off, pe.val_size, pe.key);
-              } else {
-                apply_del(pe.seq, pe.key);
-              }
-            }
-            pending.clear();
-            in_batch = false;
-            if (de.sequence > max_lsn)
-              max_lsn = de.sequence;
-            break;
-          case EntryType::Put:
-          case EntryType::Delete:
-            if (in_batch) {
-              pending.push_back({de.sequence, de.entry_type, entry_off,
-                                 narrow<std::uint32_t>(de.value.size()),
-                                 de.key});
-            } else if (de.entry_type == EntryType::Put) {
-              apply_put(de.sequence, entry_off,
-                        narrow<std::uint32_t>(de.value.size()), de.key);
-            } else {
-              apply_del(de.sequence, de.key);
-            }
-            break;
-          }
-          off = next;
-        }
-
-        if (in_batch) {
-          std::cerr << "bytecask: discarding incomplete batch in " << p
-                    << " — BulkBegin with no matching BulkEnd (crash "
-                       "mid-write)\n";
-        }
+        off = next;
       }
     }
 
