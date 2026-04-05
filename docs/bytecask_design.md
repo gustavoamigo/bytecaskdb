@@ -605,15 +605,16 @@ We use fine-grained C++20 modules:
 
 Contrast with `HintFile`, which uses `OpenForWrite` / `OpenForRead` factory functions. That split models externally visible, non-overlapping lifecycles at different call sites: one site writes during `flush_hints()`, a completely separate site reads during recovery. Encoding that distinction in the type prevents mixing them up. `DataFile` has no equivalent external semantic split.
 
-### HintFile read modes
+### HintFile I/O model
 
-`HintFile` exposes one read-only factory function used in the production recovery path:
+Both write and read modes operate on an in-memory `std::vector<std::byte>` buffer. No OS file descriptor is held open across calls.
 
-| Factory | Mechanism | Key alloc | I/O error handling |
-|---|---|---|---|
-| `OpenForRead` | Single `pread` into heap `vector` | per `scan()` call | `std::system_error` |
+- **`OpenForWrite(path)`** — creates an empty in-memory buffer. `append()` serializes entries into this buffer. `sync()` opens the file, writes the entire buffer in a single `write()`, calls `fdatasync()`, and closes the fd — all within the `sync()` call.
+- **`OpenForRead(path)`** — reads the entire file into the buffer via a single `pread` and immediately closes the fd. `scan()` operates on the buffer.
 
-`HintFile::scan_view()` returns a `HintEntryView` whose `key` is a `std::span<const std::byte>` into the backing buffer — zero allocation per entry. The production recovery path uses `scan_view()` so that every hint entry parsed during `Bytecask::open()` avoids a heap allocation for the key. `scan()` (owning `HintEntry`, `key` as `std::vector`) is retained for tests and any caller that needs to outlive the `HintFile`.
+This symmetry eliminates fd lifetime management from the class: no destructor close, no move-constructor fd transfer, defaulted special members.
+
+`HintFile::scan()` returns a `HintEntry` whose `key` is a `std::span<const std::byte>` into the backing buffer — zero allocation per entry. All callers (recovery and tests) use `scan()`.
 
 ## Hint File Format (.hint)
 
@@ -746,9 +747,9 @@ Write API:
 - **`sync() -> void`**: `::fdatasync()` flush, decoupled from `append()` for Group Commit consistency.
 
 Read API:
-- **`read(offset) -> std::optional<std::pair<HintEntry, uint64_t>>`**: Reads the hint entry at `offset` bytes from the start of the file. Returns the parsed entry and the offset of the next entry (`offset + kHintHeaderSize + key_size + kHintCrcSize`). Pass `0` to start scanning from the beginning. Returns `std::nullopt` when `offset` equals file size (end-of-file). Panics on CRC mismatch. Typical usage: `while (auto result = file.read(offset)) { auto [entry, next] = *result; offset = next; }`.
+- **`scan(offset) -> std::optional<std::pair<HintEntry, uint64_t>>`**: Returns a zero-copy view of the hint entry at `offset` bytes. The key is a `std::span<const std::byte>` into the backing buffer — valid while the `HintFile` is alive. Returns `std::nullopt` at end-of-file. Panics on CRC mismatch. Typical usage: `while (auto result = file.scan(offset)) { auto& [entry, next] = *result; offset = next; }`.
 
-`HintEntry` is a plain struct holding `{uint64_t sequence, EntryType entry_type, uint64_t file_offset, std::vector<std::byte> key, uint32_t value_size}`.
+`HintEntry` is a plain struct holding `{uint64_t sequence, EntryType entry_type, uint64_t file_offset, std::span<const std::byte> key, uint32_t value_size}`.
 
 ## Range Scan: `iter_from`
 
