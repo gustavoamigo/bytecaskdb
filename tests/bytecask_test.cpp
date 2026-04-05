@@ -13,6 +13,8 @@
 #include <thread>
 #include <vector>
 import bytecask.engine;
+import bytecask.data_file;
+import bytecask.types;
 
 namespace {
 
@@ -599,6 +601,99 @@ TEST_CASE("Bytecask recovery: cross-file tombstone suppresses stale put",
   CHECK_FALSE(db2.get({}, to_bytes("gone")).has_value());
   REQUIRE(db2.get({}, to_bytes("keep")).has_value());
   CHECK(to_string(*db2.get({}, to_bytes("keep"))) == "v2");
+}
+
+// ---------------------------------------------------------------------------
+// Test: incomplete batch entries are discarded during recovery.
+// Simulates a crash mid-batch by writing a BulkBegin + Put entries with no
+// BulkEnd directly to a data file. Recovery generates a hint file from the
+// raw data (batch-aware) and only the standalone entries survive.
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask recovery: incomplete batch is discarded",
+          "[bytecask][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  std::filesystem::create_directories(db_path);
+
+  {
+    // Manually write a data file simulating a crash mid-batch.
+    bytecask::DataFile df(db_path / "data_00000000000000000000000001.data");
+    // Standalone entry — should survive.
+    std::ignore = df.append(1, bytecask::EntryType::Put, to_bytes("good"),
+                            to_bytes("value1"));
+    // Begin batch, write some entries, but never write BulkEnd.
+    std::ignore = df.append(2, bytecask::EntryType::BulkBegin, {}, {});
+    std::ignore = df.append(3, bytecask::EntryType::Put, to_bytes("orphan_a"),
+                            to_bytes("lost1"));
+    std::ignore = df.append(4, bytecask::EntryType::Put, to_bytes("orphan_b"),
+                            to_bytes("lost2"));
+    // No BulkEnd — simulates crash.
+    df.sync();
+  }
+
+  // Open engine — should generate hint file and recover only "good".
+  auto db = bytecask::Bytecask::open(db_path);
+  REQUIRE(db.get({}, to_bytes("good")).has_value());
+  CHECK(to_string(*db.get({}, to_bytes("good"))) == "value1");
+  CHECK_FALSE(db.get({}, to_bytes("orphan_a")).has_value());
+  CHECK_FALSE(db.get({}, to_bytes("orphan_b")).has_value());
+
+  // Verify a hint file was generated.
+  int hint_count = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".hint")
+      ++hint_count;
+  }
+  CHECK(hint_count >= 1);
+}
+
+// ---------------------------------------------------------------------------
+// Test: recovery produces the same key directory regardless of the order
+// in which data/hint files are iterated. We create two data files manually
+// with crafted names and LSNs so that in one sub-case the tombstone file
+// sorts alphabetically first, and in the other it sorts last. Both must
+// yield the same result: "gone" absent, "alive" present.
+// ---------------------------------------------------------------------------
+TEST_CASE("Bytecask recovery: order-independent tombstone",
+          "[bytecask][recovery]") {
+  // Sub-case A: delete file sorts BEFORE put file (alphabetically).
+  // Sub-case B: delete file sorts AFTER put file.
+  // In both, the delete has a higher LSN than the put, so it must win.
+  auto run = [](std::string_view put_stem, std::string_view del_stem) {
+    TempDir td;
+    const auto db_path = td.path / "db";
+    std::filesystem::create_directories(db_path);
+
+    // File with a Put for "gone" (seq=1) and "alive" (seq=2).
+    {
+      bytecask::DataFile df(db_path / std::format("{}.data", put_stem));
+      std::ignore = df.append(1, bytecask::EntryType::Put, to_bytes("gone"),
+                              to_bytes("v1"));
+      std::ignore = df.append(2, bytecask::EntryType::Put, to_bytes("alive"),
+                              to_bytes("v2"));
+      df.sync();
+    }
+
+    // File with a Delete for "gone" (seq=3) — higher LSN wins.
+    {
+      bytecask::DataFile df(db_path / std::format("{}.data", del_stem));
+      std::ignore = df.append(3, bytecask::EntryType::Delete,
+                              to_bytes("gone"), {});
+      df.sync();
+    }
+
+    auto db = bytecask::Bytecask::open(db_path);
+    CHECK_FALSE(db.get({}, to_bytes("gone")).has_value());
+    REQUIRE(db.get({}, to_bytes("alive")).has_value());
+    CHECK(to_string(*db.get({}, to_bytes("alive"))) == "v2");
+  };
+
+  SECTION("delete file sorts before put file") {
+    run("data_bbb", "data_aaa");
+  }
+  SECTION("delete file sorts after put file") {
+    run("data_aaa", "data_bbb");
+  }
 }
 
 // ---------------------------------------------------------------------------
