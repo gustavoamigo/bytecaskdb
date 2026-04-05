@@ -112,6 +112,15 @@ inline constexpr auto entry_size(std::size_t key_size,
 }
 
 // ---------------------------------------------------------------------------
+// VacuumOptions — controls vacuum file selection.
+// ---------------------------------------------------------------------------
+export struct VacuumOptions {
+  // Minimum fragmentation ratio (1 − live_bytes / total_bytes) a sealed file
+  // must exceed to be eligible for vacuum. Range [0.0, 1.0].
+  double fragmentation_threshold{0.5};
+};
+
+// ---------------------------------------------------------------------------
 // Batch
 // ---------------------------------------------------------------------------
 
@@ -602,6 +611,15 @@ public:
         // Best-effort: swallow errors in destructors.
       }
     }
+    // At destruction no readers are active — purge all stale files.
+    for (auto &sf : stale_files_) {
+      try {
+        auto path = sf.data_file->path();
+        sf.data_file.reset();
+        std::filesystem::remove(path);
+        std::filesystem::remove(sf.hint_path);
+      } catch (...) {}
+    }
   }
 
   // ── Primary operations ─────────────────────────────────────────────────
@@ -831,6 +849,61 @@ public:
     flush_hints(*state_.load());
   }
 
+  // ── Vacuum ─────────────────────────────────────────────────────────────
+
+  // Selects the highest-fragmentation sealed file above the threshold
+  // and either absorbs it into the active file (if it fits) or compacts
+  // it into a new sealed file. No-op if no file qualifies.
+  // Thread-safe: serialised by vacuum_mu_ (independent from write_mu_).
+  void vacuum(VacuumOptions opts = {}) {
+    std::lock_guard vg{*vacuum_mu_};
+
+    // Drain in-flight background hint writes so that vacuum's
+    // flush_hints_for call cannot race on the same .hint.tmp file
+    // if make_data_file_stem() returns a colliding timestamp.
+    worker_.drain();
+
+    // Purge stale files no longer referenced by any reader.
+    vacuum_purge_stale_files();
+
+    // Snapshot file_stats and active-file info under write_mu_.
+    std::map<std::uint32_t, FileStats> stats_snap;
+    std::uint32_t active_id{};
+    std::uint64_t active_size{};
+    {
+      std::lock_guard wg{*write_mu_};
+      stats_snap = file_stats_;
+      auto s = state_.load();
+      active_id = s->active_file_id;
+      active_size = s->active_file().size();
+    }
+
+    // Find the highest-fragmentation sealed file above threshold.
+    std::uint32_t target_id{};
+    double worst_frag = 0.0;
+    for (const auto &[fid, fs] : stats_snap) {
+      if (fid == active_id) continue;
+      if (fs.total_bytes == 0) continue;
+      const auto frag =
+          1.0 - static_cast<double>(fs.live_bytes) /
+                    static_cast<double>(fs.total_bytes);
+      if (frag > worst_frag && frag > opts.fragmentation_threshold) {
+        worst_frag = frag;
+        target_id = fid;
+      }
+    }
+
+    if (target_id == 0 && worst_frag == 0.0) return;
+
+    // Branch: absorb if live data fits in active file, else compact.
+    const auto target_live = stats_snap.at(target_id).live_bytes;
+    if (target_live + active_size <= rotation_threshold_) {
+      vacuum_absorb_file(target_id);
+    } else {
+      vacuum_compact_file(target_id);
+    }
+  }
+
 private:
   // Writes the hint file for a single data file using the temp-then-rename
   // protocol. Batch-aware: entries between BulkBegin and BulkEnd are buffered
@@ -907,6 +980,238 @@ private:
       }
       flush_hints_for(file, dir_);
     }
+  }
+
+  // ── Vacuum primitives ──────────────────────────────────────────────────
+
+  // Mapping produced during the I/O phase for each live Put that was copied
+  // to the new/active file. The commit phase uses these to remap key_dir.
+  struct VacuumMapping {
+    Bytes key;
+    std::uint64_t new_offset;
+    std::uint64_t sequence;
+    std::uint32_t value_size;
+  };
+
+  struct VacuumScanResult {
+    std::vector<VacuumMapping> mappings;
+    std::uint64_t live_bytes{0};
+    std::uint64_t total_bytes{0};
+  };
+
+  // Batch-aware scan of source_file: copies live Puts (still current in
+  // snap->key_dir for source_file_id) and all tombstones into dest_file.
+  // Entries inside BulkBegin..BulkEnd are buffered and emitted only on
+  // BulkEnd; incomplete batches at EOF are silently discarded.
+  static auto vacuum_scan_and_copy(
+      const std::shared_ptr<const EngineState> &snap,
+      const DataFile &source_file, DataFile &dest_file,
+      std::uint32_t source_file_id) -> VacuumScanResult {
+    VacuumScanResult result;
+
+    struct PendingEntry {
+      DataEntry entry;
+      Offset original_offset;
+    };
+    bool in_batch = false;
+    std::vector<PendingEntry> pending;
+
+    auto emit_entry = [&](const DataEntry &entry, Offset entry_off) {
+      switch (entry.entry_type) {
+      case EntryType::Put: {
+        const auto existing = snap->key_dir.get(entry.key);
+        if (existing && existing->file_id == source_file_id &&
+            existing->file_offset == entry_off &&
+            existing->sequence == entry.sequence) {
+          const auto new_off = dest_file.append(
+              entry.sequence, EntryType::Put, entry.key, entry.value);
+          const auto val_size =
+              narrow<std::uint32_t>(entry.value.size());
+          const auto sz =
+              entry_size(entry.key.size(), entry.value.size());
+          result.live_bytes += sz;
+          result.total_bytes += sz;
+          result.mappings.push_back(
+              {Bytes{entry.key.begin(), entry.key.end()}, new_off,
+               entry.sequence, val_size});
+        }
+        break;
+      }
+      case EntryType::Delete: {
+        std::ignore = dest_file.append(
+            entry.sequence, EntryType::Delete, entry.key, {});
+        result.total_bytes += entry_size(entry.key.size(), 0);
+        break;
+      }
+      default:
+        break;
+      }
+    };
+
+    Offset off = 0;
+    while (auto scan_result = source_file.scan(off)) {
+      const auto entry_off = off;
+      const auto &[entry, next] = *scan_result;
+
+      switch (entry.entry_type) {
+      case EntryType::BulkBegin:
+        in_batch = true;
+        pending.clear();
+        break;
+      case EntryType::BulkEnd:
+        for (auto &pe : pending) {
+          emit_entry(pe.entry, pe.original_offset);
+        }
+        pending.clear();
+        in_batch = false;
+        break;
+      case EntryType::Put:
+      case EntryType::Delete:
+        if (in_batch) {
+          pending.push_back({entry, entry_off});
+        } else {
+          emit_entry(entry, entry_off);
+        }
+        break;
+      }
+
+      off = next;
+    }
+    // Incomplete batch at EOF → silently discard pending entries.
+
+    return result;
+  }
+
+  // Purge stale files whose DataFile is only held by stale_files_ (no
+  // in-flight readers). Called at the start of vacuum() under vacuum_mu_.
+  void vacuum_purge_stale_files() {
+    std::erase_if(stale_files_, [](StaleFile &sf) {
+      if (sf.data_file.use_count() == 1) {
+        auto path = sf.data_file->path();
+        sf.data_file.reset();
+        std::filesystem::remove(path);
+        std::filesystem::remove(sf.hint_path);
+        return true;
+      }
+      return false;
+    });
+  }
+
+  // Remaps key_dir entries from old_file_id to the destination file,
+  // updates the files map and file_stats_, and publishes the new
+  // EngineState. Caller must hold write_mu_.
+  // If new_sealed_file is non-null (compact), a fresh file-id is
+  // allocated and the new file is registered. Otherwise (absorb),
+  // the active file's stats are incremented.
+  void vacuum_commit(std::uint32_t old_file_id,
+                     const VacuumScanResult &scan,
+                     std::shared_ptr<DataFile> new_sealed_file) {
+    auto s = *state_.load();
+
+    const auto dest_file_id = new_sealed_file
+        ? s.next_file_id++
+        : s.active_file_id;
+
+    auto t = s.key_dir.transient();
+    auto actual_live_bytes = scan.live_bytes;
+    for (const auto &m : scan.mappings) {
+      const std::span<const std::byte> key_span{m.key};
+      const auto cur = t.get(key_span);
+      if (cur && cur->sequence == m.sequence) {
+        t.set(key_span,
+              KeyDirEntry{m.sequence, dest_file_id, m.new_offset,
+                          m.value_size});
+      } else {
+        actual_live_bytes -= entry_size(m.key.size(), m.value_size);
+      }
+    }
+    s.key_dir = std::move(t).persistent();
+
+    auto next_files =
+        std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>(
+            *s.files);
+    next_files->erase(old_file_id);
+    if (new_sealed_file) {
+      next_files->emplace(dest_file_id, std::move(new_sealed_file));
+    }
+    s.files = std::move(next_files);
+
+    file_stats_.erase(old_file_id);
+    if (dest_file_id != s.active_file_id) {
+      file_stats_[dest_file_id] = FileStats{actual_live_bytes,
+                                             scan.total_bytes};
+    } else {
+      auto &active_stats = file_stats_[dest_file_id];
+      active_stats.live_bytes += actual_live_bytes;
+      active_stats.total_bytes += scan.total_bytes;
+    }
+
+    state_.store(std::make_shared<EngineState>(std::move(s)));
+    state_time_.store(now_ns(), std::memory_order_release);
+  }
+
+  // Stashes the old data file and its hint path for deferred removal
+  // once no in-flight readers reference it.
+  void vacuum_defer_old_file(
+      const std::shared_ptr<const EngineState> &snap,
+      std::uint32_t file_id) {
+    auto old_data_file = snap->files->at(file_id);
+    auto old_hint_path =
+        dir_ / (old_data_file->path().stem().string() + ".hint");
+    stale_files_.push_back({std::move(old_data_file),
+                            std::move(old_hint_path)});
+  }
+
+  // Rewrites a sealed file into a new sealed file containing only live
+  // entries and tombstones. Called under vacuum_mu_, not write_mu_.
+  //
+  // The new data file is written to .data.tmp, then renamed atomically.
+  // The old file is deferred for cleanup when no readers reference it.
+  void vacuum_compact_file(std::uint32_t file_id) {
+    auto snap = state_.load();
+    const auto &old_file = *snap->files->at(file_id);
+
+    const auto stem = make_data_file_stem();
+    const auto tmp_data_path = dir_ / (stem + ".data.tmp");
+    const auto final_data_path = dir_ / (stem + ".data");
+
+    VacuumScanResult scan;
+    {
+      DataFile tmp_file(tmp_data_path);
+      scan = vacuum_scan_and_copy(snap, old_file, tmp_file, file_id);
+      tmp_file.sync();
+    }
+
+    std::filesystem::rename(tmp_data_path, final_data_path);
+    auto new_file = std::make_shared<DataFile>(final_data_path);
+    new_file->seal();
+    flush_hints_for(new_file, dir_);
+
+    {
+      std::lock_guard wg{*write_mu_};
+      vacuum_commit(file_id, scan, new_file);
+    }
+    vacuum_defer_old_file(snap, file_id);
+  }
+
+  // Appends live entries from a sealed file to the active file, then
+  // removes the sealed file. Called under vacuum_mu_.
+  // The entire I/O + commit phase runs under write_mu_ because
+  // scan_and_copy appends to the shared active DataFile, which is
+  // NOT thread-safe (requires external synchronization).
+  // The old file is deferred for cleanup when no readers reference it.
+  void vacuum_absorb_file(std::uint32_t file_id) {
+    auto snap = state_.load();
+    const auto &old_file = *snap->files->at(file_id);
+
+    {
+      std::lock_guard wg{*write_mu_};
+      auto &active = snap->active_file();
+      auto scan = vacuum_scan_and_copy(snap, old_file, active, file_id);
+      active.sync();
+      vacuum_commit(file_id, scan, nullptr);
+    }
+    vacuum_defer_old_file(snap, file_id);
   }
 
   // ── FileStats helpers (called under write_mu_) ─────────────────────────
@@ -1023,10 +1328,12 @@ private:
   // files, open all data files, seal them, register in s.files, and
   // generate missing hint files. Returns the RecoveredFile list.
   auto open_and_prepare_files(EngineState &s) -> std::vector<RecoveredFile> {
-    // Remove stale .hint.tmp files from a prior crash.
+    // Remove stale .hint.tmp and .data.tmp files from a prior crash.
     for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
       const auto &p = dir_entry.path();
-      if (p.extension() == ".tmp" && p.stem().extension() == ".hint") {
+      if (p.extension() == ".tmp" &&
+          (p.stem().extension() == ".hint" ||
+           p.stem().extension() == ".data")) {
         std::filesystem::remove(p);
       }
     }
@@ -1346,6 +1653,17 @@ private:
   // Group commit: batches concurrent fdatasync calls so one sync covers
   // multiple writers. See design doc "Group commit" section.
   SyncGroup sync_group_;
+  // Serialises vacuum() calls. Separate from write_mu_ so vacuum I/O does
+  // not block normal writes. Only the commit phase briefly acquires write_mu_.
+  std::unique_ptr<std::mutex> vacuum_mu_{std::make_unique<std::mutex>()};
+  // Files removed from the registry by vacuum but potentially still referenced
+  // by in-flight readers. Purged when use_count drops to 1 (only this list).
+  // Protected by vacuum_mu_.
+  struct StaleFile {
+    std::shared_ptr<DataFile> data_file;
+    std::filesystem::path hint_path;
+  };
+  std::vector<StaleFile> stale_files_;
   // Per-file live/total byte counters for vacuum fragmentation tracking.
   // Updated under write_mu_ on every write; rebuilt during recovery.
   std::map<std::uint32_t, FileStats> file_stats_;

@@ -382,27 +382,74 @@ Processing order across files does not matter — LSN comparison always picks th
 
 **Parallel recovery**: `RecoveryResult` includes a `file_stats` map alongside `key_dir`, `tombstones`, and `max_lsn`. Each worker builds its own `file_stats` during Phase 2 using the algorithm above. During Phase 3 fan-in: file IDs are disjoint across workers (files are partitioned by round-robin), so `file_stats` maps are unioned without summing. When the LSN resolver discards a losing entry during tree merge or tombstone cross-application, the loser's size is subtracted from its file's `live_bytes`.
 
-#### Vacuum procedure
+#### Vacuum primitives
 
-1. **Acquire `vacuum_mu_`** — prevents two `vacuum()` calls from running concurrently.
-2. **Snapshot the key directory** — call `state_.load()` to obtain the current `EngineState`. This is the authoritative view of which entries are live.
-3. **Select a target file** — copy `file_stats_` under a brief `write_mu_` acquisition (O(sealed files), then release). Iterate sealed files, compute `fragmentation = 1 − live_bytes / total_bytes` (O(1) per file, no I/O), pick the highest-fragmentation sealed file above `fragmentation_threshold`. If no file qualifies, return immediately.
-4. **Rewrite the target file** — open a new data file for writing (new timestamp stem, same directory). Scan the old data file entry by entry:
+Vacuum is decomposed into two self-contained, independently testable primitives. The `vacuum()` caller picks exactly one per target file — there is no compound "compact then maybe absorb" path.
+
+##### `vacuum_compact_file(file_id)` — rewrite a sealed file, dropping dead entries
+
+Used when the file's live data is too large to fit into the active file. Produces a new, sealed, compacted file.
+
+1. **Snapshot the key directory** — call `state_.load()` to obtain the current `EngineState`. This is the authoritative view of which entries are live.
+2. **Rewrite the target file** — open a new data file at a `.data.tmp` path for writing (new timestamp stem, same directory). Scan the old data file entry by entry using **batch-aware scanning** (see below). For each emitted entry:
    - *Put entry*: check whether the snapshot's key directory entry for that key points to the old file at this offset with the same sequence number. If yes (live), write it to the new file at its new offset, recording `(key → new_file_id, new_offset)`. If no (dead), skip.
    - *Delete entry*: always copy to the new file verbatim (same sequence number, same key). See **Tombstone handling** below.
-   - *BulkBegin / BulkEnd entries*: always skip — they are crash-recovery markers not needed in an already-committed sealed file.
-5. **Durability** — `fdatasync` the new file. Write a hint file for it using the same temp-then-rename protocol as rotation.
-6. **Atomic commit** (under `write_mu_`):
+3. **Seal and durability** — `fdatasync` the tmp file, close it. Rename `.data.tmp` → `.data` atomically. Open a new `DataFile` at the final path and seal it. Write a hint file by scanning the compacted file (no batches in the output), using the temp-then-rename protocol (`.hint.tmp` → `.hint`).
+4. **Atomic commit** (under `write_mu_`):
    a. Build a `TransientRadixTree` from the current `key_dir_`.
    b. For each live Put entry copied to the new file, look up the key in the current key directory. If the sequence number still matches (no concurrent write superseded it), update `KeyDirEntry` to the new `file_id` and `file_offset`. If the sequence number differs, skip — the concurrent writer's version takes precedence.
    c. Call `persistent()` to obtain the new immutable key directory.
    d. Build an updated `FileRegistry`: add the new compacted file, remove the old file.
-   e. Update `file_stats_`: remove the old file's entry. Insert a new entry for the compacted file using the exact `compacted_live_bytes` tracked during step 4 — for each entry whose key-dir sequence no longer matched in step 6b (concurrent write won), its `entry_size` was subtracted from the running total. `total_bytes` is the physical size of the new file. (Note: `compacted_live_bytes` may be less than `total_bytes` because the new file also contains tombstones that are never counted as live, and entries superseded by concurrent writes during the I/O phase.)
-   f. Call `publish_snapshot()` to atomically replace the observable state for all readers.
-7. **Release `write_mu_`**.
-8. **Delete the old file** — once published, the old sealed file is removed from disk. Any in-flight `EntryIterator` still holds a `shared_ptr` to the old `FileRegistry` snapshot, keeping the old `DataFile` fd alive until the iterator is destroyed.
-9. **Release `vacuum_mu_`**.
-10. Return `VacuumStats` summarising bytes examined and bytes reclaimed.
+   e. Update `file_stats_`: remove the old file's entry. Insert a new entry for the compacted file using the exact `compacted_live_bytes` tracked during step 2 — for each entry whose key-dir sequence no longer matched in step 4b (concurrent write won), its `entry_size` was subtracted from the running total. `total_bytes` is the physical size of the new file. (Note: `compacted_live_bytes` may be less than `total_bytes` because the new file also contains tombstones that are never counted as live, and entries superseded by concurrent writes during the I/O phase.)
+   f. Publish the new `EngineState` via `state_.store()`.
+5. **Release `write_mu_`**.
+6. **Defer file cleanup** — the old file is removed from the registry but may still be referenced by in-flight readers via their `EngineState` snapshot. The old `shared_ptr<DataFile>` is stashed in `stale_files_` (protected by `vacuum_mu_`). At the start of each `vacuum()` call, entries whose `use_count() == 1` (only `stale_files_` holds the reference, no readers) are purged: the fd is closed and the `.data` + `.hint` files are deleted. The destructor also purges all remaining stale files.
+
+##### `vacuum_absorb_file(file_id)` — fold a sealed file's live entries into the active file
+
+Used when the file's live data is small enough to append to the active file without exceeding the rotation threshold. Eliminates a file descriptor and reduces recovery time.
+
+Precondition: `file_stats_[file_id].live_bytes + active_file.size() <= rotation_threshold`. The caller (`vacuum()`) verifies this before calling.
+
+1. **Snapshot the key directory** — call `state_.load()`.
+2. **Acquire `write_mu_`** — the active `DataFile` is NOT thread-safe, so the entire scan-copy-sync-commit sequence must be serialised against concurrent `put`/`del`/`apply_batch` calls that also append to the active file.
+3. **Append live entries to the active file** — scan the old data file entry by entry using **batch-aware scanning** (see below). For each emitted entry:
+   - *Put entry*: if live (same check as `compact_file`), append to the active file at its new offset. The original LSN is preserved verbatim — no new sequence numbers are allocated. Record `(key → active_file_id, new_offset)`.
+   - *Delete entry*: copy verbatim to the active file (same LSN, same key).
+4. **Durability** — `fdatasync` the active file.
+5. **Commit** (still under `write_mu_`):
+   a–c. Same key-directory remapping as `vacuum_compact_file`, but pointing entries to `active_file_id` instead of a new compacted file.
+   d. Build an updated `FileRegistry`: remove the old file (no new file added).
+   e. Update `file_stats_`: remove the old file's entry. Add the absorbed entries' sizes to `file_stats_[active_file_id]` (both `live_bytes` and `total_bytes` for live Puts; `total_bytes` only for tombstones). Subtract sizes for entries superseded by concurrent writes (same logic as `vacuum_compact_file`).
+   f. Publish the new `EngineState`.
+6. **Release `write_mu_`**.
+7. **Defer file cleanup** — same as `vacuum_compact_file`: stash in `stale_files_`, purge when `use_count() == 1`.
+
+Note: absorbed entries preserve their original LSNs, which are all less than `next_lsn`. This is safe because LSN ordering is only used for recovery conflict resolution across files, and the absorbed entries now live in the active file alongside newer writes. Recovery will see all entries and LSN comparison still picks the correct winner.
+
+#### Batch-aware scanning
+
+Both vacuum primitives use batch-aware scanning when reading the old data file. Entries between `BulkBegin` and `BulkEnd` are buffered and only emitted when `BulkEnd` is reached. If the file ends mid-batch (crash during `apply_batch`), the buffered entries are silently discarded — they were never committed.
+
+**Why**: without batch-aware scanning, vacuum would copy uncommitted entries (including tombstones from incomplete batches) into the output. Those tombstones could incorrectly shadow live Puts in other files, causing data loss on recovery. This matches `flush_hints_for`'s batch-aware hint generation.
+
+#### Crash safety
+
+`vacuum_compact_file` writes the new data file to `.data.tmp` and renames it atomically to `.data` after `fdatasync`. If the engine crashes mid-write, recovery ignores `.data.tmp` files (it only processes `.data` extensions) and cleans them up in `open_and_prepare_files`. The hint file uses the same `.hint.tmp` → `.hint` protocol.
+
+`vacuum_absorb_file` appends to the already-open active file. If the engine crashes mid-absorb, the old file still exists on disk (deferred cleanup). Recovery opens both files and processes all entries. Absorbed entries appear in both the old file and the active file with identical LSNs — recovery's conflict resolution handles duplicates correctly.
+
+#### Vacuum caller (`vacuum()`)
+
+The public `vacuum()` method orchestrates file selection and dispatches to exactly one primitive:
+
+1. **Acquire `vacuum_mu_`** — prevents two `vacuum()` calls from running concurrently.
+2. **Purge stale files** — check `stale_files_` for entries whose `shared_ptr<DataFile>` has `use_count() == 1` (no in-flight readers). For those, close the fd and delete the `.data` + `.hint` files.
+3. **Select a target file** — copy `file_stats_` under a brief `write_mu_` acquisition (O(sealed files), then release). Iterate sealed files, compute `fragmentation = 1 − live_bytes / total_bytes` (O(1) per file, no I/O), pick the highest-fragmentation sealed file above `fragmentation_threshold`. If no file qualifies, return immediately.
+4. **Branch**:
+   - If `file_stats_[target].live_bytes + active_file.size() <= rotation_threshold` → call `vacuum_absorb_file(target)`.
+   - Otherwise → call `vacuum_compact_file(target)`.
+5. **Release `vacuum_mu_`**.
 
 #### Tombstone handling
 
@@ -1096,7 +1143,7 @@ The `~Bytecask()` destructor no longer calls `flush_hints()` explicitly. Because
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
 | D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1 and standard C++ practice). |
 | D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. MVCC and snapshot isolation are not provided. |
-| D10 | **Vacuum**: Conservative online 1:1 rewrite. One sealed file per `vacuum()` call. Engine continues serving reads and writes. Write-path impact is zero — `write_mu_` is held only for the in-memory commit step. Tombstones are always copied (never elided) during partial vacuum to prevent key resurrection across unprocessed files. Full vacuum (drop tombstones, multi-file merge) is a separate future operation. File selection uses `fragmentation >= fragmentation_threshold` computed from incrementally maintained `FileStats` (`live_bytes`, `total_bytes`) — O(1) per file, no scanning. Stats are reconstructed during recovery as a side-effect of the hint-file pass. |
+| D10 | **Vacuum**: Two independently testable primitives — `vacuum_compact_file` (rewrite sealed file into a new sealed file, dropping dead entries) and `vacuum_absorb_file` (append live entries to the active file, preserving original LSNs, then delete the old file). `vacuum()` selects a target file above `fragmentation_threshold`, then branches: `vacuum_absorb_file` if `live_bytes` fits in the active file, otherwise `vacuum_compact_file`. No compound paths. All vacuum-related identifiers use a `vacuum_` prefix. One sealed file per `vacuum()` call. Engine continues serving reads and writes. For `vacuum_compact_file`, `write_mu_` is held only for the commit step (I/O writes to a private temp file). For `vacuum_absorb_file`, `write_mu_` is held for the entire scan-copy-sync-commit phase because the active `DataFile` is not thread-safe and concurrent `put`/`del`/`apply_batch` also append to it. `vacuum_commit` itself does not acquire `write_mu_` — the caller is responsible for holding it. Tombstones are always copied (never elided) during partial vacuum. File selection uses `fragmentation >= fragmentation_threshold` computed from incrementally maintained `FileStats` — O(1) per file. Stats are reconstructed during recovery as a side-effect of the hint-file pass. |
 | D11 | **File naming**: `data_{YYYYMMDDHHmmssUUUUUU}` using microsecond precision. Gives lexicographic == chronological ordering and avoids the false precision of nanosecond timestamps whose sub-microsecond bits are often zero on Linux. |
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be discarded with a logged warning. No partial-batch entries enter the key directory. |
