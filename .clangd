@@ -5,3 +5,8 @@ CompileFlags:
   # back to analysing the source directly from the -fmodule-file= mappings.
   Remove: [--precompile, -x, -fvisibility*, -O3]
   Add: [-xc++]
+Diagnostics:
+  # False positive: stdlib headers (e.g. <mutex>, <thread>) transitively
+  # include <atomic> in every module's global fragment. clangd incorrectly
+  # reports an ODR violation between the copies. The actual build is clean.
+  Suppress: [module_odr_violation_record]

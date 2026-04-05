@@ -17,7 +17,7 @@ module;
 
 export module bytecask.data_file;
 
-import bytecask.crc32;
+import bytecask.util;
 import bytecask.data_entry;
 import bytecask.types;
 

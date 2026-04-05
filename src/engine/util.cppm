@@ -6,7 +6,7 @@ module;
 #include <stdexcept>
 #include <utility>
 
-export module bytecask.crc32;
+export module bytecask.util;
 
 namespace bytecask {
 

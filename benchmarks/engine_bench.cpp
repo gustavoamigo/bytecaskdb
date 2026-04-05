@@ -895,7 +895,7 @@ template <bool WithHints> void BM_Recovery(benchmark::State &state) {
   // One-time setup: populate the directory and write all hint files.
   static const bool kSetupDone = [&] {
     {
-      auto db = bytecask::Bytecask::open(recovery_dir.path, kRecoveryThreshold);
+      auto db = bytecask::Bytecask::open(recovery_dir.path, {.max_file_bytes = kRecoveryThreshold});
       bytecask::WriteOptions wo;
       const auto n = keys.size();
       for (std::size_t i = 0; i < n; ++i) {
@@ -915,7 +915,7 @@ template <bool WithHints> void BM_Recovery(benchmark::State &state) {
   struct Handle {
     bytecask::Bytecask db;
     explicit Handle(const std::filesystem::path &p, std::uint64_t threshold)
-        : db{bytecask::Bytecask::open(p, threshold)} {}
+        : db{bytecask::Bytecask::open(p, {.max_file_bytes = threshold})} {}
   };
 
   std::unique_ptr<Handle> handle;
@@ -994,7 +994,7 @@ struct ParRecoverySetup {
   std::vector<std::string> keys;
 
   ParRecoverySetup() : keys{generate_prefixed_keys(kDatasetSize)} {
-    auto db = bytecask::Bytecask::open(dir.path, kParRecoveryThreshold);
+    auto db = bytecask::Bytecask::open(dir.path, {.max_file_bytes = kParRecoveryThreshold});
     bytecask::WriteOptions wo;
     static const std::vector<std::byte> tiny_val{std::byte{0x42}};
     const auto n = keys.size();
@@ -1020,7 +1020,7 @@ void BM_RecoveryParallel(benchmark::State &state) {
     bytecask::Bytecask db;
     explicit Handle(const std::filesystem::path &p, std::uint64_t th,
                     unsigned t)
-        : db{bytecask::Bytecask::open(p, th, t)} {}
+        : db{bytecask::Bytecask::open(p, {.max_file_bytes = th, .recovery_threads = t})} {}
   };
 
   std::unique_ptr<Handle> handle;

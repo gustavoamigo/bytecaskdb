@@ -6,7 +6,7 @@ module;
 
 export module bytecask.serialization;
 
-export import bytecask.crc32;
+export import bytecask.util;
 
 namespace bytecask {
 
