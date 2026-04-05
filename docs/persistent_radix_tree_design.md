@@ -80,6 +80,7 @@ All operations leave the original tree unchanged and return a new instance.
 *   `PersistentRadixTree set(std::span<const std::byte> key, V val) const` (Insert or overwrite).
 *   `PersistentRadixTree erase(std::span<const std::byte> key) const`
 *   `TransientRadixTree<V> transient() const` (Spawns a mutable builder).
+*   `PersistentRadixTree merge(a, b, resolve)` (Static. Merges two trees; see §5.3).
 
 
 ### 4.2. Transient API (`TransientRadixTree<V>`)
@@ -116,6 +117,80 @@ When removing a value (`node->value = std::nullopt`), the tree must maintain Pat
 1.  **0 Children:** The node is deleted. Recursively check parent.
 2.  **1 Child:** The node is merged with its child. The new prefix is `parent_prefix + transition_byte + child_prefix`.
 3.  **>1 Child:** The node remains as a routing node.
+
+### 5.3. Merge
+
+`merge(a, b, resolve)` combines two persistent trees into one, producing a new tree that shares unmodified subtrees from both inputs via `IntrusivePtr` copy (no node cloning).
+
+**Signature:**
+```cpp
+template <typename ResolveFunc>
+static auto merge(const PersistentRadixTree& a,
+                  const PersistentRadixTree& b,
+                  ResolveFunc&& resolve) -> PersistentRadixTree;
+// resolve(const V& a_val, const V& b_val) -> V
+```
+
+**Algorithm — `merge_impl(node_a, node_b, resolve)`:**
+
+The function walks both trees in tandem, recursing only where the two trees overlap. At each step it compares the compressed prefixes of the two nodes. Let `cpl` = the common prefix length between `node_a.prefix` and `node_b.prefix`.
+
+**Case 1 — Base cases:**
+- If `node_a` is null, return `node_b`.
+- If `node_b` is null, return `node_a`.
+- In both cases the entire subtree is shared by pointer — O(1), no cloning.
+
+**Case 2 — Prefixes diverge (`cpl < |prefix_a|` and `cpl < |prefix_b|`):**
+- The two nodes live in disjoint parts of the key space.
+- Create a new split node whose prefix is the common part (`prefix[0..cpl)`).
+- Trim `node_a`'s prefix to `prefix_a[cpl+1..]`, insert it as a child under transition byte `prefix_a[cpl]`.
+- Trim `node_b`'s prefix to `prefix_b[cpl+1..]`, insert it as a child under transition byte `prefix_b[cpl]`.
+- Both subtrees (including all their descendants) are shared by pointer.
+
+```
+  Before:              After merge:
+  A: "abcX..."          split: "abc"
+  B: "abcY..."             ├─ 'X' → A (trimmed)
+                           └─ 'Y' → B (trimmed)
+```
+
+**Case 3 — `node_b`'s prefix is exhausted first (`cpl < |prefix_a|`, `cpl == |prefix_b|`):**
+- `node_b` sits *above* `node_a` in the trie (b is a prefix of a).
+- Clone `node_b`, trim `node_a`'s prefix, and insert/merge `node_a` as a child of the clone at transition byte `prefix_a[cpl]`.
+
+**Case 4 — `node_a`'s prefix is exhausted first (`cpl == |prefix_a|`, `cpl < |prefix_b|`):**
+- Symmetric to Case 3. Clone `node_a`, trim `node_b`, insert/merge as child.
+
+**Case 5 — Full prefix match (`cpl == |prefix_a| == |prefix_b|`):**
+- The two nodes correspond to the same trie position.
+- Clone `node_a`. If both have a value, call `resolve(a.value, b.value)` to pick the winner. If only `b` has a value, copy it.
+- Walk `node_b`'s child list and for each `(transition_byte, child_b)`:
+  - If `node_a` has a child with the same transition byte, recurse: `merge_impl(child_a, child_b, resolve)`.
+  - Otherwise, adopt `child_b` directly (O(1) `IntrusivePtr` copy — the entire disjoint subtree is shared).
+
+**Size computation:**
+
+The merged tree's `size_` is computed by walking the result with `count_keys()` in O(N). Incremental tracking during the recursive merge was considered but is error-prone in the asymmetric prefix cases (Cases 3/4 where one node contains the other). The O(N) post-walk is simple, correct, and dominated by the merge cost itself.
+
+**Complexity:**
+
+| Scenario | Cost |
+|---|---|
+| Fully disjoint trees (no shared keys) | O(1) per subtree adoption; O(N) for size walk |
+| Fully overlapping trees (all keys shared) | O(N) — must visit every conflicting leaf |
+| Partial overlap | O(overlap) for merge + O(N) for size walk |
+
+The structural sharing guarantee: any subtree that exists in only one input is adopted by pointer without cloning any of its nodes. Cloning only occurs on the path from the root to each conflict point.
+
+**Conflict resolution:**
+
+The `resolve` callback is only invoked on exact key conflicts (same key present in both trees). It receives the two values by `const&` and returns the winner. Common resolvers:
+- Recovery (higher LSN wins): `[](auto& a, auto& b) { return b.lsn > a.lsn ? b : a; }`
+- Prefer b: `[](auto&, auto& b) { return b; }`
+
+**Use case — parallel recovery:**
+
+Hint files are assigned to workers round-robin. Each worker builds a `TransientRadixTree`, converts it to persistent, and the results are merged pair-wise in a fan-in tree (log₂(N) rounds). The merge handles overlapping keys (same key updated across multiple data files) via the LSN resolver.
 
 ---
 
@@ -307,5 +382,40 @@ RadixTree is **21% cheaper** than StdMap for prefixed keys (92 vs 117 B/key) —
 | Lower bound | ~1× (parity) | 2× slower |
 | Memory (generic) | see §7.6\* | +19% |
 | Memory (prefixed) | see §7.6\* | **−21%** |
+
+### 8.9. Merge
+
+Merge-only cost (two pre-built N/2-key trees, merge step only):
+
+| Scenario | 1k (µs) | 10k (µs) | 100k (µs) |
+|---|---|---|---|
+| Disjoint (0% overlap) | 23 | 261 | 2,779 |
+| Overlapping (50% overlap) | 44 | 454 | 6,208 |
+| **Ratio** | **1.9×** | **1.7×** | **2.2×** |
+
+Overlapping merges are ~2× more expensive due to node cloning and conflict resolution at every shared key. Disjoint merges adopt entire subtrees via `IntrusivePtr` copy.
+
+### 8.10. Split-build-merge vs linear build
+
+End-to-end: `build(N/2) + build(N/2) + merge(N)` vs `build(N)`. All sequential.
+
+| Benchmark | 1k (µs) | 10k (µs) | 100k (µs) | vs linear |
+|---|---|---|---|---|
+| TransientSet (linear baseline) | 91 | 1,056 | 14,583 | 1.0× |
+| SplitBuildMerge (disjoint) | 117 | 1,395 | 19,820 | 1.36× |
+| SplitBuildMergeOverlapping (20%) | 132 | 1,606 | 24,744 | 1.70× |
+| SplitBuildMergePrefixed (disjoint) | 114 | 1,247 | 17,468 | 1.20× |
+
+Sequential split+merge is 36–70% slower than linear depending on overlap. However, in a parallel execution model the two build phases overlap on separate threads, so the wall-clock cost becomes `max(build_a, build_b) + merge` rather than the sum.
+
+Merge cost as a fraction of linear build:
+
+| Key type | Merge / Linear | Merge (µs) |
+|---|---|---|
+| Generic, disjoint | 19% | 2,779 |
+| Generic, 20% overlap | 34% | ~4,924 |
+| Prefixed, disjoint | ~20% | ~2,885 |
+
+Merge overhead is small enough that parallelising the build phase pays for itself with ≥2 threads.
 
 The RadixTree is the right choice for ByteCask's key directory: it provides O(1) snapshotting with structural sharing, competitive lookup speed, and prefix compression that pays off for the production key patterns (prefixed UUIDs). The iteration cost is acceptable because full scans are rare in the ByteCask access pattern (point lookups and range-bounded iteration are the primary operations).
