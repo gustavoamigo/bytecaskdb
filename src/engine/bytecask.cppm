@@ -1,7 +1,6 @@
 module;
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -13,7 +12,6 @@ module;
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <queue>
 #include <ranges>
 #include <span>
 #include <string>
@@ -26,7 +24,8 @@ module;
 
 export module bytecask.engine;
 
-import bytecask.crc32;
+import bytecask.concurrency;
+import bytecask.util;
 import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.hint_file;
@@ -34,6 +33,8 @@ import bytecask.radix_tree;
 import bytecask.types;
 
 namespace bytecask {
+
+#pragma region Exported types
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -118,6 +119,10 @@ export struct VacuumOptions {
   // Minimum fragmentation ratio (1 − live_bytes / total_bytes) a sealed file
   // must exceed to be eligible for vacuum. Range [0.0, 1.0].
   double fragmentation_threshold{0.5};
+  // Maximum live bytes a sealed file may contain to be absorbed into the
+  // active file instead of being compacted into a new sealed file.
+  // Files above this threshold are always compacted. Default: 1 MiB.
+  std::uint64_t absorb_threshold{1ULL * 1024 * 1024};
 };
 
 // ---------------------------------------------------------------------------
@@ -174,6 +179,11 @@ private:
 export using FileRegistry =
     std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>>;
 
+    
+
+#pragma endregion Exported types
+
+#pragma region Internal helpers
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -207,7 +217,9 @@ auto now_ns() -> std::int64_t {
 }
 
 } // namespace
+#pragma endregion
 
+#pragma region EngineState
 // ---------------------------------------------------------------------------
 // EngineState — immutable snapshot of all mutable engine state.
 //
@@ -269,7 +281,9 @@ struct EngineState {
     return s;
   }
 };
+#pragma endregion
 
+#pragma region Iterators
 // ---------------------------------------------------------------------------
 // KeyIterator — walks the key directory in ascending key order.
 //
@@ -374,153 +388,9 @@ private:
   mutable Bytes io_buf_;
   mutable bool has_cached_{false};
 };
+#pragma endregion
 
-// ---------------------------------------------------------------------------
-// SyncGroup — amortises fdatasync across concurrent writers.
-//
-// fdatasync is expensive (~2 ms). When N writers finish their writev at
-// roughly the same time, one fdatasync can cover all of them. SyncGroup
-// batches those writers so only one actually issues the syscall fdatasync 
-// while the rest wait and piggyback on its result.
-//
-// Precondition: callers must have completed their writev before entering
-// sync(). fdatasync only flushes data already in the page cache.
-//
-// Invariant: sync() does not return to a caller until an fdatasync that
-// started *after* that caller's writev has completed successfully.
-// ---------------------------------------------------------------------------
-class SyncGroup {
-public:
-  void sync(DataFile &file) {
-    std::unique_lock lk{mu_};
-
-    // Phase 1: take a ticket — our writev is done, data is in page cache.
-    const auto my_ticket = next_ticket_++;
-
-    // Phase 2: wait until covered by a completed sync, or become leader.
-    cv_.wait(lk, [&] {
-      return current_synced_ticket_ >= my_ticket || !syncing_;
-    });
-
-    // A sync that started after our writev already covered us.
-    if (current_synced_ticket_ >= my_ticket) return;
-
-    // Phase 3: we are the leader — snapshot the watermark, sync, notify.
-    syncing_ = true;
-    const auto batch_end = next_ticket_ - 1;
-    lk.unlock();
-
-    try {
-      file.sync();
-    } catch (...) {
-      // If sync fails, reset the syncing flag and wake up waiters so they can 
-      // retry (or handle their own failure). Do not advance the synced ticket.
-      lk.lock();
-      syncing_ = false;
-      lk.unlock();
-      cv_.notify_all();
-      throw; // Rethrow the exception to the caller
-    }
-
-    lk.lock();
-    current_synced_ticket_ = batch_end;
-    syncing_ = false;
-    lk.unlock();
-    cv_.notify_all();
-  }
-
-private:
-  std::mutex mu_;
-  std::condition_variable cv_;
-  std::uint64_t next_ticket_{1};            // next ticket to hand out
-  std::uint64_t current_synced_ticket_{0};  // highest ticket on disk
-  bool syncing_{false};                     // is an fdatasync in flight?
-};
-
-// ---------------------------------------------------------------------------
-// BackgroundWorker — single persistent background thread for deferred work.
-//
-// Tasks are enqueued via dispatch() and executed in FIFO order. dispatch() is
-// non-blocking; the caller returns immediately after enqueuing. Exceptions
-// thrown by tasks are caught, logged to stderr, and swallowed — hint file
-// writes are correctness-safe to drop (recovery falls back to raw data scan).
-//
-// Lifecycle: the thread starts at construction and joins at destruction.
-// drain() blocks until the queue is empty and the last task has finished.
-//
-// Declare BackgroundWorker as the LAST member of any owning class so that
-// it destructs first, ensuring the background thread joins before any other
-// member (e.g. dir_, state_) is destroyed.
-// ---------------------------------------------------------------------------
-class BackgroundWorker {
-public:
-  BackgroundWorker() : thread_{[this] { run(); }} {}
-
-  ~BackgroundWorker() {
-    {
-      std::unique_lock lk{mu_};
-      stop_ = true;
-    }
-    cv_task_.notify_one();
-    thread_.join();
-  }
-
-  BackgroundWorker(const BackgroundWorker &) = delete;
-  BackgroundWorker &operator=(const BackgroundWorker &) = delete;
-
-  // Enqueue a task. Non-blocking; returns immediately.
-  void dispatch(std::function<void()> task) {
-    {
-      std::unique_lock lk{mu_};
-      queue_.push(std::move(task));
-    }
-    cv_task_.notify_one();
-  }
-
-  // Block until the queue is empty and the running task (if any) has finished.
-  void drain() {
-    std::unique_lock lk{mu_};
-    cv_idle_.wait(lk, [this] { return queue_.empty() && active_ == 0; });
-  }
-
-private:
-  void run() {
-    while (true) {
-      std::function<void()> task;
-      {
-        std::unique_lock lk{mu_};
-        cv_task_.wait(lk, [this] { return stop_ || !queue_.empty(); });
-        if (stop_ && queue_.empty())
-          return;
-        task = std::move(queue_.front());
-        queue_.pop();
-        ++active_;
-      }
-      try {
-        task();
-      } catch (const std::exception &e) {
-        std::cerr << "bytecask: background worker exception: " << e.what()
-                  << "\n";
-      } catch (...) {
-        std::cerr << "bytecask: background worker: unknown exception\n";
-      }
-      {
-        std::unique_lock lk{mu_};
-        --active_;
-      }
-      cv_idle_.notify_all();
-    }
-  }
-
-  std::mutex mu_;
-  std::condition_variable cv_task_;
-  std::condition_variable cv_idle_;
-  std::queue<std::function<void()>> queue_;
-  std::size_t active_{0};
-  bool stop_{false};
-  std::thread thread_;
-};
-
+#pragma region Options
 // Default active-file size threshold: 64 MiB.
 export inline constexpr std::uint64_t kDefaultRotationThreshold =
     64ULL * 1024 * 1024;
@@ -564,15 +434,24 @@ export struct ReadOptions {
   std::chrono::milliseconds staleness_tolerance{0};
 };
 
+// Options passed to Bytecask::open().
+export struct Options {
+  // Active-file rotation threshold in bytes (default 64 MiB). When the active
+  // file reaches this size it is sealed and a new one is opened.
+  std::uint64_t max_file_bytes{kDefaultRotationThreshold};
+  // Number of threads used to rebuild the key directory at open time.
+  // 1 selects the serial path; >1 uses file-level fan-in parallelism.
+  unsigned recovery_threads{4};
+};
+
 // ---------------------------------------------------------------------------
 // Bytecask — SWMR key-value store
 //
 // Intent: Public engine API. open() always creates a fresh active data file.
 // Rotation: when the active file exceeds max_file_bytes, it is sealed and a
 // new active file is created. Sealed files remain open for reads.
-// Hint files are written deferred, at engine close or via flush_hints(), to
-// keep write-path latency flat and bounded (predictable latency over peak
-// throughput).
+// Hint files are written deferred at engine close to keep write-path latency
+// flat and bounded (predictable latency over peak throughput).
 //
 // Thread safety: write operations (put, del, apply_batch) are serialised by
 // write_mu_ (plain mutex). After producing a new EngineState via pure
@@ -580,17 +459,17 @@ export struct ReadOptions {
 // Readers call state_.load() without acquiring write_mu_.
 // State is published via std::atomic<std::shared_ptr<EngineState>>.
 // ---------------------------------------------------------------------------
+#pragma endregion
+
 export class Bytecask {
 public:
+  #pragma region Lifecycle
   // Opens or creates a database rooted at dir.
-  // Always creates a new active data file (BC-019 adds recovery).
-  // max_file_bytes controls the rotation threshold (default 64 MiB).
+  // Always creates a new active data file.
   // Throws std::system_error if the directory cannot be prepared.
   [[nodiscard]] static auto
-  open(std::filesystem::path dir,
-       std::uint64_t max_file_bytes = kDefaultRotationThreshold,
-       unsigned recovery_threads = 1) -> Bytecask {
-    return Bytecask{std::move(dir), max_file_bytes, recovery_threads};
+  open(std::filesystem::path dir, Options opts = {}) -> Bytecask {
+    return Bytecask{std::move(dir), std::move(opts)};
   }
 
   Bytecask(const Bytecask &) = delete;
@@ -622,24 +501,16 @@ public:
     }
   }
 
-  // ── Primary operations ─────────────────────────────────────────────────
+  #pragma endregion
 
-  // Returns the value for key, or std::nullopt if the key does not exist.
+  #pragma region Primary operations
+
+  // Writes the value for key into out, reusing its existing capacity to
+  // amortize allocation across calls. Returns true if the key was found,
+  // false otherwise.
   // Routes the read to the correct data file via KeyDirEntry::file_id.
   // Throws std::system_error on I/O failure or std::runtime_error on CRC
   // mismatch.
-  [[nodiscard]] auto get(const ReadOptions &opts, BytesView key) const
-      -> std::optional<Bytes> {
-    Bytes out;
-    if (!get(opts, key, out)) {
-      return std::nullopt;
-    }
-    return out;
-  }
-
-  // Output-parameter variant: writes the value into out, reusing its existing
-  // capacity to amortize allocation across calls. Returns true if the key was
-  // found, false otherwise.
   [[nodiscard]] auto get(const ReadOptions &opts, BytesView key,
                          Bytes &out) const -> bool {
     auto s = load_state(opts);
@@ -675,12 +546,12 @@ public:
       if (opts.sync) {
         file_to_sync = s.files->at(s.active_file_id);
       }
-      s = maybe_rotate(std::move(s));
+      s = rotate_if_needed(std::move(s));
       state_.store(std::make_shared<EngineState>(std::move(s)));
       state_time_.store(now_ns(), std::memory_order_release);
     }
     if (file_to_sync) {
-      sync_group_.sync(*file_to_sync);
+      sync_group_.sync([&]{ file_to_sync->sync(); });
     }
   }
 
@@ -709,12 +580,12 @@ public:
       if (opts.sync) {
         file_to_sync = s.files->at(s.active_file_id);
       }
-      s = maybe_rotate(std::move(s));
+      s = rotate_if_needed(std::move(s));
       state_.store(std::make_shared<EngineState>(std::move(s)));
       state_time_.store(now_ns(), std::memory_order_release);
     }
     if (file_to_sync) {
-      sync_group_.sync(*file_to_sync);
+      sync_group_.sync([&]{ file_to_sync->sync(); });
     }
     return true;
   }
@@ -733,7 +604,6 @@ public:
     return file_stats_;
   }
 
-  // ── Batch ──────────────────────────────────────────────────────────────
 
   // Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
   // batch is consumed (move-only). No-op if batch.empty().
@@ -797,15 +667,18 @@ public:
       if (opts.sync) {
         file_to_sync = s.files->at(s.active_file_id);
       }
-      s = maybe_rotate(std::move(s));
+      s = rotate_if_needed(std::move(s));
       state_.store(std::make_shared<EngineState>(std::move(s)));
       state_time_.store(now_ns(), std::memory_order_release);
     }
     if (file_to_sync) {
-      sync_group_.sync(*file_to_sync);
+      sync_group_.sync([&]{ file_to_sync->sync(); });
     }
   }
 
+  #pragma endregion
+
+  #pragma region Range iteration
   // ── Range iteration ────────────────────────────────────────────────────
 
   // Returns an input range of (key, value) pairs with keys >= from.
@@ -832,30 +705,30 @@ public:
     return std::ranges::subrange<KeyIterator, std::default_sentinel_t>{
         KeyIterator{std::move(it)}, std::default_sentinel};
   }
+  #pragma endregion
 
-  // ── Hint file management ───────────────────────────────────────────────
-
-  // Writes a hint file for every sealed data file that does not yet have one.
-  // Uses a temp-then-rename protocol for atomicity: writes to ".hint.tmp",
-  // fdatasyncs, then renames to ".hint". Idempotent: files with an existing
-  // ".hint" are skipped. Called automatically at engine close (~Bytecask).
-  //
-  // Hint files are never written on the write path (predictable latency).
-  // Drains all background hint tasks first, then writes any remaining files
-  // synchronously. Draining before the synchronous loop avoids racing with
-  // in-flight background tasks on the same .hint.tmp file.
-  void flush_hints() {
-    worker_.drain();
-    flush_hints(*state_.load());
-  }
-
-  // ── Vacuum ─────────────────────────────────────────────────────────────
+  #pragma region Vacuum
 
   // Selects the highest-fragmentation sealed file above the threshold
   // and either absorbs it into the active file (if it fits) or compacts
-  // it into a new sealed file. No-op if no file qualifies.
-  // Thread-safe: serialised by vacuum_mu_ (independent from write_mu_).
-  void vacuum(VacuumOptions opts = {}) {
+  // it into a new sealed file.
+  // Returns true if a file was vacuumed, false if no file qualified.
+  //
+  // Thread-safe: vacuum_mu_ serialises concurrent vacuum() calls independently
+  // from write_mu_, so normal put/del/apply_batch calls are not blocked while
+  // vacuum scans and rewrites data — only the brief commit step acquires
+  // write_mu_. vacuum() is safe to call from a dedicated background thread
+  // without any external synchronization.
+  //
+  // Typical background thread pattern:
+  //
+  //   while (!stop_requested) {
+  //     sleep(1h);
+  //     while (db.vacuum()) {
+  //       sleep(2s);   // more files may still qualify; keep draining
+  //     }
+  //   }
+  [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool {
     std::lock_guard vg{*vacuum_mu_};
 
     // Drain in-flight background hint writes so that vacuum's
@@ -893,18 +766,24 @@ public:
       }
     }
 
-    if (target_id == 0 && worst_frag == 0.0) return;
+    if (target_id == 0 && worst_frag == 0.0) return false;
 
-    // Branch: absorb if live data fits in active file, else compact.
+    // Absorb only if the file is small (below absorb_threshold) and its live
+    // data fits in the active file without triggering rotation. Files above
+    // absorb_threshold are always compacted into a new sealed file.
     const auto target_live = stats_snap.at(target_id).live_bytes;
-    if (target_live + active_size <= rotation_threshold_) {
+    if (target_live <= opts.absorb_threshold &&
+        target_live + active_size <= rotation_threshold_) {
       vacuum_absorb_file(target_id);
     } else {
       vacuum_compact_file(target_id);
     }
+    return true;
   }
+  #pragma endregion
 
 private:
+  #pragma region Hint internals
   // Writes the hint file for a single data file using the temp-then-rename
   // protocol. Batch-aware: entries between BulkBegin and BulkEnd are buffered
   // and written only when BulkEnd is seen; an incomplete batch (crash
@@ -982,7 +861,23 @@ private:
     }
   }
 
-  // ── Vacuum primitives ──────────────────────────────────────────────────
+  // Drains background hint tasks then writes hint files for all sealed files.
+  void flush_hints() {
+    worker_.drain();
+    flush_hints(*state_.load());
+  }
+
+  #pragma endregion
+
+  #pragma region Vacuum internals
+
+  // Data file removed from the registry by vacuum but potentially still
+  // referenced by in-flight readers. Purged when use_count drops to 1.
+  //  Protected by vacuum_mu_.
+  struct StaleFile {
+    std::shared_ptr<DataFile> data_file;
+    std::filesystem::path hint_path;
+  };
 
   // Mapping produced during the I/O phase for each live Put that was copied
   // to the new/active file. The commit phase uses these to remap key_dir.
@@ -1214,6 +1109,9 @@ private:
     vacuum_defer_old_file(snap, file_id);
   }
 
+  #pragma endregion
+
+  #pragma region FileStats helpers
   // ── FileStats helpers (called under write_mu_) ─────────────────────────
 
   // Marks an existing entry as dead in its file's stats.
@@ -1242,20 +1140,21 @@ private:
     file_stats_[active_file_id].total_bytes += kHeaderSize + kCrcSize;
   }
 
-  // ── Construction ───────────────────────────────────────────────────────
+  #pragma endregion
 
-  explicit Bytecask(std::filesystem::path dir, std::uint64_t max_file_bytes,
-                    unsigned recovery_threads)
-      : dir_{std::move(dir)}, rotation_threshold_{max_file_bytes},
+  #pragma region Construction
+
+  explicit Bytecask(std::filesystem::path dir, Options opts)
+      : dir_{std::move(dir)}, rotation_threshold_{opts.max_file_bytes},
         state_{std::make_shared<EngineState>()} {
     std::filesystem::create_directories(dir_);
     EngineState s;
     s.files =
         std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>();
-    if (recovery_threads <= 1) {
-      s = recover_existing_files(std::move(s));
+    if (opts.recovery_threads <= 1) {
+      s = recovery_load_serial(std::move(s));
     } else {
-      s = parallel_recover_existing_files(std::move(s), recovery_threads);
+      s = recovery_load_parallel(std::move(s), opts.recovery_threads);
     }
     s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
@@ -1266,6 +1165,10 @@ private:
     state_.store(std::make_shared<EngineState>(std::move(s)));
     state_time_.store(now_ns(), std::memory_order_release);
   }
+
+  #pragma endregion
+
+  #pragma region State access
 
   // Returns the engine state from a thread-local cache.
   // The hot path is a single relaxed load of state_time_ (plain MOV on x86).
@@ -1308,6 +1211,9 @@ private:
     return std::unique_lock<std::mutex>{*write_mu_};
   }
 
+  #pragma endregion
+
+  #pragma region Recovery
   // Intermediate result produced by each recovery worker and consumed
   // by the fan-in merge.
   struct RecoveryResult {
@@ -1327,7 +1233,7 @@ private:
   // Phase 1 shared by serial and parallel recovery: remove stale .hint.tmp
   // files, open all data files, seal them, register in s.files, and
   // generate missing hint files. Returns the RecoveredFile list.
-  auto open_and_prepare_files(EngineState &s) -> std::vector<RecoveredFile> {
+  auto recovery_prepare_files(EngineState &s) -> std::vector<RecoveredFile> {
     // Remove stale .hint.tmp and .data.tmp files from a prior crash.
     for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
       const auto &p = dir_entry.path();
@@ -1365,7 +1271,7 @@ private:
 
   // Builds a RecoveryResult from a subset of hint files.
   // Each worker calls this independently — no shared mutable state.
-  static auto build_from_hints(std::span<RecoveredFile> files)
+  static auto recovery_build_from_hints(std::span<RecoveredFile> files)
       -> RecoveryResult {
     std::uint64_t max_lsn = 0;
     auto t = PersistentRadixTree<KeyDirEntry>{}.transient();
@@ -1428,7 +1334,7 @@ private:
   // suppress stale PUTs. Tombstone maps and file_stats are unioned.
   // live_bytes are recomputed from the merged tree after all conflict
   // resolution (the merge resolver doesn't have access to key sizes).
-  static auto merge_results(RecoveryResult a, RecoveryResult b)
+  static auto recovery_merge_results(RecoveryResult a, RecoveryResult b)
       -> RecoveryResult {
     // Union file_stats (file IDs are disjoint across workers).
     // Preserve total_bytes from both sides; live_bytes will be recomputed.
@@ -1490,8 +1396,8 @@ private:
   // then recovers exclusively from hints — single code path.
   // Returns a new EngineState with key_dir populated and next_lsn set to
   // max_seen + 1. next_file_id is advanced for each recovered file.
-  auto recover_existing_files(EngineState s) -> EngineState {
-    auto files = open_and_prepare_files(s);
+  auto recovery_load_serial(EngineState s) -> EngineState {
+    auto files = recovery_prepare_files(s);
 
     // Seed total_bytes for each file from the filesystem.
     for (const auto &rf : files) {
@@ -1553,9 +1459,9 @@ private:
   // Parallel recovery (v1): file-level partitioning with fan-in merge.
   // Round-robin assigns files to W workers, each builds a RecoveryResult,
   // then pairwise merges reduce to a single result in ⌈log₂(W)⌉ rounds.
-  auto parallel_recover_existing_files(EngineState s, unsigned recovery_threads)
+  auto recovery_load_parallel(EngineState s, unsigned recovery_threads)
       -> EngineState {
-    auto files = open_and_prepare_files(s);
+    auto files = recovery_prepare_files(s);
 
     if (files.empty()) {
       return s;
@@ -1577,7 +1483,7 @@ private:
       threads.reserve(W);
       for (unsigned i = 0; i < W; ++i) {
         threads.emplace_back([&results, &worker_files, i] {
-          results[i] = build_from_hints(worker_files[i]);
+          results[i] = recovery_build_from_hints(worker_files[i]);
         });
       }
     }
@@ -1593,7 +1499,7 @@ private:
         threads.reserve(pairs);
         for (std::size_t i = 0; i < pairs; ++i) {
           threads.emplace_back([&results, &next, i] {
-            next[i] = merge_results(std::move(results[i * 2]),
+            next[i] = recovery_merge_results(std::move(results[i * 2]),
                                     std::move(results[i * 2 + 1]));
           });
         }
@@ -1613,7 +1519,9 @@ private:
     file_stats_ = std::move(results[0].file_stats);
     return s;
   }
+  #pragma endregion
 
+  #pragma region File rotation
   // Seals the active file, opens a new one, and dispatches hint file writing
   // for the now-sealed file to the background worker. Returns a new EngineState.
   // fdatasync on the sealed file remains synchronous for durability correctness.
@@ -1632,13 +1540,15 @@ private:
     return s;
   }
 
-  [[nodiscard]] auto maybe_rotate(EngineState s) -> EngineState {
+  [[nodiscard]] auto rotate_if_needed(EngineState s) -> EngineState {
     if (s.active_file().size() >= rotation_threshold_) {
       return rotate_active_file(std::move(s));
     }
     return s;
   }
+  #pragma endregion
 
+  #pragma region Member variables
   std::filesystem::path dir_;
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
   // All mutable state — SWMR. Writers publish via state_.store()
@@ -1656,13 +1566,8 @@ private:
   // Serialises vacuum() calls. Separate from write_mu_ so vacuum I/O does
   // not block normal writes. Only the commit phase briefly acquires write_mu_.
   std::unique_ptr<std::mutex> vacuum_mu_{std::make_unique<std::mutex>()};
-  // Files removed from the registry by vacuum but potentially still referenced
-  // by in-flight readers. Purged when use_count drops to 1 (only this list).
+  // See StaleFile in #pragma region Vacuum internals.
   // Protected by vacuum_mu_.
-  struct StaleFile {
-    std::shared_ptr<DataFile> data_file;
-    std::filesystem::path hint_path;
-  };
   std::vector<StaleFile> stale_files_;
   // Per-file live/total byte counters for vacuum fragmentation tracking.
   // Updated under write_mu_ on every write; rebuilt during recovery.
@@ -1671,6 +1576,6 @@ private:
   // Declared last so it destructs first, joining the background thread before
   // any other member (dir_, state_, files) is destroyed.
   mutable BackgroundWorker worker_;
+  #pragma endregion
 };
-
 } // namespace bytecask

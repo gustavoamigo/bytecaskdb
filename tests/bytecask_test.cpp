@@ -39,6 +39,15 @@ auto to_string(const bytecask::Key &key) -> std::string {
   return s;
 }
 
+// Convenience wrapper: reads key into a temporary buffer and returns it as
+// optional. Used by tests that don't need to reuse the output buffer.
+auto get_val(const bytecask::Bytecask &db, bytecask::BytesView key)
+    -> std::optional<bytecask::Bytes> {
+  bytecask::Bytes out;
+  if (!db.get({}, key, out)) return std::nullopt;
+  return out;
+}
+
 // Creates a unique temp directory for each test, cleaned up on scope exit.
 struct TempDir {
   std::filesystem::path path;
@@ -75,7 +84,7 @@ TEST_CASE("Bytecask put and get round-trip", "[bytecask]") {
 
   db.put({}, to_bytes("key1"), to_bytes("value1"));
 
-  const auto result = db.get({}, to_bytes("key1"));
+  const auto result = get_val(db, to_bytes("key1"));
   REQUIRE(result.has_value());
   CHECK(to_string(*result) == "value1");
 }
@@ -114,7 +123,7 @@ TEST_CASE("Bytecask put overwrites existing key", "[bytecask]") {
   db.put({}, to_bytes("key1"), to_bytes("first"));
   db.put({}, to_bytes("key1"), to_bytes("second"));
 
-  const auto result = db.get({}, to_bytes("key1"));
+  const auto result = get_val(db, to_bytes("key1"));
   REQUIRE(result.has_value());
   CHECK(to_string(*result) == "second");
 }
@@ -140,7 +149,7 @@ TEST_CASE("Bytecask del existing key", "[bytecask]") {
   const bool removed = db.del({}, to_bytes("key1"));
 
   CHECK(removed);
-  CHECK_FALSE(db.get({}, to_bytes("key1")).has_value());
+  CHECK_FALSE(get_val(db, to_bytes("key1")).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -173,11 +182,11 @@ TEST_CASE("Bytecask apply_batch mixed operations", "[bytecask]") {
   batch.del(to_bytes("del"));
   db.apply_batch({}, std::move(batch));
 
-  REQUIRE(db.get({}, to_bytes("a")).has_value());
-  CHECK(to_string(*db.get({}, to_bytes("a"))) == "alpha");
-  REQUIRE(db.get({}, to_bytes("b")).has_value());
-  CHECK(to_string(*db.get({}, to_bytes("b"))) == "beta");
-  CHECK_FALSE(db.get({}, to_bytes("del")).has_value());
+  REQUIRE(get_val(db, to_bytes("a")).has_value());
+  CHECK(to_string(*get_val(db, to_bytes("a"))) == "alpha");
+  REQUIRE(get_val(db, to_bytes("b")).has_value());
+  CHECK(to_string(*get_val(db, to_bytes("b"))) == "beta");
+  CHECK_FALSE(get_val(db, to_bytes("del")).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +270,7 @@ TEST_CASE("Bytecask rotation creates new data file", "[bytecask][rotation]") {
   TempDir td;
   const auto db_path = td.path / "db";
   // A threshold of 1 means any write will trigger rotation.
-  auto db = bytecask::Bytecask::open(db_path, 1);
+  auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
 
   db.put({}, to_bytes("key"), to_bytes("value"));
 
@@ -282,17 +291,17 @@ TEST_CASE("Bytecask get resolves value from rotated file",
           "[bytecask][rotation]") {
   TempDir td;
   // Threshold of 1 triggers rotation after each write.
-  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
 
   db.put({}, to_bytes("key_a"), to_bytes("alpha"));
   // After put, active file is now rotated. key_a lives in the sealed file.
   db.put({}, to_bytes("key_b"), to_bytes("beta"));
 
-  const auto a = db.get({}, to_bytes("key_a"));
+  const auto a = get_val(db, to_bytes("key_a"));
   REQUIRE(a.has_value());
   CHECK(to_string(*a) == "alpha");
 
-  const auto b = db.get({}, to_bytes("key_b"));
+  const auto b = get_val(db, to_bytes("key_b"));
   REQUIRE(b.has_value());
   CHECK(to_string(*b) == "beta");
 }
@@ -303,7 +312,7 @@ TEST_CASE("Bytecask get resolves value from rotated file",
 TEST_CASE("Bytecask iter_from spans multiple rotated files",
           "[bytecask][rotation]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
 
   db.put({}, to_bytes("a"), to_bytes("av"));
   db.put({}, to_bytes("b"), to_bytes("bv"));
@@ -326,18 +335,17 @@ TEST_CASE("Bytecask iter_from spans multiple rotated files",
 }
 
 // ---------------------------------------------------------------------------
-// Test 14: flush_hints writes a .hint file for each sealed data file
+// Test 14: close (destructor) writes hint files for sealed data files
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask flush_hints writes hint file for sealed file",
+TEST_CASE("Bytecask close writes hint file for sealed file",
           "[bytecask][rotation]") {
   TempDir td;
   const auto db_path = td.path / "db";
-  auto db = bytecask::Bytecask::open(db_path, 1);
-
-  db.put({}, to_bytes("k"), to_bytes("v"));
-  // At this point one file is sealed; a new active file exists too.
-
-  db.flush_hints();
+  {
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+    db.put({}, to_bytes("k"), to_bytes("v"));
+    // db destroyed here — background worker drains, hints written
+  }
 
   int hint_count = 0;
   int tmp_count = 0;
@@ -354,43 +362,15 @@ TEST_CASE("Bytecask flush_hints writes hint file for sealed file",
 }
 
 // ---------------------------------------------------------------------------
-// Test 15: flush_hints is idempotent — calling it twice does not error
 // ---------------------------------------------------------------------------
-TEST_CASE("Bytecask flush_hints is idempotent", "[bytecask][rotation]") {
-  TempDir td;
-  const auto db_path = td.path / "db";
-  auto db = bytecask::Bytecask::open(db_path, 1);
-
-  db.put({}, to_bytes("k"), to_bytes("v"));
-  db.flush_hints();
-
-  // Collect hint file count after first call.
-  int count_first = 0;
-  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
-    if (e.path().extension() == ".hint")
-      ++count_first;
-  }
-
-  REQUIRE_NOTHROW(db.flush_hints());
-
-  int count_second = 0;
-  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
-    if (e.path().extension() == ".hint")
-      ++count_second;
-  }
-
-  CHECK(count_first == count_second);
-}
-
-// ---------------------------------------------------------------------------
-// Test 16: ~Bytecask calls flush_hints — hint file exists after scope exit
+// Test 15: ~Bytecask calls flush_hints — hint file exists after scope exit
 // ---------------------------------------------------------------------------
 TEST_CASE("Bytecask destructor flushes hint files", "[bytecask][rotation]") {
   TempDir td;
   const auto db_path = td.path / "db";
 
   {
-    auto db = bytecask::Bytecask::open(db_path, 1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("k"), to_bytes("v"));
     // db destroyed here — destructor should call flush_hints()
   }
@@ -416,11 +396,11 @@ TEST_CASE("Bytecask WriteOptions sync=false data still readable",
   db.put(no_sync, to_bytes("k1"), to_bytes("v1"));
   db.put(no_sync, to_bytes("k2"), to_bytes("v2"));
 
-  const auto r1 = db.get({}, to_bytes("k1"));
+  const auto r1 = get_val(db, to_bytes("k1"));
   REQUIRE(r1.has_value());
   CHECK(to_string(*r1) == "v1");
 
-  const auto r2 = db.get({}, to_bytes("k2"));
+  const auto r2 = get_val(db, to_bytes("k2"));
   REQUIRE(r2.has_value());
   CHECK(to_string(*r2) == "v2");
 }
@@ -439,7 +419,7 @@ TEST_CASE("Bytecask WriteOptions sync=false del still removes key",
   const bool removed = db.del(no_sync, to_bytes("k"));
 
   CHECK(removed);
-  CHECK_FALSE(db.get({}, to_bytes("k")).has_value());
+  CHECK_FALSE(get_val(db, to_bytes("k")).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -456,10 +436,10 @@ TEST_CASE("Bytecask WriteOptions sync=false apply_batch results visible",
   batch.put(to_bytes("y"), to_bytes("yv"));
   db.apply_batch(no_sync, std::move(batch));
 
-  REQUIRE(db.get({}, to_bytes("x")).has_value());
-  CHECK(to_string(*db.get({}, to_bytes("x"))) == "xv");
-  REQUIRE(db.get({}, to_bytes("y")).has_value());
-  CHECK(to_string(*db.get({}, to_bytes("y"))) == "yv");
+  REQUIRE(get_val(db, to_bytes("x")).has_value());
+  CHECK(to_string(*get_val(db, to_bytes("x"))) == "xv");
+  REQUIRE(get_val(db, to_bytes("y")).has_value());
+  CHECK(to_string(*get_val(db, to_bytes("y"))) == "yv");
 }
 
 // ---------------------------------------------------------------------------
@@ -476,10 +456,10 @@ TEST_CASE("Bytecask recovery: puts survive restart", "[bytecask][recovery]") {
   } // destructor syncs; no rotation so no hint files written
 
   auto db2 = bytecask::Bytecask::open(db_path);
-  REQUIRE(db2.get({}, to_bytes("k1")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("k1"))) == "v1");
-  REQUIRE(db2.get({}, to_bytes("k2")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("k2"))) == "v2");
+  REQUIRE(get_val(db2, to_bytes("k1")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("k1"))) == "v1");
+  REQUIRE(get_val(db2, to_bytes("k2")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("k2"))) == "v2");
 }
 
 // ---------------------------------------------------------------------------
@@ -497,7 +477,7 @@ TEST_CASE("Bytecask recovery: tombstone survives restart",
   }
 
   auto db2 = bytecask::Bytecask::open(db_path);
-  CHECK_FALSE(db2.get({}, to_bytes("k")).has_value());
+  CHECK_FALSE(get_val(db2, to_bytes("k")).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -515,8 +495,8 @@ TEST_CASE("Bytecask recovery: last write wins after overwrite",
   }
 
   auto db2 = bytecask::Bytecask::open(db_path);
-  REQUIRE(db2.get({}, to_bytes("k")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("k"))) == "second");
+  REQUIRE(get_val(db2, to_bytes("k")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("k"))) == "second");
 }
 
 // ---------------------------------------------------------------------------
@@ -538,11 +518,11 @@ TEST_CASE("Bytecask recovery: batch survives restart", "[bytecask][recovery]") {
   }
 
   auto db2 = bytecask::Bytecask::open(db_path);
-  REQUIRE(db2.get({}, to_bytes("a")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("a"))) == "alpha");
-  REQUIRE(db2.get({}, to_bytes("b")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("b"))) == "beta");
-  CHECK_FALSE(db2.get({}, to_bytes("preexisting")).has_value());
+  REQUIRE(get_val(db2, to_bytes("a")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("a"))) == "alpha");
+  REQUIRE(get_val(db2, to_bytes("b")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("b"))) == "beta");
+  CHECK_FALSE(get_val(db2, to_bytes("preexisting")).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -557,7 +537,7 @@ TEST_CASE("Bytecask recovery: hint file path after rotation",
   // threshold=1 forces rotation after each write; destructor writes hint files
   // for the sealed files.
   {
-    auto db = bytecask::Bytecask::open(db_path, 1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("x"), to_bytes("xval"));
     db.put({}, to_bytes("y"), to_bytes("yval"));
   }
@@ -570,11 +550,11 @@ TEST_CASE("Bytecask recovery: hint file path after rotation",
   }
   REQUIRE(hint_count >= 1);
 
-  auto db2 = bytecask::Bytecask::open(db_path, 1);
-  REQUIRE(db2.get({}, to_bytes("x")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("x"))) == "xval");
-  REQUIRE(db2.get({}, to_bytes("y")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("y"))) == "yval");
+  auto db2 = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
+  REQUIRE(get_val(db2, to_bytes("x")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("x"))) == "xval");
+  REQUIRE(get_val(db2, to_bytes("y")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("y"))) == "yval");
 }
 
 // ---------------------------------------------------------------------------
@@ -593,17 +573,17 @@ TEST_CASE("Bytecask recovery: cross-file tombstone suppresses stale put",
 
   {
     // threshold=1 forces each write into its own file.
-    auto db = bytecask::Bytecask::open(db_path, 1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("gone"), to_bytes("v1")); // file 0
     db.del({}, to_bytes("gone")); // file 1 — Delete seq > Put seq
     db.put({}, to_bytes("keep"), to_bytes("v2")); // file 2
   }
 
-  auto db2 = bytecask::Bytecask::open(db_path, 1);
+  auto db2 = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
   CHECK_FALSE(db2.contains_key(to_bytes("gone")));
-  CHECK_FALSE(db2.get({}, to_bytes("gone")).has_value());
-  REQUIRE(db2.get({}, to_bytes("keep")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("keep"))) == "v2");
+  CHECK_FALSE(get_val(db2, to_bytes("gone")).has_value());
+  REQUIRE(get_val(db2, to_bytes("keep")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("keep"))) == "v2");
 }
 
 // ---------------------------------------------------------------------------
@@ -636,10 +616,10 @@ TEST_CASE("Bytecask recovery: incomplete batch is discarded",
 
   // Open engine — should generate hint file and recover only "good".
   auto db = bytecask::Bytecask::open(db_path);
-  REQUIRE(db.get({}, to_bytes("good")).has_value());
-  CHECK(to_string(*db.get({}, to_bytes("good"))) == "value1");
-  CHECK_FALSE(db.get({}, to_bytes("orphan_a")).has_value());
-  CHECK_FALSE(db.get({}, to_bytes("orphan_b")).has_value());
+  REQUIRE(get_val(db, to_bytes("good")).has_value());
+  CHECK(to_string(*get_val(db, to_bytes("good"))) == "value1");
+  CHECK_FALSE(get_val(db, to_bytes("orphan_a")).has_value());
+  CHECK_FALSE(get_val(db, to_bytes("orphan_b")).has_value());
 
   // Verify a hint file was generated.
   int hint_count = 0;
@@ -686,9 +666,9 @@ TEST_CASE("Bytecask recovery: order-independent tombstone",
     }
 
     auto db = bytecask::Bytecask::open(db_path);
-    CHECK_FALSE(db.get({}, to_bytes("gone")).has_value());
-    REQUIRE(db.get({}, to_bytes("alive")).has_value());
-    CHECK(to_string(*db.get({}, to_bytes("alive"))) == "v2");
+    CHECK_FALSE(get_val(db, to_bytes("gone")).has_value());
+    REQUIRE(get_val(db, to_bytes("alive")).has_value());
+    CHECK(to_string(*get_val(db, to_bytes("alive"))) == "v2");
   };
 
   SECTION("delete file sorts before put file") {
@@ -710,22 +690,22 @@ TEST_CASE("Bytecask parallel recovery: puts survive restart",
   // threshold=1 forces each write into its own file, giving multiple files
   // for parallel workers to split across.
   {
-    auto db = bytecask::Bytecask::open(db_path, 1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("a"), to_bytes("1"));
     db.put({}, to_bytes("b"), to_bytes("2"));
     db.put({}, to_bytes("c"), to_bytes("3"));
     db.put({}, to_bytes("d"), to_bytes("4"));
   }
 
-  auto db2 = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/4);
-  REQUIRE(db2.get({}, to_bytes("a")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("a"))) == "1");
-  REQUIRE(db2.get({}, to_bytes("b")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("b"))) == "2");
-  REQUIRE(db2.get({}, to_bytes("c")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("c"))) == "3");
-  REQUIRE(db2.get({}, to_bytes("d")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("d"))) == "4");
+  auto db2 = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
+  REQUIRE(get_val(db2, to_bytes("a")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("a"))) == "1");
+  REQUIRE(get_val(db2, to_bytes("b")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("b"))) == "2");
+  REQUIRE(get_val(db2, to_bytes("c")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("c"))) == "3");
+  REQUIRE(get_val(db2, to_bytes("d")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("d"))) == "4");
 }
 
 // ---------------------------------------------------------------------------
@@ -737,7 +717,7 @@ TEST_CASE("Bytecask parallel recovery: cross-worker tombstone",
   const auto db_path = td.path / "db";
 
   {
-    auto db = bytecask::Bytecask::open(db_path, 1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("gone"), to_bytes("v1"));   // file 0
     std::ignore = db.del({}, to_bytes("gone"));      // file 1
     db.put({}, to_bytes("keep"), to_bytes("v2"));    // file 2
@@ -745,12 +725,12 @@ TEST_CASE("Bytecask parallel recovery: cross-worker tombstone",
   }
 
   // 4 files, 4 workers — PUT and DELETE for "gone" land in different workers.
-  auto db2 = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/4);
-  CHECK_FALSE(db2.get({}, to_bytes("gone")).has_value());
-  REQUIRE(db2.get({}, to_bytes("keep")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("keep"))) == "v2");
-  REQUIRE(db2.get({}, to_bytes("also")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("also"))) == "v3");
+  auto db2 = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
+  CHECK_FALSE(get_val(db2, to_bytes("gone")).has_value());
+  REQUIRE(get_val(db2, to_bytes("keep")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("keep"))) == "v2");
+  REQUIRE(get_val(db2, to_bytes("also")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("also"))) == "v3");
 }
 
 // ---------------------------------------------------------------------------
@@ -762,14 +742,14 @@ TEST_CASE("Bytecask parallel recovery: last write wins",
   const auto db_path = td.path / "db";
 
   {
-    auto db = bytecask::Bytecask::open(db_path, 1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("k"), to_bytes("old"));
     db.put({}, to_bytes("k"), to_bytes("new"));
   }
 
-  auto db2 = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/2);
-  REQUIRE(db2.get({}, to_bytes("k")).has_value());
-  CHECK(to_string(*db2.get({}, to_bytes("k"))) == "new");
+  auto db2 = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 2});
+  REQUIRE(get_val(db2, to_bytes("k")).has_value());
+  CHECK(to_string(*get_val(db2, to_bytes("k"))) == "new");
 }
 
 // ---------------------------------------------------------------------------
@@ -787,7 +767,7 @@ TEST_CASE("Bytecask parallel recovery: matches serial result",
 
   // Build a database with many files, overwrites, and deletes.
   {
-    auto db = bytecask::Bytecask::open(db_path, 1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
     for (int i = 0; i < 50; ++i) {
       auto key = std::format("key_{:03d}", i);
       auto val = std::format("val_{:03d}_v1", i);
@@ -807,7 +787,7 @@ TEST_CASE("Bytecask parallel recovery: matches serial result",
   }
 
   // Recover serially.
-  auto serial = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/1);
+  auto serial = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
 
   // Collect serial results.
   std::map<std::string, std::string> serial_kv;
@@ -816,7 +796,7 @@ TEST_CASE("Bytecask parallel recovery: matches serial result",
   }
 
   // Recover in parallel.
-  auto parallel = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/4);
+  auto parallel = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
 
   // Collect parallel results.
   std::map<std::string, std::string> parallel_kv;
@@ -885,7 +865,7 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
 
   {
     // threshold=1 forces rotation after every write.
-    auto db = bytecask::Bytecask::open(db_path, /*max_file_bytes=*/1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
 
     constexpr int kOps = 2000;
     for (int i = 0; i < kOps; ++i) {
@@ -956,19 +936,19 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
   REQUIRE(data_file_count > 1);
 
   SECTION("serial recovery") {
-    auto db = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
   }
 
   SECTION("parallel recovery (2 workers)") {
-    auto db = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/2);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 2});
     verify("parallel/2", collect(db));
   }
 
   SECTION("parallel recovery (W = file count)") {
     auto db = bytecask::Bytecask::open(
-        db_path, 1,
-        /*recovery_threads=*/static_cast<unsigned>(data_file_count));
+        db_path, {.max_file_bytes = 1,
+                  .recovery_threads = static_cast<unsigned>(data_file_count)});
     verify("parallel/max", collect(db));
   }
 }
@@ -1005,7 +985,7 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
   std::map<std::string, std::string> oracle;
 
   {
-    auto db = bytecask::Bytecask::open(db_path, /*max_file_bytes=*/1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
 
     for (int i = 0; i < 1000; ++i) {
       const auto op = std::uniform_int_distribution<int>(0, 9)(gen);
@@ -1064,12 +1044,12 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
   };
 
   SECTION("serial") {
-    auto db = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
   }
 
   SECTION("parallel (4 workers)") {
-    auto db = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/4);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
     verify("parallel/4", collect(db));
   }
 }
@@ -1090,7 +1070,7 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
   std::map<std::string, std::string> oracle;
 
   {
-    auto db = bytecask::Bytecask::open(db_path, /*max_file_bytes=*/1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
 
     // Write 500 keys.
     for (int i = 0; i < 500; ++i) {
@@ -1143,19 +1123,19 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
   }
 
   SECTION("serial") {
-    auto db = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
   }
 
   SECTION("parallel (3 workers)") {
-    auto db = bytecask::Bytecask::open(db_path, 1, /*recovery_threads=*/3);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1, .recovery_threads = 3});
     verify("parallel/3", collect(db));
   }
 
   SECTION("parallel (W = file count)") {
     auto db = bytecask::Bytecask::open(
-        db_path, 1,
-        /*recovery_threads=*/static_cast<unsigned>(data_file_count));
+        db_path, {.max_file_bytes = 1,
+                  .recovery_threads = static_cast<unsigned>(data_file_count)});
     verify("parallel/max", collect(db));
   }
 }
@@ -1239,7 +1219,7 @@ TEST_CASE("Bytecask blocking writes are serialised",
     for (int i = 0; i < kWritesPerThread; ++i) {
       auto key = std::format("t{}_{:04d}", t, i);
       auto expected_val = std::format("v{}_{:04d}", t, i);
-      auto result = db.get({}, to_bytes(key));
+      auto result = get_val(db, to_bytes(key));
       REQUIRE(result.has_value());
       CHECK(to_string(*result) == expected_val);
     }
@@ -1260,13 +1240,13 @@ TEST_CASE("Bytecask try_lock works for del and apply_batch",
   // When no contention, try_lock succeeds normally.
   const bytecask::WriteOptions try_opts{.sync = false, .try_lock = true};
   CHECK(db.del(try_opts, to_bytes("k")));
-  CHECK_FALSE(db.get({}, to_bytes("k")).has_value());
+  CHECK_FALSE(get_val(db, to_bytes("k")).has_value());
 
   bytecask::Batch batch;
   batch.put(to_bytes("b1"), to_bytes("bv1"));
   REQUIRE_NOTHROW(db.apply_batch(try_opts, std::move(batch)));
-  REQUIRE(db.get({}, to_bytes("b1")).has_value());
-  CHECK(to_string(*db.get({}, to_bytes("b1"))) == "bv1");
+  REQUIRE(get_val(db, to_bytes("b1")).has_value());
+  CHECK(to_string(*get_val(db, to_bytes("b1"))) == "bv1");
 }
 
 // ---------------------------------------------------------------------------
@@ -1303,7 +1283,7 @@ TEST_CASE("Bytecask reads proceed during writes", "[bytecask][concurrency]") {
       for (int pass = 0; pass < 50; ++pass) {
         for (int i = 0; i < 100; ++i) {
           auto key = std::format("pre_{:04d}", i);
-          auto result = db.get({}, to_bytes(key));
+          auto result = get_val(db, to_bytes(key));
           if (!result.has_value()) {
             reader_ok[r] = false;
             return;
@@ -1353,7 +1333,7 @@ TEST_CASE("Bytecask concurrent mixed get/put/del", "[bytecask][concurrency]") {
       auto op = (tid + i) % 10; // 0–7: get, 8: put, 9: del
       if (op <= 7) {
         // Read — value may or may not exist (concurrent deletes).
-        auto result = db.get({}, to_bytes(key));
+        auto result = get_val(db, to_bytes(key));
         (void)result;
       } else if (op == 8) {
         auto val = std::format("t{}_{:04d}", tid, i);
@@ -1375,7 +1355,7 @@ TEST_CASE("Bytecask concurrent mixed get/put/del", "[bytecask][concurrency]") {
   // Verify no crash and that every surviving key has a valid value.
   for (int i = 0; i < kKeys; ++i) {
     auto key = std::format("k_{:04d}", i);
-    auto result = db.get({}, to_bytes(key));
+    auto result = get_val(db, to_bytes(key));
     if (result.has_value()) {
       CHECK(!result->empty());
     }
@@ -1414,7 +1394,7 @@ TEST_CASE("Bytecask group commit correctness", "[bytecask][concurrency]") {
     for (int i = 0; i < kWritesPerThread; ++i) {
       auto key = std::format("gc_t{}_{:04d}", t, i);
       auto expected_val = std::format("gv_t{}_{:04d}", t, i);
-      auto result = db.get({}, to_bytes(key));
+      auto result = get_val(db, to_bytes(key));
       REQUIRE(result.has_value());
       CHECK(to_string(*result) == expected_val);
     }
@@ -1452,7 +1432,7 @@ TEST_CASE("Bytecask concurrent reads during writes",
       int idx = r;
       while (!stop.load(std::memory_order_relaxed)) {
         auto key = std::format("rw_{:04d}", idx % 500);
-        auto result = db.get({}, to_bytes(key));
+        auto result = get_val(db, to_bytes(key));
         read_count.fetch_add(1, std::memory_order_relaxed);
         if (result.has_value()) {
           // Value must match the latest written value for this key.
@@ -1490,7 +1470,7 @@ TEST_CASE("Bytecask concurrent reads during writes",
   // All 500 keys must still be present.
   for (int i = 0; i < 500; ++i) {
     auto key = std::format("rw_{:04d}", i);
-    auto result = db.get({}, to_bytes(key));
+    auto result = get_val(db, to_bytes(key));
     REQUIRE(result.has_value());
   }
 }
@@ -1518,7 +1498,7 @@ TEST_CASE("Bytecask snapshot isolation under concurrent writes",
   for (int r = 0; r < kReaders; ++r) {
     readers.emplace_back([&] {
       while (!stop.load(std::memory_order_relaxed)) {
-        auto result = db.get({}, to_bytes("snap_key"));
+        auto result = get_val(db, to_bytes("snap_key"));
         // Must always find the key — it is never deleted.
         REQUIRE(result.has_value());
         // Value must be one of the written values (not garbage).
@@ -1677,7 +1657,7 @@ TEST_CASE("FileStats: cross-file overwrite decrements old file",
           "[bytecask][filestats]") {
   TempDir td;
   // Threshold of 1 triggers rotation after each write.
-  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
 
   db.put({}, to_bytes("k"), to_bytes("old_value"));
   // After this put, file rotated. Now write to new active file.
@@ -1733,7 +1713,7 @@ TEST_CASE("FileStats: recovery reconstructs stats", "[bytecask][filestats]") {
   std::map<std::uint32_t, bytecask::FileStats> pre_stats;
   {
     // Threshold of 1 triggers rotation after every write.
-    auto db = bytecask::Bytecask::open(db_path, 1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("a"), to_bytes("v1"));
     db.put({}, to_bytes("b"), to_bytes("v2"));
     db.put({}, to_bytes("a"), to_bytes("v3")); // overwrite across files
@@ -1741,7 +1721,7 @@ TEST_CASE("FileStats: recovery reconstructs stats", "[bytecask][filestats]") {
   }
 
   // Reopen — recovery from hint files.
-  auto db2 = bytecask::Bytecask::open(db_path, 1);
+  auto db2 = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
   auto post_stats = db2.file_stats();
 
   // Verify live_bytes and total_bytes per sealed file match.
@@ -1777,7 +1757,7 @@ TEST_CASE("FileStats: parallel recovery matches serial",
   const auto db_path = td.path / "db";
 
   {
-    auto db = bytecask::Bytecask::open(db_path, 1);
+    auto db = bytecask::Bytecask::open(db_path, {.max_file_bytes = 1});
     for (int i = 0; i < 50; ++i) {
       auto k = std::format("key{:04d}", i);
       auto v = std::format("val{:04d}", i);
@@ -1805,11 +1785,11 @@ TEST_CASE("FileStats: parallel recovery matches serial",
                         std::filesystem::copy_options::recursive);
 
   // Serial recovery.
-  auto db_serial = bytecask::Bytecask::open(serial_path, 1, 1);
+  auto db_serial = bytecask::Bytecask::open(serial_path, {.max_file_bytes = 1, .recovery_threads = 1});
   auto serial_stats = db_serial.file_stats();
 
   // Parallel recovery (4 threads).
-  auto db_parallel = bytecask::Bytecask::open(parallel_path, 1, 4);
+  auto db_parallel = bytecask::Bytecask::open(parallel_path, {.max_file_bytes = 1, .recovery_threads = 4});
   auto parallel_stats = db_parallel.file_stats();
 
   // Sum of live_bytes must match.
@@ -1867,7 +1847,7 @@ TEST_CASE("vacuum compact removes dead entries", "[vacuum]") {
   TempDir td;
   // Threshold=1 forces rotation after each write → every put lands in its
   // own sealed file (the active file is always a fresh, empty one).
-  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
 
   // Write k1, then overwrite it → original entry is dead.
   db.put({}, to_bytes("k1"), to_bytes("old"));
@@ -1879,10 +1859,10 @@ TEST_CASE("vacuum compact removes dead entries", "[vacuum]") {
   const auto files_before = count_data_files(td.path / "db");
 
   // Vacuum with threshold=0 so all fragmented files qualify.
-  db.vacuum({.fragmentation_threshold = 0.0});
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
   // Verify k1 is still readable and has the latest value.
-  const auto val = db.get({}, to_bytes("k1"));
+  const auto val = get_val(db, to_bytes("k1"));
   REQUIRE(val.has_value());
   CHECK(to_string(*val) == "new");
 
@@ -1904,21 +1884,21 @@ TEST_CASE("vacuum compact removes dead entries", "[vacuum]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum compact preserves tombstones", "[vacuum]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
 
   db.put({}, to_bytes("gone"), to_bytes("value"));
   std::ignore = db.del({}, to_bytes("gone"));
   // Now we have: file with Put("gone"), file with Delete("gone"), empty active.
 
   // Vacuum the file containing the Put (it's 100% dead).
-  db.vacuum({.fragmentation_threshold = 0.0});
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
   // The key should still be absent.
   CHECK_FALSE(db.contains_key(to_bytes("gone")));
 
   // Reopen to verify tombstone survives recovery.
   {
-    auto db2 = bytecask::Bytecask::open(td.path / "db", 1);
+    auto db2 = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
     CHECK_FALSE(db2.contains_key(to_bytes("gone")));
   }
 }
@@ -1928,15 +1908,15 @@ TEST_CASE("vacuum compact preserves tombstones", "[vacuum]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum compact on fully dead file", "[vacuum]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
 
   db.put({}, to_bytes("x"), to_bytes("v1"));
   // Overwrite so the first file's entry is dead.
   db.put({}, to_bytes("x"), to_bytes("v2"));
 
-  db.vacuum({.fragmentation_threshold = 0.0});
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
-  const auto val = db.get({}, to_bytes("x"));
+  const auto val = get_val(db, to_bytes("x"));
   REQUIRE(val.has_value());
   CHECK(to_string(*val) == "v2");
 }
@@ -1952,7 +1932,7 @@ TEST_CASE("vacuum no-op when nothing exceeds threshold", "[vacuum]") {
 
   const auto stats_before = db.file_stats();
   // Default threshold is 0.5 — active file has 0% fragmentation.
-  db.vacuum();
+  CHECK_FALSE(db.vacuum());
   const auto stats_after = db.file_stats();
 
   // Same number of files, same content.
@@ -1971,30 +1951,22 @@ TEST_CASE("vacuum no-op when nothing exceeds threshold", "[vacuum]") {
 TEST_CASE("vacuum absorb moves entries to active file", "[vacuum]") {
   TempDir td;
   // Use a large threshold so absorb path is chosen (live data fits in active).
-  auto db = bytecask::Bytecask::open(td.path / "db");
-
-  db.put({}, to_bytes("k1"), to_bytes("v1"));
-  db.put({}, to_bytes("k2"), to_bytes("v2"));
-  // Overwrite k1 to create fragmentation.
-  db.put({}, to_bytes("k1"), to_bytes("v1_new"));
-
-  // Force rotation so there's a sealed file to vacuum.
-  // Write a lot of data to trigger rotation.
   {
-    std::string big(db.file_stats().begin()->second.total_bytes + 1, 'x');
-    // Actually, let's use a smaller threshold to force rotation.
+    auto db = bytecask::Bytecask::open(td.path / "db");
+    db.put({}, to_bytes("k1"), to_bytes("v1"));
+    db.put({}, to_bytes("k2"), to_bytes("v2"));
+    // Overwrite k1 to create fragmentation.
+    db.put({}, to_bytes("k1"), to_bytes("v1_new"));
+    // db destroyed here — background worker drains, hints written
   }
-
-  // Reopen with threshold=1 to cause rotation, then reopen with large threshold.
-  db.flush_hints();
   {
-    auto db2 = bytecask::Bytecask::open(td.path / "db", 1);
+    auto db2 = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
     // Writes to force rotation of existing files.
     db2.put({}, to_bytes("k3"), to_bytes("v3"));
     // Now we have: sealed files from original writes + sealed file with k3 + active.
     // Overwrite k2 so one of the old sealed files has dead entries.
     db2.put({}, to_bytes("k2"), to_bytes("v2_new"));
-    db2.flush_hints();
+    // db2 destroyed here — background worker drains, hints written
   }
 
   // Reopen with large threshold so absorb path is used.
@@ -2008,9 +1980,9 @@ TEST_CASE("vacuum absorb moves entries to active file", "[vacuum]") {
   CHECK(stats_after < stats_before);
 
   // All keys still readable.
-  CHECK(to_string(*db3.get({}, to_bytes("k1"))) == "v1_new");
-  CHECK(to_string(*db3.get({}, to_bytes("k2"))) == "v2_new");
-  CHECK(to_string(*db3.get({}, to_bytes("k3"))) == "v3");
+  CHECK(to_string(*get_val(db3, to_bytes("k1"))) == "v1_new");
+  CHECK(to_string(*get_val(db3, to_bytes("k2"))) == "v2_new");
+  CHECK(to_string(*get_val(db3, to_bytes("k3"))) == "v3");
 }
 
 // ---------------------------------------------------------------------------
@@ -2018,25 +1990,26 @@ TEST_CASE("vacuum absorb moves entries to active file", "[vacuum]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum absorb preserves LSNs across recovery", "[vacuum]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db", 1);
-
-  db.put({}, to_bytes("a"), to_bytes("alpha"));
-  db.put({}, to_bytes("b"), to_bytes("beta"));
-  // Overwrite a to create fragmentation.
-  db.put({}, to_bytes("a"), to_bytes("alpha2"));
-  db.flush_hints();
+  {
+    auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+    db.put({}, to_bytes("a"), to_bytes("alpha"));
+    db.put({}, to_bytes("b"), to_bytes("beta"));
+    // Overwrite a to create fragmentation.
+    db.put({}, to_bytes("a"), to_bytes("alpha2"));
+    // db destroyed here — background worker drains, hints written
+  }
 
   // Reopen with large threshold so absorb is used.
   {
     auto db2 = bytecask::Bytecask::open(td.path / "db");
     db2.vacuum({.fragmentation_threshold = 0.0});
-    db2.flush_hints();
+    // db2 destroyed here — background worker drains, hints written
   }
 
   // Reopen again — recovery should see absorbed entries correctly.
   auto db3 = bytecask::Bytecask::open(td.path / "db");
-  CHECK(to_string(*db3.get({}, to_bytes("a"))) == "alpha2");
-  CHECK(to_string(*db3.get({}, to_bytes("b"))) == "beta");
+  CHECK(to_string(*get_val(db3, to_bytes("a"))) == "alpha2");
+  CHECK(to_string(*get_val(db3, to_bytes("b"))) == "beta");
 }
 
 // ---------------------------------------------------------------------------
@@ -2045,24 +2018,25 @@ TEST_CASE("vacuum absorb preserves LSNs across recovery", "[vacuum]") {
 TEST_CASE("vacuum chooses compact for large file", "[vacuum]") {
   TempDir td;
   // Threshold = 1 forces many small sealed files, each rotated immediately.
-  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+  {
+    auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+    db.put({}, to_bytes("a"), to_bytes("1"));
+    db.put({}, to_bytes("a"), to_bytes("2")); // kills first entry.
 
-  db.put({}, to_bytes("a"), to_bytes("1"));
-  db.put({}, to_bytes("a"), to_bytes("2")); // kills first entry.
-  db.flush_hints();
+    // Sealed file with "a"="1" has 100% dead entries.
+    // Active file is tiny (threshold=1 → always rotates).
+    // With threshold=1, absorb path's precondition (live + active <= threshold)
+    // will fail for any file with live data, so compact is always chosen.
+    // vacuum() drains pending hint writes internally before selecting target.
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
-  // Sealed file with "a"="1" has 100% dead entries.
-  // Active file is tiny (threshold=1 → always rotates).
-  // With threshold=1, absorb path's precondition (live + active <= threshold)
-  // will fail for any file with live data, so compact is always chosen.
-  db.vacuum({.fragmentation_threshold = 0.0});
-
-  CHECK(to_string(*db.get({}, to_bytes("a"))) == "2");
+    CHECK(to_string(*get_val(db, to_bytes("a"))) == "2");
+    // db destroyed here — background worker drains, hints written
+  }
 
   // Verify recovery after compact.
-  db.flush_hints();
-  auto db2 = bytecask::Bytecask::open(td.path / "db", 1);
-  CHECK(to_string(*db2.get({}, to_bytes("a"))) == "2");
+  auto db2 = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
+  CHECK(to_string(*get_val(db2, to_bytes("a"))) == "2");
 }
 
 // ---------------------------------------------------------------------------
@@ -2070,7 +2044,7 @@ TEST_CASE("vacuum chooses compact for large file", "[vacuum]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum loop reclaims all fragmentation", "[vacuum]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
 
   // Create multiple fragmented files.
   db.put({}, to_bytes("x"), to_bytes("1"));
@@ -2078,13 +2052,11 @@ TEST_CASE("vacuum loop reclaims all fragmentation", "[vacuum]") {
   db.put({}, to_bytes("x"), to_bytes("3")); // kills x=1
   db.put({}, to_bytes("y"), to_bytes("4")); // kills y=2
 
-  // Run vacuum in a loop.
-  for (int i = 0; i < 10; ++i) {
-    db.vacuum({.fragmentation_threshold = 0.0});
-  }
+  // Run vacuum until nothing qualifies.
+  while (db.vacuum({.fragmentation_threshold = 0.0})) {}
 
-  CHECK(to_string(*db.get({}, to_bytes("x"))) == "3");
-  CHECK(to_string(*db.get({}, to_bytes("y"))) == "4");
+  CHECK(to_string(*get_val(db, to_bytes("x"))) == "3");
+  CHECK(to_string(*get_val(db, to_bytes("y"))) == "4");
 
   // All live entries should still be accounted for.
   std::uint64_t total_live = 0;
@@ -2099,13 +2071,13 @@ TEST_CASE("vacuum loop reclaims all fragmentation", "[vacuum]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum compact stats consistency", "[vacuum][filestats]") {
   TempDir td;
-  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+  auto db = bytecask::Bytecask::open(td.path / "db", {.max_file_bytes = 1});
 
   db.put({}, to_bytes("k1"), to_bytes("aaa"));
   db.put({}, to_bytes("k2"), to_bytes("bbb"));
   db.put({}, to_bytes("k1"), to_bytes("ccc")); // kills k1=aaa
 
-  db.vacuum({.fragmentation_threshold = 0.0});
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
   const auto stats = db.file_stats();
 

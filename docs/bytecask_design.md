@@ -447,8 +447,10 @@ The public `vacuum()` method orchestrates file selection and dispatches to exact
 2. **Purge stale files** — check `stale_files_` for entries whose `shared_ptr<DataFile>` has `use_count() == 1` (no in-flight readers). For those, close the fd and delete the `.data` + `.hint` files.
 3. **Select a target file** — copy `file_stats_` under a brief `write_mu_` acquisition (O(sealed files), then release). Iterate sealed files, compute `fragmentation = 1 − live_bytes / total_bytes` (O(1) per file, no I/O), pick the highest-fragmentation sealed file above `fragmentation_threshold`. If no file qualifies, return immediately.
 4. **Branch**:
-   - If `file_stats_[target].live_bytes + active_file.size() <= rotation_threshold` → call `vacuum_absorb_file(target)`.
+   - If `file_stats_[target].live_bytes <= absorb_threshold` **and** `file_stats_[target].live_bytes + active_file.size() <= rotation_threshold` → call `vacuum_absorb_file(target)`.
    - Otherwise → call `vacuum_compact_file(target)`.
+
+   `absorb_threshold` (default 1 MiB) limits absorption to genuinely small files. A file with more live data than `absorb_threshold` is always compacted into a new sealed file, keeping the active file from bloating.
 5. **Release `vacuum_mu_`**.
 
 #### Tombstone handling
@@ -579,8 +581,8 @@ Not yet implemented — callers currently provide the full file path.
 ### Source Code Module Architecture
 
 We use fine-grained C++20 modules:
-- `bytecask.crc32`: CRC-32C accumulator (`Crc32`, backed by google/crc32c) and checked `narrow<To>(From)` conversion.
-- `bytecask.serialization`: Core serialization primitives (`ByteWriter`, `ByteReader`, `read_le`, `write_le`) and re-exports `bytecask.crc32`.
+- `bytecask.util`: CRC-32C accumulator (`Crc32`, backed by google/crc32c) and checked `narrow<To>(From)` conversion.
+- `bytecask.serialization`: Core serialization primitives (`ByteWriter`, `ByteReader`, `read_le`, `write_le`) and re-exports `bytecask.util`.
 - `bytecask.data_entry`: Logical entry definition, `write_header_and_crc()` (fills a fixed 19-byte buffer with LE header + CRC for zero-copy I/O), `serialize_entry()` (complete in-memory entry for tests/recovery), `parse_header_and_verify()` / `deserialize_entry()` / `extract_value_into()` — CRC verification is factored into `parse_header_and_verify()` and shared by both extraction functions.
 - `bytecask.data_file`: Disk I/O, writing streams sequentially to `.data` files.
 - `bytecask.hint_entry`: `HintEntry`, `serialize_entry()`, `deserialize_entry()` — symmetric read/write for hint entries.
@@ -1103,7 +1105,7 @@ The `~Bytecask()` destructor no longer calls `flush_hints()` explicitly. Because
 ## Current repository structure
 
 - `src/main.cpp`: temporary executable entry point
-- `src/engine/crc32.cppm`: C++23 module (`bytecask.crc32`) — `Crc32` accumulator (google/crc32c), `narrow<To>(From)` checked conversion
+- `src/engine/util.cppm`: C++23 module (`bytecask.util`) — `Crc32` accumulator (google/crc32c), `narrow<To>(From)` checked conversion
 - `src/engine/serialization.cppm`: C++23 module (`bytecask.serialization`) — `ByteWriter`, `ByteReader`, `read_le`, `write_le`
 - `src/engine/data_entry.cppm`: C++23 module (`bytecask.data_entry`) — `EntryType`, `EntryHeader`, `DataEntry`, serialization helpers
 - `src/engine/data_file.cppm`: C++23 module (`bytecask.data_file`) — `DataFile` POSIX I/O, `Offset`
@@ -1144,7 +1146,7 @@ The `~Bytecask()` destructor no longer calls `flush_hints()` explicitly. Because
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
 | D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1 and standard C++ practice). |
 | D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. MVCC and snapshot isolation are not provided. |
-| D10 | **Vacuum**: Two independently testable primitives — `vacuum_compact_file` (rewrite sealed file into a new sealed file, dropping dead entries) and `vacuum_absorb_file` (append live entries to the active file, preserving original LSNs, then delete the old file). `vacuum()` selects a target file above `fragmentation_threshold`, then branches: `vacuum_absorb_file` if `live_bytes` fits in the active file, otherwise `vacuum_compact_file`. No compound paths. All vacuum-related identifiers use a `vacuum_` prefix. One sealed file per `vacuum()` call. Engine continues serving reads and writes. For `vacuum_compact_file`, `write_mu_` is held only for the commit step (I/O writes to a private temp file). For `vacuum_absorb_file`, `write_mu_` is held for the entire scan-copy-sync-commit phase because the active `DataFile` is not thread-safe and concurrent `put`/`del`/`apply_batch` also append to it. `vacuum_commit` itself does not acquire `write_mu_` — the caller is responsible for holding it. Tombstones are always copied (never elided) during partial vacuum. File selection uses `fragmentation >= fragmentation_threshold` computed from incrementally maintained `FileStats` — O(1) per file. Stats are reconstructed during recovery as a side-effect of the hint-file pass. |
+| D10 | **Vacuum**: Two independently testable primitives — `vacuum_compact_file` (rewrite sealed file into a new sealed file, dropping dead entries) and `vacuum_absorb_file` (append live entries to the active file, preserving original LSNs, then delete the old file). `vacuum()` selects a target file above `fragmentation_threshold`, then branches: `vacuum_absorb_file` if `live_bytes <= absorb_threshold` and the data fits in the active file, otherwise `vacuum_compact_file`. Returns `true` if a file was processed, `false` if nothing qualified. No compound paths. All vacuum-related identifiers use a `vacuum_` prefix. One sealed file per `vacuum()` call. Engine continues serving reads and writes. For `vacuum_compact_file`, `write_mu_` is held only for the commit step (I/O writes to a private temp file). For `vacuum_absorb_file`, `write_mu_` is held for the entire scan-copy-sync-commit phase because the active `DataFile` is not thread-safe and concurrent `put`/`del`/`apply_batch` also append to it. `vacuum_commit` itself does not acquire `write_mu_` — the caller is responsible for holding it. Tombstones are always copied (never elided) during partial vacuum. File selection uses `fragmentation >= fragmentation_threshold` computed from incrementally maintained `FileStats` — O(1) per file. Stats are reconstructed during recovery as a side-effect of the hint-file pass. |
 | D11 | **File naming**: `data_{YYYYMMDDHHmmssUUUUUU}` using microsecond precision. Gives lexicographic == chronological ordering and avoids the false precision of nanosecond timestamps whose sub-microsecond bits are often zero on Linux. |
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be discarded with a logged warning. No partial-batch entries enter the key directory. |
