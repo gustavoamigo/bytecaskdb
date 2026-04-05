@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 import bytecask.engine;
+import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.types;
 
@@ -1546,4 +1547,302 @@ TEST_CASE("Bytecask snapshot isolation under concurrent writes",
 
   INFO("successful reads=" << reads_ok.load());
   CHECK(reads_ok.load() > 100);
+}
+
+// ===========================================================================
+// FileStats tracking tests
+// ===========================================================================
+
+// Helper: compute on-disk entry size from key and value string views.
+static auto esize(std::string_view key, std::string_view value)
+    -> std::uint64_t {
+  return bytecask::kHeaderSize + key.size() + value.size() +
+         bytecask::kCrcSize;
+}
+
+// Tombstone (Delete) entry has value_size = 0.
+static auto tombstone_size(std::string_view key) -> std::uint64_t {
+  return bytecask::kHeaderSize + key.size() + bytecask::kCrcSize;
+}
+
+// ---------------------------------------------------------------------------
+// put accounts for live_bytes and total_bytes on the active file
+// ---------------------------------------------------------------------------
+TEST_CASE("FileStats: put tracks live_bytes and total_bytes",
+          "[bytecask][filestats]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put({}, to_bytes("k1"), to_bytes("v1"));
+  db.put({}, to_bytes("k2"), to_bytes("val2"));
+
+  auto stats = db.file_stats();
+  // Only one file (active).
+  REQUIRE(stats.size() == 1);
+  const auto &[fid, fs] = *stats.begin();
+
+  const auto expected = esize("k1", "v1") + esize("k2", "val2");
+  CHECK(fs.live_bytes == expected);
+  CHECK(fs.total_bytes == expected);
+}
+
+// ---------------------------------------------------------------------------
+// overwrite decrements old file's live_bytes, increments new entry
+// ---------------------------------------------------------------------------
+TEST_CASE("FileStats: overwrite decrements old live_bytes",
+          "[bytecask][filestats]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put({}, to_bytes("k"), to_bytes("old_value"));
+  db.put({}, to_bytes("k"), to_bytes("new_value"));
+
+  auto stats = db.file_stats();
+  REQUIRE(stats.size() == 1);
+  const auto &fs = stats.begin()->second;
+
+  // Only the new entry is live; both entries exist on disk.
+  CHECK(fs.live_bytes == esize("k", "new_value"));
+  CHECK(fs.total_bytes == esize("k", "old_value") + esize("k", "new_value"));
+}
+
+// ---------------------------------------------------------------------------
+// del decrements live_bytes and adds tombstone to total_bytes only
+// ---------------------------------------------------------------------------
+TEST_CASE("FileStats: del decrements live_bytes, tombstone in total_bytes",
+          "[bytecask][filestats]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put({}, to_bytes("k"), to_bytes("value"));
+  db.del({}, to_bytes("k"));
+
+  auto stats = db.file_stats();
+  REQUIRE(stats.size() == 1);
+  const auto &fs = stats.begin()->second;
+
+  CHECK(fs.live_bytes == 0);
+  CHECK(fs.total_bytes == esize("k", "value") + tombstone_size("k"));
+}
+
+// ---------------------------------------------------------------------------
+// apply_batch tracks stats including BulkBegin/BulkEnd markers
+// ---------------------------------------------------------------------------
+TEST_CASE("FileStats: apply_batch tracks stats with bulk markers",
+          "[bytecask][filestats]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  bytecask::Batch batch;
+  batch.put(to_bytes("a"), to_bytes("va"));
+  batch.put(to_bytes("b"), to_bytes("vb"));
+  db.apply_batch({}, std::move(batch));
+
+  auto stats = db.file_stats();
+  REQUIRE(stats.size() == 1);
+  const auto &fs = stats.begin()->second;
+
+  const auto bulk_marker_size = bytecask::kHeaderSize + bytecask::kCrcSize;
+  const auto expected_total = bulk_marker_size * 2 + // BulkBegin + BulkEnd
+                              esize("a", "va") + esize("b", "vb");
+  CHECK(fs.live_bytes == esize("a", "va") + esize("b", "vb"));
+  CHECK(fs.total_bytes == expected_total);
+}
+
+// ---------------------------------------------------------------------------
+// batch with delete inside decrements old entry's live_bytes
+// ---------------------------------------------------------------------------
+TEST_CASE("FileStats: batch del decrements live_bytes",
+          "[bytecask][filestats]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  db.put({}, to_bytes("k"), to_bytes("val"));
+
+  bytecask::Batch batch;
+  batch.del(to_bytes("k"));
+  db.apply_batch({}, std::move(batch));
+
+  auto stats = db.file_stats();
+  REQUIRE(stats.size() == 1);
+  const auto &fs = stats.begin()->second;
+
+  CHECK(fs.live_bytes == 0);
+}
+
+// ---------------------------------------------------------------------------
+// rotation: overwrite across files decrements old file's live_bytes
+// ---------------------------------------------------------------------------
+TEST_CASE("FileStats: cross-file overwrite decrements old file",
+          "[bytecask][filestats]") {
+  TempDir td;
+  // Threshold of 1 triggers rotation after each write.
+  auto db = bytecask::Bytecask::open(td.path / "db", 1);
+
+  db.put({}, to_bytes("k"), to_bytes("old_value"));
+  // After this put, file rotated. Now write to new active file.
+  db.put({}, to_bytes("k"), to_bytes("new_value"));
+
+  auto stats = db.file_stats();
+  // Should have 3 files: sealed file 0, sealed file 1, active file 2.
+  REQUIRE(stats.size() >= 2);
+
+  // Sum live_bytes across all files — should equal the one live entry.
+  std::uint64_t total_live = 0;
+  for (const auto &[fid, fs] : stats) {
+    total_live += fs.live_bytes;
+  }
+  CHECK(total_live == esize("k", "new_value"));
+}
+
+// ---------------------------------------------------------------------------
+// fragmentation: file with 50% dead entries
+// ---------------------------------------------------------------------------
+TEST_CASE("FileStats: fragmentation computation", "[bytecask][filestats]") {
+  TempDir td;
+  auto db = bytecask::Bytecask::open(td.path / "db");
+
+  // Write two entries of equal size, then overwrite the first.
+  db.put({}, to_bytes("k1"), to_bytes("value"));
+  db.put({}, to_bytes("k2"), to_bytes("value"));
+  db.put({}, to_bytes("k1"), to_bytes("value")); // overwrites k1
+
+  auto stats = db.file_stats();
+  REQUIRE(stats.size() == 1);
+  const auto &fs = stats.begin()->second;
+
+  // 3 entries on disk, 2 live.
+  const auto one_entry = esize("k1", "value");
+  CHECK(fs.live_bytes == 2 * one_entry);
+  CHECK(fs.total_bytes == 3 * one_entry);
+
+  // fragmentation = 1 - live/total = 1/3 ≈ 0.333
+  auto frag = 1.0 - static_cast<double>(fs.live_bytes) /
+                         static_cast<double>(fs.total_bytes);
+  CHECK(frag > 0.33);
+  CHECK(frag < 0.34);
+}
+
+// ---------------------------------------------------------------------------
+// Recovery reconstructs correct file_stats
+// ---------------------------------------------------------------------------
+TEST_CASE("FileStats: recovery reconstructs stats", "[bytecask][filestats]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  std::map<std::uint32_t, bytecask::FileStats> pre_stats;
+  {
+    // Threshold of 1 triggers rotation after every write.
+    auto db = bytecask::Bytecask::open(db_path, 1);
+    db.put({}, to_bytes("a"), to_bytes("v1"));
+    db.put({}, to_bytes("b"), to_bytes("v2"));
+    db.put({}, to_bytes("a"), to_bytes("v3")); // overwrite across files
+    pre_stats = db.file_stats();
+  }
+
+  // Reopen — recovery from hint files.
+  auto db2 = bytecask::Bytecask::open(db_path, 1);
+  auto post_stats = db2.file_stats();
+
+  // Verify live_bytes and total_bytes per sealed file match.
+  // The active file from pre_stats won't match exactly (it was sealed on close
+  // and a new empty active file was created on reopen), so compare sealed files.
+  // We check that the sum of live_bytes matches.
+  std::uint64_t pre_live = 0, post_live = 0;
+  for (const auto &[fid, fs] : pre_stats) {
+    pre_live += fs.live_bytes;
+  }
+  for (const auto &[fid, fs] : post_stats) {
+    post_live += fs.live_bytes;
+  }
+  CHECK(pre_live == post_live);
+
+  // Check total_bytes of non-empty files match (sealed files preserved).
+  std::uint64_t pre_total = 0, post_total = 0;
+  for (const auto &[fid, fs] : pre_stats) {
+    if (fs.total_bytes > 0) pre_total += fs.total_bytes;
+  }
+  for (const auto &[fid, fs] : post_stats) {
+    if (fs.total_bytes > 0) post_total += fs.total_bytes;
+  }
+  CHECK(pre_total == post_total);
+}
+
+// ---------------------------------------------------------------------------
+// Parallel recovery stats match serial recovery stats
+// ---------------------------------------------------------------------------
+TEST_CASE("FileStats: parallel recovery matches serial",
+          "[bytecask][filestats]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::Bytecask::open(db_path, 1);
+    for (int i = 0; i < 50; ++i) {
+      auto k = std::format("key{:04d}", i);
+      auto v = std::format("val{:04d}", i);
+      db.put({}, to_bytes(k), to_bytes(v));
+    }
+    // Overwrite some keys across files.
+    for (int i = 0; i < 25; ++i) {
+      auto k = std::format("key{:04d}", i);
+      auto v = std::format("new{:04d}", i);
+      db.put({}, to_bytes(k), to_bytes(v));
+    }
+    // Delete some.
+    for (int i = 40; i < 50; ++i) {
+      auto k = std::format("key{:04d}", i);
+      db.del({}, to_bytes(k));
+    }
+  }
+
+  // Copy the db directory to two separate locations for isolated recovery.
+  const auto serial_path = td.path / "serial";
+  const auto parallel_path = td.path / "parallel";
+  std::filesystem::copy(db_path, serial_path,
+                        std::filesystem::copy_options::recursive);
+  std::filesystem::copy(db_path, parallel_path,
+                        std::filesystem::copy_options::recursive);
+
+  // Serial recovery.
+  auto db_serial = bytecask::Bytecask::open(serial_path, 1, 1);
+  auto serial_stats = db_serial.file_stats();
+
+  // Parallel recovery (4 threads).
+  auto db_parallel = bytecask::Bytecask::open(parallel_path, 1, 4);
+  auto parallel_stats = db_parallel.file_stats();
+
+  // Sum of live_bytes must match.
+  std::uint64_t serial_live = 0, parallel_live = 0;
+  for (const auto &[fid, fs] : serial_stats) {
+    serial_live += fs.live_bytes;
+  }
+  for (const auto &[fid, fs] : parallel_stats) {
+    parallel_live += fs.live_bytes;
+  }
+  CHECK(serial_live == parallel_live);
+
+  // Sum of total_bytes must match.
+  std::uint64_t serial_total = 0, parallel_total = 0;
+  for (const auto &[fid, fs] : serial_stats) {
+    serial_total += fs.total_bytes;
+  }
+  for (const auto &[fid, fs] : parallel_stats) {
+    parallel_total += fs.total_bytes;
+  }
+  CHECK(serial_total == parallel_total);
+
+  // Sorted live_bytes and total_bytes vectors must match (file IDs may differ
+  // between serial and parallel because directory iteration order is
+  // non-deterministic, but the multisets of per-file values must be equal).
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> serial_vals, parallel_vals;
+  for (const auto &[fid, fs] : serial_stats) {
+    serial_vals.emplace_back(fs.live_bytes, fs.total_bytes);
+  }
+  for (const auto &[fid, fs] : parallel_stats) {
+    parallel_vals.emplace_back(fs.live_bytes, fs.total_bytes);
+  }
+  std::ranges::sort(serial_vals);
+  std::ranges::sort(parallel_vals);
+  CHECK(serial_vals == parallel_vals);
 }
