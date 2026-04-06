@@ -168,7 +168,7 @@ auto DB::get(const ReadOptions &opts, BytesView key,
 #pragma clang diagnostic pop
   s->files->at(kv->file_id)
       ->read_value(kv->file_offset, narrow<std::uint16_t>(key.size()),
-                   kv->value_size, io_buf, out);
+                   kv->value_size, opts.verify_checksums, io_buf, out);
   return true;
 }
 
@@ -319,12 +319,13 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
 // one value from disk via a single pread (lazy). Results are in ascending
 // key order.
 // Throws std::system_error on I/O failure.
-auto DB::iter_from(const ReadOptions & /*opts*/, BytesView from) const
+auto DB::iter_from(const ReadOptions &opts, BytesView from) const
     -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
   auto s = state_.load();
   auto it = from.empty() ? s->key_dir.begin() : s->key_dir.lower_bound(from);
   return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
-      EntryIterator{s, std::move(it)}, std::default_sentinel};
+      EntryIterator{s, std::move(it), opts.verify_checksums},
+      std::default_sentinel};
 }
 
 // Returns an input range of keys >= from. Walks the in-memory key directory

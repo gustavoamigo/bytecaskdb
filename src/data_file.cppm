@@ -170,15 +170,27 @@ public:
     }
   }
 
-  // High-level read: preads the entry, verifies CRC, and extracts only the
-  // value into out. io_buf is a caller-owned scratch buffer whose capacity
-  // is reused across calls to amortize allocation.
+  // High-level read: extracts only the value into out.
+  // When verify is true, preads the full entry and validates the CRC32
+  // checksum. When false, preads only the value bytes — skipping header,
+  // key, and CRC — for minimum I/O.
   void read_value(Offset offset, std::uint16_t key_size,
-                  std::uint32_t value_size,
+                  std::uint32_t value_size, bool verify,
                   std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const {
-    read_entry(offset, key_size, value_size, io_buf);
-    extract_value_into(io_buf, out);
+    if (verify) {
+      read_entry(offset, key_size, value_size, io_buf);
+      extract_value_into(io_buf, out, true);
+    } else {
+      const auto val_offset = offset + kHeaderSize + key_size;
+      out.resize(value_size);
+      if (::pread(fd_, out.data(), value_size,
+                  narrow<off_t>(val_offset)) !=
+          narrow<ssize_t>(value_size)) {
+        throw std::system_error{errno, std::generic_category(),
+                                "DataFile::read_value: pread failed"};
+      }
+    }
   }
 
   // Flushes all pending writes to physical storage via fdatasync.
