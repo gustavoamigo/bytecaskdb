@@ -1,6 +1,7 @@
 module;
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -989,9 +990,9 @@ auto DB::recovery_load_serial(EngineState s) -> EngineState {
   return s;
 }
 
-// Parallel recovery (v1): file-level partitioning with fan-in merge.
+// Parallel recovery: file-level partitioning with sequential accumulator merge.
 // Round-robin assigns files to W workers, each builds a RecoveryResult,
-// then pairwise merges reduce to a single result in ⌈log₂(W)⌉ rounds.
+// then results are merged one-at-a-time into an accumulator as workers finish.
 auto DB::recovery_load_parallel(EngineState s,
                                       unsigned recovery_threads) -> EngineState {
   auto files = recovery_prepare_files(s);
@@ -1009,49 +1010,63 @@ auto DB::recovery_load_parallel(EngineState s,
     worker_files[i % W].push_back(std::move(files[i]));
   }
 
-  // Phase 2: parallel build.
-  std::vector<RecoveryResult> results(W);
+  // Phase 2: parallel build + Phase 3: sequential accumulator merge.
+  // Workers push finished results into a queue; the main thread merges
+  // each into an accumulator as it arrives. Each ~N/W-key tree is merged
+  // once; disjoint subtrees are shared O(1) by the persistent tree, so
+  // total merge work is proportional to overlap, not N × log₂(W).
+  std::mutex queue_mu;
+  std::condition_variable queue_cv;
+  std::vector<RecoveryResult> queue;
+  unsigned finished_count = 0;
+
   {
     std::vector<std::jthread> threads;
     threads.reserve(W);
     for (unsigned i = 0; i < W; ++i) {
-      threads.emplace_back([&results, &worker_files, i] {
-        results[i] = recovery_build_from_hints(worker_files[i]);
+      threads.emplace_back([&, i] {
+        auto result = recovery_build_from_hints(worker_files[i]);
+        std::unique_lock lk{queue_mu};
+        queue.push_back(std::move(result));
+        ++finished_count;
+        queue_cv.notify_one();
       });
     }
-  }
 
-  // Phase 3: parallel fan-in merge.
-  while (results.size() > 1) {
-    const auto count = results.size();
-    const auto pairs = count / 2;
-    std::vector<RecoveryResult> next(pairs);
+    // Main thread: consume results as they arrive.
+    RecoveryResult acc{};
+    bool acc_initialized = false;
+    unsigned merged_count = 0;
 
-    {
-      std::vector<std::jthread> threads;
-      threads.reserve(pairs);
-      for (std::size_t i = 0; i < pairs; ++i) {
-        threads.emplace_back([&results, &next, i] {
-          next[i] = recovery_merge_results(std::move(results[i * 2]),
-                                           std::move(results[i * 2 + 1]));
-        });
+    while (merged_count < W) {
+      std::unique_lock lk{queue_mu};
+      queue_cv.wait(lk, [&] { return !queue.empty(); });
+      auto incoming = std::move(queue.back());
+      queue.pop_back();
+      lk.unlock();
+
+      if (!acc_initialized) {
+        acc = std::move(incoming);
+        acc_initialized = true;
+      } else {
+        acc = recovery_merge_results(std::move(acc), std::move(incoming));
       }
+      ++merged_count;
     }
 
-    // Odd element carries forward.
-    if (count % 2 != 0) {
-      next.push_back(std::move(results.back()));
-    }
-
-    results = std::move(next);
+    // Store final result for phases 4-5 (threads join at scope exit).
+    queue.clear();
+    queue.push_back(std::move(acc));
   }
+
+  auto &final_result = queue[0];
 
   // Phase 4: recompute live_bytes once from the fully-merged tree.
-  auto &final_stats = results[0].file_stats;
+  auto &final_stats = final_result.file_stats;
   for (auto &[fid, fs] : final_stats) {
     fs.live_bytes = 0;
   }
-  for (auto it = results[0].key_dir.begin(); it != std::default_sentinel;
+  for (auto it = final_result.key_dir.begin(); it != std::default_sentinel;
        ++it) {
     const auto &[key_span, kde] = *it;
     final_stats[kde.file_id].live_bytes +=
@@ -1059,8 +1074,8 @@ auto DB::recovery_load_parallel(EngineState s,
   }
 
   // Phase 5: assembly.
-  s.key_dir = std::move(results[0].key_dir);
-  s.next_lsn = results[0].max_lsn + 1;
+  s.key_dir = std::move(final_result.key_dir);
+  s.next_lsn = final_result.max_lsn + 1;
   file_stats_ = std::move(final_stats);
   return s;
 }
