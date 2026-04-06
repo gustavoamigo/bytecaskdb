@@ -939,11 +939,11 @@ BENCH(BM_Mixed<Bc, true>)         ->Name("ByteCask/Mixed/Sync");
 
 
 // --- Parallel Recovery (1M keys, 1-byte values, hint-only) ---
-BENCH(BM_RecoveryParallel)->Arg(1) ->Name("ByteCask/Recovery/Parallel");
-BENCH(BM_RecoveryParallel)->Arg(2) ->Name("ByteCask/Recovery/Parallel");
-BENCH(BM_RecoveryParallel)->Arg(4) ->Name("ByteCask/Recovery/Parallel");
-BENCH(BM_RecoveryParallel)->Arg(8) ->Name("ByteCask/Recovery/Parallel");
-BENCH(BM_RecoveryParallel)->Arg(16)->Name("ByteCask/Recovery/Parallel");
+BENCH(BM_RecoveryParallel)->Arg(1) ->Name("ByteCask/Recovery/Parallel")->Unit(benchmark::kSecond);;
+BENCH(BM_RecoveryParallel)->Arg(2) ->Name("ByteCask/Recovery/Parallel")->Unit(benchmark::kSecond);;
+BENCH(BM_RecoveryParallel)->Arg(4) ->Name("ByteCask/Recovery/Parallel")->Unit(benchmark::kSecond);;
+BENCH(BM_RecoveryParallel)->Arg(8) ->Name("ByteCask/Recovery/Parallel")->Unit(benchmark::kSecond);;
+BENCH(BM_RecoveryParallel)->Arg(16)->Name("ByteCask/Recovery/Parallel")->Unit(benchmark::kSecond);;
 
 // --- LevelDB ---
 BENCH(BM_Put<Ldb, false>)          ->Name("LevelDB/Put/NoSync");

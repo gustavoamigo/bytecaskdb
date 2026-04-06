@@ -885,8 +885,8 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files)
 // Merges two RecoveryResults. Tree merge uses LSN-based conflict
 // resolution, then tombstones from both sides are cross-applied to
 // suppress stale PUTs. Tombstone maps and file_stats are unioned.
-// live_bytes are recomputed from the merged tree after all conflict
-// resolution (the merge resolver doesn't have access to key sizes).
+// live_bytes are NOT recomputed here — deferred to a single pass
+// after the final merge to avoid O(N × log₂ W) redundant traversals.
 auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 -> RecoveryResult {
   auto &merged_stats = a.file_stats;
@@ -915,15 +915,6 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
     if (entry && entry->sequence < tomb_seq) {
       merged = merged.erase(key_span);
     }
-  }
-
-  for (auto &[fid, fs] : merged_stats) {
-    fs.live_bytes = 0;
-  }
-  for (auto it = merged.begin(); it != std::default_sentinel; ++it) {
-    const auto &[key_span, kde] = *it;
-    merged_stats[kde.file_id].live_bytes +=
-        entry_size(key_span.size(), kde.value_size);
   }
 
   auto &merged_tombs = a.tombstones;
@@ -1055,10 +1046,22 @@ auto DB::recovery_load_parallel(EngineState s,
     results = std::move(next);
   }
 
-  // Phase 4: assembly.
+  // Phase 4: recompute live_bytes once from the fully-merged tree.
+  auto &final_stats = results[0].file_stats;
+  for (auto &[fid, fs] : final_stats) {
+    fs.live_bytes = 0;
+  }
+  for (auto it = results[0].key_dir.begin(); it != std::default_sentinel;
+       ++it) {
+    const auto &[key_span, kde] = *it;
+    final_stats[kde.file_id].live_bytes +=
+        entry_size(key_span.size(), kde.value_size);
+  }
+
+  // Phase 5: assembly.
   s.key_dir = std::move(results[0].key_dir);
   s.next_lsn = results[0].max_lsn + 1;
-  file_stats_ = std::move(results[0].file_stats);
+  file_stats_ = std::move(final_stats);
   return s;
 }
 

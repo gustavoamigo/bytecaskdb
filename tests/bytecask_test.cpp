@@ -927,6 +927,18 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
     }
   };
 
+  // Helper: collect per-file stats as a sorted vector for comparison.
+  // File IDs may differ, but the multiset of (live_bytes, total_bytes)
+  // must match between serial and parallel.
+  auto collect_stats = [](bytecask::DB &db) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> vals;
+    for (const auto &[fid, fs] : db.file_stats()) {
+      vals.emplace_back(fs.live_bytes, fs.total_bytes);
+    }
+    std::ranges::sort(vals);
+    return vals;
+  };
+
   // Count data files for the max-parallelism test.
   int data_file_count = 0;
   for (const auto &e : std::filesystem::directory_iterator{db_path}) {
@@ -935,21 +947,45 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
   }
   REQUIRE(data_file_count > 1);
 
+  // Collect serial file_stats as baseline for parallel comparison.
+  // Must use a separate copy since opening mutates the directory.
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> serial_stats_vals;
+  {
+    const auto serial_path = td.path / "serial_baseline";
+    std::filesystem::copy(db_path, serial_path,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(serial_path, {.max_file_bytes = 1, .recovery_threads = 1});
+    verify("serial_baseline", collect(db));
+    serial_stats_vals = collect_stats(db);
+  }
+
   SECTION("serial recovery") {
-    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
+    const auto p = td.path / "s1";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
   }
 
   SECTION("parallel recovery (2 workers)") {
-    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 2});
+    const auto p = td.path / "p2";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 2});
     verify("parallel/2", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
   }
 
   SECTION("parallel recovery (W = file count)") {
+    const auto p = td.path / "pmax";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(
-        db_path, {.max_file_bytes = 1,
-                  .recovery_threads = static_cast<unsigned>(data_file_count)});
+        p, {.max_file_bytes = 1,
+            .recovery_threads = static_cast<unsigned>(data_file_count)});
     verify("parallel/max", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
   }
 }
 
@@ -1043,14 +1079,41 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
     }
   };
 
+  auto collect_stats = [](bytecask::DB &db) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> vals;
+    for (const auto &[fid, fs] : db.file_stats()) {
+      vals.emplace_back(fs.live_bytes, fs.total_bytes);
+    }
+    std::ranges::sort(vals);
+    return vals;
+  };
+
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> serial_stats_vals;
+  {
+    const auto serial_path = td.path / "serial_baseline";
+    std::filesystem::copy(db_path, serial_path,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(serial_path, {.max_file_bytes = 1, .recovery_threads = 1});
+    verify("serial_baseline", collect(db));
+    serial_stats_vals = collect_stats(db);
+  }
+
   SECTION("serial") {
-    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
+    const auto p = td.path / "s1";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
   }
 
   SECTION("parallel (4 workers)") {
-    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 4});
+    const auto p = td.path / "p4";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 4});
     verify("parallel/4", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
   }
 }
 
@@ -1116,27 +1179,58 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
     }
   };
 
+  auto collect_stats = [](bytecask::DB &db) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> vals;
+    for (const auto &[fid, fs] : db.file_stats()) {
+      vals.emplace_back(fs.live_bytes, fs.total_bytes);
+    }
+    std::ranges::sort(vals);
+    return vals;
+  };
+
   int data_file_count = 0;
   for (const auto &e : std::filesystem::directory_iterator{db_path}) {
     if (e.path().extension() == ".data")
       ++data_file_count;
   }
 
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> serial_stats_vals;
+  {
+    const auto serial_path = td.path / "serial_baseline";
+    std::filesystem::copy(db_path, serial_path,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(serial_path, {.max_file_bytes = 1, .recovery_threads = 1});
+    verify("serial_baseline", collect(db));
+    serial_stats_vals = collect_stats(db);
+  }
+
   SECTION("serial") {
-    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
+    const auto p = td.path / "s1";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
   }
 
   SECTION("parallel (3 workers)") {
-    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 3});
+    const auto p = td.path / "p3";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 3});
     verify("parallel/3", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
   }
 
   SECTION("parallel (W = file count)") {
+    const auto p = td.path / "pmax";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(
-        db_path, {.max_file_bytes = 1,
-                  .recovery_threads = static_cast<unsigned>(data_file_count)});
+        p, {.max_file_bytes = 1,
+            .recovery_threads = static_cast<unsigned>(data_file_count)});
     verify("parallel/max", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
   }
 }
 
