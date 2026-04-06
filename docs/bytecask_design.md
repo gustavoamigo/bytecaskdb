@@ -630,46 +630,59 @@ Hint files are compact companion files to sealed (rotated) data files. Each hint
 
 ### Entry Structure
 
+`flush_hints_for()` writes entries in sorted key order (ascending), enabling prefix compression: each entry stores only the bytes that differ from the previous key.
+
 ```
 +------------------+
-| Hint Header      | 23 bytes
+| Hint Header      | 24 bytes
 +------------------+
-| Key Data         | key_size bytes
+| Suffix Data      | suffix_len bytes (key bytes after the shared prefix)
 +------------------+
-| CRC32            | 4 bytes (trailing)
+     ...repeated for each entry...
++------------------+
+| File CRC32       | 4 bytes (file trailer)
 +------------------+
 ```
 
-Total fixed overhead per entry: **27 bytes** (23-byte header + 4-byte trailing CRC).
+Total fixed overhead per entry: **24 bytes** (header). The key is stored as `prefix_len + suffix_data` (prefix_len bytes are reconstructed by the reader from the previous key). A single 4-byte CRC-32C trailer at the end of the file covers all entry bytes.
 
-> **Note on the 27-byte fixed overhead**: the five header fields sum to 23 bytes (u64 + u8 + u64 + u16 + u32). The "27 bytes" refers to the total fixed overhead including the trailing CRC, not the header alone. `BulkBegin`/`BulkEnd` data file entries are **never** written to hint files — only `Put` and `Delete` entries are included.
+> `BulkBegin`/`BulkEnd` data file entries are **never** written to hint files — only `Put` and `Delete` entries are included.
 
-### Hint Header (23 bytes)
+### Hint Header (24 bytes)
 
-| Offset | Size | Field       | Type   | Description                                    |
-|--------|------|-------------|--------|------------------------------------------------|
-| 0      | 8    | Sequence    | u64 LE | Entry sequence number (LSN)                    |
-| 8      | 1    | EntryType   | u8     | Entry kind: `Put` (0x01) or `Delete` (0x02) only — `BulkBegin`/`BulkEnd` are never written to hint files |
-| 9      | 8    | File Offset | u64 LE | Byte offset of the entry in the data file      |
-| 17     | 2    | Key Size    | u16 LE | Key length in bytes                            |
-| 19     | 4    | Value Size  | u32 LE | Value length in bytes (to rebuild the key directory without reading the data file) |
+| Offset | Size | Field        | Type   | Description                                    |
+|--------|------|--------------|--------|------------------------------------------------|
+| 0      | 8    | Sequence     | u64 LE | Entry sequence number (LSN)                    |
+| 8      | 1    | EntryType    | u8     | Entry kind: `Put` (0x01) or `Delete` (0x02) only |
+| 9      | 8    | File Offset  | u64 LE | Byte offset of the entry in the data file      |
+| 17     | 4    | Value Size   | u32 LE | Value length in bytes                          |
+| 21     | 1    | Prefix Len   | u8     | Bytes shared with the previous entry's key (0 for the first entry; capped at 255) |
+| 22     | 2    | Suffix Len   | u16 LE | Length of the key bytes that follow in this entry |
 
-`Value Size` is stored so the reader can compute the full on-disk entry size in the data file without reading it, enabling future space-accounting features.
+`Value Size` is stored so the reader can compute the full on-disk entry size in the data file without reading it.
 
-### Trailing CRC (4 bytes)
+### File Trailer (4 bytes)
 
-| Offset from entry start | Size | Field | Type   | Description                          |
-|-------------------------|------|-------|--------|--------------------------------------|
-| 23 + key_size           | 4    | CRC32 | u32 LE | Checksum of all preceding entry bytes |
+| Offset from file start | Size | Field  | Type   | Description                                       |
+|------------------------|------|--------|--------|---------------------------------------------------|
+| end - 4                | 4    | CRC32  | u32 LE | CRC-32C (Castagnoli) over all preceding entry bytes |
 
-CRC placement mirrors data file entries: accumulate header + key data in one sequential pass, then append the checksum at the end.
+`OpenForRead` verifies the trailer CRC eagerly before parsing any entries. On mismatch the entire hint file is rejected by throwing `std::runtime_error`. Corrupt hint files cause the engine to regenerate the hint from the raw data file during recovery.
 
 ### Size Constants
 
-- `kHintHeaderSize = 23` — fixed header fields
-- `kHintCrcSize = 4` — trailing CRC
-- Total fixed overhead: `kHintHeaderSize + kHintCrcSize = 27`
-- Total entry size: `kHintHeaderSize + key_size + kHintCrcSize`
+- `kHintHeaderSize = 24` — fixed header fields (no per-entry CRC)
+- Total entry size: `kHintHeaderSize + suffix_len` (variable)
+- File overhead: 4 bytes (file CRC trailer)
+
+### Scanner API
+
+`HintFile::make_scanner()` returns a `Scanner` object that iterates over entries sequentially. The scanner owns a `key_buf_` accumulator for zero-copy prefix reconstruction: `resize()` keeps shared prefix bytes in-place and only the suffix delta is copied per call. `HintEntry.key` is a `span<const byte>` into `key_buf_`, valid until the next `scanner.next()` call.
+
+```cpp
+auto scanner = hint.make_scanner();
+while (auto he = scanner.next()) { /* use he->key, he->sequence, … */ }
+```
 
 ### Recovery
 

@@ -1,7 +1,7 @@
 module;
 #include <cstddef>
 #include <cstdint>
-#include <format>
+#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -15,25 +15,25 @@ namespace bytecask {
 
 // Hint entry layout (all fields little-endian):
 //
-//   Offset  0: sequence     (u64) — monotonic LSN copied from the data file
-//   Offset  8: entry_type   (u8)  — mirrors DataFile EntryType (Put/Delete/…)
-//   Offset  9: file_offset  (u64) — byte offset of the entry in the companion
-//                                   .data file
-//   Offset 17: key_size     (u16) — key length in bytes
-//   Offset 19: value_size   (u32) — value length in bytes (for size tracking
-//                                   without reading the data file)
-//   Offset 23: key data     (key_size bytes)
-//   Trailing:  crc32        (u32) — CRC-32C (Castagnoli) over all preceding
-//   bytes
+//   Offset  0: sequence    (u64) — monotonic LSN copied from the data file
+//   Offset  8: entry_type  (u8)  — Put/Delete
+//   Offset  9: file_offset (u64) — byte offset in the companion .data file
+//   Offset 17: value_size  (u32) — value length in bytes
+//   Offset 21: prefix_len  (u8)  — bytes shared with previous entry's key
+//                                   (0 for the first entry; capped at 255)
+//   Offset 22: suffix_len  (u16) — new bytes following the shared prefix
+//   Offset 24: suffix_data (suffix_len bytes)
+//   ─────────────────────────────────────────
+//   File trailer: crc32 (u32) — CRC-32C over all entry bytes; written once
+//                               at end of file by HintFile::sync().
 
 export constexpr std::size_t kHintHeaderSize =
-    23; // sequence(8) + entry_type(1) + file_offset(8) + key_size(2) +
-        // value_size(4)
-export constexpr std::size_t kHintCrcSize = 4; // trailing CRC
+    24; // sequence(8) + entry_type(1) + file_offset(8) + value_size(4) +
+        // prefix_len(1) + suffix_len(2)
 
 // Parsed hint file entry (zero-copy).
-// key is a span into the HintFile's backing buffer; valid only while the
-// HintFile is alive.
+// key is a span into the Scanner's internal key buffer; valid only until
+// the next call to Scanner::next().
 export struct HintEntry {
   std::uint64_t sequence{};
   EntryType entry_type{};
@@ -42,59 +42,59 @@ export struct HintEntry {
   std::uint32_t value_size{};
 };
 
-// Serialize one hint entry into a flat byte buffer.
-// CRC-32 covers all bytes except itself and is appended as the final four
-// bytes.
+// Serializes one hint entry into a flat byte vector (header + suffix, no CRC).
+// prefix_len and suffix must be pre-computed by the caller (HintFile::append).
 export auto serialize_entry(std::uint64_t sequence, EntryType entry_type,
-                            std::uint64_t file_offset,
-                            std::span<const std::byte> key,
-                            std::uint32_t value_size)
+                            std::uint64_t file_offset, std::uint32_t value_size,
+                            std::uint8_t prefix_len,
+                            std::span<const std::byte> suffix)
     -> std::vector<std::byte> {
-  const auto total = kHintHeaderSize + key.size() + kHintCrcSize;
-  std::vector<std::byte> buf(total);
-
-  Crc32 crc{};
-  ByteWriter w{buf, &crc};
+  std::vector<std::byte> buf(kHintHeaderSize + suffix.size());
+  ByteWriter w{buf};
   w.put(sequence);
   w.put(static_cast<std::uint8_t>(entry_type));
   w.put(file_offset);
-  w.put(narrow<std::uint16_t>(key.size()));
   w.put(value_size);
-  w.put_bytes(key);
-
-  // CRC itself is NOT covered by the checksum — write through a bare writer.
-  ByteWriter tail{std::span{buf}.subspan(w.pos())};
-  tail.put(crc.finalize());
+  w.put(prefix_len);
+  w.put(narrow<std::uint16_t>(suffix.size()));
+  w.put_bytes(suffix);
   return buf;
 }
 
-// Deserialize a hint entry from a contiguous buffer (header + key + CRC).
-// Zero-copy: key is a span directly into buf. buf must outlive the returned
-// HintEntry. CRC is verified; throws std::runtime_error on mismatch.
-export auto deserialize_entry(std::span<const std::byte> buf)
-    -> HintEntry {
-  ByteReader r{buf};
-  const auto sequence = r.get<std::uint64_t>();
-  const auto entry_type = static_cast<EntryType>(r.get<std::uint8_t>());
-  const auto file_offset_val = r.get<std::uint64_t>();
-  const auto key_size = r.get<std::uint16_t>();
-  const auto value_size = r.get<std::uint32_t>();
-  const auto key_span = r.get_bytes(key_size);
-
-  Crc32 crc{};
-  crc.update(buf.subspan(0, buf.size() - kHintCrcSize));
-  const auto computed = crc.finalize();
-  const auto stored = read_le<std::uint32_t>(buf, buf.size() - kHintCrcSize);
-  if (computed != stored) {
-    throw std::runtime_error{
-        std::format("deserialize_entry (hint): CRC mismatch")};
+// Deserializes one hint entry from the start of buf, updating key_buf
+// in-place for zero-copy prefix decompression.
+// Returns {entry, bytes_consumed}. entry.key spans key_buf; valid until
+// the next call. Throws std::runtime_error on a truncated entry.
+export auto deserialize_entry(std::span<const std::byte> buf,
+                              std::vector<std::byte> &key_buf)
+    -> std::pair<HintEntry, std::size_t> {
+  if (buf.size() < kHintHeaderSize) {
+    throw std::runtime_error{"deserialize_entry (hint): truncated header"};
   }
+  ByteReader r{buf};
+  const auto sequence    = r.get<std::uint64_t>();
+  const auto entry_type  = static_cast<EntryType>(r.get<std::uint8_t>());
+  const auto file_offset = r.get<std::uint64_t>();
+  const auto value_size  = r.get<std::uint32_t>();
+  const auto prefix_len  = r.get<std::uint8_t>();
+  const auto suffix_len  = r.get<std::uint16_t>();
 
-  return HintEntry{.sequence = sequence,
-                       .entry_type = entry_type,
-                       .file_offset = file_offset_val,
-                       .key = key_span,
-                       .value_size = value_size};
+  const auto total = kHintHeaderSize + suffix_len;
+  if (buf.size() < total) {
+    throw std::runtime_error{"deserialize_entry (hint): truncated entry"};
+  }
+  // Resize keeps prefix bytes untouched; only the suffix delta is overwritten.
+  key_buf.resize(std::size_t{prefix_len} + suffix_len);
+  std::memcpy(key_buf.data() + prefix_len,
+              buf.data() + kHintHeaderSize,
+              suffix_len);
+
+  return {HintEntry{.sequence    = sequence,
+                    .entry_type  = entry_type,
+                    .file_offset = file_offset,
+                    .key         = std::span<const std::byte>{key_buf},
+                    .value_size  = value_size},
+          total};
 }
 
 } // namespace bytecask
