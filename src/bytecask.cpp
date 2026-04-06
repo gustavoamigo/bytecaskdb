@@ -1,4 +1,5 @@
 module;
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -414,7 +415,8 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
 
   auto hint = HintFile::OpenForWrite(tmp_path);
   bool in_batch = false;
-  std::vector<PendingHint> pending;
+  std::vector<PendingHint> pending;  // staging buffer for current batch
+  std::vector<PendingHint> all_hints; // all confirmed entries across the file
   Offset off = 0;
 
   while (auto result = file->scan(off)) {
@@ -427,7 +429,7 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
       break;
     case EntryType::BulkEnd:
       for (auto &pe : pending) {
-        hint.append(pe.seq, pe.type, pe.file_off, pe.key, pe.val_size);
+        all_hints.push_back(std::move(pe));
       }
       pending.clear();
       in_batch = false;
@@ -439,8 +441,9 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
                            narrow<std::uint32_t>(entry.value.size()),
                            entry.key});
       } else {
-        hint.append(entry.sequence, entry.entry_type, entry_off, entry.key,
-                    narrow<std::uint32_t>(entry.value.size()));
+        all_hints.push_back({entry.sequence, entry.entry_type, entry_off,
+                             narrow<std::uint32_t>(entry.value.size()),
+                             entry.key});
       }
       break;
     }
@@ -452,6 +455,19 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
               << " while generating hint file\n";
   }
 
+  // Sort by key asc; within equal keys, seq desc so first entry = authoritative.
+  std::ranges::sort(all_hints, [](const auto &a, const auto &b) {
+    return a.key < b.key || (a.key == b.key && a.seq > b.seq);
+  });
+  // Erase all but the first (highest-seq) entry per key.
+  auto tail = std::ranges::unique(all_hints, [](const auto &a, const auto &b) {
+    return a.key == b.key;
+  }).begin();
+  all_hints.erase(tail, all_hints.end());
+
+  for (const auto &pe : all_hints) {
+    hint.append(pe.seq, pe.type, pe.file_off, pe.key, pe.val_size);
+  }
   hint.sync();
   std::filesystem::rename(tmp_path, hint_path);
 }

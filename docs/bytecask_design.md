@@ -676,7 +676,7 @@ CRC placement mirrors data file entries: accumulate header + key data in one seq
 On engine startup:
 
 1. Discard any `.hint.tmp` files — incomplete hint files from a crash mid-rotation.
-2. Open all `.data` files and seal them. For any data file without a companion `.hint`, generate one via `flush_hints_for()` (batch-aware: buffers entries between BulkBegin/BulkEnd, discards incomplete batches, logs a warning).
+2. Open all `.data` files and seal them. For any data file without a companion `.hint`, generate one via `flush_hints_for()` (batch-aware: buffers entries between BulkBegin/BulkEnd, discards incomplete batches, logs a warning). Hint entries are sorted by key and deduplicated — within a data file, only the highest-sequence entry per key is retained — so each key appears at most once per hint file.
 3. Recover exclusively from hint files. For each hint entry:
    - `Put`: insert `(key → {sequence, file_id, file_offset, value_size})` only if `entry.sequence > dir[key].sequence` (skip if a fresher entry is already present).
    - `Delete`: remove the key from the tree if `entry.sequence > dir[key].sequence`; otherwise skip.
