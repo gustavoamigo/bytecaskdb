@@ -24,7 +24,16 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-078 | Published library module boundary | Decision: use Path A — keep sub-components (radix_tree, data_file, hint_file, etc.) as top-level modules for isolated testing; enforce public boundary at install time by only shipping the bytecask.engine BMI. Revisit Path B (full-partition restructure) if airtight compiler-enforced encapsulation is needed. |
 | BC-041 | `ReadOptions::verify_checksums` flag | Allow skipping CRC verification on bulk scans for ~5% win. Mirrors LevelDB/RocksDB `verify_checksums` option. |
-
+| BC-090 | Error handling | Review Error handling, we haven't reviewed this part |
+| BC-091 | Logging | Logging? (what other projects use) |
+| BC-092 | UUIDv4 test | Test and protections if customers use UUIDv4 as key (Maybe we will need a Adaptive Radix Tree extension) |
+| BC-093 | Vacuum benchmarks | Add benchmark tests for the vacuum (with performance and data file reclaim tests) |
+| BC-094 | Profile memory | Profile memory usage (maybe benchmark tests that capture that) |
+| BC-095 | Robustness test suite | Robustness and correctness validation/test suite |
+| BC-096 | Document invariants | Document correctness invariants and how it's implemented |
+| BC-097 | Pre-launch README | Write Read me and reorganize documentation (pre-launch phase) |
+| BC-098 | Open source license | Add license (MIT) |
+| BC-099 | Publish benchmarks | Run official benchmarks to share with the world. |
 
 ## Done
 
