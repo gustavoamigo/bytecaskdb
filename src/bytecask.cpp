@@ -41,7 +41,7 @@ namespace bytecask {
 
 namespace {
 
-// Generates a data file stem using a microsecond-precision UTC timestamp.
+  // Generates a data file stem using a microsecond-precision UTC timestamp.
 // Format: "data_{YYYYMMDDHHmmssUUUUUU}"
 auto make_data_file_stem() -> std::string {
   const auto now = std::chrono::system_clock::now();
@@ -71,6 +71,7 @@ auto now_ns() -> std::int64_t {
 
 #pragma endregion
 
+#pragma region Engine State
 // EngineState::apply_rotation is defined here because it needs make_data_file_stem.
 auto EngineState::apply_rotation(const std::filesystem::path &dir) const
     -> EngineState {
@@ -85,6 +86,7 @@ auto EngineState::apply_rotation(const std::filesystem::path &dir) const
   s.files = std::move(next_files);
   return s;
 }
+#pragma endregion
 
 #pragma region Construction
 
@@ -158,7 +160,12 @@ auto DB::get(const ReadOptions &opts, BytesView key,
   if (!kv) {
     return false;
   }
+  // Per-thread I/O scratch buffer — reused across calls to avoid heap churn.
+  // Thread-exit destructor is intentional; suppress the Clang diagnostic.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
   thread_local Bytes io_buf;
+#pragma clang diagnostic pop
   s->files->at(kv->file_id)
       ->read_value(kv->file_offset, narrow<std::uint16_t>(key.size()),
                    kv->value_size, io_buf, out);
@@ -339,7 +346,7 @@ auto DB::keys_from(const ReadOptions & /*opts*/, BytesView from) const
 // vacuum scans and rewrites data — only the brief commit step acquires
 // write_mu_.
 auto DB::vacuum(VacuumOptions opts) -> bool {
-  std::lock_guard vg{*vacuum_mu_};
+  std::lock_guard<std::mutex> vg{*vacuum_mu_};
 
   // Drain in-flight background hint writes so that vacuum's
   // flush_hints_for call cannot race on the same .hint.tmp file.
@@ -351,7 +358,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   std::uint32_t active_id{};
   std::uint64_t active_size{};
   {
-    std::lock_guard wg{*write_mu_};
+    std::lock_guard<std::mutex> wg{*write_mu_};
     stats_snap = file_stats_;
     auto s = state_.load();
     active_id = s->active_file_id;
@@ -535,7 +542,8 @@ auto DB::vacuum_scan_and_copy(
       result.total_bytes += entry_size(entry.key.size(), 0);
       break;
     }
-    default:
+    case EntryType::BulkBegin:
+    case EntryType::BulkEnd:
       break;
     }
   };
@@ -673,7 +681,7 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
   flush_hints_for(new_file, dir_);
 
   {
-    std::lock_guard wg{*write_mu_};
+    std::lock_guard<std::mutex> wg{*write_mu_};
     vacuum_commit(file_id, scan, new_file);
   }
   vacuum_defer_old_file(snap, file_id);
@@ -690,7 +698,7 @@ void DB::vacuum_absorb_file(std::uint32_t file_id) {
   const auto &old_file = *snap->files->at(file_id);
 
   {
-    std::lock_guard wg{*write_mu_};
+    std::lock_guard<std::mutex> wg{*write_mu_};
     auto &active = snap->active_file();
     auto scan = vacuum_scan_and_copy(snap, old_file, active, file_id);
     active.sync();
@@ -745,7 +753,11 @@ auto DB::load_state(const ReadOptions &opts) const
     std::shared_ptr<const EngineState> snapshot;
     std::int64_t last_write_time{0};
   };
+  // Per-thread state cache — thread-exit destructor is intentional.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
   thread_local TlState tl;
+#pragma clang diagnostic pop
   const auto wt = state_time_.load(std::memory_order_relaxed);
   const auto tolerance =
       std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1034,7 +1046,7 @@ auto DB::recovery_load_parallel(EngineState s,
     for (unsigned i = 0; i < W; ++i) {
       threads.emplace_back([&, i] {
         auto result = recovery_build_from_hints(worker_files[i]);
-        std::unique_lock lk{queue_mu};
+        std::unique_lock<std::mutex> lk{queue_mu};
         queue.push_back(std::move(result));
         ++finished_count;
         queue_cv.notify_one();
@@ -1047,7 +1059,7 @@ auto DB::recovery_load_parallel(EngineState s,
     unsigned merged_count = 0;
 
     while (merged_count < W) {
-      std::unique_lock lk{queue_mu};
+      std::unique_lock<std::mutex> lk{queue_mu};
       queue_cv.wait(lk, [&] { return !queue.empty(); });
       auto incoming = std::move(queue.back());
       queue.pop_back();

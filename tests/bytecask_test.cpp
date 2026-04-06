@@ -575,7 +575,7 @@ TEST_CASE("DB recovery: cross-file tombstone suppresses stale put",
     // threshold=1 forces each write into its own file.
     auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
     db.put({}, to_bytes("gone"), to_bytes("v1")); // file 0
-    db.del({}, to_bytes("gone")); // file 1 — Delete seq > Put seq
+    (void)db.del({}, to_bytes("gone")); // file 1 — Delete seq > Put seq
     db.put({}, to_bytes("keep"), to_bytes("v2")); // file 2
   }
 
@@ -841,8 +841,8 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
     const auto len = std::uniform_int_distribution<int>(1, 6)(gen);
     std::string k;
     for (int i = 0; i < len; ++i) {
-      k += alphabet[std::uniform_int_distribution<int>(
-          0, static_cast<int>(alphabet.size()) - 1)(gen)];
+      k += alphabet[static_cast<std::size_t>(std::uniform_int_distribution<int>(
+          0, static_cast<int>(alphabet.size()) - 1)(gen))];
     }
     return k;
   };
@@ -1005,8 +1005,8 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
     const auto len = std::uniform_int_distribution<int>(1, 5)(gen);
     std::string k;
     for (int i = 0; i < len; ++i) {
-      k += alphabet[std::uniform_int_distribution<int>(
-          0, static_cast<int>(alphabet.size()) - 1)(gen)];
+      k += alphabet[static_cast<std::size_t>(std::uniform_int_distribution<int>(
+          0, static_cast<int>(alphabet.size()) - 1)(gen))];
     }
     return k;
   };
@@ -1689,7 +1689,7 @@ TEST_CASE("FileStats: del decrements live_bytes, tombstone in total_bytes",
   auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("k"), to_bytes("value"));
-  db.del({}, to_bytes("k"));
+  (void)db.del({}, to_bytes("k"));
 
   auto stats = db.file_stats();
   REQUIRE(stats.size() == 1);
@@ -1866,7 +1866,7 @@ TEST_CASE("FileStats: parallel recovery matches serial",
     // Delete some.
     for (int i = 40; i < 50; ++i) {
       auto k = std::format("key{:04d}", i);
-      db.del({}, to_bytes(k));
+      (void)db.del({}, to_bytes(k));
     }
   }
 
@@ -1925,15 +1925,6 @@ TEST_CASE("FileStats: parallel recovery matches serial",
 // Vacuum tests
 // ===========================================================================
 
-// Helper: count .data files in a directory.
-static auto count_data_files(const std::filesystem::path &dir) -> int {
-  int count = 0;
-  for (const auto &e : std::filesystem::directory_iterator{dir}) {
-    if (e.path().extension() == ".data") ++count;
-  }
-  return count;
-}
-
 // ---------------------------------------------------------------------------
 // vacuum_compact_file: basic compaction
 // ---------------------------------------------------------------------------
@@ -1950,7 +1941,6 @@ TEST_CASE("vacuum compact removes dead entries", "[vacuum]") {
   // At this point we have 3 files: file with old k1, file with new k1,
   // and an empty active file. Total dead bytes > 0.
   const auto stats_before = db.file_stats();
-  const auto files_before = count_data_files(td.path / "db");
 
   // Vacuum with threshold=0 so all fragmented files qualify.
   REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
@@ -2067,7 +2057,7 @@ TEST_CASE("vacuum absorb moves entries to active file", "[vacuum]") {
   auto db3 = bytecask::DB::open(td.path / "db");
   const auto stats_before = db3.file_stats().size();
 
-  db3.vacuum({.fragmentation_threshold = 0.0});
+  (void)db3.vacuum({.fragmentation_threshold = 0.0});
 
   // One sealed file should have been absorbed → fewer files in registry.
   const auto stats_after = db3.file_stats().size();
@@ -2096,7 +2086,7 @@ TEST_CASE("vacuum absorb preserves LSNs across recovery", "[vacuum]") {
   // Reopen with large threshold so absorb is used.
   {
     auto db2 = bytecask::DB::open(td.path / "db");
-    db2.vacuum({.fragmentation_threshold = 0.0});
+    (void)db2.vacuum({.fragmentation_threshold = 0.0});
     // db2 destroyed here — background worker drains, hints written
   }
 

@@ -297,7 +297,7 @@ public:
   // Returns a snapshot of per-file stats (under write_mu_).
   // Only available in test builds (BYTECASK_TESTING).
   [[nodiscard]] auto file_stats() const -> std::map<std::uint32_t, FileStats> {
-    std::lock_guard lk{*write_mu_};
+    std::lock_guard<std::mutex> lk{*write_mu_};
     return file_stats_;
   }
 #endif

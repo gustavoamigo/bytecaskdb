@@ -31,7 +31,7 @@ public:
   // Amortises a sync operation across concurrent callers. do_sync() is called
   // by exactly one leader per batch; all others piggyback on its result.
   void sync(std::invocable auto do_sync) {
-    std::unique_lock lk{mu_};
+    std::unique_lock<std::mutex> lk{mu_};
 
     // Phase 1: take a ticket — our writev is done, data is in page cache.
     const auto my_ticket = next_ticket_++;
@@ -97,7 +97,7 @@ public:
 
   ~BackgroundWorker() {
     {
-      std::unique_lock lk{mu_};
+      std::unique_lock<std::mutex> lk{mu_};
       stop_ = true;
     }
     cv_task_.notify_one();
@@ -110,7 +110,7 @@ public:
   // Enqueue a task. Non-blocking; returns immediately.
   void dispatch(std::function<void()> task) {
     {
-      std::unique_lock lk{mu_};
+      std::unique_lock<std::mutex> lk{mu_};
       queue_.push(std::move(task));
     }
     cv_task_.notify_one();
@@ -118,7 +118,7 @@ public:
 
   // Block until the queue is empty and the running task (if any) has finished.
   void drain() {
-    std::unique_lock lk{mu_};
+    std::unique_lock<std::mutex> lk{mu_};
     cv_idle_.wait(lk, [this] { return queue_.empty() && active_ == 0; });
   }
 
@@ -127,7 +127,7 @@ private:
     while (true) {
       std::function<void()> task;
       {
-        std::unique_lock lk{mu_};
+        std::unique_lock<std::mutex> lk{mu_};
         cv_task_.wait(lk, [this] { return stop_ || !queue_.empty(); });
         if (stop_ && queue_.empty())
           return;
@@ -144,7 +144,7 @@ private:
         std::cerr << "bytecask: background worker: unknown exception\n";
       }
       {
-        std::unique_lock lk{mu_};
+        std::unique_lock<std::mutex> lk{mu_};
         --active_;
       }
       cv_idle_.notify_all();
