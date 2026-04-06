@@ -755,15 +755,17 @@ private:
   // -- merge_impl --
   // Recursively merges two subtrees rooted at `a` and `b`.
   // Disjoint subtrees are shared in O(1) via IntrusivePtr copy (no clone).
-  // Size of the merged tree is computed by the caller via count_keys().
+  // Returns {merged_root, overlap_count} where overlap_count is the number
+  // of keys present in both a and b (i.e. where resolve was called).
   template <typename ResolveFunc>
   static auto merge_impl(const IntrusivePtr<Node<V>> &a,
                          const IntrusivePtr<Node<V>> &b,
-                         ResolveFunc &&resolve) -> IntrusivePtr<Node<V>> {
+                         ResolveFunc &&resolve)
+      -> std::pair<IntrusivePtr<Node<V>>, std::size_t> {
     if (!a)
-      return b;
+      return {b, 0};
     if (!b)
-      return a;
+      return {a, 0};
 
     // Align the two nodes on their common prefix.
     auto pa = std::span<const std::byte>{a->prefix.data(), a->prefix.size()};
@@ -791,7 +793,7 @@ private:
       b_trimmed->prefix = std::move(b_suffix);
       split->insert_child(pb[cpl], std::move(b_trimmed));
 
-      return split;
+      return {std::move(split), 0};
     }
 
     if (cpl < pa.size()) {
@@ -805,12 +807,16 @@ private:
       a_trimmed->prefix = std::move(a_suffix);
 
       auto *existing = new_b->find_child_mut(pa[cpl]);
+      std::size_t overlaps = 0;
       if (existing) {
-        existing->second = merge_impl(a_trimmed, existing->second, resolve);
+        auto [child, child_overlaps] =
+            merge_impl(a_trimmed, existing->second, resolve);
+        existing->second = std::move(child);
+        overlaps = child_overlaps;
       } else {
         new_b->insert_child(pa[cpl], std::move(a_trimmed));
       }
-      return new_b;
+      return {std::move(new_b), overlaps};
     }
 
     if (cpl < pb.size()) {
@@ -824,23 +830,30 @@ private:
       b_trimmed->prefix = std::move(b_suffix);
 
       auto *existing = new_a->find_child_mut(pb[cpl]);
+      std::size_t overlaps = 0;
       if (existing) {
-        existing->second = merge_impl(existing->second, b_trimmed, resolve);
+        auto [child, child_overlaps] =
+            merge_impl(existing->second, b_trimmed, resolve);
+        existing->second = std::move(child);
+        overlaps = child_overlaps;
       } else {
         new_a->insert_child(pb[cpl], std::move(b_trimmed));
       }
-      return new_a;
+      return {std::move(new_a), overlaps};
     }
 
     // Full prefix match — both nodes share the same compressed key prefix.
     // Clone a and fold b's value + children into it.
     auto merged = a->clone();
+    std::size_t overlaps = 0;
 
     if (b->has_value()) {
-      if (merged->has_value())
+      if (merged->has_value()) {
         merged->set_value(resolve(merged->value_, b->value_));
-      else
+        ++overlaps;
+      } else {
         merged->set_value(b->value_);
+      }
     }
 
     if (b->has_children()) {
@@ -848,7 +861,10 @@ private:
         auto [tb, child_b] = b->child_at(i);
         auto *slot = merged->find_child_mut(tb);
         if (slot) {
-          slot->second = merge_impl(slot->second, child_b, resolve);
+          auto [child, child_overlaps] =
+              merge_impl(slot->second, child_b, resolve);
+          slot->second = std::move(child);
+          overlaps += child_overlaps;
         } else {
           // Disjoint subtree — share it in O(1), no clone needed.
           merged->insert_child(tb, child_b);
@@ -856,19 +872,7 @@ private:
       }
     }
 
-    return merged;
-  }
-
-  // Count all value-bearing nodes in a subtree.
-  static auto count_keys(const IntrusivePtr<Node<V>> &node) -> std::size_t {
-    if (!node)
-      return 0;
-    std::size_t n = node->has_value() ? 1 : 0;
-    if (node->has_children()) {
-      for (std::size_t i = 0; i < node->child_count(); ++i)
-        n += count_keys(node->child_at(i).second);
-    }
-    return n;
+    return {std::move(merged), overlaps};
   }
 
   friend class TransientRadixTree<V>;
@@ -1117,9 +1121,9 @@ auto PersistentRadixTree<V>::merge(const PersistentRadixTree &a,
     return b;
   if (!b.root_)
     return a;
-  auto new_root =
+  auto [new_root, overlaps] =
       merge_impl(a.root_, b.root_, std::forward<ResolveFunc>(resolve));
-  auto sz = count_keys(new_root);
+  auto sz = a.size_ + b.size_ - overlaps;
   return PersistentRadixTree{std::move(new_root), sz};
 }
 
