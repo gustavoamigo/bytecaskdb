@@ -174,15 +174,15 @@ The function walks both trees in tandem, recursing only where the two trees over
 
 **Size computation:**
 
-The merged tree's `size_` is computed by walking the result with `count_keys()` in O(N). Incremental tracking during the recursive merge was considered but is error-prone in the asymmetric prefix cases (Cases 3/4 where one node contains the other). The O(N) post-walk is simple, correct, and dominated by the merge cost itself.
+The merged tree's `size_` is computed as `a.size() + b.size() - overlaps`, where `overlaps` is the number of keys present in both trees (i.e. where `resolve` was called). `merge_impl` tracks this count during traversal and returns it alongside the merged root, avoiding an O(N) post-merge walk.
 
 **Complexity:**
 
 | Scenario | Cost |
 |---|---|
-| Fully disjoint trees (no shared keys) | O(1) per subtree adoption; O(N) for size walk |
+| Fully disjoint trees (no shared keys) | O(1) per subtree adoption |
 | Fully overlapping trees (all keys shared) | O(N) — must visit every conflicting leaf |
-| Partial overlap | O(overlap) for merge + O(N) for size walk |
+| Partial overlap | O(overlap) for merge |
 
 The structural sharing guarantee: any subtree that exists in only one input is adopted by pointer without cloning any of its nodes. Cloning only occurs on the path from the root to each conflict point.
 
