@@ -380,7 +380,7 @@ for each hint entry h (processed in arbitrary file order, LSN wins):
 
 Processing order across files does not matter — LSN comparison always picks the correct winner, so `live_bytes` converges to the right values.
 
-**Parallel recovery**: `RecoveryResult` includes a `file_stats` map alongside `key_dir`, `tombstones`, and `max_lsn`. Each worker builds its own `file_stats` during Phase 2 using the algorithm above. During Phase 3 fan-in merge, `file_stats` maps are unioned (file IDs are disjoint across workers due to round-robin). The merge does **not** recompute `live_bytes` — instead, a single `live_bytes` pass runs once after the final merge in Phase 4 (assembly), iterating the fully-merged tree exactly once. This avoids O(N × log₂ W) redundant tree traversals in the intermediate merge rounds.
+**Parallel recovery**: `RecoveryResult` includes a `file_stats` map alongside `key_dir`, `tombstones`, and `max_lsn`. Each worker builds its own `file_stats` during Phase 2 using the algorithm above. During Phase 3 sequential accumulator merge, `file_stats` maps are unioned (file IDs are disjoint across workers due to round-robin). The merge does **not** recompute `live_bytes` — instead, a single `live_bytes` pass runs once after the final merge in Phase 4 (assembly), iterating the fully-merged tree exactly once.
 
 #### Vacuum primitives
 
@@ -687,7 +687,7 @@ This is a single code path: `flush_hints_for()` is the same function used by rot
 
 1. **Phase 1 (serial, shared)**: same as above — open files, generate missing hints. Factored into `open_and_prepare_files()`, shared by both paths.
 2. **Phase 2 (parallel build)**: round-robin assign files to W workers. Each builds a `RecoveryResult{key_dir, tombstones, max_lsn, file_stats}` independently.
-3. **Phase 3 (parallel fan-in)**: pairwise merge in ⌈log₂(W)⌉ rounds. Each merge uses `PersistentRadixTree::merge(a, b, lsn_resolver)` then cross-applies tombstones from both sides to suppress stale PUTs, unions tombstone maps and `file_stats` maps for subsequent rounds. Losing entries' sizes are subtracted from their file's `live_bytes`.
+3. **Phase 3 (sequential accumulator merge)**: workers push finished `RecoveryResult`s into a thread-safe queue. A single merge thread pops results and merges each into a growing accumulator using `PersistentRadixTree::merge(acc, incoming, lsn_resolver)`, then cross-applies tombstones. Each ~N/W-key tree is merged once; disjoint subtrees are shared O(1) by the persistent tree, so total merge work is proportional to overlap, not N × log₂(W).
 4. **Phase 4 (serial assembly)**: `s.key_dir = final.key_dir; s.next_lsn = final.max_lsn + 1`.
 
 See `docs/parallel_recovery_design.md` §11 for the full v1 algorithm.
