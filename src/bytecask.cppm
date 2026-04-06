@@ -135,6 +135,11 @@ export struct ReadOptions {
   // int64_t (plain MOV on x86) — no refcount traffic, no locked
   // instructions, no clock read on the reader side.
   std::chrono::milliseconds staleness_tolerance{0};
+
+  // When true, all data read from underlying storage is verified
+  // against its CRC32 checksum. When set to false (default) for higher read throughput at
+  // the cost of silent corruption detection.
+  bool verify_checksums{false};
 };
 
 // Options passed to DB::open().
@@ -206,8 +211,10 @@ public:
   EntryIterator() = default;
 
   EntryIterator(std::shared_ptr<const EngineState> state,
-                RadixTreeIterator<KeyDirEntry> cur)
-      : state_{std::move(state)}, cur_{std::move(cur)} {}
+                RadixTreeIterator<KeyDirEntry> cur,
+                bool verify_checksums = true)
+      : state_{std::move(state)}, cur_{std::move(cur)},
+        verify_checksums_{verify_checksums} {}
 
   auto operator*() const -> const value_type & {
     if (!has_cached_) {
@@ -215,8 +222,9 @@ public:
       cached_.first = Key{key_span};
       state_->files->at(dir_entry.file_id)
           ->read_value(dir_entry.file_offset,
-                       narrow<std::uint16_t>(key_span.size()),
-                       dir_entry.value_size, io_buf_, cached_.second);
+                      narrow<std::uint16_t>(key_span.size()),
+                      dir_entry.value_size, verify_checksums_,
+                      io_buf_, cached_.second);
       has_cached_ = true;
     }
     return cached_;
@@ -241,6 +249,7 @@ private:
   std::shared_ptr<const EngineState> state_;
   RadixTreeIterator<KeyDirEntry> cur_;
   mutable value_type cached_;
+  bool verify_checksums_{true};
   mutable Bytes io_buf_;
   mutable bool has_cached_{false};
 };
