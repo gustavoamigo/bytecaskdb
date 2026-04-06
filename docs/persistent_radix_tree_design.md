@@ -54,16 +54,19 @@ struct Node {
 };
 ```
 
-`IntrusivePtr<T>` is a lightweight single-pointer (8 bytes) smart pointer. It calls `addref()` on copy and `release()` on destruction; when the count reaches zero, the node is deleted. This eliminates the ~32-byte `make_shared` control block per node and halves the pointer size in every child slot from 16 bytes (`shared_ptr`) to 8 bytes (`IntrusivePtr`).
+`IntrusivePtr<T>` is a lightweight single-pointer (8 bytes) smart pointer. It calls `addref()` on copy and `release()` on destruction; when the count reaches zero, the node is deleted. Copy assignment uses addref-before-release sequencing to prevent use-after-free when the source is a sub-object of the destination (e.g., reassigning a root to one of its own children). Move assignment detaches the source pointer before releasing the old destination for the same reason. This eliminates the ~32-byte `make_shared` control block per node and halves the pointer size in every child slot from 16 bytes (`shared_ptr`) to 8 bytes (`IntrusivePtr`).
+
+`PersistentRadixTree` and `TransientRadixTree` use explicit move constructors/assignments that reset the source's `size_` (and `tag_` for transient) to zero via `std::exchange`. This ensures a moved-from tree is in a valid empty state (`size() == 0`, `empty() == true`) rather than carrying stale metadata while the root pointer has been transferred.
 
 Children are stored behind a `unique_ptr` so leaf nodes (94% of all nodes) carry only the 8-byte null pointer instead of a 32-byte empty `SmallVector`. Internal nodes allocate the vector on first `insert_child()` call. Access is via `child_count()`, `child_at()`, and `has_children()` helpers.
 
-`SmallVector<T, N>` stores up to N elements inline (no heap allocation), spilling to the heap above N. This serves design principle #3 (predictable latency): node splits on the write path are zero-allocation in the common case.
+`SmallVector<T, N>` stores up to N elements inline (no heap allocation), spilling to the heap above N. This serves design principle #3 (predictable latency): node splits on the write path are zero-allocation in the common case. Copy assignment uses the copy-and-move idiom: construct a temporary copy first (may throw), then move-assign from it (noexcept for our element types). This guarantees strong exception safety — if the copy throws, `*this` is untouched.
 
 ### 3.2. Transient Copy-on-Write (COW) Model
 *   A global `std::atomic<uint64_t>` generates unique edit tags for Transient sessions.
-*   During a transient mutation, if the traversed node's `edit_tag` matches the session's tag, the node is mutated **in-place**.
-*   If the tag differs (e.g., `0` or an older session), the node is **copied**, the copy is tagged with the current session ID, and the mutation applies to the copy.
+*   During a transient mutation, if the traversed node's `edit_tag` matches the session's tag **and** the node's reference count is 1 (uniquely owned), the node is mutated **in-place**.
+*   If the tag differs (e.g., `0` or an older session) or the node is shared (refcount > 1), the node is **copied**, the copy is tagged with the current session ID, and the mutation applies to the copy.
+*   The refcount guard defends against edit-tag wraparound: after 2^31 `transient()` calls the 31-bit tag space can repeat, but a shared node will never be mutated in place regardless of its tag.
 
 ---
 
@@ -96,6 +99,7 @@ Operations mutate the tree in-place utilizing the COW epoch logic.
 ### 4.3. Iterator API (`Iterator`)
 Because keys are fragmented across nodes, the iterator must materialize the key dynamically during Depth-First Search (DFS) traversal.
 
+*   Satisfies `std::input_iterator` (single-pass). The iterator category is `std::input_iterator_tag` because `operator*` returns a prvalue pair containing a `span` into a mutable internal key buffer, not a true reference — this precludes `forward_iterator`.
 *   Maintains a DFS stack and a `std::vector<std::byte> current_key`.
 *   `operator*` returns `std::pair<std::span<const std::byte>, const V&>` — the materialized key and current value, suitable for structured bindings (`auto [k, v] = *it;`).
 *   Supports `operator++` (pre-increment) to advance DFS.
@@ -131,7 +135,7 @@ static auto merge(const PersistentRadixTree& a,
 // resolve(const V& a_val, const V& b_val) -> V
 ```
 
-**Algorithm — `merge_impl(node_a, node_b, resolve)`:**
+**Algorithm — `merge_impl(node_a, node_b, resolve)`:** (The resolve callable is passed by lvalue in recursive calls to avoid `std::forward`-after-move UB with stateful or move-only resolvers.)
 
 The function walks both trees in tandem, recursing only where the two trees overlap. At each step it compares the compressed prefixes of the two nodes. Let `cpl` = the common prefix length between `node_a.prefix` and `node_b.prefix`.
 

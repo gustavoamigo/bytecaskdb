@@ -60,16 +60,9 @@ public:
   }
 
   auto operator=(const SmallVector &other) -> SmallVector & {
-    if (this == &other)
-      return *this;
-    destroy_all();
-    size_ = other.size_;
-    if (other.on_heap()) {
-      new (&heap_) std::vector<T>(other.heap_);
-    } else {
-      for (std::size_t i = 0; i < size_; ++i) {
-        std::construct_at(inline_ptr() + i, other.inline_ptr()[i]);
-      }
+    if (this != &other) {
+      auto tmp{other};          // copy first — if this throws, *this is untouched
+      *this = std::move(tmp);   // move-assign is noexcept for our element types
     }
     return *this;
   }
@@ -283,22 +276,25 @@ public:
   IntrusivePtr(IntrusivePtr &&o) noexcept : ptr_(o.ptr_) { o.ptr_ = nullptr; }
 
   auto operator=(const IntrusivePtr &o) noexcept -> IntrusivePtr & {
-    if (ptr_ != o.ptr_) {
-      if (ptr_)
-        ptr_->release();
-      ptr_ = o.ptr_;
-      if (ptr_)
-        ptr_->addref();
-    }
+    // Addref before release: if o is a sub-object of *ptr_, releasing
+    // ptr_ first would destroy o (use-after-free).
+    if (o.ptr_)
+      o.ptr_->addref();
+    if (ptr_)
+      ptr_->release();
+    ptr_ = o.ptr_;
     return *this;
   }
 
   auto operator=(IntrusivePtr &&o) noexcept -> IntrusivePtr & {
     if (ptr_ != o.ptr_) {
+      // Detach o before releasing ptr_ to avoid use-after-free when
+      // o is a sub-object of *ptr_.
+      auto *tmp = o.ptr_;
+      o.ptr_ = nullptr;
       if (ptr_)
         ptr_->release();
-      ptr_ = o.ptr_;
-      o.ptr_ = nullptr;
+      ptr_ = tmp;
     }
     return *this;
   }
@@ -427,12 +423,12 @@ template <typename V> struct Node {
   void insert_child(std::byte b, IntrusivePtr<Node> child) {
     if (!children_)
       children_ = std::make_unique<ChildVec>();
-    auto *pos = children_->data();
-    auto *end = pos + children_->size();
-    while (pos != end && pos->first < b)
-      ++pos;
-    auto idx = static_cast<std::ptrdiff_t>(pos - children_->data());
-    children_->insert(children_->begin() + idx, {b, std::move(child)});
+    auto it = children_->begin();
+    while (it != children_->end() && it->first < b)
+      ++it;
+    assert((it == children_->end() || it->first != b) &&
+           "duplicate transition byte");
+    children_->insert(it, {b, std::move(child)});
   }
 
   void remove_child(std::byte b) {
@@ -485,6 +481,17 @@ inline auto common_prefix_length(std::span<const std::byte> a,
 export template <typename V> class PersistentRadixTree {
 public:
   PersistentRadixTree() = default;
+  PersistentRadixTree(const PersistentRadixTree &) = default;
+  auto operator=(const PersistentRadixTree &) -> PersistentRadixTree & = default;
+
+  PersistentRadixTree(PersistentRadixTree &&other) noexcept
+      : root_{std::move(other.root_)}, size_{std::exchange(other.size_, 0)} {}
+  auto operator=(PersistentRadixTree &&other) noexcept
+      -> PersistentRadixTree & {
+    root_ = std::move(other.root_);
+    size_ = std::exchange(other.size_, 0);
+    return *this;
+  }
 
   [[nodiscard]] auto size() const noexcept -> std::size_t { return size_; }
   [[nodiscard]] auto empty() const noexcept -> bool { return size_ == 0; }
@@ -799,8 +806,7 @@ private:
 
       auto *existing = new_b->find_child_mut(pa[cpl]);
       if (existing) {
-        existing->second = merge_impl(a_trimmed, existing->second,
-                                      std::forward<ResolveFunc>(resolve));
+        existing->second = merge_impl(a_trimmed, existing->second, resolve);
       } else {
         new_b->insert_child(pa[cpl], std::move(a_trimmed));
       }
@@ -819,8 +825,7 @@ private:
 
       auto *existing = new_a->find_child_mut(pb[cpl]);
       if (existing) {
-        existing->second = merge_impl(existing->second, b_trimmed,
-                                      std::forward<ResolveFunc>(resolve));
+        existing->second = merge_impl(existing->second, b_trimmed, resolve);
       } else {
         new_a->insert_child(pb[cpl], std::move(b_trimmed));
       }
@@ -843,8 +848,7 @@ private:
         auto [tb, child_b] = b->child_at(i);
         auto *slot = merged->find_child_mut(tb);
         if (slot) {
-          slot->second = merge_impl(slot->second, child_b,
-                                    std::forward<ResolveFunc>(resolve));
+          slot->second = merge_impl(slot->second, child_b, resolve);
         } else {
           // Disjoint subtree — share it in O(1), no clone needed.
           merged->insert_child(tb, child_b);
@@ -878,9 +882,17 @@ export template <typename V> class TransientRadixTree {
 public:
   TransientRadixTree(const TransientRadixTree &) = delete;
   auto operator=(const TransientRadixTree &) -> TransientRadixTree & = delete;
-  TransientRadixTree(TransientRadixTree &&) noexcept = default;
-  auto operator=(TransientRadixTree &&) noexcept
-      -> TransientRadixTree & = default;
+  TransientRadixTree(TransientRadixTree &&other) noexcept
+      : root_{std::move(other.root_)},
+        size_{std::exchange(other.size_, 0)},
+        tag_{std::exchange(other.tag_, 0)} {}
+  auto operator=(TransientRadixTree &&other) noexcept
+      -> TransientRadixTree & {
+    root_ = std::move(other.root_);
+    size_ = std::exchange(other.size_, 0);
+    tag_ = std::exchange(other.tag_, 0);
+    return *this;
+  }
 
   [[nodiscard]] auto get(std::span<const std::byte> key) const
       -> std::optional<V> {
@@ -927,9 +939,14 @@ private:
       : root_{std::move(root)}, size_{sz}, tag_{tag} {}
 
   // Ensure a node is owned by this transient session.
+  // Requires both matching edit tag AND unique ownership (refcount == 1)
+  // to allow in-place mutation. The refcount check defends against tag
+  // wraparound after 2^31 transient sessions: even if an old node
+  // happens to carry the same 31-bit tag, it will be cloned if shared.
   static auto ensure_mutable(const IntrusivePtr<Node<V>> &node,
                              std::uint32_t tag) -> IntrusivePtr<Node<V>> {
-    if (node && node->edit_tag() == tag)
+    if (node && node->edit_tag() == tag &&
+        node->refcount_.load(std::memory_order_acquire) == 1)
       return node;
     if (!node) {
       auto n = make_intrusive<Node<V>>();
@@ -1129,8 +1146,8 @@ auto PersistentRadixTree<V>::transient() const -> TransientRadixTree<V> {
 // ---------------------------------------------------------------------------
 export template <typename V> class RadixTreeIterator {
 public:
-  using iterator_category = std::forward_iterator_tag;
-  using iterator_concept = std::forward_iterator_tag;
+  using iterator_category = std::input_iterator_tag;
+  using iterator_concept = std::input_iterator_tag;
   using value_type = std::pair<std::span<const std::byte>, V>;
   using difference_type = std::ptrdiff_t;
 
