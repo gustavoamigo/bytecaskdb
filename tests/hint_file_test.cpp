@@ -42,8 +42,9 @@ TEST_CASE("HintFile append produces correct file size", "[hintfile]") {
     hf.sync();
   }
 
+  // "hello" has no shared prefix with the empty previous key → suffix_len = 5
   const std::size_t expected =
-      bytecask::kHintHeaderSize + 5U + bytecask::kHintCrcSize;
+      bytecask::kHintHeaderSize + 5U + 4U; // entries + file CRC trailer
   CHECK(std::filesystem::file_size(tmp) == expected);
 }
 
@@ -68,23 +69,18 @@ TEST_CASE("HintFile single entry round-trip", "[hintfile]") {
   }
 
   auto hf = bytecask::HintFile::OpenForRead(tmp);
-  const auto result = hf.scan(0);
+  auto scanner = hf.make_scanner();
+  const auto result = scanner.next();
 
   REQUIRE(result.has_value());
-  const auto &[entry, next] = *result;
+  CHECK(result->sequence == kSeq);
+  CHECK(result->entry_type == bytecask::EntryType::Put);
+  CHECK(result->file_offset == kFileOffset);
+  CHECK(result->value_size == kValueSize);
+  CHECK(to_string(result->key) == key_sv);
 
-  CHECK(entry.sequence == kSeq);
-  CHECK(entry.entry_type == bytecask::EntryType::Put);
-  CHECK(entry.file_offset == kFileOffset);
-  CHECK(entry.value_size == kValueSize);
-  CHECK(to_string(entry.key) == key_sv);
-
-  // next offset should point past this entry to EOF
-  CHECK(next ==
-        bytecask::kHintHeaderSize + key_sv.size() + bytecask::kHintCrcSize);
-
-  // reading at EOF returns nullopt
-  CHECK_FALSE(hf.scan(next).has_value());
+  // end of file
+  CHECK_FALSE(scanner.next().has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -103,31 +99,30 @@ TEST_CASE("HintFile two entries sequential scan", "[hintfile]") {
   }
 
   auto hf = bytecask::HintFile::OpenForRead(tmp);
+  auto scanner = hf.make_scanner();
 
-  const auto r0 = hf.scan(0);
+  const auto r0 = scanner.next();
   REQUIRE(r0.has_value());
-  const auto &[e0, next0] = *r0;
-  CHECK(e0.sequence == 1);
-  CHECK(e0.entry_type == bytecask::EntryType::Put);
-  CHECK(e0.file_offset == 0);
-  CHECK(e0.value_size == 10);
-  CHECK(to_string(e0.key) == "key1");
+  CHECK(r0->sequence == 1);
+  CHECK(r0->entry_type == bytecask::EntryType::Put);
+  CHECK(r0->file_offset == 0);
+  CHECK(r0->value_size == 10);
+  CHECK(to_string(r0->key) == "key1");
 
-  const auto r1 = hf.scan(next0);
+  const auto r1 = scanner.next();
   REQUIRE(r1.has_value());
-  const auto &[e1, next1] = *r1;
-  CHECK(e1.sequence == 2);
-  CHECK(e1.entry_type == bytecask::EntryType::Delete);
-  CHECK(e1.file_offset == 512);
-  CHECK(e1.value_size == 20);
-  CHECK(to_string(e1.key) == "key22");
+  CHECK(r1->sequence == 2);
+  CHECK(r1->entry_type == bytecask::EntryType::Delete);
+  CHECK(r1->file_offset == 512);
+  CHECK(r1->value_size == 20);
+  CHECK(to_string(r1->key) == "key22");
 
   // end of file
-  CHECK_FALSE(hf.scan(next1).has_value());
+  CHECK_FALSE(scanner.next().has_value());
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: CRC corruption causes a throw (panic), not silent skip
+// Test 4: CRC corruption causes a throw from OpenForRead (file-level check)
 // ---------------------------------------------------------------------------
 TEST_CASE("HintFile CRC mismatch throws", "[hintfile]") {
   const auto tmp = std::filesystem::temp_directory_path() / "bc_hint_crc.hint";
@@ -139,17 +134,55 @@ TEST_CASE("HintFile CRC mismatch throws", "[hintfile]") {
     hf.sync();
   }
 
-  // Flip the first byte of the key to corrupt the entry.
+  // Flip the first byte of the entry body to corrupt the file.
   {
     std::fstream f{tmp, std::ios::in | std::ios::out | std::ios::binary};
     REQUIRE(f.is_open());
-    f.seekp(static_cast<std::streamoff>(bytecask::kHintHeaderSize));
+    f.seekp(0);
     const char flipped = '\xFF';
     f.write(&flipped, 1);
   }
 
-  auto hf = bytecask::HintFile::OpenForRead(tmp);
-  CHECK_THROWS_AS(hf.scan(0), std::runtime_error);
+  // CRC is verified eagerly in OpenForRead — throws before any parsing.
+  CHECK_THROWS_AS(bytecask::HintFile::OpenForRead(tmp), std::runtime_error);
 }
 
+// ---------------------------------------------------------------------------
+// Test 5: prefix compression round-trip — two entries with a common prefix
+// ---------------------------------------------------------------------------
+TEST_CASE("HintFile prefix compression round-trip", "[hintfile]") {
+  const auto tmp =
+      std::filesystem::temp_directory_path() / "bc_hint_prefix.hint";
+  std::filesystem::remove(tmp);
+
+  // "user:alice" and "user:bob" share the 5-byte prefix "user:".
+  {
+    auto hf = bytecask::HintFile::OpenForWrite(tmp);
+    hf.append(1, bytecask::EntryType::Put, 0,   to_bytes("user:alice"), 10);
+    hf.append(2, bytecask::EntryType::Put, 100, to_bytes("user:bob"),   20);
+    hf.sync();
+  }
+
+  // File size: entry0 has suffix_len=10 (no previous key), entry1 has
+  // suffix_len=3 ("bob") since "user:" (5 bytes) is the shared prefix.
+  // Total = 2*kHintHeaderSize + 10 + 3 + 4 (file CRC)
+  const std::size_t expected =
+      2 * bytecask::kHintHeaderSize + 10U + 3U + 4U;
+  CHECK(std::filesystem::file_size(tmp) == expected);
+
+  auto hf = bytecask::HintFile::OpenForRead(tmp);
+  auto scanner = hf.make_scanner();
+
+  const auto r0 = scanner.next();
+  REQUIRE(r0.has_value());
+  CHECK(to_string(r0->key) == "user:alice");
+  CHECK(r0->sequence == 1);
+
+  const auto r1 = scanner.next();
+  REQUIRE(r1.has_value());
+  CHECK(to_string(r1->key) == "user:bob");
+  CHECK(r1->sequence == 2);
+
+  CHECK_FALSE(scanner.next().has_value());
+}
 

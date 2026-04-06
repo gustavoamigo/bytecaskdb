@@ -864,32 +864,29 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files)
 
   for (auto &[file_id, data_file, hint_path, tb] : files) {
     auto hint = HintFile::OpenForRead(hint_path);
-    Offset off = 0;
-    while (auto r = hint.scan(off)) {
-      const auto &[he, next] = *r;
-      if (he.entry_type == EntryType::Put) {
-        const auto k = Key{he.key};
+    auto scanner = hint.make_scanner();
+    while (auto he = scanner.next()) {
+      if (he->entry_type == EntryType::Put) {
+        const auto k = Key{he->key};
         const auto tomb_it = tombstones.find(k);
-        if (tomb_it != tombstones.end() && tomb_it->second >= he.sequence) {
-          if (he.sequence > max_lsn) max_lsn = he.sequence;
-          off = next;
+        if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
+          if (he->sequence > max_lsn) max_lsn = he->sequence;
           continue;
         }
-        t.upsert(he.key,
-                 KeyDirEntry{he.sequence, file_id, he.file_offset,
-                             he.value_size},
+        t.upsert(he->key,
+                 KeyDirEntry{he->sequence, file_id, he->file_offset,
+                             he->value_size},
                  lsn_wins);
-      } else if (he.entry_type == EntryType::Delete) {
-        const auto k = Key{he.key};
+      } else if (he->entry_type == EntryType::Delete) {
+        const auto k = Key{he->key};
         auto &tomb_seq = tombstones[k];
-        if (he.sequence > tomb_seq) tomb_seq = he.sequence;
-        const auto existing = t.get(he.key);
-        if (existing && existing->sequence < he.sequence) {
-          t.erase(he.key);
+        if (he->sequence > tomb_seq) tomb_seq = he->sequence;
+        const auto existing = t.get(he->key);
+        if (existing && existing->sequence < he->sequence) {
+          t.erase(he->key);
         }
       }
-      if (he.sequence > max_lsn) max_lsn = he.sequence;
-      off = next;
+      if (he->sequence > max_lsn) max_lsn = he->sequence;
     }
   }
 
@@ -960,42 +957,39 @@ auto DB::recovery_load_serial(EngineState s) -> EngineState {
 
   for (auto &[file_id, data_file, hint_path, tb] : files) {
     auto hint = HintFile::OpenForRead(hint_path);
-    Offset off = 0;
-    while (auto r = hint.scan(off)) {
-      const auto &[he, next] = *r;
-      if (he.entry_type == EntryType::Put) {
-        const auto k = Key{he.key};
+    auto scanner = hint.make_scanner();
+    while (auto he = scanner.next()) {
+      if (he->entry_type == EntryType::Put) {
+        const auto k = Key{he->key};
         const auto tomb_it = tombstones.find(k);
-        if (tomb_it != tombstones.end() && tomb_it->second >= he.sequence) {
-          if (he.sequence > max_lsn) max_lsn = he.sequence;
-          off = next;
+        if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
+          if (he->sequence > max_lsn) max_lsn = he->sequence;
           continue;
         }
-        const auto existing = transient_key_dir.get(he.key);
-        if (!existing || existing->sequence < he.sequence) {
+        const auto existing = transient_key_dir.get(he->key);
+        if (!existing || existing->sequence < he->sequence) {
           if (existing) {
             file_stats_[existing->file_id].live_bytes -=
-                entry_size(he.key.size(), existing->value_size);
+                entry_size(he->key.size(), existing->value_size);
           }
           file_stats_[file_id].live_bytes +=
-              entry_size(he.key.size(), he.value_size);
-          transient_key_dir.set(he.key,
-                                KeyDirEntry{he.sequence, file_id,
-                                            he.file_offset, he.value_size});
+              entry_size(he->key.size(), he->value_size);
+          transient_key_dir.set(he->key,
+                                KeyDirEntry{he->sequence, file_id,
+                                            he->file_offset, he->value_size});
         }
-      } else if (he.entry_type == EntryType::Delete) {
-        const auto k = Key{he.key};
+      } else if (he->entry_type == EntryType::Delete) {
+        const auto k = Key{he->key};
         auto &tomb_seq = tombstones[k];
-        if (he.sequence > tomb_seq) tomb_seq = he.sequence;
-        const auto existing = transient_key_dir.get(he.key);
-        if (existing && existing->sequence < he.sequence) {
+        if (he->sequence > tomb_seq) tomb_seq = he->sequence;
+        const auto existing = transient_key_dir.get(he->key);
+        if (existing && existing->sequence < he->sequence) {
           file_stats_[existing->file_id].live_bytes -=
-              entry_size(he.key.size(), existing->value_size);
-          transient_key_dir.erase(he.key);
+              entry_size(he->key.size(), existing->value_size);
+          transient_key_dir.erase(he->key);
         }
       }
-      if (he.sequence > max_lsn) max_lsn = he.sequence;
-      off = next;
+      if (he->sequence > max_lsn) max_lsn = he->sequence;
     }
   }
 
