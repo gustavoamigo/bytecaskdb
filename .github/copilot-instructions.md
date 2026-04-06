@@ -88,6 +88,15 @@ When extending, follow the existing pattern: collect a serial baseline outside t
 - Use `std::ssize` (C++20) instead of casting `.size()` to a signed type.
 - Prefer `std::filesystem` utilities over manual file-handle tricks (e.g. `std::filesystem::file_size`).
 
+### Clang warnings to avoid (-Weverything is enabled)
+- **CTAD on standard lock types** (`-Wctad-maybe-unsupported`): Always write the explicit template argument for `std::lock_guard` and `std::unique_lock`: `std::lock_guard<std::mutex>`, `std::unique_lock<std::mutex>`. Never rely on CTAD for these types.
+- **`[[nodiscard]]` ignored** (`-Wunused-result`): Never silently discard the return value of a `[[nodiscard]]` function. In tests where the value is intentionally unused, cast to `void`: `(void)db.del(...)`. In production code, handle or assign the result.
+- **Exit-time destructors** (`-Wexit-time-destructors`): `thread_local` variables with non-trivial destructors trigger this warning. Wrap the declaration in `#pragma clang diagnostic push/pop` with `-Wexit-time-destructors` ignored and a comment explaining why the destructor is intentional.
+- **Switch coverage** (`-Wswitch-enum` / `-Wswitch-default` conflict): The project suppresses `-Wswitch-default` (in `xmake.lua`) because `-Wswitch-enum` already enforces exhaustive enum coverage. When writing a switch on an enum: list every case explicitly — do not add a catch-all `default:` break. If a subset of cases is genuinely irrelevant (e.g. `BulkBegin`/`BulkEnd` inside `emit_entry`), add explicit no-op cases for the remaining values rather than a `default:`.
+- **Sign-conversion on array indexing** (`-Wsign-conversion`): When indexing an array/string with the result of a signed distribution or function, wrap the index in `static_cast<std::size_t>(...)`.
+- **Missing `[[noreturn]]` on lambdas** (`-Wmissing-noreturn`): Add `[[noreturn]]` to lambdas that unconditionally throw: `[][[noreturn]] { throw ...; }`.
+- **Unused functions/variables** (`-Wunused-function`, `-Wunused-variable`): Remove helper functions and variables that are no longer referenced after a refactor rather than leaving them in place.
+
 ## Tips
 
 * xmake can take a while to run, wait for the build to run before trying to do something else. 

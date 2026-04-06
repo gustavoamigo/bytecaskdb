@@ -23,6 +23,9 @@ local common_flags = {
     "-Wno-missing-variable-declarations", "-Wno-missing-prototypes",
     -- raw pointer indexing over a known-bounded span is intentional in I/O paths
     "-Wno-unsafe-buffer-usage",
+    -- -Wswitch-enum catches unhandled enum values; -Wswitch-default conflicts with
+    -- exhaustive switches that list all enum cases and need no default.
+    "-Wno-switch-default",
 }
 
 -- Apply sanitizer flags to a target if the option is set.

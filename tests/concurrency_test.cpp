@@ -33,7 +33,7 @@ TEST_CASE("BackgroundWorker tasks execute in FIFO order", "[concurrency]") {
 
   for (int i = 0; i < 5; ++i) {
     w.dispatch([&, i] {
-      std::lock_guard lk{mu};
+      std::lock_guard<std::mutex> lk{mu};
       order.push_back(i);
     });
   }
@@ -48,7 +48,7 @@ TEST_CASE("BackgroundWorker exception in task is swallowed", "[concurrency]") {
   bytecask::BackgroundWorker w;
   std::atomic<int> after{0};
 
-  w.dispatch([] { throw std::runtime_error("oops"); });
+  w.dispatch([][[noreturn]] { throw std::runtime_error("oops"); });
   w.dispatch([&] { ++after; });
   w.drain();
 
@@ -123,7 +123,7 @@ TEST_CASE("SyncGroup sync exception propagates to at most one caller",
           "[concurrency]") {
   // Single-threaded: the one caller (the leader) must see the exception.
   bytecask::SyncGroup sg;
-  CHECK_THROWS_AS(sg.sync([] { throw std::runtime_error("sync failed"); }),
+  CHECK_THROWS_AS(sg.sync([][[noreturn]] { throw std::runtime_error("sync failed"); }),
                   std::runtime_error);
 }
 
@@ -132,7 +132,7 @@ TEST_CASE("SyncGroup remains usable after a sync exception", "[concurrency]") {
   std::atomic<int> calls{0};
 
   // First sync throws.
-  CHECK_THROWS(sg.sync([] { throw std::runtime_error("transient"); }));
+  CHECK_THROWS(sg.sync([][[noreturn]] { throw std::runtime_error("transient"); }));
 
   // Subsequent sync must succeed.
   sg.sync([&] { ++calls; });
