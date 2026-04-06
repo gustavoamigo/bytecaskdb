@@ -380,7 +380,7 @@ for each hint entry h (processed in arbitrary file order, LSN wins):
 
 Processing order across files does not matter — LSN comparison always picks the correct winner, so `live_bytes` converges to the right values.
 
-**Parallel recovery**: `RecoveryResult` includes a `file_stats` map alongside `key_dir`, `tombstones`, and `max_lsn`. Each worker builds its own `file_stats` during Phase 2 using the algorithm above. During Phase 3 fan-in: file IDs are disjoint across workers (files are partitioned by round-robin), so `file_stats` maps are unioned without summing. When the LSN resolver discards a losing entry during tree merge or tombstone cross-application, the loser's size is subtracted from its file's `live_bytes`.
+**Parallel recovery**: `RecoveryResult` includes a `file_stats` map alongside `key_dir`, `tombstones`, and `max_lsn`. Each worker builds its own `file_stats` during Phase 2 using the algorithm above. During Phase 3 fan-in merge, `file_stats` maps are unioned (file IDs are disjoint across workers due to round-robin). The merge does **not** recompute `live_bytes` — instead, a single `live_bytes` pass runs once after the final merge in Phase 4 (assembly), iterating the fully-merged tree exactly once. This avoids O(N × log₂ W) redundant tree traversals in the intermediate merge rounds.
 
 #### Vacuum primitives
 

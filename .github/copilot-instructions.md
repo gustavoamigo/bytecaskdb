@@ -39,6 +39,20 @@ These instructions apply to every repository work request in this workspace.
 - If the repository does not yet have the necessary test seam, create the smallest practical test harness first.
 - If tests cannot be run, state why clearly and leave the project plan updated with the blocker.
 
+### Model-based recovery tests
+
+The `[model]` test cases in `tests/bytecask_test.cpp` (random workload, batch-heavy, delete-heavy) are the primary soundness checks for the DB engine. They run thousands of random operations, close the DB, then reopen under serial and parallel recovery and verify that all key/values and per-file `file_stats` (live_bytes, total_bytes) match a serial baseline.
+
+Update or extend the model-based tests when a change could affect what a recovered DB contains or reports. Common examples:
+- Alters recovery logic (parsing, merging, fan-in, file_stats computation).
+- Adds a new write-path feature (new operation type, new on-disk format field) that must survive recovery.
+- Changes how `file_stats` are computed or propagated.
+- Modifies the parallel merge strategy (thread counts, merge order, tombstone handling).
+
+This list is not exhaustive — use judgment. If a change touches anything that could make serial and parallel recovery diverge, add or update coverage.
+
+When extending, follow the existing pattern: collect a serial baseline outside the SECTIONs, copy the sealed DB to an isolated directory per SECTION, reopen with the target thread count, and CHECK both key/values and `collect_stats(db) == serial_stats_vals`.
+
 ## Commit rules
 
 - Show the user what changed and the test result before offering to commit.
