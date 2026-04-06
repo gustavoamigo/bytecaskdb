@@ -301,7 +301,6 @@ public:
     return file_stats_;
   }
 #endif
-
   // Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
   // batch is consumed (move-only). No-op if batch.empty().
   // opts.sync controls whether a single fdatasync is issued at the end.
@@ -356,6 +355,7 @@ private:
   void flush_hints(const EngineState &s);
   // Drains background hint tasks then writes all sealed hint files.
   void flush_hints();
+  
 
   // Vacuum helpers
   // Batch-aware scan: copies live Puts and tombstones from source_file into dest_file.

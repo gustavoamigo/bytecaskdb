@@ -721,7 +721,7 @@ One hint file corresponds to exactly one data file (same timestamp stem, differe
 
 **Hint files are a correctness-carrying artifact for recovery.** On startup, any data file without a companion `.hint` has one generated via the batch-aware `flush_hints_for()`. Recovery then reads only hint files — there is no separate raw-scan fallback path.
 
-Hint files are written **deferred**: at engine close, or via an explicit `flush_hints()` call — never inline on the write path. This keeps write-path latency flat and bounded regardless of file size at the time of rotation. The cost is that a crash after rotation but before `flush_hints()` causes recovery to generate the hint file on startup, which is always correct and only slower.
+Hint files are written **deferred**: never inline on the write path. During normal operation, `rotate_active_file()` dispatches hint writes to the `BackgroundWorker`. At engine close, `~DB()` seals the active file and calls `flush_hints()`, ensuring every data file has a companion `.hint` after a clean shutdown. This keeps write-path latency flat and bounded. The cost is that a crash before shutdown causes recovery to generate missing hint files on startup, which is always correct and only slower.
 
 ### Hint File Atomicity
 
@@ -1089,7 +1089,7 @@ After `rotate_active_file()` seals a data file, it captures a `shared_ptr<DataFi
 
 The synchronous path in `flush_hints(EngineState&)` (called by the public `flush_hints()` method) reuses the same `flush_hints_for` helper, guaranteeing consistent hint-writing behaviour between the background and synchronous paths.
 
-The `~Bytecask()` destructor no longer calls `flush_hints()` explicitly. Because `worker_` destructs first and drains all pending tasks, every sealed file that was rotated during the engine's lifetime will have had its hint file written (or the write attempted) before the engine shuts down.
+The `~DB()` destructor seals the active file, then calls `flush_hints()` which drains the background worker and writes hint files for all sealed files. This guarantees that after a clean shutdown every data file has a companion `.hint` — the next `DB::open()` recovers purely from hint files with no raw `.data` scanning. `flush_hints()` is a private method; callers rely on the destructor for clean shutdown.
 
 ---
 

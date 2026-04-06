@@ -67,6 +67,7 @@ target("bytecask_bench")
     -- --allow-multiple-definition lets the linker keep the first definition
     -- encountered (the .o file, which comes before the archive), so the
     -- custom allocator tracker in map_bench.cpp wins as intended.
+    add_defines("BYTECASK_TESTING")
     add_ldflags("-Wl,--allow-multiple-definition", {force = true})
     on_load(apply_sanitizer)
 

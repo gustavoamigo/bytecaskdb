@@ -114,18 +114,21 @@ DB::DB(std::filesystem::path dir, Options opts)
 
 #pragma region Lifecycle
 
-// Sync the active file before destruction.
-// hint files for sealed files are handled by the BackgroundWorker, which
-// destructs first (declared last) and drains all pending tasks before any
-// other member is destroyed.
-// At destruction no readers are active — purge all stale files.
+// Seals the active file, drains background hint tasks, writes hint files for
+// all sealed files, then purges stale files.
+// At destruction no readers are active.
 DB::~DB() {
   auto s = state_.load();
   if (s->files && !s->files->empty()) {
     try {
-      s->files->at(s->active_file_id)->sync();
+      auto &active = *s->files->at(s->active_file_id);
+      active.sync();
+      active.seal();
     } catch (...) {}
   }
+  try {
+    flush_hints();
+  } catch (...) {}
   for (auto &sf : stale_files_) {
     try {
       auto path = sf.data_file->path();
