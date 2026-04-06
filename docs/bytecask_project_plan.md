@@ -30,6 +30,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-086 | Iterative tail-release in `Node::release()` | Converted recursive `~IntrusivePtr` cascade to iterative loop for the last child. MergeOverlapping/100K: 5.36→5.05ms (−6%). Recovery 1M@16T: 84→73ms (−13%). 120 tests pass. |
 | BC-085 | Sequential accumulator merge for parallel recovery | Replaced pairwise fan-in with sequential accumulator merge: workers push finished results as they arrive, main thread folds each into accumulator. 16T 84→77ms (−8%). 120 tests pass. |
 | BC-084 | Defer live_bytes recomputation to after final merge | Moved the O(N) live_bytes tree traversal from `recovery_merge_results` (per merge round) to a single pass after the final merge. At 1M keys: 8T 123→95ms (−23%), 16T 118→83ms (−30%). 120 tests pass. |
 | BC-083 | Destructor seals active file + flushes all hints | `~DB()` now seals the active file and calls `flush_hints()`, guaranteeing every data file has a companion `.hint` after clean shutdown. `flush_hints()` consolidated to private-only (removed `BYTECASK_TESTING` guards). Removed `BM_Recovery/NoHints` benchmark variant; `BM_Recovery` is now a single non-template benchmark. |
