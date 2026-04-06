@@ -31,14 +31,14 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-094 | Profile memory | Profile memory usage (maybe benchmark tests that capture that) |
 | BC-095 | Robustness test suite | Robustness and correctness validation/test suite |
 | BC-096 | Document invariants | Document correctness invariants and how it's implemented |
-| BC-097 | Pre-launch README | Write Read me and reorganize documentation (pre-launch phase) |
-| BC-098 | Open source license | Add license (MIT) |
 | BC-099 | Publish benchmarks | Run official benchmarks to share with the world. |
 
 ## Done
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-098 | Open source license | Added MIT `LICENSE` file. |
+| BC-097 | Pre-launch README | Added `README.md`: project overview, features, API reference, architecture, performance tables, build instructions, and documentation index. |
 | BC-089 | Hint file format v2: prefix compression + file-level CRC | New layout: `prefix_len(u8) + suffix_len(u16) + suffix_data` replaces `key_size(u16) + key_data`. Per-entry CRC removed; 4-byte CRC-32C file trailer verified eagerly in `OpenForRead`. `scan(Offset)` replaced by `Scanner` + `next()`. Zero-copy key via Scanner's `key_buf_` accumulator. `serialize_entry`/`deserialize_entry` updated in `hint_entry.cppm`. Recovery 1M@16T: 68→66ms (−3%); @32T: 72→66ms (−8%); @64T: 73→69ms (−5%). 1T within noise. 122 tests pass. |
 | BC-088 | Sorted, deduplicated hint files | `flush_hints_for()` accumulates all entries, sorts by key asc/seq desc, deduplicates (keeps highest-seq per key), then writes. Smaller hint files, fewer redundant upserts at recovery. Safe: within a file the highest-seq entry per key is authoritative. Recovery 1M@1T: 271→248ms (−8%). Multi-threaded noise-level. 121 tests pass. |
 | BC-087 | Single-traversal upsert for parallel recovery | Added `TransientRadixTree::upsert(key, val, should_replace)` — fuses get+conditional-set into one root-to-leaf traversal. `recovery_build_from_hints` uses it to eliminate the dual traversal (was ~49% of recovery time). Also dropped redundant per-entry live_bytes tracking (Phase 4 recomputes). Recovery 1M@2T: 188→142ms (−24%). @8T: 83→72ms (−13%). @16T: 76→68ms (−11%). 121 tests pass. |
