@@ -30,6 +30,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-087 | Single-traversal upsert for parallel recovery | Added `TransientRadixTree::upsert(key, val, should_replace)` — fuses get+conditional-set into one root-to-leaf traversal. `recovery_build_from_hints` uses it to eliminate the dual traversal (was ~49% of recovery time). Also dropped redundant per-entry live_bytes tracking (Phase 4 recomputes). Recovery 1M@2T: 188→142ms (−24%). @8T: 83→72ms (−13%). @16T: 76→68ms (−11%). 121 tests pass. |
 | BC-086 | Iterative tail-release in `Node::release()` | Converted recursive `~IntrusivePtr` cascade to iterative loop for the last child. MergeOverlapping/100K: 5.36→5.05ms (−6%). Recovery 1M@16T: 84→73ms (−13%). 120 tests pass. |
 | BC-085 | Sequential accumulator merge for parallel recovery | Replaced pairwise fan-in with sequential accumulator merge: workers push finished results as they arrive, main thread folds each into accumulator. 16T 84→77ms (−8%). 120 tests pass. |
 | BC-084 | Defer live_bytes recomputation to after final merge | Moved the O(N) live_bytes tree traversal from `recovery_merge_results` (per merge round) to a single pass after the final merge. At 1M keys: 8T 123→95ms (−23%), 16T 118→83ms (−30%). 120 tests pass. |

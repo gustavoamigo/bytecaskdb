@@ -961,6 +961,24 @@ public:
       ++size_;
   }
 
+  // Single-traversal insert-or-conditional-replace.
+  // If key absent: inserts val, returns nullopt.
+  // If key present: calls should_replace(existing, val).
+  //   If true: replaces with val, returns the displaced old value.
+  //   If false: no-op, returns nullopt.
+  template <typename Pred>
+  auto upsert(std::span<const std::byte> key, V val, Pred &&should_replace)
+      -> std::optional<V> {
+    assert(tag_ != 0 && "transient already consumed");
+    auto [new_root, displaced, inserted] = upsert_transient(
+        root_, key, std::move(val), tag_,
+        std::forward<Pred>(should_replace));
+    root_ = std::move(new_root);
+    if (inserted)
+      ++size_;
+    return displaced;
+  }
+
   auto erase(std::span<const std::byte> key) -> bool {
     assert(tag_ != 0 && "transient already consumed");
     if (!root_)
@@ -1075,6 +1093,91 @@ private:
     leaf->set_value(std::move(val));
     mutable_node->insert_child(transition, std::move(leaf));
     return {std::move(mutable_node), true};
+  }
+
+  // Single-traversal upsert — like set_transient, but conditionally replaces
+  // an existing value. Returns {new_root, displaced_value, was_newly_inserted}.
+  // When the key already exists, calls should_replace(existing, incoming);
+  // if true, swaps in the new value and returns the old one as displaced.
+  template <typename Pred>
+  static auto upsert_transient(const IntrusivePtr<Node<V>> &node,
+                               std::span<const std::byte> key, V val,
+                               std::uint32_t tag, Pred &&should_replace)
+      -> std::tuple<IntrusivePtr<Node<V>>, std::optional<V>, bool> {
+    if (!node) {
+      auto leaf = make_intrusive<Node<V>>();
+      leaf->set_edit_tag(tag);
+      for (auto b : key)
+        leaf->prefix.push_back(b);
+      leaf->set_value(std::move(val));
+      return {std::move(leaf), std::nullopt, true};
+    }
+
+    auto mutable_node = ensure_mutable(node, tag);
+    auto prefix_span = std::span<const std::byte>{mutable_node->prefix.data(),
+                                                  mutable_node->prefix.size()};
+    auto cpl = common_prefix_length(prefix_span, key);
+
+    if (cpl < prefix_span.size()) {
+      // Split — key diverges from prefix, so this is always a new insert.
+      auto split = make_intrusive<Node<V>>();
+      split->set_edit_tag(tag);
+      for (std::size_t i = 0; i < cpl; ++i)
+        split->prefix.push_back(prefix_span[i]);
+
+      auto old_transition = prefix_span[cpl];
+      typename Node<V>::Prefix old_suffix;
+      for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
+        old_suffix.push_back(prefix_span[i]);
+      mutable_node->prefix = std::move(old_suffix);
+      split->insert_child(old_transition, std::move(mutable_node));
+
+      auto remaining = key.subspan(cpl);
+      if (remaining.empty()) {
+        split->set_value(std::move(val));
+      } else {
+        auto new_transition = remaining[0];
+        auto new_leaf = make_intrusive<Node<V>>();
+        new_leaf->set_edit_tag(tag);
+        for (auto b : remaining.subspan(1))
+          new_leaf->prefix.push_back(b);
+        new_leaf->set_value(std::move(val));
+        split->insert_child(new_transition, std::move(new_leaf));
+      }
+      return {std::move(split), std::nullopt, true};
+    }
+
+    auto remaining = key.subspan(cpl);
+    if (remaining.empty()) {
+      if (mutable_node->has_value()) {
+        if (should_replace(mutable_node->value_, val)) {
+          auto old = std::move(mutable_node->value_);
+          mutable_node->set_value(std::move(val));
+          return {std::move(mutable_node), std::move(old), false};
+        }
+        return {std::move(mutable_node), std::nullopt, false};
+      }
+      mutable_node->set_value(std::move(val));
+      return {std::move(mutable_node), std::nullopt, true};
+    }
+
+    auto transition = remaining[0];
+    auto child_key = remaining.subspan(1);
+    auto *existing_child = mutable_node->find_child_mut(transition);
+    if (existing_child) {
+      auto [new_child, displaced, inserted] = upsert_transient(
+          existing_child->second, child_key, std::move(val), tag,
+          std::forward<Pred>(should_replace));
+      existing_child->second = std::move(new_child);
+      return {std::move(mutable_node), std::move(displaced), inserted};
+    }
+    auto leaf = make_intrusive<Node<V>>();
+    leaf->set_edit_tag(tag);
+    for (auto b : child_key)
+      leaf->prefix.push_back(b);
+    leaf->set_value(std::move(val));
+    mutable_node->insert_child(transition, std::move(leaf));
+    return {std::move(mutable_node), std::nullopt, true};
   }
 
   // Transient erase with path compression.

@@ -280,6 +280,66 @@ TEST_CASE("RadixTree transient bulk insert", "[radix_tree]") {
 }
 
 // ---------------------------------------------------------------------------
+// Transient: upsert
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree transient upsert", "[radix_tree]") {
+  auto greater = [](int existing, int incoming) {
+    return incoming > existing;
+  };
+
+  SECTION("insert into empty tree") {
+    auto tr = Tree{}.transient();
+    auto displaced = tr.upsert(to_bytes("a"), 10, greater);
+    CHECK_FALSE(displaced.has_value());
+    CHECK(tr.get(to_bytes("a")) == 10);
+  }
+
+  SECTION("replace when predicate accepts") {
+    auto tr = Tree{}.transient();
+    tr.set(to_bytes("a"), 5);
+    auto displaced = tr.upsert(to_bytes("a"), 10, greater);
+    REQUIRE(displaced.has_value());
+    CHECK(*displaced == 5);
+    CHECK(tr.get(to_bytes("a")) == 10);
+  }
+
+  SECTION("no-op when predicate rejects") {
+    auto tr = Tree{}.transient();
+    tr.set(to_bytes("a"), 10);
+    auto displaced = tr.upsert(to_bytes("a"), 5, greater);
+    CHECK_FALSE(displaced.has_value());
+    CHECK(tr.get(to_bytes("a")) == 10);
+  }
+
+  SECTION("size tracks only new inserts") {
+    auto tr = Tree{}.transient();
+    tr.upsert(to_bytes("a"), 1, greater);
+    CHECK(tr.get(to_bytes("a")) == 1);
+    tr.upsert(to_bytes("b"), 2, greater);
+    tr.upsert(to_bytes("a"), 10, greater); // replace — size unchanged
+    tr.upsert(to_bytes("a"), 0, greater);  // rejected — size unchanged
+    auto t = std::move(tr).persistent();
+    CHECK(t.size() == 2U);
+    CHECK(*t.get(to_bytes("a")) == 10);
+    CHECK(*t.get(to_bytes("b")) == 2);
+  }
+
+  SECTION("bulk upsert with conflicts") {
+    auto tr = Tree{}.transient();
+    for (int i = 0; i < 500; ++i) {
+      auto key = std::string("key_") + std::to_string(i % 100);
+      tr.upsert(to_bytes(key), i, greater);
+    }
+    auto t = std::move(tr).persistent();
+    CHECK(t.size() == 100U);
+    for (int i = 0; i < 100; ++i) {
+      auto key = std::string("key_") + std::to_string(i);
+      CHECK(*t.get(to_bytes(key)) == 400 + i);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Immutability: snapshot before mutation is stable
 // ---------------------------------------------------------------------------
 TEST_CASE("RadixTree immutability snapshot", "[radix_tree]") {

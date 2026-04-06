@@ -839,6 +839,13 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files)
     fstats[rf.file_id].total_bytes = rf.total_bytes;
   }
 
+  // live_bytes are NOT tracked per-entry here — Phase 4 in
+  // recovery_load_parallel recomputes them in a single pass after the
+  // final merge, avoiding redundant O(N) map lookups per worker.
+  auto lsn_wins = [](const KeyDirEntry &existing, const KeyDirEntry &incoming) {
+    return existing.sequence < incoming.sequence;
+  };
+
   for (auto &[file_id, data_file, hint_path, tb] : files) {
     auto hint = HintFile::OpenForRead(hint_path);
     Offset off = 0;
@@ -852,25 +859,16 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files)
           off = next;
           continue;
         }
-        const auto existing = t.get(he.key);
-        if (!existing || existing->sequence < he.sequence) {
-          if (existing) {
-            fstats[existing->file_id].live_bytes -=
-                entry_size(he.key.size(), existing->value_size);
-          }
-          fstats[file_id].live_bytes +=
-              entry_size(he.key.size(), he.value_size);
-          t.set(he.key, KeyDirEntry{he.sequence, file_id, he.file_offset,
-                                    he.value_size});
-        }
+        t.upsert(he.key,
+                 KeyDirEntry{he.sequence, file_id, he.file_offset,
+                             he.value_size},
+                 lsn_wins);
       } else if (he.entry_type == EntryType::Delete) {
         const auto k = Key{he.key};
         auto &tomb_seq = tombstones[k];
         if (he.sequence > tomb_seq) tomb_seq = he.sequence;
         const auto existing = t.get(he.key);
         if (existing && existing->sequence < he.sequence) {
-          fstats[existing->file_id].live_bytes -=
-              entry_size(he.key.size(), existing->value_size);
           t.erase(he.key);
         }
       }
