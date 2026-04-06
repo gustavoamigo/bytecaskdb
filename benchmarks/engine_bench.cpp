@@ -858,9 +858,8 @@ void BM_ReadWhileWriting(benchmark::State &state) {
 // ──────────── Parallel Recovery ──────────────────────────────────────────────
 // Measures startup recovery with varying thread counts.
 // Uses kDatasetSize keys with 1-byte values so hint-file parsing dominates.
-// 256 KiB rotation threshold → many data files for meaningful parallelism.
 
-static constexpr std::uint64_t kParRecoveryThreshold = 256ULL * 1024;
+static constexpr std::uint64_t kParRecoveryThreshold = 4ULL * 1024 * 1024;
 
 namespace {
 struct ParRecoverySetup {
