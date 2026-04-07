@@ -1,6 +1,6 @@
 # ByteCask Engine API Design
 
-This document proposes the public C++ API for the main `Bytecask` class — the entry point for all ByteCask operations. It is intended as a discussion artifact before implementation begins.
+This document describes the public C++ API for the main `DB` class — the entry point for all ByteCask operations.
 
 Canonical location: `docs/engine_api_design.md`.
 
@@ -10,15 +10,14 @@ Canonical location: `docs/engine_api_design.md`.
 
 - Provide a clean, minimal API surface for key-value operations.
 - Support atomic multi-operation batches.
-- Support ordered range iteration (enabled by the B-Tree key directory).
-- Be idiomatic C++23: no raw pointers, no stringly-typed errors, move-only ownership.
+- Support ordered range iteration (enabled by the radix-tree key directory).
+- Be idiomatic C++20: no raw pointers, no stringly-typed errors, move-only ownership.
 
 ## Non-Goals (for now)
 
 - Multi-writer access, MVCC, or snapshot isolation. ByteCask uses a SWMR model; see Architecture below.
 - TTL or expiry.
 - Async I/O.
-- Online (background) compaction. Vacuum is a fully offline operation.
 
 ---
 
@@ -26,16 +25,19 @@ Canonical location: `docs/engine_api_design.md`.
 
 ### Key Directory
 
-ByteCask uses `PersistentOrderedMap<Key, KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times. The immutable sorted-map structure enables cheap snapshots for concurrent reads without locks.
+ByteCask uses `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times. The immutable trie structure provides structural sharing so readers take a cheap snapshot of the root without acquiring any lock.
 
-`immer::btree_map` does not exist in the immer library. `PersistentOrderedMap<K, V>` is a thin wrapper backed by `immer::flex_vector<Entry>` (Radix Balanced Tree) that provides sorted-map semantics: O(log n) get/set/erase, structural sharing, and a `transient()` / `persistent()` round-trip for batch mutations. See `src/engine/persistent_ordered_map.cppm`.
+`PersistentRadixTree<V>` is a custom copy-on-write adaptive radix tree (ART-style) implemented in `src/radix_tree.cppm`. It supports O(k) get/set/erase (k = key length), structural sharing between versions, and in-order iteration via `RadixTreeIterator<V>`.
 
 ### Concurrency Model
 
 ByteCask follows a **single-writer / multiple-reader (SWMR)** model:
 
-- Exactly one writer may operate at a time.
-- Multiple readers may operate concurrently, isolated from writes by a persistent snapshot of the key directory.
+- Exactly one writer may operate at a time (`write_mu_` serialises `put`, `del`, `apply_batch`).
+- Multiple readers may operate concurrently, isolated from writes by a persistent snapshot of the key directory loaded via `state_.load()`.
+- `WriteOptions::try_lock` lets write callers opt into a non-blocking lock attempt that throws `std::system_error(errc::resource_unavailable_try_again)` instead of blocking.
+- `ReadOptions::staleness_tolerance` lets readers trade freshness for throughput: a non-zero tolerance allows reading from a snapshot that is at most that many milliseconds old (bounded staleness). The default (0) provides read-your-writes session consistency.
+- A `SyncGroup` batches concurrent `fdatasync` calls so one sync can cover multiple writers, reducing syscall overhead under concurrent write workloads.
 - MVCC and snapshot isolation are not supported.
 
 ### Data File Lifecycle
@@ -65,7 +67,18 @@ Rationale:
 
 ### Vacuum
 
-Vacuum (also called *compaction* or *merge* in other systems; this project uses the PostgreSQL term) is **fully offline**: the engine must not be running while vacuum operates. There is no background or online compaction. This simplifies the storage engine because the key directory never needs to handle files being rewritten underneath it.
+Vacuum is **online**: the engine continues to serve reads and writes while vacuum scans and rewrites data. `vacuum_mu_` serialises concurrent `vacuum()` calls independently from `write_mu_`, so only the brief commit step (remapping key-directory entries and swapping files) blocks writers. `vacuum()` is designed to be called safely from a dedicated background thread.
+
+The caller drives the vacuum loop:
+
+```cpp
+while (!stop_requested) {
+    sleep(1h);
+    while (db.vacuum()) {
+        sleep(2s);   // more files may still qualify; keep draining
+    }
+}
+```
 
 ### Log Sequence Number (LSN)
 
@@ -108,16 +121,78 @@ If the engine crashes after writing a `BulkBegin` but before the matching `BulkE
 // Owned byte buffer — used for return values and batch storage.
 using Bytes = std::vector<std::byte>;
 
-// Owned key — semantically distinct from a generic byte buffer.
-// Keys have an upper bound of 65 535 bytes (u16 key_size in the data file header).
-// Starting as an alias for Bytes; may be refined to enforce the size invariant.
-using Key = Bytes;
-
 // Non-owning view — used for all input parameters.
 using BytesView = std::span<const std::byte>;
 ```
 
-**Rationale:** `std::byte` makes the intent clear (raw bytes, not text) and prevents accidental arithmetic. `Key` is kept distinct from `Bytes` so the key directory type (`PersistentOrderedMap<Key, KeyDirEntry>`) reads as its intent and provides a single point of change if the key type needs to evolve (e.g., to enforce the u16 size limit or adopt a small-buffer-optimized representation). `BytesView` as the universal input type avoids copies at call sites and accepts any contiguous range (`std::vector<std::byte>`, `std::string`, `std::array`, string literals via a small helper).
+**Rationale:** `std::byte` makes the intent clear (raw bytes, not text) and prevents accidental arithmetic. `BytesView` as the universal input type avoids copies at call sites and accepts any contiguous range (`std::vector<std::byte>`, `std::string`, `std::array`, string literals via a small helper).
+
+---
+
+## Options
+
+```cpp
+// Passed to DB::open().
+struct Options {
+    // Active-file rotation threshold in bytes (default 64 MiB).
+    std::uint64_t max_file_bytes{64ULL * 1024 * 1024};
+    // Number of threads used to rebuild the key directory at open time.
+    // 1 selects the serial path; >1 uses file-level fan-in parallelism.
+    unsigned recovery_threads{4};
+};
+```
+
+## WriteOptions
+
+```cpp
+// Controls durability behaviour for put, del, apply_batch.
+struct WriteOptions {
+    // When true (default), fdatasync is called after the write.
+    // Set to false for higher throughput when durability can be relaxed.
+    bool sync{true};
+
+    // When false (default), the write lock is acquired with a blocking wait.
+    // When true, throws std::system_error(errc::resource_unavailable_try_again)
+    // if the lock is already held.
+    bool try_lock{false};
+};
+```
+
+## ReadOptions
+
+```cpp
+// Controls consistency behaviour for get, contains_key, iter_from, keys_from.
+struct ReadOptions {
+    // Maximum age of the cached snapshot before the reader refreshes it.
+    // 0 (default): read-your-writes session consistency — refresh on every write.
+    // > 0: bounded staleness — snapshot may be up to this many milliseconds old.
+    //      Useful for write-heavy workloads where read throughput matters more
+    //      than freshness. The staleness check is a single relaxed load (no lock,
+    //      no clock read on the reader side).
+    std::chrono::milliseconds staleness_tolerance{0};
+
+    // When true, CRC32 is verified for every value read from disk.
+    // Default false for higher throughput; enable when silent corruption
+    // detection is required.
+    bool verify_checksums{false};
+};
+```
+
+## VacuumOptions
+
+```cpp
+// Controls which sealed files are eligible for vacuum.
+struct VacuumOptions {
+    // Minimum fragmentation ratio (1 − live_bytes / total_bytes) a sealed
+    // file must exceed to be eligible. Range [0.0, 1.0]. Default 0.5.
+    double fragmentation_threshold{0.5};
+
+    // Maximum live bytes a sealed file may contain to be absorbed into the
+    // active file rather than compacted into a new sealed file.
+    // Files above this threshold are always compacted. Default: 1 MiB.
+    std::uint64_t absorb_threshold{1ULL * 1024 * 1024};
+};
+```
 
 ---
 
@@ -143,19 +218,19 @@ public:
     Batch(Batch&&) noexcept        = default;
     Batch& operator=(Batch&&) noexcept = default;
 
-    void insert(BytesView key, BytesView value);
-    void remove(BytesView key);
+    void put(BytesView key, BytesView value);
+    void del(BytesView key);
 
     [[nodiscard]] bool empty() const noexcept;
     [[nodiscard]] std::size_t size() const noexcept;
 
 private:
     std::vector<BatchOperation> operations_;
-    friend class Bytecask;
+    friend class DB;
 };
 ```
 
-**Rationale:** `std::variant` over an inheritance hierarchy keeps `BatchOperation` a value type (no heap allocation per item, trivially movable). `Batch` is move-only and single-use; `Bytecask::apply_batch` consumes it by move. No size limit is imposed by the engine.
+**Rationale:** `std::variant` over an inheritance hierarchy keeps `BatchOperation` a value type (no heap allocation per item, trivially movable). `Batch` is move-only and single-use; `DB::apply_batch` consumes it by move. No size limit is imposed by the engine.
 
 ---
 
@@ -164,26 +239,26 @@ private:
 Both iterators satisfy `std::input_iterator`. They are forward-only and yield entries in ascending key order.
 
 ```cpp
-// Yields (key, value) pairs.
-class EntryIterator {
-public:
-    using value_type      = std::pair<Bytes, Bytes>;
-    using difference_type = std::ptrdiff_t;
-
-    auto operator++() -> EntryIterator&;
-    void operator++(int);                        // advance only; no copy
-    auto operator*() const -> const value_type&;
-    auto operator==(std::default_sentinel_t) const noexcept -> bool;
-};
-
-// Yields keys only (no value I/O).
+// Yields keys only (no data file I/O). Walks the in-memory radix tree.
 class KeyIterator {
 public:
     using value_type      = Bytes;
     using difference_type = std::ptrdiff_t;
 
     auto operator++() -> KeyIterator&;
-    void operator++(int);                        // advance only; no copy
+    void operator++(int);
+    auto operator*() const -> const value_type&;
+    auto operator==(std::default_sentinel_t) const noexcept -> bool;
+};
+
+// Yields (key, value) pairs. Reads values lazily from disk via pread.
+class EntryIterator {
+public:
+    using value_type      = std::pair<Bytes, Bytes>;
+    using difference_type = std::ptrdiff_t;
+
+    auto operator++() -> EntryIterator&;
+    void operator++(int);
     auto operator*() const -> const value_type&;
     auto operator==(std::default_sentinel_t) const noexcept -> bool;
 };
@@ -192,72 +267,94 @@ public:
 Both integrate with `std::ranges::subrange` so callers can use range-for directly:
 
 ```cpp
-for (auto& [key, value] : db.iter_from(start_key)) { ... }
-for (auto& key : db.keys_from(prefix))              { ... }
+for (auto& [key, value] : db.iter_from(opts, start_key)) { ... }
+for (auto& key : db.keys_from(opts, prefix))              { ... }
 ```
 
 **Decisions:**
-- **Lazy**: `operator++` reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries.
-- **`KeyIterator` is in-memory only**: walks the B-Tree key directory without touching any data file.
+- **Lazy**: `operator*` reads one value from disk on demand via a single `pread`. Early-termination scans pay no I/O cost for unvisited entries.
+- **`KeyIterator` is in-memory only**: walks the radix-tree key directory without touching any data file.
 - **Error handling**: throws `std::system_error` on I/O failure (consistent with all other operations).
 
 ---
 
-## Bytecask
+## DB
 
 ```cpp
-class Bytecask {
+class DB {
 public:
-    // Opens or creates a database rooted at `dir`.
-    // Throws std::system_error if the directory cannot be opened or recovery fails.
-    [[nodiscard]] static auto open(std::filesystem::path dir) -> Bytecask;
+    // Opens or creates a database rooted at dir.
+    // Always creates a new active data file on open.
+    // Throws std::system_error if the directory cannot be prepared.
+    [[nodiscard]] static auto open(std::filesystem::path dir,
+                                   Options opts = {}) -> DB;
 
-    Bytecask(const Bytecask&)            = delete;
-    Bytecask& operator=(const Bytecask&) = delete;
-    Bytecask(Bytecask&&) noexcept        = default;
-    Bytecask& operator=(Bytecask&&) noexcept = default;
-    ~Bytecask();
+    DB(const DB&)            = delete;
+    DB& operator=(const DB&) = delete;
+    DB(DB&&)                 = delete;
+    DB& operator=(DB&&)      = delete;
+    ~DB();
 
     // ── Primary operations ────────────────────────────────────────────────
 
-    // Returns the value for `key`, or std::nullopt if the key does not exist.
-    // Throws std::system_error on I/O failure or std::runtime_error on corruption.
-    [[nodiscard]] auto get(BytesView key) const -> std::optional<Bytes>;
+    // Writes the value for key into out, reusing its existing capacity.
+    // Returns true if the key was found, false otherwise.
+    // opts.verify_checksums controls CRC verification on the read path.
+    // Throws std::system_error on I/O failure or std::runtime_error on CRC mismatch.
+    [[nodiscard]] auto get(const ReadOptions& opts,
+                           BytesView key, Bytes& out) const -> bool;
 
-    // Writes `key` → `value`. Overwrites any existing value.
-    // Throws std::system_error on I/O failure.
-    void insert(BytesView key, BytesView value);
+    // Writes key → value. Overwrites any existing value.
+    // opts.sync controls fdatasync; opts.try_lock controls lock mode.
+    // Throws std::system_error on I/O failure or lock contention (try_lock).
+    void put(const WriteOptions& opts, BytesView key, BytesView value);
 
-    // Writes a tombstone for `key`.
+    // Writes a tombstone for key.
     // Returns true if the key existed and was removed, false if it was absent.
-    // Throws std::system_error on I/O failure.
-    [[nodiscard]] bool remove(BytesView key);
+    // opts.sync controls fdatasync; opts.try_lock controls lock mode.
+    // Throws std::system_error on I/O failure or lock contention (try_lock).
+    [[nodiscard]] auto del(const WriteOptions& opts, BytesView key) -> bool;
 
-    // Returns true if `key` exists in the index (no disk I/O).
+    // Returns true if key exists in the index (no disk I/O).
     [[nodiscard]] auto contains_key(BytesView key) const -> bool;
 
     // ── Batch ─────────────────────────────────────────────────────────────
 
-    // Atomically applies all operations in `batch` wrapped in BulkBegin/BulkEnd entries.
-    // `batch` is consumed (move-only). No-op if batch.empty().
-    // Throws std::system_error on I/O failure; the database is left consistent on failure.
-    void apply_batch(Batch batch);
+    // Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
+    // batch is consumed (move-only). No-op if batch.empty().
+    // opts.sync controls whether a single fdatasync is issued at the end.
+    // Throws std::system_error on I/O failure or lock contention (try_lock).
+    void apply_batch(const WriteOptions& opts, Batch batch);
 
     // ── Range iteration ───────────────────────────────────────────────────
 
-    // Returns an input range of (key, value) pairs with keys >= `from`.
-    // Pass an empty span to start from the first key. Each increment reads one
-    // value from disk (lazy). Throws std::system_error on I/O failure.
-    [[nodiscard]] auto iter_from(BytesView from = {}) const
+    // Returns an input range of (key, value) pairs with keys >= from.
+    // Pass an empty span to start from the first key. Each dereference reads
+    // one value from disk via a single pread (lazy). Results are in ascending
+    // key order.
+    // Throws std::system_error on I/O failure.
+    [[nodiscard]] auto iter_from(const ReadOptions& opts,
+                                 BytesView from = {}) const
         -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
 
-    // Returns an input range of keys >= `from` without reading values.
-    // Walks the in-memory B-Tree only; no disk I/O.
-    [[nodiscard]] auto keys_from(BytesView from = {}) const
+    // Returns an input range of keys >= from. Walks the in-memory radix tree
+    // only; no disk I/O.
+    [[nodiscard]] auto keys_from(const ReadOptions& opts,
+                                 BytesView from = {}) const
         -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
 
+    // ── Vacuum ────────────────────────────────────────────────────────────
+
+    // Selects the highest-fragmentation sealed file above the threshold and
+    // either absorbs it into the active file (if it is small enough) or
+    // compacts it into a new sealed file.
+    // Returns true if a file was vacuumed, false if no file qualified.
+    // Thread-safe: safe to call from a dedicated background thread without
+    // any external synchronisation; only the brief commit step blocks writers.
+    [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
+
 private:
-    explicit Bytecask(std::filesystem::path dir);
+    explicit DB(std::filesystem::path dir, Options opts);
 };
 ```
 
@@ -267,33 +364,45 @@ private:
 
 ```cpp
 // Open (or create) a database.
-auto db = Bytecask::open("my_db");
+auto db = DB::open("my_db");
+
+// Default options.
+constexpr WriteOptions kSync{};
+constexpr ReadOptions  kRead{};
 
 // Single-key operations.
-db.insert(as_bytes("user:1"), as_bytes("alice"));
+db.put(kSync, as_bytes("user:1"), as_bytes("alice"));
 
-auto val = db.get(as_bytes("user:1"));
-if (val) { /* use *val */ }
+Bytes out;
+bool found = db.get(kRead, as_bytes("user:1"), out);
 
-bool existed = db.remove(as_bytes("user:1")); // false if key was absent
+bool existed = db.del(kSync, as_bytes("user:1"));  // false if key was absent
 
 // Atomic batch.
 Batch batch;
-batch.insert(as_bytes("user:2"), as_bytes("bob"));
-batch.insert(as_bytes("user:3"), as_bytes("carol"));
-batch.remove(as_bytes("user:1"));
-db.apply_batch(std::move(batch));
+batch.put(as_bytes("user:2"), as_bytes("bob"));
+batch.put(as_bytes("user:3"), as_bytes("carol"));
+batch.del(as_bytes("user:1"));
+db.apply_batch(kSync, std::move(batch));
 
 // Range scan.
-for (auto& [key, value] : db.iter_from(as_bytes("user:"))) {
+for (auto& [key, value] : db.iter_from(kRead, as_bytes("user:"))) {
     // Iterates all keys >= "user:" in ascending order.
 }
 
-// Keys-only scan (no disk I/O — B-Tree walk only).
-for (auto& key : db.keys_from(as_bytes("user:"))) { ... }
+// Keys-only scan (no disk I/O — radix tree walk only).
+for (auto& key : db.keys_from(kRead, as_bytes("user:"))) { ... }
+
+// Background vacuum loop (run in a dedicated thread).
+while (!stop_requested) {
+    sleep(1h);
+    while (db.vacuum()) {
+        sleep(2s);
+    }
+}
 ```
 
-> `as_bytes` is a small helper that converts a string literal or `std::string_view` to `BytesView`. Its exact form is TBD.
+> `as_bytes` is a small helper that converts a string literal or `std::string_view` to `BytesView`.
 
 ---
 
@@ -301,16 +410,17 @@ for (auto& key : db.keys_from(as_bytes("user:"))) { ... }
 
 | # | Decision |
 |---|----------|
-| D1 | **Error handling**: Throw (`std::system_error` for I/O, `std::runtime_error` for corruption). These are panic-level events the caller cannot meaningfully recover from inline. `std::optional` covers the key-not-found case for `get`. No `std::expected` at this boundary — there are no anticipated recoverable error conditions in normal operation. |
-| D2 | **Config**: Deferred — removed from the initial API scope. |
-| D3 | **Batch ownership**: `Batch` is move-only (copy constructor and copy assignment deleted). Single-use by design. |
+| D1 | **Error handling**: Throw (`std::system_error` for I/O, `std::runtime_error` for corruption). These are panic-level events the caller cannot meaningfully recover from inline. `get` uses an output parameter + `bool` return instead of `std::optional` so the caller can reuse an existing buffer across repeated calls. No `std::expected` at this boundary. |
+| D2 | **Config**: `Options` (open-time), `WriteOptions` (per-write durability), `ReadOptions` (per-read freshness and CRC), `VacuumOptions` (fragmentation thresholds). Modelled after LevelDB / RocksDB patterns. |
+| D3 | **Batch ownership**: `Batch` is move-only (copy constructor and copy assignment deleted). Single-use by design; `apply_batch` consumes it. |
 | D4 | **Batch size limit**: None — the caller is responsible. |
-| D5 | **Iterator strategy**: Lazy — each `operator++` reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries. |
-| D6 | **`KeyIterator` source**: In-memory only — walks the B-Tree key directory without opening any data file. |
-| D7 | **`remove` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
-| D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1 and standard C++ practice — `std::istream_iterator` propagates stream errors the same way). |
-| D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. MVCC and snapshot isolation are not provided. |
-| D10 | **Vacuum**: Fully offline. The engine must not be running while vacuum operates. No background or online compaction. |
+| D5 | **Iterator strategy**: Lazy — `operator*` reads one value from disk on demand via a single `pread`. Early-termination scans pay no I/O cost for unvisited entries. |
+| D6 | **`KeyIterator` source**: In-memory only — walks the radix-tree key directory without opening any data file. |
+| D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
+| D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1). |
+| D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. `WriteOptions::try_lock` enables non-blocking write attempts. `ReadOptions::staleness_tolerance` enables bounded-staleness reads. |
+| D10 | **Vacuum**: Online. `vacuum()` is safe to call from a background thread. Only the brief commit step (key-dir remap + file swap) blocks writers via `write_mu_`. A separate `vacuum_mu_` serialises concurrent `vacuum()` calls. |
 | D11 | **File naming**: `data_{YYYYMMDDHHmmssUUUUUU}` using microsecond precision. Gives lexicographic == chronological ordering and avoids the false precision of nanosecond timestamps whose sub-microsecond bits are often zero on Linux. |
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be silently discarded with a logged warning. No partial-batch entries enter the key directory. |
+| D14 | **`DB` is not movable**: Both move constructor and move assignment are deleted. `DB` owns a mutex by `unique_ptr` and a `SyncGroup` with an internal background thread; move semantics would leave the source in an indeterminate state. Use `DB::open` exclusively and store the result in place (e.g. in a `std::optional<DB>`). |
