@@ -53,7 +53,7 @@ See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md)
 | Operation | ByteCask | RocksDB | Notes |
 |-----------|----------|---------|-------|
 | Put (NoSync) | 157 Kops/s | **166 Kops/s** | Comparable with an edge for RocksDB. Sequential append on both sides |
-| Put (Sync) | 435 ops/s |&& | Comparable  with an edge for RocksDB. Disk-bound — limited by `fdatasync` round-trip latency |
+| Put (Sync) | 435 ops/s |**478.0 ops/s** | Comparable  with an edge for RocksDB. Disk-bound — limited by `fdatasync` round-trip latency |
 | Get | **1.34 Mops/s** | 575 Kops/s | **2.3×** — in-memory radix tree lookup; no block cache miss risk |
 | Del (Sync) | **657 ops/s** | 320 ops/s | **2.1×** — single tombstone append vs RocksDB write amplification |
 | Range-50 | 30 K scans/s | **87 K scans/s** | RocksDB prefetches sequential blocks; ByteCask fetches each value individually. |
@@ -110,7 +110,7 @@ Recovery is the process that runs when ByteCask opens an existing database: it r
 
 ---
 
-_Tested on AMD Ryzen 7 3700X (8C/16T), Samsung SSD 860 EVO SATA (483 MiB/s read), 31 GiB RAM. Values: 245 bytes of random data. Each result is the mean of 3 runs. Benchmark source: [`benchmarks/engine_bench.cpp`](benchmarks/engine_bench.cpp)._
+_Tested on AMD Ryzen 7 3700X (8C/16T), Samsung SSD 860 EVO SATA (483 MiB/s read), 31 GiB RAM. Each result is the mean of 3 runs. Benchmark source: [`benchmarks/engine_bench.cpp`](benchmarks/engine_bench.cpp)._
 
 ## Quick Start
 
@@ -227,7 +227,7 @@ ByteCask requires **Clang** (with C++23 modules support) and [xmake](https://xma
 
 ```bash
 # Build and run the test suite.
-xmake build bytecask_tests
+xmake build 
 xmake run bytecask_tests
 
 # Build benchmarks (optional; requires RocksDB).
