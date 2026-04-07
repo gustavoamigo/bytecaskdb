@@ -25,6 +25,7 @@ for (auto& [key, value] : db.iter_from({}, to_bytes("user:"))) { ... }
 - **Sequential write path** — every `put`, `del`, and `apply_batch` performs a single sequential append; no WAL, no random writes, just one I/O operation per write.
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration.
 - **Atomic writes** — every `put` and `del` is atomic. `apply_batch` makes multiple puts and deletes atomic as a group.
+- **Conflict-safe CAS writes** — `snapshot()` captures a consistent read-only view; `apply_batch_if(snap, opts, batch)` applies a batch atomically only if none of its keys were written since the snapshot, throwing `BatchConflict` otherwise. Single-key CAS with no marker overhead.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms and 100 M keys in under 6 s on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second; a single writer ensures consistent writes even under concurrent multi-threaded access.
@@ -135,6 +136,20 @@ batch.put(to_bytes("user:3"), to_bytes("carol"));
 batch.del(to_bytes("user:1"));
 db.apply_batch({}, std::move(batch));
 
+// Conflict-safe CAS write — reads from a consistent snapshot,
+// applies the batch only if none of its keys changed since the snapshot.
+auto snap = db.snapshot();
+Bytes balance_out;
+snap.get(to_bytes("account:42"), balance_out);
+// ... compute new_balance ...
+Batch cas;
+cas.put(to_bytes("account:42"), new_balance);
+try {
+    db.apply_batch_if(snap, {}, std::move(cas));
+} catch (const BatchConflict&) {
+    // a concurrent writer modified "account:42" — retry
+}
+
 // Prefix scan — in-memory key walk, values fetched lazily from disk.
 for (auto& [key, value] : db.iter_from({}, to_bytes("user:"))) {
     // Iterates all keys >= "user:" in ascending order.
@@ -177,6 +192,14 @@ public:
     // Atomically applies all operations in batch. Consumes batch (move-only).
     void apply_batch(const WriteOptions& opts, Batch batch);
 
+    // Returns a frozen, move-only, read-only view of the DB at this instant.
+    // Holds open referenced data files until destroyed — vacuum deferred automatically.
+    [[nodiscard]] auto snapshot() const -> Snapshot;
+
+    // Applies batch atomically iff no key in batch was modified since snap.
+    // Throws BatchConflict on W-W conflict. Throws std::system_error on I/O failure.
+    void apply_batch_if(const Snapshot& snap, WriteOptions opts, Batch batch);
+
     [[nodiscard]] auto iter_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
 
@@ -190,7 +213,7 @@ public:
 } // namespace bytecask
 ```
 
-Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; key-not-found is signalled by `get` returning `false`.
+Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; key-not-found is signalled by `get` returning `false`; W-W conflicts throw `BatchConflict`.
 
 ## Architecture
 

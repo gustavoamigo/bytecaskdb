@@ -247,17 +247,54 @@ auto DB::contains_key(BytesView key) const -> bool {
 // Rotates the active file after the sync if the threshold is reached.
 // Throws std::system_error on I/O failure or lock contention (try_lock).
 void DB::apply_batch(const WriteOptions &opts, Batch batch) {
+  apply_batch_impl(opts, std::move(batch), nullptr);
+}
+
+#pragma endregion
+
+#pragma region apply_batch_impl
+
+const char *BatchConflict::what() const noexcept { return "batch conflict"; }
+
+// Shared write path for apply_batch (snap == nullptr) and apply_batch_if
+// (snap != nullptr). When snap is provided, performs a W-W conflict check
+// under write_mu_ before applying; short-circuits on the first conflict.
+// Single-op optimization: skips BulkBegin/BulkEnd when batch.size() == 1.
+void DB::apply_batch_impl(const WriteOptions &opts, Batch batch,
+                          const Snapshot *snap) {
   if (batch.empty()) {
     return;
   }
   std::shared_ptr<DataFile> file_to_sync;
   {
     auto guard = acquire_write_lock(opts);
-    auto s = *state_.load();
+    auto current = state_.load();
 
-    stats_publish_bulk_marker(s.active_file_id);
-    std::ignore =
-        s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
+    // W-W conflict check — only on the apply_batch_if path.
+    if (snap) {
+      for (const auto &op : batch.operations_) {
+        std::visit(
+            [&](const auto &o) {
+              const std::span<const std::byte> key_span{o.key};
+              const auto snap_entry = snap->state_->key_dir.get(key_span);
+              const auto cur_entry = current->key_dir.get(key_span);
+              const bool appeared = !snap_entry && cur_entry;
+              const bool deleted = snap_entry && !cur_entry;
+              const bool modified = snap_entry && cur_entry &&
+                                    cur_entry->sequence != snap_entry->sequence;
+              if (appeared || deleted || modified) throw BatchConflict{};
+            },
+            op);
+      }
+    }
+
+    auto s = *current;
+    const bool multi = batch.size() > 1;
+    if (multi) {
+      stats_publish_bulk_marker(s.active_file_id);
+      std::ignore =
+          s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
+    }
 
     auto t = s.key_dir.transient();
     for (auto &op : batch.operations_) {
@@ -270,7 +307,6 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
               if (existing) stats_retire_entry(key_span, *existing);
               stats_publish_put(s.active_file_id, key_span,
                                 std::span<const std::byte>{o.value});
-
               const auto offset = s.active_file().append(
                   s.next_lsn, EntryType::Put, key_span,
                   std::span<const std::byte>{o.value});
@@ -283,7 +319,6 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
               const auto existing = t.get(key_span);
               if (existing) stats_retire_entry(key_span, *existing);
               stats_publish_tombstone(s.active_file_id, key_span);
-
               std::ignore = s.active_file().append(s.next_lsn, EntryType::Delete,
                                                    key_span, {});
               ++s.next_lsn;
@@ -293,9 +328,11 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
           op);
     }
 
-    stats_publish_bulk_marker(s.active_file_id);
-    std::ignore =
-        s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
+    if (multi) {
+      stats_publish_bulk_marker(s.active_file_id);
+      std::ignore =
+          s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
+    }
 
     s.key_dir = std::move(t).persistent();
     if (opts.sync) {
@@ -308,6 +345,56 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
   if (file_to_sync) {
     sync_group_.sync([&] { file_to_sync->sync(); });
   }
+}
+
+#pragma endregion
+
+#pragma region Snapshot and apply_batch_if
+
+auto DB::snapshot() const -> Snapshot { return Snapshot{state_.load()}; }
+
+void DB::apply_batch_if(const Snapshot &snap, WriteOptions opts, Batch batch) {
+  apply_batch_impl(opts, std::move(batch), &snap);
+}
+
+#pragma endregion
+
+#pragma region Snapshot read methods
+
+auto Snapshot::contains_key(BytesView key) const -> bool {
+  return state_->key_dir.contains(key);
+}
+
+// Reads the value for key from the frozen snapshot state into out.
+// Thread-local I/O buffer reused across calls to amortize allocation.
+auto Snapshot::get(BytesView key, Bytes &out) const -> bool {
+  const auto kv = state_->key_dir.get(key);
+  if (!kv) return false;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  thread_local Bytes io_buf;
+#pragma clang diagnostic pop
+  state_->files->at(kv->file_id)
+      ->read_value(kv->file_offset, narrow<std::uint16_t>(key.size()),
+                   kv->value_size, /*verify_checksums=*/true, io_buf, out);
+  return true;
+}
+
+auto Snapshot::iter_from(BytesView from) const
+    -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
+  auto it =
+      from.empty() ? state_->key_dir.begin() : state_->key_dir.lower_bound(from);
+  return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
+      EntryIterator{state_, std::move(it), /*verify_checksums=*/true},
+      std::default_sentinel};
+}
+
+auto Snapshot::keys_from(BytesView from) const
+    -> std::ranges::subrange<KeyIterator, std::default_sentinel_t> {
+  auto it =
+      from.empty() ? state_->key_dir.begin() : state_->key_dir.lower_bound(from);
+  return std::ranges::subrange<KeyIterator, std::default_sentinel_t>{
+      KeyIterator{std::move(it)}, std::default_sentinel};
 }
 
 #pragma endregion

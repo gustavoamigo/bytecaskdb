@@ -84,8 +84,7 @@ public:
 private:
   explicit Snapshot(std::shared_ptr<const EngineState> state);
   std::shared_ptr<const EngineState> state_;
-  friend class DB;          // DB::snapshot() constructs; apply_batch_if() reads state_
-  friend class Transaction; // Transaction::get() reads state_ for Serializable read set
+  friend class DB; // DB::snapshot() constructs; apply_batch_if() reads state_
 };
 ```
 
@@ -111,7 +110,7 @@ Applies `batch` atomically, but only if no key in the batch was modified since `
 ```cpp
 // On DB:
 // Applies batch atomically iff no key in batch was modified since snap.
-// Throws TransactionConflict naming the conflicting keys.
+// Throws BatchConflict on W-W conflict.
 // Throws std::system_error on I/O failure.
 // No-op if batch is empty.
 void apply_batch_if(const Snapshot& snap, WriteOptions opts, Batch batch);
@@ -132,9 +131,9 @@ for each key K in batch:
        current_entry.sequence != snap_entry.sequence:
         → conflict (key was modified after snapshot was taken)
 
-if any conflicts:
+on first conflict:
     unlock write_mu_
-    throw TransactionConflict{conflicting_keys}
+    throw BatchConflict{}
 
 // No conflict — apply the batch (single-op optimization: see below)
 write entries, publish new EngineState
@@ -154,7 +153,7 @@ auto new_balance = compute(out);
 Batch b;
 b.put(to_bytes("balance"), new_balance);
 db.apply_batch_if(snap, {}, std::move(b));
-// throws TransactionConflict if "balance" was written concurrently
+// throws BatchConflict if "balance" was written concurrently
 ```
 
 ### Single-operation optimization
@@ -227,7 +226,7 @@ public:
 
   // Builds a Batch from the write set; calls db_.apply_batch_if(snapshot_, batch).
   // For Serializable: runs R-W read-set check first, before calling apply_batch_if.
-  // Throws TransactionConflict on conflict.
+  // Throws BatchConflict on conflict.
   // Throws std::system_error on I/O failure.
   // No-op if write set is empty.
   void commit();
@@ -255,7 +254,7 @@ txn.get(to_bytes("k"), out);          // reads from snapshot
 txn.put(to_bytes("k"), new_value);    // buffered
 txn.get(to_bytes("k"), out);          // returns new_value (write set wins)
 txn.commit();  // calls db.apply_batch_if(snapshot_, {}, batch)
-               // throws TransactionConflict if "k" was modified concurrently
+               // throws BatchConflict if "k" was modified concurrently
 ```
 
 ### `commit()` implementation
@@ -273,7 +272,7 @@ void Transaction::commit() {
       std::uint64_t cur_seq = entry ? entry->sequence : 0;
       if (cur_seq > snap_seq) conflicts.push_back(key);
     }
-    if (!conflicts.empty()) throw TransactionConflict{std::move(conflicts)};
+    if (cur_seq > snap_seq) throw BatchConflict{};
   }
 
   Batch batch;
@@ -314,13 +313,11 @@ Not meaningful in ByteCask's SWMR model. Writes are only visible after `state_.s
 
 ---
 
-## `TransactionConflict` error
+## `BatchConflict` error
 
 ```cpp
-export struct TransactionConflict : std::exception {
-  // Keys involved in the conflict (W-W or R-W).
-  std::vector<Bytes> conflicting_keys;
-  const char* what() const noexcept override { return "transaction conflict"; }
+export struct BatchConflict : std::exception {
+  const char* what() const noexcept override { return "batch conflict"; }
 };
 ```
 
@@ -428,7 +425,7 @@ for each ensure_range_unchanged(from, to):
 for each write key K:
     // W-W check (as today)
 
-if any conflicts: throw TransactionConflict
+if any conflicts: throw BatchConflict{}
 apply batch
 unlock write_mu_
 ```
@@ -470,11 +467,11 @@ Two additions to `DB`'s public interface:
 [[nodiscard]] auto snapshot() const -> Snapshot;
 
 // Applies batch atomically iff no key in batch was modified since snap.
-// Throws TransactionConflict on sequence mismatch. Throws std::system_error on I/O failure.
+// Throws BatchConflict on W-W conflict. Throws std::system_error on I/O failure.
 void apply_batch_if(const Snapshot& snap, WriteOptions opts, Batch batch);
 ```
 
-Everything else — `Transaction`, `TxnEntryIterator`, `TxnKeyIterator`, `IsolationLevel`, `TransactionConflict` — lives in `src/transactions.cpp`.
+Everything else — `Transaction`, `TxnEntryIterator`, `TxnKeyIterator`, `IsolationLevel` — lives in `src/transactions.cpp`. `BatchConflict` and `Snapshot` are exported from `bytecask.cppm`.
 
 No `TransactionalDB`. No `txn_mu_`. No `friend` declarations added to `DB`. No internal restructuring of `DB`.
 
@@ -489,9 +486,9 @@ No `TransactionalDB`. No `txn_mu_`. No `friend` declarations added to `DB`. No i
 | `ReadOptions`, `WriteOptions`, `Options`, `VacuumOptions` | Unchanged |
 | `KeyIterator`, `EntryIterator` | Unchanged |
 | `Snapshot` | **New** |
+| `BatchConflict` | **New** |
 | `Transaction` | **New** |
 | `IsolationLevel` | **New** |
-| `TransactionConflict` | **New** |
 | `TxnKeyIterator` | **New** |
 | `TxnEntryIterator` | **New** |
 
@@ -514,7 +511,7 @@ No `TransactionalDB`. No `txn_mu_`. No `friend` declarations added to `DB`. No i
 | Item | Scope |
 |---|---|
 | `IsolationLevel` enum | New export, trivial |
-| `TransactionConflict` | New export, trivial |
+| `BatchConflict` | New export, trivial |
 | `DB::snapshot()` | One-liner: `return Snapshot{state_.load()}` |
 | `Snapshot` class | New export; wraps `shared_ptr<const EngineState>`; full read-only API |
 | `DB::apply_batch_if()` | New method on `DB`: sequence check loop under `write_mu_` + existing apply path |
@@ -534,7 +531,7 @@ No `TransactionalDB`. No `txn_mu_`. No `friend` declarations added to `DB`. No i
 
 | File | Change | Content |
 |---|---|---|
-| `src/bytecask.cppm` | Modified | Forward-declare `Snapshot` before `DB`; add `snapshot()` and `apply_batch_if()` to `DB`; append full definitions of `IsolationLevel`, `TransactionConflict`, `Snapshot`, `TxnKeyIterator`, `TxnEntryIterator`, `Transaction` after `DB` |
+| `src/bytecask.cppm` | Modified | Forward-declare `Snapshot` before `DB`; add `snapshot()` and `apply_batch_if()` to `DB`; append full definitions of `BatchConflict`, `Snapshot`, after `DB`; `IsolationLevel`, `TxnKeyIterator`, `TxnEntryIterator`, `Transaction` in `src/transactions.cpp` |
 | `src/bytecask.cpp` | Modified | `DB::snapshot()` and `DB::apply_batch_if()` implementations; single-op optimization in both `apply_batch` and `apply_batch_if` |
 | `src/transactions.cpp` | **New** | `Snapshot` method bodies; `TxnKeyIterator`; `TxnEntryIterator`; `Transaction` method bodies |
 | `xmake.lua` | Modified | `src/bytecask.cpp` → `src/*.cpp` to pick up the new translation unit (all three targets) |
@@ -552,8 +549,7 @@ export class Snapshot;
 export class DB { ... };
 
 // Full definitions in dependency order after DB:
-// IsolationLevel → TransactionConflict → Snapshot (full) →
-// TxnKeyIterator → TxnEntryIterator → Transaction
+// BatchConflict → Snapshot (full)
 ```
 
 ### Key field name
@@ -570,7 +566,7 @@ export class DB { ... };
 |---|---|
 | `DB::snapshot()` standalone | Read-only view consistent after concurrent writes |
 | `apply_batch_if` no conflict | Applies when no concurrent write occurred |
-| `apply_batch_if` W-W conflict | Throws `TransactionConflict` when key modified after snapshot |
+| `apply_batch_if` W-W conflict | Throws `BatchConflict` when key modified after snapshot |
 | Single-op optimization | `apply_batch` / `apply_batch_if` with 1 op writes no markers (verify via `file_stats` byte counts) |
 | `Transaction` read-your-own-writes | `txn.put(k, v)` then `txn.get(k)` returns `v` before commit |
 | `Transaction` snapshot read consistency | `txn.get(k)` returns snapshot value, not a later committed write |

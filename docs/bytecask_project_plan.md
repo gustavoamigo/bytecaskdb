@@ -38,6 +38,8 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-103 | Layer 1: `snapshot()` and `apply_batch_if()` | Added `DB::snapshot()` → `Snapshot` (frozen read-only view, lock-free reads, auto vacuum deferral) and `DB::apply_batch_if()` (W-W CAS under `write_mu_`, short-circuits on first conflict, throws `BatchConflict`). Single-entry batch optimization skips `BulkBegin`/`BulkEnd` markers for both `apply_batch` and `apply_batch_if`. 13 new tests (5 `[snapshot]`, 8 `[apply_batch_if]`). 120 test cases total. |
+| --- | --- | --- |
 | BC-101 | Replace `sys-info.sh` memory usage with installed RAM summary | Removed the `free -h` OS usage view. The script now prints a single installed-RAM line from `/proc/meminfo`, avoiding privileged SMBIOS/DIMM probing while still describing machine capacity. |
 | BC-100 | Scope `sys-info.sh` disk output to current path | `scripts/sys-info.sh` now resolves `findmnt --target "$PWD"`, strips subvolume suffixes such as `[/home]`, maps partitions to their parent disk with `lsblk -no PKNAME`, and prints only the backing device for the current path. |
 | BC-098 | Open source license | Added MIT `LICENSE` file. |
