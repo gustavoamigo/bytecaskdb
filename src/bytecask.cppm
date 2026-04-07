@@ -3,6 +3,7 @@ module;
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -257,6 +258,12 @@ private:
 // ---------------------------------------------------------------------------
 // DB — SWMR key-value store
 //
+// Forward declaration — full definition after DB.
+export class Snapshot;
+
+// ---------------------------------------------------------------------------
+// DB — SWMR key-value store
+//
 // Thread safety: write operations (put, del, apply_batch) are serialised by
 // write_mu_. After producing a new EngineState, the writer publishes it via
 // state_.store(). Readers call state_.load() without acquiring write_mu_.
@@ -316,6 +323,15 @@ public:
   // Rotates the active file after the sync if the threshold is reached.
   // Throws std::system_error on I/O failure or lock contention (try_lock).
   void apply_batch(const WriteOptions &opts, Batch batch);
+
+  // Returns a frozen, move-only, read-only view of the DB at this instant.
+  // Holds open any data files referenced at snapshot time until destroyed.
+  [[nodiscard]] auto snapshot() const -> Snapshot;
+
+  // Applies batch atomically iff no key in batch was modified since snap.
+  // Throws BatchConflict on W-W conflict. Throws std::system_error on I/O failure.
+  // No-op if batch is empty.
+  void apply_batch_if(const Snapshot &snap, WriteOptions opts, Batch batch);
 
   // Returns an input range of (key, value) pairs with keys >= from.
   // Pass an empty span to start from the first key. Each dereference reads
@@ -425,6 +441,12 @@ private:
   // Calls rotate_active_file if active file has reached rotation_threshold_.
   [[nodiscard]] auto rotate_if_needed(EngineState s) -> EngineState;
 
+  // Shared implementation for apply_batch and apply_batch_if.
+  // snap == nullptr: unconditional apply (apply_batch path).
+  // snap != nullptr: W-W conflict check before applying (apply_batch_if path).
+  void apply_batch_impl(const WriteOptions &opts, Batch batch,
+                        const Snapshot *snap);
+
   // Member variables
   std::filesystem::path dir_;
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
@@ -450,6 +472,52 @@ private:
   // Declared last so it destructs first, joining the background thread before
   // any other member is destroyed.
   mutable BackgroundWorker worker_;
+};
+
+// ---------------------------------------------------------------------------
+// BatchConflict — thrown by apply_batch_if() when a W-W conflict is detected.
+// At least one key in the batch was modified after the snapshot was taken.
+// ---------------------------------------------------------------------------
+export struct BatchConflict : std::exception {
+  const char *what() const noexcept override;
+};
+
+// ---------------------------------------------------------------------------
+// Snapshot — frozen, move-only, read-only view of DB state.
+//
+// Holds a shared_ptr<const EngineState> that keeps referenced data files open
+// until the Snapshot is destroyed. Vacuum defers physical file deletion until
+// all Snapshots referencing a file are gone.
+// No mutex is acquired on any read method — reads are lock-free.
+// ---------------------------------------------------------------------------
+export class Snapshot {
+public:
+  Snapshot(const Snapshot &) = delete;
+  Snapshot &operator=(const Snapshot &) = delete;
+  Snapshot(Snapshot &&) noexcept = default;
+  Snapshot &operator=(Snapshot &&) noexcept = default;
+
+  // Returns true if key exists in this snapshot. No disk I/O.
+  [[nodiscard]] auto contains_key(BytesView key) const -> bool;
+
+  // Writes the value for key into out. Returns true if found, false if absent.
+  // Throws std::system_error on I/O failure or std::runtime_error on CRC mismatch.
+  [[nodiscard]] auto get(BytesView key, Bytes &out) const -> bool;
+
+  // Returns an input range of (key, value) pairs with keys >= from.
+  // Results are in ascending key order. Each dereference reads from disk (lazy).
+  [[nodiscard]] auto iter_from(BytesView from = {}) const
+      -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
+
+  // Returns an input range of keys >= from. Pure in-memory — no disk I/O.
+  [[nodiscard]] auto keys_from(BytesView from = {}) const
+      -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
+
+private:
+  explicit Snapshot(std::shared_ptr<const EngineState> state)
+      : state_{std::move(state)} {}
+  std::shared_ptr<const EngineState> state_;
+  friend class DB; // DB::snapshot() constructs; apply_batch_if() reads state_
 };
 
 } // namespace bytecask

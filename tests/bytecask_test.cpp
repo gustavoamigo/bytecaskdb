@@ -2179,3 +2179,239 @@ TEST_CASE("vacuum compact stats consistency", "[vacuum][filestats]") {
   // total_bytes >= total_live (there may be tombstones or overhead).
   CHECK(total_total >= total_live);
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot tests
+// ---------------------------------------------------------------------------
+
+// Snapshot::get returns the value frozen at snapshot time, not later writes.
+TEST_CASE("Snapshot get is frozen at snapshot time", "[snapshot]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v1"));
+
+  auto snap = db.snapshot();
+
+  db.put({}, to_bytes("k"), to_bytes("v2"));
+
+  bytecask::Bytes out;
+  REQUIRE(snap.get(to_bytes("k"), out));
+  CHECK(to_string(out) == "v1");
+
+  REQUIRE(db.get({}, to_bytes("k"), out));
+  CHECK(to_string(out) == "v2");
+}
+
+// Snapshot::contains_key reflects state at snapshot time, not after a del.
+TEST_CASE("Snapshot contains_key is frozen at snapshot time", "[snapshot]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v"));
+
+  auto snap = db.snapshot();
+
+  (void)db.del({}, to_bytes("k"));
+
+  CHECK(snap.contains_key(to_bytes("k")));
+  CHECK_FALSE(db.contains_key(to_bytes("k")));
+}
+
+// Snapshot::get returns false for a key absent at snapshot time.
+TEST_CASE("Snapshot get returns false for absent key", "[snapshot]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("k"), to_bytes("v"));
+
+  bytecask::Bytes out;
+  CHECK_FALSE(snap.get(to_bytes("k"), out));
+}
+
+// Snapshot::iter_from yields entries frozen at snapshot time.
+TEST_CASE("Snapshot iter_from is frozen at snapshot time", "[snapshot]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+
+  auto snap = db.snapshot();
+
+  // Add a key after the snapshot — must not appear in snap iteration.
+  db.put({}, to_bytes("c"), to_bytes("3"));
+
+  std::vector<std::string> keys;
+  for (const auto &[k, v] : snap.iter_from()) {
+    keys.push_back(to_string(k));
+  }
+  CHECK(keys == std::vector<std::string>{"a", "b"});
+}
+
+// Snapshot::keys_from yields keys frozen at snapshot time.
+TEST_CASE("Snapshot keys_from is frozen at snapshot time", "[snapshot]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+
+  auto snap = db.snapshot();
+
+  db.put({}, to_bytes("c"), to_bytes("3"));
+  (void)db.del({}, to_bytes("a"));
+
+  std::vector<std::string> keys;
+  for (const auto &k : snap.keys_from()) {
+    keys.push_back(to_string(k));
+  }
+  CHECK(keys == std::vector<std::string>{"a", "b"});
+}
+
+// ---------------------------------------------------------------------------
+// apply_batch_if tests
+// ---------------------------------------------------------------------------
+
+// No conflict: batch applies when no concurrent write touched the keys.
+TEST_CASE("apply_batch_if succeeds with no conflict", "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  bytecask::Batch b;
+  b.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE_NOTHROW(db.apply_batch_if(snap, {}, std::move(b)));
+
+  const auto result = get_val(db, to_bytes("k"));
+  REQUIRE(result.has_value());
+  CHECK(to_string(*result) == "v1");
+}
+
+// W-W conflict: key modified after snapshot — throws BatchConflict.
+TEST_CASE("apply_batch_if throws BatchConflict on modified key",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("k"), to_bytes("interleaved"));
+
+  bytecask::Batch b;
+  b.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE_THROWS_AS(db.apply_batch_if(snap, {}, std::move(b)),
+                    bytecask::BatchConflict);
+}
+
+// Conflict: key appeared after snapshot — throws BatchConflict.
+TEST_CASE("apply_batch_if throws BatchConflict when key appeared",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto snap = db.snapshot(); // "k" absent at snapshot time
+  db.put({}, to_bytes("k"), to_bytes("appeared"));
+
+  bytecask::Batch b;
+  b.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE_THROWS_AS(db.apply_batch_if(snap, {}, std::move(b)),
+                    bytecask::BatchConflict);
+}
+
+// Conflict: key deleted after snapshot — throws BatchConflict.
+TEST_CASE("apply_batch_if throws BatchConflict when key deleted",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  (void)db.del({}, to_bytes("k"));
+
+  bytecask::Batch b;
+  b.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE_THROWS_AS(db.apply_batch_if(snap, {}, std::move(b)),
+                    bytecask::BatchConflict);
+}
+
+// No conflict on disjoint keys: concurrent write touches "a", batch writes "b".
+TEST_CASE("apply_batch_if no conflict on disjoint keys", "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("v0"));
+  db.put({}, to_bytes("b"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("a"), to_bytes("concurrent"));
+
+  bytecask::Batch b;
+  b.put(to_bytes("b"), to_bytes("v1"));
+  REQUIRE_NOTHROW(db.apply_batch_if(snap, {}, std::move(b)));
+
+  const auto result = get_val(db, to_bytes("b"));
+  REQUIRE(result.has_value());
+  CHECK(to_string(*result) == "v1");
+}
+
+// Empty batch is a no-op and never throws.
+TEST_CASE("apply_batch_if empty batch is a no-op", "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  bytecask::Batch b;
+  REQUIRE_NOTHROW(db.apply_batch_if(snap, {}, std::move(b)));
+
+  CHECK(to_string(*get_val(db, to_bytes("k"))) == "v0");
+}
+
+#ifdef BYTECASK_TESTING
+// Single-op optimization: a 1-entry apply_batch_if writes no BulkBegin/BulkEnd
+// markers, so total_bytes matches an equivalent plain put().
+TEST_CASE("apply_batch_if single-op writes no markers", "[apply_batch_if]") {
+  auto measure_total = [](auto &&fn) -> std::uint64_t {
+    TempDir td;
+    auto db = bytecask::DB::open(td.path / "db");
+    fn(db);
+    std::uint64_t total = 0;
+    for (const auto &[fid, fs] : db.file_stats()) total += fs.total_bytes;
+    return total;
+  };
+
+  const auto put_bytes = measure_total([](auto &db) {
+    db.put({}, to_bytes("k"), to_bytes("value"));
+  });
+
+  const auto batch_if_bytes = measure_total([](auto &db) {
+    auto snap = db.snapshot();
+    bytecask::Batch b;
+    b.put(to_bytes("k"), to_bytes("value"));
+    db.apply_batch_if(snap, {}, std::move(b));
+  });
+
+  CHECK(batch_if_bytes == put_bytes);
+}
+
+// Single-op optimization: a 1-entry apply_batch writes no markers.
+TEST_CASE("apply_batch single-op writes no markers", "[apply_batch_if]") {
+  auto measure_total = [](auto &&fn) -> std::uint64_t {
+    TempDir td;
+    auto db = bytecask::DB::open(td.path / "db");
+    fn(db);
+    std::uint64_t total = 0;
+    for (const auto &[fid, fs] : db.file_stats()) total += fs.total_bytes;
+    return total;
+  };
+
+  const auto put_bytes = measure_total([](auto &db) {
+    db.put({}, to_bytes("k"), to_bytes("value"));
+  });
+
+  const auto batch_bytes = measure_total([](auto &db) {
+    bytecask::Batch b;
+    b.put(to_bytes("k"), to_bytes("value"));
+    db.apply_batch({}, std::move(b));
+  });
+
+  CHECK(batch_bytes == put_bytes);
+}
+#endif

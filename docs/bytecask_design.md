@@ -23,7 +23,7 @@ Canonical location: `docs/bytecask_design.md`.
 
 ## Non-Goals (for now)
 
-- Multi-writer access, MVCC, or snapshot isolation. ByteCask uses a SWMR model.
+- Multi-writer access, MVCC, or full transaction isolation. ByteCask uses a SWMR model. Snapshot isolation via `snapshot()` and `apply_batch_if()` is available at Layer 1.
 - TTL or expiry.
 - Async I/O.
 - Background (auto) vacuum. Vacuum is called explicitly by the user.
@@ -1150,6 +1150,38 @@ The `~DB()` destructor seals the active file, then calls `flush_hints()` which d
 - Evolve the current executable into a real storage engine with separable components that can be tested independently.
 - Treat design changes as documentation changes: code and this file should move together.
 
+## Layer 1: `snapshot()` and `apply_batch_if()`
+
+Two primitives added to `DB` in BC-103 providing snapshot isolation without any mandatory transaction wrapper.
+
+### `DB::snapshot() → Snapshot`
+
+Returns a `Snapshot` — a move-only, read-only value wrapping a `shared_ptr<const EngineState>`. The entire state at that moment is frozen: the key directory, the file registry, and open file descriptors. Reads on `Snapshot` are lock-free; no mutex is ever acquired.
+
+The `shared_ptr` keeps all data files referenced at snapshot time alive. Vacuum's `use_count() == 1` guard defers physical file deletion until all snapshots referencing a file are destroyed — no additional code required.
+
+`Snapshot` exposes the same read API as `DB`: `get`, `contains_key`, `iter_from`, `keys_from`.
+
+### `DB::apply_batch_if(snap, opts, batch)`
+
+Applies `batch` atomically only if no key in the batch was modified since `snap` was taken. Both the conflict check and the apply run under `write_mu_`, serialised with all other writers.
+
+Conflict is detected by comparing `KeyDirEntry::sequence` between the snapshot state and the current state for each key in the batch. Three conflict cases are detected:
+
+1. Key absent in snapshot but present now (key appeared after snapshot).
+2. Key present in snapshot but absent now (key deleted after snapshot).
+3. Key present in both but with a different `sequence` (key modified after snapshot).
+
+On the first conflict detected, `BatchConflict` is thrown before any I/O is performed. If no conflict is found, the batch is applied identically to `apply_batch`.
+
+### `BatchConflict`
+
+`export struct BatchConflict : std::exception` — no payload, just the exception type. Thrown by `apply_batch_if()`. Callers catch by type and retry.
+
+### Single-entry batch optimization
+
+When `batch.size() == 1`, both `apply_batch` and `apply_batch_if` skip the `BulkBegin`/`BulkEnd` marker writes entirely. A single data entry is CRC-protected and self-describing — the markers add no recovery benefit. See D14.
+
 ## Immediate engineering constraints
 
 - Tests must remain runnable from the repository with a single clear command.
@@ -1174,6 +1206,7 @@ The `~DB()` destructor seals the active file, then calls `flush_hints()` which d
 | D11 | **File naming**: `data_{YYYYMMDDHHmmssUUUUUU}` using microsecond precision. Gives lexicographic == chronological ordering and avoids the false precision of nanosecond timestamps whose sub-microsecond bits are often zero on Linux. |
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be discarded with a logged warning. No partial-batch entries enter the key directory. |
+| D14 | **Single-entry batch optimization**: When `apply_batch` or `apply_batch_if` is called with exactly one operation, the `BulkBegin`/`BulkEnd` marker writes are skipped. A single data entry is self-describing and CRC-protected, so the markers add no recovery benefit for a batch of size 1. |
 
 ## Working agreement
 
