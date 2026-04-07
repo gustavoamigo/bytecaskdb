@@ -3,12 +3,13 @@
 benchmarks/engine_bench_results.csv for longitudinal performance tracking.
 
 Usage:
-    python3 scripts/run_engine_bench.py [--skip-build] [--full] [--dataset-size N] [--tmpdir DIR] [-- <extra benchmark flags>]
+    python3 scripts/run_engine_bench.py [--skip-build] [--full] [--dataset-size N] [--tmpdir DIR] [--exclude PATTERN] [-- <extra benchmark flags>]
 
-    --skip-build      Skip the xmake build step (binary must already exist).
-    --full            Run with 1 000 000 keys (full benchmark). Default is 50 000 (light).
-    --dataset-size N  Run with exactly N keys.
-    --tmpdir DIR      Override TMPDIR for benchmark data (default: ./.tmp).
+    --skip-build        Skip the xmake build step (binary must already exist).
+    --full              Run with 1 000 000 keys (full benchmark). Default is 50 000 (light).
+    --dataset-size N    Run with exactly N keys.
+    --tmpdir DIR        Override TMPDIR for benchmark data (default: ./.tmp).
+    --exclude PATTERN   Exclude benchmarks whose names contain PATTERN (repeatable).
     Extra flags after '--' are forwarded to the benchmark binary.
 
 CSV columns:
@@ -91,6 +92,28 @@ def build(skip: bool) -> None:
     subprocess.run(["xmake", "f", "-m", "release"], check=True, cwd=REPO_ROOT)
     print(f"Building {BENCH_TARGET}...")
     subprocess.run(["xmake", "build", BENCH_TARGET], check=True, cwd=REPO_ROOT)
+
+
+def build_exclude_filter(exclude_patterns: list[str]) -> str | None:
+    """Return a --benchmark_filter value that excludes all names matching any pattern.
+
+    Lists all registered tests, drops those that match any exclude pattern,
+    and joins the survivors with '|' as a positive allowlist regex.
+    Returns None if no tests survive (caller should abort).
+    """
+    result = subprocess.run(
+        [str(BENCH_BINARY), "--benchmark_list_tests=true"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    tests = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    kept = [t for t in tests if not any(pat in t for pat in exclude_patterns)]
+    if not kept:
+        return None
+    # Escape special regex chars in test names, then join as alternation.
+    import re
+    return "|".join(re.escape(t) for t in kept)
 
 
 def run_benchmark(extra_flags: list[str], dataset_size: int, tmpdir: str) -> dict:
@@ -193,6 +216,7 @@ def main() -> None:
         dataset_size = 50_000
 
     tmpdir = str(REPO_ROOT / ".tmp")
+    exclude_patterns: list[str] = []
 
     for arg in list(args):
         if arg.startswith("--dataset-size="):
@@ -211,6 +235,14 @@ def main() -> None:
             tmpdir = args[idx + 1]
             args.remove(args[idx + 1])
             args.remove(arg)
+        elif arg.startswith("--exclude="):
+            exclude_patterns.append(arg.split("=", 1)[1])
+            args.remove(arg)
+        elif arg == "--exclude":
+            idx = args.index(arg)
+            exclude_patterns.append(args[idx + 1])
+            args.remove(args[idx + 1])
+            args.remove(arg)
 
     os.makedirs(tmpdir, exist_ok=True)
 
@@ -222,6 +254,15 @@ def main() -> None:
         extra_flags = []
 
     build(skip_build)
+
+    # Build a positive-allowlist filter from --exclude patterns.
+    if exclude_patterns:
+        filt = build_exclude_filter(exclude_patterns)
+        if filt is None:
+            print("Error: --exclude patterns eliminated all benchmarks.")
+            sys.exit(1)
+        extra_flags = [f"--benchmark_filter={filt}"] + extra_flags
+        print(f"Excluding {exclude_patterns!r}; filter covers {filt.count('|') + 1} benchmarks.")
     git_commit = get_git_commit()
     memory_gb = get_memory_gb()
     try:

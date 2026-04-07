@@ -60,7 +60,7 @@ import bytecask.types;
 // Constants
 // ---------------------------------------------------------------------------
 
-static constexpr std::size_t kValueSize = 1024;
+static constexpr std::size_t kValueSize = 245;
 static constexpr int kRangeLen = 50;
 static constexpr int kRangeLen1000 = 1000;
 
@@ -203,7 +203,7 @@ struct BcAdapter {
         bytecask::WriteOptions wo;
         const auto n = populate_keys->size();
         for (std::size_t i = 0; i < n; ++i) {
-          wo.sync = (i % 1000 == 999) || (i == n - 1);
+          wo.sync = (i % 30000 == 29999) || (i == n - 1);
           engine.put(wo, bc_key((*populate_keys)[i]), bc_val(*populate_val));
         }
       }
@@ -335,6 +335,7 @@ template <bool UseCache = true> struct LdbAdapter {
 
   static void get(Db &db, const std::string &k) {
     leveldb::ReadOptions ro;
+    ro.verify_checksums = false;
     if constexpr (!UseCache)
       ro.fill_cache = false;
     std::string value;
@@ -351,6 +352,7 @@ template <bool UseCache = true> struct LdbAdapter {
 
   static void range(Db &db, const std::string &k, int limit) {
     leveldb::ReadOptions ro;
+    ro.verify_checksums = false;
     if constexpr (!UseCache)
       ro.fill_cache = false;
     std::unique_ptr<leveldb::Iterator> it{db.raw->NewIterator(ro)};
@@ -437,6 +439,7 @@ template <bool UseCache = true> struct RdbAdapter {
 
   static void get(Db &db, const std::string &k) {
     rocksdb::ReadOptions ro;
+    ro.verify_checksums = false;
     if constexpr (!UseCache)
       ro.fill_cache = false;
     std::string value;
@@ -453,6 +456,7 @@ template <bool UseCache = true> struct RdbAdapter {
 
   static void range(Db &db, const std::string &k, int limit) {
     rocksdb::ReadOptions ro;
+    ro.verify_checksums = false;
     if constexpr (!UseCache)
       ro.fill_cache = false;
     std::unique_ptr<rocksdb::Iterator> it{db.raw->NewIterator(ro)};
@@ -872,7 +876,7 @@ struct ParRecoverySetup {
     static const std::vector<std::byte> tiny_val{std::byte{0x42}};
     const auto n = keys.size();
     for (std::size_t i = 0; i < n; ++i) {
-      wo.sync = (i % 10'000 == 9'999) || (i == n - 1);
+      wo.sync = (i == n - 1);
       db.put(wo, bc_key(keys[i]), bc_val(tiny_val));
     }
     // db destructs here — seals active file, writes all hint files.
@@ -926,33 +930,27 @@ using LdbNC = LdbAdapter<false>;
 using Rdb = RdbAdapter<true>;
 using RdbNC = RdbAdapter<false>;
 
+// -- Single Threaded Tests ---
 // --- ByteCask ---
 BENCH(BM_Put<Bc, false>)          ->Name("ByteCask/Put/NoSync");
 BENCH(BM_Put<Bc, true>)           ->Name("ByteCask/Put/Sync");
 BENCH(BM_Del<Bc, true>)           ->Name("ByteCask/Del/Sync");
 BENCH(BM_Get<Bc>)                 ->Name("ByteCask/Get");
 BENCH(BM_Range<Bc, kRangeLen>)    ->Name("ByteCask/Range50");
-BENCH(BM_Mixed<Bc, true>)         ->Name("ByteCask/Mixed/Sync");
+BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCask/MixedBatch/Sync");
 
 
 
 
-// --- Parallel Recovery (1M keys, 1-byte values, hint-only) ---
-BENCH(BM_RecoveryParallel)->Arg(1) ->Name("ByteCask/Recovery/Parallel")->Unit(benchmark::kSecond);
-BENCH(BM_RecoveryParallel)->Arg(2) ->Name("ByteCask/Recovery/Parallel")->Unit(benchmark::kSecond);
-BENCH(BM_RecoveryParallel)->Arg(4) ->Name("ByteCask/Recovery/Parallel")->Unit(benchmark::kSecond);
-BENCH(BM_RecoveryParallel)->Arg(8) ->Name("ByteCask/Recovery/Parallel")->Unit(benchmark::kSecond);
-BENCH(BM_RecoveryParallel)->Arg(16)->Name("ByteCask/Recovery/Parallel")->Unit(benchmark::kSecond);
-BENCH(BM_RecoveryParallel)->Arg(32)->Name("ByteCask/Recovery/Parallel")->Unit(benchmark::kSecond);
-BENCH(BM_RecoveryParallel)->Arg(64)->Name("ByteCask/Recovery/Parallel")->Unit(benchmark::kSecond);
 
 // --- LevelDB ---
-BENCH(BM_Put<Ldb, false>)          ->Name("LevelDB/Put/NoSync");
-BENCH(BM_Put<Ldb, true>)           ->Name("LevelDB/Put/Sync");
-BENCH(BM_Del<Ldb, true>)           ->Name("LevelDB/Del/Sync");
-BENCH(BM_Get<Ldb>)                 ->Name("LevelDB/Get");
-BENCH(BM_Range<Ldb, kRangeLen>)    ->Name("LevelDB/Range50");
-BENCH(BM_Mixed<Ldb, true>)         ->Name("LevelDB/Mixed/Sync");
+// BENCH(BM_Put<Ldb, false>)          ->Name("LevelDB/Put/NoSync");
+// BENCH(BM_Put<Ldb, true>)           ->Name("LevelDB/Put/Sync");
+// BENCH(BM_Del<Ldb, true>)           ->Name("LevelDB/Del/Sync");
+// BENCH(BM_Get<Ldb>)                 ->Name("LevelDB/Get");
+// BENCH(BM_Range<Ldb, kRangeLen>)    ->Name("LevelDB/Range50");
+// BENCH(BM_MixedBatch<Ldb, true>)    ->Name("LevelDB/MixedBatch/Sync");
+
 
 // --- RocksDB ---
 BENCH(BM_Put<Rdb, false>)          ->Name("RocksDB/Put/NoSync");
@@ -960,13 +958,18 @@ BENCH(BM_Put<Rdb, true>)           ->Name("RocksDB/Put/Sync");
 BENCH(BM_Del<Rdb, true>)           ->Name("RocksDB/Del/Sync");
 BENCH(BM_Get<Rdb>)                 ->Name("RocksDB/Get");
 BENCH(BM_Range<Rdb, kRangeLen>)    ->Name("RocksDB/Range50");
-BENCH(BM_Mixed<Rdb, true>)         ->Name("RocksDB/Mixed/Sync");
+BENCH(BM_MixedBatch<Rdb, true>)    ->Name("RocksDB/MixedBatch/Sync");
 
-// --- Mixed Batch ---
-BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCask/MixedBatch/Sync");
-BENCH(BM_MixedBatch<Ldb, true>)     ->Name("LevelDB/MixedBatch/Sync");
-BENCH(BM_MixedBatch<Rdb, true>)     ->Name("RocksDB/MixedBatch/Sync");
 
+
+// --- Recovery from 1 thread to 16 ---
+BENCH(BM_RecoveryParallel)->Name("ByteCask/Recovery")->ArgName("threads")->Arg(1) ->Unit(benchmark::kSecond);
+BENCH(BM_RecoveryParallel)->Name("ByteCask/Recovery")->ArgName("threads")->Arg(2) ->Unit(benchmark::kSecond);
+BENCH(BM_RecoveryParallel)->Name("ByteCask/Recovery")->ArgName("threads")->Arg(4) ->Unit(benchmark::kSecond);
+BENCH(BM_RecoveryParallel)->Name("ByteCask/Recovery")->ArgName("threads")->Arg(8) ->Unit(benchmark::kSecond);
+BENCH(BM_RecoveryParallel)->Name("ByteCask/Recovery")->ArgName("threads")->Arg(16)->Unit(benchmark::kSecond);
+
+// -- Multithreaded Threaded Tests (LevelDb excluded as it's not optimized for this use case) --
 // --- Multithreaded Get (pure read throughput under concurrency) ---
 BENCH(BM_GetMT<Bc>)                ->Name("ByteCask/GetMT")           ->Threads(2);
 BENCH(BM_GetMT<Bc>)                ->Name("ByteCask/GetMT")           ->Threads(4);
@@ -977,34 +980,38 @@ BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(2
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(4);
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(8);
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(16);
+BENCH(BM_GetMT<Rdb>)                ->Name("RocksDB/GetMT")           ->Threads(32);
 
 // --- ReadAndWriteLoad (read throughput with 1 background writer) ---
 BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCask/ReadAndWriteLoad/Sync")            ->Threads(2);
 BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCask/ReadAndWriteLoad/Sync")            ->Threads(4);
 BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCask/ReadAndWriteLoad/Sync")            ->Threads(8);
 BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCask/ReadAndWriteLoad/Sync")            ->Threads(16);
-BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCask/ReadAndWriteLoad/Sync/StaleRead")  ->Threads(2);
-BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCask/ReadAndWriteLoad/Sync/StaleRead")  ->Threads(4);
-BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCask/ReadAndWriteLoad/Sync/StaleRead")  ->Threads(8);
-BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCask/ReadAndWriteLoad/Sync/StaleRead")  ->Threads(16);
+BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCask/ReadAndWriteLoad/Sync")            ->Threads(32);
+BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCask/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(2);
+BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCask/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(4);
+BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCask/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(8);
+BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCask/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(16);
+BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCask/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(32);
 BENCH(BM_ReadWhileWriting<Rdb, true>)            ->Name("RocksDB/ReadAndWriteLoad/Sync")            ->Threads(2);
 BENCH(BM_ReadWhileWriting<Rdb, true>)            ->Name("RocksDB/ReadAndWriteLoad/Sync")            ->Threads(4);
 BENCH(BM_ReadWhileWriting<Rdb, true>)            ->Name("RocksDB/ReadAndWriteLoad/Sync")            ->Threads(8);
 BENCH(BM_ReadWhileWriting<Rdb, true>)            ->Name("RocksDB/ReadAndWriteLoad/Sync")            ->Threads(16);
-BENCH(BM_ReadWhileWriting<RdbNC, true>)          ->Name("RocksDB/ReadAndWriteLoad/Sync/NoCache")    ->Threads(2);
-BENCH(BM_ReadWhileWriting<RdbNC, true>)          ->Name("RocksDB/ReadAndWriteLoad/Sync/NoCache")    ->Threads(4);
-BENCH(BM_ReadWhileWriting<RdbNC, true>)          ->Name("RocksDB/ReadAndWriteLoad/Sync/NoCache")    ->Threads(8);
-BENCH(BM_ReadWhileWriting<RdbNC, true>)          ->Name("RocksDB/ReadAndWriteLoad/Sync/NoCache")    ->Threads(16);
+BENCH(BM_ReadWhileWriting<Rdb, true>)            ->Name("RocksDB/ReadAndWriteLoad/Sync")            ->Threads(32);
+// BENCH(BM_ReadWhileWriting<RdbNC, true>)          ->Name("RocksDB/ReadAndWriteLoad/Sync/NoCache")    ->Threads(2);
+// BENCH(BM_ReadWhileWriting<RdbNC, true>)          ->Name("RocksDB/ReadAndWriteLoad/Sync/NoCache")    ->Threads(4);
+// BENCH(BM_ReadWhileWriting<RdbNC, true>)          ->Name("RocksDB/ReadAndWriteLoad/Sync/NoCache")    ->Threads(8);
+// BENCH(BM_ReadWhileWriting<RdbNC, true>)          ->Name("RocksDB/ReadAndWriteLoad/Sync/NoCache")    ->Threads(16);
 
 // --- Multithreaded Put (pure write throughput under concurrency) ---
-BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(2) ; //->Iterations(100);
-BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(4) ; //->Iterations(1000);
-BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(8) ; //->Iterations(1000);
-BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(16); //->Iterations(1000);
-BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(2) ; //->Iterations(1000);
-BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(4) ; //->Iterations(1000);
-BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(8) ; //->Iterations(1000);
-BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(16); //->Iterations(1000);
+BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(2) ; 
+BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(4) ; 
+BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(8) ; 
+BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCask/PutMT/Sync")     ->Threads(16); 
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(2) ; 
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(4) ; 
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(8) ; 
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(16); 
 
 
 // clang-format on
