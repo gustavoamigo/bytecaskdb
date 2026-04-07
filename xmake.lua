@@ -78,7 +78,11 @@ target("engine_bench")
     set_kind("binary")
     set_default(false)
     add_files("benchmarks/engine_bench.cpp", "src/*.cppm", "src/bytecask.cpp")
-    add_cxflags("-Wno-global-constructors")
+    add_cxflags(
+        "-Wno-global-constructors", "-Wno-sign-conversion", "-Wno-exit-time-destructors",
+        "-Wno-unused-const-variable", "-Wno-unneeded-internal-declaration",
+        "-Wno-unused-template", "-Wno-unused-member-function"
+    )
     add_packages("benchmark", "crc32c", "jemalloc", "leveldb", "rocksdb")
     on_load(apply_sanitizer)
 

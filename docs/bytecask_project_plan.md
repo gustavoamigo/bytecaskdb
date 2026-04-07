@@ -37,6 +37,8 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-101 | Replace `sys-info.sh` memory usage with installed RAM summary | Removed the `free -h` OS usage view. The script now prints a single installed-RAM line from `/proc/meminfo`, avoiding privileged SMBIOS/DIMM probing while still describing machine capacity. |
+| BC-100 | Scope `sys-info.sh` disk output to current path | `scripts/sys-info.sh` now resolves `findmnt --target "$PWD"`, strips subvolume suffixes such as `[/home]`, maps partitions to their parent disk with `lsblk -no PKNAME`, and prints only the backing device for the current path. |
 | BC-098 | Open source license | Added MIT `LICENSE` file. |
 | BC-097 | Pre-launch README | Added `README.md`: project overview, features, API reference, architecture, performance tables, build instructions, and documentation index. |
 | BC-089 | Hint file format v2: prefix compression + file-level CRC | New layout: `prefix_len(u8) + suffix_len(u16) + suffix_data` replaces `key_size(u16) + key_data`. Per-entry CRC removed; 4-byte CRC-32C file trailer verified eagerly in `OpenForRead`. `scan(Offset)` replaced by `Scanner` + `next()`. Zero-copy key via Scanner's `key_buf_` accumulator. `serialize_entry`/`deserialize_entry` updated in `hint_entry.cppm`. Recovery 1M@16T: 68→66ms (−3%); @32T: 72→66ms (−8%); @64T: 73→69ms (−5%). 1T within noise. 122 tests pass. |
