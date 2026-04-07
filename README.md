@@ -6,75 +6,93 @@ ByteCask is a [Bitcask](https://riak.com/assets/bitcask-intro.pdf)-inspired embe
 
 ## Features
 
-- **Append-only writes** — every `insert` and `remove` is a sequential append; no random writes.
+- **Sequential write path** — every `put`, `del`, and `apply_batch` performs a single sequential append; no WAL, no random writes, just one I/O operation per write.
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration.
-- **Atomic batches** — `apply_batch` wraps a set of inserts and removes in `BulkBegin`/`BulkEnd` markers; partial batches are discarded on recovery.
-- **Parallel recovery** — hint-file replay is partitioned across worker threads and merged with a fan-in strategy; 8-thread recovery is ~5× faster than serial on large datasets.
-- **Vacuum / compaction** — `vacuum()` rewrites or absorbs the most fragmented sealed file, reclaiming space left by overwritten or deleted keys.
-- **SWMR concurrency** — a single writer serialised by a mutex; readers never acquire the write lock; state is published via `std::atomic<shared_ptr<EngineState>>`.
-- **Crash safety** — hint files are written atomically (`write → fdatasync → rename`); the active data file is scanned on recovery to reconstruct any entries written after the last hint.
+- **Atomic operations** — `apply_batch` atomically applies a set of puts and deletes.
+- **Fast recovery** — parallelised index reconstruction from hint files; 100 M keys recover in under 5 seconds on fast hardware.
+- **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
+- **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second; a single writer ensures consistent writes even under concurrent multi-threaded access.
+- **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and data files that act as a write-ahead log ensure durability.
 
 ## Quick Start
 
 ```cpp
-#include "bytecask.cppm"  // import bytecask.engine;
+import bytecask;
+using namespace bytecask;
 
 // Open (or create) a database directory.
-auto db = Bytecask::open("my_db");
+auto db = DB::open("my_db");
 
 // Single-key operations.
-db.insert(as_bytes("user:1"), as_bytes("alice"));
+db.put({}, to_bytes("user:1"), to_bytes("alice"));
 
-auto val = db.get(as_bytes("user:1"));   // std::optional<Bytes>
-if (val) { /* use *val */ }
-
-bool existed = db.remove(as_bytes("user:1"));  // false if key was absent
+Bytes out;
+bool found = db.get({}, to_bytes("user:1"), out);   // true; value in out
+bool existed = db.del({}, to_bytes("user:1"));       // false if key was absent
 
 // Atomic batch.
 Batch batch;
-batch.insert(as_bytes("user:2"), as_bytes("bob"));
-batch.insert(as_bytes("user:3"), as_bytes("carol"));
-batch.remove(as_bytes("user:1"));
-db.apply_batch(std::move(batch));
+batch.put(to_bytes("user:2"), to_bytes("bob"));
+batch.put(to_bytes("user:3"), to_bytes("carol"));
+batch.del(to_bytes("user:1"));
+db.apply_batch({}, std::move(batch));
 
 // Range scan — lazy, reads values from disk on demand.
-for (auto& [key, value] : db.iter_from(as_bytes("user:"))) {
+for (auto& [key, value] : db.iter_from({}, to_bytes("user:"))) {
     // Iterates all keys >= "user:" in ascending order.
 }
 
 // Keys-only scan — in-memory radix tree walk, no disk I/O.
-for (auto& key : db.keys_from(as_bytes("user:"))) { ... }
+for (auto& key : db.keys_from({})) { ... }
 ```
+
+> `to_bytes` is a small helper that converts a `std::string_view` to `BytesView`:
+> ```cpp
+> auto to_bytes(std::string_view sv) -> BytesView {
+>     return std::as_bytes(std::span{sv.data(), sv.size()});
+> }
+> ```
 
 ## API Reference
 
 ```cpp
-class Bytecask {
-public:
-    [[nodiscard]] static auto open(std::filesystem::path dir) -> Bytecask;
-    [[nodiscard]] static auto open(std::filesystem::path dir,
-                                   std::size_t max_file_bytes,
-                                   std::size_t recovery_threads) -> Bytecask;
+namespace bytecask {
 
-    [[nodiscard]] auto get(BytesView key) const -> std::optional<Bytes>;
-    void insert(BytesView key, BytesView value);
-    [[nodiscard]] bool remove(BytesView key);
+class DB {
+public:
+    [[nodiscard]] static auto open(std::filesystem::path dir,
+                                   Options opts = {}) -> DB;
+
+    // Writes value for key into out, reusing its capacity. Returns true if found.
+    // Throws std::system_error on I/O failure or std::runtime_error on CRC mismatch.
+    [[nodiscard]] auto get(const ReadOptions& opts,
+                           BytesView key, Bytes& out) const -> bool;
+
+    // Writes key → value. Overwrites any existing value.
+    void put(const WriteOptions& opts, BytesView key, BytesView value);
+
+    // Writes a tombstone for key. Returns true if the key existed.
+    [[nodiscard]] auto del(const WriteOptions& opts, BytesView key) -> bool;
+
     [[nodiscard]] auto contains_key(BytesView key) const -> bool;
 
-    void apply_batch(Batch batch);
+    // Atomically applies all operations in batch. Consumes batch (move-only).
+    void apply_batch(const WriteOptions& opts, Batch batch);
 
-    [[nodiscard]] auto iter_from(BytesView from = {}) const
+    [[nodiscard]] auto iter_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
-    [[nodiscard]] auto keys_from(BytesView from = {}) const
+
+    [[nodiscard]] auto keys_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
 
-    void vacuum(VacuumOptions opts = {});
-    [[nodiscard]] auto file_stats() const
-        -> std::map<std::uint32_t, FileStats>;
+    // Returns true if a file was vacuumed, false if no file qualified.
+    [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
 };
+
+} // namespace bytecask
 ```
 
-Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; key-not-found is represented by `std::optional`.
+Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; key-not-found is signalled by `get` returning `false`.
 
 ## Architecture
 
