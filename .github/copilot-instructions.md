@@ -10,12 +10,13 @@ These instructions apply to every repository work request in this workspace.
 
 1. Update `docs/bytecask_design.md` to reflect any behavior, architecture, constraints, or invariants changed by the work.
 2. Update `docs/bytecask_project_plan.md` to track the task, status, and any follow-up work.
-3. Always validate design before moving to implementation
-4. After design approval, move to the implementation
-5. Add or update tests that cover the behavior being changed.
-6. Run the relevant tests after making changes.
-7. Do not create a git commit until the user has reviewed the change and explicitly approved committing it.
-8. After approval, create one commit with a concise, high-signal message that describes the change.
+3. Update `README.md` to keep it in sync with the project: if a feature is added or changed, update the Features list, Quick Start examples, API Reference, and Architecture sections as needed. The README targets an external audience — avoid internal implementation details; focus on user-visible characteristics and behavior.
+4. Always validate design before moving to implementation
+5. After design approval, move to the implementation
+6. Add or update tests that cover the behavior being changed.
+7. Run the relevant tests after making changes.
+8. Do not create a git commit until the user has reviewed the change and explicitly approved committing it.
+9. After approval, create one commit with a concise, high-signal message that describes the change.
 
 ## Project plan rules
 
