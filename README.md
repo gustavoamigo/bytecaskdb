@@ -249,6 +249,7 @@ If you want to take it in a different direction and fork it into your own thing,
 | Document | Description |
 |----------|-------------|
 | [`docs/bytecask_design.md`](docs/bytecask_design.md) | Living design reference: architecture, concurrency model, file format, vacuum, recovery |
+| [`docs/file_format.md`](docs/file_format.md) | On-disk file format reference: data file entries, hint file entries, CRC, byte order, naming |
 | [`docs/engine_api_design.md`](docs/engine_api_design.md) | Public API specification with usage examples |
 | [`docs/parallel_recovery_design.md`](docs/parallel_recovery_design.md) | Parallel recovery algorithm and fan-in merge strategy |
 | [`docs/persistent_radix_tree_design.md`](docs/persistent_radix_tree_design.md) | Persistent radix tree data structure design |
