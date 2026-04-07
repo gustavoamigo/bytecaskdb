@@ -572,7 +572,7 @@ public:
 
   // Merge two trees. On key conflicts, resolve(a_val, b_val) picks the winner.
   // Disjoint subtrees are shared in O(1) via IntrusivePtr copy.
-  // Size of the result is computed in O(N) after the merge.
+  // Size is computed inline as a.size() + b.size() - overlaps (no post-merge walk).
   template <typename ResolveFunc>
   [[nodiscard]] static auto merge(const PersistentRadixTree &a,
                                   const PersistentRadixTree &b,
