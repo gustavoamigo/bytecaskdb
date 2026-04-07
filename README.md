@@ -1,14 +1,26 @@
 # ByteCask
 
-ByteCask is a [Bitcask](https://riak.com/assets/bitcask-intro.pdf)-inspired embedded key-value store written in C++23. It extends the original Bitcask design by replacing the hash-table key directory with a **persistent radix tree**, enabling efficient range queries and prefix scans while preserving Bitcask's core strengths: append-only writes, fast recovery, and simple crash safety.
+ByteCask is a fast, predictable embedded key-value store written in C++23 that scales to **hundreds of millions of keys** across multiple cores with flat, consistent latency.
 
-> **Trade-off**: ByteCask keeps all keys in memory at all times. This enables O(k) point lookups and ordered iteration without any disk I/O on the read path, but limits the number of unique keys to available RAM. At ~100 bytes per key (key data + metadata + tree overhead), 10 million keys require roughly 1 GB of RAM.
+Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCask replaces the original hash-table key directory with a **persistent radix tree** — enabling ordered range queries, prefix scans, and prefix compaction while keeping the simplicity that makes Bitcask fast. Prefix scans are pure in-memory radix tree walks:
+
+```cpp
+// Scan all keys starting with "user:" — no disk I/O.
+for (auto& key : db.keys_from({}, to_bytes("user:"))) { ... }
+
+// Scan with values — values fetched lazily from disk.
+for (auto& [key, value] : db.iter_from({}, to_bytes("user:"))) { ... }
+```
+
+**O(1) reads and writes**: point lookups and writes take constant time regardless of database size — performance stays flat whether you have 1 000 or 100 M records. Very few moving parts (an in-memory radix tree + append-only data files) is what keeps latency predictable. O(1) snapshots are planned.
+
+> **Trade-off**: ByteCask keeps all keys in memory at all times. This enables O(1) point lookups and ordered iteration without any disk I/O on the read path, but limits the number of unique keys to available RAM. At ~100 bytes per key (key data + metadata + tree overhead), 10 million keys require roughly 1 GB of RAM.
 
 ## Features
 
 - **Sequential write path** — every `put`, `del`, and `apply_batch` performs a single sequential append; no WAL, no random writes, just one I/O operation per write.
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration.
-- **Atomic operations** — `apply_batch` atomically applies a set of puts and deletes.
+- **Atomic writes** — every `put` and `del` is atomic. `apply_batch` makes multiple puts and deletes atomic as a group.
 - **Fast recovery** — parallelised index reconstruction from hint files; 100 M keys recover in under 5 seconds on fast hardware.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second; a single writer ensures consistent writes even under concurrent multi-threaded access.
@@ -30,20 +42,20 @@ Bytes out;
 bool found = db.get({}, to_bytes("user:1"), out);   // true; value in out
 bool existed = db.del({}, to_bytes("user:1"));       // false if key was absent
 
-// Atomic batch.
+// Atomic batch — all operations land atomically.
 Batch batch;
 batch.put(to_bytes("user:2"), to_bytes("bob"));
 batch.put(to_bytes("user:3"), to_bytes("carol"));
 batch.del(to_bytes("user:1"));
 db.apply_batch({}, std::move(batch));
 
-// Range scan — lazy, reads values from disk on demand.
+// Prefix scan — in-memory key walk, values fetched lazily from disk.
 for (auto& [key, value] : db.iter_from({}, to_bytes("user:"))) {
     // Iterates all keys >= "user:" in ascending order.
 }
 
-// Keys-only scan — in-memory radix tree walk, no disk I/O.
-for (auto& key : db.keys_from({})) { ... }
+// Keys-only prefix scan — pure in-memory, no disk I/O.
+for (auto& key : db.keys_from({}, to_bytes("user:"))) { ... }
 ```
 
 > `to_bytes` is a small helper that converts a `std::string_view` to `BytesView`:
@@ -96,19 +108,30 @@ Error handling follows the throw-on-failure convention used by the C++ standard 
 
 ## Architecture
 
+### Design Principles
+
+ByteCask is designed around four core tenets, in priority order:
+
+1. **Correctness** — data integrity above all else.
+2. **Simplicity** — few moving parts; the design is easy to understand and maintain.
+3. **Predictable latency over peak throughput** — bounded, flat write latency at every scale. A steady 1 ms per write is preferable to an average 0.1 ms with occasional 500 ms spikes.
+4. **Performance** — optimisations are pursued only when they do not compromise correctness or simplicity.
+
+### Components
+
 ```
-  Bytecask
+  ByteCask
   ├── Key Directory  PersistentRadixTree<KeyDirEntry>   (all keys, in memory)
   ├── File Registry  map<file_id, DataFile>             (open file descriptors)
   ├── Active File    append-only .data file             (current writes)
   └── Sealed Files   read-only .data + .hint files      (older segments)
 ```
 
-**Write path**: every `insert`/`remove` appends a length-prefixed, CRC-32-verified entry to the active data file, updates the in-memory radix tree, and publishes a new immutable `EngineState` snapshot via atomic `shared_ptr`.
+**Write path**: every `put`/`del`/`apply_batch` appends a CRC-32-verified, length-prefixed record to the active data file and updates the in-memory radix tree. No random I/O; one sequential write per operation.
 
-**Read path**: readers atomically load the current `EngineState` snapshot, look up the key in the radix tree to find `(file_id, offset)`, then `pread` the value bytes directly from the appropriate data file. Readers never acquire the write mutex.
+**Read path**: readers obtain an immutable snapshot of the engine state, look up the key in the radix tree to find its file and offset, then read the value directly. Reads are lock-free and scale linearly across cores.
 
-**Recovery**: on `open`, the engine replays hint files (compact per-file indexes written at rotation time) to rebuild the key directory, then scans the active data file's tail for any entries appended after the last hint was flushed. Recovery can be parallelised by passing `recovery_threads > 1` to `open`.
+**Recovery**: on `open`, the engine replays hint files (compact per-file indexes written atomically at rotation time) to rebuild the key directory, then scans the active file's tail for entries written after the last hint flush. Recovery is parallelised across files for fast startup.
 
 See [`docs/bytecask_design.md`](docs/bytecask_design.md) for the full design reference.
 
