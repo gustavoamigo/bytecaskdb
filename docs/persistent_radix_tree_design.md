@@ -424,5 +424,3 @@ Merge cost as a fraction of linear build:
 | Prefixed, disjoint | ~20% | ~2,885 |
 
 Merge overhead is small enough that parallelising the build phase pays for itself with ≥2 threads.
-
-The RadixTree is the right choice for ByteCask's key directory: it provides O(1) snapshotting with structural sharing, competitive lookup speed, and prefix compression that pays off for the production key patterns (prefixed UUIDs). The iteration cost is acceptable because full scans are rare in the ByteCask access pattern (point lookups and range-bounded iteration are the primary operations).
