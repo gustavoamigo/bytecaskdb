@@ -3,13 +3,14 @@ module;
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -258,8 +259,9 @@ private:
 // ---------------------------------------------------------------------------
 // DB — SWMR key-value store
 //
-// Forward declaration — full definition after DB.
+// Forward declarations — full definitions after DB.
 export class Snapshot;
+export class WritePlan;
 
 // ---------------------------------------------------------------------------
 // DB — SWMR key-value store
@@ -328,10 +330,12 @@ public:
   // Holds open any data files referenced at snapshot time until destroyed.
   [[nodiscard]] auto snapshot() const -> Snapshot;
 
-  // Applies batch atomically iff no key in batch was modified since snap.
-  // Throws BatchConflict on W-W conflict. Throws std::system_error on I/O failure.
-  // No-op if batch is empty.
-  void apply_batch_if(const Snapshot &snap, WriteOptions opts, Batch batch);
+  // Applies plan atomically iff all guards pass and no written key was
+  // modified since snap. Returns true if committed, false on conflict.
+  // Throws std::system_error on I/O failure or lock contention (try_lock).
+  // Returns true (no-op) if plan has no writes and no guards.
+  [[nodiscard]] auto apply_batch_if(const Snapshot &snap, WriteOptions opts,
+                                    WritePlan plan) -> bool;
 
   // Returns an input range of (key, value) pairs with keys >= from.
   // Pass an empty span to start from the first key. Each dereference reads
@@ -441,11 +445,11 @@ private:
   // Calls rotate_active_file if active file has reached rotation_threshold_.
   [[nodiscard]] auto rotate_if_needed(EngineState s) -> EngineState;
 
-  // Shared implementation for apply_batch and apply_batch_if.
-  // snap == nullptr: unconditional apply (apply_batch path).
-  // snap != nullptr: W-W conflict check before applying (apply_batch_if path).
-  void apply_batch_impl(const WriteOptions &opts, Batch batch,
-                        const Snapshot *snap);
+  // Writes batch entries to disk, updates stats, publishes new EngineState.
+  // Caller must hold write_mu_. Returns the file to sync (null if !opts.sync).
+  auto commit_batch(const WriteOptions &opts, Batch &batch,
+                    const std::shared_ptr<const EngineState> &current)
+      -> std::shared_ptr<DataFile>;
 
   // Member variables
   std::filesystem::path dir_;
@@ -475,11 +479,108 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// BatchConflict — thrown by apply_batch_if() when a W-W conflict is detected.
-// At least one key in the batch was modified after the snapshot was taken.
+// WritePlan — conditional write + guard vocabulary for apply_batch_if.
+//
+// Carries writes (put/del) and guards (ensure_present, ensure_absent,
+// ensure_unchanged, ensure_range_unchanged). Guards are preconditions
+// checked atomically under write_mu_ at commit time — if any guard fails,
+// apply_batch_if returns false.
+//
+// Builds up a per-key KeyAction map internally; guards and writes on the
+// same key are merged. Contradictory guards throw std::logic_error at
+// build time.
 // ---------------------------------------------------------------------------
-export struct BatchConflict : std::exception {
-  const char *what() const noexcept override;
+
+export class WritePlan {
+public:
+  enum class Precondition { None, MustExist, MustBeAbsent, MustBeUnchanged };
+  enum class Write { None, Put, Del };
+
+  struct KeyAction {
+    Precondition precondition{Precondition::None};
+    Write write{Write::None};
+    Bytes value; // meaningful only when write == Put
+  };
+
+  struct RangeGuard {
+    Bytes from;
+    Bytes to; // exclusive — [from, to)
+  };
+
+  WritePlan() = default;
+  WritePlan(const WritePlan &) = delete;
+  WritePlan &operator=(const WritePlan &) = delete;
+  WritePlan(WritePlan &&) noexcept = default;
+  WritePlan &operator=(WritePlan &&) noexcept = default;
+
+  // --- Writes (unconditional) ---
+
+  void put(BytesView key, BytesView value) {
+    auto &a = action_for(key);
+    a.write = Write::Put;
+    a.value = Bytes{value.begin(), value.end()};
+  }
+
+  void del(BytesView key) {
+    auto &a = action_for(key);
+    a.write = Write::Del;
+    a.value.clear();
+  }
+
+  // --- Point guards ---
+
+  void ensure_present(BytesView key) {
+    set_precondition(key, Precondition::MustExist);
+  }
+
+  void ensure_absent(BytesView key) {
+    set_precondition(key, Precondition::MustBeAbsent);
+  }
+
+  void ensure_unchanged(BytesView key) {
+    set_precondition(key, Precondition::MustBeUnchanged);
+  }
+
+  // --- Range guards ---
+
+  // Conflict if any key in [from, to) was inserted, modified,
+  // or deleted since the snapshot. The range is half-open:
+  // from is inclusive, to is exclusive.
+  void ensure_range_unchanged(BytesView from, BytesView to) {
+    range_guards_.push_back(
+        {Bytes{from.begin(), from.end()}, Bytes{to.begin(), to.end()}});
+  }
+
+private:
+  [[nodiscard]] auto empty() const noexcept -> bool {
+    return actions_.empty() && range_guards_.empty();
+  }
+
+  // Number of write operations (Put or Del).
+  [[nodiscard]] auto write_count() const noexcept -> std::size_t {
+    std::size_t n = 0;
+    for (const auto &[k, a] : actions_) {
+      if (a.write != Write::None) ++n;
+    }
+    return n;
+  }
+
+  auto action_for(BytesView key) -> KeyAction & {
+    auto k = Bytes{key.begin(), key.end()};
+    return actions_[std::move(k)];
+  }
+
+  void set_precondition(BytesView key, Precondition pre) {
+    auto &a = action_for(key);
+    if (a.precondition != Precondition::None && a.precondition != pre) {
+      throw std::logic_error{"WritePlan: contradictory guards on same key"};
+    }
+    a.precondition = pre;
+  }
+
+  std::map<Bytes, KeyAction> actions_;
+  std::vector<RangeGuard> range_guards_;
+  friend class DB;
 };
 
 // ---------------------------------------------------------------------------

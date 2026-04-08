@@ -2269,24 +2269,24 @@ TEST_CASE("Snapshot keys_from is frozen at snapshot time", "[snapshot]") {
 // apply_batch_if tests
 // ---------------------------------------------------------------------------
 
-// No conflict: batch applies when no concurrent write touched the keys.
+// No conflict: plan applies when no concurrent write touched the keys.
 TEST_CASE("apply_batch_if succeeds with no conflict", "[apply_batch_if]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
   db.put({}, to_bytes("k"), to_bytes("v0"));
 
   auto snap = db.snapshot();
-  bytecask::Batch b;
-  b.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE_NOTHROW(db.apply_batch_if(snap, {}, std::move(b)));
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
 
   const auto result = get_val(db, to_bytes("k"));
   REQUIRE(result.has_value());
   CHECK(to_string(*result) == "v1");
 }
 
-// W-W conflict: key modified after snapshot — throws BatchConflict.
-TEST_CASE("apply_batch_if throws BatchConflict on modified key",
+// W-W conflict: key modified after snapshot — returns false.
+TEST_CASE("apply_batch_if returns false on modified key",
           "[apply_batch_if]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
@@ -2295,14 +2295,13 @@ TEST_CASE("apply_batch_if throws BatchConflict on modified key",
   auto snap = db.snapshot();
   db.put({}, to_bytes("k"), to_bytes("interleaved"));
 
-  bytecask::Batch b;
-  b.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE_THROWS_AS(db.apply_batch_if(snap, {}, std::move(b)),
-                    bytecask::BatchConflict);
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
 }
 
-// Conflict: key appeared after snapshot — throws BatchConflict.
-TEST_CASE("apply_batch_if throws BatchConflict when key appeared",
+// Conflict: key appeared after snapshot — returns false.
+TEST_CASE("apply_batch_if returns false when key appeared",
           "[apply_batch_if]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
@@ -2310,14 +2309,13 @@ TEST_CASE("apply_batch_if throws BatchConflict when key appeared",
   auto snap = db.snapshot(); // "k" absent at snapshot time
   db.put({}, to_bytes("k"), to_bytes("appeared"));
 
-  bytecask::Batch b;
-  b.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE_THROWS_AS(db.apply_batch_if(snap, {}, std::move(b)),
-                    bytecask::BatchConflict);
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
 }
 
-// Conflict: key deleted after snapshot — throws BatchConflict.
-TEST_CASE("apply_batch_if throws BatchConflict when key deleted",
+// Conflict: key deleted after snapshot — returns false.
+TEST_CASE("apply_batch_if returns false when key deleted",
           "[apply_batch_if]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
@@ -2326,13 +2324,12 @@ TEST_CASE("apply_batch_if throws BatchConflict when key deleted",
   auto snap = db.snapshot();
   (void)db.del({}, to_bytes("k"));
 
-  bytecask::Batch b;
-  b.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE_THROWS_AS(db.apply_batch_if(snap, {}, std::move(b)),
-                    bytecask::BatchConflict);
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
 }
 
-// No conflict on disjoint keys: concurrent write touches "a", batch writes "b".
+// No conflict on disjoint keys: concurrent write touches "a", plan writes "b".
 TEST_CASE("apply_batch_if no conflict on disjoint keys", "[apply_batch_if]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
@@ -2342,30 +2339,229 @@ TEST_CASE("apply_batch_if no conflict on disjoint keys", "[apply_batch_if]") {
   auto snap = db.snapshot();
   db.put({}, to_bytes("a"), to_bytes("concurrent"));
 
-  bytecask::Batch b;
-  b.put(to_bytes("b"), to_bytes("v1"));
-  REQUIRE_NOTHROW(db.apply_batch_if(snap, {}, std::move(b)));
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("b"), to_bytes("v1"));
+  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
 
   const auto result = get_val(db, to_bytes("b"));
   REQUIRE(result.has_value());
   CHECK(to_string(*result) == "v1");
 }
 
-// Empty batch is a no-op and never throws.
-TEST_CASE("apply_batch_if empty batch is a no-op", "[apply_batch_if]") {
+// Empty plan is a no-op and returns true.
+TEST_CASE("apply_batch_if empty plan is a no-op", "[apply_batch_if]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
   db.put({}, to_bytes("k"), to_bytes("v0"));
 
   auto snap = db.snapshot();
-  bytecask::Batch b;
-  REQUIRE_NOTHROW(db.apply_batch_if(snap, {}, std::move(b)));
+  bytecask::WritePlan plan;
+  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
 
   CHECK(to_string(*get_val(db, to_bytes("k"))) == "v0");
 }
 
+// ---------------------------------------------------------------------------
+// WritePlan guard tests
+// ---------------------------------------------------------------------------
+
+// ensure_present succeeds when key exists.
+TEST_CASE("apply_batch_if ensure_present passes when key exists",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  bytecask::WritePlan plan;
+  plan.ensure_present(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+  CHECK(to_string(*get_val(db, to_bytes("k"))) == "v1");
+}
+
+// ensure_present fails when key is absent.
+TEST_CASE("apply_batch_if ensure_present fails when key absent",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto snap = db.snapshot();
+  bytecask::WritePlan plan;
+  plan.ensure_present(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+}
+
+// ensure_absent succeeds when key does not exist.
+TEST_CASE("apply_batch_if ensure_absent passes when key absent",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto snap = db.snapshot();
+  bytecask::WritePlan plan;
+  plan.ensure_absent(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+  CHECK(to_string(*get_val(db, to_bytes("k"))) == "v1");
+}
+
+// ensure_absent fails when key exists.
+TEST_CASE("apply_batch_if ensure_absent fails when key exists",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  bytecask::WritePlan plan;
+  plan.ensure_absent(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+}
+
+// ensure_unchanged succeeds when no concurrent writes.
+TEST_CASE("apply_batch_if ensure_unchanged passes without modification",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  bytecask::WritePlan plan;
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+  CHECK(to_string(*get_val(db, to_bytes("k"))) == "v1");
+}
+
+// ensure_unchanged fails when key modified since snapshot.
+TEST_CASE("apply_batch_if ensure_unchanged fails on modification",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("k"), to_bytes("concurrent"));
+
+  bytecask::WritePlan plan;
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+}
+
+// ensure_unchanged on absent key — passes when still absent.
+TEST_CASE("apply_batch_if ensure_unchanged passes for absent key staying absent",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto snap = db.snapshot();
+  bytecask::WritePlan plan;
+  plan.ensure_unchanged(to_bytes("nonexistent"));
+  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+}
+
+// ensure_unchanged on absent key — fails when key appeared.
+TEST_CASE("apply_batch_if ensure_unchanged fails when absent key appeared",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("k"), to_bytes("appeared"));
+
+  bytecask::WritePlan plan;
+  plan.ensure_unchanged(to_bytes("k"));
+  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+}
+
+// ensure_range_unchanged succeeds when no keys in range were modified.
+TEST_CASE("apply_batch_if ensure_range_unchanged passes when range clean",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("v0"));
+  db.put({}, to_bytes("c"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  // Modify a key outside the guarded range.
+  db.put({}, to_bytes("a"), to_bytes("modified"));
+
+  bytecask::WritePlan plan;
+  plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
+  plan.put(to_bytes("x"), to_bytes("new"));
+  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+}
+
+// ensure_range_unchanged fails when a key in range was modified.
+TEST_CASE("apply_batch_if ensure_range_unchanged fails on in-range modification",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("b"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("b"), to_bytes("modified"));
+
+  bytecask::WritePlan plan;
+  plan.ensure_range_unchanged(to_bytes("a"), to_bytes("c"));
+  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+}
+
+// ensure_range_unchanged fails when a key in range was inserted.
+TEST_CASE("apply_batch_if ensure_range_unchanged fails on in-range insertion",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("b"), to_bytes("inserted"));
+
+  bytecask::WritePlan plan;
+  plan.ensure_range_unchanged(to_bytes("a"), to_bytes("c"));
+  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+}
+
+// ensure_range_unchanged fails when a key in range was deleted.
+TEST_CASE("apply_batch_if ensure_range_unchanged fails on in-range deletion",
+          "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("b"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  (void)db.del({}, to_bytes("b"));
+
+  bytecask::WritePlan plan;
+  plan.ensure_range_unchanged(to_bytes("a"), to_bytes("c"));
+  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+}
+
+// Guards-only plan with no writes — validates consistency without disk I/O.
+TEST_CASE("apply_batch_if guards-only plan with no writes", "[apply_batch_if]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  bytecask::WritePlan plan;
+  plan.ensure_unchanged(to_bytes("k"));
+  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+}
+
+// Contradictory guards throw std::logic_error at build time.
+TEST_CASE("WritePlan contradictory guards throw logic_error",
+          "[apply_batch_if]") {
+  bytecask::WritePlan plan;
+  plan.ensure_present(to_bytes("k"));
+  REQUIRE_THROWS_AS(plan.ensure_absent(to_bytes("k")), std::logic_error);
+}
+
 #ifdef BYTECASK_TESTING
-// Single-op optimization: a 1-entry apply_batch_if writes no BulkBegin/BulkEnd
+// Single-op optimization: a 1-write apply_batch_if writes no BulkBegin/BulkEnd
 // markers, so total_bytes matches an equivalent plain put().
 TEST_CASE("apply_batch_if single-op writes no markers", "[apply_batch_if]") {
   auto measure_total = [](auto &&fn) -> std::uint64_t {
@@ -2383,9 +2579,9 @@ TEST_CASE("apply_batch_if single-op writes no markers", "[apply_batch_if]") {
 
   const auto batch_if_bytes = measure_total([](auto &db) {
     auto snap = db.snapshot();
-    bytecask::Batch b;
-    b.put(to_bytes("k"), to_bytes("value"));
-    db.apply_batch_if(snap, {}, std::move(b));
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k"), to_bytes("value"));
+    (void)db.apply_batch_if(snap, {}, std::move(plan));
   });
 
   CHECK(batch_if_bytes == put_bytes);
