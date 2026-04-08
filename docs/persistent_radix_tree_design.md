@@ -1,7 +1,165 @@
 # Persistent Radix Tree (Byte-Array Keys)
 
+This document describes the design of the persistent radix tree used as the in-memory key directory in ByteCask. It is intended for contributors who need to understand, modify, or reason about correctness of this component.
+
+The **Background** section builds up the necessary concepts from scratch — persistent data structures, structural sharing, Tries, and Patricia Tries — for readers coming without that context. From §1 onward the document covers the C++ design: the overview, design principles, node layout, API, algorithms, acceptance criteria, memory usage, and benchmark results.
+
+---
+
+## Background
+
+### What is a Persistent Data Structure?
+
+A **persistent data structure** preserves all previous versions of itself when modified. Instead of mutating state in place, every operation returns a new version. Old versions are never altered and remain fully accessible.
+
+> **Note on terminology**: "Persistent" here comes from functional programming — it refers to *immutability and version preservation*, not to storage on disk. A persistent data structure lives entirely in memory.
+
+The simplest way to implement persistence is to deep-copy the entire structure on every write. That is O(N) per operation — correct, but impractical at any real scale.
+
+The efficient alternative is **structural sharing**: since nodes are never mutated after creation, unchanged nodes can be *referenced by both the old and the new version simultaneously*. No copying is needed for any part of the structure that wasn't on the modified path.
+
+For trees, a single insertion or deletion only touches nodes along the *path from the root to the affected leaf*. Everything off that path is shared freely between the two versions — this technique is called **path copying**.
+
+### Persistent BST: Path Copying
+
+Consider a binary search tree holding integer keys. Nodes are identified by a pointer ID (e.g. `ptr_1`) and carry a key (e.g. `8`).
+
+**Version 1** — `root_v1` holds a reference to `ptr_1`:
+
+```mermaid
+graph TB
+    ptr_1["ptr_1 : 8"] --> ptr_2["ptr_2 : 4"]
+    ptr_1 --> ptr_5["ptr_5 : 12"]
+    ptr_2 --> ptr_3["ptr_3 : 2"]
+    ptr_2 --> ptr_4["ptr_4 : 6"]
+    ptr_5 --> ptr_6["ptr_6 : 10"]
+    ptr_5 --> ptr_9["ptr_9 : 14"]
+    ptr_6 --> ptr_7["ptr_7 : 9"]
+    ptr_6 --> ptr_8["ptr_8 : 11"]
+    ptr_9 --> ptr_10["ptr_10 : 13"]
+
+    classDef sharedNode fill:#ADD8E6,stroke:#2166ac
+    class ptr_1,ptr_2,ptr_3,ptr_4,ptr_5,ptr_6,ptr_7,ptr_8,ptr_9,ptr_10 sharedNode
+```
+
+The search path for inserting 5 is **ptr_1(8) → ptr_2(4) → ptr_4(6)**, where 5 is placed as the left child of `ptr_4` (since 5 < 6). Every node on this path must be copied because their child pointers change. Everything off the path is untouched.
+
+The result is three copies (`ptr_11`, `ptr_12`, `ptr_13`) plus a new leaf (`ptr_14 : 5`). `root_v2` points to `ptr_11`. The remaining 7 nodes on the right subtree and the untouched left leaf are shared unchanged.
+
+**Version 2** — `root_v2 → ptr_11` (after inserting key 5):
+
+```mermaid
+graph TB
+    ptr_11["ptr_11 : 8"] --> ptr_12["ptr_12 : 4"]
+    ptr_11 --> ptr_5["ptr_5 : 12"]
+    ptr_12 --> ptr_3["ptr_3 : 2"]
+    ptr_12 --> ptr_13["ptr_13 : 6"]
+    ptr_13 --> ptr_14["ptr_14 : 5"]
+    ptr_5 --> ptr_6["ptr_6 : 10"]
+    ptr_5 --> ptr_9["ptr_9 : 14"]
+    ptr_6 --> ptr_7["ptr_7 : 9"]
+    ptr_6 --> ptr_8["ptr_8 : 11"]
+    ptr_9 --> ptr_10["ptr_10 : 13"]
+
+    classDef newNode fill:#90EE90,stroke:#2d7a2d
+    classDef sharedNode fill:#ADD8E6,stroke:#2166ac
+    class ptr_11,ptr_12,ptr_13,ptr_14 newNode
+    class ptr_3,ptr_5,ptr_6,ptr_7,ptr_8,ptr_9,ptr_10 sharedNode
+```
+
+- **Green nodes** — newly allocated copies (`ptr_11`, `ptr_12`, `ptr_13`) plus the new leaf (`ptr_14 : 5`). Only 4 nodes out of 11 are new.
+- **Blue nodes** — the exact same node objects from Version 1, shared by pointer. No copying occurred.
+
+A caller holding `root_v1` sees the original tree, unchanged. A caller holding `root_v2` sees a tree that contains key 5. Both are valid simultaneously and neither is aware of the other.
+
+Persistence adds O(log N) allocations per write — the length of the copied path — but **does not change the time complexity of any operation**.
+
+### Tries: Branching on Key Bytes
+
+A BST branches based on a *comparison* between whole keys. The path length depends on the number of keys in the tree (O(log N) for a balanced tree).
+
+A **Trie** (from the word *re**trie**val*) takes a fundamentally different approach: it branches on *individual characters (or bytes)* of the key, one per level. The depth of any key equals its length, regardless of how many keys are in the tree.
+
+- Each **edge** is labelled with a single character.
+- A key's value is stored at the node reached after consuming all its characters.
+- All keys sharing a common prefix share the same path down to the point of divergence — prefix sharing is structural, not incidental.
+
+Keys: `app`, `apple`, `apply`, `apt`
+
+```
+root
+ └─'a'─ node
+          └─'p'─ node
+                   ├─'p'─ [app ✓]
+                   │        └─'l'─ node
+                   │                ├─'e'─ [apple ✓]
+                   │                └─'y'─ [apply ✓]
+                   └─'t'─ [apt ✓]
+```
+
+Nodes marked ✓ carry a value. Unmarked nodes are routing-only intermediates.
+
+Path copying applies exactly as in the BST. The path to any key has at most k nodes — one per character — so inserting or updating a key of length k copies at most k nodes. The rest of the trie is shared. Unlike the BST, path length is O(k) — bounded by the key length, not the number of keys N. For large N this is a significant advantage: lookup and write cost stay constant as the dataset grows.
+
+### Patricia Tries (Radix Trees): Compressing the Trie
+
+A standard Trie can contain long chains of single-child nodes — one per character of a shared prefix — that carry no branching information. A key `"application"` with no sibling sharing its prefix creates a linear chain 11 nodes deep. These nodes are pure structural overhead.
+
+A **Patricia Trie** (also called a *Radix Tree*) eliminates this by collapsing chains of single-child nodes into a single edge whose label carries the entire compressed byte sequence. Branching still happens at the first character where two keys diverge; it just doesn't allocate a separate node for every character in between.
+
+**Standard Trie** — the `a → p` prefix creates a 2-node chain before the first branch:
+
+```
+root
+ └─'a'─ node
+          └─'p'─ node
+                   ├─'p'─ [app ✓]
+                   │        └─'l'─ node
+                   │                ├─'e'─ [apple ✓]
+                   │                └─'y'─ [apply ✓]
+                   └─'t'─ [apt ✓]
+```
+
+**Patricia Trie** — the single-child chain `a → p` is collapsed into the edge label `"ap"`:
+
+```
+root
+ └─"ap"─ node
+            ├─"p"─ [app ✓]
+            │        └─"l"─ node
+            │                ├─"e"─ [apple ✓]
+            │                └─"y"─ [apply ✓]
+            └─"t"─ [apt ✓]
+```
+
+Node count drops from 7 to 5. For keys with long shared prefixes — say, UUID-keyed namespaces where every key starts with `"user::"` — the savings compound dramatically. A properly compressed Patricia Trie has at most 2N − 1 nodes for N keys — no unbounded single-child chains exist.
+
+Path copying still applies. A key of length k touches at most k nodes on the path from root to leaf, so at most k nodes are copied per write. The edge-label compression reduces the *number* of nodes on that path in practice, meaning fewer allocations per write — but the bound remains O(k).
+
+> **Naming**: Patricia Trie and Radix Tree refer to the same data structure. The rest of this document uses **Radix Tree**.
+
+### Big-O Summary
+
+Let N = total number of keys, k = length of the key being operated on.
+
+| Structure | `get` | `set` | `erase` | New allocs / write |
+|---|---|---|---|---|
+| Mutable BST | O(log N) | O(log N) | O(log N) | O(1) |
+| **Persistent BST** | O(log N) | O(log N) | O(log N) | **O(log N)** |
+| Mutable Trie | O(k) | O(k) | O(k) | O(k) |
+| **Persistent Trie** | O(k) | O(k) | O(k) | **O(k)** |
+| Mutable Radix Tree | O(k) | O(k) | O(k) | O(k) |
+| **Persistent Radix Tree** | O(k) | O(k) | O(k) | **O(k)** |
+
+**Making a structure persistent does not change the asymptotic time complexity of any operation.**
+
+---
+
 ## 1. Overview
-A Persistent (Immutable) Radix Tree (Patricia Trie) in C++ that provides native prefix-compression for byte-array keys, $O(1)$ snapshotting via structural sharing, ordered iteration (`lower_bound`), and efficient bulk updates via a Transient API. The container uses standard allocators. Module: `bytecask.radix_tree`.
+
+This component implements a persistent radix tree in C++ as the key directory for ByteCask. It exposes two interfaces: a fully immutable `PersistentRadixTree<V>` where every mutating operation returns a new version sharing unchanged subtrees by pointer, and a `TransientRadixTree<V>` builder for efficient bulk loading that converts to a persistent snapshot when done. Both support `get`, `set`, `erase`, ordered iteration, and `lower_bound`. A static `merge` operation combines two persistent trees in O(overlap) time, adopting disjoint subtrees by pointer without cloning. The module is `bytecask.radix_tree` and uses standard allocators.
+
+
 
 ## Design Principles
 
@@ -14,19 +172,12 @@ This component inherits the ByteCask design tenets in order of priority:
 
 **Key context**: this tree is an in-memory index in front of disk I/O that is orders of magnitude slower. CPU-bound optimizations matter only where they affect the write path's latency distribution (principle #3) or materially reduce memory overhead for large key sets. Complexity that doesn't serve one of these goals is cut.
 
-### VM pressure and prefix-aligned hot/cold access
-
-ByteCask's stated operating envelope is all keys in physical RAM. However, the radix tree has a useful emergent property under memory pressure: because the tree's structure mirrors key prefixes, subtrees for different prefixes occupy disjoint pointer graphs and thus tend to land on disjoint OS pages. When access has clear prefix-aligned hot/cold locality (e.g., `user:<uuidv7>` where recent UUIDs are warm and old ones are cold), the OS VM subsystem acts as an implicit buffer pool — keeping warm subtrees resident and transparently paging out cold ones.
-
-Under this pattern, latency becomes bimodal (fast for warm keys, a page-fault away for cold ones) but the system remains correct and the average case is dominated by the warm path. Full-tree scans defeat this property by pulling the entire working set back into RAM and should be avoided or rate-limited.
-
-A manually managed buffer pool could replicate this behaviour, but Linux's VM is a decades-hardened implementation with adaptive LRU (active/inactive list split), readahead heuristics, NUMA awareness, and transparent huge pages. A userspace buffer pool would need to reimplement all of that to reach parity — and would almost certainly lose. Delegating to the OS is therefore not just simpler (principle #2) but likely better in practice.
-
 ## 2. Core Characteristics
+
 *   **Key Type:** `std::span<const std::byte>` (Ingested and prefix-compressed natively).
 *   **Value Type:** Generic `V`.
 *   **Immutability:** All mutating operations return a new version of the tree. Untouched nodes are shared via intrusive reference-counted pointers (`IntrusivePtr<Node>`).
-*   **Memory Management:** Standard allocators. No `std::pmr`. Nodes embed their own reference count (`std::atomic<std::uint32_t>`) and are managed via `IntrusivePtr<T>`, a lightweight single-pointer (8 B) smart pointer that replaces `std::shared_ptr` (16 B + 32 B control block). This eliminates 32 bytes of `make_shared` control-block overhead per node and halves the pointer size in every child slot.
+*   **Memory Management:** Standard allocators. Nodes embed their own reference count (`std::atomic<std::uint32_t>`) and are managed via `IntrusivePtr<T>`, a lightweight single-pointer (8 B) smart pointer that replaces `std::shared_ptr` (16 B + 32 B control block). This eliminates 32 bytes of `make_shared` control-block overhead per node and halves the pointer size in every child slot.
 *   **Prefix Compression:** Shared byte sequences are stored once in the highest common parent node.
 *   **Edit Tags (COW):** Transient mode uses epoch tags to safely mutate uniquely-owned nodes in-place, falling back to Path Copying when sharing occurs.
 
@@ -114,16 +265,55 @@ Because keys are fragmented across nodes, the iterator must materialize the key 
 ## 5. Algorithmic Requirements
 
 ### 5.1. Insertion / Splitting
+
 When inserting a key that diverges from an existing node's prefix (e.g., Node has "ABC", inserting "AXY"):
 1.  Split the node into a Parent ("A") and a Child ("C", old value/children).
 2.  Create a new Leaf ("Y", new value).
 3.  Parent gets transition bytes 'B' (pointing to Child) and 'X' (pointing to Leaf), sorted by byte value.
 
+```
+  Before:                       After inserting "AXY":
+
+  root                          root
+   └─"ABC"─ [V1, ...]            └─"A"─ node
+                                          ├─'B'─ "C"─ [V1, ...]
+                                          └─'X'─ "Y"─ [V2]
+```
+
 ### 5.2. Erasure / Path Compression
+
 When removing a value (`node->value = std::nullopt`), the tree must maintain Patricia Trie invariants:
 1.  **0 Children:** The node is deleted. Recursively check parent.
 2.  **1 Child:** The node is merged with its child. The new prefix is `parent_prefix + transition_byte + child_prefix`.
 3.  **>1 Child:** The node remains as a routing node.
+
+```
+  Notation: [✓] = node holds a value.  Nodes without [✓] are routing-only.
+
+  Case 1 — 0 children (delete and propagate up):
+
+  Before: erase "AB"             After:
+  root                           root (empty)
+   └─"A"─ node
+             └─'B'─ "" [✓]
+
+
+  Case 2 — 1 child (merge with child):
+
+  Before: erase "A"              After:
+  root                           root
+   └─"A"─ [✓]                     └─"ABC"─ [✓]
+             └─'B'─ "C"─ [✓]
+
+
+  Case 3 — >1 children (keep as routing node):
+
+  Before: erase "A"              After:
+  root                           root
+   └─"A"─ [✓]                     └─"A"─ (routing)
+             ├─'B'─ "C"─ [✓]               ├─'B'─ "C"─ [✓]
+             └─'X'─ "Y"─ [✓]               └─'X'─ "Y"─ [✓]
+```
 
 ### 5.3. Merge
 
@@ -142,6 +332,19 @@ static auto merge(const PersistentRadixTree& a,
 
 The function walks both trees in tandem, recursing only where the two trees overlap. At each step it compares the compressed prefixes of the two nodes. Let `cpl` = the common prefix length between `node_a.prefix` and `node_b.prefix`.
 
+```
+  Tree A:                 Tree B:                 Merged:
+
+  root_a                  root_b                  root
+   └─"ap"─ node            └─"ap"─ node            └─"ap"─ node
+             ├─"p"─ [V1]             ├─"p"─ [V2]             ├─"p"─ [resolve(V1,V2)]
+             └─"t"─ [V3]             └─"ple"─ [V4]           ├─"t"─ [V3]
+                                                             └─"ple"─ [V4]
+
+  "app"  conflict      → resolve(V1,V2) called.
+  "apt"  only in A     → adopted by pointer, no clone.
+  "apple" only in B    → adopted by pointer, no clone.
+```
 **Case 1 — Base cases:**
 - If `node_a` is null, return `node_b`.
 - If `node_b` is null, return `node_a`.
@@ -165,6 +368,11 @@ The function walks both trees in tandem, recursing only where the two trees over
 - `node_b` sits *above* `node_a` in the trie (b is a prefix of a).
 - Clone `node_b`, trim `node_a`'s prefix, and insert/merge `node_a` as a child of the clone at transition byte `prefix_a[cpl]`.
 
+```
+  A: "abc"─ [V1]        B: "ab"─ [V2]         Merged: "ab"─ [V2] (clone of B)
+                                                          └─'c'─ ""-─ [V1]  (A trimmed)
+```
+
 **Case 4 — `node_a`'s prefix is exhausted first (`cpl == |prefix_a|`, `cpl < |prefix_b|`):**
 - Symmetric to Case 3. Clone `node_a`, trim `node_b`, insert/merge as child.
 
@@ -174,6 +382,7 @@ The function walks both trees in tandem, recursing only where the two trees over
 - Walk `node_b`'s child list and for each `(transition_byte, child_b)`:
   - If `node_a` has a child with the same transition byte, recurse: `merge_impl(child_a, child_b, resolve)`.
   - Otherwise, adopt `child_b` directly (O(1) `IntrusivePtr` copy — the entire disjoint subtree is shared).
+- *This is the case shown in the overview diagram above:* both roots share the prefix `"ap"`, so they are cloned and their children merged recursively.
 
 **Size computation:**
 
@@ -424,3 +633,15 @@ Merge cost as a fraction of linear build:
 | Prefixed, disjoint | ~20% | ~2,885 |
 
 Merge overhead is small enough that parallelising the build phase pays for itself with ≥2 threads.
+
+---
+
+## 9. Additional Considerations
+
+### VM pressure and prefix-aligned hot/cold access
+
+ByteCask's stated operating envelope is all keys in physical RAM. However, the radix tree has a useful emergent property under memory pressure: because the tree's structure mirrors key prefixes, subtrees for different prefixes occupy disjoint pointer graphs and thus tend to land on disjoint OS pages. When access has clear prefix-aligned hot/cold locality (e.g., `user:<uuidv7>` where recent UUIDs are warm and old ones are cold), the OS VM subsystem acts as an implicit buffer pool — keeping warm subtrees resident and transparently paging out cold ones.
+
+Under this pattern, latency becomes bimodal (fast for warm keys, a page-fault away for cold ones) but the system remains correct and the average case is dominated by the warm path. Full-tree scans defeat this property by pulling the entire working set back into RAM and should be avoided or rate-limited.
+
+A manually managed buffer pool could replicate this behaviour, but Linux's VM is a decades-hardened implementation with adaptive LRU (active/inactive list split), readahead heuristics, NUMA awareness, and transparent huge pages. A userspace buffer pool would need to reimplement all of that to reach parity — and would almost certainly lose. Delegating to the OS is therefore not just simpler (principle #2) but likely better in practice.

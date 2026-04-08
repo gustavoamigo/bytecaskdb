@@ -27,3 +27,6 @@ __pycache__/
 # perf profiling data
 perf*.data
 perf*.data.old
+
+.notes
+
