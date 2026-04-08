@@ -4,9 +4,9 @@
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/gustavoamigo/bytecask)
 
-ByteCask is a fast, predictable embedded key-value store written in C++23 that scales to **hundreds of millions of keys** across multiple cores with flat, consistent latency.
+ByteCask is a fast, predictable embedded key-value store written in C++ that scales to **hundreds of millions of keys** across multiple cores with flat, consistent latency.
 
-Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCask replaces the original hash-table key directory with a **persistent radix tree** — enabling ordered range queries, prefix scans, and prefix compaction while keeping the simplicity that makes Bitcask fast. Prefix scans are pure in-memory radix tree walks:
+Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCask replaces the original hash-table key directory with a **[persistent radix tree](docs/persistent_radix_tree_design.md)** — enabling ordered range queries, prefix scans, and prefix compaction while keeping the simplicity that makes Bitcask fast. Prefix scans are pure in-memory radix tree walks:
 
 ```cpp
 // Scan all keys starting with "user:" — no disk I/O.
