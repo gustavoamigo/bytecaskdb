@@ -247,100 +247,12 @@ auto DB::contains_key(BytesView key) const -> bool {
 // Rotates the active file after the sync if the threshold is reached.
 // Throws std::system_error on I/O failure or lock contention (try_lock).
 void DB::apply_batch(const WriteOptions &opts, Batch batch) {
-  apply_batch_impl(opts, std::move(batch), nullptr);
-}
-
-#pragma endregion
-
-#pragma region apply_batch_impl
-
-const char *BatchConflict::what() const noexcept { return "batch conflict"; }
-
-// Shared write path for apply_batch (snap == nullptr) and apply_batch_if
-// (snap != nullptr). When snap is provided, performs a W-W conflict check
-// under write_mu_ before applying; short-circuits on the first conflict.
-// Single-op optimization: skips BulkBegin/BulkEnd when batch.size() == 1.
-void DB::apply_batch_impl(const WriteOptions &opts, Batch batch,
-                          const Snapshot *snap) {
-  if (batch.empty()) {
-    return;
-  }
+  if (batch.empty()) return;
   std::shared_ptr<DataFile> file_to_sync;
   {
     auto guard = acquire_write_lock(opts);
     auto current = state_.load();
-
-    // W-W conflict check — only on the apply_batch_if path.
-    if (snap) {
-      for (const auto &op : batch.operations_) {
-        std::visit(
-            [&](const auto &o) {
-              const std::span<const std::byte> key_span{o.key};
-              const auto snap_entry = snap->state_->key_dir.get(key_span);
-              const auto cur_entry = current->key_dir.get(key_span);
-              const bool appeared = !snap_entry && cur_entry;
-              const bool deleted = snap_entry && !cur_entry;
-              const bool modified = snap_entry && cur_entry &&
-                                    cur_entry->sequence != snap_entry->sequence;
-              if (appeared || deleted || modified) throw BatchConflict{};
-            },
-            op);
-      }
-    }
-
-    auto s = *current;
-    const bool multi = batch.size() > 1;
-    if (multi) {
-      stats_publish_bulk_marker(s.active_file_id);
-      std::ignore =
-          s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
-    }
-
-    auto t = s.key_dir.transient();
-    for (auto &op : batch.operations_) {
-      std::visit(
-          [&](auto &o) {
-            using T = std::decay_t<decltype(o)>;
-            if constexpr (std::is_same_v<T, BatchInsert>) {
-              const std::span<const std::byte> key_span{o.key};
-              const auto existing = t.get(key_span);
-              if (existing) stats_retire_entry(key_span, *existing);
-              stats_publish_put(s.active_file_id, key_span,
-                                std::span<const std::byte>{o.value});
-              const auto offset = s.active_file().append(
-                  s.next_lsn, EntryType::Put, key_span,
-                  std::span<const std::byte>{o.value});
-              t.set(key_span,
-                    KeyDirEntry{s.next_lsn, s.active_file_id, offset,
-                                narrow<std::uint32_t>(o.value.size())});
-              ++s.next_lsn;
-            } else if constexpr (std::is_same_v<T, BatchRemove>) {
-              const std::span<const std::byte> key_span{o.key};
-              const auto existing = t.get(key_span);
-              if (existing) stats_retire_entry(key_span, *existing);
-              stats_publish_tombstone(s.active_file_id, key_span);
-              std::ignore = s.active_file().append(s.next_lsn, EntryType::Delete,
-                                                   key_span, {});
-              ++s.next_lsn;
-              t.erase(key_span);
-            }
-          },
-          op);
-    }
-
-    if (multi) {
-      stats_publish_bulk_marker(s.active_file_id);
-      std::ignore =
-          s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
-    }
-
-    s.key_dir = std::move(t).persistent();
-    if (opts.sync) {
-      file_to_sync = s.files->at(s.active_file_id);
-    }
-    s = rotate_if_needed(std::move(s));
-    state_.store(std::make_shared<EngineState>(std::move(s)));
-    state_time_.store(now_ns(), std::memory_order_release);
+    file_to_sync = commit_batch(opts, batch, current);
   }
   if (file_to_sync) {
     sync_group_.sync([&] { file_to_sync->sync(); });
@@ -349,12 +261,168 @@ void DB::apply_batch_impl(const WriteOptions &opts, Batch batch,
 
 #pragma endregion
 
+#pragma region apply_batch_impl
+
+// Writes batch entries to disk under write_mu_, updates stats, publishes new
+// EngineState. Single-op optimization: skips BulkBegin/BulkEnd when
+// batch.size() == 1. Returns the file to sync (null if !opts.sync).
+auto DB::commit_batch(const WriteOptions &opts, Batch &batch,
+                      const std::shared_ptr<const EngineState> &current)
+    -> std::shared_ptr<DataFile> {
+  auto s = *current;
+  const bool multi = batch.size() > 1;
+  if (multi) {
+    stats_publish_bulk_marker(s.active_file_id);
+    std::ignore =
+        s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
+  }
+
+  auto t = s.key_dir.transient();
+  for (auto &op : batch.operations_) {
+    std::visit(
+        [&](auto &o) {
+          using T = std::decay_t<decltype(o)>;
+          if constexpr (std::is_same_v<T, BatchInsert>) {
+            const std::span<const std::byte> key_span{o.key};
+            const auto existing = t.get(key_span);
+            if (existing) stats_retire_entry(key_span, *existing);
+            stats_publish_put(s.active_file_id, key_span,
+                              std::span<const std::byte>{o.value});
+            const auto offset = s.active_file().append(
+                s.next_lsn, EntryType::Put, key_span,
+                std::span<const std::byte>{o.value});
+            t.set(key_span,
+                  KeyDirEntry{s.next_lsn, s.active_file_id, offset,
+                              narrow<std::uint32_t>(o.value.size())});
+            ++s.next_lsn;
+          } else if constexpr (std::is_same_v<T, BatchRemove>) {
+            const std::span<const std::byte> key_span{o.key};
+            const auto existing = t.get(key_span);
+            if (existing) stats_retire_entry(key_span, *existing);
+            stats_publish_tombstone(s.active_file_id, key_span);
+            std::ignore = s.active_file().append(s.next_lsn, EntryType::Delete,
+                                                 key_span, {});
+            ++s.next_lsn;
+            t.erase(key_span);
+          }
+        },
+        op);
+  }
+
+  if (multi) {
+    stats_publish_bulk_marker(s.active_file_id);
+    std::ignore =
+        s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
+  }
+
+  s.key_dir = std::move(t).persistent();
+  std::shared_ptr<DataFile> file_to_sync;
+  if (opts.sync) {
+    file_to_sync = s.files->at(s.active_file_id);
+  }
+  s = rotate_if_needed(std::move(s));
+  state_.store(std::make_shared<EngineState>(std::move(s)));
+  state_time_.store(now_ns(), std::memory_order_release);
+  return file_to_sync;
+}
+
+#pragma endregion
+
 #pragma region Snapshot and apply_batch_if
 
 auto DB::snapshot() const -> Snapshot { return Snapshot{state_.load()}; }
 
-void DB::apply_batch_if(const Snapshot &snap, WriteOptions opts, Batch batch) {
-  apply_batch_impl(opts, std::move(batch), &snap);
+// Evaluates guards and W-W checks under write_mu_, then delegates to
+// commit_batch if all checks pass. Returns true if committed, false on conflict.
+auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
+                        WritePlan plan) -> bool {
+  if (plan.empty()) return true;
+
+  std::shared_ptr<DataFile> file_to_sync;
+  {
+    auto guard = acquire_write_lock(opts);
+    auto current = state_.load();
+
+    // 1. Point guards.
+    for (const auto &[key, action] : plan.actions_) {
+      const std::span<const std::byte> key_span{key};
+      const auto snap_entry = snap.state_->key_dir.get(key_span);
+      const auto cur_entry = current->key_dir.get(key_span);
+
+      switch (action.precondition) {
+      case WritePlan::Precondition::MustExist:
+        if (!cur_entry) return false;
+        break;
+      case WritePlan::Precondition::MustBeAbsent:
+        if (cur_entry) return false;
+        break;
+      case WritePlan::Precondition::MustBeUnchanged: {
+        const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence : 0;
+        const std::uint64_t cur_seq = cur_entry ? cur_entry->sequence : 0;
+        if (cur_seq != snap_seq) return false;
+        break;
+      }
+      case WritePlan::Precondition::None:
+        break;
+      }
+    }
+
+    // 2. Range guards.
+    for (const auto &rg : plan.range_guards_) {
+      const std::span<const std::byte> from_span{rg.from};
+      const std::span<const std::byte> to_span{rg.to};
+
+      // Check current state for keys modified since snapshot.
+      for (auto it = current->key_dir.lower_bound(from_span);
+           it != std::default_sentinel; ++it) {
+        auto [key_span, entry] = *it;
+        if (Key{key_span} >= Key{to_span}) break;
+        const auto snap_entry = snap.state_->key_dir.get(key_span);
+        const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence : 0;
+        if (entry.sequence != snap_seq) return false;
+      }
+
+      // Check snapshot for keys deleted since snapshot.
+      for (auto it = snap.state_->key_dir.lower_bound(from_span);
+           it != std::default_sentinel; ++it) {
+        auto [key_span, entry] = *it;
+        if (Key{key_span} >= Key{to_span}) break;
+        if (!current->key_dir.get(key_span)) return false;
+      }
+    }
+
+    // 3. Implicit W-W check on all write keys.
+    for (const auto &[key, action] : plan.actions_) {
+      if (action.write == WritePlan::Write::None) continue;
+      const std::span<const std::byte> key_span{key};
+      const auto snap_entry = snap.state_->key_dir.get(key_span);
+      const auto cur_entry = current->key_dir.get(key_span);
+      const bool appeared = !snap_entry && cur_entry;
+      const bool deleted = snap_entry && !cur_entry;
+      const bool modified = snap_entry && cur_entry &&
+                            cur_entry->sequence != snap_entry->sequence;
+      if (appeared || deleted || modified) return false;
+    }
+
+    // All checks passed — convert WritePlan writes to Batch and commit.
+    Batch batch;
+    for (auto &[key, action] : plan.actions_) {
+      if (action.write == WritePlan::Write::Put) {
+        batch.put(std::span<const std::byte>{key},
+                  std::span<const std::byte>{action.value});
+      } else if (action.write == WritePlan::Write::Del) {
+        batch.del(std::span<const std::byte>{key});
+      }
+    }
+
+    if (!batch.empty()) {
+      file_to_sync = commit_batch(opts, batch, current);
+    }
+  }
+  if (file_to_sync) {
+    sync_group_.sync([&] { file_to_sync->sync(); });
+  }
+  return true;
 }
 
 #pragma endregion

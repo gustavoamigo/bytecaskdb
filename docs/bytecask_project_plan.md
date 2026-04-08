@@ -38,6 +38,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-104 | `WritePlan` type: split `Batch` from `apply_batch_if` | New `WritePlan` type with composable guards (`ensure_present`/`ensure_absent`/`ensure_unchanged`/`ensure_range_unchanged`) + writes (`put`/`del`) for `apply_batch_if`. `Batch` stays as-is for `apply_batch`. Guards and writes merged per-key into `KeyAction`. `apply_batch_if` returns `bool` (false on conflict) instead of throwing. Shared `commit_batch` helper. `BatchConflict` removed. 25 `[apply_batch_if]` tests. README, design doc, and project plan updated. |
 | BC-103 | Layer 1: `snapshot()` and `apply_batch_if()` | Added `DB::snapshot()` → `Snapshot` (frozen read-only view, lock-free reads, auto vacuum deferral) and `DB::apply_batch_if()` (W-W CAS under `write_mu_`, short-circuits on first conflict, throws `BatchConflict`). Single-entry batch optimization skips `BulkBegin`/`BulkEnd` markers for both `apply_batch` and `apply_batch_if`. 13 new tests (5 `[snapshot]`, 8 `[apply_batch_if]`). 120 test cases total. |
 | --- | --- | --- |
 | BC-101 | Replace `sys-info.sh` memory usage with installed RAM summary | Removed the `free -h` OS usage view. The script now prints a single installed-RAM line from `/proc/meminfo`, avoiding privileged SMBIOS/DIMM probing while still describing machine capacity. |

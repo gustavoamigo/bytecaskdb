@@ -25,7 +25,7 @@ for (auto& [key, value] : db.iter_from({}, to_bytes("user:"))) { ... }
 - **Sequential write path** — every `put`, `del`, and `apply_batch` performs a single sequential append; no WAL, no random writes, just one I/O operation per write.
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration.
 - **Atomic writes** — every `put` and `del` is atomic. `apply_batch` makes multiple puts and deletes atomic as a group.
-- **Conflict-safe CAS writes** — `snapshot()` captures a consistent read-only view; `apply_batch_if(snap, opts, batch)` applies a batch atomically only if none of its keys were written since the snapshot, throwing `BatchConflict` otherwise. Single-key CAS with no marker overhead.
+- **Conflict-safe CAS writes** — `snapshot()` captures a point-in-time read-only view; `apply_batch_if(snap, opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. Precondition checks are cheap — all key lookups are in-memory radix tree traversals with no disk I/O. Single-key CAS with no marker overhead.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms and 100 M keys in under 6 s on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second; a single writer ensures consistent writes even under concurrent multi-threaded access.
@@ -137,16 +137,15 @@ batch.del(to_bytes("user:1"));
 db.apply_batch({}, std::move(batch));
 
 // Conflict-safe CAS write — reads from a consistent snapshot,
-// applies the batch only if none of its keys changed since the snapshot.
+// applies the plan only if every precondition holds.
 auto snap = db.snapshot();
 Bytes balance_out;
 snap.get(to_bytes("account:42"), balance_out);
 // ... compute new_balance ...
-Batch cas;
-cas.put(to_bytes("account:42"), new_balance);
-try {
-    db.apply_batch_if(snap, {}, std::move(cas));
-} catch (const BatchConflict&) {
+WritePlan plan;
+plan.ensure_unchanged(to_bytes("account:42"));   // guard: no concurrent write
+plan.put(to_bytes("account:42"), new_balance);
+if (!db.apply_batch_if(snap, {}, std::move(plan))) {
     // a concurrent writer modified "account:42" — retry
 }
 
@@ -196,9 +195,11 @@ public:
     // Holds open referenced data files until destroyed — vacuum deferred automatically.
     [[nodiscard]] auto snapshot() const -> Snapshot;
 
-    // Applies batch atomically iff no key in batch was modified since snap.
-    // Throws BatchConflict on W-W conflict. Throws std::system_error on I/O failure.
-    void apply_batch_if(const Snapshot& snap, WriteOptions opts, Batch batch);
+    // Applies plan atomically iff every guard holds (key present/absent/unchanged,
+    // range unchanged) and no write key was modified since snap.
+    // Returns false on conflict; throws std::system_error on I/O failure.
+    [[nodiscard]] auto apply_batch_if(const Snapshot& snap, WriteOptions opts,
+                                      WritePlan plan) -> bool;
 
     [[nodiscard]] auto iter_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
@@ -213,7 +214,7 @@ public:
 } // namespace bytecask
 ```
 
-Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; key-not-found is signalled by `get` returning `false`; W-W conflicts throw `BatchConflict`.
+Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; key-not-found is signalled by `get` returning `false`; `apply_batch_if` returns `false` on precondition or W-W conflict (conflicts are expected outcomes, not exceptional errors).
 
 ## Architecture
 
