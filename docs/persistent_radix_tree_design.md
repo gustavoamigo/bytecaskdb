@@ -18,7 +18,7 @@ The simplest way to implement persistence is to deep-copy the entire structure o
 
 The efficient alternative is **structural sharing**: since nodes are never mutated after creation, unchanged nodes can be *referenced by both the old and the new version simultaneously*. No copying is needed for any part of the structure that wasn't on the modified path.
 
-For trees, a single insertion or deletion only touches nodes along the *path from the root to the affected leaf*. Everything off that path is shared freely between the two versions — this technique is called **path copying**.
+For trees, a single insertion or deletion only touches nodes along the *path from the root to the affected leaf*. Everything off that path is shared freely between the two versions — this technique is called **[path copying](https://doi.org/10.1016/0022-0000(89)90034-2)**. Okasaki's [*Purely Functional Data Structures*](https://www.cambridge.org/9780521663502) (1998) develops this and related techniques in depth.
 
 ### Persistent BST: Path Copying
 
@@ -105,7 +105,7 @@ Path copying applies exactly as in the BST. The path to any key has at most k no
 
 A standard Trie can contain long chains of single-child nodes — one per character of a shared prefix — that carry no branching information. A key `"application"` with no sibling sharing its prefix creates a linear chain 11 nodes deep. These nodes are pure structural overhead.
 
-A **Patricia Trie** (also called a *Radix Tree*) eliminates this by collapsing chains of single-child nodes into a single edge whose label carries the entire compressed byte sequence. Branching still happens at the first character where two keys diverge; it just doesn't allocate a separate node for every character in between.
+A **[Patricia Trie](https://dl.acm.org/doi/abs/10.1145/321479.321481)** (also called a *Radix Tree*) eliminates this by collapsing chains of single-child nodes into a single edge whose label carries the entire compressed byte sequence. Branching still happens at the first character where two keys diverge; it just doesn't allocate a separate node for every character in between.
 
 **Standard Trie** — the `a → p` prefix creates a 2-node chain before the first branch:
 
@@ -216,6 +216,7 @@ Children are stored behind a `unique_ptr` so leaf nodes (94% of all nodes) carry
 `SmallVector<T, N>` stores up to N elements inline (no heap allocation), spilling to the heap above N. This serves design principle #3 (predictable latency): node splits on the write path are zero-allocation in the common case. Copy assignment uses the copy-and-move idiom: construct a temporary copy first (may throw), then move-assign from it (noexcept for our element types). This guarantees strong exception safety — if the copy throws, `*this` is untouched.
 
 ### 3.2. Transient Copy-on-Write (COW) Model
+The `transient()` / `persistent()` API pattern — a mutable builder that freezes into an immutable snapshot — was popularised by [Rich Hickey's Clojure transients](https://clojure.org/reference/transients) (Clojure 1.1, ~2009).
 *   A global `std::atomic<uint64_t>` generates unique edit tags for Transient sessions.
 *   During a transient mutation, if the traversed node's `edit_tag` matches the session's tag **and** the node's reference count is 1 (uniquely owned), the node is mutated **in-place**.
 *   If the tag differs (e.g., `0` or an older session) or the node is shared (refcount > 1), the node is **copied**, the copy is tagged with the current session ID, and the mutation applies to the copy.
@@ -645,3 +646,67 @@ ByteCask's stated operating envelope is all keys in physical RAM. However, the r
 Under this pattern, latency becomes bimodal (fast for warm keys, a page-fault away for cold ones) but the system remains correct and the average case is dominated by the warm path. Full-tree scans defeat this property by pulling the entire working set back into RAM and should be avoided or rate-limited.
 
 A manually managed buffer pool could replicate this behaviour, but Linux's VM is a decades-hardened implementation with adaptive LRU (active/inactive list split), readahead heuristics, NUMA awareness, and transparent huge pages. A userspace buffer pool would need to reimplement all of that to reach parity — and would almost certainly lose. Delegating to the OS is therefore not just simpler (principle #2) but likely better in practice.
+
+---
+
+## Appendix A: PersistentOrderedMap (retired predecessor)
+
+`PersistentOrderedMap<K, V>` was the key-directory implementation that `PersistentRadixTree` replaced. The benchmark tables in §8 use **OrderedMap** as the persistent-data-structure comparison point; this appendix explains what that container was.
+
+### What it is
+
+A persistent, sorted associative container backed by [`immer::flex_vector<Entry>`](https://github.com/arximboldi/immer) — a Radix Balanced Tree (RBT) of 32-element chunks. Every mutating operation returns a new version that shares unmodified RBT chunks with the original. Iteration order is ascending by `K::operator<`.
+
+```
+Module:  bytecask.persistent_ordered_map
+Key:     K  (std::totally_ordered + std::copyable)
+Value:   V  (std::copyable)
+Storage: immer::flex_vector<Entry>   — sorted, persistent RBT
+```
+
+### Core API
+
+| Method | Description | Complexity |
+|---|---|---|
+| `get(key)` | Returns `std::optional<V>` | O(log n) |
+| `contains(key)` | Predicate | O(log n) |
+| `lower_bound(key)` | Iterator to first entry ≥ key | O(log n) |
+| `set(key, val)` | Insert or overwrite; returns new version | O(log n) |
+| `erase(key)` | Remove; returns new version | O(log n) |
+| `transient()` | Spawns a mutable `OrderedMapTransient<K,V>` builder | O(1) |
+
+### Transient builder (`OrderedMapTransient<K, V>`)
+
+The transient builder wraps `immer::flex_vector_transient` and mutates RBT nodes in place until `persistent()` is called (freezes the tree in O(1)).
+
+| Operation | Path | Complexity |
+|---|---|---|
+| `set` — overwrite existing key | mutates node in place | O(1) amortised |
+| `set` — append at tail (sorted bulk load) | `push_back` only | **O(1) amortised** |
+| `set` — insert in the middle | freeze → split → push → rejoin | O(log n) |
+| `erase` | freeze → erase at index → refreeze | O(log n) |
+| `persistent()` | freeze transient RBT | O(1) |
+
+The O(1) tail-append path made pre-sorted bulk loading substantially faster than chained persistent `set()` calls, but it required the caller to insert keys in ascending order to exploit it.
+
+### Why it was replaced
+
+`PersistentOrderedMap` stores the **full key** in every `Entry`. It has no notion of shared prefixes: two keys `"user::018f6e2c-aaa"` and `"user::018f6e2c-bbb"` each carry the entire 25+ byte string. Memory scales linearly with key length × N.
+
+`PersistentRadixTree` compresses shared prefixes into internal nodes. For the prefixed-UUIDv7 workload this reduces per-key memory from ~117 B (std::map baseline) to ~92 B (−21%). It also delivers ~6× faster point lookups and ~10× faster transient bulk insert at 100k keys, with the only cost being ~2.8× slower full iteration (DFS key materialisation overhead).
+
+The `immer::flex_vector` chunk-sharing model also made accurate memory accounting difficult: the allocation tracker reported only *net* bytes for the final snapshot, undercounting the steady-state cost of a live map (see §7.6). `PersistentRadixTree` uses a straightforward `new`-per-node model that the allocation tracker counts accurately.
+
+---
+
+## Appendix B: References and Prior Art
+
+Listed as a matter of good faith — this design builds on established ideas from the literature and from prior open-source work. If you know of a missing reference, please open a PR.
+
+| Concept | Source | Link |
+|---|---|---|
+| Patricia Trie | Morrison, *J. ACM* 15(4), 1968 | https://dl.acm.org/doi/abs/10.1145/321479.321481 |
+| Persistent data structures (path copying) | Driscoll, Sarnak, Sleator & Tarjan, *JCSS* 38(1), 1989 | https://doi.org/10.1016/0022-0000(89)90034-2 |
+| Persistent data structures (accessible introduction) | Okasaki, *Purely Functional Data Structures*, Cambridge University Press, 1998 | [book](https://www.cambridge.org/9780521663502) · [OCaml source](https://github.com/mmottl/pure-fun) |
+| Transient/persistent duality | Rich Hickey, Clojure (transients added in Clojure 1.1, ~2009) | https://clojure.org/reference/transients |
+| Persistent C++ containers (benchmark baseline) | immer — Juan Pedro Bolívar Puente (arximboldi) | https://github.com/arximboldi/immer |
