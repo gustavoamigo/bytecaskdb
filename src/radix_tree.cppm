@@ -5,6 +5,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <new>
 #include <optional>
@@ -581,14 +582,25 @@ public:
 
   // Iteration
   [[nodiscard]] auto begin() const -> RadixTreeIterator<V>;
-  [[nodiscard]] auto end() const -> std::default_sentinel_t {
-    return std::default_sentinel;
+  [[nodiscard]] auto end() const noexcept -> std::default_sentinel_t {
+    return {};
   }
+
+  [[nodiscard]] auto rbegin() const
+      -> std::reverse_iterator<RadixTreeIterator<V>>;
+  [[nodiscard]] auto rend() const
+      -> std::reverse_iterator<RadixTreeIterator<V>>;
 
   [[nodiscard]] auto lower_bound(std::span<const std::byte> key) const
       -> RadixTreeIterator<V>;
+  [[nodiscard]] auto upper_bound(std::span<const std::byte> key) const
+      -> RadixTreeIterator<V>;
 
 private:
+  // Iterator-returning end for rbegin()/rend()/upper_bound() — avoids
+  // exposing it as end() because the default_sentinel_t overload is
+  // cheaper in tight forward-iteration loops (no temporary iterator).
+  [[nodiscard]] auto end_iter() const -> RadixTreeIterator<V>;
   IntrusivePtr<Node<V>> root_;
   std::size_t size_{0};
 
@@ -1297,8 +1309,8 @@ auto PersistentRadixTree<V>::transient() const -> TransientRadixTree<V> {
 // ---------------------------------------------------------------------------
 export template <typename V> class RadixTreeIterator {
 public:
-  using iterator_category = std::input_iterator_tag;
-  using iterator_concept = std::input_iterator_tag;
+  using iterator_category = std::bidirectional_iterator_tag;
+  using iterator_concept = std::bidirectional_iterator_tag;
   using value_type = std::pair<std::span<const std::byte>, V>;
   using difference_type = std::ptrdiff_t;
 
@@ -1317,6 +1329,17 @@ public:
   auto operator++(int) -> RadixTreeIterator {
     auto tmp = *this;
     advance();
+    return tmp;
+  }
+
+  auto operator--() -> RadixTreeIterator & {
+    retreat();
+    return *this;
+  }
+
+  auto operator--(int) -> RadixTreeIterator {
+    auto tmp = *this;
+    retreat();
     return tmp;
   }
 
@@ -1341,14 +1364,16 @@ private:
     std::size_t key_len;   // Length of current_key_ when this frame was pushed.
   };
 
+  IntrusivePtr<Node<V>> root_;
   std::vector<Frame> stack_;
   std::vector<std::byte> current_key_;
 
   // Construct an iterator starting at begin (visit the whole tree).
-  explicit RadixTreeIterator(IntrusivePtr<Node<V>> root) {
-    if (!root)
+  explicit RadixTreeIterator(IntrusivePtr<Node<V>> root)
+      : root_{std::move(root)} {
+    if (!root_)
       return;
-    push_node(root, 0);
+    push_node(root_, 0);
     if (!stack_.empty() && !stack_.back().node->has_value()) {
       advance();
     }
@@ -1356,18 +1381,23 @@ private:
 
   // Construct a lower_bound iterator.
   RadixTreeIterator(IntrusivePtr<Node<V>> root,
-                    std::span<const std::byte> target) {
+                    std::span<const std::byte> target)
+      : root_{std::move(root)} {
     stack_.reserve(16);
     current_key_.reserve(128);
-    if (!root)
+    if (!root_)
       return;
-    auto at_target = seek(root, target);
+    auto at_target = seek(root_, target);
     if (stack_.empty())
       return;
     if (at_target && stack_.back().node->has_value())
       return;
     advance();
   }
+
+  // Construct an end iterator (empty stack, root stored for --end()).
+  RadixTreeIterator(IntrusivePtr<Node<V>> root, std::default_sentinel_t)
+      : root_{std::move(root)} {}
 
   void push_node(const IntrusivePtr<Node<V>> &node,
                  std::size_t key_len_before) {
@@ -1397,6 +1427,74 @@ private:
         stack_.pop_back();
       }
     }
+  }
+
+  // From the current stack top, follow the rightmost child at each level
+  // until reaching a node with no children. Sets child_idx = child_count()
+  // on each intermediate frame (all children "visited" for backtracking).
+  void descend_rightmost() {
+    while (stack_.back().node->has_children()) {
+      auto &frame = stack_.back();
+      auto last = frame.node->child_count() - 1;
+      frame.child_idx = frame.node->child_count();
+      auto &[transition, child] = frame.node->child_at(last);
+      auto key_before = current_key_.size();
+      current_key_.push_back(transition);
+      push_node(child, key_before);
+    }
+  }
+
+  // Move to the previous value-bearing node (reverse DFS preorder).
+  void retreat() {
+    if (stack_.empty()) {
+      // --end(): descend to the rightmost (largest) key in the tree.
+      if (!root_)
+        return;
+      push_node(root_, 0);
+      stack_.back().child_idx = stack_.back().node->child_count();
+      descend_rightmost();
+      // Leaf nodes always have values (path compression invariant).
+      return;
+    }
+
+    // The current position is at a value-bearing node. We need to find the
+    // previous one in DFS preorder. In preorder: parent is visited before
+    // children. So the previous node is either:
+    //   (a) the rightmost leaf of the previous sibling's subtree, or
+    //   (b) the parent itself (if it has a value and we are its first child).
+
+    // Pop current node.
+    current_key_.resize(stack_.back().key_len);
+    stack_.pop_back();
+
+    while (!stack_.empty()) {
+      auto &frame = stack_.back();
+      // frame.child_idx is the index of the *next* child to visit forward.
+      // The child we just came from was child_idx - 1. The previous sibling
+      // is child_idx - 2.
+      if (frame.child_idx >= 2) {
+        // There is a previous sibling. Undo the transition byte of the child
+        // we popped (current_key_ already trimmed to frame's key_len + prefix).
+        --frame.child_idx;
+        auto prev_idx = frame.child_idx - 1;
+        auto &[transition, child] = frame.node->child_at(prev_idx);
+        auto key_before = current_key_.size();
+        current_key_.push_back(transition);
+        push_node(child, key_before);
+        stack_.back().child_idx = stack_.back().node->child_count();
+        descend_rightmost();
+        return;
+      }
+      // child_idx <= 1: no previous sibling. Check if the parent node
+      // itself has a value.
+      frame.child_idx = 0;
+      if (frame.node->has_value())
+        return;
+      // Parent is a routing node — continue upward.
+      current_key_.resize(frame.key_len);
+      stack_.pop_back();
+    }
+    // Retreated past begin() — iterator becomes end (empty stack).
   }
 
   // Navigate the trie to find the first position whose key >= target.
@@ -1493,11 +1591,45 @@ auto PersistentRadixTree<V>::begin() const -> RadixTreeIterator<V> {
   return RadixTreeIterator<V>{root_};
 }
 
+// Out-of-line: PersistentRadixTree::end_iter()
+template <typename V>
+auto PersistentRadixTree<V>::end_iter() const -> RadixTreeIterator<V> {
+  return RadixTreeIterator<V>{root_, std::default_sentinel};
+}
+
+// Out-of-line: PersistentRadixTree::rbegin()
+template <typename V>
+auto PersistentRadixTree<V>::rbegin() const
+    -> std::reverse_iterator<RadixTreeIterator<V>> {
+  return std::make_reverse_iterator(end_iter());
+}
+
+// Out-of-line: PersistentRadixTree::rend()
+template <typename V>
+auto PersistentRadixTree<V>::rend() const
+    -> std::reverse_iterator<RadixTreeIterator<V>> {
+  return std::make_reverse_iterator(begin());
+}
+
 // Out-of-line: PersistentRadixTree::lower_bound()
 template <typename V>
 auto PersistentRadixTree<V>::lower_bound(std::span<const std::byte> key) const
     -> RadixTreeIterator<V> {
   return RadixTreeIterator<V>{root_, key};
+}
+
+// Out-of-line: PersistentRadixTree::upper_bound()
+template <typename V>
+auto PersistentRadixTree<V>::upper_bound(std::span<const std::byte> key) const
+    -> RadixTreeIterator<V> {
+  auto it = lower_bound(key);
+  if (it != std::default_sentinel) {
+    auto [k, v] = *it;
+    if (k.size() == key.size() &&
+        std::equal(k.begin(), k.end(), key.begin()))
+      ++it;
+  }
+  return it;
 }
 
 } // namespace bytecask

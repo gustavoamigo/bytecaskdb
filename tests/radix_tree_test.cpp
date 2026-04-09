@@ -421,6 +421,21 @@ TEST_CASE("RadixTree model-based property test", "[radix_tree]") {
         ++it;
       }
       REQUIRE(it == tree_p.end());
+
+      // Verify reverse iteration matches forward in reverse.
+      std::vector<std::string> fwd_keys;
+      for (auto fit = tree_p.begin(); fit != tree_p.end(); ++fit) {
+        auto [fk, fv] = *fit;
+        fwd_keys.push_back(to_string(fk));
+      }
+      std::vector<std::string> rev_keys;
+      for (auto rit = tree_p.rbegin(); rit != tree_p.rend(); ++rit) {
+        auto [rk, rv] = *rit;
+        rev_keys.push_back(to_string(rk));
+      }
+      auto expected_rev = fwd_keys;
+      std::reverse(expected_rev.begin(), expected_rev.end());
+      REQUIRE(rev_keys == expected_rev);
     }
 
     if (round % 100 == 0) {
@@ -1240,4 +1255,141 @@ TEST_CASE("RadixTree merge model-based", "[radix_tree][merge]") {
     CHECK(tree_a.size() == map_a.size());
     CHECK(tree_b.size() == map_b.size());
   }
+}
+
+// ---------------------------------------------------------------------------
+// Reverse iteration: rbegin/rend
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree reverse iteration", "[radix_tree]") {
+  auto t = Tree{};
+  for (auto &k : {"apple", "banana", "cherry", "date", "elderberry"}) {
+    t = t.set(to_bytes(k), 0);
+  }
+
+  // Collect forward keys.
+  std::vector<std::string> forward;
+  for (auto it = t.begin(); it != t.end(); ++it) {
+    auto [k, v] = *it;
+    forward.push_back(to_string(k));
+  }
+
+  // Collect reverse keys.
+  std::vector<std::string> reverse;
+  for (auto it = t.rbegin(); it != t.rend(); ++it) {
+    auto [k, v] = *it;
+    reverse.push_back(to_string(k));
+  }
+
+  auto expected = forward;
+  std::reverse(expected.begin(), expected.end());
+  CHECK(reverse == expected);
+}
+
+TEST_CASE("RadixTree reverse iteration empty tree", "[radix_tree]") {
+  const Tree t;
+  CHECK(t.rbegin() == t.rend());
+}
+
+TEST_CASE("RadixTree reverse iteration single element", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("only"), 42);
+  auto it = t.rbegin();
+  REQUIRE(it != t.rend());
+  auto [k, v] = *it;
+  CHECK(to_string(k) == "only");
+  CHECK(v == 42);
+  ++it;
+  CHECK(it == t.rend());
+}
+
+TEST_CASE("RadixTree --end() gives last element via rbegin", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("a"), 1)
+                  .set(to_bytes("b"), 2)
+                  .set(to_bytes("z"), 26);
+  auto it = t.rbegin();
+  REQUIRE(it != t.rend());
+  auto [k, v] = *it;
+  CHECK(to_string(k) == "z");
+  CHECK(v == 26);
+}
+
+TEST_CASE("RadixTree bidirectional round-trip", "[radix_tree]") {
+  auto t = Tree{};
+  for (auto &k : {"alpha", "beta", "gamma", "delta", "epsilon"}) {
+    t = t.set(to_bytes(k), 0);
+  }
+
+  // Forward then backward should reproduce the same keys.
+  auto it = t.begin();
+  std::vector<std::string> forward;
+  while (it != t.end()) {
+    auto [k, v] = *it;
+    forward.push_back(to_string(k));
+    ++it;
+  }
+
+  // Now go backward from end.
+  std::vector<std::string> backward;
+  while (it != t.begin()) {
+    --it;
+    auto [k, v] = *it;
+    backward.push_back(to_string(k));
+  }
+
+  auto expected = forward;
+  std::reverse(expected.begin(), expected.end());
+  CHECK(backward == expected);
+}
+
+// ---------------------------------------------------------------------------
+// upper_bound
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree upper_bound existing key", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("a"), 1)
+                  .set(to_bytes("b"), 2)
+                  .set(to_bytes("c"), 3);
+  auto it = t.upper_bound(to_bytes("b"));
+  REQUIRE(it != t.end());
+  auto [k, v] = *it;
+  CHECK(to_string(k) == "c");
+}
+
+TEST_CASE("RadixTree upper_bound absent key", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("apple"), 1)
+                  .set(to_bytes("cherry"), 3);
+  auto it = t.upper_bound(to_bytes("banana"));
+  REQUIRE(it != t.end());
+  auto [k, v] = *it;
+  CHECK(to_string(k) == "cherry");
+}
+
+TEST_CASE("RadixTree upper_bound past largest", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("a"), 1).set(to_bytes("b"), 2);
+  CHECK(t.upper_bound(to_bytes("b")) == t.end());
+  CHECK(t.upper_bound(to_bytes("z")) == t.end());
+}
+
+TEST_CASE("RadixTree reverse from upper_bound", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("a"), 1)
+                  .set(to_bytes("b"), 2)
+                  .set(to_bytes("c"), 3)
+                  .set(to_bytes("d"), 4);
+  // --upper_bound("c") should give the last key <= "c", which is "c".
+  auto it = t.upper_bound(to_bytes("c"));
+  REQUIRE(it != t.begin());
+  --it;
+  auto [k, v] = *it;
+  CHECK(to_string(k) == "c");
+  CHECK(v == 3);
+
+  // --upper_bound("bb") should give "b".
+  auto it2 = t.upper_bound(to_bytes("bb"));
+  REQUIRE(it2 != t.begin());
+  --it2;
+  auto [k2, v2] = *it2;
+  CHECK(to_string(k2) == "b");
+}
+
+TEST_CASE("RadixTree upper_bound empty tree", "[radix_tree]") {
+  const Tree t;
+  CHECK(t.upper_bound(to_bytes("anything")) == t.end());
 }

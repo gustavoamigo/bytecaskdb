@@ -148,6 +148,19 @@ struct RTreeAdapter {
     return sum;
   }
 
+  static auto iterate_reverse_sum(const map_type &m) -> int {
+    int sum = 0;
+    for (auto it = m.rbegin(); it != m.rend(); ++it) {
+      auto [k, v] = *it;
+      sum += v;
+    }
+    return sum;
+  }
+
+  static auto upper_bound(const map_type &m, const key_type &k) {
+    return m.upper_bound(to_bytes(k));
+  }
+
   static auto build_transient(const std::vector<key_type> &keys)
       -> transient_type {
     auto tr = map_type{}.transient();
@@ -199,6 +212,17 @@ struct StdMapAdapter {
     for (auto &[k, v] : m)
       sum += v;
     return sum;
+  }
+
+  static auto iterate_reverse_sum(const map_type &m) -> int {
+    int sum = 0;
+    for (auto it = m.rbegin(); it != m.rend(); ++it)
+      sum += it->second;
+    return sum;
+  }
+
+  static auto upper_bound(const map_type &m, const key_type &k) {
+    return m.upper_bound(k);
   }
 };
 
@@ -277,6 +301,25 @@ template <typename A> void BM_LowerBound(benchmark::State &state) {
   std::size_t idx = 0;
   for (auto _ : state) {
     benchmark::DoNotOptimize(A::lower_bound(m, keys[idx % keys.size()]));
+    ++idx;
+  }
+}
+
+template <typename A> void BM_ReverseIterate(benchmark::State &state) {
+  auto keys =
+      A::make_keys(generate_keys(static_cast<std::size_t>(state.range(0))));
+  auto m = A::build(keys);
+  for (auto _ : state)
+    benchmark::DoNotOptimize(A::iterate_reverse_sum(m));
+}
+
+template <typename A> void BM_UpperBound(benchmark::State &state) {
+  auto keys =
+      A::make_keys(generate_keys(static_cast<std::size_t>(state.range(0))));
+  auto m = A::build(keys);
+  std::size_t idx = 0;
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(A::upper_bound(m, keys[idx % keys.size()]));
     ++idx;
   }
 }
@@ -456,6 +499,14 @@ BENCHMARK(BM_Iterate<StdMapAdapter>)      ->Name("StdMap/Iterate")           ITE
 // lower_bound
 BENCHMARK(BM_LowerBound<RTreeAdapter>)    ->Name("RadixTree/LowerBound")     SIZES;
 BENCHMARK(BM_LowerBound<StdMapAdapter>)   ->Name("StdMap/LowerBound")        SIZES;
+
+// upper_bound
+BENCHMARK(BM_UpperBound<RTreeAdapter>)    ->Name("RadixTree/UpperBound")     SIZES;
+BENCHMARK(BM_UpperBound<StdMapAdapter>)   ->Name("StdMap/UpperBound")        SIZES;
+
+// Reverse iteration
+BENCHMARK(BM_ReverseIterate<RTreeAdapter>)->Name("RadixTree/ReverseIterate") ITER_SIZES;
+BENCHMARK(BM_ReverseIterate<StdMapAdapter>)->Name("StdMap/ReverseIterate")   ITER_SIZES;
 
 // Memory footprint with prefix-heavy keys (user::uuid, order::uuid, …)
 BENCHMARK(BM_PrefixedMemory<RTreeAdapter>)   ->Name("RadixTree/PrefixedMemory")  SIZES;
