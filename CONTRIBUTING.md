@@ -1,6 +1,6 @@
-# Contributing to ByteCask
+# Contributing to ByteCaskDB
 
-Thanks for your interest. ByteCask is in early development, so contributions at every level are welcome — from fixing a typo to implementing a new feature.
+Thanks for your interest. ByteCaskDB is in early development, so contributions at every level are welcome — from fixing a typo to implementing a new feature.
 
 ## Getting started
 

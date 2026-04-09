@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ByteCask vs RocksDB Benchmark Showcase
+"""ByteCaskDB vs RocksDB Benchmark Showcase
 
 Runs engine_bench across multiple dataset sizes and writes a self-contained
 Markdown performance report to the repo root.
@@ -218,8 +218,8 @@ def find_mt(means: dict[str, dict], prefix: str) -> dict[int, dict]:
 
     Only matches names where threads:N follows the prefix directly (with at
     most a 'real_time/' segment in between). This prevents a prefix like
-    'ByteCask/ReadAndWriteLoad/Sync' from accidentally matching the longer
-    'ByteCask/ReadAndWriteLoad/Sync/BoundedStaleness/...' names.
+    'ByteCaskDB/ReadAndWriteLoad/Sync' from accidentally matching the longer
+    'ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness/...' names.
     """
     result: dict[int, dict] = {}
     for name, bench in means.items():
@@ -306,12 +306,12 @@ CRC_NOTE = (
 )
 
 ST_ROWS: list[tuple[str, str, str, str]] = [
-    ("Put (NoSync)",    "ByteCask/Put/NoSync",      "RocksDB/Put/NoSync",      "ops"),
-    ("Put (Sync)",      "ByteCask/Put/Sync",        "RocksDB/Put/Sync",        "ops"),
-    ("Get",             "ByteCask/Get",             "RocksDB/Get",             "ops"),
-    ("Del (Sync)",      "ByteCask/Del/Sync",        "RocksDB/Del/Sync",        "ops"),
-    ("Range-50",        "ByteCask/Range50",         "RocksDB/Range50",         "scans"),
-    ("MixedBatch/Sync", "ByteCask/MixedBatch/Sync", "RocksDB/MixedBatch/Sync", "ops"),
+    ("Put (NoSync)",    "ByteCaskDB/Put/NoSync",      "RocksDB/Put/NoSync",      "ops"),
+    ("Put (Sync)",      "ByteCaskDB/Put/Sync",        "RocksDB/Put/Sync",        "ops"),
+    ("Get",             "ByteCaskDB/Get",             "RocksDB/Get",             "ops"),
+    ("Del (Sync)",      "ByteCaskDB/Del/Sync",        "RocksDB/Del/Sync",        "ops"),
+    ("Range-50",        "ByteCaskDB/Range50",         "RocksDB/Range50",         "scans"),
+    ("MixedBatch/Sync", "ByteCaskDB/MixedBatch/Sync", "RocksDB/MixedBatch/Sync", "ops"),
 ]
 
 
@@ -326,7 +326,7 @@ def section_regular(size: int, data: dict) -> str:
     L.append("### Single-Threaded Throughput\n")
     L.append(CRC_NOTE)
     L.append("")
-    L.append("| Benchmark | ByteCask | RocksDB | ByteCask / RocksDB |")
+    L.append("| Benchmark | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |")
     L.append("|---|---:|---:|:---:|")
 
     for row_label, bc_k, rdb_k, kind in ST_ROWS:
@@ -360,11 +360,11 @@ def section_regular(size: int, data: dict) -> str:
     L.append("")
 
     # ── Get latency ────────────────────────────────────────────────────────
-    bc_get  = find_any(means, "ByteCask/Get")
+    bc_get  = find_any(means, "ByteCaskDB/Get")
     rdb_get = find_any(means, "RocksDB/Get")
     if bc_get is not None or rdb_get is not None:
         L.append("### Get Latency _(CRC disabled)_\n")
-        L.append("| Percentile | ByteCask | RocksDB |")
+        L.append("| Percentile | ByteCaskDB | RocksDB |")
         L.append("|---|---:|---:|")
         for p, key in [("p50", "lat_p50_ns"), ("p99", "lat_p99_ns")]:
             L.append(
@@ -374,11 +374,11 @@ def section_regular(size: int, data: dict) -> str:
         L.append("")
 
     # ── Concurrent reads (GetMT) ───────────────────────────────────────────
-    bc_mt  = find_mt(means, "ByteCask/GetMT")
+    bc_mt  = find_mt(means, "ByteCaskDB/GetMT")
     rdb_mt = find_mt(means, "RocksDB/GetMT")
     if bc_mt or rdb_mt:
         L.append("### Concurrent Reads — GetMT _(CRC disabled)_\n")
-        L.append("| Threads | ByteCask | RocksDB | ByteCask / RocksDB |")
+        L.append("| Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |")
         L.append("|---:|---:|---:|:---:|")
         for t in sorted(set(list(bc_mt) + list(rdb_mt))):
             bc_v  = _val(bc_mt.get(t),  "ops_per_us")
@@ -392,11 +392,11 @@ def section_regular(size: int, data: dict) -> str:
         L.append("")
 
     # ── Concurrent writes (PutMT) ──────────────────────────────────────────
-    bc_put_mt  = find_mt(means, "ByteCask/PutMT/Sync")
+    bc_put_mt  = find_mt(means, "ByteCaskDB/PutMT/Sync")
     rdb_put_mt = find_mt(means, "RocksDB/PutMT/Sync")
     if bc_put_mt or rdb_put_mt:
         L.append("### Concurrent Writes — PutMT/Sync\n")
-        L.append("| Threads | ByteCask | RocksDB | ByteCask / RocksDB |")
+        L.append("| Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |")
         L.append("|---:|---:|---:|:---:|")
         for t in sorted(set(list(bc_put_mt) + list(rdb_put_mt))):
             bc_v  = _val(bc_put_mt.get(t),  "ops_per_us")
@@ -410,22 +410,22 @@ def section_regular(size: int, data: dict) -> str:
         L.append("")
 
     # ── Read-while-writing ─────────────────────────────────────────────────
-    bc_rww    = find_mt(means, "ByteCask/ReadAndWriteLoad/Sync")
+    bc_rww    = find_mt(means, "ByteCaskDB/ReadAndWriteLoad/Sync")
     rdb_rww   = find_mt(means, "RocksDB/ReadAndWriteLoad/Sync")
-    bc_rww_bs = find_mt(means, "ByteCask/ReadAndWriteLoad/Sync/BoundedStaleness")
+    bc_rww_bs = find_mt(means, "ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")
     if bc_rww or rdb_rww:
         L.append(
             "### Read-While-Writing — 1 writer + N readers, Sync _(CRC disabled)_\n"
         )
         L.append(
-            "> **BoundedStaleness** is a ByteCask read mode where readers observe "
+            "> **BoundedStaleness** is a ByteCaskDB read mode where readers observe "
             "the keydir snapshot from the previous completed write batch instead of "
             "acquiring a per-read epoch lock. This eliminates reader-writer "
             "contention at high thread counts at the cost of seeing writes that are "
             "at most one batch behind.\n"
         )
         L.append(
-            "| Readers | ByteCask | ByteCask BoundedStaleness | RocksDB |"
+            "| Readers | ByteCaskDB | ByteCaskDB BoundedStaleness | RocksDB |"
         )
         L.append("|---:|---:|---:|---:|")
         for t in sorted(set(list(bc_rww) + list(rdb_rww))):
@@ -449,7 +449,7 @@ def section_scalability_table(regular: dict[int, dict]) -> str:
     labels  = [size_label(s) for s in sizes]
     means_s = [extract_means(regular[s]) for s in sizes]
 
-    bc_mt_s  = [find_mt(m, "ByteCask/GetMT") for m in means_s]
+    bc_mt_s  = [find_mt(m, "ByteCaskDB/GetMT") for m in means_s]
     rdb_mt_s = [find_mt(m, "RocksDB/GetMT")  for m in means_s]
     threads  = sorted({t for bc_m in bc_mt_s for t in bc_m} |
                       {t for rdb_m in rdb_mt_s for t in rdb_m})
@@ -458,12 +458,12 @@ def section_scalability_table(regular: dict[int, dict]) -> str:
     L.append("## GetMT Scalability — Throughput and Latency vs Dataset Size\n")
     L.append(
         "> Throughput (Mops/s) and p99 read latency at each thread count as the "
-        "dataset grows. ByteCask's in-memory keydir keeps read latency flat; "
+        "dataset grows. ByteCaskDB's in-memory keydir keeps read latency flat; "
         "RocksDB's block cache hit rate falls as the working set exceeds the cache.\n"
     )
 
     header = "| Threads | " + " | ".join(
-        f"BC {lbl} | RDB {lbl}" for lbl in labels
+        f"BCDB {lbl} | RDB {lbl}" for lbl in labels
     ) + " |"
     sep = "|---:| " + " | ".join("---: | ---:" for _ in labels) + " |"
 
@@ -520,9 +520,9 @@ def section_recovery(recovery: dict[int, dict]) -> str:
         for threads in [1, 2, 4, 8, 16]:
             bench = find_any(
                 means,
-                f"ByteCask/Recovery/threads:{threads}",
-                f"ByteCask/Recovery/{threads}",
-                f"ByteCask/Recovery/Parallel/{threads}",
+                f"ByteCaskDB/Recovery/threads:{threads}",
+                f"ByteCaskDB/Recovery/{threads}",
+                f"ByteCaskDB/Recovery/Parallel/{threads}",
             )
             L.append(f"| {threads} | {fmt_time(time_s(bench))} |")
         L.append("")
@@ -552,7 +552,7 @@ def render_report(
     L: list[str] = []
 
     # ── Title & meta ──────────────────────────────────────────────────────
-    L.append("# ByteCask Benchmark Showcase\n")
+    L.append("# ByteCaskDB Benchmark Showcase\n")
     L.append("| | |")
     L.append("|---|---|")
     L.append(f"| **Date** | {date_str} |")
@@ -603,7 +603,7 @@ def render_report(
 
     # ── Throughput sections ────────────────────────────────────────────────
     L.append("---\n")
-    L.append("# Throughput Comparison — ByteCask vs RocksDB\n")
+    L.append("# Throughput Comparison — ByteCaskDB vs RocksDB\n")
     for size in sorted(regular):
         L.append(section_regular(size, regular[size]))
         L.append("---")
@@ -681,7 +681,7 @@ def main() -> None:
     recovery_sizes = QUICK_RECOVERY_SIZES if quick else FULL_RECOVERY_SIZES
     mode = "Quick" if quick else "Full"
 
-    print(f"\n=== ByteCask Benchmark Showcase [{mode}] ===\n")
+    print(f"\n=== ByteCaskDB Benchmark Showcase [{mode}] ===\n")
     TMPDIR.mkdir(exist_ok=True)
 
     try:

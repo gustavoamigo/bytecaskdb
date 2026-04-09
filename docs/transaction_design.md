@@ -1,16 +1,16 @@
-# ByteCask Transaction Design
+# ByteCaskDB Transaction Design
 
 ## Purpose
 
-This document describes the design for adding first-class transaction support to ByteCask. It covers the three-layer architecture, the two new `DB` primitives that underpin it, the optional `Transaction` ergonomics layer, isolation models, conflict detection, resource management, and implementation strategy.
+This document describes the design for adding first-class transaction support to ByteCaskDB. It covers the three-layer architecture, the two new `DB` primitives that underpin it, the optional `Transaction` ergonomics layer, isolation models, conflict detection, resource management, and implementation strategy.
 
 Canonical location: `docs/transaction_design.md`.
 
 ---
 
-## Background: Where ByteCask stands today
+## Background: Where ByteCaskDB stands today
 
-ByteCask already provides atomic multi-operation writes via `apply_batch()`. A `Batch` groups an arbitrary number of `put` and `del` operations wrapped in `BulkBegin`/`BulkEnd` markers that are recovered atomically on restart.
+ByteCaskDB already provides atomic multi-operation writes via `apply_batch()`. A `Batch` groups an arbitrary number of `put` and `del` operations wrapped in `BulkBegin`/`BulkEnd` markers that are recovered atomically on restart.
 
 What `apply_batch()` does **not** provide:
 
@@ -101,7 +101,7 @@ for (auto& [k, v] : snap.iter_from()) { ... }
 
 **Why `Snapshot` as a first-class type, not `ReadOptions::snapshot`**:
 
-LevelDB threads snapshots through `ReadOptions` as a raw `const Snapshot*` with manual `ReleaseSnapshot()`. The snapshot is not the object you call — it is a parameter you carry, with manual lifetime. ByteCask's `Snapshot` inverts the model: reads are called directly on it, and lifetime is automatic (value semantics + RAII). It is also composable — `Transaction` is built on top of `Snapshot` rather than reimplementing state capture independently.
+LevelDB threads snapshots through `ReadOptions` as a raw `const Snapshot*` with manual `ReleaseSnapshot()`. The snapshot is not the object you call — it is a parameter you carry, with manual lifetime. ByteCaskDB's `Snapshot` inverts the model: reads are called directly on it, and lifetime is automatic (value semantics + RAII). It is also composable — `Transaction` is built on top of `Snapshot` rather than reimplementing state capture independently.
 
 ### `apply_batch_if(snap, opts, plan)` — compare-and-swap multi-key write
 
@@ -595,7 +595,7 @@ Extends Snapshot isolation by tracking the **read set** inside `Transaction::get
 
 ### ReadUncommitted / ReadCommitted
 
-Not meaningful in ByteCask's SWMR model. Writes are only visible after `state_.store()` completes — there are no uncommitted writes visible to other readers. Not worth implementing.
+Not meaningful in ByteCaskDB's SWMR model. Writes are only visible after `state_.store()` completes — there are no uncommitted writes visible to other readers. Not worth implementing.
 
 ---
 
@@ -624,7 +624,7 @@ while (true) {
 
 ## Comparison with RocksDB
 
-| Concept | RocksDB | ByteCask |
+| Concept | RocksDB | ByteCaskDB |
 |---|---|---|
 | CAS write | Not directly available; requires `TransactionDB` | `db.apply_batch_if(snap, opts, batch)` — on plain `DB` |
 | Snapshot | `db->GetSnapshot()` + manual `ReleaseSnapshot()` | `db.snapshot()` → `Snapshot` with RAII lifetime |
@@ -637,7 +637,7 @@ while (true) {
 | Conflict serialization | Separate lock manager or per-key locks | `write_mu_` inside `apply_batch_if()` — no extra infrastructure |
 | File retention | SST files are immutable + ref-counted | `Snapshot` holds `shared_ptr<EngineState>` → vacuum deferred automatically |
 
-The key structural difference: RocksDB's transaction support requires a mandatory `TransactionDB` wrapper that takes ownership of the underlying `DB`. ByteCask's Layer 1 primitives are available directly on `DB`, so any caller can use conflict-safe writes without adopting a wrapper type or changing how they manage the database object.
+The key structural difference: RocksDB's transaction support requires a mandatory `TransactionDB` wrapper that takes ownership of the underlying `DB`. ByteCaskDB's Layer 1 primitives are available directly on `DB`, so any caller can use conflict-safe writes without adopting a wrapper type or changing how they manage the database object.
 
 ---
 

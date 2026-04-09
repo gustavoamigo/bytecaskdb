@@ -1,10 +1,10 @@
-# ByteCask Design
+# ByteCaskDB Design
 
 ## Purpose
 
-ByteCask is a [Bitcask](https://riak.com/assets/bitcask-intro.pdf) implementation with a key architectural difference: it uses an immutable **persistent radix tree** for the Key Directory instead of a Hash Table. This design choice enables efficient **range queries** and **prefix searches** while maintaining Bitcask's core strengths of fast writes and simple recovery. The name "ByteCask" reflects this hybrid approach: **Bitcask algorithm** + **tree index** = **ByteCask**.
+ByteCaskDB is a [Bitcask](https://riak.com/assets/bitcask-intro.pdf) implementation with a key architectural difference: it uses an immutable **persistent radix tree** for the Key Directory instead of a Hash Table. This design choice enables efficient **range queries** and **prefix searches** while maintaining Bitcask's core strengths of fast writes and simple recovery. The name "ByteCaskDB" reflects this hybrid approach: **Bitcask algorithm** + **tree index** = **ByteCaskDB**.
 
-**Fundamental Trade-off**: ByteCask keeps **all keys in memory** at all times. This enables extremely fast lookups and range queries but limits database size to available RAM. Considering a memory requirement of approximately 100 bytes per unique key (key data + metadata + tree structure overhead), 10 million keys would require around 1 GB RAM.
+**Fundamental Trade-off**: ByteCaskDB keeps **all keys in memory** at all times. This enables extremely fast lookups and range queries but limits database size to available RAM. Considering a memory requirement of approximately 100 bytes per unique key (key data + metadata + tree structure overhead), 10 million keys would require around 1 GB RAM.
 
 This document is the living design reference for the repository. It should track the current implementation state, the intended architecture, and important constraints.
 
@@ -23,7 +23,7 @@ Canonical location: `docs/bytecask_design.md`.
 
 ## Non-Goals (for now)
 
-- Multi-writer access, MVCC, or full transaction isolation. ByteCask uses a SWMR model. Snapshot isolation via `snapshot()` and `apply_batch_if()` is available at Layer 1.
+- Multi-writer access, MVCC, or full transaction isolation. ByteCaskDB uses a SWMR model. Snapshot isolation via `snapshot()` and `apply_batch_if()` is available at Layer 1.
 - TTL or expiry.
 - Async I/O.
 - Background (auto) vacuum. Vacuum is called explicitly by the user.
@@ -41,7 +41,7 @@ The design follows these core tenets in order of priority:
 
 ### Key Directory
 
-ByteCask uses `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times.
+ByteCaskDB uses `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times.
 
 The key directory is a persistent (immutable) radix tree with path-compressed nodes, intrusive reference counting, and structural sharing across versions. It provides O(k) get/set/erase (where k = key length), ordered iteration via DFS, `lower_bound()` for range queries, and a `transient()` / `persistent()` API for batch mutations. Implemented in `bytecask.radix_tree` (`src/engine/radix_tree.cppm`).
 
@@ -55,7 +55,7 @@ Keys are stored as byte sequences within the radix tree's prefix-compressed node
 
 ### Concurrency Model
 
-ByteCask follows a **single-writer / multiple-reader (SWMR)** model:
+ByteCaskDB follows a **single-writer / multiple-reader (SWMR)** model:
 
 - Exactly one writer may operate at a time.
 - Multiple readers may operate concurrently.
@@ -63,7 +63,7 @@ ByteCask follows a **single-writer / multiple-reader (SWMR)** model:
 
 #### Concurrency strategy
 
-ByteCask's read path is designed so that **readers never acquire the write mutex**. The strategy combines two ideas:
+ByteCaskDB's read path is designed so that **readers never acquire the write mutex**. The strategy combines two ideas:
 
 1. **A single writer mutex** (`write_mu_`) that serialises mutations — readers are completely unaffected by it.
 2. **An immutable, copy-on-write snapshot** (`EngineState`) published via `std::atomic<std::shared_ptr<EngineState>>` — readers capture the current snapshot without blocking the writer.
@@ -198,7 +198,7 @@ Throughput scales near-linearly with thread count for read-heavy workloads.
 
 #### Read consistency (`ReadOptions`)
 
-`ReadOptions` controls consistency behaviour for read operations (`get`, `contains_key`). ByteCask provides two read consistency modes, controlled by a single field:
+`ReadOptions` controls consistency behaviour for read operations (`get`, `contains_key`). ByteCaskDB provides two read consistency modes, controlled by a single field:
 
 ```cpp
 struct ReadOptions {
@@ -213,7 +213,7 @@ The two modes follow the same naming conventions used by Azure Cosmos DB and dis
 | **Session** (default) | `0` | Always sees the put. Refreshes whenever `state_time_` changes — i.e. after any new write, including one just performed by this thread. | A nanosecond-scale window between the two writer stores (see below). | Single `MOV` + integer compare when cached |
 | **Bounded staleness** | `> 0` | **May not see the put.** If a previous write occurred within `staleness_tolerance`, the cached snapshot is returned — even for the thread that just called `put()`. | Up to `staleness_tolerance` after each write. | Single `MOV` + integer compare when cached |
 
-This is analogous to RocksDB's built-in `SuperVersion` thread-local caching, which always provides session consistency with no user-facing knob. ByteCask adds bounded staleness as an opt-in for write-heavy workloads where read throughput matters more than freshness.
+This is analogous to RocksDB's built-in `SuperVersion` thread-local caching, which always provides session consistency with no user-facing knob. ByteCaskDB adds bounded staleness as an opt-in for write-heavy workloads where read throughput matters more than freshness.
 
 ##### Session consistency (`staleness_tolerance = 0`, default)
 
@@ -275,7 +275,7 @@ With `staleness_tolerance > 0` the window is irrelevant: the snapshot is held fo
 
 The benefit is pronounced at high thread counts where session-mode readers contend for the internal spinlock inside `atomic<shared_ptr>` on every refresh.
 
-`engine_bench` compares ByteCask against LevelDB and RocksDB across Put, Get, Del, Range50, Mixed, MixedBatch, PutMT, and MixedMT benchmarks at both NoSync and Sync durability levels. RocksDB compression is disabled (`kNoCompression`) and values are 1 KiB of random (incompressible) bytes so neither LevelDB nor RocksDB gains an advantage from Snappy/block-cache effects.
+`engine_bench` compares ByteCaskDB against LevelDB and RocksDB across Put, Get, Del, Range50, Mixed, MixedBatch, PutMT, and MixedMT benchmarks at both NoSync and Sync durability levels. RocksDB compression is disabled (`kNoCompression`) and values are 1 KiB of random (incompressible) bytes so neither LevelDB nor RocksDB gains an advantage from Snappy/block-cache effects.
 
 `WriteOptions::try_lock` (default `false`) controls write-lock acquisition behaviour:
 
