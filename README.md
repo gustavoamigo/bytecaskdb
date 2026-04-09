@@ -23,7 +23,7 @@ for (auto& [key, value] : db.iter_from({}, to_bytes("user:"))) { ... }
 ## Features
 
 - **Sequential write path** — every `put`, `del`, and `apply_batch` performs a single sequential append; no WAL, no random writes, just one I/O operation per write.
-- **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration.
+- **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration. Bidirectional: iterate forward or backward with `rbegin()`/`rend()` and `upper_bound()`.
 - **Atomic writes** — every `put` and `del` is atomic. `apply_batch` makes multiple puts and deletes atomic as a group.
 - **Conflict-safe CAS writes** — `snapshot()` captures a point-in-time read-only view; `apply_batch_if(snap, opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. Precondition checks are cheap — all key lookups are in-memory radix tree traversals with no disk I/O. Single-key CAS with no marker overhead.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms and 100 M keys in under 6 s on a SATA SSD.
