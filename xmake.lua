@@ -1,7 +1,6 @@
 add_rules("mode.debug", "mode.release", "mode.releasedbg")
 
 add_requires("catch2 3.x")
-add_requires("jemalloc")
 add_requires("crc32c")
 add_requires("benchmark", {optional = true})
 add_requires("leveldb", {optional = true})
@@ -55,7 +54,7 @@ target("bytecask_tests")
     set_kind("binary")
     -- For VS Code / clangd support, run: scripts/gen_compile_commands.sh
     add_files("tests/*.cpp", "src/*.cppm", "src/bytecask.cpp")
-    add_packages("catch2", "crc32c", "jemalloc")
+    add_packages("catch2", "crc32c")
     add_defines("BYTECASK_TESTING")
     on_load(apply_sanitizer)
 
@@ -64,26 +63,29 @@ target("bytecask_bench")
     set_default(false)
     add_files("benchmarks/map_bench.cpp", "src/*.cppm", "src/bytecask.cpp")
     add_cxflags("-Wno-global-constructors")
-    add_packages("benchmark", "crc32c", "jemalloc")
-    -- map_bench.cpp defines operator new/delete for allocation tracking.
-    -- jemalloc's static archive (jemalloc_cpp.o) also defines them.
-    -- --allow-multiple-definition lets the linker keep the first definition
-    -- encountered (the .o file, which comes before the archive), so the
-    -- custom allocator tracker in map_bench.cpp wins as intended.
+    add_packages("benchmark", "crc32c")
     add_defines("BYTECASK_TESTING")
-    add_ldflags("-Wl,--allow-multiple-definition", {force = true})
     on_load(apply_sanitizer)
 
 target("engine_bench")
     set_kind("binary")
     set_default(false)
     add_files("benchmarks/engine_bench.cpp", "src/*.cppm", "src/bytecask.cpp")
-    add_cxflags(
-        "-Wno-global-constructors", "-Wno-sign-conversion", "-Wno-exit-time-destructors",
-        "-Wno-unused-const-variable", "-Wno-unneeded-internal-declaration",
-        "-Wno-unused-template", "-Wno-unused-member-function"
-    )
-    add_packages("benchmark", "crc32c", "jemalloc", "leveldb", "rocksdb")
+    add_cxflags("-Wno-global-constructors")
+    add_packages("benchmark", "crc32c", "leveldb", "rocksdb")
+    on_load(apply_sanitizer)
+
+-- Static library target for out-of-tree consumers (e.g. the MariaDB plugin).
+-- Compiles all C++23 module sources and exposes them via libbytecask.a.
+-- Note: C++23 module BMIs are not portable across translation units that
+-- import them without the matching toolchain; the MariaDB plugin instead
+-- uses the stable header-based C API in include/bytecask_c.h.
+target("bytecask")
+    set_kind("static")
+    set_default(false)
+    add_cxxflags("-fPIC", {force = true})  -- required when linking into a shared object (e.g. MariaDB plugin)
+    add_files("src/*.cppm", "src/bytecask.cpp", "src/bytecask_c.cpp")
+    add_packages("crc32c")
     on_load(apply_sanitizer)
 
 

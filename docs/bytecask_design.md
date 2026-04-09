@@ -28,6 +28,20 @@ Canonical location: `docs/bytecask_design.md`.
 - Async I/O.
 - Background (auto) vacuum. Vacuum is called explicitly by the user.
 
+## Integration: MariaDB Storage Engine
+
+ByteCaskDB is being integrated as a MariaDB pluggable storage engine (`ha_bytecask`). The plugin builds out-of-tree against MariaDB development headers and loads via `INSTALL PLUGIN`. The integration uses a MariaDB-internal L2 Transaction built directly on Layer 1 primitives (`snapshot()` + `apply_batch_if()`), separate from the public `Transaction` class in `transaction_design.md`. Full design: `docs/mariadb_engine_design.md`.
+
+### C API / Shared Library Boundary
+
+ByteCaskDB uses C++23 modules internally, which are not portable across compilation unit boundaries when linking external code. To cross this boundary (e.g. the MariaDB plugin), a stable `extern "C"` API is provided:
+
+- **`include/bytecask_c.h`**: flat C header with opaque `bytecask_db_t*` / `bytecask_iter_t*` handles. No C++ types, no module imports.
+- **`src/bytecask_c.cpp`**: implementation that imports `bytecask` (the C++23 module) and forwards calls through the C API. Compiled into `libbytecask.a`.
+- **`xmake.lua` `bytecask` target**: static library combining all engine module objects plus `bytecask_c.cpp`.
+
+Any out-of-tree consumer (not just the MariaDB plugin) should use this C API boundary rather than importing the C++23 modules directly.
+
 ## Design Principles
 
 The design follows these core tenets in order of priority:
@@ -1226,6 +1240,8 @@ When `batch.size() == 1`, both `apply_batch` and `apply_batch_if` skip the `Bulk
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be discarded with a logged warning. No partial-batch entries enter the key directory. |
 | D14 | **Single-entry batch optimization**: When `apply_batch` or `apply_batch_if` is called with exactly one operation, the `BulkBegin`/`BulkEnd` marker writes are skipped. A single data entry is self-describing and CRC-protected, so the markers add no recovery benefit for a batch of size 1. |
+| D15 | **C ABI / shared-library link constraint**: `libbytecask.a` is compiled with `-fPIC` so it can be linked into a shared object (e.g. `ha_bytecaskdb.so`). Without `-fPIC`, clang emits `R_X86_64_TPOFF32`/`R_X86_64_32S` relocations illegal in a DSO. xmake syntax: `add_cxxflags("-fPIC", {force = true})` on the `bytecask` static target. |
+| D16 | **MariaDB plugin header ordering**: Server-internal headers require `server/my_global.h` before `handler.h`. The client-side stub does not define `MY_GLOBAL_INCLUDED`/`uchar`/`unlikely()`. Fedora layout: base `/usr/include/mysql`, server `/usr/include/mysql/server`, private `/usr/include/mysql/server/private`. CMake include order must be `server/private` → `server` → base. `-DMYSQL_SERVER` is required. `handlerton::state` does not exist in this MariaDB ABI; use `PLUGIN_LICENSE_GPL` (no MIT constant). |
 
 ## Working agreement
 
