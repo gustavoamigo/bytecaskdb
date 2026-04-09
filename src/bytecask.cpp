@@ -465,6 +465,26 @@ auto Snapshot::keys_from(BytesView from) const
       KeyIterator{std::move(it)}, std::default_sentinel};
 }
 
+auto Snapshot::riter_from(BytesView from) const
+    -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator> {
+  auto begin_it = from.empty()
+      ? state_->key_dir.rbegin().base()
+      : state_->key_dir.upper_bound(from);
+  auto end_it = state_->key_dir.begin();
+  return {ReverseEntryIterator{EntryIterator{state_, std::move(begin_it), /*verify_checksums=*/true}},
+          ReverseEntryIterator{EntryIterator{state_, std::move(end_it), /*verify_checksums=*/true}}};
+}
+
+auto Snapshot::rkeys_from(BytesView from) const
+    -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator> {
+  auto begin_it = from.empty()
+      ? state_->key_dir.rbegin().base()
+      : state_->key_dir.upper_bound(from);
+  auto end_it = state_->key_dir.begin();
+  return {ReverseKeyIterator{KeyIterator{std::move(begin_it)}},
+          ReverseKeyIterator{KeyIterator{std::move(end_it)}}};
+}
+
 #pragma endregion
 
 #pragma region Range iteration
@@ -491,6 +511,28 @@ auto DB::keys_from(const ReadOptions & /*opts*/, BytesView from) const
   auto it = from.empty() ? s->key_dir.begin() : s->key_dir.lower_bound(from);
   return std::ranges::subrange<KeyIterator, std::default_sentinel_t>{
       KeyIterator{std::move(it)}, std::default_sentinel};
+}
+
+auto DB::riter_from(const ReadOptions &opts, BytesView from) const
+    -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator> {
+  auto s = state_.load();
+  auto begin_it = from.empty()
+      ? s->key_dir.rbegin().base()
+      : s->key_dir.upper_bound(from);
+  auto end_it = s->key_dir.begin();
+  return {ReverseEntryIterator{EntryIterator{s, std::move(begin_it), opts.verify_checksums}},
+          ReverseEntryIterator{EntryIterator{s, std::move(end_it), opts.verify_checksums}}};
+}
+
+auto DB::rkeys_from(const ReadOptions & /*opts*/, BytesView from) const
+    -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator> {
+  auto s = state_.load();
+  auto begin_it = from.empty()
+      ? s->key_dir.rbegin().base()
+      : s->key_dir.upper_bound(from);
+  auto end_it = s->key_dir.begin();
+  return {ReverseKeyIterator{KeyIterator{std::move(begin_it)}},
+          ReverseKeyIterator{KeyIterator{std::move(end_it)}}};
 }
 
 #pragma endregion

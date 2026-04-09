@@ -23,7 +23,7 @@ for (auto& [key, value] : db.iter_from({}, to_bytes("user:"))) { ... }
 ## Features
 
 - **Sequential write path** — every `put`, `del`, and `apply_batch` performs a single sequential append; no WAL, no random writes, just one I/O operation per write.
-- **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration. Bidirectional: iterate forward or backward with `rbegin()`/`rend()` and `upper_bound()`.
+- **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
 - **Atomic writes** — every `put` and `del` is atomic. `apply_batch` makes multiple puts and deletes atomic as a group.
 - **Conflict-safe CAS writes** — `snapshot()` captures a point-in-time read-only view; `apply_batch_if(snap, opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. Precondition checks are cheap — all key lookups are in-memory radix tree traversals with no disk I/O. Single-key CAS with no marker overhead.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms and 100 M keys in under 6 s on a SATA SSD.
@@ -156,6 +156,12 @@ for (auto& [key, value] : db.iter_from({}, to_bytes("user:"))) {
 
 // Keys-only prefix scan — pure in-memory, no disk I/O.
 for (auto& key : db.keys_from({}, to_bytes("user:"))) { ... }
+
+// Reverse scan — descending key order. Starts at last key <= "user:~".
+for (auto& [key, value] : db.riter_from({}, to_bytes("user:~"))) { ... }
+
+// Reverse keys-only — pure in-memory, descending order.
+for (auto& key : db.rkeys_from({}, to_bytes("user:~"))) { ... }
 ```
 
 > `to_bytes` is a small helper that converts a `std::string_view` to `BytesView`:
@@ -206,6 +212,12 @@ public:
 
     [[nodiscard]] auto keys_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
+
+    [[nodiscard]] auto riter_from(const ReadOptions& opts, BytesView from = {}) const
+        -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
+
+    [[nodiscard]] auto rkeys_from(const ReadOptions& opts, BytesView from = {}) const
+        -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 
     // Returns true if a file was vacuumed, false if no file qualified.
     [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;

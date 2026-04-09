@@ -586,6 +586,12 @@ public:
     return {};
   }
 
+  // WARNING: rbegin()/rend() return std::reverse_iterator whose operator*
+  // creates a temporary copy, decrements it, and dereferences. Because
+  // RadixTreeIterator::operator* returns a pair containing a span into the
+  // iterator's internal key buffer, that span dangles when the temporary is
+  // destroyed. Use these ONLY for positional queries (e.g. .base()) — never
+  // dereference them directly.
   [[nodiscard]] auto rbegin() const
       -> std::reverse_iterator<RadixTreeIterator<V>>;
   [[nodiscard]] auto rend() const
