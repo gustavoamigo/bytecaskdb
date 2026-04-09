@@ -16,8 +16,22 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | ID | Title | Note |
 | --- | --- | --- |
 | BC-102 | File format reference document | Created `docs/file_format.md` with full layout spec for `.data` and `.hint` files; added to README documentation table. |
+| BC-110 | MariaDB storage engine integration — design | Design doc (`docs/mariadb_engine_design.md`) and phased plan for `ha_bytecask` plugin. Branch: `feature/mariadb-engine`. |
 
 ## Backlog
+
+### MariaDB Engine Integration
+
+| ID | Title | Note |
+| --- | --- | --- |
+| BC-114 | Purge table keys on DROP TABLE | `ha_bytecaskdb::delete_table()` currently only removes the in-memory table_id mapping. Phase 1 follow-up: scan and `del()` all keys with the `[table_id]` prefix so storage is reclaimed. |
+| BC-115 | MariaDB Phase 2 — Basic CRUD + PK lookups | `delete_row`, `update_row`, `index_read` on PK, `store_lock` no-op, `external_lock` no-op. |
+| BC-116 | MariaDB Phase 3 — L2 Transaction + statement atomicity | Internal `MariaDBTxn` class on top of `snapshot()` + `apply_batch_if()`. `hton->commit/rollback`. OCC conflict → `HA_ERR_LOCK_DEADLOCK`. |
+| BC-117 | MariaDB Phase 4 — Secondary indexes | Key encoding `[index_id][sec_key][pk]`, atomic primary+secondary writes, `index_read/next/prev`. |
+| BC-118 | MariaDB Phase 5 — MVCC + lockless architecture | `HTON_MVCC`, `HTON_NO_LOCK_MANAGER`, `start_consistent_snapshot()`. |
+| BC-119 | MariaDB Phase 6 — Replication + backup hooks | 2PC `prepare`, XA `recover`, `backup_stage` hooks. |
+
+### Core Engine
 
 | ID | Title | Note |
 | --- | --- | --- |
@@ -38,6 +52,9 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-113 | Static library build target with -fPIC | `xmake.lua` `bytecask` target builds `libbytecask.a` with `add_cxxflags("-fPIC", {force=true})` so the archive can link into a shared object (e.g. MariaDB plugin). |
+| BC-112 | C API wrapper / stable ABI header | `include/bytecask_c.h` + `src/bytecask_c.cpp` — flat `extern "C"` API with opaque `bytecask_db_t*` and `bytecask_iter_t*` handles. Compiles cleanly. |
+| BC-111 | MariaDB Phase 1 — POC plugin builds and smoke-tested | Plugin compiles and links (`ha_bytecaskdb.so`). Switched descriptor to `maria_declare_plugin` with `MariaDB_PLUGIN_MATURITY_GAMMA`. Full smoke test passes: `INSTALL PLUGIN` → `CREATE TABLE` → `INSERT` → `SELECT` → `DROP TABLE` → `UNINSTALL PLUGIN`. |
 | BC-106 | Reverse iteration API (`riter_from`/`rkeys_from`) | Bidirectional `KeyIterator`/`EntryIterator`, `riter_from`/`rkeys_from` on DB and Snapshot. Generic `ReverseIterator<Iter>` template (avoids `std::reverse_iterator` dangling-reference pitfall). 7 new tests, 166 total passing. RocksDB parity: `SeekForPrev`+`Prev` ↔ `riter_from`. |
 | BC-105 | Bidirectional radix tree iterator + `upper_bound` + `rbegin`/`rend` | Upgraded `RadixTreeIterator` from `input_iterator` to `bidirectional_iterator`: added `operator--` (retreat + descend_rightmost), `rbegin()`/`rend()` via `std::reverse_iterator`, and `upper_bound()`. 8 new test cases + model-based reverse verification. 4 new map_bench benchmarks (UpperBound, ReverseIterate for RadixTree and StdMap). 53 tests pass (1M+ assertions). |
 | BC-104 | `WritePlan` type: split `Batch` from `apply_batch_if` | New `WritePlan` type with composable guards (`ensure_present`/`ensure_absent`/`ensure_unchanged`/`ensure_range_unchanged`) + writes (`put`/`del`) for `apply_batch_if`. `Batch` stays as-is for `apply_batch`. Guards and writes merged per-key into `KeyAction`. `apply_batch_if` returns `bool` (false on conflict) instead of throwing. Shared `commit_batch` helper. `BatchConflict` removed. 25 `[apply_batch_if]` tests. README, design doc, and project plan updated. |
@@ -101,7 +118,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-042 | Buffer-reusing `get()` and iterator | Added `Bytes&` output-param `get()` overload (convenience `get` delegates to it), `DataFile::read_entry(io_buf)` as single read primitive, `verify_entry()` factored from duplicated CRC logic. Removed `read_value_into` (replaced by `read_entry` + `extract_value_into`). `EntryIterator` reuses internal I/O + value buffers across advances. Get: ~flat (pread-dominated). Range50: **−16%** CPU time (37 µs → 31 µs at 50K keys). 87 tests pass (1M+ assertions). |
 | BC-030 | Radix tree engine integration | Replaced `PersistentOrderedMap<Key, KeyDirEntry>` with `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. `KeyIterator` and `EntryIterator` now wrap `RadixTreeIterator<KeyDirEntry>`. All engine operations (`get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`) and recovery pass byte spans directly to the radix tree API. 82 tests pass (1M+ assertions). ASan clean. |
 | BC-033 | Radix tree hardening + memory layout optimisation | Phase 1: linear scan kept, 3 comments added, 10 new tests (33 total, ~1M assertions). Phase 2: children N=8→N=4 (−31% memory). Phase 3: packed node layout — `uint64_t edit_tag` + `optional<V>` replaced by `uint32_t packed_tag_` (high bit = has_value) + bare `V value_`; children N=4→N=1. Combined: 184→112 B/node; measured 209→129 B/key (−38%) at 100k generic keys, 225→139 B/key (−38%) with prefixed UUIDv7 keys. 33 tests pass. |
-| BC-036 | jemalloc as global allocator | `add_requires("jemalloc")` + `add_packages` on all four targets. Replaces glibc ptmalloc2 via symbol interposition. No regression in `engine_bench` (results within noise; load avg was 5.56 on the after run). Fragmentation benefit visible only in long-running workloads. |
+| BC-036 | ~~jemalloc as global allocator~~ (reverted) | Removed: caused `cannot allocate memory in static TLS block` when MariaDB dlopen'd the plugin. No measurable bench benefit. Reverted to glibc ptmalloc2. |
 | BC-035 | ByteCaskDB vs LevelDB benchmark suite | `benchmarks/engine_bench.cpp` (target `engine_bench`). Benchmarks: put/get/del/range-50/mixed(80%get 10%put 10%del) at nosync and sync durability levels, prefixed UUIDv7 keys, 1 KiB values. Reports ops/s rate + p50/p99 latency counters per benchmark. LevelDB added as xmake dependency. |
 | BC-031 | Benchmark harness: OrderedMap vs RadixTree | Google Benchmark suite in `benchmarks/map_bench.cpp` (target `bytecask_bench`, `set_default(false)`). Compares persistent set, transient set, get, iteration, lower_bound, and memory footprint at 1k/10k/100k keys. RadixTree transient set ~2.4× faster than its persistent set at 100k keys; RadixTree get ~8× faster than OrderedMap. |
 | BC-032 | Sanitizer build mode + memory/concurrency verification | `xmake f --sanitizer=address` / `--sanitizer=thread` applies ASan/TSan to all targets via `on_load` callback. Full test suite clean under ASan+LSan (70 tests, 47,529 assertions, zero leaks). Concurrent reader/writer test (`[concurrency]` tag) verifies persistent snapshot immutability across threads. TSan blocked in Codespaces by ASLR sandbox; documented workaround. Memory footprint benchmark (`BM_MemoryFootprint`) added to `map_bench.cpp`. |
