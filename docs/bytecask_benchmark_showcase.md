@@ -1,4 +1,4 @@
-# ByteCask Benchmark Showcase
+# ByteCaskDB Benchmark Showcase
 
 | | |
 |---|---|
@@ -46,7 +46,7 @@ Sequential write speed: 448MiB/s
 
 ---
 
-# Throughput Comparison — ByteCask vs RocksDB
+# Throughput Comparison — ByteCaskDB vs RocksDB
 
 ## 50k Keys (50,000)
 
@@ -54,7 +54,7 @@ Sequential write speed: 448MiB/s
 
 > **CRC verification is disabled** for read operations in this section (Get, Range-50, MixedBatch). Recovery benchmarks run with CRC **enabled**.
 
-| Benchmark | ByteCask | RocksDB | ByteCask / RocksDB |
+| Benchmark | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---|---:|---:|:---:|
 | Put (NoSync) | **163.3 Kops/s** | 163.1 Kops/s | **1.00×** |
 | Put (Sync) | **480.7 ops/s** | 476.5 ops/s | **1.01×** |
@@ -65,14 +65,14 @@ Sequential write speed: 448MiB/s
 
 ### Get Latency _(CRC disabled)_
 
-| Percentile | ByteCask | RocksDB |
+| Percentile | ByteCaskDB | RocksDB |
 |---|---:|---:|
 | p50 | 723 ns | 613 ns |
 | p99 | 1.21 µs | 1.06 µs |
 
 ### Concurrent Reads — GetMT _(CRC disabled)_
 
-| Threads | ByteCask | RocksDB | ByteCask / RocksDB |
+| Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
 | 2 | 2.40 Mops/s | **3.16 Mops/s** | **0.76×** |
 | 4 | 4.42 Mops/s | **5.69 Mops/s** | **0.78×** |
@@ -82,7 +82,7 @@ Sequential write speed: 448MiB/s
 
 ### Concurrent Writes — PutMT/Sync
 
-| Threads | ByteCask | RocksDB | ByteCask / RocksDB |
+| Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
 | 2 | 542.4 ops/s | **660.3 ops/s** | **0.82×** |
 | 4 | 879.0 ops/s | **1.2 Kops/s** | **0.76×** |
@@ -91,9 +91,9 @@ Sequential write speed: 448MiB/s
 
 ### Read-While-Writing — 1 writer + N readers, Sync _(CRC disabled)_
 
-> **BoundedStaleness** is a ByteCask read mode where readers observe the keydir snapshot from the previous completed write batch instead of acquiring a per-read epoch lock. This eliminates reader-writer contention at high thread counts at the cost of seeing writes that are at most one batch behind.
+> **BoundedStaleness** is a ByteCaskDB read mode where readers observe the keydir snapshot from the previous completed write batch instead of acquiring a per-read epoch lock. This eliminates reader-writer contention at high thread counts at the cost of seeing writes that are at most one batch behind.
 
-| Readers | ByteCask | ByteCask BoundedStaleness | RocksDB |
+| Readers | ByteCaskDB | ByteCaskDB BoundedStaleness | RocksDB |
 |---:|---:|---:|---:|
 | 2 | 2.52 Mops/s | 2.58 Mops/s | **3.06 Mops/s** |
 | 4 | 4.06 Mops/s | 4.17 Mops/s | **5.55 Mops/s** |
@@ -107,7 +107,7 @@ Sequential write speed: 448MiB/s
 
 > **CRC verification is disabled** for read operations in this section (Get, Range-50, MixedBatch). Recovery benchmarks run with CRC **enabled**.
 
-| Benchmark | ByteCask | RocksDB | ByteCask / RocksDB |
+| Benchmark | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---|---:|---:|:---:|
 | Put (NoSync) | 158.5 Kops/s | **170.1 Kops/s** | **0.93×** |
 | Put (Sync) | **455.6 ops/s** | 448.4 ops/s | **1.02×** |
@@ -118,14 +118,14 @@ Sequential write speed: 448MiB/s
 
 ### Get Latency _(CRC disabled)_
 
-| Percentile | ByteCask | RocksDB |
+| Percentile | ByteCaskDB | RocksDB |
 |---|---:|---:|
 | p50 | 670 ns | 2.15 µs |
 | p99 | 1.11 µs | 4.52 µs |
 
 ### Concurrent Reads — GetMT _(CRC disabled)_
 
-| Threads | ByteCask | RocksDB | ByteCask / RocksDB |
+| Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
 | 2 | **2.58 Mops/s** | 895.5 Kops/s | **2.88×** |
 | 4 | **4.21 Mops/s** | 1.71 Mops/s | **2.46×** |
@@ -135,7 +135,7 @@ Sequential write speed: 448MiB/s
 
 ### Concurrent Writes — PutMT/Sync
 
-| Threads | ByteCask | RocksDB | ByteCask / RocksDB |
+| Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
 | 2 | 471.1 ops/s | **731.7 ops/s** | **0.64×** |
 | 4 | 408.8 ops/s | **1.3 Kops/s** | **0.32×** |
@@ -144,9 +144,9 @@ Sequential write speed: 448MiB/s
 
 ### Read-While-Writing — 1 writer + N readers, Sync _(CRC disabled)_
 
-> **BoundedStaleness** is a ByteCask read mode where readers observe the keydir snapshot from the previous completed write batch instead of acquiring a per-read epoch lock. This eliminates reader-writer contention at high thread counts at the cost of seeing writes that are at most one batch behind.
+> **BoundedStaleness** is a ByteCaskDB read mode where readers observe the keydir snapshot from the previous completed write batch instead of acquiring a per-read epoch lock. This eliminates reader-writer contention at high thread counts at the cost of seeing writes that are at most one batch behind.
 
-| Readers | ByteCask | ByteCask BoundedStaleness | RocksDB |
+| Readers | ByteCaskDB | ByteCaskDB BoundedStaleness | RocksDB |
 |---:|---:|---:|---:|
 | 2 | 2.51 Mops/s | **2.56 Mops/s** | 837.4 Kops/s |
 | 4 | 4.14 Mops/s | **4.24 Mops/s** | 1.48 Mops/s |
@@ -160,7 +160,7 @@ Sequential write speed: 448MiB/s
 
 > **CRC verification is disabled** for read operations in this section (Get, Range-50, MixedBatch). Recovery benchmarks run with CRC **enabled**.
 
-| Benchmark | ByteCask | RocksDB | ByteCask / RocksDB |
+| Benchmark | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---|---:|---:|:---:|
 | Put (NoSync) | 157.1 Kops/s | **166.4 Kops/s** | **0.94×** |
 | Put (Sync) | 434.8 ops/s | **478.0 ops/s** | **0.91×** |
@@ -171,14 +171,14 @@ Sequential write speed: 448MiB/s
 
 ### Get Latency _(CRC disabled)_
 
-| Percentile | ByteCask | RocksDB |
+| Percentile | ByteCaskDB | RocksDB |
 |---|---:|---:|
 | p50 | 680 ns | 1.57 µs |
 | p99 | 1.15 µs | 3.96 µs |
 
 ### Concurrent Reads — GetMT _(CRC disabled)_
 
-| Threads | ByteCask | RocksDB | ByteCask / RocksDB |
+| Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
 | 2 | **2.56 Mops/s** | 1.13 Mops/s | **2.27×** |
 | 4 | **4.27 Mops/s** | 2.15 Mops/s | **1.99×** |
@@ -188,7 +188,7 @@ Sequential write speed: 448MiB/s
 
 ### Concurrent Writes — PutMT/Sync
 
-| Threads | ByteCask | RocksDB | ByteCask / RocksDB |
+| Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
 | 2 | 440.9 ops/s | **721.4 ops/s** | **0.61×** |
 | 4 | 785.3 ops/s | **1.3 Kops/s** | **0.61×** |
@@ -197,9 +197,9 @@ Sequential write speed: 448MiB/s
 
 ### Read-While-Writing — 1 writer + N readers, Sync _(CRC disabled)_
 
-> **BoundedStaleness** is a ByteCask read mode where readers observe the keydir snapshot from the previous completed write batch instead of acquiring a per-read epoch lock. This eliminates reader-writer contention at high thread counts at the cost of seeing writes that are at most one batch behind.
+> **BoundedStaleness** is a ByteCaskDB read mode where readers observe the keydir snapshot from the previous completed write batch instead of acquiring a per-read epoch lock. This eliminates reader-writer contention at high thread counts at the cost of seeing writes that are at most one batch behind.
 
-| Readers | ByteCask | ByteCask BoundedStaleness | RocksDB |
+| Readers | ByteCaskDB | ByteCaskDB BoundedStaleness | RocksDB |
 |---:|---:|---:|---:|
 | 2 | 2.54 Mops/s | **2.61 Mops/s** | 1.12 Mops/s |
 | 4 | 4.26 Mops/s | **4.46 Mops/s** | 2.14 Mops/s |
@@ -212,11 +212,11 @@ Sequential write speed: 448MiB/s
 
 ## GetMT Scalability — Throughput and Latency vs Dataset Size
 
-> Throughput (Mops/s) and p99 read latency at each thread count as the dataset grows. ByteCask's in-memory keydir keeps read latency flat; RocksDB's block cache hit rate falls as the working set exceeds the cache.
+> Throughput (Mops/s) and p99 read latency at each thread count as the dataset grows. ByteCaskDB's in-memory keydir keeps read latency flat; RocksDB's block cache hit rate falls as the working set exceeds the cache.
 
 ### Throughput (Mops/s)
 
-| Threads | BC 50k | RDB 50k | BC 500k | RDB 500k | BC 1M | RDB 1M |
+| Threads | BCDB 50k | RDB 50k | BCDB 500k | RDB 500k | BCDB 1M | RDB 1M |
 |---:| ---: | ---: | ---: | ---: | ---: | ---: |
 | 2 | 2.40 Mops/s | **3.16 Mops/s** | **2.58 Mops/s** | 895.5 Kops/s | **2.56 Mops/s** | 1.13 Mops/s |
 | 4 | 4.42 Mops/s | **5.69 Mops/s** | **4.21 Mops/s** | 1.71 Mops/s | **4.27 Mops/s** | 2.15 Mops/s |
@@ -226,7 +226,7 @@ Sequential write speed: 448MiB/s
 
 ### p99 Read Latency
 
-| Threads | BC 50k | RDB 50k | BC 500k | RDB 500k | BC 1M | RDB 1M |
+| Threads | BCDB 50k | RDB 50k | BCDB 500k | RDB 500k | BCDB 1M | RDB 1M |
 |---:| ---: | ---: | ---: | ---: | ---: | ---: |
 | 2 | 2.54 µs | **1.95 µs** | **2.45 µs** | 9.20 µs | **2.49 µs** | 8.35 µs |
 | 4 | 5.31 µs | **4.50 µs** | **6.25 µs** | 20.82 µs | **6.13 µs** | 18.67 µs |

@@ -1,6 +1,6 @@
-# ByteCask Engine API Design
+# ByteCaskDB Engine API Design
 
-This document describes the public C++ API for the main `DB` class — the entry point for all ByteCask operations.
+This document describes the public C++ API for the main `DB` class — the entry point for all ByteCaskDB operations.
 
 Canonical location: `docs/engine_api_design.md`.
 
@@ -15,7 +15,7 @@ Canonical location: `docs/engine_api_design.md`.
 
 ## Non-Goals (for now)
 
-- Multi-writer access, MVCC, or snapshot isolation. ByteCask uses a SWMR model; see Architecture below.
+- Multi-writer access, MVCC, or snapshot isolation. ByteCaskDB uses a SWMR model; see Architecture below.
 - TTL or expiry.
 - Async I/O.
 
@@ -25,13 +25,13 @@ Canonical location: `docs/engine_api_design.md`.
 
 ### Key Directory
 
-ByteCask uses `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times. The immutable trie structure provides structural sharing so readers take a cheap snapshot of the root without acquiring any lock.
+ByteCaskDB uses `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times. The immutable trie structure provides structural sharing so readers take a cheap snapshot of the root without acquiring any lock.
 
 `PersistentRadixTree<V>` is a custom copy-on-write adaptive radix tree (ART-style) implemented in `src/radix_tree.cppm`. It supports O(k) get/set/erase (k = key length), structural sharing between versions, and in-order iteration via `RadixTreeIterator<V>`.
 
 ### Concurrency Model
 
-ByteCask follows a **single-writer / multiple-reader (SWMR)** model:
+ByteCaskDB follows a **single-writer / multiple-reader (SWMR)** model:
 
 - Exactly one writer may operate at a time (`write_mu_` serialises `put`, `del`, `apply_batch`).
 - Multiple readers may operate concurrently, isolated from writes by a persistent snapshot of the key directory loaded via `state_.load()`.

@@ -1,6 +1,6 @@
 # Persistent Radix Tree (Byte-Array Keys)
 
-This document describes the design of the persistent radix tree used as the in-memory key directory in ByteCask. It is intended for contributors who need to understand, modify, or reason about correctness of this component.
+This document describes the design of the persistent radix tree used as the in-memory key directory in ByteCaskDB. It is intended for contributors who need to understand, modify, or reason about correctness of this component.
 
 The **Background** section builds up the necessary concepts from scratch — persistent data structures, structural sharing, Tries, and Patricia Tries — for readers coming without that context. From §1 onward the document covers the C++ design: the overview, design principles, node layout, API, algorithms, acceptance criteria, memory usage, and benchmark results.
 
@@ -157,13 +157,13 @@ Let N = total number of keys, k = length of the key being operated on.
 
 ## 1. Overview
 
-This component implements a persistent radix tree in C++ as the key directory for ByteCask. It exposes two interfaces: a fully immutable `PersistentRadixTree<V>` where every mutating operation returns a new version sharing unchanged subtrees by pointer, and a `TransientRadixTree<V>` builder for efficient bulk loading that converts to a persistent snapshot when done. Both support `get`, `set`, `erase`, ordered iteration, and `lower_bound`. A static `merge` operation combines two persistent trees in O(overlap) time, adopting disjoint subtrees by pointer without cloning. The module is `bytecask.radix_tree` and uses standard allocators.
+This component implements a persistent radix tree in C++ as the key directory for ByteCaskDB. It exposes two interfaces: a fully immutable `PersistentRadixTree<V>` where every mutating operation returns a new version sharing unchanged subtrees by pointer, and a `TransientRadixTree<V>` builder for efficient bulk loading that converts to a persistent snapshot when done. Both support `get`, `set`, `erase`, ordered iteration, and `lower_bound`. A static `merge` operation combines two persistent trees in O(overlap) time, adopting disjoint subtrees by pointer without cloning. The module is `bytecask.radix_tree` and uses standard allocators.
 
 
 
 ## Design Principles
 
-This component inherits the ByteCask design tenets in order of priority:
+This component inherits the ByteCaskDB design tenets in order of priority:
 
 1. **Correctness**: Data integrity is paramount. All design decisions prioritize correctness over performance.
 2. **Simplicity**: The architecture is kept simple to facilitate understanding and maintainability.
@@ -494,7 +494,7 @@ For short, dissimilar keys (e.g. the generic `"key_N"` benchmark, 6–10 bytes e
 
 ### 7.5. 100M key projections
 
-The primary concern for ByteCask is the key directory at production scale. The table below uses 1.07 nodes/key and the measured 86 B/key at 100k as the per-node baseline.
+The primary concern for ByteCaskDB is the key directory at production scale. The table below uses 1.07 nodes/key and the measured 86 B/key at 100k as the per-node baseline.
 
 | Configuration | B/key | 100M keys |
 |---|---|---|
@@ -641,7 +641,7 @@ Merge overhead is small enough that parallelising the build phase pays for itsel
 
 ### VM pressure and prefix-aligned hot/cold access
 
-ByteCask's stated operating envelope is all keys in physical RAM. However, the radix tree has a useful emergent property under memory pressure: because the tree's structure mirrors key prefixes, subtrees for different prefixes occupy disjoint pointer graphs and thus tend to land on disjoint OS pages. When access has clear prefix-aligned hot/cold locality (e.g., `user:<uuidv7>` where recent UUIDs are warm and old ones are cold), the OS VM subsystem acts as an implicit buffer pool — keeping warm subtrees resident and transparently paging out cold ones.
+ByteCaskDB's stated operating envelope is all keys in physical RAM. However, the radix tree has a useful emergent property under memory pressure: because the tree's structure mirrors key prefixes, subtrees for different prefixes occupy disjoint pointer graphs and thus tend to land on disjoint OS pages. When access has clear prefix-aligned hot/cold locality (e.g., `user:<uuidv7>` where recent UUIDs are warm and old ones are cold), the OS VM subsystem acts as an implicit buffer pool — keeping warm subtrees resident and transparently paging out cold ones.
 
 Under this pattern, latency becomes bimodal (fast for warm keys, a page-fault away for cold ones) but the system remains correct and the average case is dominated by the warm path. Full-tree scans defeat this property by pulling the entire working set back into RAM and should be avoided or rate-limited.
 

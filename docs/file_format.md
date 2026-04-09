@@ -1,12 +1,12 @@
-# ByteCask File Format Reference
+# ByteCaskDB File Format Reference
 
-This document specifies the on-disk format for ByteCask databases. It is the
+This document specifies the on-disk format for ByteCaskDB databases. It is the
 authoritative reference for anyone who needs to read, write, or validate
-ByteCask files outside the engine itself.
+ByteCaskDB files outside the engine itself.
 
 ## Database Directory Layout
 
-A ByteCask database is a directory containing pairs of files sharing the same
+A ByteCaskDB database is a directory containing pairs of files sharing the same
 timestamp stem:
 
 ```

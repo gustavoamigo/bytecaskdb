@@ -1,4 +1,4 @@
-# ByteCask Recovery Time Estimates
+# ByteCaskDB Recovery Time Estimates
 
 ## Methodology
 
@@ -228,7 +228,7 @@ Parallel recovery does not apply to NoHints (it operates on hint files only).
 
 ## Memory requirement: the real ceiling - Estimation based on Benchmarks
 
-ByteCask holds the entire key directory in RAM. The radix tree uses
+ByteCaskDB holds the entire key directory in RAM. The radix tree uses
 approximately **80–120 bytes per key** accounting for key bytes and internal
 node overhead (with good prefix sharing for the prefixed-UUID key distribution
 used in the benchmark).
@@ -247,7 +247,7 @@ machine (as used for benchmarking) the practical key-directory ceiling is
 ### Scaling with larger values
 
 The key/memory relationship does not change with value size — larger values
-reduce key count for the same DB size, making ByteCask *more* practical at
+reduce key count for the same DB size, making ByteCaskDB *more* practical at
 scale. For example:
 
 | Average value size | Keys in 1 TB | Key directory RAM | Serial recovery | 16T | 32T† | 64T‡ |

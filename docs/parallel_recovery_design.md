@@ -2,7 +2,7 @@
 
 ## 1. Motivation
 
-ByteCask recovery rebuilds the in-memory key directory by scanning hint files
+ByteCaskDB recovery rebuilds the in-memory key directory by scanning hint files
 (or raw data files) from disk. At large key counts the bottleneck is radix tree
 insertion, not I/O:
 
