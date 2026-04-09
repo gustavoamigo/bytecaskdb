@@ -161,6 +161,7 @@ export struct Options {
 // ---------------------------------------------------------------------------
 export class KeyIterator {
 public:
+  using iterator_concept = std::bidirectional_iterator_tag;
   using value_type = Key;
   using difference_type = std::ptrdiff_t;
 
@@ -179,9 +180,26 @@ public:
     return *this;
   }
 
-  void operator++(int) {
-    ++cur_;
+  auto operator++(int) -> KeyIterator {
+    auto tmp = *this;
+    ++*this;
+    return tmp;
+  }
+
+  auto operator--() -> KeyIterator & {
+    --cur_;
     cache_key();
+    return *this;
+  }
+
+  auto operator--(int) -> KeyIterator {
+    auto tmp = *this;
+    --*this;
+    return tmp;
+  }
+
+  auto operator==(const KeyIterator &other) const noexcept -> bool {
+    return cur_ == other.cur_;
   }
 
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
@@ -207,6 +225,7 @@ private:
 // ---------------------------------------------------------------------------
 export class EntryIterator {
 public:
+  using iterator_concept = std::bidirectional_iterator_tag;
   using value_type = std::pair<Key, Bytes>;
   using difference_type = std::ptrdiff_t;
 
@@ -238,9 +257,26 @@ public:
     return *this;
   }
 
-  void operator++(int) {
-    ++cur_;
+  auto operator++(int) -> EntryIterator {
+    auto tmp = *this;
+    ++*this;
+    return tmp;
+  }
+
+  auto operator--() -> EntryIterator & {
+    --cur_;
     has_cached_ = false;
+    return *this;
+  }
+
+  auto operator--(int) -> EntryIterator {
+    auto tmp = *this;
+    --*this;
+    return tmp;
+  }
+
+  auto operator==(const EntryIterator &other) const noexcept -> bool {
+    return cur_ == other.cur_;
   }
 
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
@@ -255,6 +291,56 @@ private:
   mutable Bytes io_buf_;
   mutable bool has_cached_{false};
 };
+
+// ---------------------------------------------------------------------------
+// ReverseIterator<Iter> — generic reverse adapter for bidirectional iterators
+// whose operator* returns a reference to internal cache.
+//
+// std::reverse_iterator cannot be used here: its operator* dereferences a
+// temporary copy of the underlying iterator, which dangles when the iterator
+// caches its result internally (KeyIterator, EntryIterator both do).
+//
+// This adapter holds the underlying iterator directly, pre-decrements once
+// in the constructor, and advances by calling operator-- on the inner
+// iterator. Because the inner iterator is long-lived, the reference returned
+// by operator* remains valid.
+// ---------------------------------------------------------------------------
+export template <std::bidirectional_iterator Iter>
+class ReverseIterator {
+public:
+  using iterator_concept = std::forward_iterator_tag;
+  using value_type = std::iter_value_t<Iter>;
+  using difference_type = std::ptrdiff_t;
+
+  ReverseIterator() = default;
+
+  explicit ReverseIterator(Iter past_pos) : cur_{std::move(past_pos)} {
+    --cur_;
+  }
+
+  auto operator*() const -> std::iter_reference_t<Iter> { return *cur_; }
+
+  auto operator++() -> ReverseIterator & {
+    --cur_;
+    return *this;
+  }
+
+  auto operator++(int) -> ReverseIterator {
+    auto tmp = *this;
+    ++*this;
+    return tmp;
+  }
+
+  auto operator==(const ReverseIterator &other) const noexcept -> bool {
+    return cur_ == other.cur_;
+  }
+
+private:
+  Iter cur_;
+};
+
+export using ReverseKeyIterator = ReverseIterator<KeyIterator>;
+export using ReverseEntryIterator = ReverseIterator<EntryIterator>;
 
 // ---------------------------------------------------------------------------
 // DB — SWMR key-value store
@@ -351,6 +437,18 @@ public:
   [[nodiscard]] auto keys_from(const ReadOptions &opts,
                                BytesView from = {}) const
       -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
+
+  // Returns a range of (key, value) pairs in descending key order.
+  // When from is non-empty, starts at the last key <= from.
+  // When from is empty, starts at the last key in the DB.
+  [[nodiscard]] auto riter_from(const ReadOptions &opts,
+                                BytesView from = {}) const
+      -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
+
+  // Returns a range of keys in descending order. Pure in-memory — no disk I/O.
+  [[nodiscard]] auto rkeys_from(const ReadOptions &opts,
+                                BytesView from = {}) const
+      -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 
   // Selects the highest-fragmentation sealed file above the threshold
   // and either absorbs it into the active file (if it fits) or compacts
@@ -613,6 +711,16 @@ public:
   // Returns an input range of keys >= from. Pure in-memory — no disk I/O.
   [[nodiscard]] auto keys_from(BytesView from = {}) const
       -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
+
+  // Returns a range of (key, value) pairs in descending key order.
+  // When from is non-empty, starts at the last key <= from.
+  // When from is empty, starts at the last key in the DB.
+  [[nodiscard]] auto riter_from(BytesView from = {}) const
+      -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
+
+  // Returns a range of keys in descending order. Pure in-memory — no disk I/O.
+  [[nodiscard]] auto rkeys_from(BytesView from = {}) const
+      -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 
 private:
   explicit Snapshot(std::shared_ptr<const EngineState> state)

@@ -2266,6 +2266,140 @@ TEST_CASE("Snapshot keys_from is frozen at snapshot time", "[snapshot]") {
 }
 
 // ---------------------------------------------------------------------------
+// Reverse iteration tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("DB riter_from returns entries in descending order",
+          "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("av"));
+  db.put({}, to_bytes("b"), to_bytes("bv"));
+  db.put({}, to_bytes("c"), to_bytes("cv"));
+
+  bytecask::ReadOptions ro;
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  for (auto &[k, v] : db.riter_from(ro)) {
+    keys.push_back(to_string(k));
+    values.push_back(to_string(v));
+  }
+
+  REQUIRE(keys.size() == 3);
+  CHECK(keys[0] == "c");
+  CHECK(keys[1] == "b");
+  CHECK(keys[2] == "a");
+  CHECK(values[0] == "cv");
+  CHECK(values[1] == "bv");
+  CHECK(values[2] == "av");
+}
+
+TEST_CASE("DB riter_from starts at given key", "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("apple"), to_bytes("1"));
+  db.put({}, to_bytes("banana"), to_bytes("2"));
+  db.put({}, to_bytes("cherry"), to_bytes("3"));
+
+  std::vector<std::string> keys;
+  for (auto &[k, v] : db.riter_from({}, to_bytes("banana"))) {
+    keys.push_back(to_string(k));
+  }
+
+  REQUIRE(keys.size() == 2);
+  CHECK(keys[0] == "banana");
+  CHECK(keys[1] == "apple");
+}
+
+TEST_CASE("DB riter_from with nonexistent key starts at predecessor",
+          "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("c"), to_bytes("2"));
+  db.put({}, to_bytes("e"), to_bytes("3"));
+
+  std::vector<std::string> keys;
+  // "d" doesn't exist; upper_bound("d") points to "e", so reverse starts at "c"
+  for (auto &[k, v] : db.riter_from({}, to_bytes("d"))) {
+    keys.push_back(to_string(k));
+  }
+
+  REQUIRE(keys.size() == 2);
+  CHECK(keys[0] == "c");
+  CHECK(keys[1] == "a");
+}
+
+TEST_CASE("DB rkeys_from returns all keys in descending order",
+          "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("z"), to_bytes("zv"));
+  db.put({}, to_bytes("m"), to_bytes("mv"));
+  db.put({}, to_bytes("a"), to_bytes("av"));
+
+  std::vector<std::string> keys;
+  for (auto &k : db.rkeys_from({})) {
+    keys.push_back(to_string(k));
+  }
+
+  REQUIRE(keys.size() == 3);
+  CHECK(keys[0] == "z");
+  CHECK(keys[1] == "m");
+  CHECK(keys[2] == "a");
+}
+
+TEST_CASE("DB riter_from on empty DB yields nothing", "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  std::vector<std::string> keys;
+  for (auto &[k, v] : db.riter_from({})) {
+    keys.push_back(to_string(k));
+  }
+  CHECK(keys.empty());
+}
+
+TEST_CASE("Snapshot riter_from is frozen at snapshot time", "[snapshot]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+
+  auto snap = db.snapshot();
+
+  db.put({}, to_bytes("c"), to_bytes("3"));
+
+  std::vector<std::string> keys;
+  for (const auto &[k, v] : snap.riter_from()) {
+    keys.push_back(to_string(k));
+  }
+  CHECK(keys == std::vector<std::string>{"b", "a"});
+}
+
+TEST_CASE("Snapshot rkeys_from is frozen at snapshot time", "[snapshot]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+
+  auto snap = db.snapshot();
+
+  db.put({}, to_bytes("c"), to_bytes("3"));
+  (void)db.del({}, to_bytes("a"));
+
+  std::vector<std::string> keys;
+  for (const auto &k : snap.rkeys_from()) {
+    keys.push_back(to_string(k));
+  }
+  CHECK(keys == std::vector<std::string>{"b", "a"});
+}
+
+// ---------------------------------------------------------------------------
 // apply_batch_if tests
 // ---------------------------------------------------------------------------
 

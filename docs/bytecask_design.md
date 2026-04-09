@@ -913,31 +913,35 @@ private:
 
 ### Iterators
 
-Both iterators satisfy `std::input_iterator`. They are forward-only and yield entries in ascending key order.
+Both `KeyIterator` and `EntryIterator` satisfy `std::bidirectional_iterator`. They yield entries in ascending key order when advanced with `operator++` and descending order with `operator--`. This matches the underlying `RadixTreeIterator`, which is itself bidirectional. Backward traversal uses a `retreat()` method that backtracks through the parent stack and `descend_rightmost()` to enter the rightmost subtree of prior siblings — O(1) amortized per step, matching forward iteration.
 
-The underlying `RadixTreeIterator` is a `std::bidirectional_iterator` and supports `operator--`, `rbegin()` / `rend()` (via `std::reverse_iterator`), and `upper_bound()`. Backward traversal uses a `retreat()` method that backtracks through the parent stack and `descend_rightmost()` to enter the rightmost subtree of prior siblings — O(1) amortized per step, matching forward iteration.
+Forward scans use `iter_from` / `keys_from` (keys >= `from`); reverse scans use `riter_from` / `rkeys_from` (keys <= `from` in descending order). Both are available on `DB` and `Snapshot`. RocksDB equivalents: `Seek` + `Next` ↔ `iter_from`; `SeekForPrev` + `Prev` ↔ `riter_from`.
+
+Reverse iteration is provided by a generic `ReverseIterator<Iter>` template that wraps `KeyIterator` or `EntryIterator`. `std::reverse_iterator` cannot be used because its `operator*` dereferences a temporary copy of the underlying iterator — when the underlying iterator caches its result internally (as both `KeyIterator` and `EntryIterator` do), the returned reference dangles. `ReverseIterator` holds the inner iterator directly and pre-decrements once in the constructor, so the reference remains valid.
 
 ```cpp
-// Yields (key, value) pairs.
+// Yields (key, value) pairs — bidirectional.
 class EntryIterator {
 public:
+    using iterator_category = std::bidirectional_iterator_tag;
     using value_type      = std::pair<Bytes, Bytes>;
     using difference_type = std::ptrdiff_t;
 
     auto operator++() -> EntryIterator&;
-    void operator++(int);                        // advance only; no copy
+    auto operator--() -> EntryIterator&;
     auto operator*() const -> const value_type&;
     auto operator==(std::default_sentinel_t) const noexcept -> bool;
 };
 
-// Yields keys only (no value I/O).
+// Yields keys only (no value I/O) — bidirectional.
 class KeyIterator {
 public:
+    using iterator_category = std::bidirectional_iterator_tag;
     using value_type      = Bytes;
     using difference_type = std::ptrdiff_t;
 
     auto operator++() -> KeyIterator&;
-    void operator++(int);                        // advance only; no copy
+    auto operator--() -> KeyIterator&;
     auto operator*() const -> const value_type&;
     auto operator==(std::default_sentinel_t) const noexcept -> bool;
 };
@@ -946,12 +950,17 @@ public:
 Both integrate with `std::ranges::subrange` so callers can use range-for directly:
 
 ```cpp
-for (auto& [key, value] : db.iter_from(start_key)) { ... }
-for (auto& key : db.keys_from(prefix))              { ... }
+// Forward scan (ascending).
+for (auto& [key, value] : db.iter_from(opts, start_key)) { ... }
+for (auto& key : db.keys_from(opts, prefix))              { ... }
+
+// Reverse scan (descending).
+for (auto& [key, value] : db.riter_from(opts, start_key)) { ... }
+for (auto& key : db.rkeys_from(opts, prefix))              { ... }
 ```
 
-- **Lazy**: `operator++` reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries.
-- **`KeyIterator` is in-memory only**: walks the B-Tree key directory without touching any data file.
+- **Lazy**: each dereference reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries.
+- **`KeyIterator` is in-memory only**: walks the radix tree key directory without touching any data file.
 - **Error handling**: throws `std::system_error` on I/O failure.
 
 ### WriteOptions and ReadOptions
@@ -1022,16 +1031,18 @@ public:
 
     // ── Range iteration ───────────────────────────────────────────────────
 
-    // Returns an input range of (key, value) pairs with keys >= `from`.
-    // Pass an empty span to start from the first key. Each increment reads one
-    // value from disk (lazy). Throws std::system_error on I/O failure.
+    // Forward: keys >= `from` in ascending order.
     [[nodiscard]] auto iter_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
-
-    // Returns an input range of keys >= `from` without reading values.
-    // Walks the in-memory B-Tree only; no disk I/O.
     [[nodiscard]] auto keys_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
+
+    // Reverse: keys <= `from` in descending order.
+    // Empty `from` starts from the last key.
+    [[nodiscard]] auto riter_from(const ReadOptions& opts, BytesView from = {}) const
+        -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
+    [[nodiscard]] auto rkeys_from(const ReadOptions& opts, BytesView from = {}) const
+        -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 
 private:
     explicit Bytecask(std::filesystem::path dir);
@@ -1059,13 +1070,19 @@ batch.put(as_bytes("user:3"), as_bytes("carol"));
 batch.del(as_bytes("user:1"));
 db.apply_batch(std::move(batch));
 
-// Range scan.
+// Range scan (forward).
 for (auto& [key, value] : db.iter_from(as_bytes("user:"))) {
     // Iterates all keys >= "user:" in ascending order.
 }
 
-// Keys-only scan (no disk I/O — B-Tree walk only).
+// Keys-only scan (no disk I/O — radix tree walk only).
 for (auto& key : db.keys_from(as_bytes("user:"))) { ... }
+
+// Reverse scan (descending).
+for (auto& [key, value] : db.riter_from(as_bytes("user:~"))) {
+    // Iterates all keys <= "user:~" in descending order.
+}
+for (auto& key : db.rkeys_from(as_bytes("user:~"))) { ... }
 ```
 
 > `as_bytes` is a small helper that converts a string literal or `std::string_view` to `BytesView`. Its exact form is TBD.
@@ -1123,7 +1140,7 @@ The `~DB()` destructor seals the active file, then calls `flush_hints()` which d
 - Dependencies: crc32c (google/crc32c, hardware-accelerated CRC-32C)
 - Primary target: `bytecask` (includes `src/*.cpp` + `src/engine/*.cppm`)
 - Test target: `bytecask_tests` (includes `tests/*.cpp` + `src/engine/*.cppm`)
-- Status: Full `Bytecask` SWMR engine with `open`, `get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`. Key directory backed by `PersistentRadixTree<KeyDirEntry>`. Per-file fragmentation tracking via `FileStats` (`live_bytes`, `total_bytes`) maintained on every write and reconstructed during recovery. `open()` always creates a fresh active data file; recovery from hint files (serial and parallel). 1.2M+ assertions, 103 test cases.
+- Status: Full `Bytecask` SWMR engine with `open`, `get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from`. Key directory backed by `PersistentRadixTree<KeyDirEntry>`. Per-file fragmentation tracking via `FileStats` (`live_bytes`, `total_bytes`) maintained on every write and reconstructed during recovery. `open()` always creates a fresh active data file; recovery from hint files (serial and parallel). 1.2M+ assertions, 103 test cases.
 
 ## Current repository structure
 
@@ -1162,7 +1179,7 @@ Returns a `Snapshot` — a move-only, read-only value wrapping a `shared_ptr<con
 
 The `shared_ptr` keeps all data files referenced at snapshot time alive. Vacuum's `use_count() == 1` guard defers physical file deletion until all snapshots referencing a file are destroyed — no additional code required.
 
-`Snapshot` exposes the same read API as `DB`: `get`, `contains_key`, `iter_from`, `keys_from`.
+`Snapshot` exposes the same read API as `DB`: `get`, `contains_key`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from`.
 
 ### `DB::apply_batch_if(snap, opts, batch)`
 
