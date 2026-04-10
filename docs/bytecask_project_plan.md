@@ -34,7 +34,6 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-048 | Full vacuum (multi-file merge with tombstone elision) | Process all sealed files in a single commit. Safe to drop tombstones because no unprocessed Put for any deleted key can survive. Separate from conservative vacuum. |
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-078 | Published library module boundary | Decision: use Path A — keep sub-components (radix_tree, data_file, hint_file, etc.) as top-level modules for isolated testing; enforce public boundary at install time by only shipping the bytecask.engine BMI. Revisit Path B (full-partition restructure) if airtight compiler-enforced encapsulation is needed. |
 | BC-041 | `ReadOptions::verify_checksums` flag | Allow skipping CRC verification on bulk scans for ~5% win. Mirrors LevelDB/RocksDB `verify_checksums` option. |
@@ -43,6 +42,8 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-092 | UUIDv4 test | Test and protections if customers use UUIDv4 as key (Maybe we will need a Adaptive Radix Tree extension) |
 | BC-093 | Vacuum benchmarks | Add benchmark tests for the vacuum (with performance and data file reclaim tests) |
 | BC-094 | Profile memory | Profile memory usage (maybe benchmark tests that capture that) |
+| BC-125 | `WriteOptions::sync_before_visible` | Add an opt-in flag that moves `state_.store()` to after `fdatasync`, closing the visibility-before-durability window for callers that need it. Cost: forfeits SyncGroup group-commit benefit for that write. Document the trade-off clearly. |
+| BC-126 | `SyncGroup::change_state` refactor + `Options::durability_mode` | Centralise the write protocol inside `SyncGroup` via a `change_state(lambda)` interface. Policy (`VisibleBeforeDurable` / `DurableBeforeVisible`) set at `DB::open` time as `Options::durability_mode`. Eliminates scattered three-phase sequencing across `put`/`del`/`commit_batch`/`apply_batch_if`. See design doc section "Future evolution: SyncGroup::change_state". |
 | BC-095 | Robustness test suite | Robustness and correctness validation/test suite |
 | BC-096 | Document invariants | Document correctness invariants and how it's implemented |
 | BC-099 | Publish benchmarks | Run official benchmarks to share with the world. |
@@ -159,3 +160,4 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | --- | --- | --- |
 | BC-045 | `fdatasync` sealed file after rotation (async) | Archived — `fdatasync` in `rotate_active_file()` stays synchronous for correctness and simplicity. Background hint flush (BC-026) defers the expensive I/O work instead. |
 | BC-024 | Implement PMR - Memory Allocation described in design | Note: There is a draft proposal in the bytecask_design.md
+| BC-048 | Full vacuum (multi-file merge with tombstone elision) | Not doing this. Conservative single-file vacuum is sufficient.

@@ -6,36 +6,24 @@
 
 ByteCaskDB is a fast, predictable embedded key-value store written in C++ that scales to **hundreds of millions of keys** across multiple cores with flat, consistent latency.
 
-Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCaskDB replaces the original hash-table key directory with a **[persistent radix tree](docs/persistent_radix_tree_design.md)** — enabling ordered range queries, prefix scans, and prefix compaction while keeping the simplicity that makes Bitcask fast. Prefix scans are pure in-memory radix tree walks:
+Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCaskDB replaces the original hash-table key directory with a **[persistent radix tree](docs/persistent_radix_tree_design.md)** — enabling ordered range queries, prefix scans, and prefix compaction while keeping the simplicity that makes Bitcask fast. Prefix scans are pure in-memory radix tree walks — no disk I/O for key enumeration.
 
-```cpp
-// Scan all keys starting with "user:" — no disk I/O.
-for (auto& key : db.keys_from({}, to_bytes("user:"))) { ... }
-
-// Scan with values — values fetched lazily from disk.
-for (auto& [key, value] : db.iter_from({}, to_bytes("user:"))) { ... }
-```
-
-**O(1) reads and writes**: point lookups and writes take constant time regardless of database size — performance stays flat whether you have 1 000 or 100 M records. Very few moving parts (an in-memory radix tree + append-only data files) is what keeps latency predictable. O(1) snapshots are planned.
-
-> **Trade-off**: ByteCaskDB keeps all keys in memory at all times. This enables O(1) point lookups and ordered iteration without any disk I/O on the read path, but limits the number of unique keys to available RAM. At ~100 bytes per key (key data + metadata + tree overhead), 10 million keys require roughly 1 GB of RAM.
+ByteCaskDB keeps all keys in memory at all times — a deliberate design choice that removes an entire class of complexity (block caches, compaction, buffer pool tuning) and makes every point lookup O(1) with flat, predictable latency. At ~100 bytes per key, 128 GB of RAM holds roughly a billion keys. Performance stays flat whether you have 1 000 or 100 M records: very few moving parts (an in-memory radix tree + append-only data files) is what keeps latency predictable. O(1) snapshots and full MVCC are supported.
 
 ## Features
 
 - **Sequential write path** — every `put`, `del`, and `apply_batch` performs a single sequential append; no WAL, no random writes, just one I/O operation per write.
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
 - **Atomic writes** — every `put` and `del` is atomic. `apply_batch` makes multiple puts and deletes atomic as a group.
-- **Conflict-safe CAS writes** — `snapshot()` captures a point-in-time read-only view; `apply_batch_if(snap, opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. Precondition checks are cheap — all key lookups are in-memory radix tree traversals with no disk I/O. Single-key CAS with no marker overhead.
+- **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch_if(snap, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add `ensure_unchanged` / range guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms and 100 M keys in under 6 s on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
-- **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second; a single writer ensures consistent writes even under concurrent multi-threaded access.
+- **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Concurrent sync writes are amortised via group commit: when multiple writers finish their append at the same time, a single `fdatasync` covers the whole batch, keeping write throughput consistent under high concurrency.
 - **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and data files that act as a write-ahead log ensure durability.
 
 ## Performance
 
-ByteCaskDB is built around a single design bet: keep all keys in memory, always. This lets every point lookup resolve in one in-memory radix tree traversal followed by a single pread at a known file offset — no block cache churn, no compaction stalls, no indirection through SST index blocks. The trade-off is RAM: the key directory grows with the number of unique keys, not the value size.
-
-What that looks like in practice compared to [RocksDB](https://rocksdb.org/) at 1 M keys:
+Compared to [RocksDB](https://rocksdb.org/) at 1 M keys:
 
 - **Reads are 2–3× faster** when the working set exceeds RocksDB's block cache. At 50 k keys the caches are warm and RocksDB is faster; from 500 k keys onward ByteCaskDB's flat-cost lookup wins consistently. p50 Get latency is **680 ns** vs 1.57 µs; p99 is **1.15 µs** vs 3.96 µs.
 - **Concurrent reads scale linearly.** Lock-free reads reach **11 Mops/s at 32 threads** vs 8.3 Mops/s for RocksDB. Mixed read-while-write workloads show the same gap.
@@ -249,7 +237,7 @@ ByteCaskDB is designed around four core tenets, in priority order:
   └── Sealed Files   read-only .data + .hint files      (older segments)
 ```
 
-**Write path**: every `put`/`del`/`apply_batch` appends a CRC-32-verified, length-prefixed record to the active data file and updates the in-memory radix tree. No random I/O; one sequential write per operation.
+**Write path**: every `put`/`del`/`apply_batch`/`apply_batch_if` appends a CRC-32-verified, length-prefixed record to the active data file and updates the in-memory radix tree. No random I/O; one sequential write per operation.
 
 **Read path**: readers obtain an immutable snapshot of the engine state, look up the key in the radix tree to find its file and offset, then read the value directly. Reads are lock-free and scale linearly across cores.
 
