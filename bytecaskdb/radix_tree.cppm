@@ -339,6 +339,7 @@ auto make_intrusive(Args &&...args) -> IntrusivePtr<T> {
 // ---------------------------------------------------------------------------
 export template <typename V> class TransientRadixTree;
 export template <typename V> class RadixTreeIterator;
+export template <typename V> class ReverseRadixTreeIterator;
 
 // Global edit-tag counter for transient sessions.
 // Relaxed ordering: only uniqueness is required, not inter-thread visibility
@@ -591,16 +592,10 @@ public:
     return {};
   }
 
-  // WARNING: rbegin()/rend() return std::reverse_iterator whose operator*
-  // creates a temporary copy, decrements it, and dereferences. Because
-  // RadixTreeIterator::operator* returns a pair containing a span into the
-  // iterator's internal key buffer, that span dangles when the temporary is
-  // destroyed. Use these ONLY for positional queries (e.g. .base()) — never
-  // dereference them directly.
-  [[nodiscard]] auto rbegin() const
-      -> std::reverse_iterator<RadixTreeIterator<V>>;
-  [[nodiscard]] auto rend() const
-      -> std::reverse_iterator<RadixTreeIterator<V>>;
+  [[nodiscard]] auto rbegin() const -> ReverseRadixTreeIterator<V>;
+  [[nodiscard]] auto rend() const noexcept -> std::default_sentinel_t {
+    return {};
+  }
 
   [[nodiscard]] auto lower_bound(std::span<const std::byte> key) const
       -> RadixTreeIterator<V>;
@@ -608,9 +603,10 @@ public:
       -> RadixTreeIterator<V>;
 
 private:
-  // Iterator-returning end for rbegin()/rend()/upper_bound() — avoids
-  // exposing it as end() because the default_sentinel_t overload is
-  // cheaper in tight forward-iteration loops (no temporary iterator).
+  // Returns an iterator-typed end sentinel for upper_bound() and as the
+  // starting point for ReverseRadixTreeIterator construction. Not named
+  // end() to avoid shadowing the cheaper default_sentinel_t overload used
+  // in tight forward-iteration loops.
   [[nodiscard]] auto end_iter() const -> RadixTreeIterator<V>;
   IntrusivePtr<Node<V>> root_;
   std::size_t size_{0};
@@ -1608,18 +1604,68 @@ auto PersistentRadixTree<V>::end_iter() const -> RadixTreeIterator<V> {
   return RadixTreeIterator<V>{root_, std::default_sentinel};
 }
 
+// ---------------------------------------------------------------------------
+// ReverseRadixTreeIterator<V>
+//
+// Safe reverse iterator that pre-decrements from past-the-end and holds the
+// underlying RadixTreeIterator alive. operator* returns a span into the live
+// iterator's key buffer — no temporary, no dangling reference.
+// ---------------------------------------------------------------------------
+export template <typename V> class ReverseRadixTreeIterator {
+public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = std::pair<std::span<const std::byte>, V>;
+  using difference_type = std::ptrdiff_t;
+
+  explicit ReverseRadixTreeIterator(RadixTreeIterator<V> past_pos)
+      : cur_{std::move(past_pos)} {
+    --cur_; // position at the last element (or stay at end if tree is empty)
+  }
+
+  auto operator*() const
+      -> std::pair<std::span<const std::byte>, const V &> {
+    return *cur_; // span is into cur_'s live key buffer — no dangling
+  }
+
+  auto operator++() -> ReverseRadixTreeIterator & {
+    --cur_; // advance backward; retreat() sets empty stack past begin → end
+    return *this;
+  }
+
+  auto operator++(int) -> ReverseRadixTreeIterator {
+    auto tmp = *this;
+    --cur_;
+    return tmp;
+  }
+
+  auto operator==(const ReverseRadixTreeIterator &other) const noexcept
+      -> bool {
+    return cur_ == other.cur_;
+  }
+
+  // Compares against the end sentinel. True when the iterator has advanced
+  // past the first element (retreat() emptied the stack — same state as end).
+  auto operator==(std::default_sentinel_t) const noexcept -> bool {
+    return cur_ == std::default_sentinel;
+  }
+
+  // Returns the underlying forward iterator positioned one past the current
+  // element. Useful for converting a reverse starting point back to a forward
+  // iterator (e.g. passing to ReverseKeyIterator in DB::rkeys_from).
+  [[nodiscard]] auto base() const -> RadixTreeIterator<V> {
+    auto fwd = cur_;
+    ++fwd;
+    return fwd;
+  }
+
+private:
+  RadixTreeIterator<V> cur_;
+};
+
 // Out-of-line: PersistentRadixTree::rbegin()
 template <typename V>
-auto PersistentRadixTree<V>::rbegin() const
-    -> std::reverse_iterator<RadixTreeIterator<V>> {
-  return std::make_reverse_iterator(end_iter());
-}
-
-// Out-of-line: PersistentRadixTree::rend()
-template <typename V>
-auto PersistentRadixTree<V>::rend() const
-    -> std::reverse_iterator<RadixTreeIterator<V>> {
-  return std::make_reverse_iterator(begin());
+auto PersistentRadixTree<V>::rbegin() const -> ReverseRadixTreeIterator<V> {
+  return ReverseRadixTreeIterator<V>{end_iter()};
 }
 
 // Out-of-line: PersistentRadixTree::lower_bound()
