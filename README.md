@@ -4,11 +4,11 @@
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/gustavoamigo/bytecaskdb)
 
-ByteCaskDB is a fast, predictable embedded key-value store written in C++ that scales to **hundreds of millions of keys** across multiple cores with flat, consistent latency.
+**ByteCaskDB** is a fast, predictable embedded key-value store written in C++. Reads and writes have flat, predictable latency from thousands of keys to hundreds of millions.
 
-ByteCaskDB keeps all keys in memory at all times — a deliberate design choice that removes an entire class of complexity (block caches, compaction, buffer pool tuning) and makes every point lookup O(1) with flat, predictable latency. At ~100 bytes per key, 128 GB of RAM holds roughly a billion keys. Very few moving parts — an in-memory radix tree and an append-only data file — is what keeps that latency flat whether you have 1,000 records or 100 million. Full MVCC and serializable conflict detection are supported with no separate transaction type required.
+All keys in memory at all times — a deliberate design choice that removes an entire class of complexity that exists solely to minimise disk access and makes every point lookup O(1) with flat, predictable latency. At ~100 bytes per key, 128 GB of RAM holds roughly a billion keys. Very few moving parts — an in-memory radix tree and an append-only data file — is what keeps that latency flat whether you have 1,000 records or 100 million. Full MVCC and serializable conflict detection are supported with no separate transaction type required.
 
-Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCaskDB replaces the original hash-table key directory with a **[persistent radix tree](docs/persistent_radix_tree_design.md)** — enabling ordered range queries, prefix scans, and prefix compaction while keeping the simplicity that makes Bitcask fast. Prefix scans are pure in-memory radix tree walks — no disk I/O for key enumeration.
+Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCaskDB replaces the original hash-table key directory with a **[persistent radix tree](docs/persistent_radix_tree_design.md)** — enabling ordered range queries, prefix scans, and prefix compaction, while keeping the simplicity that makes Bitcask fast. Snapshots are O(1) — just a root pointer copy. Prefix scans are in-memory radix tree walks — no disk I/O for key enumeration.
 
 
 ## Features
@@ -17,20 +17,20 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
 - **Atomic writes** — every `put` and `del` is atomic. `apply_batch` makes multiple puts and deletes atomic as a group.
 - **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch_if(snap, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add `ensure_unchanged` / range guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
-- **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms and 100 M keys in under 6 s on a SATA SSD.
+- **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Concurrent sync writes are amortised via group commit: when multiple writers finish their append at the same time, a single `fdatasync` covers the whole batch, keeping write throughput consistent under high concurrency.
 - **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and data files that act as a write-ahead log ensure durability.
 
 ## Performance
 
-Compared to [RocksDB](https://rocksdb.org/) at 1 M keys:
+Benchmarked against [RocksDB](https://rocksdb.org/) at 1 M keys. The tables below have the numbers; the summary:
 
-- **Reads are 2–3× faster** when the working set exceeds RocksDB's block cache. At 50 k keys the caches are warm and RocksDB is faster; from 500 k keys onward ByteCaskDB's flat-cost lookup wins consistently. p50 Get latency is **680 ns** vs 1.57 µs; p99 is **1.15 µs** vs 3.96 µs.
-- **Concurrent reads scale linearly.** Lock-free reads reach **11 Mops/s at 32 threads** vs 8.3 Mops/s for RocksDB. Mixed read-while-write workloads show the same gap.
-- **Sequential writes are comparable.** Both engines perform sequential appends; throughput is within ±10 % across all write benchmarks. ByteCaskDB does not have write amplification from compaction, so Sync Delete is **2×** faster.
-- **Range scans over values are slower.** ByteCaskDB must read each value from disk individually; RocksDB prefetches sequential blocks. For key-only iteration (`keys_from`) ByteCaskDB wins — it is a pure in-memory radix tree walk with no disk I/O.
-- **Recovery is fast and parallel.** On restart, ByteCaskDB rebuilds the in-memory key directory by replaying compact hint files in parallel across all available cores, with full CRC verification. At 16 threads: 1 M keys recover in **~60 ms**, 10 M in **~580 ms**. Extrapolating linearly, 100 M keys recover in roughly **~6 s** and 1 B keys in roughly **~60 s** — both with CRC validation of every byte on disk.
+- **Reads are 2–3× faster** once the working set exceeds RocksDB's block cache (from ~500 k keys onward).
+- **Concurrent reads scale linearly** — lock-free snapshots, no shared mutex.
+- **Sequential writes are comparable** — both engines append; ±10 % across all write benchmarks. No write amplification from compaction, so Sync Delete is 2× faster.
+- **Range scans over values are slower** — each value is a separate disk read. Key-only iteration (`keys_from`) is a pure in-memory tree walk.
+- **Recovery is fast and parallel** — hint files replayed across all cores with full CRC verification. 1 M keys in ~60 ms, 10 M in ~580 ms at 16 threads.
 
 See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md) for the full benchmark report with all thread counts, dataset sizes, and hardware details.
 
