@@ -310,6 +310,9 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
         // Isolate the orphaned BulkBegin: subsequent writes to this
         // file would be treated as part of the incomplete batch by
         // flush_hints_for and silently discarded on recovery.
+        // Sync before sealing so earlier slots' writes in this
+        // WriteGroup batch are durable on the file being sealed.
+        try { s.active_file().sync(); } catch (...) {}
         s = rotate_active_file(std::move(s));
       }
       throw;
@@ -481,9 +484,12 @@ auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
           // Isolate the orphaned BulkBegin: subsequent writes to this
           // file would be treated as part of the incomplete batch by
           // flush_hints_for and silently discarded on recovery.
-          // Unlike apply_batch (which runs inside a WriteGroup lambda
-          // where execute_write_batch publishes state), the solo path
-          // must publish the rotated state directly.
+          // Sync before sealing so earlier writes are durable on the
+          // file being sealed. Unlike apply_batch (which runs inside
+          // a WriteGroup lambda where execute_write_batch publishes
+          // state), the solo path must publish the rotated state
+          // directly.
+          try { s.active_file().sync(); } catch (...) {}
           s = rotate_active_file(std::move(s));
           state_.store(std::make_shared<EngineState>(std::move(s)));
           state_time_.store(now_ns(), std::memory_order_release);
