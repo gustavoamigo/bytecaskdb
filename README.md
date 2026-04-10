@@ -6,9 +6,10 @@
 
 ByteCaskDB is a fast, predictable embedded key-value store written in C++ that scales to **hundreds of millions of keys** across multiple cores with flat, consistent latency.
 
+ByteCaskDB keeps all keys in memory at all times — a deliberate design choice that removes an entire class of complexity (block caches, compaction, buffer pool tuning) and makes every point lookup O(1) with flat, predictable latency. At ~100 bytes per key, 128 GB of RAM holds roughly a billion keys. Very few moving parts — an in-memory radix tree and an append-only data file — is what keeps that latency flat whether you have 1,000 records or 100 million. Full MVCC and serializable conflict detection are supported with no separate transaction type required.
+
 Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCaskDB replaces the original hash-table key directory with a **[persistent radix tree](docs/persistent_radix_tree_design.md)** — enabling ordered range queries, prefix scans, and prefix compaction while keeping the simplicity that makes Bitcask fast. Prefix scans are pure in-memory radix tree walks — no disk I/O for key enumeration.
 
-ByteCaskDB keeps all keys in memory at all times — a deliberate design choice that removes an entire class of complexity (block caches, compaction, buffer pool tuning) and makes every point lookup O(1) with flat, predictable latency. At ~100 bytes per key, 128 GB of RAM holds roughly a billion keys. Performance stays flat whether you have 1 000 or 100 M records: very few moving parts (an in-memory radix tree + append-only data files) is what keeps latency predictable. O(1) snapshots and full MVCC are supported.
 
 ## Features
 
