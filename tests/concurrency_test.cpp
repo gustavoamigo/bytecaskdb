@@ -165,25 +165,44 @@ TEST_CASE("WriteGroup remains usable after executor exception", "[concurrency]")
 
 TEST_CASE("WriteGroup executor throw propagates to all waiting slots",
           "[concurrency]") {
-  // If the executor itself throws (not per-slot err), leader_loop must
-  // propagate the exception to every queued slot rather than deadlocking.
+  // Multiple concurrent submitters must all receive the exception when the
+  // executor throws, rather than deadlocking.
+  constexpr int kSubmitters = 3;
   bytecask::WriteGroup wg{[][[noreturn]](std::vector<bytecask::WriteGroup::Slot *> & /*batch*/) {
+    std::this_thread::sleep_for(50ms);
     throw std::runtime_error("executor boom");
   }};
 
-  bytecask::WriteGroup::Slot slot;
-  slot.sync = false;
-  CHECK_THROWS_AS(wg.submit(slot), std::runtime_error);
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+  std::atomic<int> threw{0};
+  std::vector<std::thread> threads;
+  threads.reserve(kSubmitters);
+  for (int i = 0; i < kSubmitters; ++i) {
+    threads.emplace_back([&] {
+      bytecask::WriteGroup::Slot slot;
+      slot.sync = false;
+      ++ready;
+      while (!start.load()) {
+        std::this_thread::yield();
+      }
+      try {
+        wg.submit(slot);
+      } catch (const std::runtime_error &) {
+        ++threw;
+      }
+    });
+  }
 
-  // WriteGroup should remain usable after the failure.
-  std::atomic<int> ok{0};
-  bytecask::WriteGroup wg2{[&](std::vector<bytecask::WriteGroup::Slot *> & /*batch*/) {
-    ++ok;
-  }};
-  bytecask::WriteGroup::Slot slot2;
-  slot2.sync = false;
-  wg2.submit(slot2);
-  CHECK(ok.load() == 1);
+  while (ready.load() != kSubmitters) {
+    std::this_thread::yield();
+  }
+  start.store(true);
+
+  for (auto &thread : threads) {
+    thread.join();
+  }
+  CHECK(threw.load() == kSubmitters);
 }
 
 TEST_CASE("WriteGroup aborted slots receive WriteGroupAborted", "[concurrency]") {

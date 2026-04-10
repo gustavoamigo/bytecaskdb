@@ -42,7 +42,6 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-092 | UUIDv4 test | Test and protections if customers use UUIDv4 as key (Maybe we will need a Adaptive Radix Tree extension) |
 | BC-093 | Vacuum benchmarks | Add benchmark tests for the vacuum (with performance and data file reclaim tests) |
 | BC-094 | Profile memory | Profile memory usage (maybe benchmark tests that capture that) |
-
 | BC-095 | Robustness test suite | Robustness and correctness validation/test suite |
 | BC-096 | Document invariants | Document correctness invariants and how it's implemented |
 | BC-099 | Publish benchmarks | Run official benchmarks to share with the world. |
@@ -53,6 +52,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | --- | --- | --- |
 | BC-126 | WriteGroup — leader-applies-all write batching | Replaced `SyncGroup` with `WriteGroup` (Template Method pattern): generic skeleton in `concurrency.cppm`, engine-specific `execute_write_batch` on DB. Leader collects concurrent writers, executes all on shared `TransientRadixTree`, single `fdatasync` + `state_.store`. Durable-before-visible. PutMT/Sync@16T: 2,499 → 4,248 ops/s (+70%). 167 tests pass. |
 | BC-128 | IO-before-mutation fix for `put`, `del`, `apply_batch_if` | Fixed `file_stats_` consistency bug: `put` and `del` lambdas mutated `file_stats_` before `append()`, so an I/O exception left stats permanently stale. Reordered all write-path lambdas to two-phase (I/O first, then in-memory mutations). Also fixed `apply_batch_if`'s inline batch path to use the same deferred two-phase pattern as `apply_batch`. Design doc updated with uniform IO-before-mutation invariant. |
+| BC-129 | IO-before-mutation fix for bulk markers | Fixed `BulkBegin`/`BulkEnd` markers in `apply_batch` and `apply_batch_if`: `stats_publish_bulk_marker()` and `next_lsn++` were executed before the `append()` call, so an I/O exception left stats/LSN advanced without a corresponding on-disk entry. Reordered to append first, then mutate. |
 | BC-127 | Sync README and design doc with writing guidelines | Rewrote intro (transactions surfaced early), trimmed Performance prose (tables prove the numbers), removed extrapolated 100M recovery claim, reframed "Fundamental Trade-off" as "Core design choice" in design doc. |
 | BC-113 | Static library build target with -fPIC | `xmake.lua` `bytecask` target builds `libbytecask.a` with `add_cxxflags("-fPIC", {force=true})` so the archive can link into a shared object (e.g. MariaDB plugin). |
 | BC-112 | C API wrapper / stable ABI header | `include/bytecask_c.h` + `src/bytecask_c.cpp` — flat `extern "C"` API with opaque `bytecask_db_t*` and `bytecask_iter_t*` handles. Compiles cleanly. |

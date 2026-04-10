@@ -253,9 +253,11 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
   slot.fn = [&](EngineState &s, TransientRadixTree<KeyDirEntry> &t) {
     const bool multi = batch.size() > 1;
     if (multi) {
-      stats_publish_bulk_marker(s.active_file_id);
+      const auto bulk_begin_lsn = s.next_lsn;
       std::ignore =
-          s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
+          s.active_file().append(bulk_begin_lsn, EntryType::BulkBegin, {}, {});
+      stats_publish_bulk_marker(s.active_file_id);
+      ++s.next_lsn;
     }
 
     // Phase 1: ALL I/O — can throw, exits cleanly (no mutations yet).
@@ -293,9 +295,11 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
     }
 
     if (multi) {
-      stats_publish_bulk_marker(s.active_file_id);
+      const auto bulk_end_lsn = s.next_lsn;
       std::ignore =
-          s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
+          s.active_file().append(bulk_end_lsn, EntryType::BulkEnd, {}, {});
+      stats_publish_bulk_marker(s.active_file_id);
+      ++s.next_lsn;
     }
 
     // Phase 2: ALL mutations — pure in-memory, cannot fail.
@@ -409,9 +413,11 @@ auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
       auto s = *current;
       const bool multi = batch.size() > 1;
       if (multi) {
-        stats_publish_bulk_marker(s.active_file_id);
+        const auto bulk_begin_lsn = s.next_lsn;
         std::ignore =
-            s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
+            s.active_file().append(bulk_begin_lsn, EntryType::BulkBegin, {}, {});
+        stats_publish_bulk_marker(s.active_file_id);
+        ++s.next_lsn;
       }
 
       // Phase 1: ALL I/O — can throw without corrupting in-memory state.
@@ -448,9 +454,11 @@ auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
       }
 
       if (multi) {
-        stats_publish_bulk_marker(s.active_file_id);
+        const auto bulk_end_lsn = s.next_lsn;
         std::ignore =
-            s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
+            s.active_file().append(bulk_end_lsn, EntryType::BulkEnd, {}, {});
+        ++s.next_lsn;
+        stats_publish_bulk_marker(s.active_file_id);
       }
 
       // Phase 2: ALL mutations — pure in-memory, cannot fail.
