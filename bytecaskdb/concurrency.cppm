@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — reader-writer lock and epoch-based memory reclamation
+
 module;
 #include <condition_variable>
 #include <cstddef>

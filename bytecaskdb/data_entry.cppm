@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — on-disk data entry layout and CRC validation
+
 module;
 #include <array>
 #include <cstddef>

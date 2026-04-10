@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Gustavo Amigo
+//
 // row_encoding.cc — Row encoding implementation (Phase 1: raw buffer copy).
 
 #include "row_encoding.h"
