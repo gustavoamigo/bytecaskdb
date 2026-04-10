@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
 // bytecask_c.h — Stable C API for ByteCaskDB.
 //
 // This header provides a flat extern "C" interface over the C++23 module-based

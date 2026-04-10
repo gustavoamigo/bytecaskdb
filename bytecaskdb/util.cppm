@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — filesystem utilities, RNG helpers, and string formatting
+
 module;
 #include <cstddef>
 #include <cstdint>

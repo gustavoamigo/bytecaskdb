@@ -1,9 +1,14 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
 // bytecask_c.cpp — C API implementation for ByteCaskDB.
 //
-// This translation unit bridges the stable C API (include/bytecask_c.h) to
-// the C++23 module-based engine.  It is compiled into libbytecask.a so that
-// out-of-tree consumers only need to include the C header and link the
-// archive — no C++23 module imports required on their side.
+// Contains no MariaDB headers. Bridges the stable C API (include/bytecask_c.h)
+// to the C++23 module-based engine.
+//
+// Build note: this file is compiled by mariadb/CMakeLists.txt as part of the
+// plugin — NOT by xmake. This is intentional: it keeps libbytecask.a free of
+// C ABI symbols so that the test suite links against a pure C++23 engine.
 
 #include <cstddef>
 #include <cstdlib>

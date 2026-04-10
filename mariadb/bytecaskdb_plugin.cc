@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Gustavo Amigo
+//
 // bytecaskdb_plugin.cc — MariaDB plugin registration for ByteCaskDB.
 //
 // Implements the handlerton lifecycle:

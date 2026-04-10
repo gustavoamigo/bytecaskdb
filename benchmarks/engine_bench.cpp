@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — engine benchmarks: throughput and latency vs RocksDB
+
 // Benchmarks comparing ByteCaskDB against LevelDB and RocksDB across:
 //  - Put throughput (ops/µs)
 //  - Get throughput (ops/µs)

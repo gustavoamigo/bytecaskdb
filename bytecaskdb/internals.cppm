@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — internal engine types shared across implementation units
+
 module;
 #include <algorithm>
 #include <cstddef>

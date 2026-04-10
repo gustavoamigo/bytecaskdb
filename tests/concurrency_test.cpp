@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — concurrency stress tests for reader-writer lock and epoch reclamation
+
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>

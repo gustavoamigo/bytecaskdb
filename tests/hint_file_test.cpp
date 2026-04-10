@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — unit tests for hint file writing and recovery parsing
+
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <cstddef>

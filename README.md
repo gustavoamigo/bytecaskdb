@@ -293,4 +293,9 @@ If you want to take it in a different direction and fork it into your own thing,
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+ByteCaskDB is dual-licensed:
+
+- **MIT** — core engine (`src/`, `include/`, `tests/`, `benchmarks/`). See [`LICENSE`](LICENSE).
+- **GPL-2.0-only** — MariaDB plugin (`mariadb/`). Required by the MariaDB plugin API.
+
+See [`docs/project_organization.md`](docs/project_organization.md) for the full license boundary and rationale.

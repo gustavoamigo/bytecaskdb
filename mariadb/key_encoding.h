@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Gustavo Amigo
+//
 // key_encoding.h — Primary key encoding for ByteCaskDB / MariaDB plugin.
 //
 // All keys stored in the global ByteCaskDB instance are prefixed with a

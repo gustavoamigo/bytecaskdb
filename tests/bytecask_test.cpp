@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — integration and model-based correctness tests
+
 #include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>

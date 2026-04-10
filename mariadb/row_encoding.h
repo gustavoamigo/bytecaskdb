@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Gustavo Amigo
+//
 // row_encoding.h — Row encoding for the ByteCaskDB / MariaDB plugin.
 //
 // Phase 1 strategy: store MariaDB's raw internal row buffer directly as the

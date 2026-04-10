@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — C++23 module interface: public API surface for the storage engine
+
 module;
 #include <atomic>
 #include <chrono>

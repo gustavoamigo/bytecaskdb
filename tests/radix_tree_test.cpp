@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — unit tests for the adaptive radix tree
+
 #include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>

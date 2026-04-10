@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Gustavo Amigo
+//
 // ha_bytecaskdb.h — MariaDB storage engine handler for ByteCaskDB.
 //
 // Phase 1 scope: CREATE TABLE, INSERT, SELECT *, DROP TABLE.

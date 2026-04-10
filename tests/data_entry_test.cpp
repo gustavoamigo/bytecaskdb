@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — unit tests for on-disk data entry encoding and CRC
+
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <cstddef>

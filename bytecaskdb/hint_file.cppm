@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — hint file writing and sequential recovery scan
+
 module;
 #include <algorithm>
 #include <cerrno>
