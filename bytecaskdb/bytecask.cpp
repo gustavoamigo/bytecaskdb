@@ -476,6 +476,9 @@ auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
         }
       }
 
+      // Commit phase: persistent() → rotate → sync → publish.
+      // If sync/publish throws, file_stats_ may drift until next recovery
+      // (rebuilt from disk on open, so the inconsistency is bounded).
       s.key_dir = std::move(t).persistent();
       s = rotate_if_needed(std::move(s));
       if (opts.sync) {
@@ -1031,13 +1034,30 @@ void DB::execute_write_batch(std::vector<WriteGroup::Slot *> &batch) {
     }
   }
 
-  s.key_dir = std::move(t).persistent();
-  s = rotate_if_needed(std::move(s));
-  if (any_sync) {
-    s.active_file().sync();
+  // Commit phase: persistent() → rotate → sync → publish.
+  // If any step throws, propagate the error to all slots that ran.
+  // file_stats_ may drift from published state until the next recovery
+  // (it is rebuilt from disk on open, so the inconsistency is bounded).
+  try {
+    s.key_dir = std::move(t).persistent();
+    s = rotate_if_needed(std::move(s));
+    if (any_sync) {
+      s.active_file().sync();
+    }
+    state_.store(std::make_shared<EngineState>(std::move(s)));
+    state_time_.store(now_ns(), std::memory_order_release);
+  } catch (...) {
+    auto commit_err = std::current_exception();
+    for (std::size_t i = 0; i < completed; ++i) {
+      batch[i]->err = commit_err;
+    }
+    for (auto i = completed + 1; i < batch.size(); ++i) {
+      if (batch[i]->err == nullptr) {
+        batch[i]->err = std::make_exception_ptr(WriteGroupAborted{});
+      }
+    }
+    throw;
   }
-  state_.store(std::make_shared<EngineState>(std::move(s)));
-  state_time_.store(now_ns(), std::memory_order_release);
 
   // Mark unexecuted slots as aborted.
   for (auto i = completed + 1; i < batch.size(); ++i) {

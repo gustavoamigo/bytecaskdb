@@ -430,6 +430,29 @@ This is safe because:
   the missing `BulkEnd` causes recovery to discard the incomplete batch.
 - Lambdas K+1..N-1 were never executed — no I/O, no mutations.
 
+###### Commit-phase exception safety
+
+The commit phase runs *after* all lambda I/O and mutations:
+`persistent()` → `rotate_if_needed()` → `fdatasync` → `state_.store()`.
+If any of these steps throws (e.g. `fdatasync` returns EIO), all data
+from lambdas 0..K-1 is already appended to the data file and
+`file_stats_` has already been mutated, but `state_.store()` never ran.
+
+`execute_write_batch` wraps the commit phase in try/catch:
+- Every completed slot receives the commit exception.
+- Unexecuted slots receive `WriteGroupAborted`.
+- The exception propagates to the leader thread (and through
+  `leader_loop`'s existing catch to all waiting slots).
+
+The `apply_batch_if` solo path lets the commit exception propagate to
+the caller naturally.
+
+**`file_stats_` consistency.** In both paths, `file_stats_` may drift
+from the published `EngineState` after a commit-phase failure. This is
+acceptable because `file_stats_` is advisory (used only for compaction
+heuristics) and is rebuilt from disk on the next `DB::open`. No user
+data is lost or corrupted — appended entries are visible on recovery.
+
 ###### `sync` flag aggregation
 
 Each submitted lambda carries its caller's `opts.sync` flag. The leader
@@ -644,13 +667,18 @@ held during I/O** — only for the O(1) swap to drain and the O(N) wake.
        try { static_cast<EngineSlot*>(slot)->fn(s, t);
              any_sync |= slot->sync; ++completed; }
        catch { slot->err = current_exception(); break; }
-  5. s.key_dir = move(t).persistent().
-  6. s = rotate_if_needed(move(s)).
-  7. If any_sync: active_file.sync().           ← single fdatasync
-  8. state_.store(make_shared<EngineState>(move(s))).
-  9. state_time_.store(now, release).
-  10. For slots completed+1..end: slot->err = WriteGroupAborted{}.
-  11. Unlock write_mu_.
+  5. try:
+       s.key_dir = move(t).persistent().
+       s = rotate_if_needed(move(s)).
+       If any_sync: active_file.sync().         ← single fdatasync
+       state_.store(make_shared<EngineState>(move(s))).
+       state_time_.store(now, release).
+     catch:
+       For slots 0..completed-1: slot->err = commit_exception.
+       For slots completed+1..end: slot->err = WriteGroupAborted{}.
+       rethrow.
+  6. For slots completed+1..end: slot->err = WriteGroupAborted{}.
+  7. Unlock write_mu_.
 ```
 
 **Solo writer interaction.** Solo writers (`apply_batch_if`,
