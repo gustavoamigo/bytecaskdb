@@ -225,7 +225,7 @@ ByteCaskDB is designed around four core tenets, in priority order:
 1. **Correctness** — data integrity above all else.
 2. **Simplicity** — few moving parts; the design is easy to understand and maintain.
 3. **Predictable latency over peak throughput** — bounded, flat write latency at every scale. A steady 1 ms per write is preferable to an average 0.1 ms with occasional 500 ms spikes.
-4. **Performance** — optimisations are pursued only when they do not compromise correctness or simplicity.
+4. **Performance** — optimisations require a real use case. Without one, correctness and simplicity take priority.
 
 ### Components
 
