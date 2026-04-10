@@ -156,6 +156,37 @@ private:
 - **Missing `[[noreturn]]` on lambdas** (`-Wmissing-noreturn`): Add `[[noreturn]]` to lambdas that unconditionally throw: `[][[noreturn]] { throw ...; }`.
 - **Unused functions/variables** (`-Wunused-function`, `-Wunused-variable`): Remove helper functions and variables that are no longer referenced after a refactor rather than leaving them in place.
 
+## Documentation writing guidelines
+
+- Write for the audience, not for completeness. If the reader can infer it, don't say it.
+- Plain, direct, technical prose. No marketing language.
+- Short sentences over long ones when making a key claim.
+- Don't repeat a claim in prose that a benchmark or example already proves.
+- Don't pre-empt criticisms with defensive explanations. The right data point makes the point silently.
+- Be honest about weaknesses. Acknowledging a real limitation earns more trust than hiding it.
+- Don't extrapolate benchmark results beyond what has actually been measured.
+
+## README guidelines
+
+The README targets an experienced systems/database engineering audience. They know what block caches, compaction, and B-tree rebalancing are. They will scroll past the intro to check for transactions. Write accordingly.
+
+**Framing**
+- The core argument is that ByteCaskDB is designed for current hardware reality, not a reaction against other engines. Don't frame it as LSM vs B-tree vs Bitcask. Frame it as: what would you design if you started today?
+- Never use "trade-off" framing that implicitly accepts disk-based designs as the neutral default.
+- Make the point and move on. This is not a court trial.
+
+**Intro section must answer, in order:**
+1. What is it?
+2. What is the core design bet and why?
+3. How much RAM does that actually require?
+4. Does it support transactions?
+
+**Specific rules**
+- Avoid repeating the project name unnecessarily within the same paragraph.
+- Don't claim scale properties in prose that the benchmark tables already prove.
+- Don't extrapolate benchmark results beyond what has been measured. If a number hasn't been benchmarked, don't publish it.
+- Weaknesses belong in the README. The range scan caveat stays.
+
 ## Tips
 
 * xmake can take a while to run, wait for the build to run before trying to do something else. 
