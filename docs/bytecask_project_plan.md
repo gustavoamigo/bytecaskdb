@@ -52,6 +52,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-127 | Sync README and design doc with writing guidelines | Rewrote intro (transactions surfaced early), trimmed Performance prose (tables prove the numbers), removed extrapolated 100M recovery claim, reframed "Fundamental Trade-off" as "Core design choice" in design doc. |
 | BC-113 | Static library build target with -fPIC | `xmake.lua` `bytecask` target builds `libbytecask.a` with `add_cxxflags("-fPIC", {force=true})` so the archive can link into a shared object (e.g. MariaDB plugin). |
 | BC-112 | C API wrapper / stable ABI header | `include/bytecask_c.h` + `src/bytecask_c.cpp` — flat `extern "C"` API with opaque `bytecask_db_t*` and `bytecask_iter_t*` handles. Compiles cleanly. |
 | BC-111 | MariaDB Phase 1 — POC plugin builds and smoke-tested | Plugin compiles and links (`ha_bytecaskdb.so`). Switched descriptor to `maria_declare_plugin` with `MariaDB_PLUGIN_MATURITY_GAMMA`. Full smoke test passes: `INSTALL PLUGIN` → `CREATE TABLE` → `INSERT` → `SELECT` → `DROP TABLE` → `UNINSTALL PLUGIN`. |
