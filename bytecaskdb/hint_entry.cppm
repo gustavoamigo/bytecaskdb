@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — compact hint entry encoding for accelerated recovery
+
 module;
 #include <cstddef>
 #include <cstdint>

@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — engine implementation: open, close, read, write, recovery, compaction
+
 module;
 #include <algorithm>
 #include <atomic>

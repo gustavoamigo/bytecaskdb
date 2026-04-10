@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — benchmarks for the adaptive radix tree and ordered map structures
+
 #include <atomic>
 #include <benchmark/benchmark.h>
 #include <cstddef>

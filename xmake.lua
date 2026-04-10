@@ -53,7 +53,7 @@ add_cxflags(table.unpack(common_flags))
 target("bytecask_tests")
     set_kind("binary")
     -- For VS Code / clangd support, run: scripts/gen_compile_commands.sh
-    add_files("tests/*.cpp", "src/*.cppm", "src/bytecask.cpp")
+    add_files("tests/*.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
     add_packages("catch2", "crc32c")
     add_defines("BYTECASK_TESTING")
     on_load(apply_sanitizer)
@@ -61,7 +61,7 @@ target("bytecask_tests")
 target("bytecask_bench")
     set_kind("binary")
     set_default(false)
-    add_files("benchmarks/map_bench.cpp", "src/*.cppm", "src/bytecask.cpp")
+    add_files("benchmarks/map_bench.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
     add_cxflags("-Wno-global-constructors")
     add_packages("benchmark", "crc32c")
     add_defines("BYTECASK_TESTING")
@@ -70,7 +70,7 @@ target("bytecask_bench")
 target("engine_bench")
     set_kind("binary")
     set_default(false)
-    add_files("benchmarks/engine_bench.cpp", "src/*.cppm", "src/bytecask.cpp")
+    add_files("benchmarks/engine_bench.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
     add_cxflags("-Wno-global-constructors")
     add_packages("benchmark", "crc32c", "leveldb", "rocksdb")
     on_load(apply_sanitizer)
@@ -80,11 +80,15 @@ target("engine_bench")
 -- Note: C++23 module BMIs are not portable across translation units that
 -- import them without the matching toolchain; the MariaDB plugin instead
 -- uses the stable header-based C API in include/bytecask_c.h.
+--
+-- Note: src/bytecask_c.cpp is intentionally excluded here.
+-- It is MIT-clean but compiled by mariadb/CMakeLists.txt only,
+-- keeping libbytecask.a free of C ABI symbols for pure C++23 tests.
 target("bytecask")
     set_kind("static")
     set_default(false)
     add_cxxflags("-fPIC", {force = true})  -- required when linking into a shared object (e.g. MariaDB plugin)
-    add_files("src/*.cppm", "src/bytecask.cpp", "src/bytecask_c.cpp")
+    add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
     add_packages("crc32c")
     on_load(apply_sanitizer)
 

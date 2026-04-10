@@ -113,6 +113,8 @@ add_library(ha_bytecaskdb MODULE
   bytecaskdb_plugin.cc
   key_encoding.cc
   row_encoding.cc
+  # C ABI bridge — MIT-clean; compiled here so libbytecask.a stays free of C symbols.
+  "${BYTECASK_ROOT}/src/bytecask_c.cpp"
 )
 
 target_include_directories(ha_bytecaskdb PRIVATE

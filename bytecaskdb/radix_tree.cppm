@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — lock-free adaptive radix tree for the in-memory key index
+
 module;
 #include <algorithm>
 #include <atomic>

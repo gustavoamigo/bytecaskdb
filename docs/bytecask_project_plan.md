@@ -29,7 +29,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-116 | MariaDB Phase 3 — L2 Transaction + statement atomicity | Internal `MariaDBTxn` class on top of `snapshot()` + `apply_batch_if()`. `hton->commit/rollback`. OCC conflict → `HA_ERR_LOCK_DEADLOCK`. |
 | BC-117 | MariaDB Phase 4 — Secondary indexes | Key encoding `[index_id][sec_key][pk]`, atomic primary+secondary writes, `index_read/next/prev`. |
 | BC-118 | MariaDB Phase 5 — MVCC + lockless architecture | `HTON_MVCC`, `HTON_NO_LOCK_MANAGER`, `start_consistent_snapshot()`. |
-| BC-119 | MariaDB Phase 6 — Replication + backup hooks | 2PC `prepare`, XA `recover`, `backup_stage` hooks. |
+| BC-120 | MariaDB Phase 6 — Replication + backup hooks | 2PC `prepare`, XA `recover`, `backup_stage` hooks. |
 
 ### Core Engine
 
@@ -60,6 +60,8 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-104 | `WritePlan` type: split `Batch` from `apply_batch_if` | New `WritePlan` type with composable guards (`ensure_present`/`ensure_absent`/`ensure_unchanged`/`ensure_range_unchanged`) + writes (`put`/`del`) for `apply_batch_if`. `Batch` stays as-is for `apply_batch`. Guards and writes merged per-key into `KeyAction`. `apply_batch_if` returns `bool` (false on conflict) instead of throwing. Shared `commit_batch` helper. `BatchConflict` removed. 25 `[apply_batch_if]` tests. README, design doc, and project plan updated. |
 | BC-103 | Layer 1: `snapshot()` and `apply_batch_if()` | Added `DB::snapshot()` → `Snapshot` (frozen read-only view, lock-free reads, auto vacuum deferral) and `DB::apply_batch_if()` (W-W CAS under `write_mu_`, short-circuits on first conflict, throws `BatchConflict`). Single-entry batch optimization skips `BulkBegin`/`BulkEnd` markers for both `apply_batch` and `apply_batch_if`. 13 new tests (5 `[snapshot]`, 8 `[apply_batch_if]`). 120 test cases total. |
 | --- | --- | --- |
+| BC-121 | `src/` → `bytecaskdb/` rename + CMakeLists fix | Engine C++23 module sources moved from `src/` to `bytecaskdb/`. `xmake.lua` updated across all four targets. `${BYTECASK_ROOT}/src/bytecask_c.cpp` added to `mariadb/CMakeLists.txt` plugin sources. `docs/project_organization.md` now reflects actual layout. |
+| BC-119 | Dual-license structure + SPDX headers | `mariadb/` is `GPL-2.0-only` (MariaDB plugin API boundary); all other sources are MIT. SPDX-License-Identifier on every source file. License boundary, SPDX convention, and build separation documented in `docs/project_organization.md`. |
 | BC-101 | Replace `sys-info.sh` memory usage with installed RAM summary | Removed the `free -h` OS usage view. The script now prints a single installed-RAM line from `/proc/meminfo`, avoiding privileged SMBIOS/DIMM probing while still describing machine capacity. |
 | BC-100 | Scope `sys-info.sh` disk output to current path | `scripts/sys-info.sh` now resolves `findmnt --target "$PWD"`, strips subvolume suffixes such as `[/home]`, maps partitions to their parent disk with `lsblk -no PKNAME`, and prints only the backing device for the current path. |
 | BC-098 | Open source license | Added MIT `LICENSE` file. |

@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — append-only data file writes and random-access reads
+
 module;
 #include <array>
 #include <cassert>

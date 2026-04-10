@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// ByteCaskDB — binary encoding helpers for the on-disk log format
+
 module;
 #include <cstddef>
 #include <cstdint>
