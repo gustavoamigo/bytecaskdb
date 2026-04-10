@@ -69,6 +69,8 @@ public:
   // Rethrows the caller's own exception or WriteGroupAborted.
   void submit(Slot &slot) {
     std::unique_lock<std::mutex> lk{queue_mu_};
+    slot.done = false;
+    slot.err = nullptr;
     queue_.push_back(&slot);
 
     if (!leader_active_) {
@@ -96,7 +98,16 @@ private:
         batch.swap(queue_);
       }
 
-      executor_(batch);
+      try {
+        executor_(batch);
+      } catch (...) {
+        // Executor threw without setting per-slot errors.
+        // Record the exception on every slot that has no error yet.
+        auto ex = std::current_exception();
+        for (auto *s : batch) {
+          if (!s->err) s->err = ex;
+        }
+      }
 
       {
         std::unique_lock<std::mutex> lk{queue_mu_};

@@ -285,11 +285,13 @@ leader thread under `write_mu_`), no synchronisation is needed.
 
 ```cpp
 write_group_.submit(opts.sync, [&](EngineState& s, auto& t) {
+  // Phase 1: I/O — can throw without corrupting in-memory state.
+  const auto offset =
+      s.active_file().append(s.next_lsn, EntryType::Put, key, value);
+  // Phase 2: in-memory mutations — cannot fail.
   const auto existing = t.get(key);
   if (existing) stats_retire_entry(key, *existing);
   stats_publish_put(s.active_file_id, key, value);
-  const auto offset =
-      s.active_file().append(s.next_lsn, EntryType::Put, key, value);
   t.set(key, KeyDirEntry{s.next_lsn, s.active_file_id, offset,
                          narrow<uint32_t>(value.size())});
   ++s.next_lsn;
@@ -302,10 +304,12 @@ write_group_.submit(opts.sync, [&](EngineState& s, auto& t) {
 write_group_.submit(opts.sync, [&](EngineState& s, auto& t) {
   const auto existing = t.get(key);
   if (!existing) { /* signal not-found to caller */ return; }
-  stats_retire_entry(key, *existing);
-  stats_publish_tombstone(s.active_file_id, key);
+  // Phase 1: I/O — can throw without corrupting in-memory state.
   std::ignore =
       s.active_file().append(s.next_lsn, EntryType::Delete, key, {});
+  // Phase 2: in-memory mutations — cannot fail.
+  stats_retire_entry(key, *existing);
+  stats_publish_tombstone(s.active_file_id, key);
   ++s.next_lsn;
   t.erase(key);
 });
@@ -381,19 +385,24 @@ safety.
 
 ###### IO-before-mutation invariant
 
-Within each lambda, I/O (`writev`) happens before tree mutations
-(`t.set` / `t.erase`). This is the fundamental exception safety
-guarantee:
+Every write-path lambda follows the same two-phase structure:
 
-- If `writev` throws at operation K, no tree mutations from operations
-  0..K have occurred. The transient reflects only the mutations from
-  previously completed lambdas (0..N-1).
-- The leader commits whatever succeeded: `persistent()` on the transient
-  produces a tree consistent with all completed I/O.
-- For `apply_batch`: if `writev` fails mid-batch, no `BulkEnd` was
-  written. Recovery discards the incomplete batch (standard batch-aware
-  recovery). No tree mutations from the failed batch have occurred, so
-  the committed transient is consistent.
+- **Phase 1 (I/O):** `writev` to the active data file. This is the only
+  step that can throw (`std::system_error` on I/O failure).
+- **Phase 2 (mutations):** `stats_retire_entry`, `stats_publish_*`,
+  `t.set` / `t.erase`, `++next_lsn`. These are pure in-memory
+  operations that cannot fail.
+
+This ordering guarantees that if I/O throws at operation K, no in-memory
+state (`key_dir`, `file_stats_`, `next_lsn`) has been mutated for
+operation K. The transient reflects only the mutations from previously
+completed lambdas (0..K-1).
+
+`put` and `del` follow this pattern for single entries. `apply_batch`
+extends it to N entries: Phase 1 does **all** `writev` calls and
+collects results in a `Deferred` vector, then Phase 2 replays all
+mutations in order. `apply_batch_if` uses the same two-phase
+structure for its inline batch commit path.
 
 No rollback logic is needed. The transient is always exactly "one step
 behind" the I/O — it reflects all operations whose I/O completed
@@ -483,11 +492,12 @@ return existed;
 
 ###### Interaction with file rotation
 
-`rotate_if_needed` runs once after all lambdas complete, before
-`persistent()` and `state_.store()`. The leader checks whether the
-active file has exceeded the rotation threshold and, if so, seals it
-and opens a new one. This means all lambdas in a batch write to the
-same active file. File rotation happens at most once per batch.
+`rotate_if_needed` runs once after all lambdas complete, after
+`persistent()` and before `state_.store()`. The leader checks whether
+the active file has exceeded the rotation threshold and, if so, seals
+it and opens a new one for subsequent batches. This means all lambdas
+in a batch write to the same active file. File rotation happens at most
+once per batch.
 
 ###### Durability ordering
 

@@ -514,6 +514,8 @@ private:
   // Records a new Put entry: live + total on the active file.
   void stats_publish_put(std::uint32_t active_file_id, BytesView key,
                          BytesView value);
+  void stats_publish_put(std::uint32_t active_file_id, BytesView key,
+                         std::uint32_t value_size);
   // Records a tombstone: total only on the active file.
   void stats_publish_tombstone(std::uint32_t active_file_id, BytesView key);
   // Records a bulk marker (BulkBegin / BulkEnd): total only.

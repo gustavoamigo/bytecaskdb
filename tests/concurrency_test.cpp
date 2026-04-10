@@ -163,16 +163,30 @@ TEST_CASE("WriteGroup remains usable after executor exception", "[concurrency]")
   CHECK(call_count.load() == 2);
 }
 
-TEST_CASE("WriteGroup aborted slots receive WriteGroupAborted", "[concurrency]") {
-  // Single-threaded: submit two slots in sequence. The executor marks the
-  // second slot as aborted (simulating a prior failure).
-  bytecask::WriteGroup wg{[](std::vector<bytecask::WriteGroup::Slot *> &batch) {
-    // Simulate: first slot succeeds, second is aborted.
-    if (batch.size() > 1) {
-      batch[1]->err = std::make_exception_ptr(bytecask::WriteGroupAborted{});
-    }
+TEST_CASE("WriteGroup executor throw propagates to all waiting slots",
+          "[concurrency]") {
+  // If the executor itself throws (not per-slot err), leader_loop must
+  // propagate the exception to every queued slot rather than deadlocking.
+  bytecask::WriteGroup wg{[][[noreturn]](std::vector<bytecask::WriteGroup::Slot *> & /*batch*/) {
+    throw std::runtime_error("executor boom");
   }};
 
+  bytecask::WriteGroup::Slot slot;
+  slot.sync = false;
+  CHECK_THROWS_AS(wg.submit(slot), std::runtime_error);
+
+  // WriteGroup should remain usable after the failure.
+  std::atomic<int> ok{0};
+  bytecask::WriteGroup wg2{[&](std::vector<bytecask::WriteGroup::Slot *> & /*batch*/) {
+    ++ok;
+  }};
+  bytecask::WriteGroup::Slot slot2;
+  slot2.sync = false;
+  wg2.submit(slot2);
+  CHECK(ok.load() == 1);
+}
+
+TEST_CASE("WriteGroup aborted slots receive WriteGroupAborted", "[concurrency]") {
   // We need concurrent submits to get multiple slots in one batch.
   std::atomic<int> aborted_count{0};
   std::atomic<int> succeeded_count{0};

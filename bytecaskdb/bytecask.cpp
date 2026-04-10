@@ -196,11 +196,13 @@ void DB::put(const WriteOptions &opts, BytesView key, BytesView value) {
   EngineSlot slot;
   slot.sync = opts.sync;
   slot.fn = [&](EngineState &s, TransientRadixTree<KeyDirEntry> &t) {
+    // Phase 1: I/O — can throw without corrupting in-memory state.
+    const auto offset =
+        s.active_file().append(s.next_lsn, EntryType::Put, key, value);
+    // Phase 2: in-memory mutations — cannot fail.
     const auto existing = t.get(key);
     if (existing) stats_retire_entry(key, *existing);
     stats_publish_put(s.active_file_id, key, value);
-    const auto offset =
-        s.active_file().append(s.next_lsn, EntryType::Put, key, value);
     t.set(key, KeyDirEntry{s.next_lsn, s.active_file_id, offset,
                            narrow<std::uint32_t>(value.size())});
     ++s.next_lsn;
@@ -220,11 +222,13 @@ auto DB::del(const WriteOptions &opts, BytesView key) -> bool {
   slot.fn = [&](EngineState &s, TransientRadixTree<KeyDirEntry> &t) {
     const auto existing = t.get(key);
     if (!existing) return;
+    // Phase 1: I/O — can throw without corrupting in-memory state.
+    std::ignore =
+        s.active_file().append(s.next_lsn, EntryType::Delete, key, {});
+    // Phase 2: in-memory mutations — cannot fail.
     existed = true;
     stats_retire_entry(key, *existing);
     stats_publish_tombstone(s.active_file_id, key);
-    std::ignore =
-        s.active_file().append(s.next_lsn, EntryType::Delete, key, {});
     ++s.next_lsn;
     t.erase(key);
   };
@@ -299,10 +303,7 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
       const auto existing = t.get(d.key);
       if (existing) stats_retire_entry(d.key, *existing);
       if (d.is_put) {
-        const auto sz = entry_size(d.key.size(), d.val_size);
-        auto &st = file_stats_[s.active_file_id];
-        st.live_bytes += sz;
-        st.total_bytes += sz;
+        stats_publish_put(s.active_file_id, d.key, d.val_size);
         t.set(d.key, KeyDirEntry{d.lsn, s.active_file_id, d.offset,
                                  d.val_size});
       } else {
@@ -413,34 +414,35 @@ auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
             s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
       }
 
-      auto t = s.key_dir.transient();
+      // Phase 1: ALL I/O — can throw without corrupting in-memory state.
+      struct Deferred {
+        std::span<const std::byte> key;
+        std::uint64_t offset;
+        std::uint64_t lsn;
+        std::uint32_t val_size;
+        bool is_put;
+      };
+      std::vector<Deferred> ops;
+      ops.reserve(batch.size());
+
       for (auto &op : batch.operations_) {
         std::visit(
             [&](auto &o) {
               using T = std::decay_t<decltype(o)>;
               if constexpr (std::is_same_v<T, BatchInsert>) {
                 const std::span<const std::byte> key_span{o.key};
-                const auto existing = t.get(key_span);
-                if (existing) stats_retire_entry(key_span, *existing);
-                stats_publish_put(s.active_file_id, key_span,
-                                  std::span<const std::byte>{o.value});
+                const std::span<const std::byte> val_span{o.value};
                 const auto offset = s.active_file().append(
-                    s.next_lsn, EntryType::Put, key_span,
-                    std::span<const std::byte>{o.value});
-                t.set(key_span,
-                      KeyDirEntry{s.next_lsn, s.active_file_id, offset,
-                                  narrow<std::uint32_t>(o.value.size())});
-                ++s.next_lsn;
+                    s.next_lsn, EntryType::Put, key_span, val_span);
+                ops.push_back({key_span, offset, s.next_lsn,
+                               narrow<std::uint32_t>(o.value.size()), true});
               } else if constexpr (std::is_same_v<T, BatchRemove>) {
                 const std::span<const std::byte> key_span{o.key};
-                const auto existing = t.get(key_span);
-                if (existing) stats_retire_entry(key_span, *existing);
-                stats_publish_tombstone(s.active_file_id, key_span);
                 std::ignore = s.active_file().append(
                     s.next_lsn, EntryType::Delete, key_span, {});
-                ++s.next_lsn;
-                t.erase(key_span);
+                ops.push_back({key_span, 0, s.next_lsn, 0, false});
               }
+              ++s.next_lsn;
             },
             op);
       }
@@ -449,6 +451,21 @@ auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
         stats_publish_bulk_marker(s.active_file_id);
         std::ignore =
             s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
+      }
+
+      // Phase 2: ALL mutations — pure in-memory, cannot fail.
+      auto t = s.key_dir.transient();
+      for (auto &d : ops) {
+        const auto existing = t.get(d.key);
+        if (existing) stats_retire_entry(d.key, *existing);
+        if (d.is_put) {
+          stats_publish_put(s.active_file_id, d.key, d.val_size);
+          t.set(d.key,
+                KeyDirEntry{d.lsn, s.active_file_id, d.offset, d.val_size});
+        } else {
+          stats_publish_tombstone(s.active_file_id, d.key);
+          t.erase(d.key);
+        }
       }
 
       s.key_dir = std::move(t).persistent();
@@ -955,7 +972,13 @@ void DB::stats_retire_entry(BytesView key, const KeyDirEntry &old) {
 // Records a new Put entry: live + total on the active file.
 void DB::stats_publish_put(std::uint32_t active_file_id, BytesView key,
                                  BytesView value) {
-  const auto sz = entry_size(key.size(), value.size());
+  stats_publish_put(active_file_id, key,
+                    narrow<std::uint32_t>(value.size()));
+}
+
+void DB::stats_publish_put(std::uint32_t active_file_id, BytesView key,
+                                 std::uint32_t value_size) {
+  const auto sz = entry_size(key.size(), value_size);
   auto &st = file_stats_[active_file_id];
   st.live_bytes += sz;
   st.total_bytes += sz;
