@@ -547,8 +547,8 @@ private:
   // File rotation
   // Seals active file, dispatches hint write to background, opens new active file.
   [[nodiscard]] auto rotate_active_file(EngineState s) -> EngineState;
-  // Calls rotate_active_file if active file has reached rotation_threshold_.
-  [[nodiscard]] auto rotate_if_needed(EngineState s) -> EngineState;
+  // Returns true if the active file has reached the rotation threshold.
+  [[nodiscard]] auto is_rotation_needed(const EngineState &s) const -> bool;
 
   // WriteGroup batch executor — the Template Method hook.
   // Called by the WriteGroup leader under queue_mu_ (unlocked); acquires

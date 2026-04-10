@@ -281,10 +281,16 @@ leader thread under `write_mu_`), no synchronisation is needed.
 
 ###### Call site examples
 
+Each call site constructs an `EngineSlot` and submits it to the
+write group. The pseudocode below mirrors the actual implementation;
+`slot.fn` is the lambda executed by the leader thread.
+
 **`put(key, value)`**:
 
 ```cpp
-write_group_.submit(opts.sync, [&](EngineState& s, auto& t) {
+EngineSlot slot;
+slot.sync = opts.sync;
+slot.fn = [&](EngineState& s, auto& t) {
   // Phase 1: I/O — can throw without corrupting in-memory state.
   const auto offset =
       s.active_file().append(s.next_lsn, EntryType::Put, key, value);
@@ -295,13 +301,16 @@ write_group_.submit(opts.sync, [&](EngineState& s, auto& t) {
   t.set(key, KeyDirEntry{s.next_lsn, s.active_file_id, offset,
                          narrow<uint32_t>(value.size())});
   ++s.next_lsn;
-});
+};
+write_group_.submit(slot);
 ```
 
 **`del(key)`**:
 
 ```cpp
-write_group_.submit(opts.sync, [&](EngineState& s, auto& t) {
+EngineSlot slot;
+slot.sync = opts.sync;
+slot.fn = [&](EngineState& s, auto& t) {
   const auto existing = t.get(key);
   if (!existing) { /* signal not-found to caller */ return; }
   // Phase 1: I/O — can throw without corrupting in-memory state.
@@ -312,50 +321,58 @@ write_group_.submit(opts.sync, [&](EngineState& s, auto& t) {
   stats_publish_tombstone(s.active_file_id, key);
   ++s.next_lsn;
   t.erase(key);
-});
+};
+write_group_.submit(slot);
 ```
 
 **`apply_batch(batch)`** — two-phase lambda:
 
 ```cpp
-write_group_.submit(opts.sync, [&](EngineState& s, auto& t) {
+EngineSlot slot;
+slot.sync = opts.sync;
+slot.fn = [&](EngineState& s, auto& t) {
   const bool multi = batch.size() > 1;
 
-  // Phase 1: ALL I/O — can throw, exits cleanly (no mutations yet)
   if (multi) {
-    stats_publish_bulk_marker(s.active_file_id);
     std::ignore =
-        s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
+        s.active_file().append(s.next_lsn, EntryType::BulkBegin, {}, {});
+    stats_publish_bulk_marker(s.active_file_id);
+    ++s.next_lsn;
   }
 
-  struct Deferred {
-    BytesView key; uint64_t offset; uint64_t lsn;
-    uint32_t val_size; bool is_put;
-  };
+  // Phase 1: ALL I/O — can throw, exits cleanly (no mutations yet).
+  // If multi and the loop throws, the file has an orphaned BulkBegin.
+  // Force-rotate to isolate it (see "Rotate on batch failure" below).
+  struct Deferred { BytesView key; uint64_t offset, lsn; uint32_t val_size; bool is_put; };
   std::vector<Deferred> ops;
 
-  for (auto& op : batch.operations_) {
-    // writev only — if this throws, no mutations have occurred
-    std::visit([&](auto& o) {
-      using T = std::decay_t<decltype(o)>;
-      if constexpr (std::is_same_v<T, BatchInsert>) {
-        auto offset = s.active_file().append(
-            s.next_lsn, EntryType::Put, o.key, o.value);
-        ops.push_back({o.key, offset, s.next_lsn,
-                       narrow<uint32_t>(o.value.size()), true});
-      } else {
-        std::ignore = s.active_file().append(
-            s.next_lsn, EntryType::Delete, o.key, {});
-        ops.push_back({o.key, 0, s.next_lsn, 0, false});
-      }
-      ++s.next_lsn;
-    }, op);
-  }
+  try {
+    for (auto& op : batch.operations_) {
+      std::visit([&](auto& o) {
+        using T = std::decay_t<decltype(o)>;
+        if constexpr (std::is_same_v<T, BatchInsert>) {
+          auto offset = s.active_file().append(
+              s.next_lsn, EntryType::Put, o.key, o.value);
+          ops.push_back({o.key, offset, s.next_lsn,
+                         narrow<uint32_t>(o.value.size()), true});
+        } else {
+          std::ignore = s.active_file().append(
+              s.next_lsn, EntryType::Delete, o.key, {});
+          ops.push_back({o.key, 0, s.next_lsn, 0, false});
+        }
+        ++s.next_lsn;
+      }, op);
+    }
 
-  if (multi) {
-    stats_publish_bulk_marker(s.active_file_id);
-    std::ignore =
-        s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
+    if (multi) {
+      std::ignore =
+          s.active_file().append(s.next_lsn, EntryType::BulkEnd, {}, {});
+      stats_publish_bulk_marker(s.active_file_id);
+      ++s.next_lsn;
+    }
+  } catch (...) {
+    if (multi) s = rotate_active_file(std::move(s));
+    throw;
   }
 
   // Phase 2: ALL mutations — pure in-memory, cannot fail
@@ -363,8 +380,7 @@ write_group_.submit(opts.sync, [&](EngineState& s, auto& t) {
     const auto existing = t.get(d.key);
     if (existing) stats_retire_entry(d.key, *existing);
     if (d.is_put) {
-      stats_publish_put(s.active_file_id, d.key,
-                        /* value_size */ d.val_size);
+      stats_publish_put(s.active_file_id, d.key, d.val_size);
       t.set(d.key, KeyDirEntry{d.lsn, s.active_file_id,
                                 d.offset, d.val_size});
     } else {
@@ -372,7 +388,8 @@ write_group_.submit(opts.sync, [&](EngineState& s, auto& t) {
       t.erase(d.key);
     }
   }
-});
+};
+write_group_.submit(slot);
 ```
 
 The two-phase structure is necessary because intra-batch operations can
@@ -407,6 +424,25 @@ structure for its inline batch commit path.
 No rollback logic is needed. The transient is always exactly "one step
 behind" the I/O — it reflects all operations whose I/O completed
 successfully.
+
+###### Rotate on batch failure
+
+If `append()` throws mid-batch after `BulkBegin` has been written, the
+active file contains an orphaned `BulkBegin` with no matching `BulkEnd`.
+Without intervention, subsequent writes to the same file extend the
+region that `flush_hints_for` (and `compact_file`) treat as part of the
+incomplete batch — those entries would be silently discarded on recovery.
+
+The fix is simple: force `rotate_active_file()` in the catch block when
+`multi` is true. This seals the file, isolating the incomplete batch at
+its tail. `flush_hints_for` already discards entries between a
+`BulkBegin` and EOF when no `BulkEnd` is found, so the orphaned entries
+are safely ignored. New writes go to a fresh file unaffected by the
+failed batch.
+
+Both `apply_batch` (WriteGroup lambda) and `apply_batch_if` (solo path)
+implement this pattern. The solo path additionally publishes the rotated
+state via `state_.store()` since it is not inside `execute_write_batch`.
 
 ###### Exception handling in the leader loop
 

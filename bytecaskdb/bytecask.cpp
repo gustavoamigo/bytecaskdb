@@ -261,6 +261,9 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
     }
 
     // Phase 1: ALL I/O — can throw, exits cleanly (no mutations yet).
+    // If a multi-entry batch fails mid-write, the file contains an
+    // orphaned BulkBegin. Force-rotate to isolate it: flush_hints_for
+    // discards incomplete batches at the tail of a sealed file.
     struct Deferred {
       BytesView key;
       std::uint64_t offset;
@@ -271,35 +274,45 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
     std::vector<Deferred> ops;
     ops.reserve(batch.size());
 
-    for (auto &op : batch.operations_) {
-      std::visit(
-          [&](auto &o) {
-            using T = std::decay_t<decltype(o)>;
-            if constexpr (std::is_same_v<T, BatchInsert>) {
-              const std::span<const std::byte> key_span{o.key};
-              const std::span<const std::byte> val_span{o.value};
-              const auto offset = s.active_file().append(
-                  s.next_lsn, EntryType::Put, key_span, val_span);
-              ops.push_back({key_span, offset, s.next_lsn,
-                             narrow<std::uint32_t>(o.value.size()), true});
-            } else if constexpr (std::is_same_v<T, BatchRemove>) {
-              const std::span<const std::byte> key_span{o.key};
-              std::ignore = s.active_file().append(s.next_lsn,
-                                                   EntryType::Delete,
-                                                   key_span, {});
-              ops.push_back({key_span, 0, s.next_lsn, 0, false});
-            }
-            ++s.next_lsn;
-          },
-          op);
-    }
+    try {
+      for (auto &op : batch.operations_) {
+        std::visit(
+            [&](auto &o) {
+              using T = std::decay_t<decltype(o)>;
+              if constexpr (std::is_same_v<T, BatchInsert>) {
+                const std::span<const std::byte> key_span{o.key};
+                const std::span<const std::byte> val_span{o.value};
+                const auto offset = s.active_file().append(
+                    s.next_lsn, EntryType::Put, key_span, val_span);
+                ops.push_back({key_span, offset, s.next_lsn,
+                               narrow<std::uint32_t>(o.value.size()), true});
+              } else if constexpr (std::is_same_v<T, BatchRemove>) {
+                const std::span<const std::byte> key_span{o.key};
+                std::ignore = s.active_file().append(s.next_lsn,
+                                                     EntryType::Delete,
+                                                     key_span, {});
+                ops.push_back({key_span, 0, s.next_lsn, 0, false});
+              }
+              ++s.next_lsn;
+            },
+            op);
+      }
 
-    if (multi) {
-      const auto bulk_end_lsn = s.next_lsn;
-      std::ignore =
-          s.active_file().append(bulk_end_lsn, EntryType::BulkEnd, {}, {});
-      stats_publish_bulk_marker(s.active_file_id);
-      ++s.next_lsn;
+      if (multi) {
+        const auto bulk_end_lsn = s.next_lsn;
+        std::ignore =
+            s.active_file().append(bulk_end_lsn, EntryType::BulkEnd, {}, {});
+        stats_publish_bulk_marker(s.active_file_id);
+        ++s.next_lsn;
+      }
+    } catch (...) {
+      if (multi) {
+        // Isolate the orphaned BulkBegin: subsequent writes to this
+        // file would be treated as part of the incomplete batch by
+        // flush_hints_for and silently discarded on recovery.
+        s = rotate_active_file(std::move(s));
+      }
+      throw;
     }
 
     // Phase 2: ALL mutations — pure in-memory, cannot fail.
@@ -421,6 +434,8 @@ auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
       }
 
       // Phase 1: ALL I/O — can throw without corrupting in-memory state.
+      // If a multi-entry batch fails mid-write, force-rotate to isolate
+      // the orphaned BulkBegin (same rationale as apply_batch).
       struct Deferred {
         std::span<const std::byte> key;
         std::uint64_t offset;
@@ -431,34 +446,49 @@ auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
       std::vector<Deferred> ops;
       ops.reserve(batch.size());
 
-      for (auto &op : batch.operations_) {
-        std::visit(
-            [&](auto &o) {
-              using T = std::decay_t<decltype(o)>;
-              if constexpr (std::is_same_v<T, BatchInsert>) {
-                const std::span<const std::byte> key_span{o.key};
-                const std::span<const std::byte> val_span{o.value};
-                const auto offset = s.active_file().append(
-                    s.next_lsn, EntryType::Put, key_span, val_span);
-                ops.push_back({key_span, offset, s.next_lsn,
-                               narrow<std::uint32_t>(o.value.size()), true});
-              } else if constexpr (std::is_same_v<T, BatchRemove>) {
-                const std::span<const std::byte> key_span{o.key};
-                std::ignore = s.active_file().append(
-                    s.next_lsn, EntryType::Delete, key_span, {});
-                ops.push_back({key_span, 0, s.next_lsn, 0, false});
-              }
-              ++s.next_lsn;
-            },
-            op);
-      }
+      try {
+        for (auto &op : batch.operations_) {
+          std::visit(
+              [&](auto &o) {
+                using T = std::decay_t<decltype(o)>;
+                if constexpr (std::is_same_v<T, BatchInsert>) {
+                  const std::span<const std::byte> key_span{o.key};
+                  const std::span<const std::byte> val_span{o.value};
+                  const auto offset = s.active_file().append(
+                      s.next_lsn, EntryType::Put, key_span, val_span);
+                  ops.push_back({key_span, offset, s.next_lsn,
+                                 narrow<std::uint32_t>(o.value.size()), true});
+                } else if constexpr (std::is_same_v<T, BatchRemove>) {
+                  const std::span<const std::byte> key_span{o.key};
+                  std::ignore = s.active_file().append(
+                      s.next_lsn, EntryType::Delete, key_span, {});
+                  ops.push_back({key_span, 0, s.next_lsn, 0, false});
+                }
+                ++s.next_lsn;
+              },
+              op);
+        }
 
-      if (multi) {
-        const auto bulk_end_lsn = s.next_lsn;
-        std::ignore =
-            s.active_file().append(bulk_end_lsn, EntryType::BulkEnd, {}, {});
-        ++s.next_lsn;
-        stats_publish_bulk_marker(s.active_file_id);
+        if (multi) {
+          const auto bulk_end_lsn = s.next_lsn;
+          std::ignore =
+              s.active_file().append(bulk_end_lsn, EntryType::BulkEnd, {}, {});
+          ++s.next_lsn;
+          stats_publish_bulk_marker(s.active_file_id);
+        }
+      } catch (...) {
+        if (multi) {
+          // Isolate the orphaned BulkBegin: subsequent writes to this
+          // file would be treated as part of the incomplete batch by
+          // flush_hints_for and silently discarded on recovery.
+          // Unlike apply_batch (which runs inside a WriteGroup lambda
+          // where execute_write_batch publishes state), the solo path
+          // must publish the rotated state directly.
+          s = rotate_active_file(std::move(s));
+          state_.store(std::make_shared<EngineState>(std::move(s)));
+          state_time_.store(now_ns(), std::memory_order_release);
+        }
+        throw;
       }
 
       // Phase 2: ALL mutations — pure in-memory, cannot fail.
@@ -476,16 +506,21 @@ auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
         }
       }
 
-      // Commit phase: persistent() → rotate → sync → publish.
-      // If sync/publish throws, file_stats_ may drift until next recovery
-      // (rebuilt from disk on open, so the inconsistency is bounded).
+      // Commit phase: persistent() → sync → rotate → publish.
       s.key_dir = std::move(t).persistent();
-      s = rotate_if_needed(std::move(s));
-      if (opts.sync) {
-        s.active_file().sync();
+      const bool needs_rotation = is_rotation_needed(s);
+      // Sync covers both durability (opts.sync) and rotation (sealed
+      // file must be durable). Publish before rethrow so the running
+      // process stays consistent even if sync fails.
+      std::exception_ptr sync_err;
+      if (opts.sync || needs_rotation) {
+        try { s.active_file().sync(); }
+        catch (...) { sync_err = std::current_exception(); }
       }
+      if (needs_rotation) s = rotate_active_file(std::move(s));
       state_.store(std::make_shared<EngineState>(std::move(s)));
       state_time_.store(now_ns(), std::memory_order_release);
+      if (sync_err) std::rethrow_exception(sync_err);
     }
   }
   return true;
@@ -1012,7 +1047,7 @@ void DB::stats_publish_bulk_marker(std::uint32_t active_file_id) {
 
 // The Template Method hook called by the WriteGroup leader.
 // Acquires write_mu_, runs all queued lambdas on a shared TransientRadixTree,
-// calls persistent(), rotate_if_needed, fdatasync if any_sync, then publishes
+// calls persistent(), fdatasync, rotate if needed, then publishes
 // a single EngineState. On exception from lambda K, lambdas 0..K-1 are
 // committed and lambdas K+1..N-1 receive WriteGroupAborted.
 void DB::execute_write_batch(std::vector<WriteGroup::Slot *> &batch) {
@@ -1034,34 +1069,33 @@ void DB::execute_write_batch(std::vector<WriteGroup::Slot *> &batch) {
     }
   }
 
-  // Commit phase: persistent() → rotate → sync → publish.
-  // If any step throws, propagate the error to all slots that ran.
-  // file_stats_ may drift from published state until the next recovery
-  // (it is rebuilt from disk on open, so the inconsistency is bounded).
-  try {
-    s.key_dir = std::move(t).persistent();
-    s = rotate_if_needed(std::move(s));
-    if (any_sync) {
-      s.active_file().sync();
-    }
-    state_.store(std::make_shared<EngineState>(std::move(s)));
-    state_time_.store(now_ns(), std::memory_order_release);
-  } catch (...) {
-    auto commit_err = std::current_exception();
-    for (std::size_t i = 0; i < completed; ++i) {
-      batch[i]->err = commit_err;
-    }
-    for (auto i = completed + 1; i < batch.size(); ++i) {
-      if (batch[i]->err == nullptr) {
-        batch[i]->err = std::make_exception_ptr(WriteGroupAborted{});
-      }
-    }
-    throw;
+  // Commit: persistent() is pure in-memory.
+  s.key_dir = std::move(t).persistent();
+  const bool needs_rotation = is_rotation_needed(s);
+
+  // Sync covers both durability (any_sync) and rotation (sealed file
+  // must be durable). Publish before rethrow so the running process
+  // stays consistent even if sync fails.
+  std::exception_ptr sync_err;
+  if (any_sync || needs_rotation) {
+    try { s.active_file().sync(); }
+    catch (...) { sync_err = std::current_exception(); }
   }
+  if (needs_rotation) s = rotate_active_file(std::move(s));
+  state_.store(std::make_shared<EngineState>(std::move(s)));
+  state_time_.store(now_ns(), std::memory_order_release);
 
   // Mark unexecuted slots as aborted.
   for (auto i = completed + 1; i < batch.size(); ++i) {
     batch[i]->err = std::make_exception_ptr(WriteGroupAborted{});
+  }
+
+  // If sync failed, report to all completed slots and rethrow.
+  if (sync_err) {
+    for (std::size_t i = 0; i < completed; ++i) {
+      batch[i]->err = sync_err;
+    }
+    std::rethrow_exception(sync_err);
   }
 }
 
@@ -1120,9 +1154,8 @@ auto DB::acquire_write_lock(const WriteOptions &opts)
 
 // Seals the active file, opens a new one, and dispatches hint file writing
 // for the now-sealed file to the background worker. Returns a new EngineState.
-// fdatasync on the sealed file remains synchronous for durability correctness.
+// Caller must sync the active file before calling if durability is required.
 auto DB::rotate_active_file(EngineState s) -> EngineState {
-  s.active_file().sync();
   s.active_file().seal();
   auto sealed = s.files->at(s.active_file_id);
   auto dir = dir_;
@@ -1134,11 +1167,8 @@ auto DB::rotate_active_file(EngineState s) -> EngineState {
   return s;
 }
 
-auto DB::rotate_if_needed(EngineState s) -> EngineState {
-  if (s.active_file().size() >= rotation_threshold_) {
-    return rotate_active_file(std::move(s));
-  }
-  return s;
+auto DB::is_rotation_needed(const EngineState &s) const -> bool {
+  return s.active_file().size() >= rotation_threshold_;
 }
 
 #pragma endregion
