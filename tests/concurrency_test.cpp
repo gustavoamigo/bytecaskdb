@@ -4,6 +4,7 @@
 // ByteCaskDB — concurrency stress tests for reader-writer lock and epoch reclamation
 
 #include <atomic>
+#include <barrier>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstddef>
@@ -206,11 +207,17 @@ TEST_CASE("WriteGroup executor throw propagates to all waiting slots",
 }
 
 TEST_CASE("WriteGroup aborted slots receive WriteGroupAborted", "[concurrency]") {
-  // We need concurrent submits to get multiple slots in one batch.
+  // Deterministic multi-slot batch: all threads reach a barrier before
+  // any calls submit(), so when the first thread becomes leader and the
+  // executor sleeps, the other threads are guaranteed to enqueue and
+  // accumulate in the next batch.
   std::atomic<int> aborted_count{0};
   std::atomic<int> succeeded_count{0};
+  constexpr int kThreads = 4;
+  std::barrier sync_point(kThreads);
 
   bytecask::WriteGroup wg2{[](std::vector<bytecask::WriteGroup::Slot *> &batch) {
+    // Sleep so non-leader threads enqueue into the next batch.
     std::this_thread::sleep_for(5ms);
     // First slot succeeds, rest aborted.
     for (std::size_t i = 1; i < batch.size(); ++i) {
@@ -218,12 +225,12 @@ TEST_CASE("WriteGroup aborted slots receive WriteGroupAborted", "[concurrency]")
     }
   }};
 
-  constexpr int kThreads = 4;
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
 
   for (int i = 0; i < kThreads; ++i) {
     threads.emplace_back([&] {
+      sync_point.arrive_and_wait();
       bytecask::WriteGroup::Slot slot;
       slot.sync = false;
       try {
@@ -237,7 +244,7 @@ TEST_CASE("WriteGroup aborted slots receive WriteGroupAborted", "[concurrency]")
 
   for (auto &t : threads) t.join();
 
-  // At least 1 succeeded (the first in each batch).
   CHECK(succeeded_count.load() >= 1);
+  CHECK(aborted_count.load() >= 1);
   CHECK(succeeded_count.load() + aborted_count.load() == kThreads);
 }

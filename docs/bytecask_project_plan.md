@@ -37,7 +37,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-078 | Published library module boundary | Decision: use Path A — keep sub-components (radix_tree, data_file, hint_file, etc.) as top-level modules for isolated testing; enforce public boundary at install time by only shipping the bytecask.engine BMI. Revisit Path B (full-partition restructure) if airtight compiler-enforced encapsulation is needed. |
 | BC-041 | `ReadOptions::verify_checksums` flag | Allow skipping CRC verification on bulk scans for ~5% win. Mirrors LevelDB/RocksDB `verify_checksums` option. |
-| BC-090 | Error handling | Review Error handling, we haven't reviewed this part |
+| BC-090 | Error handling | Review error handling. Includes: poisoned-DB flag on sync failure — error-path `sync()` in batch-failure catch blocks (lines 315, 492) is swallowed because the caller already sees the `append()` exception, but earlier successful WriteGroup slots don't learn their writes may not be durable. Add `is_poisoned_` flag; subsequent ops fail-fast with `DbPoisoned` until restart. |
 | BC-091 | Logging | Logging? (what other projects use) |
 | BC-092 | UUIDv4 test | Test and protections if customers use UUIDv4 as key (Maybe we will need a Adaptive Radix Tree extension) |
 | BC-093 | Vacuum benchmarks | Add benchmark tests for the vacuum (with performance and data file reclaim tests) |
