@@ -173,6 +173,82 @@ because benchmarks showed no benefit. Those benchmarks ran on tmpfs where
 (ext4 on NVMe) confirmed that `fdatasync` costs ~2 ms and serialised syncs are
 the dominant bottleneck for concurrent writes.
 
+##### Visibility before durability
+
+Because `state_.store()` (which makes a write visible to readers) happens
+**inside** `write_mu_` before `sync_group_.sync()` (which calls `fdatasync`)
+**outside** it, there is a brief window between when a write becomes readable
+and when it is guaranteed to be on disk.
+
+Consequences:
+- A reader can observe a value that would be lost in a crash-before-fsync.
+- After recovery, the in-memory state is consistent with what is on disk — the
+  lost write simply never reappears. The database itself is always internally
+  consistent.
+- The window exists only under `sync = true` writes; `sync = false` writes
+  have no durability guarantee at all.
+
+This is a deliberate trade-off, not an oversight. Moving `state_.store()`
+to after the `fdatasync` would close the window but would also force each
+write to hold `write_mu_` across the entire blocking syscall, serialising all
+concurrent writers and eliminating the SyncGroup group-commit benefit entirely.
+
+The only scenario where this matters in practice is when an external system
+reads a value from ByteCaskDB, acts on it irreversibly outside the database
+(e.g., charges a card, writes to a second store), and the process crashes
+before the fsync completes. This is a cross-system consistency problem that no
+embedded store can fully solve without two-phase commit across system
+boundaries.
+
+**Comparison with other stores**: PostgreSQL and SQLite WAL couple visibility
+to durability (readers block until the WAL fsync completes). Redis and Cassandra
+in async mode have the same window as ByteCaskDB and document it explicitly.
+RocksDB with `sync=true` fsyncs the WAL before returning to the caller,
+closing the window but serialising syncs.
+
+A future `WriteOptions::sync_before_visible` flag could close the window for
+callers that require it (see BC-125 in the backlog).
+
+##### Future evolution: `SyncGroup::change_state` (BC-126)
+
+The current write path scatters the three-phase protocol (acquire lock →
+`writev` + `state_.store` → release lock → `fdatasync`) across `put`, `del`,
+`commit_batch`, and `apply_batch_if`. This makes it easy to accidentally
+skip a phase or mis-sequence them in future call sites.
+
+A cleaner future design would centralise the entire protocol inside `SyncGroup`
+via a `change_state` interface:
+
+```cpp
+sync_group_.change_state([&] {
+    // Under write_mu_: append to page cache + update key directory
+    s.active_file().append(...);
+    state_.store(make_shared<EngineState>(std::move(s)));
+});
+// SyncGroup owns: acquire lock → run lambda → (release lock / fdatasync)
+// in the order determined by the durability policy.
+```
+
+`SyncGroup` would:
+1. Acquire `write_mu_`.
+2. Run the caller's lambda (writev + `state_.store`).
+3. Execute the fsync phase according to a construction-time `DurabilityPolicy`:
+   - `VisibleBeforeDurable` (current behaviour): release lock, then
+     `fdatasync` outside it via the ticket protocol.
+   - `DurableBeforeVisible`: `fdatasync` inside the lock before
+     `state_.store`, then release — closes the visibility window at the
+     cost of serialising concurrent writers.
+
+The policy should be a `DB::Options` field set at `open` time, not a
+per-call flag. Mixing policies on the same `SyncGroup` creates ambiguous
+ordering when a durable-before-visible write arrives while a
+visible-before-durable batch is in-flight. A single construction-time
+decision eliminates that class of problem entirely.
+
+The ticket-based phase structure of `SyncGroup` remains unchanged; only
+where `state_.store` fires relative to the ticket phases shifts. The
+refactor is ~50 lines plus a new `Options::durability_mode` field.
+
 ##### Read path (no lock, no mutex)
 
 ```
