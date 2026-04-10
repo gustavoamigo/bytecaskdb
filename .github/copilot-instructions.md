@@ -70,7 +70,7 @@ These four principles govern every design decision in the codebase, in priority 
 
 3. **Predictable latency over peak throughput** — Write-path operations must have bounded, predictable latency. Work that can be deferred without compromising correctness must be deferred. A steady 1 ms per write is preferable to an average of 0.1 ms with occasional 500 ms spikes. This directly influences decisions like deferring hint file writes out of the rotation path, and avoiding heap allocations on hot iteration paths.
 
-4. **Performance** — Optimizations are pursued only when they do not compromise correctness or simplicity. Benchmark before and after every claimed improvement (`python3 scripts/run_engine_bench.py`). A performance win that introduces a latent UB is not a win.
+4. **Performance** — Optimizations require a real use case. Without one, correctness and simplicity take priority. Benchmark before and after every claimed improvement (`python3 scripts/run_engine_bench.py`). A performance win that introduces a latent UB is not a win.
 
 > **The BC-122 lesson:** The old `std::reverse_iterator<RadixTreeIterator>` satisfied none of the first three principles. It was UB (dangling span), it required an apology comment, and it allocated and freed a heap buffer on *every single dereference* — the opposite of predictable latency. Replacing it with `ReverseRadixTreeIterator`, which simply holds the cursor alive as a member (`cur_`) and returns `*cur_` from `operator*`, was simultaneously the correct, simpler, and 26× faster choice. That ordering is not a coincidence.
 

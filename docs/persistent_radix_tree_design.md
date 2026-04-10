@@ -168,7 +168,7 @@ This component inherits the ByteCaskDB design tenets in order of priority:
 1. **Correctness**: Data integrity is paramount. All design decisions prioritize correctness over performance.
 2. **Simplicity**: The architecture is kept simple to facilitate understanding and maintainability.
 3. **Predictable latency over peak throughput**: Write-path operations must have bounded, predictable latency. A steady 1 ms per write is preferable to an average of 0.1 ms with occasional 500 ms spikes.
-4. **Performance**: Optimizations are pursued only when they don't compromise correctness or simplicity.
+4. **Performance**: Optimizations require a real use case. Without one, correctness and simplicity take priority.
 
 **Key context**: this tree is an in-memory index in front of disk I/O that is orders of magnitude slower. CPU-bound optimizations matter only where they affect the write path's latency distribution (principle #3) or materially reduce memory overhead for large key sets. Complexity that doesn't serve one of these goals is cut.
 

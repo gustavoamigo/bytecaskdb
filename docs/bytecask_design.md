@@ -49,7 +49,7 @@ The design follows these core tenets in order of priority:
 1. **Correctness**: Data integrity is paramount. All design decisions prioritize correctness over performance.
 2. **Simplicity**: The architecture is kept simple to facilitate understanding and maintainability.
 3. **Predictable latency over peak throughput**: Write-path operations must have bounded, predictable latency. Work that can be deferred without compromising correctness must be deferred. A steady 1 ms per write is preferable to an average of 0.1 ms with occasional 500 ms spikes. This directly influences decisions like deferring hint file writes out of the rotation path.
-4. **Performance**: Optimizations are pursued only when they don't compromise correctness or simplicity.
+4. **Performance**: Optimizations require a real use case. Without one, correctness and simplicity take priority.
 
 ## System Architecture
 
