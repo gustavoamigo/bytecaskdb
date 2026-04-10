@@ -548,11 +548,11 @@ private:
   // Calls rotate_active_file if active file has reached rotation_threshold_.
   [[nodiscard]] auto rotate_if_needed(EngineState s) -> EngineState;
 
-  // Writes batch entries to disk, updates stats, publishes new EngineState.
-  // Caller must hold write_mu_. Returns the file to sync (null if !opts.sync).
-  auto commit_batch(const WriteOptions &opts, Batch &batch,
-                    const std::shared_ptr<const EngineState> &current)
-      -> std::shared_ptr<DataFile>;
+  // WriteGroup batch executor — the Template Method hook.
+  // Called by the WriteGroup leader under queue_mu_ (unlocked); acquires
+  // write_mu_, runs all queued lambdas on a shared TransientRadixTree,
+  // calls persistent(), fdatasync if any_sync, publishes state.
+  void execute_write_batch(std::vector<WriteGroup::Slot *> &batch);
 
   // Member variables
   std::filesystem::path dir_;
@@ -566,9 +566,10 @@ private:
   std::atomic<std::int64_t> state_time_{0};
   // Serialises writers (put, del, apply_batch). Readers never acquire this.
   std::unique_ptr<std::mutex> write_mu_{std::make_unique<std::mutex>()};
-  // Group commit: batches concurrent fdatasync calls so one sync covers
-  // multiple writers.
-  SyncGroup sync_group_;
+  // Leader-applies-all write batching (Template Method pattern).
+  // Skeleton: enqueue → elect leader → drain → call executor → mark done → wake.
+  // Hook: execute_write_batch (see bytecask.cpp).
+  WriteGroup write_group_;
   // Serialises vacuum() calls. Separate from write_mu_ so vacuum I/O does
   // not block normal writes.
   std::unique_ptr<std::mutex> vacuum_mu_{std::make_unique<std::mutex>()};

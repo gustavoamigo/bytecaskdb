@@ -10,6 +10,7 @@ module;
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -74,6 +75,15 @@ auto now_ns() -> std::int64_t {
 
 } // namespace
 
+// Engine-specific WriteGroup slot. Extends the generic Slot with a typed
+// lambda that operates on EngineState and a shared TransientRadixTree.
+// Stack-allocated by each caller — no heap allocation per writer.
+struct EngineSlot : WriteGroup::Slot {
+  std::move_only_function<void(EngineState &,
+                               TransientRadixTree<KeyDirEntry> &)>
+      fn;
+};
+
 #pragma endregion
 
 #pragma region Engine State
@@ -100,7 +110,8 @@ auto EngineState::apply_rotation(const std::filesystem::path &dir) const
 // Throws std::system_error if the directory cannot be prepared.
 DB::DB(std::filesystem::path dir, Options opts)
     : dir_{std::move(dir)}, rotation_threshold_{opts.max_file_bytes},
-      state_{std::make_shared<EngineState>()} {
+      state_{std::make_shared<EngineState>()},
+      write_group_{[this](auto &batch) { execute_write_batch(batch); }} {
   std::filesystem::create_directories(dir_);
   EngineState s;
   s.files =
@@ -182,29 +193,19 @@ auto DB::get(const ReadOptions &opts, BytesView key,
 // opts.sync controls whether fdatasync is called after the write.
 // Throws std::system_error on I/O failure or lock contention (try_lock).
 void DB::put(const WriteOptions &opts, BytesView key, BytesView value) {
-  std::shared_ptr<DataFile> file_to_sync;
-  {
-    auto guard = acquire_write_lock(opts);
-    auto s = *state_.load();
-
-    const auto existing = s.key_dir.get(key);
+  EngineSlot slot;
+  slot.sync = opts.sync;
+  slot.fn = [&](EngineState &s, TransientRadixTree<KeyDirEntry> &t) {
+    const auto existing = t.get(key);
     if (existing) stats_retire_entry(key, *existing);
     stats_publish_put(s.active_file_id, key, value);
-
     const auto offset =
         s.active_file().append(s.next_lsn, EntryType::Put, key, value);
-
-    s = s.apply_put(key, offset, narrow<std::uint32_t>(value.size()));
-    if (opts.sync) {
-      file_to_sync = s.files->at(s.active_file_id);
-    }
-    s = rotate_if_needed(std::move(s));
-    state_.store(std::make_shared<EngineState>(std::move(s)));
-    state_time_.store(now_ns(), std::memory_order_release);
-  }
-  if (file_to_sync) {
-    sync_group_.sync([&] { file_to_sync->sync(); });
-  }
+    t.set(key, KeyDirEntry{s.next_lsn, s.active_file_id, offset,
+                           narrow<std::uint32_t>(value.size())});
+    ++s.next_lsn;
+  };
+  write_group_.submit(slot);
 }
 
 // Writes a tombstone for key.
@@ -213,32 +214,22 @@ void DB::put(const WriteOptions &opts, BytesView key, BytesView value) {
 // opts.sync controls whether fdatasync is called after the write.
 // Throws std::system_error on I/O failure or lock contention (try_lock).
 auto DB::del(const WriteOptions &opts, BytesView key) -> bool {
-  std::shared_ptr<DataFile> file_to_sync;
-  {
-    auto guard = acquire_write_lock(opts);
-    auto s = *state_.load();
-    const auto existing = s.key_dir.get(key);
-    if (!existing) {
-      return false;
-    }
-
+  auto existed = false;
+  EngineSlot slot;
+  slot.sync = opts.sync;
+  slot.fn = [&](EngineState &s, TransientRadixTree<KeyDirEntry> &t) {
+    const auto existing = t.get(key);
+    if (!existing) return;
+    existed = true;
     stats_retire_entry(key, *existing);
     stats_publish_tombstone(s.active_file_id, key);
-
-    std::ignore = s.active_file().append(s.next_lsn, EntryType::Delete, key, {});
-
-    s = s.apply_del(key);
-    if (opts.sync) {
-      file_to_sync = s.files->at(s.active_file_id);
-    }
-    s = rotate_if_needed(std::move(s));
-    state_.store(std::make_shared<EngineState>(std::move(s)));
-    state_time_.store(now_ns(), std::memory_order_release);
-  }
-  if (file_to_sync) {
-    sync_group_.sync([&] { file_to_sync->sync(); });
-  }
-  return true;
+    std::ignore =
+        s.active_file().append(s.next_lsn, EntryType::Delete, key, {});
+    ++s.next_lsn;
+    t.erase(key);
+  };
+  write_group_.submit(slot);
+  return existed;
 }
 
 auto DB::contains_key(BytesView key) const -> bool {
@@ -253,82 +244,74 @@ auto DB::contains_key(BytesView key) const -> bool {
 // Throws std::system_error on I/O failure or lock contention (try_lock).
 void DB::apply_batch(const WriteOptions &opts, Batch batch) {
   if (batch.empty()) return;
-  std::shared_ptr<DataFile> file_to_sync;
-  {
-    auto guard = acquire_write_lock(opts);
-    auto current = state_.load();
-    file_to_sync = commit_batch(opts, batch, current);
-  }
-  if (file_to_sync) {
-    sync_group_.sync([&] { file_to_sync->sync(); });
-  }
-}
+  EngineSlot slot;
+  slot.sync = opts.sync;
+  slot.fn = [&](EngineState &s, TransientRadixTree<KeyDirEntry> &t) {
+    const bool multi = batch.size() > 1;
+    if (multi) {
+      stats_publish_bulk_marker(s.active_file_id);
+      std::ignore =
+          s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
+    }
 
-#pragma endregion
+    // Phase 1: ALL I/O — can throw, exits cleanly (no mutations yet).
+    struct Deferred {
+      BytesView key;
+      std::uint64_t offset;
+      std::uint64_t lsn;
+      std::uint32_t val_size;
+      bool is_put;
+    };
+    std::vector<Deferred> ops;
+    ops.reserve(batch.size());
 
-#pragma region apply_batch_impl
-
-// Writes batch entries to disk under write_mu_, updates stats, publishes new
-// EngineState. Single-op optimization: skips BulkBegin/BulkEnd when
-// batch.size() == 1. Returns the file to sync (null if !opts.sync).
-auto DB::commit_batch(const WriteOptions &opts, Batch &batch,
-                      const std::shared_ptr<const EngineState> &current)
-    -> std::shared_ptr<DataFile> {
-  auto s = *current;
-  const bool multi = batch.size() > 1;
-  if (multi) {
-    stats_publish_bulk_marker(s.active_file_id);
-    std::ignore =
-        s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
-  }
-
-  auto t = s.key_dir.transient();
-  for (auto &op : batch.operations_) {
-    std::visit(
-        [&](auto &o) {
-          using T = std::decay_t<decltype(o)>;
-          if constexpr (std::is_same_v<T, BatchInsert>) {
-            const std::span<const std::byte> key_span{o.key};
-            const auto existing = t.get(key_span);
-            if (existing) stats_retire_entry(key_span, *existing);
-            stats_publish_put(s.active_file_id, key_span,
-                              std::span<const std::byte>{o.value});
-            const auto offset = s.active_file().append(
-                s.next_lsn, EntryType::Put, key_span,
-                std::span<const std::byte>{o.value});
-            t.set(key_span,
-                  KeyDirEntry{s.next_lsn, s.active_file_id, offset,
-                              narrow<std::uint32_t>(o.value.size())});
+    for (auto &op : batch.operations_) {
+      std::visit(
+          [&](auto &o) {
+            using T = std::decay_t<decltype(o)>;
+            if constexpr (std::is_same_v<T, BatchInsert>) {
+              const std::span<const std::byte> key_span{o.key};
+              const std::span<const std::byte> val_span{o.value};
+              const auto offset = s.active_file().append(
+                  s.next_lsn, EntryType::Put, key_span, val_span);
+              ops.push_back({key_span, offset, s.next_lsn,
+                             narrow<std::uint32_t>(o.value.size()), true});
+            } else if constexpr (std::is_same_v<T, BatchRemove>) {
+              const std::span<const std::byte> key_span{o.key};
+              std::ignore = s.active_file().append(s.next_lsn,
+                                                   EntryType::Delete,
+                                                   key_span, {});
+              ops.push_back({key_span, 0, s.next_lsn, 0, false});
+            }
             ++s.next_lsn;
-          } else if constexpr (std::is_same_v<T, BatchRemove>) {
-            const std::span<const std::byte> key_span{o.key};
-            const auto existing = t.get(key_span);
-            if (existing) stats_retire_entry(key_span, *existing);
-            stats_publish_tombstone(s.active_file_id, key_span);
-            std::ignore = s.active_file().append(s.next_lsn, EntryType::Delete,
-                                                 key_span, {});
-            ++s.next_lsn;
-            t.erase(key_span);
-          }
-        },
-        op);
-  }
+          },
+          op);
+    }
 
-  if (multi) {
-    stats_publish_bulk_marker(s.active_file_id);
-    std::ignore =
-        s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
-  }
+    if (multi) {
+      stats_publish_bulk_marker(s.active_file_id);
+      std::ignore =
+          s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
+    }
 
-  s.key_dir = std::move(t).persistent();
-  std::shared_ptr<DataFile> file_to_sync;
-  if (opts.sync) {
-    file_to_sync = s.files->at(s.active_file_id);
-  }
-  s = rotate_if_needed(std::move(s));
-  state_.store(std::make_shared<EngineState>(std::move(s)));
-  state_time_.store(now_ns(), std::memory_order_release);
-  return file_to_sync;
+    // Phase 2: ALL mutations — pure in-memory, cannot fail.
+    for (auto &d : ops) {
+      const auto existing = t.get(d.key);
+      if (existing) stats_retire_entry(d.key, *existing);
+      if (d.is_put) {
+        const auto sz = entry_size(d.key.size(), d.val_size);
+        auto &st = file_stats_[s.active_file_id];
+        st.live_bytes += sz;
+        st.total_bytes += sz;
+        t.set(d.key, KeyDirEntry{d.lsn, s.active_file_id, d.offset,
+                                 d.val_size});
+      } else {
+        stats_publish_tombstone(s.active_file_id, d.key);
+        t.erase(d.key);
+      }
+    }
+  };
+  write_group_.submit(slot);
 }
 
 #pragma endregion
@@ -337,13 +320,13 @@ auto DB::commit_batch(const WriteOptions &opts, Batch &batch,
 
 auto DB::snapshot() const -> Snapshot { return Snapshot{state_.load()}; }
 
-// Evaluates guards and W-W checks under write_mu_, then delegates to
-// commit_batch if all checks pass. Returns true if committed, false on conflict.
+// Solo path: evaluates guards and W-W checks under write_mu_, then inlines
+// batch commit if all checks pass. Does not use WriteGroup (needs lower_bound
+// for range guards). Returns true if committed, false on conflict.
 auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
                         WritePlan plan) -> bool {
   if (plan.empty()) return true;
 
-  std::shared_ptr<DataFile> file_to_sync;
   {
     auto guard = acquire_write_lock(opts);
     auto current = state_.load();
@@ -421,11 +404,61 @@ auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
     }
 
     if (!batch.empty()) {
-      file_to_sync = commit_batch(opts, batch, current);
+      // Inline batch commit (solo path — not through WriteGroup).
+      auto s = *current;
+      const bool multi = batch.size() > 1;
+      if (multi) {
+        stats_publish_bulk_marker(s.active_file_id);
+        std::ignore =
+            s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
+      }
+
+      auto t = s.key_dir.transient();
+      for (auto &op : batch.operations_) {
+        std::visit(
+            [&](auto &o) {
+              using T = std::decay_t<decltype(o)>;
+              if constexpr (std::is_same_v<T, BatchInsert>) {
+                const std::span<const std::byte> key_span{o.key};
+                const auto existing = t.get(key_span);
+                if (existing) stats_retire_entry(key_span, *existing);
+                stats_publish_put(s.active_file_id, key_span,
+                                  std::span<const std::byte>{o.value});
+                const auto offset = s.active_file().append(
+                    s.next_lsn, EntryType::Put, key_span,
+                    std::span<const std::byte>{o.value});
+                t.set(key_span,
+                      KeyDirEntry{s.next_lsn, s.active_file_id, offset,
+                                  narrow<std::uint32_t>(o.value.size())});
+                ++s.next_lsn;
+              } else if constexpr (std::is_same_v<T, BatchRemove>) {
+                const std::span<const std::byte> key_span{o.key};
+                const auto existing = t.get(key_span);
+                if (existing) stats_retire_entry(key_span, *existing);
+                stats_publish_tombstone(s.active_file_id, key_span);
+                std::ignore = s.active_file().append(
+                    s.next_lsn, EntryType::Delete, key_span, {});
+                ++s.next_lsn;
+                t.erase(key_span);
+              }
+            },
+            op);
+      }
+
+      if (multi) {
+        stats_publish_bulk_marker(s.active_file_id);
+        std::ignore =
+            s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
+      }
+
+      s.key_dir = std::move(t).persistent();
+      s = rotate_if_needed(std::move(s));
+      if (opts.sync) {
+        s.active_file().sync();
+      }
+      state_.store(std::make_shared<EngineState>(std::move(s)));
+      state_time_.store(now_ns(), std::memory_order_release);
     }
-  }
-  if (file_to_sync) {
-    sync_group_.sync([&] { file_to_sync->sync(); });
   }
   return true;
 }
@@ -937,6 +970,48 @@ void DB::stats_publish_tombstone(std::uint32_t active_file_id,
 // Records a bulk marker (BulkBegin / BulkEnd): total only.
 void DB::stats_publish_bulk_marker(std::uint32_t active_file_id) {
   file_stats_[active_file_id].total_bytes += kHeaderSize + kCrcSize;
+}
+
+#pragma endregion
+
+#pragma region WriteGroup batch executor
+
+// The Template Method hook called by the WriteGroup leader.
+// Acquires write_mu_, runs all queued lambdas on a shared TransientRadixTree,
+// calls persistent(), rotate_if_needed, fdatasync if any_sync, then publishes
+// a single EngineState. On exception from lambda K, lambdas 0..K-1 are
+// committed and lambdas K+1..N-1 receive WriteGroupAborted.
+void DB::execute_write_batch(std::vector<WriteGroup::Slot *> &batch) {
+  std::lock_guard<std::mutex> wg{*write_mu_};
+  auto s = *state_.load();
+  auto t = s.key_dir.transient();
+  auto any_sync = false;
+  std::size_t completed = 0;
+
+  for (auto *slot : batch) {
+    auto *es = static_cast<EngineSlot *>(slot);
+    try {
+      es->fn(s, t);
+      any_sync |= es->sync;
+      ++completed;
+    } catch (...) {
+      es->err = std::current_exception();
+      break;
+    }
+  }
+
+  s.key_dir = std::move(t).persistent();
+  s = rotate_if_needed(std::move(s));
+  if (any_sync) {
+    s.active_file().sync();
+  }
+  state_.store(std::make_shared<EngineState>(std::move(s)));
+  state_time_.store(now_ns(), std::memory_order_release);
+
+  // Mark unexecuted slots as aborted.
+  for (auto i = completed + 1; i < batch.size(); ++i) {
+    batch[i]->err = std::make_exception_ptr(WriteGroupAborted{});
+  }
 }
 
 #pragma endregion
