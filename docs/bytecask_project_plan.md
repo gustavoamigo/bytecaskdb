@@ -17,7 +17,6 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | --- | --- | --- |
 | BC-102 | File format reference document | Created `docs/file_format.md` with full layout spec for `.data` and `.hint` files; added to README documentation table. |
 | BC-110 | MariaDB storage engine integration — design | Design doc (`docs/mariadb_engine_design.md`) and phased plan for `ha_bytecask` plugin. Branch: `feature/mariadb-engine`. |
-
 ## Backlog
 
 ### MariaDB Engine Integration
@@ -61,6 +60,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-103 | Layer 1: `snapshot()` and `apply_batch_if()` | Added `DB::snapshot()` → `Snapshot` (frozen read-only view, lock-free reads, auto vacuum deferral) and `DB::apply_batch_if()` (W-W CAS under `write_mu_`, short-circuits on first conflict, throws `BatchConflict`). Single-entry batch optimization skips `BulkBegin`/`BulkEnd` markers for both `apply_batch` and `apply_batch_if`. 13 new tests (5 `[snapshot]`, 8 `[apply_batch_if]`). 120 test cases total. |
 | --- | --- | --- |
 | BC-121 | `src/` → `bytecaskdb/` rename + CMakeLists fix | Engine C++23 module sources moved from `src/` to `bytecaskdb/`. `xmake.lua` updated across all four targets. `${BYTECASK_ROOT}/src/bytecask_c.cpp` added to `mariadb/CMakeLists.txt` plugin sources. `docs/project_organization.md` now reflects actual layout. |
+| BC-122 | Safe `rbegin()`/`rend()` via `ReverseRadixTreeIterator` | Replaced `std::reverse_iterator<RadixTreeIterator>` (which dangled spans on dereference) with a custom `ReverseRadixTreeIterator<V>` that pre-decrements in its constructor and holds the underlying iterator alive. `operator*` now returns a span into the live iterator buffer — no temporaries, no dangling references. Removed the WARNING comment. Provides a `base()` method for positional queries. `rend()` now returns `std::default_sentinel_t`. All 166 tests pass. |
 | BC-119 | Dual-license structure + SPDX headers | `mariadb/` is `GPL-2.0-only` (MariaDB plugin API boundary); all other sources are MIT. SPDX-License-Identifier on every source file. License boundary, SPDX convention, and build separation documented in `docs/project_organization.md`. |
 | BC-101 | Replace `sys-info.sh` memory usage with installed RAM summary | Removed the `free -h` OS usage view. The script now prints a single installed-RAM line from `/proc/meminfo`, avoiding privileged SMBIOS/DIMM probing while still describing machine capacity. |
 | BC-100 | Scope `sys-info.sh` disk output to current path | `scripts/sys-info.sh` now resolves `findmnt --target "$PWD"`, strips subvolume suffixes such as `[/home]`, maps partitions to their parent disk with `lsblk -no PKNAME`, and prints only the backing device for the current path. |
