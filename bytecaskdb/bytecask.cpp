@@ -1075,33 +1075,44 @@ void DB::execute_write_batch(std::vector<WriteGroup::Slot *> &batch) {
     }
   }
 
-  // Commit: persistent() is pure in-memory.
-  s.key_dir = std::move(t).persistent();
-  const bool needs_rotation = is_rotation_needed(s);
+  try {
+    // Commit: persistent() is pure in-memory.
+    s.key_dir = std::move(t).persistent();
+    const bool needs_rotation = is_rotation_needed(s);
 
-  // Sync covers both durability (any_sync) and rotation (sealed file
-  // must be durable). Publish before rethrow so the running process
-  // stays consistent even if sync fails.
-  std::exception_ptr sync_err;
-  if (any_sync || needs_rotation) {
-    try { s.active_file().sync(); }
-    catch (...) { sync_err = std::current_exception(); }
-  }
-  if (needs_rotation) s = rotate_active_file(std::move(s));
-  state_.store(std::make_shared<EngineState>(std::move(s)));
-  state_time_.store(now_ns(), std::memory_order_release);
-
-  // Mark unexecuted slots as aborted.
-  for (auto i = completed + 1; i < batch.size(); ++i) {
-    batch[i]->err = std::make_exception_ptr(WriteGroupAborted{});
-  }
-
-  // If sync failed, report to all completed slots and rethrow.
-  if (sync_err) {
-    for (std::size_t i = 0; i < completed; ++i) {
-      batch[i]->err = sync_err;
+    // Sync covers both durability (any_sync) and rotation (sealed file
+    // must be durable). Publish before rethrow so the running process
+    // stays consistent even if sync fails.
+    std::exception_ptr sync_err;
+    if (any_sync || needs_rotation) {
+      try { s.active_file().sync(); }
+      catch (...) { sync_err = std::current_exception(); }
     }
-    std::rethrow_exception(sync_err);
+    if (needs_rotation) s = rotate_active_file(std::move(s));
+    state_.store(std::make_shared<EngineState>(std::move(s)));
+    state_time_.store(now_ns(), std::memory_order_release);
+
+    // Mark unexecuted slots as aborted.
+    for (auto i = completed + 1; i < batch.size(); ++i) {
+      batch[i]->err = std::make_exception_ptr(WriteGroupAborted{});
+    }
+
+    // If sync failed, report to all completed slots and rethrow.
+    if (sync_err) {
+      for (std::size_t i = 0; i < completed; ++i) {
+        batch[i]->err = sync_err;
+      }
+      std::rethrow_exception(sync_err);
+    }
+  } catch (...) {
+    auto commit_err = std::current_exception();
+    for (std::size_t i = 0; i < completed; ++i) {
+      if (!batch[i]->err) batch[i]->err = commit_err;
+    }
+    for (auto i = completed + 1; i < batch.size(); ++i) {
+      if (!batch[i]->err) batch[i]->err = std::make_exception_ptr(WriteGroupAborted{});
+    }
+    throw;
   }
 }
 

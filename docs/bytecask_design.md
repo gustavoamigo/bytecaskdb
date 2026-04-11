@@ -130,7 +130,7 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
   4. s = *state_.load(),  t = s.key_dir.transient()
   5. for each slot: slot.fn(s, t)   (writev + tree mutations)
   6. s.key_dir = persistent(t)
-  7. rotate_if_needed(s)
+  7. if is_rotation_needed(s): s = rotate_active_file(s)
   8. if any_sync: fdatasync        ← single syscall for N writers
   9. state_.store(new EngineState)  ← durable before visible
   10. wake all N waiters
@@ -154,8 +154,14 @@ writer still did its own `persistent()` and `state_.store()` under
 ##### Durability guarantee
 
 With WriteGroup (BC-126), `fdatasync` runs **inside** `write_mu_` before
-`state_.store()`. A write is never visible to readers until it is durable
-on disk. There is no visibility-before-durability window.
+`state_.store()`. When a write returns success, it is durable on disk
+before it becomes visible to readers.
+
+If `fdatasync` fails, the leader publishes the new state anyway so the
+running process stays internally consistent (callers receive the sync
+exception). This means a failed sync can leave writes visible but not
+durable — a trade-off accepted until the poisoned-DB flag (BC-090)
+allows fail-fast on subsequent operations.
 
 The leader sequence under `write_mu_` is:
 
@@ -170,8 +176,7 @@ each writer called `fdatasync` individually. WriteGroup avoids this: N
 concurrent writers queue their lambdas, one leader executes them all,
 and a single `fdatasync` covers the entire batch. The ~2 ms cost is
 amortised across N writers, giving the same throughput as the old
-`SyncGroup` ticket-based approach — but with a strict durability
-guarantee.
+`SyncGroup` ticket-based approach.
 
 `sync = false` writes skip the `fdatasync` step entirely. They are in
 the OS page cache but not guaranteed on disk. The `state_.store()` still
@@ -252,7 +257,7 @@ batching makes this practical: N writers share one ~2 ms `fdatasync`.
                                        │       lambda(s, t)
                                        │       (may throw — see exception safety)
                                        │  7. s.key_dir = std::move(t).persistent()
-                                       │  8. s = rotate_if_needed(std::move(s))
+                                       │  8. if is_rotation_needed(s): s = rotate_active_file(s)
                                        │  9. if any_sync: fdatasync
                                        │ 10. state_.store(make_shared(s))
                                        │     state_time_.store(now_ns())
@@ -272,7 +277,7 @@ void(EngineState& s, TransientRadixTree<KeyDirEntry>& t)
 The leader provides `s` (a mutable copy of the current `EngineState`) and
 `t` (the shared transient). The lambda performs I/O (writev to the active
 file) and mutates `t` (set/erase). The lambda must **not** call
-`state_.store`, `persistent()`, or `rotate_if_needed` — the leader owns
+`state_.store`, `persistent()`, or `rotate_active_file` — the leader owns
 those steps.
 
 `s.next_lsn` is a shared counter across all lambdas in the batch. Each
@@ -469,7 +474,7 @@ This is safe because:
 ###### Commit-phase exception safety
 
 The commit phase runs *after* all lambda I/O and mutations:
-`persistent()` → `rotate_if_needed()` → `fdatasync` → `state_.store()`.
+`persistent()` → `is_rotation_needed()` / `rotate_active_file()` → `fdatasync` → `state_.store()`.
 If any of these steps throws (e.g. `fdatasync` returns EIO), all data
 from lambdas 0..K-1 is already appended to the data file and
 `file_stats_` has already been mutated, but `state_.store()` never ran.
@@ -551,7 +556,7 @@ return existed;
 
 ###### Interaction with file rotation
 
-`rotate_if_needed` runs once after all lambdas complete, after
+`is_rotation_needed` / `rotate_active_file` runs once after all lambdas complete, after
 `persistent()` and before `state_.store()`. The leader checks whether
 the active file has exceeded the rotation threshold and, if so, seals
 it and opens a new one for subsequent batches. This means all lambdas
@@ -642,7 +647,7 @@ The `DB` constructor injects the executor:
 
 `execute_write_batch` acquires `write_mu_`, creates `s` + `t`, iterates
 slots calling `static_cast<EngineSlot *>(slot)->fn(s, t)`, then calls
-`persistent()`, `rotate_if_needed`, `fdatasync` if `any_sync`,
+`persistent()`, `is_rotation_needed` / `rotate_active_file`, `fdatasync` if `any_sync`,
 `state_.store`. Solo writers (`apply_batch_if`, `vacuum_commit`)
 acquire `write_mu_` directly — they serialise correctly because the
 leader holds the same mutex.
@@ -705,7 +710,7 @@ held during I/O** — only for the O(1) swap to drain and the O(N) wake.
        catch { slot->err = current_exception(); break; }
   5. try:
        s.key_dir = move(t).persistent().
-       s = rotate_if_needed(move(s)).
+       if is_rotation_needed(s): s = rotate_active_file(move(s)).
        If any_sync: active_file.sync().         ← single fdatasync
        state_.store(make_shared<EngineState>(move(s))).
        state_time_.store(now, release).
