@@ -16,9 +16,9 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
 - **Atomic writes** — every `put` and `del` is atomic. `apply_batch` makes multiple puts and deletes atomic as a group.
 - **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch_if(snap, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add `ensure_unchanged` / range guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
-- **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms on a SATA SSD.
+- **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in ~630 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
-- **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Concurrent sync writes are amortised via group commit: when multiple writers finish their append at the same time, a single `fdatasync` covers the whole batch, keeping write throughput consistent under high concurrency.
+- **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Concurrent sync writers are batched via a **write-group** protocol: the first writer to arrive becomes the leader, collects all concurrent write operations, executes them on a shared state, and issues a single `fdatasync` for the entire batch — scaling to **4.2 Kops/s at 16 threads** (3.5× RocksDB) on sync writes.
 - **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and data files that act as a write-ahead log ensure durability.
 
 ## Performance
@@ -27,9 +27,10 @@ Benchmarked against [RocksDB](https://rocksdb.org/) at 1 M keys. The tables belo
 
 - **Reads are 2–3× faster** once the working set exceeds RocksDB's block cache (from ~500 k keys onward).
 - **Concurrent reads scale linearly** — lock-free snapshots, no shared mutex.
-- **Sequential writes are comparable** — both engines append; ±10 % across all write benchmarks. No write amplification from compaction, so Sync Delete is 2× faster.
+- **Sequential writes are comparable** — both engines append; ±10 % across all write benchmarks. No write amplification from compaction, so Sync Delete is 1.7× faster.
+- **Concurrent sync writes scale** — write-group batching amortises `fdatasync` across all concurrent writers. At 16 threads ByteCaskDB reaches 4.2 Kops/s (3.5× RocksDB); at 64 threads, 16.5 Kops/s (3.1× RocksDB).
 - **Range scans over values are slower** — each value is a separate disk read. Key-only iteration (`keys_from`) is a pure in-memory tree walk.
-- **Recovery is fast and parallel** — hint files replayed across all cores with full CRC verification. 1 M keys in ~60 ms, 10 M in ~580 ms at 16 threads.
+- **Recovery is fast and parallel** — hint files replayed across all cores with full CRC verification. 1 M keys in ~63 ms, 10 M in ~630 ms at 16 threads.
 
 See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md) for the full benchmark report with all thread counts, dataset sizes, and hardware details.
 
@@ -41,12 +42,12 @@ See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md)
 
 | Operation | ByteCaskDB | RocksDB | Notes |
 |-----------|----------|---------|-------|
-| Put (NoSync) | 157 Kops/s | **166 Kops/s** | Comparable with an edge for RocksDB. Sequential append on both sides |
-| Put (Sync) | 435 ops/s |**478.0 ops/s** | Comparable  with an edge for RocksDB. Disk-bound — limited by `fdatasync` round-trip latency |
-| Get | **1.34 Mops/s** | 575 Kops/s | **2.3×** — in-memory radix tree lookup; no block cache miss risk |
-| Del (Sync) | **657 ops/s** | 320 ops/s | **2.1×** — single tombstone append vs RocksDB write amplification |
-| Range-50 | 30 K scans/s | **87 K scans/s** | RocksDB prefetches sequential blocks; ByteCaskDB fetches each value individually. |
-| MixedBatch (Sync) | 34 Kops/s | 33 Kops/s | Comparable |
+| Put (NoSync) | 155 Kops/s | **181 Kops/s** | Comparable with an edge for RocksDB. Sequential append on both sides |
+| Put (Sync) | 466 ops/s | **476 ops/s** | Comparable with an edge for RocksDB. Disk-bound — limited by `fdatasync` round-trip latency |
+| Get | **1.36 Mops/s** | 508 Kops/s | **2.7×** — in-memory radix tree lookup; no block cache miss risk |
+| Del (Sync) | **645 ops/s** | 380 ops/s | **1.7×** — single tombstone append vs RocksDB write amplification |
+| Range-50 | 30 K scans/s | **83 K scans/s** | RocksDB prefetches sequential blocks; ByteCaskDB fetches each value individually. |
+| MixedBatch (Sync) | 34 Kops/s | **37 Kops/s** | Comparable |
 
 ByteCaskDB's read advantage grows with dataset size: at 50k keys RocksDB's block cache covers the entire working set and leads; from 500k keys onward the cache misses and ByteCaskDB pulls ahead by **2–3×**.
 
@@ -54,8 +55,8 @@ ByteCaskDB's read advantage grows with dataset size: at 50k keys RocksDB's block
 
 | Percentile | ByteCaskDB | RocksDB |
 |-----------|---------|----------|
-| p50 | **680 ns** | 1.57 µs |
-| p99 | **1.15 µs** | 3.96 µs |
+| p50 | **680 ns** | 1.97 µs |
+| p99 | **1.03 µs** | 4.25 µs |
 
 Latency stays flat as the dataset grows: ByteCaskDB always reads from the OS page cache at a known offset; RocksDB's latency climbs when key metadata exceeds the block cache.
 
@@ -65,11 +66,24 @@ Latency stays flat as the dataset grows: ByteCaskDB always reads from the OS pag
 
 | Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
-| 2 | **2.56 Mops/s** | 1.13 Mops/s | 2.27× |
-| 4 | **4.27 Mops/s** | 2.15 Mops/s | 1.99× |
-| 8 | **6.10 Mops/s** | 4.44 Mops/s | 1.37× |
-| 16 | **8.61 Mops/s** | 6.17 Mops/s | 1.40× |
-| 32 | **11.43 Mops/s** | 8.30 Mops/s | 1.38× |
+| 2 | **2.58 Mops/s** | 1.01 Mops/s | 2.54× |
+| 4 | **4.30 Mops/s** | 1.99 Mops/s | 2.16× |
+| 8 | **6.27 Mops/s** | 4.06 Mops/s | 1.54× |
+| 16 | **8.99 Mops/s** | 6.45 Mops/s | 1.39× |
+| 32 | **14.31 Mops/s** | 8.98 Mops/s | 1.59× |
+
+### Concurrent Writes — `PutMT/Sync` (1M keys)
+
+> Write-group batching amortises `fdatasync` across concurrent writers. The leader executes all queued writes, issues a single sync, and publishes the new state.
+
+| Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
+|---:|---:|---:|:---:|
+| 2 | 477 ops/s | **690 ops/s** | 0.69× |
+| 4 | 931 ops/s | **1.2 Kops/s** | 0.80× |
+| 8 | **1.8 Kops/s** | 1.2 Kops/s | 1.47× |
+| 16 | **4.2 Kops/s** | 1.2 Kops/s | 3.49× |
+| 32 | **9.6 Kops/s** | 2.3 Kops/s | 4.20× |
+| 64 | **16.5 Kops/s** | 5.4 Kops/s | 3.08× |
 
 ### Read-While-Writing (1M keys, 1 writer + N readers, Sync, CRC disabled)
 
@@ -77,10 +91,11 @@ Latency stays flat as the dataset grows: ByteCaskDB always reads from the OS pag
 
 | Readers | ByteCaskDB | ByteCaskDB BoundedStaleness | RocksDB |
 |---:|---:|---:|---:|
-| 2 | 2.54 Mops/s | 2.61 Mops/s | 1.12 Mops/s |
-| 4 | 4.26 Mops/s | 4.46 Mops/s | 2.14 Mops/s |
-| 8 | 5.94 Mops/s | 6.22 Mops/s | 4.30 Mops/s |
-| 16 | 8.55 Mops/s | 9.34 Mops/s | 6.27 Mops/s |
+| 2 | 2.44 Mops/s | 2.56 Mops/s | 1.09 Mops/s |
+| 4 | 4.53 Mops/s | 4.61 Mops/s | 2.03 Mops/s |
+| 8 | 6.76 Mops/s | 7.12 Mops/s | 4.22 Mops/s |
+| 16 | 9.98 Mops/s | 10.69 Mops/s | 6.63 Mops/s |
+| 32 | 15.71 Mops/s | 15.99 Mops/s | 9.62 Mops/s |
 
 ### Recovery
 
@@ -88,14 +103,14 @@ Recovery is the process that runs when ByteCaskDB opens an existing database: it
 
 | Keys | Threads | Recovery Time | Speedup vs 1T |
 |---:|---:|---:|---:|
-| 1M | 1 | 252 ms | — |
-| 1M | 4 | 87 ms | 2.9× |
-| 1M | 8 | 63 ms | 4.0× |
-| 1M | 16 | 61 ms | 4.1× |
+| 1M | 1 | 257 ms | — |
+| 1M | 4 | 94 ms | 2.7× |
+| 1M | 8 | 75 ms | 3.4× |
+| 1M | 16 | 63 ms | 4.1× |
 | 10M | 1 | 2.74 s | — |
-| 10M | 4 | 0.96 s | 2.9× |
-| 10M | 8 | 0.64 s | 4.3× |
-| 10M | 16 | 0.58 s | 4.7× |
+| 10M | 4 | 1.02 s | 2.7× |
+| 10M | 8 | 0.72 s | 3.8× |
+| 10M | 16 | 0.63 s | 4.3× |
 
 ---
 

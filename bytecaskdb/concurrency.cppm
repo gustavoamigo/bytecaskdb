@@ -7,78 +7,121 @@ module;
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
+#include <utility>
+#include <vector>
 
 export module bytecask.concurrency;
 
 namespace bytecask {
 
 // ---------------------------------------------------------------------------
-// SyncGroup — amortises fdatasync across concurrent writers.
-//
-// fdatasync is expensive (~2 ms). When N writers finish their writev at
-// roughly the same time, one fdatasync can cover all of them. SyncGroup
-// batches those writers so only one actually calls the sync callable
-// while the rest wait and piggyback on its result.
-//
-// Precondition: callers must have completed their writev before entering
-// sync(). The callable flushes data already in the page cache.
-//
-// Invariant: sync() does not return to a caller until a sync that started
-// *after* that caller's writev has completed successfully.
+// WriteGroupAborted — thrown to callers whose lambda was not executed
+// because a prior lambda in the same batch failed.
 // ---------------------------------------------------------------------------
-export class SyncGroup {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wweak-vtables"
+export class WriteGroupAborted : public std::runtime_error {
 public:
-  // Amortises a sync operation across concurrent callers. do_sync() is called
-  // by exactly one leader per batch; all others piggyback on its result.
-  void sync(std::invocable auto do_sync) {
-    std::unique_lock<std::mutex> lk{mu_};
+  WriteGroupAborted()
+      : std::runtime_error(
+            "bytecask: write group aborted — operation was not attempted") {}
+};
+#pragma clang diagnostic pop
 
-    // Phase 1: take a ticket — our writev is done, data is in page cache.
-    const auto my_ticket = next_ticket_++;
+// ---------------------------------------------------------------------------
+// WriteGroup — leader-applies-all write batching (Template Method pattern).
+//
+// The algorithm skeleton lives here: enqueue → elect leader → drain queue →
+// call executor → mark done → wake → loop until empty. The domain-specific
+// batch execution logic is injected via a BatchExecutor callback at
+// construction time.
+//
+// Slot is a minimal base struct carrying only sync/done/err. The engine
+// extends it (e.g. EngineSlot) with a typed lambda; the executor
+// static_cast's Slot* to the derived type.
+//
+// submit() is non-template — it takes a Slot&.
+// ---------------------------------------------------------------------------
+export class WriteGroup {
+public:
+  struct Slot {
+    bool sync{false};
+    bool done{false};
+    std::exception_ptr err;
+  };
 
-    // Phase 2: wait until covered by a completed sync, or become leader.
-    cv_.wait(lk, [&] {
-      return current_synced_ticket_ >= my_ticket || !syncing_;
-    });
+  using BatchExecutor = std::move_only_function<void(std::vector<Slot *> &)>;
 
-    // A sync that started after our writev already covered us.
-    if (current_synced_ticket_ >= my_ticket) return;
+  explicit WriteGroup(BatchExecutor executor)
+      : executor_{std::move(executor)} {}
 
-    // Phase 3: we are the leader — snapshot the watermark, sync, notify.
-    syncing_ = true;
-    const auto batch_end = next_ticket_ - 1;
-    lk.unlock();
+  WriteGroup(const WriteGroup &) = delete;
+  WriteGroup &operator=(const WriteGroup &) = delete;
 
-    try {
-      do_sync();
-    } catch (...) {
-      // If sync fails, reset the syncing flag and wake up waiters so they can
-      // retry (or handle their own failure). Do not advance the synced ticket.
-      lk.lock();
-      syncing_ = false;
+  // Enqueue a slot and block until the batch containing it has been committed.
+  // Rethrows the caller's own exception or WriteGroupAborted.
+  void submit(Slot &slot) {
+    std::unique_lock<std::mutex> lk{queue_mu_};
+    slot.done = false;
+    slot.err = nullptr;
+    queue_.push_back(&slot);
+
+    if (!leader_active_) {
+      leader_active_ = true;
       lk.unlock();
-      cv_.notify_all();
-      throw;
+      leader_loop();
+      lk.lock();
     }
 
-    lk.lock();
-    current_synced_ticket_ = batch_end;
-    syncing_ = false;
-    lk.unlock();
-    cv_.notify_all();
+    cv_.wait(lk, [&] { return slot.done; });
+
+    if (slot.err) std::rethrow_exception(slot.err);
   }
 
 private:
-  std::mutex mu_;
+  void leader_loop() {
+    while (true) {
+      std::vector<Slot *> batch;
+      {
+        std::unique_lock<std::mutex> lk{queue_mu_};
+        if (queue_.empty()) {
+          leader_active_ = false;
+          return;
+        }
+        batch.swap(queue_);
+      }
+
+      try {
+        executor_(batch);
+      } catch (...) {
+        // Executor threw without setting per-slot errors.
+        // Record the exception on every slot that has no error yet.
+        auto ex = std::current_exception();
+        for (auto *s : batch) {
+          if (!s->err) s->err = ex;
+        }
+      }
+
+      {
+        std::unique_lock<std::mutex> lk{queue_mu_};
+        for (auto *s : batch) s->done = true;
+      }
+      cv_.notify_all();
+    }
+  }
+
+  BatchExecutor executor_;
+  std::mutex queue_mu_;
+  std::vector<Slot *> queue_;
+  bool leader_active_{false};
   std::condition_variable cv_;
-  std::uint64_t next_ticket_{1};           // next ticket to hand out
-  std::uint64_t current_synced_ticket_{0}; // highest ticket on disk
-  bool syncing_{false};                    // is a sync in flight?
 };
 
 // ---------------------------------------------------------------------------

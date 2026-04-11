@@ -120,134 +120,626 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
 ```
   Writer thread
   ─────────────
-  1. acquire write_mu_
-     └─ serialises concurrent writers; readers never touch this mutex
+  1. construct EngineSlot with lambda and sync flag
 
-  2. append entry to active DataFile   (I/O, under write_mu_)
+  2. write_group_.submit(slot)
+     └─ enqueues the slot; if first in queue, becomes leader
 
-  3. produce new EngineState via pure transition (e.g. state.apply_put(...))
-
-  4. state_.store( make_shared<EngineState>(new_state) )
-     └─ atomically publishes the new immutable snapshot;
-        any subsequent state_.load() on any thread is
-        guaranteed to observe this or a later value
-
-  5. release write_mu_
-
-  6. sync_group_.sync(file)   ← group commit; see below
+  Leader (inside execute_write_batch, under write_mu_):
+  3. drain queue → collect N slots
+  4. s = *state_.load(),  t = s.key_dir.transient()
+  5. for each slot: slot.fn(s, t)   (writev + tree mutations)
+  6. s.key_dir = persistent(t)
+  7. if is_rotation_needed(s): s = rotate_active_file(s)
+  8. if any_sync: fdatasync        ← single syscall for N writers
+  9. state_.store(new EngineState)  ← durable before visible
+  10. wake all N waiters
 ```
 
-##### Group commit (`SyncGroup`)
+##### WriteGroup batching (BC-126)
 
-After releasing `write_mu_`, the writer calls `sync_group_.sync(file)` instead
-of `file->sync()` directly. `SyncGroup` uses a ticket-based protocol to batch
-concurrent `fdatasync` calls:
+`WriteGroup` (Template Method pattern) replaces the old `SyncGroup`
+ticket-based protocol. Instead of batching only `fdatasync`, it batches
+the entire write path: I/O + tree mutations + `persistent()` +
+`fdatasync` + `state_.store()`. One leader executes all N queued lambdas,
+producing a single `persistent()` snapshot and a single `fdatasync`.
 
-1. **Phase 1 — Take a ticket.**  The writer increments a monotonic counter
-   (`next_ticket_`) under the SyncGroup mutex, registering that its `writev`
-   has completed and its data is in the page cache.
+**Historical note**: SyncGroup (BC-064) used a ticket-based watermark to
+batch concurrent `fdatasync` calls after `write_mu_` was released. Each
+writer still did its own `persistent()` and `state_.store()` under
+`write_mu_`. WriteGroup eliminates N-1 `persistent()` calls and N-1
+`state_.store()` calls per batch, and moves `fdatasync` inside
+`write_mu_` to close the visibility-before-durability window.
 
-2. **Phase 2 — Wait or lead.**  The writer waits until either
-   (a) `current_synced_ticket_ >= my_ticket` — a later sync already covered
-   its data, so it returns immediately; or
-   (b) `!syncing_` — no `fdatasync` is in flight, so it becomes the leader.
+##### Durability guarantee
 
-3. **Phase 3 — Sync.**  The leader snapshots `next_ticket_ - 1` as the batch
-   watermark, releases the lock, and calls `fdatasync` (wrapped in a try/catch
-   block to gracefully handle I/O exceptions by waking waiters before throwing).
-   Every ticket issued up to that watermark has a completed `writev`, so one syscall
-   covers them all. On return the leader advances `current_synced_ticket_` and
-   wakes all waiters.
+With WriteGroup (BC-126), `fdatasync` runs **inside** `write_mu_` before
+`state_.store()`. When a write returns success, it is durable on disk
+before it becomes visible to readers.
 
-**Invariant**: a writer's data is never assumed durable until an `fdatasync`
-that started *after* the writer's `writev` has completed. Writers can never
-piggyback on an in-flight sync that may have started before their data reached
-the page cache.
+If `fdatasync` fails, the leader publishes the new state anyway so the
+running process stays internally consistent (callers receive the sync
+exception). This means a failed sync can leave writes visible but not
+durable — a trade-off accepted until the poisoned-DB flag (BC-090)
+allows fail-fast on subsequent operations.
 
-This amortises the ~2 ms `fdatasync` cost across N concurrent writers instead
-of serialising N × 2 ms.
+The leader sequence under `write_mu_` is:
 
-**Historical note**: BC-051 removed an earlier `GroupWriter` implementation
-because benchmarks showed no benefit. Those benchmarks ran on tmpfs where
-`fdatasync` is a no-op (~0 ns). Re-benchmarking on a real block device
-(ext4 on NVMe) confirmed that `fdatasync` costs ~2 ms and serialised syncs are
-the dominant bottleneck for concurrent writes.
+1. Execute all queued lambdas (writev + tree mutations).
+2. `persistent()` → new immutable tree.
+3. `fdatasync` the active file — data is on disk.
+4. `state_.store()` → publish the new state to readers.
+5. Release `write_mu_`.
 
-##### Visibility before durability
+Holding `write_mu_` across `fdatasync` would serialise all writers if
+each writer called `fdatasync` individually. WriteGroup avoids this: N
+concurrent writers queue their lambdas, one leader executes them all,
+and a single `fdatasync` covers the entire batch. The ~2 ms cost is
+amortised across N writers, giving the same throughput as the old
+`SyncGroup` ticket-based approach.
 
-Because `state_.store()` (which makes a write visible to readers) happens
-**inside** `write_mu_` before `sync_group_.sync()` (which calls `fdatasync`)
-**outside** it, there is a brief window between when a write becomes readable
-and when it is guaranteed to be on disk.
+`sync = false` writes skip the `fdatasync` step entirely. They are in
+the OS page cache but not guaranteed on disk. The `state_.store()` still
+happens inside `write_mu_` after all I/O, so the ordering is consistent
+— only the durability guarantee is relaxed.
 
-Consequences:
-- A reader can observe a value that would be lost in a crash-before-fsync.
-- After recovery, the in-memory state is consistent with what is on disk — the
-  lost write simply never reappears. The database itself is always internally
-  consistent.
-- The window exists only under `sync = true` writes; `sync = false` writes
-  have no durability guarantee at all.
+**Comparison with other stores**: PostgreSQL and SQLite WAL couple
+visibility to durability. Redis and Cassandra in async mode allow
+visibility before durability. RocksDB with `sync=true` fsyncs the WAL
+before returning. ByteCaskDB now matches the PostgreSQL/SQLite model
+for `sync = true` writes.
 
-This is a deliberate trade-off, not an oversight. Moving `state_.store()`
-to after the `fdatasync` would close the window but would also force each
-write to hold `write_mu_` across the entire blocking syscall, serialising all
-concurrent writers and eliminating the SyncGroup group-commit benefit entirely.
+**Historical note**: the pre-WriteGroup implementation had a
+visibility-before-durability window: `state_.store()` ran inside
+`write_mu_` before `fdatasync` ran outside it. This was a deliberate
+trade-off to avoid serialising writers. WriteGroup's batching eliminated
+the need for the trade-off.
 
-The only scenario where this matters in practice is when an external system
-reads a value from ByteCaskDB, acts on it irreversibly outside the database
-(e.g., charges a card, writes to a second store), and the process crashes
-before the fsync completes. This is a cross-system consistency problem that no
-embedded store can fully solve without two-phase commit across system
-boundaries.
+##### WriteGroup — leader-applies-all write batching (BC-126)
 
-**Comparison with other stores**: PostgreSQL and SQLite WAL couple visibility
-to durability (readers block until the WAL fsync completes). Redis and Cassandra
-in async mode have the same window as ByteCaskDB and document it explicitly.
-RocksDB with `sync=true` fsyncs the WAL before returning to the caller,
-closing the window but serialising syncs.
+###### Problem
 
-A future `WriteOptions::sync_before_visible` flag could close the window for
-callers that require it (see BC-125 in the backlog).
+The current write path has two inefficiencies:
 
-##### Future evolution: `SyncGroup::change_state` (BC-126)
+1. **Scattered protocol.** The three-phase sequence (acquire `write_mu_` →
+   writev + `state_.store` → release → `fdatasync`) is duplicated across
+   `put`, `del`, `commit_batch`, and `apply_batch_if`. Each call site
+   independently acquires the lock, does its I/O and tree mutation,
+   publishes state, releases, and calls `sync_group_.sync()`. This makes
+   it easy to accidentally skip a phase or mis-sequence them in future
+   call sites.
 
-The current write path scatters the three-phase protocol (acquire lock →
-`writev` + `state_.store` → release lock → `fdatasync`) across `put`, `del`,
-`commit_batch`, and `apply_batch_if`. This makes it easy to accidentally
-skip a phase or mis-sequence them in future call sites.
+2. **Per-operation persistent tree mutation.** `put` and `del` each
+   produce a new `PersistentRadixTree` via `apply_put` / `apply_del` —
+   a full persistent set/erase (path-copy) per operation. When N
+   concurrent writers are serialised through `write_mu_`, each performs
+   its own persistent mutation and state publication. A single
+   `TransientRadixTree` shared across all N writers would amortise path
+   copying and produce one `persistent()` snapshot for the entire batch.
 
-A cleaner future design would centralise the entire protocol inside `SyncGroup`
-via a `change_state` interface:
+3. **Visibility-before-durability window.** `state_.store()` fires inside
+   `write_mu_` before `fdatasync` runs outside it, so readers can observe
+   data that would be lost in a crash. Closing this window by holding
+   `write_mu_` through `fdatasync` was previously rejected because it
+   would serialise all writers. With leader-applies-all batching, the
+   `fdatasync` cost is amortised across N queued writers — holding the
+   lock through `fdatasync` is no longer a throughput problem.
+
+###### Design: WriteGroup
+
+`WriteGroup` replaces `SyncGroup` with a leader-applies-all pattern
+(similar to RocksDB's `WriteThread`). Concurrent writers submit lambdas
+to a queue; one leader thread collects them, executes all lambdas on a
+single shared `TransientRadixTree` under `write_mu_`, calls `fdatasync`
+(if any writer requested `sync = true`), publishes a single
+`EngineState`, and wakes all waiters.
+
+`fdatasync` always runs inside `write_mu_`, before `state_.store()`. No
+configurability — one code path, durable-before-visible, always. The
+batching makes this practical: N writers share one ~2 ms `fdatasync`.
+
+###### Protocol
+
+```
+  Writer thread                          WriteGroup
+  ─────────────                          ──────────
+  1. submit lambda to queue  ──────→  enqueue(lambda, sync_flag)
+  2. block on per-writer CV            │
+                                       │  Leader wakes (first in queue,
+                                       │  or when previous batch completes)
+                                       │
+                                       │  3. acquire write_mu_
+                                       │  4. snapshot state: s = *state_.load()
+                                       │     t = s.key_dir.transient()
+                                       │  5. drain queue → collect N lambdas
+                                       │     any_sync = OR of all sync flags
+                                       │  6. for each lambda:
+                                       │       lambda(s, t)
+                                       │       (may throw — see exception safety)
+                                       │  7. s.key_dir = std::move(t).persistent()
+                                       │  8. if is_rotation_needed(s): s = rotate_active_file(s)
+                                       │  9. if any_sync: fdatasync
+                                       │ 10. state_.store(make_shared(s))
+                                       │     state_time_.store(now_ns())
+                                       │ 11. release write_mu_
+                                       │ 12. wake all N waiters
+  13. return from submit     ←──────  done
+```
+
+###### Lambda signature
+
+Each call site submits a lambda with signature:
 
 ```cpp
-sync_group_.change_state([&] {
-    // Under write_mu_: append to page cache + update key directory
-    s.active_file().append(...);
-    state_.store(make_shared<EngineState>(std::move(s)));
-});
-// SyncGroup owns: acquire lock → run lambda → (release lock / fdatasync)
-// in the order determined by the durability policy.
+void(EngineState& s, TransientRadixTree<KeyDirEntry>& t)
 ```
 
-`SyncGroup` would:
-1. Acquire `write_mu_`.
-2. Run the caller's lambda (writev + `state_.store`).
-3. Execute the fsync phase according to a construction-time `DurabilityPolicy`:
-   - `VisibleBeforeDurable` (current behaviour): release lock, then
-     `fdatasync` outside it via the ticket protocol.
-   - `DurableBeforeVisible`: `fdatasync` inside the lock before
-     `state_.store`, then release — closes the visibility window at the
-     cost of serialising concurrent writers.
+The leader provides `s` (a mutable copy of the current `EngineState`) and
+`t` (the shared transient). The lambda performs I/O (writev to the active
+file) and mutates `t` (set/erase). The lambda must **not** call
+`state_.store`, `persistent()`, or `rotate_active_file` — the leader owns
+those steps.
 
-The policy should be a `DB::Options` field set at `open` time, not a
-per-call flag. Mixing policies on the same `SyncGroup` creates ambiguous
-ordering when a durable-before-visible write arrives while a
-visible-before-durable batch is in-flight. A single construction-time
-decision eliminates that class of problem entirely.
+`s.next_lsn` is a shared counter across all lambdas in the batch. Each
+lambda increments it for its entries. Since execution is serial (single
+leader thread under `write_mu_`), no synchronisation is needed.
 
-The ticket-based phase structure of `SyncGroup` remains unchanged; only
-where `state_.store` fires relative to the ticket phases shifts. The
-refactor is ~50 lines plus a new `Options::durability_mode` field.
+###### Call site examples
+
+Each call site constructs an `EngineSlot` and submits it to the
+write group. The pseudocode below mirrors the actual implementation;
+`slot.fn` is the lambda executed by the leader thread.
+
+**`put(key, value)`**:
+
+```cpp
+EngineSlot slot;
+slot.sync = opts.sync;
+slot.fn = [&](EngineState& s, auto& t) {
+  // Phase 1: I/O — can throw without corrupting in-memory state.
+  const auto offset =
+      s.active_file().append(s.next_lsn, EntryType::Put, key, value);
+  // Phase 2: in-memory mutations — cannot fail.
+  const auto existing = t.get(key);
+  if (existing) stats_retire_entry(key, *existing);
+  stats_publish_put(s.active_file_id, key, value);
+  t.set(key, KeyDirEntry{s.next_lsn, s.active_file_id, offset,
+                         narrow<uint32_t>(value.size())});
+  ++s.next_lsn;
+};
+write_group_.submit(slot);
+```
+
+**`del(key)`**:
+
+```cpp
+EngineSlot slot;
+slot.sync = opts.sync;
+slot.fn = [&](EngineState& s, auto& t) {
+  const auto existing = t.get(key);
+  if (!existing) { /* signal not-found to caller */ return; }
+  // Phase 1: I/O — can throw without corrupting in-memory state.
+  std::ignore =
+      s.active_file().append(s.next_lsn, EntryType::Delete, key, {});
+  // Phase 2: in-memory mutations — cannot fail.
+  stats_retire_entry(key, *existing);
+  stats_publish_tombstone(s.active_file_id, key);
+  ++s.next_lsn;
+  t.erase(key);
+};
+write_group_.submit(slot);
+```
+
+**`apply_batch(batch)`** — two-phase lambda:
+
+```cpp
+EngineSlot slot;
+slot.sync = opts.sync;
+slot.fn = [&](EngineState& s, auto& t) {
+  const bool multi = batch.size() > 1;
+
+  if (multi) {
+    std::ignore =
+        s.active_file().append(s.next_lsn, EntryType::BulkBegin, {}, {});
+    stats_publish_bulk_marker(s.active_file_id);
+    ++s.next_lsn;
+  }
+
+  // Phase 1: ALL I/O — can throw, exits cleanly (no mutations yet).
+  // If multi and the loop throws, the file has an orphaned BulkBegin.
+  // Force-rotate to isolate it (see "Rotate on batch failure" below).
+  struct Deferred { BytesView key; uint64_t offset, lsn; uint32_t val_size; bool is_put; };
+  std::vector<Deferred> ops;
+
+  try {
+    for (auto& op : batch.operations_) {
+      std::visit([&](auto& o) {
+        using T = std::decay_t<decltype(o)>;
+        if constexpr (std::is_same_v<T, BatchInsert>) {
+          auto offset = s.active_file().append(
+              s.next_lsn, EntryType::Put, o.key, o.value);
+          ops.push_back({o.key, offset, s.next_lsn,
+                         narrow<uint32_t>(o.value.size()), true});
+        } else {
+          std::ignore = s.active_file().append(
+              s.next_lsn, EntryType::Delete, o.key, {});
+          ops.push_back({o.key, 0, s.next_lsn, 0, false});
+        }
+        ++s.next_lsn;
+      }, op);
+    }
+
+    if (multi) {
+      std::ignore =
+          s.active_file().append(s.next_lsn, EntryType::BulkEnd, {}, {});
+      stats_publish_bulk_marker(s.active_file_id);
+      ++s.next_lsn;
+    }
+  } catch (...) {
+    if (multi) s = rotate_active_file(std::move(s));
+    throw;
+  }
+
+  // Phase 2: ALL mutations — pure in-memory, cannot fail
+  for (auto& d : ops) {
+    const auto existing = t.get(d.key);
+    if (existing) stats_retire_entry(d.key, *existing);
+    if (d.is_put) {
+      stats_publish_put(s.active_file_id, d.key, d.val_size);
+      t.set(d.key, KeyDirEntry{d.lsn, s.active_file_id,
+                                d.offset, d.val_size});
+    } else {
+      stats_publish_tombstone(s.active_file_id, d.key);
+      t.erase(d.key);
+    }
+  }
+};
+write_group_.submit(slot);
+```
+
+The two-phase structure is necessary because intra-batch operations can
+overwrite earlier operations in the same batch (e.g. `put("x", 1)` then
+`put("x", 2)`). Phase 2 mutates `t` in order, so each `t.get()` sees
+the prior operation's mutation — stats correctly retire the first put
+when the second put overwrites it. Phase 1 does all I/O before any
+mutation, preserving the IO-before-mutation invariant for exception
+safety.
+
+###### IO-before-mutation invariant
+
+Every write-path lambda follows the same two-phase structure:
+
+- **Phase 1 (I/O):** `writev` to the active data file. This is the only
+  step that can throw (`std::system_error` on I/O failure).
+- **Phase 2 (mutations):** `stats_retire_entry`, `stats_publish_*`,
+  `t.set` / `t.erase`, `++next_lsn`. These are pure in-memory
+  operations that cannot fail.
+
+This ordering guarantees that if I/O throws at operation K, no in-memory
+state (`key_dir`, `file_stats_`, `next_lsn`) has been mutated for
+operation K. The transient reflects only the mutations from previously
+completed lambdas (0..K-1).
+
+`put` and `del` follow this pattern for single entries. `apply_batch`
+extends it to N entries: Phase 1 does **all** `writev` calls and
+collects results in a `Deferred` vector, then Phase 2 replays all
+mutations in order. `apply_batch_if` uses the same two-phase
+structure for its inline batch commit path.
+
+No rollback logic is needed. The transient is always exactly "one step
+behind" the I/O — it reflects all operations whose I/O completed
+successfully.
+
+###### Rotate on batch failure
+
+If `append()` throws mid-batch after `BulkBegin` has been written, the
+active file contains an orphaned `BulkBegin` with no matching `BulkEnd`.
+Without intervention, subsequent writes to the same file extend the
+region that `flush_hints_for` (and `compact_file`) treat as part of the
+incomplete batch — those entries would be silently discarded on recovery.
+
+The fix is simple: force `rotate_active_file()` in the catch block when
+`multi` is true. This seals the file, isolating the incomplete batch at
+its tail. `flush_hints_for` already discards entries between a
+`BulkBegin` and EOF when no `BulkEnd` is found, so the orphaned entries
+are safely ignored. New writes go to a fresh file unaffected by the
+failed batch.
+
+Both `apply_batch` (WriteGroup lambda) and `apply_batch_if` (solo path)
+implement this pattern. The solo path additionally publishes the rotated
+state via `state_.store()` since it is not inside `execute_write_batch`.
+
+###### Exception handling in the leader loop
+
+When the leader executes lambda K and it throws:
+
+1. The transient `t` contains mutations from lambdas 0..K-1 (all
+   successful). Lambda K did I/O before mutating, so no partial
+   mutations from K exist in `t`.
+2. The leader calls `persistent()` on `t`, publishes the state covering
+   lambdas 0..K-1, and (if `any_sync`) calls `fdatasync`.
+3. Lambda K's caller receives the exception (rethrown after state
+   publication).
+4. Lambdas K+1..N-1 are discarded — their callers receive a
+   `WriteGroupAborted` exception indicating their operation was not
+   attempted. They can retry.
+
+This is safe because:
+- Lambdas 0..K-1 are fully committed (I/O + mutations + fdatasync).
+- Lambda K's I/O is in the page cache but not in the tree. For `put`/`del`,
+  recovery ignores entries not in the key directory. For `apply_batch`,
+  the missing `BulkEnd` causes recovery to discard the incomplete batch.
+- Lambdas K+1..N-1 were never executed — no I/O, no mutations.
+
+###### Commit-phase exception safety
+
+The commit phase runs *after* all lambda I/O and mutations:
+`persistent()` → `is_rotation_needed()` / `rotate_active_file()` → `fdatasync` → `state_.store()`.
+If any of these steps throws (e.g. `fdatasync` returns EIO), all data
+from lambdas 0..K-1 is already appended to the data file and
+`file_stats_` has already been mutated, but `state_.store()` never ran.
+
+`execute_write_batch` wraps the commit phase in try/catch:
+- Every completed slot receives the commit exception.
+- Unexecuted slots receive `WriteGroupAborted`.
+- The exception propagates to the leader thread (and through
+  `leader_loop`'s existing catch to all waiting slots).
+
+The `apply_batch_if` solo path lets the commit exception propagate to
+the caller naturally.
+
+**`file_stats_` consistency.** In both paths, `file_stats_` may drift
+from the published `EngineState` after a commit-phase failure. This is
+acceptable because `file_stats_` is advisory (used only for compaction
+heuristics) and is rebuilt from disk on the next `DB::open`. No user
+data is lost or corrupted — appended entries are visible on recovery.
+
+###### `sync` flag aggregation
+
+Each submitted lambda carries its caller's `opts.sync` flag. The leader
+computes `any_sync = OR(all sync flags)`. If `any_sync` is true, one
+`fdatasync` covers all writers in the batch — including those that
+specified `sync = false`. This is always safe: syncing data that didn't
+request it merely provides stronger-than-requested durability.
+
+If all writers specify `sync = false`, no `fdatasync` is issued.
+
+###### Shared transient across lambdas
+
+All lambdas in a batch operate on the same `TransientRadixTree`. This
+means:
+
+- Lambda 1's `put("x")` is visible to lambda 2's `t.get("x")`.
+- This is serialisation order — correct. The lambdas execute in queue
+  order, which defines their commit order.
+- Stats are correct: if lambda 2 overwrites lambda 1's key, `t.get()`
+  returns lambda 1's entry, and `stats_retire_entry` debits the right
+  file.
+
+One `persistent()` call at the end produces a single immutable tree
+covering all N mutations. One `state_.store()`. One `state_time_` update.
+This eliminates N-1 persistent tree snapshots and N-1 atomic stores.
+
+###### Participants and exclusions
+
+| Call site | Uses WriteGroup? | Reason |
+|-----------|-----------------|--------|
+| `put` | Yes | Hot path, single I/O + single tree mutation |
+| `del` | Yes | Hot path, single I/O + single tree mutation |
+| `apply_batch` | Yes | Two-phase lambda: all I/O first, all mutations after |
+| `apply_batch_if` | **No — solo** | Needs `lower_bound` (range guards) which `TransientRadixTree` does not expose. Also, checking preconditions against a transient containing unpublished mutations from other lambdas in the batch would produce non-deterministic conflict results depending on queue order. Locks `write_mu_` directly. |
+| `vacuum_commit` | **No — solo** | Already a rare, internally-triggered path. Locks `write_mu_` directly. |
+| Any `try_lock` call | **No — solo** | `try_lock` semantics require immediate success/failure. Queuing in WriteGroup and waiting for a leader contradicts this. These calls lock `write_mu_` directly; if the lock is held (by WriteGroup leader or a solo writer), `try_lock` fails immediately. |
+
+Solo writers acquire `write_mu_` directly, which serialises correctly
+with WriteGroup since the leader holds the same mutex. A solo writer
+that grabs `write_mu_` while the WriteGroup queue is non-empty simply
+delays the next leader — no deadlock, no reordering.
+
+###### `del` return value
+
+`del` currently returns `bool` (true if the key existed). In the
+WriteGroup model, the return value must be communicated out of the
+lambda. The lambda captures a `bool& existed` reference and sets it
+inside the lambda body. The caller reads it after `submit` returns.
+
+```cpp
+bool existed = false;
+write_group_.submit(opts.sync, [&](EngineState& s, auto& t) {
+  const auto existing = t.get(key);
+  if (!existing) return;
+  existed = true;
+  // ... stats + I/O + t.erase ...
+});
+return existed;
+```
+
+###### Interaction with file rotation
+
+`is_rotation_needed` / `rotate_active_file` runs once after all lambdas complete, after
+`persistent()` and before `state_.store()`. The leader checks whether
+the active file has exceeded the rotation threshold and, if so, seals
+it and opens a new one for subsequent batches. This means all lambdas
+in a batch write to the same active file. File rotation happens at most
+once per batch.
+
+###### Durability ordering
+
+The leader always calls `fdatasync` before `state_.store()`. No reader
+can observe data that is not yet durable. The visibility window that
+existed in the pre-WriteGroup implementation is eliminated.
+
+The `fdatasync` cost (~2 ms) is amortised across N batched writers. With
+10 concurrent writers, per-writer amortised cost is ~200 µs — comparable
+to the old `SyncGroup` approach but without the window.
+
+###### Cost analysis
+
+Per-operation costs under `write_mu_`:
+- **writev**: ~5 µs per entry (1 KiB value, NVMe)
+- **Transient set/erase**: ~2 µs per entry
+- **persistent()**: O(modified path nodes), ~2–10 µs for a batch of N
+- **fdatasync**: ~2 ms, amortised across N writers
+
+For N = 10 concurrent writers, batch execution takes ~70 µs (I/O +
+mutations) + ~2 ms (fdatasync) = ~2.07 ms total, or ~207 µs per writer.
+This is identical throughput to the current SyncGroup approach but
+simpler (one code path instead of scattered phases) and eliminates the
+visibility window.
+
+The one new per-batch cost is the `std::vector<Deferred>` allocation
+inside `apply_batch`'s two-phase lambda. This is proportional to batch
+size and happens once per `apply_batch` call under the lock — negligible
+for typical batch sizes (tens of operations).
+
+###### Relationship to SyncGroup
+
+`WriteGroup` subsumes `SyncGroup`. The ticket-based fdatasync batching
+is no longer needed — the leader performs a single fdatasync covering
+all writers in the batch, inside `write_mu_`. `SyncGroup` is removed.
+
+###### `WriteGroup` API (Template Method pattern)
+
+`WriteGroup` implements the Template Method pattern: the algorithm
+skeleton (enqueue → elect leader → drain queue → call executor → mark
+done → wake → loop) lives in `concurrency.cppm`. The domain-specific
+batch execution logic (`execute_write_batch`) is injected via a
+`BatchExecutor` callback at construction time. `WriteGroup` never sees
+`EngineState`, `TransientRadixTree`, or any engine type.
+
+```cpp
+// concurrency.cppm — generic skeleton
+class WriteGroup {
+public:
+  struct Slot {
+    bool sync{false};
+    bool done{false};
+    std::exception_ptr err;
+  };
+
+  using BatchExecutor = std::move_only_function<void(std::vector<Slot *> &)>;
+
+  explicit WriteGroup(BatchExecutor executor);
+
+  // Enqueue a slot and block until committed. Non-template.
+  // Rethrows the caller's own exception or WriteGroupAborted.
+  void submit(Slot &slot);
+
+private:
+  BatchExecutor executor_;
+  std::mutex queue_mu_;
+  std::vector<Slot *> queue_;
+  bool leader_active_{false};
+  std::condition_variable cv_;
+};
+```
+
+```cpp
+// bytecask.cpp — engine-specific hook
+struct EngineSlot : WriteGroup::Slot {
+  std::move_only_function<void(EngineState &,
+                               TransientRadixTree<KeyDirEntry> &)> fn;
+};
+```
+
+The `DB` constructor injects the executor:
+`write_group_{[this](auto &batch) { execute_write_batch(batch); }}`
+
+`execute_write_batch` acquires `write_mu_`, creates `s` + `t`, iterates
+slots calling `static_cast<EngineSlot *>(slot)->fn(s, t)`, then calls
+`persistent()`, `is_rotation_needed` / `rotate_active_file`, `fdatasync` if `any_sync`,
+`state_.store`. Solo writers (`apply_batch_if`, `vacuum_commit`)
+acquire `write_mu_` directly — they serialise correctly because the
+leader holds the same mutex.
+
+###### Implementation: queue + leader election + leader loop
+
+WriteGroup does **not** use SyncGroup's ticket-based watermark. Tickets
+solved a problem WriteGroup doesn't have: tracking which writers' data
+existed in the page cache before a given `fdatasync` started. In
+WriteGroup, one leader executes all lambdas sequentially then calls
+`fdatasync` once — it knows exactly which lambdas it ran.
+
+The data structures and algorithms are described in the API section above.
+Slots are stack-allocated by each caller — no heap allocation per writer.
+The only allocation is the `std::vector<Slot*>`, which reuses capacity
+across batches.
+
+**`submit(slot)`** — called by every writer:
+
+```
+  1. Push &slot onto queue_ under queue_mu_.
+  2. If !leader_active_:
+       Set leader_active_ = true, release queue_mu_, enter leader_loop().
+       On return from leader_loop(), re-lock queue_mu_.
+  3. cv_.wait(queue_mu_, [&] { return slot.done; })
+  4. If slot.err, rethrow.
+```
+
+The caller that finds `!leader_active_` becomes the leader. All other
+callers park on the CV. The leader's own slot is in the first batch and
+is marked done during execution — when the leader returns and re-enters
+the wait, it returns immediately.
+
+**`leader_loop()`** — runs until the queue is empty:
+
+```
+  loop:
+    1. Lock queue_mu_, swap(batch, queue_). If queue was empty:
+         leader_active_ = false, return.        ← resign
+    2. Unlock queue_mu_.
+    3. executor_(batch).                        ← the Template Method hook
+    4. Lock queue_mu_, mark all slots done, cv_.notify_all().
+    5. Goto loop.                               ← drain new arrivals
+```
+
+Writers that arrive during the executor call accumulate in `queue_` and
+get picked up in the next iteration. When the queue is finally empty
+after a batch completes, the leader resigns. `queue_mu_` is **never
+held during I/O** — only for the O(1) swap to drain and the O(N) wake.
+
+**`execute_write_batch(batch)`** — a `DB` method, the Template Method hook:
+
+```
+  1. Lock write_mu_.
+  2. s = copy of *state_.load().   t = s.key_dir.transient().
+  3. any_sync = false, completed = 0.
+  4. For each slot in batch:
+       try { static_cast<EngineSlot*>(slot)->fn(s, t);
+             any_sync |= slot->sync; ++completed; }
+       catch { slot->err = current_exception(); break; }
+  5. try:
+       s.key_dir = move(t).persistent().
+       if is_rotation_needed(s): s = rotate_active_file(move(s)).
+       If any_sync: active_file.sync().         ← single fdatasync
+       state_.store(make_shared<EngineState>(move(s))).
+       state_time_.store(now, release).
+     catch:
+       For slots 0..completed-1: slot->err = commit_exception.
+       For slots completed+1..end: slot->err = WriteGroupAborted{}.
+       rethrow.
+  6. For slots completed+1..end: slot->err = WriteGroupAborted{}.
+  7. Unlock write_mu_.
+```
+
+**Solo writer interaction.** Solo writers (`apply_batch_if`,
+`vacuum_commit`, `try_lock` callers) acquire `write_mu_` directly.
+Between batches (during the leader's `queue_mu_` to check for more
+work), `write_mu_` is not held — solo writers have a window to run.
+If a solo writer holds `write_mu_` when the leader tries to acquire
+it, the leader blocks. If the leader holds it, the solo writer blocks
+(or fails for `try_lock`). No special coordination needed.
+
+**Why not tickets:**
+
+| Aspect | SyncGroup (tickets) | WriteGroup (queue + leader) |
+|--------|--------------------|-----------------------------|
+| What's batched | Only fdatasync | IO + mutations + fdatasync + publish |
+| Tracking mechanism | Ticket watermark | None — leader knows its batch |
+| Per-writer state | Ticket number | Stack-allocated Slot |
+| Leader election | Implicit (`!syncing_`) | Explicit (`!leader_active_` flag) |
+| `persistent()` calls | N per batch | 1 per batch |
+| `state_.store` calls | N per batch | 1 per batch |
 
 ##### Read path (no lock, no mutex)
 
@@ -1242,7 +1734,7 @@ The `~DB()` destructor seals the active file, then calls `flush_hints()` which d
 - `src/engine/hint_entry.cppm`: C++23 module (`bytecask.hint_entry`) — `HintEntry`, `serialize_entry`, `deserialize_entry`
 - `src/engine/hint_file.cppm`: C++23 module (`bytecask.hint_file`) — `HintFile`, `OpenForWrite`/`OpenForRead`
 - `src/engine/radix_tree.cppm`: C++23 module (`bytecask.radix_tree`) — `PersistentRadixTree<V>`, `RadixTreeIterator<V>`
-- `src/engine/concurrency.cppm`: C++23 module (`bytecask.concurrency`) — `SyncGroup`, `BackgroundWorker`
+- `src/engine/concurrency.cppm`: C++23 module (`bytecask.concurrency`) — `WriteGroup`, `WriteGroupAborted`, `BackgroundWorker`
 - `src/engine/internals.cppm`: internal partition `bytecask.engine:internals` — `EngineState`, `FileStats`, `KeyDirEntry`, `FileRegistry`, `Key`, `StaleFile`, `VacuumMapping`, `VacuumScanResult`, `RecoveredFile`, `RecoveryResult`, `entry_size`
 - `src/engine/bytecask.cppm`: primary interface unit `bytecask.engine` — public types (`Bytes`, `BytesView`, `VacuumOptions`, `Batch`, `WriteOptions`, `ReadOptions`, `Options`, `KeyIterator`, `EntryIterator`) and `Bytecask` class declaration
 - `src/engine/bytecask.cpp`: implementation unit `bytecask.engine` — all `Bytecask` method bodies, recovery, vacuum, hint, rotation logic
