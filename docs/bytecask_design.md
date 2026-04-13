@@ -188,6 +188,12 @@ When this happens, the engine calls `deem_as_poisoned(reason)` with a diagnostic
 
 Implementation: `poisoned_` is an `atomic<bool>` (release on write, acquire on read). The non-atomic `poison_reason_` string is safely published via the release/acquire pair — the string is written before `poisoned_.store(true, release)` and read after `poisoned_.load(acquire)`.
 
+##### Partial write detection (tainted file)
+
+If `writev` returns a short write (0 < written < total), `DataFile::append()` sets a `tainted_` flag before throwing. A tainted file has bytes on disk that `offset_` does not account for. The file is opened with `O_APPEND`, so the next `writev` would write at the kernel's true EOF (past the partial data), but `offset_` would still point to the old position — the offset returned by subsequent appends would be wrong.
+
+For multi-entry batches this is safe: the isolation rotation moves to a new file, abandoning the tainted one. For single-entry writes, the `apply_batch_if` catch block checks `file.is_tainted()` and poisons the DB if set. Recovery (process restart) discards the partial entry via CRC mismatch and restores a clean state.
+
 ##### Sync failure: publish before rethrow
 
 If `fdatasync` fails (step 8), the writes are in the page cache but not guaranteed durable. The state is published to `state_.store()` before rethrowing the sync exception. This preserves in-process consistency: LSNs advance, the key directory reflects the writes, and the next write builds on the correct state. Without this, the old state would be reused, causing duplicate LSNs and data corruption on the next write. Sync failure affects crash safety (durability), not process correctness. The long-term fix is BC-090 (poisoned-DB flag on sync failure).

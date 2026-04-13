@@ -271,13 +271,44 @@ operation failed, not what the key bytes were.
 ```python
 class FailureClass(Enum):
     SUCCESS = "success"               # no failure — transition fully persisted
-    A = "before_any_io"               # conflict check fails — no I/O attempted
-    B = "during_phase1_appends"       # append fails mid-batch — not persisted
-    C = "on_bulk_end_append"          # BulkEnd write fails — orphan isolation
-    D = "isolation_sync_fails"        # sync during orphan isolation fails — poison
-    E = "isolation_rotation_fails"    # rotation during orphan isolation fails — poison
-    F = "commit_sync_fails"           # sync in commit phase — persisted, throws
+    A  = "before_any_io"              # conflict check fails — no I/O attempted
+    B1 = "append_fails_nothing_written"   # writev returns -1, no bytes on disk
+    B2 = "append_fails_partial_write"     # writev returns short, file tainted
+    B3 = "append_fails_after_full_write"  # writev ok, post-write fault, file tainted
+    C  = "on_bulk_end_append"         # BulkEnd write fails — orphan isolation
+    D  = "isolation_sync_fails"       # sync during orphan isolation fails — poison
+    E  = "isolation_rotation_fails"   # rotation during orphan isolation fails — poison
+    F  = "commit_sync_fails"          # sync in commit phase — persisted, throws
 ```
+
+### Write outcome subclasses (B1, B2, B3)
+
+The original class B ("append fails mid-batch") assumed `writev` either
+fully succeeds or fails before writing anything. In reality, `writev`
+can produce three outcomes:
+
+- **B1 — nothing written**: `writev` returns -1. No bytes on disk.
+  `offset_` is unchanged, kernel fd position is unchanged. Safe.
+- **B2 — partial write**: `writev` returns 0 < N < total. N bytes are
+  on disk, kernel fd position advanced by N. `offset_` is not advanced
+  (the throw in `append()` skips `offset_ +=`). The file is `tainted`.
+- **B3 — full write + failure**: `writev` returns total (all bytes on
+  disk), but the caller throws before `offset_` advances. Only possible
+  via fault injection (`PostWriteMode::throw_after`). The file is
+  `tainted`.
+
+For multi-entry batches, B2 and B3 are safe: the isolation rotation
+moves to a new file, abandoning the tainted one. For single-entry
+writes, there is no isolation — `offset_` diverges from the kernel's
+file position (the file was opened with `O_APPEND`). The next `writev`
+would write at the kernel's true EOF (past the stale bytes), but
+`offset_` would still point to the old position. The returned offset
+for subsequent entries would be wrong — silent corruption.
+
+The fix: `DataFile::append()` sets `tainted_ = true` when `writev`
+returns a short write (`written > 0`). In the `apply_batch_if` catch
+block, if `!multi && file.is_tainted()`, the engine poisons the DB.
+Recovery (process restart) clears the state.
 
 ### Class Behavior Summary
 
@@ -285,7 +316,11 @@ class FailureClass(Enum):
 |-------|---------------------|-----------------|--------------|--------|----------|
 | SUCCESS | Yes — fully | Yes — full delta | Yes | No | No |
 | A | No — not attempted | No | No | No (returns false) | No |
-| B | No — partial write | No | No | Yes | No |
+| B1 | No — nothing written | No | No | Yes | No |
+| B2 (multi) | No — partial write | No | No | Yes | No (isolation rotates) |
+| B2 (single) | No — partial write | No | No | Yes | Yes (tainted) |
+| B3 (multi) | No — full write | No | No | Yes | No (isolation rotates) |
+| B3 (single) | No — full write | No | No | Yes | Yes (tainted) |
 | C | No — partial write | No | No | Yes | No |
 | D | No — partial write | No | No | Yes | Yes |
 | E | No — partial write | No | No | Yes | Yes |
@@ -301,10 +336,13 @@ exception is rethrown. The caller knows the write succeeded durably.
 |-------|---------|-----|
 | SUCCESS | Yes | All existing engine tests exercise this path |
 | A | Yes | 25 `validate_preconditions` unit tests (BC-129) |
-| B | Partial | 1 fault injection test (BC-131) — count-based, not name-based |
+| B1 | Partial | 1 fault injection test (BC-131) — count-based, not name-based |
+| B2 (single) | Yes | `[partial_write]` test — `PostWriteMode::short_write` (BC-135) |
+| B2 (multi) | Yes | `[partial_write]` test — multi-entry batch with isolation (BC-135) |
+| B3 (single) | Yes | `[partial_write]` test — `PostWriteMode::throw_after` (BC-135) |
 | C | No | Requires `bulk_end_append` checkpoint |
-| D | No | Requires `isolation_sync` checkpoint + `DbPoisoned` |
-| E | No | Requires `isolation_rotation` checkpoint + `DbPoisoned` |
+| D | Yes | BC-134 `[poisoned]` test — count-based chains through isolation sync |
+| E | Yes | BC-134 `[poisoned]` test — `io_rotate_file_creation` checkpoint |
 | F | Yes | 1 fault injection test (BC-133) |
 
 ---
@@ -348,14 +386,30 @@ def expected_delta(P: PlanShape, F: FailureClass) -> Delta:
             threw        = False,
         )
 
-    elif F in {FailureClass.B, FailureClass.C}:
-        # Transition not fully persisted — must not be applied
+    elif F in {FailureClass.B1, FailureClass.C}:
+        # Transition not fully persisted — must not be applied.
+        # B1: writev returned -1, no bytes on disk. Safe.
+        # C: BulkEnd failed, isolation rotates. Safe.
         return Delta(
             keys_added   = [],
             keys_removed = [],
             lsn_advance  = 0,       # published next_lsn unchanged
             stats_delta  = NoDelta,
             poisoned     = False,
+            threw        = True,
+        )
+
+    elif F in {FailureClass.B2, FailureClass.B3}:
+        # Partial or full write on disk, offset_ not advanced.
+        # Multi-entry: isolation rotation handles it — safe, not poisoned.
+        # Single-entry: offset_ diverges from kernel fd — must poison.
+        multi = len(P.ops) > 1
+        return Delta(
+            keys_added   = [],
+            keys_removed = [],
+            lsn_advance  = 0,
+            stats_delta  = NoDelta,
+            poisoned     = not multi,  # single-entry taint → poison
             threw        = True,
         )
 
@@ -418,15 +472,15 @@ plan_shapes = [
     PlanShape(ops=[Put], conflict=True,label="conflicting_plan"),
 ]
 
-failure_classes = list(FailureClass)  # all seven classes
+failure_classes = list(FailureClass)  # all nine classes
 ```
 
 Total generated tests:
 
 ```
 len(state_shapes) × len(plan_shapes) × len(failure_classes)
-= 4 × 7 × 7
-= 196 tests
+= 4 × 7 × 9
+= 252 tests
 ```
 
 Each test is deterministic, independent, and covers exactly one cell
@@ -487,15 +541,23 @@ plan shape. This is what connects the abstract class to the
 deterministic injector.
 
 ```python
-def fault_point_for_class(p: PlanShape, f: FailureClass) -> int:
+def fault_point_for_class(p: PlanShape, f: FailureClass) -> FaultConfig:
+    """
+    Maps a failure class to the concrete injection configuration.
+
+    B1 uses the existing pre-write checkpoint (throw_before mode).
+    B2 uses the post-write checkpoint (PostWriteMode.short_write).
+    B3 uses the post-write checkpoint (PostWriteMode.throw_after).
+    All others use count-based pre-write injection.
+    """
     multi = len(p.ops) > 1
     checkpoints = []
 
     if multi:
-        checkpoints.append(("bulk_begin_append", FailureClass.B))
+        checkpoints.append(("bulk_begin_append", FailureClass.B1))
 
     for i, op in enumerate(p.ops):
-        checkpoints.append((f"op_{i}_append", FailureClass.B))
+        checkpoints.append((f"op_{i}_append", FailureClass.B1))
 
     if multi:
         checkpoints.append(("bulk_end_append",   FailureClass.C))
@@ -504,12 +566,27 @@ def fault_point_for_class(p: PlanShape, f: FailureClass) -> int:
 
     checkpoints.append(("commit_sync", FailureClass.F))
 
-    # Return the index of the first checkpoint matching the class
+    if f == FailureClass.B2:
+        # Post-write short_write on the first data append
+        return FaultConfig(
+            name="io_data_file_append_partial",
+            post_write_mode=PostWriteMode.short_write,
+            short_write_bytes=5,
+        )
+
+    if f == FailureClass.B3:
+        # Post-write throw_after on the first data append
+        return FaultConfig(
+            name="io_data_file_append_partial",
+            post_write_mode=PostWriteMode.throw_after,
+        )
+
+    # Pre-write count-based injection for all other classes
     for i, (label, cls) in enumerate(checkpoints):
         if cls == f:
-            return i
+            return FaultConfig(fail_at=i)
 
-    return -1  # SUCCESS — no fault injected
+    return FaultConfig()  # SUCCESS — no fault injected
 ```
 
 ---
@@ -613,18 +690,16 @@ Class G — rename completes but process does not confirm
 
 Work items ordered by dependency. Each builds on the previous.
 
-### Phase 1 — `DbPoisoned` (prerequisite for classes D, E)
+### Phase 1 — `DbPoisoned` (prerequisite for classes D, E) ✅
 
-Add a `poisoned_` flag to `DB`. When the isolation rotation path
-(the `catch(...)` block in `apply_batch_if` after orphaned `BulkBegin`)
-fails to sync or rotate, set `poisoned_ = true`. All subsequent write
-operations (`put`, `del`, `apply_batch`, `apply_batch_if`, `vacuum`)
-must throw `DbPoisoned`. Read operations (`get`, `contains_key`,
-`snapshot`, iterators) remain available — the in-memory state was
-correctly rolled back. Add `is_poisoned()` public accessor.
-
-**Depends on**: nothing (the isolation path already exists in
-`apply_batch_if`).
+Implemented in BC-134. The engine calls `deem_as_poisoned(reason)` when
+isolation rotation fails after an orphaned `BulkBegin`. All subsequent
+writes throw `DbPoisoned` with a diagnostic reason; reads remain
+available. `is_poisoned()` and `poison_reason()` public accessors
+added. A `FAULT_INJECTION(io_rotate_file_creation)` checkpoint in
+`rotate_active_file` enables deterministic testing. Three `[poisoned]`
+tests cover: poison on isolation failure, reads on poisoned DB,
+single-entry failure does not poison.
 
 **Unblocks**: failure classes D and E.
 
@@ -698,8 +773,10 @@ test/
       prove_apply_batch_if.cpp    ← generated, never hand-edited
       prove_vacuum_compact.cpp    ← generated, never hand-edited
       prove_vacuum_absorb.cpp     ← generated, never hand-edited
-    xmake.lua
 ```
+
+Build targets for the proof tests are added to the root `xmake.lua`,
+consistent with the existing test and benchmark targets.
 
 The generated files are committed to the repository. They are
 evidence. Regenerating them and seeing no diff confirms the model

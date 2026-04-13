@@ -2924,6 +2924,101 @@ TEST_CASE("single-entry failure does not poison the DB", "[poisoned]") {
 }
 
 // ---------------------------------------------------------------------------
+// Partial write tests — exercise the tainted file / poison-on-divergence
+// mechanism when writev writes partial or full data but the entry is
+// incomplete from ByteCask's perspective.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("partial write on single-entry put poisons the DB",
+          "[partial_write]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // Write "a" successfully so we can verify reads still work after poison.
+  db.put({.sync = false}, to_bytes("a"), to_bytes("val_a"));
+
+  // Inject a short write: writev succeeds fully, then ftruncate simulates
+  // only 5 bytes making it to disk. The file is tainted; the single-entry
+  // path poisons the DB.
+  {
+    using PW = bytecask::testing::PostWriteMode;
+    bytecask::testing::ScopedFaultInjector fi{
+        "io_data_file_append_partial", PW::short_write, 5};
+    REQUIRE_THROWS_AS(db.put({.sync = false}, to_bytes("b"), to_bytes("v")),
+                      std::system_error);
+  }
+
+  REQUIRE(db.is_poisoned());
+  CHECK(db.poison_reason().find("partial write") != std::string::npos);
+
+  // Writes must throw DbPoisoned.
+  CHECK_THROWS_AS(db.put({.sync = false}, to_bytes("z"), to_bytes("z")),
+                  bytecask::DbPoisoned);
+
+  // Reads still work on pre-poison data.
+  const auto val = get_val(db, to_bytes("a"));
+  REQUIRE(val.has_value());
+  CHECK(to_string(*val) == "val_a");
+}
+
+TEST_CASE("full write + throw on single-entry put poisons the DB",
+          "[partial_write]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({.sync = false}, to_bytes("a"), to_bytes("val_a"));
+
+  // Inject throw_after: writev succeeds fully (all bytes on disk), then
+  // the post-write checkpoint throws before offset_ advances. The file
+  // is tainted; the single-entry path poisons the DB.
+  {
+    using PW = bytecask::testing::PostWriteMode;
+    bytecask::testing::ScopedFaultInjector fi{
+        "io_data_file_append_partial", PW::throw_after};
+    REQUIRE_THROWS_AS(db.put({.sync = false}, to_bytes("b"), to_bytes("v")),
+                      std::system_error);
+  }
+
+  REQUIRE(db.is_poisoned());
+
+  // Reads still work.
+  CHECK(db.contains_key(to_bytes("a")));
+  CHECK_FALSE(db.contains_key(to_bytes("b")));
+}
+
+TEST_CASE("partial write on multi-entry batch does not poison if isolation "
+          "succeeds",
+          "[partial_write]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // A 2-op batch: BulkBegin, Put-a, Put-b, BulkEnd.
+  // Inject short_write on the post-write checkpoint. The pre-write
+  // FAULT_INJECTION(io_data_file_append) fires first (call_count-based
+  // is not used here — name-based targets only io_data_file_append_partial).
+  // After Put-a's writev succeeds, the post-write checkpoint triggers:
+  // ftruncate + throw. The file is tainted, but multi==true so isolation
+  // rotation runs and moves to a new file. The tainted file is abandoned.
+  {
+    using PW = bytecask::testing::PostWriteMode;
+    bytecask::testing::ScopedFaultInjector fi{
+        "io_data_file_append_partial", PW::short_write, 5};
+    bytecask::Batch batch;
+    batch.put(to_bytes("a"), to_bytes("v1"));
+    batch.put(to_bytes("b"), to_bytes("v2"));
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(batch)),
+                      std::system_error);
+  }
+
+  // Multi-entry isolation handled it — DB must not be poisoned.
+  CHECK_FALSE(db.is_poisoned());
+
+  // Subsequent writes succeed.
+  REQUIRE_NOTHROW(db.put({.sync = false}, to_bytes("c"), to_bytes("v3")));
+  CHECK(get_val(db, to_bytes("c")).has_value());
+}
+
+// ---------------------------------------------------------------------------
 // validate_preconditions unit tests
 // ---------------------------------------------------------------------------
 // These test TransientEngineState::validate_preconditions in isolation —

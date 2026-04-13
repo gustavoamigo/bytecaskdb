@@ -548,6 +548,11 @@ auto DB::apply_batch_if(WriteOptions opts,
             file.path().string()));
         throw;
       }
+    } else if (file.is_tainted()) {
+      deem_as_poisoned(std::format(
+          "partial write detected on '{}': file position diverged from "
+          "offset tracking. Writes blocked until restart.",
+          file.path().string()));
     }
     throw;
   }
