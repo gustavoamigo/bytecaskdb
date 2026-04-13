@@ -37,7 +37,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-078 | Published library module boundary | Decision: use Path A — keep sub-components (radix_tree, data_file, hint_file, etc.) as top-level modules for isolated testing; enforce public boundary at install time by only shipping the bytecask.engine BMI. Revisit Path B (full-partition restructure) if airtight compiler-enforced encapsulation is needed. |
 | BC-041 | `ReadOptions::verify_checksums` flag | Allow skipping CRC verification on bulk scans for ~5% win. Mirrors LevelDB/RocksDB `verify_checksums` option. |
-| BC-090 | Error handling | Review Error handling, we haven't reviewed this part |
+| BC-090 | Error handling | Review Error handling, we haven't reviewed this part. BC-134 implemented DbPoisoned for isolation rotation failures; sync-failure poisoning is still open. |
 | BC-091 | Logging | Logging? (what other projects use) |
 | BC-092 | UUIDv4 test | Test and protections if customers use UUIDv4 as key (Maybe we will need a Adaptive Radix Tree extension) |
 | BC-093 | Vacuum benchmarks | Add benchmark tests for the vacuum (with performance and data file reclaim tests) |
@@ -45,7 +45,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-125 | ~~`WriteOptions::sync_before_visible`~~ | Obsolete. Durability-before-visibility is now the default. `state_.store()` happens after `fdatasync`. |
 | BC-126 | ~~`SyncGroup::change_state` refactor~~ | Obsolete. `SyncGroup` removed. All writes route through a single coordinator (`apply_batch_if`) with `TransientEngineState`. |
 | BC-095 | Robustness test suite | Robustness and correctness validation/test suite |
-| BC-132 | IO fault injection test harness | Add ability to inject IO failures (e.g. failing `append`, `sync`) in tests. Required to directly test: orphaned-BulkBegin rotation (BC-131), sync-failure publish-before-rethrow (BC-133). Currently these bugs are fixed but not directly testable without a fault injection seam. |
+| ~~BC-132~~ | ~~IO fault injection test harness~~ | Done. Moved to Done section. |
 | BC-096 | Document invariants | Document correctness invariants and how it's implemented |
 | BC-099 | Publish benchmarks | Run official benchmarks to share with the world. |
 
@@ -53,6 +53,8 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-134 | `DbPoisoned` — block writes on isolation rotation failure | If isolation rotation fails after an orphaned `BulkBegin`, the engine sets a poisoned flag via `deem_as_poisoned(reason)`. All writes (`put`, `del`, `apply_batch`, `apply_batch_if`, `vacuum`) throw `DbPoisoned` with a diagnostic reason. Reads remain available. Recovery (process restart) clears the state. `FAULT_INJECTION(io_rotate_file_creation)` checkpoint added to `rotate_active_file` for deterministic testing. 3 new `[poisoned]` tests, 192 total pass. |
+| BC-132 | IO fault injection test harness | `ScopedFaultInjector` (count-based and name-based), `FAULT_INJECTION(name)` macro at IO boundaries (`io_data_file_append`, `io_data_file_sync`, `io_rotate_file_creation`). Rewritten BC-131 and BC-133 smoke tests to use fault injection instead of filesystem tricks. 2 `[fault_inject]` tests. |
 | BC-128 | TransientEngineState + single write path + durability-before-visibility | Introduced `TransientEngineState` (transient/persistent pattern for all engine state including `file_stats`, which moved from `DB` into `EngineState`). All writes (`put`, `del`, `apply_batch`, `apply_batch_if`) route through a single coordinator (`apply_batch_if`). Two-phase discipline: IO first, then pure state mutations. `SyncGroup` removed; `state_.store()` now happens after `fdatasync` (durability before visibility). Removed dead `EngineState::apply_put`/`apply_del`/`apply_rotation`, `commit_batch`, `rotate_active_file`, `rotate_if_needed`. Vacuum uses `TransientEngineState::apply_vacuum`. 162 tests pass. |
 | BC-129 | Unit tests for `validate_preconditions` | 25 pure unit tests for `TransientEngineState::validate_preconditions` — no DB, no disk I/O. Covers all point guards (`MustExist`, `MustBeAbsent`, `MustBeUnchanged`), range guards, implicit W-W conflict detection, combined scenarios, and snapshot-less plans. Added `Snapshot::from_state()` test-only factory (`BYTECASK_TESTING`). 187 tests pass. |
 | BC-131 | Rotate on batch failure | If `append()` throws mid-batch after `BulkBegin`, force-rotate to isolate the orphaned marker. Without this, subsequent writes to the same file would be treated as part of the incomplete batch by `flush_hints_for` and silently discarded on recovery. |

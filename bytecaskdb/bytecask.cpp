@@ -10,6 +10,9 @@ module;
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#ifdef BYTECASK_TESTING
+#include "fault_injector.h"
+#endif
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -41,6 +44,8 @@ import bytecask.types;
 import bytecask.util;
 
 namespace bytecask {
+
+DbPoisoned::~DbPoisoned() = default;
 
 #pragma region Internal helpers
 
@@ -495,6 +500,7 @@ auto DB::snapshot() const -> Snapshot { return Snapshot{state_.load()}; }
 // delegate here.
 auto DB::apply_batch_if(WriteOptions opts,
                         WritePlan plan) -> bool {
+  if (is_poisoned()) throw DbPoisoned{poison_reason_};
   if (plan.empty()) return true;
 
   auto guard = acquire_write_lock(opts);
@@ -530,10 +536,18 @@ auto DB::apply_batch_if(WriteOptions opts,
     }
   } catch (...) {
     if (multi) {
-      try { file.sync(); } catch (...) {}
-      rotate_active_file(t, current);
-      state_.store(std::move(t).persistent());
-      state_time_.store(now_ns(), std::memory_order_release);
+      try {
+        try { file.sync(); } catch (...) {}
+        rotate_active_file(t, current);
+        state_.store(std::move(t).persistent());
+        state_time_.store(now_ns(), std::memory_order_release);
+      } catch (...) {
+        deem_as_poisoned(std::format(
+            "isolation rotation failed for '{}': orphaned BulkBegin "
+            "cannot be isolated. Writes blocked until restart.",
+            file.path().string()));
+        throw;
+      }
     }
     throw;
   }
@@ -684,6 +698,7 @@ auto DB::rkeys_from(const ReadOptions & /*opts*/, BytesView from) const
 // write_mu_.
 auto DB::vacuum(VacuumOptions opts) -> bool {
   std::lock_guard<std::mutex> vg{*vacuum_mu_};
+  if (is_poisoned()) throw DbPoisoned{poison_reason_};
 
   // Drain in-flight background hint writes so that vacuum's
   // flush_hints_for call cannot race on the same .hint.tmp file.
@@ -745,6 +760,9 @@ void DB::rotate_active_file(TransientEngineState &t,
     flush_hints_for(f, d);
   });
   const auto stem = make_data_file_stem();
+#ifdef BYTECASK_TESTING
+  FAULT_INJECTION(io_rotate_file_creation);
+#endif
   auto new_file = std::make_shared<DataFile>(dir_ / (stem + ".data"));
   t.apply_rotate_file(std::move(new_file));
 }
@@ -1033,6 +1051,11 @@ void DB::vacuum_absorb_file(std::uint32_t file_id) {
 #pragma endregion
 
 #pragma region State access
+
+void DB::deem_as_poisoned(std::string reason) {
+  poison_reason_ = std::move(reason);
+  poisoned_.store(true, std::memory_order_release);
+}
 
 // Returns the engine state from a thread-local cache.
 // The hot path is a single relaxed load of state_time_ (plain MOV on x86).

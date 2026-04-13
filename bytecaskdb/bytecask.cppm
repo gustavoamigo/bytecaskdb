@@ -432,6 +432,22 @@ private:
 
 // ---------------------------------------------------------------------------
 // DB — SWMR key-value store
+// ---------------------------------------------------------------------------
+// DbPoisoned — thrown by write operations when the engine is poisoned.
+//
+// The engine poisons itself when an isolation rotation fails after an
+// orphaned BulkBegin marker. Writes are blocked; reads remain available.
+// Only a process restart (which triggers recovery) clears the state.
+// ---------------------------------------------------------------------------
+export class DbPoisoned : public std::runtime_error {
+public:
+  explicit DbPoisoned(const std::string &reason)
+      : std::runtime_error(reason) {}
+  ~DbPoisoned() override;
+};
+
+// ---------------------------------------------------------------------------
+// DB — the public interface to a ByteCaskDB database.
 //
 // Thread safety: write operations (put, del, apply_batch) are serialised by
 // write_mu_. After producing a new EngineState, the writer publishes it via
@@ -478,12 +494,30 @@ public:
   // Returns true if key exists in the index (no disk I/O).
   [[nodiscard]] auto contains_key(BytesView key) const -> bool;
 
+  // Returns true if the engine has been poisoned. A poisoned DB refuses
+  // all writes but reads remain available. Only a restart clears the state.
+  [[nodiscard]] auto is_poisoned() const noexcept -> bool {
+    return poisoned_.load(std::memory_order_acquire);
+  }
+
+  // Returns the reason the engine was poisoned. Safe to call after
+  // is_poisoned() returns true — the acquire load synchronises access.
+  [[nodiscard]] auto poison_reason() const noexcept -> const std::string & {
+    return poison_reason_;
+  }
+
 #ifdef BYTECASK_TESTING
   // Returns a snapshot of per-file stats.
   // Only available in test builds (BYTECASK_TESTING).
   [[nodiscard]] auto file_stats() const -> std::map<std::uint32_t, FileStats> {
     auto s = state_.load();
     return s->file_stats;
+  }
+
+  // Returns the current engine state for invariant checking.
+  // Only available in test builds (BYTECASK_TESTING).
+  [[nodiscard]] auto engine_state() const -> std::shared_ptr<const EngineState> {
+    return state_.load();
   }
 #endif
   // Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
@@ -560,6 +594,9 @@ private:
   void rotate_active_file(TransientEngineState &t,
                           const std::shared_ptr<const EngineState> &current);
 
+  // Poison — sets the engine to write-blocked state with a reason.
+  void deem_as_poisoned(std::string reason);
+
   // Hint file management
   // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint exists.
   static void flush_hints_for(const std::shared_ptr<DataFile> &file,
@@ -622,6 +659,13 @@ private:
   // Stale readers compare this against a thread-local timestamp with a
   // single relaxed load (plain MOV on x86) to decide whether to refresh.
   std::atomic<std::int64_t> state_time_{0};
+  // Set by deem_as_poisoned() when isolation rotation fails after an
+  // orphaned BulkBegin. Blocks all writes; reads remain available.
+  // Cleared only by recovery (process restart).
+  std::atomic<bool> poisoned_{false};
+  // Written before poisoned_.store(release); read after
+  // poisoned_.load(acquire) — the atomic bool synchronises access.
+  std::string poison_reason_;
   // Serialises writers (put, del, apply_batch). Readers never acquire this.
   std::unique_ptr<std::mutex> write_mu_{std::make_unique<std::mutex>()};
   // Serialises vacuum() calls. Separate from write_mu_ so vacuum I/O does

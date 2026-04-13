@@ -2764,22 +2764,27 @@ TEST_CASE("apply_batch single-op writes no markers", "[apply_batch_if]") {
 TEST_CASE("mid-batch append failure rotates file and discards partial batch",
           "[fault_inject]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path / "db");
 
   // A 2-op batch produces: BulkBegin(0), Put-a(1), Put-b(2), BulkEnd(3).
   // Fail on append call index 2 (Put-b): BulkBegin and Put-a are orphaned in
   // the active file with no matching BulkEnd.
+  //
+  // The count-based injector fires from checkpoint 3 onward, which also
+  // fails the isolation rotation (io_rotate_file_creation) — poisoning
+  // this DB instance. That's expected: we're testing that recovery
+  // handles the orphaned BulkBegin correctly regardless.
   {
-    bytecask::testing::ScopedFaultInjector fi{2};
+    auto db = bytecask::DB::open(td.path / "db");
+    // Write a key before the failure so recovery has something to find.
+    db.put({.sync = false}, to_bytes("c"), to_bytes("v3"));
+
+    bytecask::testing::ScopedFaultInjector fi{3};
     bytecask::Batch batch;
     batch.put(to_bytes("a"), to_bytes("v1"));
     batch.put(to_bytes("b"), to_bytes("v2"));
     REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(batch)),
                       std::system_error);
-  } // fi destructor resets active_injector
-
-  // Post-rotation: write a key to the clean new active file.
-  db.put({.sync = false}, to_bytes("c"), to_bytes("v3"));
+  } // db closes, fi resets
 
   // Reopen: recovery must discard the orphaned batch and retain only "c".
   {
@@ -2816,6 +2821,106 @@ TEST_CASE("sync failure publishes state before rethrowing", "[fault_inject]") {
   // Subsequent writes must succeed on the advanced LSN — no duplicate sequence.
   REQUIRE_NOTHROW(db.put({.sync = false}, to_bytes("k2"), to_bytes("v2")));
   CHECK(get_val(db, to_bytes("k2")).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Poisoned DB tests — exercise the DbPoisoned mechanism.
+//
+// Test strategy: count-based fault injection with ScopedFaultInjector{2}
+// on a 2-op batch. The injector fires from checkpoint 3 onward:
+//
+//   ckpt 1: io_data_file_append (BulkBegin)   — passes
+//   ckpt 2: io_data_file_append (Put-a)        — passes
+//   ckpt 3: io_data_file_append (Put-b)        — throws (call_count=3 > 2)
+//   ckpt 4: io_data_file_sync   (isolation)    — throws (swallowed)
+//   ckpt 5: io_rotate_file_creation (isolation) — throws → poison
+// ---------------------------------------------------------------------------
+
+TEST_CASE("isolation rotation failure poisons the DB", "[poisoned]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  CHECK_FALSE(db.is_poisoned());
+
+  // Fail from the 3rd checkpoint onward — mid-batch append triggers
+  // isolation, whose rotation also fails.
+  {
+    bytecask::testing::ScopedFaultInjector fi{2};
+    bytecask::Batch batch;
+    batch.put(to_bytes("a"), to_bytes("v1"));
+    batch.put(to_bytes("b"), to_bytes("v2"));
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(batch)),
+                      std::system_error);
+  }
+
+  // Engine must be poisoned.
+  REQUIRE(db.is_poisoned());
+  CHECK(db.poison_reason().find("orphaned BulkBegin") != std::string::npos);
+
+  // Writes must throw DbPoisoned.
+  CHECK_THROWS_AS(db.put({.sync = false}, to_bytes("z"), to_bytes("z")),
+                  bytecask::DbPoisoned);
+  CHECK_THROWS_AS(db.vacuum(), bytecask::DbPoisoned);
+}
+
+TEST_CASE("reads work on a poisoned DB", "[poisoned]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // Pre-populate before poisoning.
+  db.put({.sync = false}, to_bytes("x"), to_bytes("val_x"));
+
+  // Poison the DB.
+  {
+    bytecask::testing::ScopedFaultInjector fi{2};
+    bytecask::Batch batch;
+    batch.put(to_bytes("a"), to_bytes("v1"));
+    batch.put(to_bytes("b"), to_bytes("v2"));
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(batch)),
+                      std::system_error);
+  }
+  REQUIRE(db.is_poisoned());
+
+  // get — returns pre-poison data.
+  const auto val = get_val(db, to_bytes("x"));
+  REQUIRE(val.has_value());
+  CHECK(to_string(*val) == "val_x");
+
+  // contains_key — pure in-memory.
+  CHECK(db.contains_key(to_bytes("x")));
+  CHECK_FALSE(db.contains_key(to_bytes("a")));
+
+  // snapshot — frozen read-only view.
+  auto snap = db.snapshot();
+  bytecask::Bytes snap_out;
+  CHECK(snap.get(to_bytes("x"), snap_out));
+
+  // iter_from — lazy value fetch.
+  auto range = db.iter_from({}, to_bytes("x"));
+  CHECK(range.begin() != std::default_sentinel);
+
+  // keys_from — pure in-memory walk.
+  auto keys = db.keys_from({}, to_bytes("x"));
+  CHECK(keys.begin() != std::default_sentinel);
+}
+
+TEST_CASE("single-entry failure does not poison the DB", "[poisoned]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // A single-entry put failure does not trigger the isolation path
+  // (multi==false in apply_batch_if), so the DB must not be poisoned.
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+    REQUIRE_THROWS_AS(db.put({.sync = false}, to_bytes("k"), to_bytes("v")),
+                      std::system_error);
+  }
+
+  CHECK_FALSE(db.is_poisoned());
+
+  // DB remains operational for writes.
+  REQUIRE_NOTHROW(db.put({.sync = false}, to_bytes("k"), to_bytes("v")));
+  CHECK(get_val(db, to_bytes("k")).has_value());
 }
 
 // ---------------------------------------------------------------------------

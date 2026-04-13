@@ -174,7 +174,19 @@ The coordinator (step 5 above) only performs IO. It never touches `key_dir`, `fi
 
 If `append()` throws mid-batch after `BulkBegin` has been written, the active file contains an orphaned `BulkBegin` with no matching `BulkEnd`. Without intervention, subsequent writes to the same file extend the region that `flush_hints_for` (and `vacuum_scan_and_copy`) treat as part of the incomplete batch — those entries would be silently discarded on recovery.
 
-The fix: the IO loop (step 5) is wrapped in `try/catch`. When the batch is multi-entry and IO fails, the catch block syncs (swallowed — best-effort durability for any preceding entries), seals the file, dispatches a hint write, and rotates to a fresh active file via `apply_rotate_file`. The rotated state is published immediately so subsequent writes go to the clean file. The exception is then rethrown to the caller.
+The fix: the IO loop (step 5) is wrapped in `try/catch`. When the batch is multi-entry and IO fails, the catch block syncs (swallowed — best-effort durability for any preceding entries) and rotates to a fresh active file. The rotated state is published immediately so subsequent writes go to the clean file. The exception is then rethrown to the caller. If the isolation rotation itself fails, the engine is poisoned (see below).
+
+##### Poisoned state (`DbPoisoned`)
+
+If the isolation rotation after an orphaned `BulkBegin` fails (e.g. filesystem error creating the new data file), the active file retains the orphaned marker. Any subsequent write to that file would appear to succeed in-process but be silently discarded by recovery — a consistency divergence between in-memory and on-disk state.
+
+When this happens, the engine calls `deem_as_poisoned(reason)` with a diagnostic string identifying the failed file, then rethrows the original exception. From that point:
+
+- **Writes blocked**: `put`, `del`, `apply_batch`, `apply_batch_if`, and `vacuum` throw `DbPoisoned` immediately. The reason string is available via `poison_reason()`.
+- **Reads available**: `get`, `contains_key`, `snapshot`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from` continue to work. The in-memory state was correctly rolled back (the transient was never persisted), so reads reflect the last successfully committed state.
+- **Recovery required**: the poisoned flag is in-memory only. Restarting the process runs recovery, which discards the orphaned `BulkBegin` and its trailing entries, restoring a clean state.
+
+Implementation: `poisoned_` is an `atomic<bool>` (release on write, acquire on read). The non-atomic `poison_reason_` string is safely published via the release/acquire pair — the string is written before `poisoned_.store(true, release)` and read after `poisoned_.load(acquire)`.
 
 ##### Sync failure: publish before rethrow
 

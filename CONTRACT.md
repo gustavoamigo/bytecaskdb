@@ -17,10 +17,13 @@ One section per write function. Plain language.
 **Durable**: a key-value pair is durable when it will survive a process
 crash and be present after recovery.
 
-**Poisoned**: the engine has detected that in-memory state may have
-diverged from what recovery would produce. A poisoned DB must refuse all
-read and write operations with a `DbPoisoned` exception until the
-process restarts and recovery runs.
+**Poisoned**: the engine has detected an internal state divergence that
+it cannot resolve on its own. Continuing to accept writes would risk
+persisting data that recovery would not reproduce. A poisoned DB must
+refuse all write operations with a `DbPoisoned` exception carrying a
+diagnostic reason. Read operations remain available — the in-memory
+state is recovery-equivalent at the time of poisoning. Only a process
+restart (which triggers recovery) clears the poisoned state.
 
 **Recovery-equivalent**: the in-memory state agrees with what opening
 a fresh DB from the current on-disk files would produce.
