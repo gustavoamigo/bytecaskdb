@@ -279,6 +279,8 @@ class FailureClass(Enum):
     D  = "isolation_sync_fails"       # sync during orphan isolation fails — poison
     E  = "isolation_rotation_fails"   # rotation during orphan isolation fails — poison
     F  = "commit_sync_fails"          # sync in commit phase — persisted, throws
+    G  = "rotation_sync_fails"        # post-write rotation sync fails — persisted, throws
+    H  = "rotation_file_creation_fails"  # post-write rotation fails after seal — poison
 ```
 
 ### Write outcome subclasses (B1, B2, B3)
@@ -310,6 +312,30 @@ returns a short write (`written > 0`). In the `apply_batch_if` catch
 block, if `!multi && file.is_tainted()`, the engine poisons the DB.
 Recovery (process restart) clears the state.
 
+### Post-write rotation failure subclasses (G, H)
+
+After all appends succeed and in-memory state is applied, the engine
+checks whether the active file has reached the rotation threshold. If
+so, it syncs the file and rotates to a new one. Two distinct failures
+can occur at this point:
+
+- **G — rotation sync fails**: The pre-rotation `fdatasync` fails.
+  The file is not sealed. The transition is fully persisted (appends
+  succeeded), so the state is published and the exception is rethrown.
+  The DB is not poisoned — the next write will retry rotation or
+  continue appending to the same file.
+- **H — rotation file creation fails**: The sync succeeded but
+  `rotate_active_file` fails after sealing the active file. The sealed
+  file cannot accept further appends (`assert(!sealed_)` would fire).
+  The engine poisons the DB and publishes the state (writes are on disk,
+  LSNs must advance). Recovery (process restart) clears the sealed file
+  problem by creating a fresh active file.
+
+Key insight: `rotate_active_file` calls `seal()` before creating the new
+file. If file creation fails, the active file is sealed and unusable.
+Publishing state without poisoning would leave an engine that appears
+healthy but fails on the next append. Poisoning is the correct response.
+
 ### Class Behavior Summary
 
 | Class | Transition persisted | key_dir changes | LSN advances | Throws | Poisoned |
@@ -325,10 +351,14 @@ Recovery (process restart) clears the state.
 | D | No — partial write | No | No | Yes | Yes |
 | E | No — partial write | No | No | Yes | Yes |
 | F | Yes — fully | Yes — full delta | Yes | Yes | No |
+| G | Yes — fully | Yes — full delta | Yes | Yes | No |
+| H | Yes — fully | Yes — full delta | Yes | Yes | Yes |
 
-Note: Class F is the only class where the transition is fully persisted
+Note: Classes F and G are the cases where the transition is fully persisted
 but the caller receives an exception. The state is published before the
-exception is rethrown. The caller knows the write succeeded durably.
+exception is rethrown. Class H is similar — the transition is persisted —
+but the engine is also poisoned because the sealed active file cannot
+accept further appends.
 
 ### Current test coverage by failure class
 
@@ -344,6 +374,8 @@ exception is rethrown. The caller knows the write succeeded durably.
 | D | Yes | BC-134 `[poisoned]` test — count-based chains through isolation sync |
 | E | Yes | BC-134 `[poisoned]` test — `io_rotate_file_creation` checkpoint |
 | F | Yes | 1 fault injection test (BC-133) |
+| G | Yes | BC-136 `[rotation_failure]` — sync failure publishes state, no poison |
+| H | Yes | BC-136 `[rotation_failure]` — file creation failure poisons, preserves writes |
 
 ---
 
@@ -435,6 +467,30 @@ def expected_delta(P: PlanShape, F: FailureClass) -> Delta:
             threw        = True,    # caller receives exception but write succeeded
         )
 
+    elif F == FailureClass.G:
+        # Post-write rotation sync fails — transition fully persisted,
+        # file not sealed, state published, DB not poisoned.
+        return Delta(
+            keys_added   = [op for op in P.ops if op.type == Put],
+            keys_removed = [op for op in P.ops if op.type == Delete],
+            lsn_advance  = len(P.ops) + (2 if len(P.ops) > 1 else 0),
+            stats_delta  = full_stats_delta(P),
+            poisoned     = False,
+            threw        = True,
+        )
+
+    elif F == FailureClass.H:
+        # Post-write rotation file creation fails after seal —
+        # transition fully persisted, state published, DB poisoned.
+        return Delta(
+            keys_added   = [op for op in P.ops if op.type == Put],
+            keys_removed = [op for op in P.ops if op.type == Delete],
+            lsn_advance  = len(P.ops) + (2 if len(P.ops) > 1 else 0),
+            stats_delta  = full_stats_delta(P),
+            poisoned     = True,
+            threw        = True,
+        )
+
     elif F == FailureClass.A:
         # No I/O attempted — transition not started
         return Delta(
@@ -472,15 +528,15 @@ plan_shapes = [
     PlanShape(ops=[Put], conflict=True,label="conflicting_plan"),
 ]
 
-failure_classes = list(FailureClass)  # all nine classes
+failure_classes = list(FailureClass)  # all eleven classes
 ```
 
 Total generated tests:
 
 ```
 len(state_shapes) × len(plan_shapes) × len(failure_classes)
-= 4 × 7 × 9
-= 252 tests
+= 4 × 7 × 11
+= 308 tests
 ```
 
 Each test is deterministic, independent, and covers exactly one cell
@@ -565,6 +621,8 @@ def fault_point_for_class(p: PlanShape, f: FailureClass) -> FaultConfig:
         checkpoints.append(("isolation_rotation", FailureClass.E))
 
     checkpoints.append(("commit_sync", FailureClass.F))
+    checkpoints.append(("rotation_sync", FailureClass.G))
+    checkpoints.append(("rotation_file_creation", FailureClass.H))
 
     if f == FailureClass.B2:
         # Post-write short_write on the first data append
@@ -808,7 +866,7 @@ The failure classes reduce an infinite problem space to a finite
 and tractable one. What matters is not which specific operation
 failed or what the key bytes were — it is which phase boundary the
 failure crossed, which determines whether the transition was fully
-persisted or not. Seven classes cover the entire behavioral space of
+persisted or not. Eleven classes cover the entire behavioral space of
 `apply_batch_if` under I/O failure.
 
 The Python generator makes the model explicit, auditable, and

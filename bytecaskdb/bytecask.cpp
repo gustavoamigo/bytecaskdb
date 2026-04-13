@@ -561,24 +561,50 @@ auto DB::apply_batch_if(WriteOptions opts,
   t.apply_writes(plan, offsets);
 
   // 6. Rotation — IO is coordinator's job, state change is transient's.
+  // Two failure modes with different outcomes:
+  //   - Pre-rotation sync fails: the file is not sealed. Publish state
+  //     (writes applied, no rotation) to preserve LSN monotonicity.
+  //   - rotate_active_file fails after sealing: the active file is sealed
+  //     and no new file was created. Publishing would leave a sealed active
+  //     file — subsequent appends would fail. Must poison.
+  std::exception_ptr rotation_err;
   if (t.is_rotation_needed(rotation_threshold_)) {
-    file.sync();
-    rotate_active_file(t, current);
+    try {
+      file.sync();
+    } catch (...) {
+      rotation_err = std::current_exception();
+    }
+    if (!rotation_err) {
+      try {
+        rotate_active_file(t, current);
+      } catch (...) {
+        deem_as_poisoned(std::format(
+            "post-write rotation failed for '{}': active file is sealed "
+            "but new file could not be created. Writes blocked until restart.",
+            file.path().string()));
+        // Publish state so LSNs advance — reads remain correct.
+        state_.store(std::move(t).persistent());
+        state_time_.store(now_ns(), std::memory_order_release);
+        throw;
+      }
+    }
   }
 
   // 7. Durability before visibility.
   // On sync failure, publish state for process consistency before
   // rethrowing — sync failure affects durability (crash safety),
-  // not in-process correctness.
+  // not in-process correctness. Skip if rotation already failed.
   std::exception_ptr sync_err;
-  if (opts.sync) {
+  if (!rotation_err && opts.sync) {
     try { file.sync(); }
     catch (...) { sync_err = std::current_exception(); }
   }
 
-  // 8. Publish.
+  // 8. Publish — writes are on disk. State must reflect them regardless
+  // of rotation or sync failure.
   state_.store(std::move(t).persistent());
   state_time_.store(now_ns(), std::memory_order_release);
+  if (rotation_err) std::rethrow_exception(rotation_err);
   if (sync_err) std::rethrow_exception(sync_err);
   return true;
 }

@@ -3019,6 +3019,68 @@ TEST_CASE("partial write on multi-entry batch does not poison if isolation "
 }
 
 // ---------------------------------------------------------------------------
+// Post-write rotation failure tests — exercise the step 6 rotation path
+// after all appends succeed. Uses max_file_bytes=1 to trigger rotation
+// on every write.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("rotation sync failure publishes state and preserves writes",
+          "[rotation_failure]") {
+  TempDir td;
+  // max_file_bytes=1 forces rotation after every write.
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+
+  // First put: appends succeed, rotation triggers, inject sync failure.
+  // With sync=false, the only io_data_file_sync checkpoint in this path
+  // is the pre-rotation sync in step 6.
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    REQUIRE_THROWS_AS(db.put({.sync = false}, to_bytes("a"), to_bytes("v1")),
+                      std::system_error);
+  }
+
+  // The write must be visible — state was published before rethrowing.
+  CHECK_FALSE(db.is_poisoned());
+  const auto val = get_val(db, to_bytes("a"));
+  REQUIRE(val.has_value());
+  CHECK(to_string(*val) == "v1");
+
+  // Subsequent writes must succeed (the file was not sealed, rotation
+  // will be retried).
+  REQUIRE_NOTHROW(db.put({.sync = false}, to_bytes("b"), to_bytes("v2")));
+  CHECK(get_val(db, to_bytes("b")).has_value());
+}
+
+TEST_CASE("rotation file creation failure poisons DB but preserves writes",
+          "[rotation_failure]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+
+  // First put: appends succeed, rotation triggers, file creation fails.
+  // rotate_active_file seals the file before creating the new one —
+  // if file creation fails, the active file is sealed and unusable.
+  // The engine must poison.
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+    REQUIRE_THROWS_AS(db.put({.sync = false}, to_bytes("a"), to_bytes("v1")),
+                      std::system_error);
+  }
+
+  // The write must be visible — state was published before throwing.
+  REQUIRE(db.is_poisoned());
+  CHECK(db.poison_reason().find("post-write rotation") != std::string::npos);
+
+  // The data is accessible via reads.
+  const auto val = get_val(db, to_bytes("a"));
+  REQUIRE(val.has_value());
+  CHECK(to_string(*val) == "v1");
+
+  // Writes are blocked.
+  CHECK_THROWS_AS(db.put({.sync = false}, to_bytes("z"), to_bytes("z")),
+                  bytecask::DbPoisoned);
+}
+
+// ---------------------------------------------------------------------------
 // validate_preconditions unit tests
 // ---------------------------------------------------------------------------
 // These test TransientEngineState::validate_preconditions in isolation —

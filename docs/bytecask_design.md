@@ -194,6 +194,13 @@ If `writev` returns a short write (0 < written < total), `DataFile::append()` se
 
 For multi-entry batches this is safe: the isolation rotation moves to a new file, abandoning the tainted one. For single-entry writes, the `apply_batch_if` catch block checks `file.is_tainted()` and poisons the DB if set. Recovery (process restart) discards the partial entry via CRC mismatch and restores a clean state.
 
+##### Post-write rotation failure
+
+After all appends succeed and mutations are applied, the engine may rotate the active file if it exceeds the size threshold. Rotation syncs the file, seals it, and creates a new active file. Two distinct failures can occur:
+
+- **Sync fails before seal**: the file is not sealed. The engine captures the exception, publishes the new state (writes are on disk, LSNs must advance), and rethrows. The DB is not poisoned — the next write retries rotation or continues appending.
+- **File creation fails after seal**: `rotate_active_file` calls `seal()` before creating the new file. If creation fails, the active file is sealed and cannot accept further appends. The engine poisons the DB and publishes state. Recovery creates a fresh active file.
+
 ##### Sync failure: publish before rethrow
 
 If `fdatasync` fails (step 8), the writes are in the page cache but not guaranteed durable. The state is published to `state_.store()` before rethrowing the sync exception. This preserves in-process consistency: LSNs advance, the key directory reflects the writes, and the next write builds on the correct state. Without this, the old state would be reused, causing duplicate LSNs and data corruption on the next write. Sync failure affects crash safety (durability), not process correctness. The long-term fix is BC-090 (poisoned-DB flag on sync failure).
