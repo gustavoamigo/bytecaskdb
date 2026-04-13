@@ -76,27 +76,292 @@ auto now_ns() -> std::int64_t {
 
 #pragma endregion
 
-#pragma region Engine State
-// EngineState::apply_rotation is defined here because it needs make_data_file_stem.
-auto EngineState::apply_rotation(const std::filesystem::path &dir) const
-    -> EngineState {
-  auto s = *this;
-  s.active_file_id = s.next_file_id++;
-  const auto stem = make_data_file_stem();
+#pragma region TransientEngineState
+
+TransientEngineState::TransientEngineState(
+    TransientRadixTree<KeyDirEntry> key_dir, FileRegistry files,
+    std::map<std::uint32_t, FileStats> file_stats,
+    std::uint32_t active_file_id, std::uint32_t next_file_id,
+    std::uint64_t next_lsn)
+    : key_dir_{std::move(key_dir)}, files_{std::move(files)},
+      file_stats_{std::move(file_stats)}, active_file_id_{active_file_id},
+      next_file_id_{next_file_id}, next_lsn_{next_lsn} {}
+
+auto EngineState::transient() const -> TransientEngineState {
+  return TransientEngineState{
+      key_dir.transient(), files, file_stats,
+      active_file_id, next_file_id, next_lsn};
+}
+
+auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
+    -> bool {
+  const auto *snap_state =
+      plan.snap_ ? plan.snap_->state_.get() : nullptr;
+
+  // 1. Point guards.
+  for (const auto &[key, action] : plan.actions_) {
+    const std::span<const std::byte> key_span{key};
+    const auto cur_entry = key_dir_.get(key_span);
+
+    switch (action.precondition) {
+    case WritePlan::Precondition::MustExist:
+      if (!cur_entry) return false;
+      break;
+    case WritePlan::Precondition::MustBeAbsent:
+      if (cur_entry) return false;
+      break;
+    case WritePlan::Precondition::MustBeUnchanged: {
+      // ensure_unchanged already enforced snap_ is present at build time.
+      const auto snap_entry = snap_state->key_dir.get(key_span);
+      const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence : 0;
+      const std::uint64_t cur_seq = cur_entry ? cur_entry->sequence : 0;
+      if (cur_seq != snap_seq) return false;
+      break;
+    }
+    case WritePlan::Precondition::None:
+      break;
+    }
+  }
+
+  // 2. Range guards (only present when snap_ is set — enforced at build time).
+  for (const auto &rg : plan.range_guards_) {
+    const std::span<const std::byte> from_span{rg.from};
+    const std::span<const std::byte> to_span{rg.to};
+
+    // Check current state for keys modified since snapshot.
+    for (auto it = key_dir_.lower_bound(from_span);
+         it != std::default_sentinel; ++it) {
+      auto [key_span, entry] = *it;
+      if (Key{key_span} >= Key{to_span}) break;
+      const auto snap_entry = snap_state->key_dir.get(key_span);
+      const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence : 0;
+      if (entry.sequence != snap_seq) return false;
+    }
+
+    // Check snapshot for keys deleted since snapshot.
+    for (auto it = snap_state->key_dir.lower_bound(from_span);
+         it != std::default_sentinel; ++it) {
+      auto [key_span, entry] = *it;
+      if (Key{key_span} >= Key{to_span}) break;
+      if (!key_dir_.get(key_span)) return false;
+    }
+  }
+
+  // 3. Implicit W-W check on all write keys (only when snapshot present).
+  if (snap_state) {
+    for (const auto &[key, action] : plan.actions_) {
+      if (action.write == WritePlan::Write::None) continue;
+      const std::span<const std::byte> key_span{key};
+      const auto snap_entry = snap_state->key_dir.get(key_span);
+      const auto cur_entry = key_dir_.get(key_span);
+      const bool appeared = !snap_entry && cur_entry;
+      const bool deleted = snap_entry && !cur_entry;
+      const bool modified =
+          snap_entry && cur_entry &&
+          cur_entry->sequence != snap_entry->sequence;
+      if (appeared || deleted || modified) return false;
+    }
+  }
+
+  return true;
+}
+
+auto TransientEngineState::prepare_write(const WritePlan &plan) const
+    -> std::vector<AppendEntry> {
+  std::vector<AppendEntry> entries;
+  const auto wc = plan.write_count();
+  if (wc == 0) return entries;
+
+  const bool multi = wc > 1;
+  entries.reserve(multi ? wc + 2 : 1);
+
+  auto lsn = next_lsn_;
+
+  if (multi) {
+    entries.push_back({lsn++, EntryType::BulkBegin, {}, {}});
+  }
+
+  for (const auto &[key, action] : plan.actions_) {
+    const std::span<const std::byte> key_span{key};
+    if (action.write == WritePlan::Write::Put) {
+      entries.push_back(
+          {lsn++, EntryType::Put, key_span,
+           std::span<const std::byte>{action.value}});
+    } else if (action.write == WritePlan::Write::Del) {
+      entries.push_back({lsn++, EntryType::Delete, key_span, {}});
+    }
+  }
+
+  if (multi) {
+    entries.push_back({lsn++, EntryType::BulkEnd, {}, {}});
+  }
+
+  return entries;
+}
+
+void TransientEngineState::apply_writes(
+    const WritePlan &plan, const std::vector<std::uint64_t> &offsets) {
+  std::size_t io_idx = 0;
+  const auto wc = plan.write_count();
+  const bool multi = wc > 1;
+
+  // Account for BulkBegin marker.
+  if (multi) {
+    file_stats_[active_file_id_].total_bytes += kHeaderSize + kCrcSize;
+    ++next_lsn_;
+    ++io_idx;
+  }
+
+  for (const auto &[key, action] : plan.actions_) {
+    const std::span<const std::byte> key_span{key};
+    if (action.write == WritePlan::Write::Put) {
+      const auto existing = key_dir_.get(key_span);
+      if (existing) {
+        file_stats_[existing->file_id].live_bytes -=
+            entry_size(key_span.size(), existing->value_size);
+      }
+      const auto val_size = narrow<std::uint32_t>(action.value.size());
+      const auto sz = entry_size(key_span.size(), val_size);
+      auto &st = file_stats_[active_file_id_];
+      st.live_bytes += sz;
+      st.total_bytes += sz;
+      key_dir_.set(key_span, KeyDirEntry{next_lsn_, active_file_id_,
+                                          offsets[io_idx], val_size});
+      ++next_lsn_;
+      ++io_idx;
+    } else if (action.write == WritePlan::Write::Del) {
+      const auto existing = key_dir_.get(key_span);
+      if (existing) {
+        file_stats_[existing->file_id].live_bytes -=
+            entry_size(key_span.size(), existing->value_size);
+      }
+      file_stats_[active_file_id_].total_bytes +=
+          entry_size(key_span.size(), 0);
+      key_dir_.erase(key_span);
+      ++next_lsn_;
+      ++io_idx;
+    }
+  }
+
+  // Account for BulkEnd marker.
+  if (multi) {
+    file_stats_[active_file_id_].total_bytes += kHeaderSize + kCrcSize;
+    ++next_lsn_;
+    ++io_idx;
+  }
+}
+
+void TransientEngineState::apply_rotate_file(
+    std::shared_ptr<DataFile> new_file) {
+  active_file_id_ = next_file_id_++;
   auto next_files =
       std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>(
-          *s.files);
-  next_files->emplace(s.active_file_id,
-                      std::make_shared<DataFile>(dir / (stem + ".data")));
-  s.files = std::move(next_files);
+          *files_);
+  next_files->emplace(active_file_id_, std::move(new_file));
+  files_ = std::move(next_files);
+  file_stats_[active_file_id_] = FileStats{};
+}
+
+void TransientEngineState::apply_vacuum(
+    std::uint32_t old_file_id, const VacuumScanResult &scan,
+    std::shared_ptr<DataFile> new_sealed_file) {
+  const auto dest_file_id =
+      new_sealed_file ? next_file_id_++ : active_file_id_;
+
+  auto actual_live_bytes = scan.live_bytes;
+  for (const auto &m : scan.mappings) {
+    const std::span<const std::byte> key_span{m.key};
+    const auto cur = key_dir_.get(key_span);
+    if (cur && cur->sequence == m.sequence) {
+      key_dir_.set(key_span,
+                   KeyDirEntry{m.sequence, dest_file_id, m.new_offset,
+                               m.value_size});
+    } else {
+      actual_live_bytes -= entry_size(m.key.size(), m.value_size);
+    }
+  }
+
+  auto next_files =
+      std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>(
+          *files_);
+  next_files->erase(old_file_id);
+  if (new_sealed_file) {
+    next_files->emplace(dest_file_id, std::move(new_sealed_file));
+  }
+  files_ = std::move(next_files);
+
+  file_stats_.erase(old_file_id);
+  if (dest_file_id != active_file_id_) {
+    file_stats_[dest_file_id] =
+        FileStats{actual_live_bytes, scan.total_bytes};
+  } else {
+    auto &active_stats = file_stats_[dest_file_id];
+    active_stats.live_bytes += actual_live_bytes;
+    active_stats.total_bytes += scan.total_bytes;
+  }
+}
+
+auto TransientEngineState::active_file() -> DataFile & {
+  return *files_->at(active_file_id_);
+}
+
+auto TransientEngineState::active_file_id() const noexcept -> std::uint32_t {
+  return active_file_id_;
+}
+
+auto TransientEngineState::is_rotation_needed(std::uint64_t threshold) const
+    -> bool {
+  return files_->at(active_file_id_)->size() >= threshold;
+}
+
+auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
+  auto s = std::make_shared<EngineState>();
+  s->key_dir = std::move(key_dir_).persistent();
+  s->files = std::move(files_);
+  s->file_stats = std::move(file_stats_);
+  s->active_file_id = active_file_id_;
+  s->next_file_id = next_file_id_;
+  s->next_lsn = next_lsn_;
   return s;
 }
+
+#pragma endregion
+
+#pragma region FileStats helpers
+
+// Marks an existing entry as dead in its file's stats.
+void stats_retire_entry(std::map<std::uint32_t, FileStats> &fs,
+                        BytesView key, const KeyDirEntry &old) {
+  fs[old.file_id].live_bytes -= entry_size(key.size(), old.value_size);
+}
+
+// Records a new Put entry: live + total on the active file.
+void stats_publish_put(std::map<std::uint32_t, FileStats> &fs,
+                       std::uint32_t active_file_id, BytesView key,
+                       BytesView value) {
+  const auto sz = entry_size(key.size(), value.size());
+  auto &st = fs[active_file_id];
+  st.live_bytes += sz;
+  st.total_bytes += sz;
+}
+
+// Records a tombstone (Delete): total only on the active file.
+void stats_publish_tombstone(std::map<std::uint32_t, FileStats> &fs,
+                             std::uint32_t active_file_id, BytesView key) {
+  fs[active_file_id].total_bytes += entry_size(key.size(), 0);
+}
+
+// Records a bulk marker (BulkBegin / BulkEnd): total only.
+void stats_publish_bulk_marker(std::map<std::uint32_t, FileStats> &fs,
+                               std::uint32_t active_file_id) {
+  fs[active_file_id].total_bytes += kHeaderSize + kCrcSize;
+}
+
 #pragma endregion
 
 #pragma region Construction
 
 // Opens dir, runs recovery, creates initial active data file.
-// Initialises file_stats_ for the new active file.
 // Throws std::system_error if the directory cannot be prepared.
 DB::DB(std::filesystem::path dir, Options opts)
     : dir_{std::move(dir)}, rotation_threshold_{opts.max_file_bytes},
@@ -114,7 +379,7 @@ DB::DB(std::filesystem::path dir, Options opts)
   const auto stem = make_data_file_stem();
   s.files->emplace(s.active_file_id,
                    std::make_shared<DataFile>(dir_ / (stem + ".data")));
-  file_stats_[s.active_file_id] = FileStats{};
+  s.file_stats[s.active_file_id] = FileStats{};
   state_.store(std::make_shared<EngineState>(std::move(s)));
   state_time_.store(now_ns(), std::memory_order_release);
 }
@@ -182,63 +447,16 @@ auto DB::get(const ReadOptions &opts, BytesView key,
 // opts.sync controls whether fdatasync is called after the write.
 // Throws std::system_error on I/O failure or lock contention (try_lock).
 void DB::put(const WriteOptions &opts, BytesView key, BytesView value) {
-  std::shared_ptr<DataFile> file_to_sync;
-  {
-    auto guard = acquire_write_lock(opts);
-    auto s = *state_.load();
-
-    const auto existing = s.key_dir.get(key);
-    if (existing) stats_retire_entry(key, *existing);
-    stats_publish_put(s.active_file_id, key, value);
-
-    const auto offset =
-        s.active_file().append(s.next_lsn, EntryType::Put, key, value);
-
-    s = s.apply_put(key, offset, narrow<std::uint32_t>(value.size()));
-    if (opts.sync) {
-      file_to_sync = s.files->at(s.active_file_id);
-    }
-    s = rotate_if_needed(std::move(s));
-    state_.store(std::make_shared<EngineState>(std::move(s)));
-    state_time_.store(now_ns(), std::memory_order_release);
-  }
-  if (file_to_sync) {
-    sync_group_.sync([&] { file_to_sync->sync(); });
-  }
+  WritePlan plan;
+  plan.put(key, value);
+  (void)apply_batch_if(opts, std::move(plan));
 }
 
-// Writes a tombstone for key.
-// Returns true if the key existed and was removed, false if it was absent.
-// Rotates the active file if it has reached the threshold.
-// opts.sync controls whether fdatasync is called after the write.
-// Throws std::system_error on I/O failure or lock contention (try_lock).
 auto DB::del(const WriteOptions &opts, BytesView key) -> bool {
-  std::shared_ptr<DataFile> file_to_sync;
-  {
-    auto guard = acquire_write_lock(opts);
-    auto s = *state_.load();
-    const auto existing = s.key_dir.get(key);
-    if (!existing) {
-      return false;
-    }
-
-    stats_retire_entry(key, *existing);
-    stats_publish_tombstone(s.active_file_id, key);
-
-    std::ignore = s.active_file().append(s.next_lsn, EntryType::Delete, key, {});
-
-    s = s.apply_del(key);
-    if (opts.sync) {
-      file_to_sync = s.files->at(s.active_file_id);
-    }
-    s = rotate_if_needed(std::move(s));
-    state_.store(std::make_shared<EngineState>(std::move(s)));
-    state_time_.store(now_ns(), std::memory_order_release);
-  }
-  if (file_to_sync) {
-    sync_group_.sync([&] { file_to_sync->sync(); });
-  }
-  return true;
+  WritePlan plan;
+  plan.ensure_present(key);
+  plan.del(key);
+  return apply_batch_if(opts, std::move(plan));
 }
 
 auto DB::contains_key(BytesView key) const -> bool {
@@ -246,89 +464,23 @@ auto DB::contains_key(BytesView key) const -> bool {
   return s->key_dir.contains(key);
 }
 
-// Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
-// batch is consumed (move-only). No-op if batch.empty().
-// opts.sync controls whether a single fdatasync is issued at the end.
-// Rotates the active file after the sync if the threshold is reached.
-// Throws std::system_error on I/O failure or lock contention (try_lock).
 void DB::apply_batch(const WriteOptions &opts, Batch batch) {
   if (batch.empty()) return;
-  std::shared_ptr<DataFile> file_to_sync;
-  {
-    auto guard = acquire_write_lock(opts);
-    auto current = state_.load();
-    file_to_sync = commit_batch(opts, batch, current);
-  }
-  if (file_to_sync) {
-    sync_group_.sync([&] { file_to_sync->sync(); });
-  }
-}
-
-#pragma endregion
-
-#pragma region apply_batch_impl
-
-// Writes batch entries to disk under write_mu_, updates stats, publishes new
-// EngineState. Single-op optimization: skips BulkBegin/BulkEnd when
-// batch.size() == 1. Returns the file to sync (null if !opts.sync).
-auto DB::commit_batch(const WriteOptions &opts, Batch &batch,
-                      const std::shared_ptr<const EngineState> &current)
-    -> std::shared_ptr<DataFile> {
-  auto s = *current;
-  const bool multi = batch.size() > 1;
-  if (multi) {
-    stats_publish_bulk_marker(s.active_file_id);
-    std::ignore =
-        s.active_file().append(s.next_lsn++, EntryType::BulkBegin, {}, {});
-  }
-
-  auto t = s.key_dir.transient();
+  WritePlan plan;
   for (auto &op : batch.operations_) {
     std::visit(
         [&](auto &o) {
           using T = std::decay_t<decltype(o)>;
           if constexpr (std::is_same_v<T, BatchInsert>) {
-            const std::span<const std::byte> key_span{o.key};
-            const auto existing = t.get(key_span);
-            if (existing) stats_retire_entry(key_span, *existing);
-            stats_publish_put(s.active_file_id, key_span,
-                              std::span<const std::byte>{o.value});
-            const auto offset = s.active_file().append(
-                s.next_lsn, EntryType::Put, key_span,
-                std::span<const std::byte>{o.value});
-            t.set(key_span,
-                  KeyDirEntry{s.next_lsn, s.active_file_id, offset,
-                              narrow<std::uint32_t>(o.value.size())});
-            ++s.next_lsn;
+            plan.put(std::span<const std::byte>{o.key},
+                     std::span<const std::byte>{o.value});
           } else if constexpr (std::is_same_v<T, BatchRemove>) {
-            const std::span<const std::byte> key_span{o.key};
-            const auto existing = t.get(key_span);
-            if (existing) stats_retire_entry(key_span, *existing);
-            stats_publish_tombstone(s.active_file_id, key_span);
-            std::ignore = s.active_file().append(s.next_lsn, EntryType::Delete,
-                                                 key_span, {});
-            ++s.next_lsn;
-            t.erase(key_span);
+            plan.del(std::span<const std::byte>{o.key});
           }
         },
         op);
   }
-
-  if (multi) {
-    stats_publish_bulk_marker(s.active_file_id);
-    std::ignore =
-        s.active_file().append(s.next_lsn++, EntryType::BulkEnd, {}, {});
-  }
-
-  s.key_dir = std::move(t).persistent();
-  std::shared_ptr<DataFile> file_to_sync;
-  if (opts.sync) {
-    file_to_sync = s.files->at(s.active_file_id);
-  }
-  s = rotate_if_needed(std::move(s));
-  state_.store(std::make_shared<EngineState>(std::move(s)));
-  state_time_.store(now_ns(), std::memory_order_release);
-  return file_to_sync;
+  (void)apply_batch_if(opts, std::move(plan));
 }
 
 #pragma endregion
@@ -337,96 +489,66 @@ auto DB::commit_batch(const WriteOptions &opts, Batch &batch,
 
 auto DB::snapshot() const -> Snapshot { return Snapshot{state_.load()}; }
 
-// Evaluates guards and W-W checks under write_mu_, then delegates to
-// commit_batch if all checks pass. Returns true if committed, false on conflict.
-auto DB::apply_batch_if(const Snapshot &snap, WriteOptions opts,
+// The single write path. Validates preconditions, runs IO, applies state
+// transitions via TransientEngineState, handles rotation and sync.
+// put/del/apply_batch are thin wrappers that construct a WritePlan and
+// delegate here.
+auto DB::apply_batch_if(WriteOptions opts,
                         WritePlan plan) -> bool {
   if (plan.empty()) return true;
 
-  std::shared_ptr<DataFile> file_to_sync;
-  {
-    auto guard = acquire_write_lock(opts);
-    auto current = state_.load();
+  auto guard = acquire_write_lock(opts);
+  auto current = state_.load();
 
-    // 1. Point guards.
-    for (const auto &[key, action] : plan.actions_) {
-      const std::span<const std::byte> key_span{key};
-      const auto snap_entry = snap.state_->key_dir.get(key_span);
-      const auto cur_entry = current->key_dir.get(key_span);
+  // 1. Create transient working copy.
+  auto t = current->transient();
 
-      switch (action.precondition) {
-      case WritePlan::Precondition::MustExist:
-        if (!cur_entry) return false;
-        break;
-      case WritePlan::Precondition::MustBeAbsent:
-        if (cur_entry) return false;
-        break;
-      case WritePlan::Precondition::MustBeUnchanged: {
-        const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence : 0;
-        const std::uint64_t cur_seq = cur_entry ? cur_entry->sequence : 0;
-        if (cur_seq != snap_seq) return false;
-        break;
-      }
-      case WritePlan::Precondition::None:
-        break;
-      }
-    }
+  // 2. Validate preconditions (TransientEngineState decides).
+  if (!t.validate_preconditions(plan)) return false;
 
-    // 2. Range guards.
-    for (const auto &rg : plan.range_guards_) {
-      const std::span<const std::byte> from_span{rg.from};
-      const std::span<const std::byte> to_span{rg.to};
-
-      // Check current state for keys modified since snapshot.
-      for (auto it = current->key_dir.lower_bound(from_span);
-           it != std::default_sentinel; ++it) {
-        auto [key_span, entry] = *it;
-        if (Key{key_span} >= Key{to_span}) break;
-        const auto snap_entry = snap.state_->key_dir.get(key_span);
-        const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence : 0;
-        if (entry.sequence != snap_seq) return false;
-      }
-
-      // Check snapshot for keys deleted since snapshot.
-      for (auto it = snap.state_->key_dir.lower_bound(from_span);
-           it != std::default_sentinel; ++it) {
-        auto [key_span, entry] = *it;
-        if (Key{key_span} >= Key{to_span}) break;
-        if (!current->key_dir.get(key_span)) return false;
-      }
-    }
-
-    // 3. Implicit W-W check on all write keys.
-    for (const auto &[key, action] : plan.actions_) {
-      if (action.write == WritePlan::Write::None) continue;
-      const std::span<const std::byte> key_span{key};
-      const auto snap_entry = snap.state_->key_dir.get(key_span);
-      const auto cur_entry = current->key_dir.get(key_span);
-      const bool appeared = !snap_entry && cur_entry;
-      const bool deleted = snap_entry && !cur_entry;
-      const bool modified = snap_entry && cur_entry &&
-                            cur_entry->sequence != snap_entry->sequence;
-      if (appeared || deleted || modified) return false;
-    }
-
-    // All checks passed — convert WritePlan writes to Batch and commit.
-    Batch batch;
-    for (auto &[key, action] : plan.actions_) {
-      if (action.write == WritePlan::Write::Put) {
-        batch.put(std::span<const std::byte>{key},
-                  std::span<const std::byte>{action.value});
-      } else if (action.write == WritePlan::Write::Del) {
-        batch.del(std::span<const std::byte>{key});
-      }
-    }
-
-    if (!batch.empty()) {
-      file_to_sync = commit_batch(opts, batch, current);
-    }
+  // 3. Prepare IO plan (TransientEngineState assigns LSNs, inserts markers).
+  auto entries = t.prepare_write(plan);
+  if (entries.empty()) {
+    // Guards-only plan with no writes.
+    return true;
   }
-  if (file_to_sync) {
-    sync_group_.sync([&] { file_to_sync->sync(); });
+
+  // 4. IO phase — coordinator's job (can throw).
+  auto &file = t.active_file();
+  std::vector<std::uint64_t> offsets;
+  offsets.reserve(entries.size());
+  for (const auto &entry : entries) {
+    offsets.push_back(
+        file.append(entry.sequence, entry.entry_type, entry.key, entry.value));
   }
+
+  // 5. State transition — TransientEngineState's job (cannot fail).
+  t.apply_writes(plan, offsets);
+
+  // 6. Rotation — IO is coordinator's job, state change is transient's.
+  if (t.is_rotation_needed(rotation_threshold_)) {
+    file.sync();
+    file.seal();
+    auto sealed = t.active_file_id();
+    auto sealed_file = current->files->at(sealed);
+    auto dir = dir_;
+    worker_.dispatch([f = std::move(sealed_file), d = std::move(dir)] {
+      flush_hints_for(f, d);
+    });
+    const auto stem = make_data_file_stem();
+    auto new_file =
+        std::make_shared<DataFile>(dir_ / (stem + ".data"));
+    t.apply_rotate_file(std::move(new_file));
+  }
+
+  // 7. Durability before visibility.
+  if (opts.sync) {
+    file.sync();
+  }
+
+  // 8. Publish.
+  state_.store(std::move(t).persistent());
+  state_time_.store(now_ns(), std::memory_order_release);
   return true;
 }
 
@@ -556,14 +678,13 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   worker_.drain();
   vacuum_purge_stale_files();
 
-  // Snapshot file_stats and active-file info under write_mu_.
+  // Snapshot file_stats and active-file info.
   std::map<std::uint32_t, FileStats> stats_snap;
   std::uint32_t active_id{};
   std::uint64_t active_size{};
   {
-    std::lock_guard<std::mutex> wg{*write_mu_};
-    stats_snap = file_stats_;
     auto s = state_.load();
+    stats_snap = s->file_stats;
     active_id = s->active_file_id;
     active_size = s->active_file().size();
   }
@@ -800,7 +921,7 @@ void DB::vacuum_purge_stale_files() {
 }
 
 // Remaps key_dir entries from old_file_id to the destination file,
-// updates the files map and file_stats_, and publishes the new
+// updates the files map and file_stats, and publishes the new
 // EngineState. Caller must hold write_mu_.
 // If new_sealed_file is non-null (compact), a fresh file-id is
 // allocated and the new file is registered. Otherwise (absorb),
@@ -808,44 +929,11 @@ void DB::vacuum_purge_stale_files() {
 void DB::vacuum_commit(std::uint32_t old_file_id,
                              const VacuumScanResult &scan,
                              std::shared_ptr<DataFile> new_sealed_file) {
-  auto s = *state_.load();
+  auto current = state_.load();
+  auto t = current->transient();
+  t.apply_vacuum(old_file_id, scan, std::move(new_sealed_file));
 
-  const auto dest_file_id =
-      new_sealed_file ? s.next_file_id++ : s.active_file_id;
-
-  auto t = s.key_dir.transient();
-  auto actual_live_bytes = scan.live_bytes;
-  for (const auto &m : scan.mappings) {
-    const std::span<const std::byte> key_span{m.key};
-    const auto cur = t.get(key_span);
-    if (cur && cur->sequence == m.sequence) {
-      t.set(key_span,
-            KeyDirEntry{m.sequence, dest_file_id, m.new_offset, m.value_size});
-    } else {
-      actual_live_bytes -= entry_size(m.key.size(), m.value_size);
-    }
-  }
-  s.key_dir = std::move(t).persistent();
-
-  auto next_files =
-      std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>(
-          *s.files);
-  next_files->erase(old_file_id);
-  if (new_sealed_file) {
-    next_files->emplace(dest_file_id, std::move(new_sealed_file));
-  }
-  s.files = std::move(next_files);
-
-  file_stats_.erase(old_file_id);
-  if (dest_file_id != s.active_file_id) {
-    file_stats_[dest_file_id] = FileStats{actual_live_bytes, scan.total_bytes};
-  } else {
-    auto &active_stats = file_stats_[dest_file_id];
-    active_stats.live_bytes += actual_live_bytes;
-    active_stats.total_bytes += scan.total_bytes;
-  }
-
-  state_.store(std::make_shared<EngineState>(std::move(s)));
+  state_.store(std::move(t).persistent());
   state_time_.store(now_ns(), std::memory_order_release);
 }
 
@@ -912,35 +1000,6 @@ void DB::vacuum_absorb_file(std::uint32_t file_id) {
 
 #pragma endregion
 
-#pragma region FileStats helpers
-
-// Marks an existing entry as dead in its file's stats.
-void DB::stats_retire_entry(BytesView key, const KeyDirEntry &old) {
-  file_stats_[old.file_id].live_bytes -= entry_size(key.size(), old.value_size);
-}
-
-// Records a new Put entry: live + total on the active file.
-void DB::stats_publish_put(std::uint32_t active_file_id, BytesView key,
-                                 BytesView value) {
-  const auto sz = entry_size(key.size(), value.size());
-  auto &st = file_stats_[active_file_id];
-  st.live_bytes += sz;
-  st.total_bytes += sz;
-}
-
-// Records a tombstone (Delete): total only on the active file.
-void DB::stats_publish_tombstone(std::uint32_t active_file_id,
-                                       BytesView key) {
-  file_stats_[active_file_id].total_bytes += entry_size(key.size(), 0);
-}
-
-// Records a bulk marker (BulkBegin / BulkEnd): total only.
-void DB::stats_publish_bulk_marker(std::uint32_t active_file_id) {
-  file_stats_[active_file_id].total_bytes += kHeaderSize + kCrcSize;
-}
-
-#pragma endregion
-
 #pragma region State access
 
 // Returns the engine state from a thread-local cache.
@@ -989,31 +1048,6 @@ auto DB::acquire_write_lock(const WriteOptions &opts)
 }
 
 #pragma endregion
-
-#pragma region File rotation
-
-// Seals the active file, opens a new one, and dispatches hint file writing
-// for the now-sealed file to the background worker. Returns a new EngineState.
-// fdatasync on the sealed file remains synchronous for durability correctness.
-auto DB::rotate_active_file(EngineState s) -> EngineState {
-  s.active_file().sync();
-  s.active_file().seal();
-  auto sealed = s.files->at(s.active_file_id);
-  auto dir = dir_;
-  worker_.dispatch([f = std::move(sealed), d = std::move(dir)] {
-    flush_hints_for(f, d);
-  });
-  s = s.apply_rotation(dir_);
-  file_stats_[s.active_file_id] = FileStats{};
-  return s;
-}
-
-auto DB::rotate_if_needed(EngineState s) -> EngineState {
-  if (s.active_file().size() >= rotation_threshold_) {
-    return rotate_active_file(std::move(s));
-  }
-  return s;
-}
 
 #pragma endregion
 
@@ -1163,7 +1197,7 @@ auto DB::recovery_load_serial(EngineState s) -> EngineState {
   auto files = recovery_prepare_files(s);
 
   for (const auto &rf : files) {
-    file_stats_[rf.file_id].total_bytes = rf.total_bytes;
+    s.file_stats[rf.file_id].total_bytes = rf.total_bytes;
   }
 
   std::uint64_t max_lsn = 0;
@@ -1184,10 +1218,10 @@ auto DB::recovery_load_serial(EngineState s) -> EngineState {
         const auto existing = transient_key_dir.get(he->key);
         if (!existing || existing->sequence < he->sequence) {
           if (existing) {
-            file_stats_[existing->file_id].live_bytes -=
+            s.file_stats[existing->file_id].live_bytes -=
                 entry_size(he->key.size(), existing->value_size);
           }
-          file_stats_[file_id].live_bytes +=
+          s.file_stats[file_id].live_bytes +=
               entry_size(he->key.size(), he->value_size);
           transient_key_dir.set(he->key,
                                 KeyDirEntry{he->sequence, file_id,
@@ -1199,7 +1233,7 @@ auto DB::recovery_load_serial(EngineState s) -> EngineState {
         if (he->sequence > tomb_seq) tomb_seq = he->sequence;
         const auto existing = transient_key_dir.get(he->key);
         if (existing && existing->sequence < he->sequence) {
-          file_stats_[existing->file_id].live_bytes -=
+          s.file_stats[existing->file_id].live_bytes -=
               entry_size(he->key.size(), existing->value_size);
           transient_key_dir.erase(he->key);
         }
@@ -1299,7 +1333,7 @@ auto DB::recovery_load_parallel(EngineState s,
   // Phase 5: assembly.
   s.key_dir = std::move(final_result.key_dir);
   s.next_lsn = final_result.max_lsn + 1;
-  file_stats_ = std::move(final_stats);
+  s.file_stats = std::move(final_stats);
   return s;
 }
 

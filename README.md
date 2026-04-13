@@ -18,7 +18,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch_if(snap, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add `ensure_unchanged` / range guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
-- **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Concurrent sync writes are amortised via group commit: when multiple writers finish their append at the same time, a single `fdatasync` covers the whole batch, keeping write throughput consistent under high concurrency.
+- **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex; `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
 - **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and data files that act as a write-ahead log ensure durability.
 
 ## Performance
@@ -237,7 +237,7 @@ ByteCaskDB is designed around four core tenets, in priority order:
   └── Sealed Files   read-only .data + .hint files      (older segments)
 ```
 
-**Write path**: every `put`/`del`/`apply_batch`/`apply_batch_if` appends a CRC-32-verified, length-prefixed record to the active data file and updates the in-memory radix tree. No random I/O; one sequential write per operation.
+**Write path**: all writes route through a single coordinator (`apply_batch_if`). Each write appends a CRC-32-verified, length-prefixed record to the active data file, then applies pure in-memory state transitions via `TransientEngineState`. When `sync` is requested, `fdatasync` completes before the new state becomes visible to readers.
 
 **Read path**: readers obtain an immutable snapshot of the engine state, look up the key in the radix tree to find its file and offset, then read the value directly. Reads are lock-free and scale linearly across cores.
 

@@ -355,6 +355,82 @@ export class Snapshot;
 export class WritePlan;
 
 // ---------------------------------------------------------------------------
+// TransientEngineState — mutable working copy of engine state.
+//
+// Created from EngineState via transient(). Owns the mutation logic for all
+// state transitions: writes, rotation, vacuum. The coordinator (DB) does IO
+// and sequencing but never touches key_dir, file_stats, or LSN directly.
+//
+// Follows the same transient/persistent discipline as
+// TransientRadixTree/PersistentRadixTree: mutations are batched on a
+// mutable copy, then committed back to an immutable shared_ptr<EngineState>
+// via persistent().
+// ---------------------------------------------------------------------------
+export class TransientEngineState {
+public:
+  TransientEngineState(const TransientEngineState &) = delete;
+  auto operator=(const TransientEngineState &)
+      -> TransientEngineState & = delete;
+  TransientEngineState(TransientEngineState &&) noexcept = default;
+  auto operator=(TransientEngineState &&) noexcept
+      -> TransientEngineState & = default;
+
+  // Precondition validation — pure reads, no mutations.
+  // If the plan has a snapshot, checks point guards + range guards + W-W on
+  // all write keys. Without a snapshot, checks only point guards that
+  // don't need one (MustExist, MustBeAbsent).
+  // Returns true if all guards pass.
+  [[nodiscard]] auto validate_preconditions(const WritePlan &plan) const
+      -> bool;
+
+  // Prepare IO plan — pure read, no mutations.
+  // Returns the exact append entries to write: LSN-assigned,
+  // BulkBegin/BulkEnd included for multi-op batches.
+  // Borrows key/value from the WritePlan; the plan must outlive the result.
+  [[nodiscard]] auto prepare_write(const WritePlan &plan) const
+      -> std::vector<AppendEntry>;
+
+  // State transition: apply all writes from a plan using IO results (offsets).
+  // Cannot fail — pure in-memory mutations.
+  void apply_writes(const WritePlan &plan,
+                     const std::vector<std::uint64_t> &offsets);
+
+  // State transition: register a new file as active after rotation.
+  // Cannot fail.
+  void apply_rotate_file(std::shared_ptr<DataFile> new_file);
+
+  // State transition: remap keys after vacuum scan+copy.
+  // Cannot fail.
+  void apply_vacuum(std::uint32_t old_file_id, const VacuumScanResult &scan,
+                    std::shared_ptr<DataFile> new_sealed_file);
+
+  // Pure queries the coordinator needs for IO decisions.
+  [[nodiscard]] auto active_file() -> DataFile &;
+  [[nodiscard]] auto active_file_id() const noexcept -> std::uint32_t;
+  [[nodiscard]] auto is_rotation_needed(std::uint64_t threshold) const -> bool;
+
+  // Commit: consume the transient and produce a new immutable EngineState.
+  [[nodiscard]] auto persistent() && -> std::shared_ptr<EngineState>;
+
+private:
+  friend class DB;
+  friend struct EngineState;
+  TransientEngineState(TransientRadixTree<KeyDirEntry> key_dir,
+                       FileRegistry files,
+                       std::map<std::uint32_t, FileStats> file_stats,
+                       std::uint32_t active_file_id,
+                       std::uint32_t next_file_id,
+                       std::uint64_t next_lsn);
+
+  TransientRadixTree<KeyDirEntry> key_dir_;
+  FileRegistry files_;
+  std::map<std::uint32_t, FileStats> file_stats_;
+  std::uint32_t active_file_id_;
+  std::uint32_t next_file_id_;
+  std::uint64_t next_lsn_;
+};
+
+// ---------------------------------------------------------------------------
 // DB — SWMR key-value store
 //
 // Thread safety: write operations (put, del, apply_batch) are serialised by
@@ -403,11 +479,11 @@ public:
   [[nodiscard]] auto contains_key(BytesView key) const -> bool;
 
 #ifdef BYTECASK_TESTING
-  // Returns a snapshot of per-file stats (under write_mu_).
+  // Returns a snapshot of per-file stats.
   // Only available in test builds (BYTECASK_TESTING).
   [[nodiscard]] auto file_stats() const -> std::map<std::uint32_t, FileStats> {
-    std::lock_guard<std::mutex> lk{*write_mu_};
-    return file_stats_;
+    auto s = state_.load();
+    return s->file_stats;
   }
 #endif
   // Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
@@ -425,7 +501,7 @@ public:
   // modified since snap. Returns true if committed, false on conflict.
   // Throws std::system_error on I/O failure or lock contention (try_lock).
   // Returns true (no-op) if plan has no writes and no guards.
-  [[nodiscard]] auto apply_batch_if(const Snapshot &snap, WriteOptions opts,
+  [[nodiscard]] auto apply_batch_if(WriteOptions opts,
                                     WritePlan plan) -> bool;
 
   // Returns an input range of (key, value) pairs with keys >= from.
@@ -508,17 +584,6 @@ private:
   // Appends live entries from a sealed file into the active file, then removes the sealed file.
   void vacuum_absorb_file(std::uint32_t file_id);
 
-  // FileStats helpers (called under write_mu_)
-  // Marks an existing entry as dead in its file's stats.
-  void stats_retire_entry(BytesView key, const KeyDirEntry &old);
-  // Records a new Put entry: live + total on the active file.
-  void stats_publish_put(std::uint32_t active_file_id, BytesView key,
-                         BytesView value);
-  // Records a tombstone: total only on the active file.
-  void stats_publish_tombstone(std::uint32_t active_file_id, BytesView key);
-  // Records a bulk marker (BulkBegin / BulkEnd): total only.
-  void stats_publish_bulk_marker(std::uint32_t active_file_id);
-
   // State access
   // Returns a thread-local cached EngineState snapshot; refreshes on staleness.
   [[nodiscard]] auto load_state(const ReadOptions &opts) const
@@ -542,18 +607,6 @@ private:
   auto recovery_load_parallel(EngineState s, unsigned recovery_threads)
       -> EngineState;
 
-  // File rotation
-  // Seals active file, dispatches hint write to background, opens new active file.
-  [[nodiscard]] auto rotate_active_file(EngineState s) -> EngineState;
-  // Calls rotate_active_file if active file has reached rotation_threshold_.
-  [[nodiscard]] auto rotate_if_needed(EngineState s) -> EngineState;
-
-  // Writes batch entries to disk, updates stats, publishes new EngineState.
-  // Caller must hold write_mu_. Returns the file to sync (null if !opts.sync).
-  auto commit_batch(const WriteOptions &opts, Batch &batch,
-                    const std::shared_ptr<const EngineState> &current)
-      -> std::shared_ptr<DataFile>;
-
   // Member variables
   std::filesystem::path dir_;
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
@@ -566,124 +619,14 @@ private:
   std::atomic<std::int64_t> state_time_{0};
   // Serialises writers (put, del, apply_batch). Readers never acquire this.
   std::unique_ptr<std::mutex> write_mu_{std::make_unique<std::mutex>()};
-  // Group commit: batches concurrent fdatasync calls so one sync covers
-  // multiple writers.
-  SyncGroup sync_group_;
   // Serialises vacuum() calls. Separate from write_mu_ so vacuum I/O does
   // not block normal writes.
   std::unique_ptr<std::mutex> vacuum_mu_{std::make_unique<std::mutex>()};
   // Protected by vacuum_mu_.
   std::vector<StaleFile> stale_files_;
-  // Per-file live/total byte counters for vacuum fragmentation tracking.
-  std::map<std::uint32_t, FileStats> file_stats_;
   // Declared last so it destructs first, joining the background thread before
   // any other member is destroyed.
   mutable BackgroundWorker worker_;
-};
-
-// ---------------------------------------------------------------------------
-// WritePlan — conditional write + guard vocabulary for apply_batch_if.
-//
-// Carries writes (put/del) and guards (ensure_present, ensure_absent,
-// ensure_unchanged, ensure_range_unchanged). Guards are preconditions
-// checked atomically under write_mu_ at commit time — if any guard fails,
-// apply_batch_if returns false.
-//
-// Builds up a per-key KeyAction map internally; guards and writes on the
-// same key are merged. Contradictory guards throw std::logic_error at
-// build time.
-// ---------------------------------------------------------------------------
-
-export class WritePlan {
-public:
-  enum class Precondition { None, MustExist, MustBeAbsent, MustBeUnchanged };
-  enum class Write { None, Put, Del };
-
-  struct KeyAction {
-    Precondition precondition{Precondition::None};
-    Write write{Write::None};
-    Bytes value; // meaningful only when write == Put
-  };
-
-  struct RangeGuard {
-    Bytes from;
-    Bytes to; // exclusive — [from, to)
-  };
-
-  WritePlan() = default;
-  WritePlan(const WritePlan &) = delete;
-  WritePlan &operator=(const WritePlan &) = delete;
-  WritePlan(WritePlan &&) noexcept = default;
-  WritePlan &operator=(WritePlan &&) noexcept = default;
-
-  // --- Writes (unconditional) ---
-
-  void put(BytesView key, BytesView value) {
-    auto &a = action_for(key);
-    a.write = Write::Put;
-    a.value = Bytes{value.begin(), value.end()};
-  }
-
-  void del(BytesView key) {
-    auto &a = action_for(key);
-    a.write = Write::Del;
-    a.value.clear();
-  }
-
-  // --- Point guards ---
-
-  void ensure_present(BytesView key) {
-    set_precondition(key, Precondition::MustExist);
-  }
-
-  void ensure_absent(BytesView key) {
-    set_precondition(key, Precondition::MustBeAbsent);
-  }
-
-  void ensure_unchanged(BytesView key) {
-    set_precondition(key, Precondition::MustBeUnchanged);
-  }
-
-  // --- Range guards ---
-
-  // Conflict if any key in [from, to) was inserted, modified,
-  // or deleted since the snapshot. The range is half-open:
-  // from is inclusive, to is exclusive.
-  void ensure_range_unchanged(BytesView from, BytesView to) {
-    range_guards_.push_back(
-        {Bytes{from.begin(), from.end()}, Bytes{to.begin(), to.end()}});
-  }
-
-private:
-  [[nodiscard]] auto empty() const noexcept -> bool {
-    return actions_.empty() && range_guards_.empty();
-  }
-
-  // Number of write operations (Put or Del).
-  [[nodiscard]] auto write_count() const noexcept -> std::size_t {
-    std::size_t n = 0;
-    for (const auto &[k, a] : actions_) {
-      if (a.write != Write::None) ++n;
-    }
-    return n;
-  }
-
-  auto action_for(BytesView key) -> KeyAction & {
-    auto k = Bytes{key.begin(), key.end()};
-    return actions_[std::move(k)];
-  }
-
-  void set_precondition(BytesView key, Precondition pre) {
-    auto &a = action_for(key);
-    if (a.precondition != Precondition::None && a.precondition != pre) {
-      throw std::logic_error{"WritePlan: contradictory guards on same key"};
-    }
-    a.precondition = pre;
-  }
-
-  std::map<Bytes, KeyAction> actions_;
-  std::vector<RangeGuard> range_guards_;
-  friend class DB;
 };
 
 // ---------------------------------------------------------------------------
@@ -731,7 +674,137 @@ private:
   explicit Snapshot(std::shared_ptr<const EngineState> state)
       : state_{std::move(state)} {}
   std::shared_ptr<const EngineState> state_;
-  friend class DB; // DB::snapshot() constructs; apply_batch_if() reads state_
+  friend class DB;
+  friend class TransientEngineState;
+  friend class WritePlan;
+#ifdef BYTECASK_TESTING
+public:
+  static auto from_state(std::shared_ptr<const EngineState> s) -> Snapshot {
+    return Snapshot{std::move(s)};
+  }
+#endif
+};
+
+// ---------------------------------------------------------------------------
+// WritePlan — conditional write + guard vocabulary for apply_batch_if.
+//
+// Optionally carries a Snapshot that defines the reference point for
+// ensure_unchanged / ensure_range_unchanged guards. When constructed
+// without a snapshot, only ensure_present / ensure_absent guards are
+// available — calling ensure_unchanged or ensure_range_unchanged on a
+// snapshot-less plan throws std::logic_error (programming error).
+//
+// Guards and writes on the same key are merged. Contradictory guards
+// throw std::logic_error at build time.
+// ---------------------------------------------------------------------------
+
+export class WritePlan {
+public:
+  enum class Precondition { None, MustExist, MustBeAbsent, MustBeUnchanged };
+  enum class Write { None, Put, Del };
+
+  struct KeyAction {
+    Precondition precondition{Precondition::None};
+    Write write{Write::None};
+    Bytes value; // meaningful only when write == Put
+  };
+
+  struct RangeGuard {
+    Bytes from;
+    Bytes to; // exclusive — [from, to)
+  };
+
+  WritePlan() = default;
+  explicit WritePlan(Snapshot snap) : snap_{std::move(snap)} {}
+  WritePlan(const WritePlan &) = delete;
+  WritePlan &operator=(const WritePlan &) = delete;
+  WritePlan(WritePlan &&) noexcept = default;
+  WritePlan &operator=(WritePlan &&) noexcept = default;
+
+  // --- Writes (unconditional) ---
+
+  void put(BytesView key, BytesView value) {
+    auto &a = action_for(key);
+    a.write = Write::Put;
+    a.value = Bytes{value.begin(), value.end()};
+  }
+
+  void del(BytesView key) {
+    auto &a = action_for(key);
+    a.write = Write::Del;
+    a.value.clear();
+  }
+
+  // --- Point guards ---
+
+  void ensure_present(BytesView key) {
+    set_precondition(key, Precondition::MustExist);
+  }
+
+  void ensure_absent(BytesView key) {
+    set_precondition(key, Precondition::MustBeAbsent);
+  }
+
+  // Requires a snapshot — throws std::logic_error if constructed without one.
+  void ensure_unchanged(BytesView key) {
+    if (!snap_) {
+      throw std::logic_error{
+          "WritePlan::ensure_unchanged requires a snapshot"};
+    }
+    set_precondition(key, Precondition::MustBeUnchanged);
+  }
+
+  // --- Range guards ---
+
+  // Conflict if any key in [from, to) was inserted, modified,
+  // or deleted since the snapshot. The range is half-open:
+  // from is inclusive, to is exclusive.
+  // Requires a snapshot — throws std::logic_error if constructed without one.
+  void ensure_range_unchanged(BytesView from, BytesView to) {
+    if (!snap_) {
+      throw std::logic_error{
+          "WritePlan::ensure_range_unchanged requires a snapshot"};
+    }
+    range_guards_.push_back(
+        {Bytes{from.begin(), from.end()}, Bytes{to.begin(), to.end()}});
+  }
+
+  [[nodiscard]] auto has_snapshot() const noexcept -> bool {
+    return snap_.has_value();
+  }
+
+private:
+  [[nodiscard]] auto empty() const noexcept -> bool {
+    return actions_.empty() && range_guards_.empty();
+  }
+
+  // Number of write operations (Put or Del).
+  [[nodiscard]] auto write_count() const noexcept -> std::size_t {
+    std::size_t n = 0;
+    for (const auto &[k, a] : actions_) {
+      if (a.write != Write::None) ++n;
+    }
+    return n;
+  }
+
+  auto action_for(BytesView key) -> KeyAction & {
+    auto k = Bytes{key.begin(), key.end()};
+    return actions_[std::move(k)];
+  }
+
+  void set_precondition(BytesView key, Precondition pre) {
+    auto &a = action_for(key);
+    if (a.precondition != Precondition::None && a.precondition != pre) {
+      throw std::logic_error{"WritePlan: contradictory guards on same key"};
+    }
+    a.precondition = pre;
+  }
+
+  std::optional<Snapshot> snap_;
+  std::map<Bytes, KeyAction> actions_;
+  std::vector<RangeGuard> range_guards_;
+  friend class DB;
+  friend class TransientEngineState;
 };
 
 } // namespace bytecask
