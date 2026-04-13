@@ -1165,6 +1165,42 @@ The `~DB()` destructor seals the active file, then calls `flush_hints()` which d
 
 ---
 
+## Fault Injection Test Seam
+
+To directly test correctness paths that only activate on IO failures (BC-131, BC-133), `bytecask.data_file` exposes a thread-local fault injection API compiled exclusively when `BYTECASK_TESTING` is defined.
+
+### API
+
+```cpp
+// Fail the Nth next append() call. n=0 fails immediately; n=1 lets one through, etc.
+void fault_inject_nth_append(int n) noexcept;
+
+// Fail the Nth next sync() call. n=0 fails immediately.
+void fault_inject_nth_sync(int n) noexcept;
+
+// Reset all fault state to disabled. Call after each test (or use FaultGuard).
+void fault_inject_reset() noexcept;
+```
+
+Fault state is per-thread (`thread_local FaultHooks`), so tests on different threads don't interfere. Both functions throw `std::system_error(EINVAL)` when the countdown reaches zero, identical in type to a real IO failure.
+
+### Intended use
+
+The `FaultGuard` RAII helper in `bytecask_test.cpp` calls `fault_inject_reset()` on destruction, so the fault state is always cleared even when a test assertion fails.
+
+Tests enabled by this seam:
+- **`[fault_inject]` mid-batch append failure** (BC-131): confirms that a failed append after `BulkBegin` triggers rotation and that the orphaned batch is discarded by recovery.
+- **`[fault_inject]` sync failure publish** (BC-133): confirms that state is published before the sync exception is rethrown, keeping in-process LSNs consistent.
+
+### Design notes
+
+The seam is intentionally minimal:
+- Zero production overhead: the `#ifdef BYTECASK_TESTING` blocks compile away entirely in non-test builds.
+- Thread-local (not global) state: each thread has an independent countdown, avoiding cross-test interference in multi-threaded test runners.
+- No virtual dispatch, no interface changes: `DataFile` remains a concrete class.
+
+---
+
 ## Current implementation state
 
 - Language: C++23

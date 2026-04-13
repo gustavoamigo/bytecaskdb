@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <atomic>
+#ifdef BYTECASK_TESTING
+#include "fault_injector.h"
+#endif
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstddef>
@@ -67,6 +70,7 @@ struct TempDir {
 
   ~TempDir() { std::filesystem::remove_all(path); }
 };
+
 
 } // namespace
 
@@ -2748,6 +2752,70 @@ TEST_CASE("apply_batch single-op writes no markers", "[apply_batch_if]") {
   });
 
   CHECK(batch_bytes == put_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Fault injection tests — directly exercise the BC-131 and BC-133 paths.
+// ---------------------------------------------------------------------------
+
+// BC-131: If append() throws mid-batch after BulkBegin has been written, the
+// engine force-rotates to a fresh active file. Recovery then sees an orphaned
+// BulkBegin with no matching BulkEnd and discards the partial batch entries.
+TEST_CASE("mid-batch append failure rotates file and discards partial batch",
+          "[fault_inject]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // A 2-op batch produces: BulkBegin(0), Put-a(1), Put-b(2), BulkEnd(3).
+  // Fail on append call index 2 (Put-b): BulkBegin and Put-a are orphaned in
+  // the active file with no matching BulkEnd.
+  {
+    bytecask::testing::ScopedFaultInjector fi{2};
+    bytecask::Batch batch;
+    batch.put(to_bytes("a"), to_bytes("v1"));
+    batch.put(to_bytes("b"), to_bytes("v2"));
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(batch)),
+                      std::system_error);
+  } // fi destructor resets active_injector
+
+  // Post-rotation: write a key to the clean new active file.
+  db.put({.sync = false}, to_bytes("c"), to_bytes("v3"));
+
+  // Reopen: recovery must discard the orphaned batch and retain only "c".
+  {
+    auto db2 = bytecask::DB::open(td.path / "db");
+    CHECK_FALSE(get_val(db2, to_bytes("a")).has_value());
+    CHECK_FALSE(get_val(db2, to_bytes("b")).has_value());
+    const auto vc = get_val(db2, to_bytes("c"));
+    REQUIRE(vc.has_value());
+    CHECK(to_string(*vc) == "v3");
+  }
+}
+
+// BC-133: If fdatasync fails, the engine publishes the new state before
+// rethrowing — writes remain visible in-process despite sync failure.
+// Without this, the old state would be reused on the next write, causing
+// duplicate LSNs and data corruption.
+TEST_CASE("sync failure publishes state before rethrowing", "[fault_inject]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // Inject a sync failure by name: skips the append checkpoint and fails
+  // exactly at io_data_file_sync.
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("k"), to_bytes("v1")),
+                      std::system_error);
+  } // fi destructor resets active_injector
+
+  // State was published before the rethrow: "k" must be visible in-process.
+  const auto val = get_val(db, to_bytes("k"));
+  REQUIRE(val.has_value());
+  CHECK(to_string(*val) == "v1");
+
+  // Subsequent writes must succeed on the advanced LSN — no duplicate sequence.
+  REQUIRE_NOTHROW(db.put({.sync = false}, to_bytes("k2"), to_bytes("v2")));
+  CHECK(get_val(db, to_bytes("k2")).has_value());
 }
 
 // ---------------------------------------------------------------------------

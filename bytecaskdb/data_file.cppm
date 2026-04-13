@@ -6,6 +6,9 @@
 module;
 #include <array>
 #include <cassert>
+#ifdef BYTECASK_TESTING
+#include "fault_injector.h"
+#endif
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -108,6 +111,9 @@ public:
   [[nodiscard]] auto append(std::uint64_t sequence, EntryType entry_type,
                             std::span<const std::byte> key,
                             std::span<const std::byte> value) -> Offset {
+#ifdef BYTECASK_TESTING
+    FAULT_INJECTION(io_data_file_append);
+#endif
     assert(!sealed_);
     const auto entry_offset = offset_;
 
@@ -201,6 +207,9 @@ public:
   // Flushes all pending writes to physical storage via fdatasync.
   // Call after one or more append()s to guarantee crash-safety (Group Commit).
   void sync() {
+#ifdef BYTECASK_TESTING
+    FAULT_INJECTION(io_data_file_sync);
+#endif
     if (::fdatasync(fd_) != 0) {
       throw std::system_error{errno, std::generic_category(),
                               "DataFile::sync: fdatasync failed"};
