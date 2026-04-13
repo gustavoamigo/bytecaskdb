@@ -514,41 +514,53 @@ auto DB::apply_batch_if(WriteOptions opts,
   }
 
   // 4. IO phase — coordinator's job (can throw).
+  // If a multi-entry batch fails mid-write after BulkBegin, the file
+  // has an orphaned BulkBegin. Force-rotate to isolate it: subsequent
+  // writes to the same file would be treated as part of the incomplete
+  // batch by flush_hints_for and silently discarded on recovery.
+  const bool multi = !entries.empty() &&
+                     entries.front().entry_type == EntryType::BulkBegin;
   auto &file = t.active_file();
   std::vector<std::uint64_t> offsets;
   offsets.reserve(entries.size());
-  for (const auto &entry : entries) {
-    offsets.push_back(
-        file.append(entry.sequence, entry.entry_type, entry.key, entry.value));
+  try {
+    for (const auto &entry : entries) {
+      offsets.push_back(file.append(
+          entry.sequence, entry.entry_type, entry.key, entry.value));
+    }
+  } catch (...) {
+    if (multi) {
+      try { file.sync(); } catch (...) {}
+      rotate_active_file(t, current);
+      state_.store(std::move(t).persistent());
+      state_time_.store(now_ns(), std::memory_order_release);
+    }
+    throw;
   }
 
-  // 5. State transition — TransientEngineState's job (cannot fail).
+  // 5. Apply mutations (pure, no IO).
   t.apply_writes(plan, offsets);
 
   // 6. Rotation — IO is coordinator's job, state change is transient's.
   if (t.is_rotation_needed(rotation_threshold_)) {
     file.sync();
-    file.seal();
-    auto sealed = t.active_file_id();
-    auto sealed_file = current->files->at(sealed);
-    auto dir = dir_;
-    worker_.dispatch([f = std::move(sealed_file), d = std::move(dir)] {
-      flush_hints_for(f, d);
-    });
-    const auto stem = make_data_file_stem();
-    auto new_file =
-        std::make_shared<DataFile>(dir_ / (stem + ".data"));
-    t.apply_rotate_file(std::move(new_file));
+    rotate_active_file(t, current);
   }
 
   // 7. Durability before visibility.
+  // On sync failure, publish state for process consistency before
+  // rethrowing — sync failure affects durability (crash safety),
+  // not in-process correctness.
+  std::exception_ptr sync_err;
   if (opts.sync) {
-    file.sync();
+    try { file.sync(); }
+    catch (...) { sync_err = std::current_exception(); }
   }
 
   // 8. Publish.
   state_.store(std::move(t).persistent());
   state_time_.store(now_ns(), std::memory_order_release);
+  if (sync_err) std::rethrow_exception(sync_err);
   return true;
 }
 
@@ -715,6 +727,26 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
     vacuum_compact_file(target_id);
   }
   return true;
+}
+
+#pragma endregion
+
+#pragma region File rotation
+
+// Seals the active file, dispatches hint file writing for it to the
+// background worker, and opens a new active file.
+// Caller must sync the active file before calling if durability is required.
+void DB::rotate_active_file(TransientEngineState &t,
+                            const std::shared_ptr<const EngineState> &current) {
+  t.active_file().seal();
+  auto sealed_file = current->files->at(t.active_file_id());
+  auto dir = dir_;
+  worker_.dispatch([f = std::move(sealed_file), d = std::move(dir)] {
+    flush_hints_for(f, d);
+  });
+  const auto stem = make_data_file_stem();
+  auto new_file = std::make_shared<DataFile>(dir_ / (stem + ".data"));
+  t.apply_rotate_file(std::move(new_file));
 }
 
 #pragma endregion

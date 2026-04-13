@@ -555,6 +555,11 @@ public:
 private:
   explicit DB(std::filesystem::path dir, Options opts);
 
+  // File rotation
+  // Seals active file, dispatches hint write to background, opens new active file.
+  void rotate_active_file(TransientEngineState &t,
+                          const std::shared_ptr<const EngineState> &current);
+
   // Hint file management
   // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint exists.
   static void flush_hints_for(const std::shared_ptr<DataFile> &file,

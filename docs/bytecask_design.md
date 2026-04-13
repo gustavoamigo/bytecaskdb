@@ -133,7 +133,8 @@ All writes (`put`, `del`, `apply_batch`, `apply_batch_if`) route through a singl
      └─ assigns LSNs, inserts BulkBegin/End markers — pure computation
 
   5. IO loop: for each AppendEntry, file.append(...)
-     └─ collects offsets into WriteIOResult
+     └─ collects offsets; on mid-batch failure, rotate to isolate
+        orphaned BulkBegin (see "Rotate on batch failure")
 
   6. apply_writes(plan, io_result)
      └─ updates key_dir, file_stats, LSN — pure in-memory mutations
@@ -144,8 +145,9 @@ All writes (`put`, `del`, `apply_batch`, `apply_batch_if`) route through a singl
      c. open new DataFile                      (IO)
      d. apply_rotate_file(new_file)            (state)
 
-  8. if opts.sync or rotation: active_file.sync()
-     └─ durability before visibility
+  8. if opts.sync: active_file.sync()
+     └─ on failure, publish state before rethrow
+        (see "Sync failure: publish before rethrow")
 
   9. state_.store(persistent())
      └─ atomically publishes new immutable snapshot
@@ -167,6 +169,16 @@ The coordinator (step 5 above) only performs IO. It never touches `key_dir`, `fi
 - `persistent() &&` — produces `shared_ptr<EngineState>` for publishing
 
 **Two-phase discipline**: IO happens first (steps 4-5), then pure state mutations (step 6). If IO throws, the transient is untouched — no partial state to unwind.
+
+##### Rotate on batch failure
+
+If `append()` throws mid-batch after `BulkBegin` has been written, the active file contains an orphaned `BulkBegin` with no matching `BulkEnd`. Without intervention, subsequent writes to the same file extend the region that `flush_hints_for` (and `vacuum_scan_and_copy`) treat as part of the incomplete batch — those entries would be silently discarded on recovery.
+
+The fix: the IO loop (step 5) is wrapped in `try/catch`. When the batch is multi-entry and IO fails, the catch block syncs (swallowed — best-effort durability for any preceding entries), seals the file, dispatches a hint write, and rotates to a fresh active file via `apply_rotate_file`. The rotated state is published immediately so subsequent writes go to the clean file. The exception is then rethrown to the caller.
+
+##### Sync failure: publish before rethrow
+
+If `fdatasync` fails (step 8), the writes are in the page cache but not guaranteed durable. The state is published to `state_.store()` before rethrowing the sync exception. This preserves in-process consistency: LSNs advance, the key directory reflects the writes, and the next write builds on the correct state. Without this, the old state would be reused, causing duplicate LSNs and data corruption on the next write. Sync failure affects crash safety (durability), not process correctness. The long-term fix is BC-090 (poisoned-DB flag on sync failure).
 
 ##### Durability before visibility
 
