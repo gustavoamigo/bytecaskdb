@@ -19,7 +19,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex; on the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
-- **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a poisoned state: reads remain available, all writes throw `DbPoisoned`, and only a process restart clears the state.
+- **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a degraded state: reads remain available, all writes throw `DbDegraded`, and the service calls `resume()` to recover without a restart.
 
 ## Performance
 
@@ -194,16 +194,16 @@ public:
 
     // Writes value for key into out, reusing its capacity. Returns true if found.
     // Throws std::system_error on I/O failure, std::runtime_error on CRC mismatch,
-    // or DbPoisoned if the engine is poisoned.
+    // or DbDegraded if the engine is degraded.
     [[nodiscard]] auto get(const ReadOptions& opts,
                            BytesView key, Bytes& out) const -> bool;
 
     // Writes key → value. Overwrites any existing value.
-    // Throws std::system_error on I/O failure or DbPoisoned if the engine is poisoned.
+    // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
     void put(const WriteOptions& opts, BytesView key, BytesView value);
 
     // Writes a tombstone for key. Returns true if the key existed.
-    // Throws std::system_error on I/O failure or DbPoisoned if the engine is poisoned.
+    // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
     [[nodiscard]] auto del(const WriteOptions& opts, BytesView key) -> bool;
 
     [[nodiscard]] auto contains_key(BytesView key) const -> bool;
@@ -218,7 +218,7 @@ public:
     // Applies plan atomically iff every guard holds and no write key was modified
     // since the plan's snapshot. Returns true if committed (including when the plan
     // is empty — no-op). Returns false on conflict.
-    // Throws std::system_error on I/O failure or DbPoisoned if the engine is poisoned.
+    // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
     [[nodiscard]] auto apply_batch_if(WriteOptions opts,
                                       WritePlan plan) -> bool;
 
@@ -237,10 +237,17 @@ public:
     // Returns true if a file was vacuumed, false if no file qualified.
     [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
 
-    // True if the engine has entered a poisoned state from an unrecoverable write-path failure.
-    // Reads remain available; all write operations throw DbPoisoned. Only a process restart clears it.
-    [[nodiscard]] auto is_poisoned() const noexcept -> bool;
-    [[nodiscard]] auto poison_reason() const noexcept -> const std::string&;
+    // True if the engine has entered a degraded state from a write-path failure.
+    // Reads remain available; all write operations throw DbDegraded.
+    [[nodiscard]] auto is_degraded() const noexcept -> bool;
+    [[nodiscard]] auto degraded_reason() const noexcept -> const std::string&;
+
+    // Attempts to recover from a degraded state. Scans the active file to find
+    // the last valid committed offset, truncates garbage bytes, syncs, seals
+    // the file, and opens a new active file. On success, clears the degraded
+    // flag. On failure, the engine stays degraded and the caller may retry.
+    // No-op if the engine is not degraded.
+    void resume();
 };
 
 // Frozen, move-only, read-only view of DB state at a point in time.
@@ -278,13 +285,13 @@ public:
     [[nodiscard]] auto has_snapshot() const noexcept -> bool;
 };
 
-// Thrown by write operations when the engine is in a poisoned state.
-class DbPoisoned : public std::runtime_error { /* ... */ };
+// Thrown by write operations when the engine is in a degraded state.
+class DbDegraded : public std::runtime_error { /* ... */ };
 
 } // namespace bytecask
 ```
 
-Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; write operations on a poisoned engine throw `DbPoisoned` (a `std::runtime_error` subclass, catchable separately). Key-not-found is signalled by `get` returning `false`; `apply_batch_if` returns `false` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors.
+Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately). Key-not-found is signalled by `get` returning `false`; `apply_batch_if` returns `false` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors.
 
 
 ## Architecture

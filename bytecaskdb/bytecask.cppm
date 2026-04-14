@@ -423,6 +423,13 @@ public:
   // in the page cache, while keeping key changes unpublished.
   void advance_next_lsn(std::uint64_t new_lsn) noexcept;
 
+  // Returns a mutable reference to file_stats_. Used by resume() to update
+  // total_bytes for a truncated active file before publishing state.
+  [[nodiscard]] auto file_stats() noexcept
+      -> std::map<std::uint32_t, FileStats> & {
+    return file_stats_;
+  }
+
   // Commit: consume the transient and produce a new immutable EngineState.
   [[nodiscard]] auto persistent() && -> std::shared_ptr<EngineState>;
 
@@ -447,17 +454,17 @@ private:
 // ---------------------------------------------------------------------------
 // DB — SWMR key-value store
 // ---------------------------------------------------------------------------
-// DbPoisoned — thrown by write operations when the engine is poisoned.
+// DbDegraded — thrown by write operations when the engine is degraded.
 //
-// The engine poisons itself when an isolation rotation fails after an
-// orphaned BulkBegin marker. Writes are blocked; reads remain available.
-// Only a process restart (which triggers recovery) clears the state.
+// The engine enters degraded state when a write-path failure leaves the
+// active file in an inconsistent state. Writes are blocked; reads remain
+// available. Call resume() to attempt in-process recovery without restart.
 // ---------------------------------------------------------------------------
-export class DbPoisoned : public std::runtime_error {
+export class DbDegraded : public std::runtime_error {
 public:
-  explicit DbPoisoned(const std::string &reason)
+  explicit DbDegraded(const std::string &reason)
       : std::runtime_error(reason) {}
-  ~DbPoisoned() override;
+  ~DbDegraded() override;
 };
 
 // ---------------------------------------------------------------------------
@@ -508,17 +515,24 @@ public:
   // Returns true if key exists in the index (no disk I/O).
   [[nodiscard]] auto contains_key(BytesView key) const -> bool;
 
-  // Returns true if the engine has been poisoned. A poisoned DB refuses
-  // all writes but reads remain available. Only a restart clears the state.
-  [[nodiscard]] auto is_poisoned() const noexcept -> bool {
-    return poisoned_.load(std::memory_order_acquire);
+  // Returns true if the engine has entered a degraded state. A degraded DB
+  // refuses all writes but reads remain available. Call resume() to attempt
+  // in-process recovery.
+  [[nodiscard]] auto is_degraded() const noexcept -> bool {
+    return degraded_.load(std::memory_order_acquire);
   }
 
-  // Returns the reason the engine was poisoned. Safe to call after
-  // is_poisoned() returns true — the acquire load synchronises access.
-  [[nodiscard]] auto poison_reason() const noexcept -> const std::string & {
-    return poison_reason_;
+  // Returns the reason the engine entered degraded state. Safe to call after
+  // is_degraded() returns true — the acquire load synchronises access.
+  [[nodiscard]] auto degraded_reason() const noexcept -> const std::string & {
+    return degraded_reason_;
   }
+
+  // Attempts to recover from a degraded state. If not degraded, returns
+  // immediately. On success, clears the degraded flag and the engine accepts
+  // writes again. If any step fails, the engine stays degraded and the caller
+  // may retry. Recovery is idempotent.
+  void resume();
 
 #ifdef BYTECASK_TESTING
   // Returns a snapshot of per-file stats.
@@ -608,8 +622,8 @@ private:
   void rotate_active_file(TransientEngineState &t,
                           const std::shared_ptr<const EngineState> &current);
 
-  // Poison — sets the engine to write-blocked state with a reason.
-  void deem_as_poisoned(std::string reason);
+  // Degrade — sets the engine to write-blocked state with a reason.
+  void deem_as_degraded(std::string reason);
 
   // Hint file management
   // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint exists.
@@ -677,13 +691,12 @@ private:
   // Stale readers compare this against a thread-local timestamp with a
   // single relaxed load (plain MOV on x86) to decide whether to refresh.
   std::atomic<std::int64_t> state_time_{0};
-  // Set by deem_as_poisoned() when isolation rotation fails after an
-  // orphaned BulkBegin. Blocks all writes; reads remain available.
-  // Cleared only by recovery (process restart).
-  std::atomic<bool> poisoned_{false};
-  // Written before poisoned_.store(release); read after
-  // poisoned_.load(acquire) — the atomic bool synchronises access.
-  std::string poison_reason_;
+  // Set by deem_as_degraded() on write-path failure. Blocks all writes;
+  // reads remain available. Cleared by resume() on successful recovery.
+  std::atomic<bool> degraded_{false};
+  // Written before degraded_.store(release); read after
+  // degraded_.load(acquire) — the atomic bool synchronises access.
+  std::string degraded_reason_;
   // Serialises writers (put, del, apply_batch). Readers never acquire this.
   std::unique_ptr<std::mutex> write_mu_{std::make_unique<std::mutex>()};
   // Serialises vacuum() calls. Separate from write_mu_ so vacuum I/O does

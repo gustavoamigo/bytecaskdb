@@ -176,30 +176,38 @@ If `append()` throws mid-batch after `BulkBegin` has been written, the active fi
 
 The fix: the IO loop (step 5) is wrapped in `try/catch`. When the batch is multi-entry and IO fails, the catch block attempts to sync the tainted file and rotate to a fresh active file. If the isolation sync fails, the orphaned batch markers may not be durable — a crash could leave an unresolvable `BulkBegin` — so the engine is poisoned immediately instead of proceeding. If sync succeeds but the isolation rotation fails, the engine is also poisoned (see below). When isolation succeeds, the rotated state is published immediately so subsequent writes go to the clean file, and the exception is rethrown to the caller.
 
-##### Poisoned state (`DbPoisoned`)
+##### Degraded state (`DbDegraded`) and `resume()`
 
-If the isolation sync or rotation after an orphaned `BulkBegin` fails (e.g. `fdatasync` error on the tainted file, or filesystem error creating the new data file), the active file may retain the orphaned marker in a non-durable state. Any subsequent write to that file would appear to succeed in-process but be silently discarded by recovery — a consistency divergence between in-memory and on-disk state.
+If the isolation sync or rotation after an orphaned `BulkBegin` fails (e.g. `fdatasync` error on the tainted file, or filesystem error creating the new data file), the active file may retain the orphaned marker in a non-durable or inconsistent state. Any subsequent write to that file would appear to succeed in-process but be silently discarded by recovery.
 
-When this happens, the engine calls `deem_as_poisoned(reason)` with a diagnostic string identifying the failed file, then rethrows the original exception. From that point:
+When this happens, the engine calls `deem_as_degraded(reason)` with a diagnostic string identifying the failed file, then rethrows the original exception. From that point:
 
-- **Writes blocked**: `put`, `del`, `apply_batch`, `apply_batch_if`, and `vacuum` throw `DbPoisoned` immediately. The reason string is available via `poison_reason()`.
+- **Writes blocked**: `put`, `del`, `apply_batch`, `apply_batch_if`, and `vacuum` throw `DbDegraded` immediately. The reason string is available via `degraded_reason()`.
 - **Reads available**: `get`, `contains_key`, `snapshot`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from` continue to work. The in-memory state was correctly rolled back (the transient was never persisted), so reads reflect the last successfully committed state.
-- **Recovery required**: the poisoned flag is in-memory only. Restarting the process runs recovery, which discards the orphaned `BulkBegin` and its trailing entries, restoring a clean state.
+- **Recovery via `resume()`**: the degraded flag is in-memory only. The service calls `resume()` to attempt in-process recovery without a restart. `resume()` runs a universal recovery process:
+  1. Acquires the write lock.
+  2. Scans the active file (batch-aware) to find the last valid committed offset. Orphaned `BulkBegin` batches are excluded — if a `BulkBegin` has no matching `BulkEnd`, `valid_offset` is reset to the batch start.
+  3. Calls `ftruncate` to remove garbage bytes and orphaned batch markers up to `valid_offset`.
+  4. Calls `fdatasync` to persist the truncation.
+  5. Seals the active file and dispatches hint generation (both idempotent).
+  6. Creates a new active file and publishes the new engine state.
+  7. Clears the `degraded_` flag.
+  If any step throws, the engine stays degraded and the caller may retry. Recovery is idempotent.
 
-Implementation: `poisoned_` is an `atomic<bool>` (release on write, acquire on read). The non-atomic `poison_reason_` string is safely published via the release/acquire pair — the string is written before `poisoned_.store(true, release)` and read after `poisoned_.load(acquire)`.
+Implementation: `degraded_` is an `atomic<bool>` (release on write, acquire on read). The non-atomic `degraded_reason_` string is safely published via the release/acquire pair — the string is written before `degraded_.store(true, release)` and read after `degraded_.load(acquire)`.
 
 ##### Partial write detection (tainted file)
 
 If `writev` returns a short write (0 < written < total), `DataFile::append()` sets a `tainted_` flag before throwing. A tainted file has bytes on disk that `offset_` does not account for. The file is opened with `O_APPEND`, so the next `writev` would write at the kernel's true EOF (past the partial data), but `offset_` would still point to the old position — the offset returned by subsequent appends would be wrong.
 
-For multi-entry batches this is safe: the isolation rotation moves to a new file, abandoning the tainted one. For single-entry writes, the `apply_batch_if` catch block checks `file.is_tainted()` and poisons the DB if set. Recovery (process restart) discards the partial entry via CRC mismatch and restores a clean state.
+For multi-entry batches this is safe: the isolation rotation moves to a new file, abandoning the tainted one. For single-entry writes, the `apply_batch_if` catch block checks `file.is_tainted()` and degrades the DB if set. `resume()` then truncates the partial entry and restores a clean state.
 
 ##### Post-write rotation failure
 
 After all appends succeed and mutations are applied, the engine may rotate the active file if it exceeds the size threshold. Rotation syncs the file, seals it, and creates a new active file. Two distinct failures can occur:
 
-- **Sync fails before seal**: the file is not sealed. The engine captures the exception, advances `next_lsn` past consumed LSNs, and rethrows without publishing key changes. The DB is not poisoned — the next write retries rotation or continues appending.
-- **File creation fails after seal**: `rotate_active_file` calls `seal()` before creating the new file. If creation fails, the active file is sealed and cannot accept further appends. The engine poisons the DB and publishes state. Recovery creates a fresh active file.
+- **Sync fails before seal**: the file is not sealed. The engine captures the exception, advances `next_lsn` past consumed LSNs, and rethrows without publishing key changes. The DB is not degraded — the next write retries rotation or continues appending.
+- **File creation fails after seal**: `rotate_active_file` calls `seal()` before creating the new file. If creation fails, the active file is sealed and cannot accept further appends. The engine degrades the DB and publishes state. `resume()` creates a fresh active file.
 
 ##### Sync failure: advance LSN, discard key changes
 
@@ -1221,7 +1229,7 @@ The `FaultGuard` RAII helper in `bytecask_test.cpp` calls `fault_inject_reset()`
 
 Tests enabled by this seam:
 - **`[fault_inject]` mid-batch append failure** (BC-131): confirms that a failed append after `BulkBegin` triggers rotation and that the orphaned batch is discarded by recovery.
-- **`[f_visibility]`/`[g_visibility]`** (BC-155): confirms that key changes are not published on sync failure — written key is absent after F or G failure, engine not poisoned.
+- **`[f_visibility]`/`[g_visibility]`** (BC-155): confirms that key changes are not published on sync failure — written key is absent after F or G failure, engine not degraded.
 
 ### Design notes
 

@@ -190,26 +190,25 @@ def gen_delta_literal(delta: Delta) -> str:
     """Generate C++ ExpectedDelta aggregate initializer."""
     ka = "{" + ", ".join(f'"{k}"' for k in delta.keys_added) + "}"
     kr = "{" + ", ".join(f'"{k}"' for k in delta.keys_removed) + "}"
-    poisoned = "true" if delta.poisoned else "false"
+    degraded = "true" if delta.degraded else "false"
     return (
         f"ExpectedDelta{{\n"
         f"        .keys_added = {ka},\n"
         f"        .keys_removed = {kr},\n"
         f"        .lsn_advance = {delta.lsn_advance},\n"
-        f"        .poisoned = {poisoned},\n"
+        f"        .degraded = {degraded},\n"
         f"    }}"
     )
 
 
 def should_check_recovery(delta: Delta, failure: FailureClass) -> bool:
-    """Recovery check: skipped when not recoverable or sync failure diverged."""
+    """Recovery check: skipped only when sync failure causes visibility divergence."""
     if failure in (FailureClass.F, FailureClass.G):
         # In-session and recovery visibility diverge after sync failure (BC-155):
         # bytes are physically in the page cache and appear in recovery after a
-        # clean shutdown, but key changes were not published in-session. Checking
-        # assert_recoverable would fail spuriously. Addressed by BC-157 RecoveryMode.
+        # clean shutdown, but key changes were not published in-session.
         return False
-    return not delta.poisoned or delta.lsn_advance > 0
+    return True  # resume() restores consistency for C/D/E/H before db scope closes
 
 
 def gen_test(
@@ -265,6 +264,8 @@ def gen_test(
 
     # In-process validation
     parts.append("    assert_delta(before, db, expected);")
+    if delta.degraded:
+        parts.append("    assert_resumable(db);")
     parts.append("  }")
 
     # Recovery
@@ -283,7 +284,7 @@ def gen_test(
             )
         else:
             parts.append(
-                "  // Recovery skipped: poisoned with unpersisted transition."
+                "  // Recovery skipped: degraded state with unpersisted transition."
             )
 
     parts.append("}")
@@ -321,6 +322,7 @@ namespace {
 using bytecask::testing::assert_consistent;
 using bytecask::testing::assert_delta;
 using bytecask::testing::assert_recoverable;
+using bytecask::testing::assert_resumable;
 using bytecask::testing::Baseline;
 using bytecask::testing::capture_baseline;
 using bytecask::testing::ExpectedDelta;

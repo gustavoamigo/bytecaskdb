@@ -46,7 +46,7 @@ import bytecask.util;
 
 namespace bytecask {
 
-DbPoisoned::~DbPoisoned() = default;
+DbDegraded::~DbDegraded() = default;
 
 #pragma region Internal helpers
 
@@ -510,7 +510,7 @@ auto DB::snapshot() const -> Snapshot { return Snapshot{state_.load()}; }
 // delegate here.
 auto DB::apply_batch_if(WriteOptions opts,
                         WritePlan plan) -> bool {
-  if (is_poisoned()) throw DbPoisoned{poison_reason_};
+  if (is_degraded()) throw DbDegraded{degraded_reason_};
   if (plan.empty()) return true;
 
   auto guard = acquire_write_lock(opts);
@@ -554,9 +554,9 @@ auto DB::apply_batch_if(WriteOptions opts,
       try {
         file.sync();
       } catch (...) {
-        deem_as_poisoned(std::format(
+        deem_as_degraded(std::format(
             "isolation sync failed for '{}': orphaned batch markers "
-            "may not be durable. Writes blocked until restart.",
+            "may not be durable. Writes blocked until resume().",
             file.path().string()));
         throw;
       }
@@ -565,9 +565,9 @@ auto DB::apply_batch_if(WriteOptions opts,
         state_.store(std::move(t).persistent());
         state_time_.store(now_ns(), std::memory_order_release);
       } catch (...) {
-        deem_as_poisoned(std::format(
+        deem_as_degraded(std::format(
             "isolation rotation failed for '{}': orphaned BulkBegin "
-            "cannot be isolated. Writes blocked until restart.",
+            "cannot be isolated. Call resume() to recover.",
             file.path().string()));
         throw;
       }
@@ -582,9 +582,9 @@ auto DB::apply_batch_if(WriteOptions opts,
         offsets.push_back(*off);
         b3_recovered = true;
       } else {
-        deem_as_poisoned(std::format(
+        deem_as_degraded(std::format(
             "partial write detected on '{}': file position diverged from "
-            "offset tracking. Writes blocked until restart.",
+            "offset tracking. Call resume() to recover.",
             file.path().string()));
       }
     }
@@ -614,9 +614,9 @@ auto DB::apply_batch_if(WriteOptions opts,
       try {
         rotate_active_file(t, current);
       } catch (...) {
-        deem_as_poisoned(std::format(
+        deem_as_degraded(std::format(
             "post-write rotation failed for '{}': active file is sealed "
-            "but new file could not be created. Writes blocked until restart.",
+            "but new file could not be created. Call resume() to recover.",
             file.path().string()));
         // Publish state so LSNs advance — reads remain correct.
         state_.store(std::move(t).persistent());
@@ -771,7 +771,7 @@ auto DB::rkeys_from(const ReadOptions & /*opts*/, BytesView from) const
 // write_mu_.
 auto DB::vacuum(VacuumOptions opts) -> bool {
   std::lock_guard<std::mutex> vg{*vacuum_mu_};
-  if (is_poisoned()) throw DbPoisoned{poison_reason_};
+  if (is_degraded()) throw DbDegraded{degraded_reason_};
 
   // Drain in-flight background hint writes so that vacuum's
   // flush_hints_for call cannot race on the same .hint.tmp file.
@@ -1135,9 +1135,80 @@ void DB::vacuum_absorb_file(std::uint32_t file_id) {
 
 #pragma region State access
 
-void DB::deem_as_poisoned(std::string reason) {
-  poison_reason_ = std::move(reason);
-  poisoned_.store(true, std::memory_order_release);
+void DB::deem_as_degraded(std::string reason) {
+  degraded_reason_ = std::move(reason);
+  degraded_.store(true, std::memory_order_release);
+}
+
+void DB::resume() {
+  if (!is_degraded()) return;
+
+  auto guard = acquire_write_lock({.sync = false, .try_lock = false});
+  if (!is_degraded()) return;  // re-check under lock
+
+  auto current = state_.load();
+  const auto old_file_id = current->active_file_id;
+  auto &file = *current->files->at(old_file_id);
+
+  // Scan the active file (batch-aware) to find the last valid committed offset.
+  // Orphaned BulkBegin batches are excluded: if a batch start is found but no
+  // matching BulkEnd, valid_offset is reset to batch_start (discarding it).
+  Offset valid_offset = 0;
+  Offset off = 0;
+  bool in_batch = false;
+  Offset batch_start = 0;
+  try {
+    while (auto result = file.scan(off)) {
+      const auto &[entry, next] = *result;
+      switch (entry.entry_type) {
+        case EntryType::BulkBegin:
+          in_batch = true;
+          batch_start = off;
+          break;
+        case EntryType::BulkEnd:
+          in_batch = false;
+          valid_offset = next;
+          break;
+        case EntryType::Put:
+        case EntryType::Delete:
+          if (!in_batch) valid_offset = next;
+          break;
+      }
+      off = next;
+    }
+  } catch (...) {
+    // Stop at first CRC error — valid_offset is the last known-good position.
+  }
+  if (in_batch) valid_offset = batch_start;  // discard orphaned batch
+
+  // Remove garbage bytes / orphaned batch markers via truncation.
+  if (file.size() != valid_offset) {
+    file.truncate(valid_offset);  // throws std::system_error → stays degraded
+  }
+
+  // Sync the truncated file (may throw → stays degraded).
+  file.sync();
+
+  // Seal and dispatch hint generation. Both are idempotent: seal() is a flag
+  // set, and flush_hints_for skips files whose .hint already exists.
+  file.seal();
+  worker_.dispatch([f = current->files->at(old_file_id), d = dir_] {
+    flush_hints_for(f, d);
+  });
+
+  // Create the new active file (may throw → stays degraded).
+  const auto stem = make_data_file_stem();
+  auto new_file = std::make_shared<DataFile>(dir_ / (stem + ".data"));
+
+  // Build and publish new state.
+  auto t = current->transient();
+  t.file_stats()[old_file_id].total_bytes = valid_offset;
+  t.apply_rotate_file(std::move(new_file));
+  state_.store(std::move(t).persistent());
+  state_time_.store(now_ns(), std::memory_order_release);
+
+  // Success: clear degraded flag.
+  degraded_.store(false, std::memory_order_release);
 }
 
 // Returns the engine state from a thread-local cache.

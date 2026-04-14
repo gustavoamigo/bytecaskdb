@@ -22,6 +22,7 @@ namespace {
 using bytecask::testing::assert_consistent;
 using bytecask::testing::assert_delta;
 using bytecask::testing::assert_recoverable;
+using bytecask::testing::assert_resumable;
 using bytecask::testing::capture_baseline;
 using bytecask::testing::ExpectedDelta;
 using bytecask::testing::to_bytes;
@@ -109,7 +110,7 @@ TEST_CASE("assert_delta on successful single put", "[invariants]") {
       .keys_added = {"new_key"},
       .keys_removed = {},
       .lsn_advance = 1,
-      .poisoned = false,
+      .degraded = false,
   });
 }
 
@@ -125,7 +126,7 @@ TEST_CASE("assert_delta on successful single delete", "[invariants]") {
       .keys_added = {},
       .keys_removed = {"k"},
       .lsn_advance = 1,
-      .poisoned = false,
+      .degraded = false,
   });
 }
 
@@ -144,18 +145,18 @@ TEST_CASE("assert_delta on successful batch", "[invariants]") {
       .keys_added = {"a", "b"},
       .keys_removed = {},
       .lsn_advance = 4,
-      .poisoned = false,
+      .degraded = false,
   });
 }
 
-TEST_CASE("assert_delta detects poison", "[invariants]") {
+TEST_CASE("assert_delta detects degraded", "[invariants]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
   db.put({.sync = false}, to_bytes("pre"), to_bytes("existing"));
 
   auto before = capture_baseline(db);
 
-  // Class D+E cascade: count-based injection at checkpoint 2 poisons the DB.
+  // Class D+E cascade: count-based injection at checkpoint 2 degrades the DB.
   {
     bytecask::testing::ScopedFaultInjector fi{2};
     bytecask::Batch batch;
@@ -169,8 +170,9 @@ TEST_CASE("assert_delta detects poison", "[invariants]") {
       .keys_added = {},
       .keys_removed = {},
       .lsn_advance = 0,
-      .poisoned = true,
+      .degraded = true,
   });
+  assert_resumable(db);
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +195,7 @@ TEST_CASE("assert_recoverable after successful write", "[invariants]") {
       .keys_added = {"new_key"},
       .keys_removed = {},
       .lsn_advance = 1,
-      .poisoned = false,
+      .degraded = false,
   });
 }
 
@@ -221,7 +223,7 @@ TEST_CASE("assert_recoverable when transition not persisted",
       .keys_added = {},
       .keys_removed = {},
       .lsn_advance = 0,
-      .poisoned = false,
+      .degraded = false,
   });
 }
 

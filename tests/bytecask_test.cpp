@@ -902,9 +902,7 @@ TEST_CASE("DB recovery: lenient mode opens with partial recovery on corrupt hint
   bytecask::DB db =
       bytecask::DB::open(db_path, {.max_file_bytes = 1,
                                    .fail_recovery_on_crc_errors = false});
-  CHECK_FALSE(db.is_poisoned());
-
-  // Keys from uncorrupted files must be present.
+  CHECK_FALSE(db.is_degraded());
   CHECK(get_val(db, to_bytes("key_first")).has_value());
   CHECK(get_val(db, to_bytes("key_third")).has_value());
   // Key from the corrupt file must be absent.
@@ -2921,17 +2919,17 @@ TEST_CASE("mid-batch append failure rotates file and discards partial batch",
 }
 
 // ---------------------------------------------------------------------------
-// Poisoned DB tests — mechanism smoke tests not covered by [prove] matrix.
+// Degraded DB tests — mechanism smoke tests not covered by [prove] matrix.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("reads work on a poisoned DB", "[poisoned]") {
+TEST_CASE("reads work on a degraded DB", "[degraded]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
 
-  // Pre-populate before poisoning.
+  // Pre-populate before degrading.
   db.put({.sync = false}, to_bytes("x"), to_bytes("val_x"));
 
-  // Poison the DB.
+  // Degrade the DB via an orphaned BulkBegin batch.
   {
     bytecask::testing::ScopedFaultInjector fi{2};
     bytecask::Batch batch;
@@ -2940,9 +2938,9 @@ TEST_CASE("reads work on a poisoned DB", "[poisoned]") {
     REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(batch)),
                       std::system_error);
   }
-  REQUIRE(db.is_poisoned());
+  REQUIRE(db.is_degraded());
 
-  // get — returns pre-poison data.
+  // get — returns pre-degrade data.
   const auto val = get_val(db, to_bytes("x"));
   REQUIRE(val.has_value());
   CHECK(to_string(*val) == "val_x");
@@ -2963,6 +2961,10 @@ TEST_CASE("reads work on a poisoned DB", "[poisoned]") {
   // keys_from — pure in-memory walk.
   auto keys = db.keys_from({}, to_bytes("x"));
   CHECK(keys.begin() != std::default_sentinel);
+
+  // resume() clears the degraded state.
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
 }
 
 // ---------------------------------------------------------------------------
@@ -2985,7 +2987,7 @@ TEST_CASE("class F: key not visible after commit sync failure", "[f_visibility]"
 
   // Key must not be visible — write was not confirmed durable.
   CHECK_FALSE(db.contains_key(to_bytes("new_key")));
-  CHECK_FALSE(db.is_poisoned());
+  CHECK_FALSE(db.is_degraded());
 }
 
 TEST_CASE("class G: key not visible after rotation sync failure", "[g_visibility]") {
@@ -3009,9 +3011,39 @@ TEST_CASE("class G: key not visible after rotation sync failure", "[g_visibility
 
   // Key must not be visible — write was not confirmed durable.
   CHECK_FALSE(db.contains_key(to_bytes("new_key")));
-  CHECK_FALSE(db.is_poisoned());
+  CHECK_FALSE(db.is_degraded());
   // Pre-existing key must still be visible.
   CHECK(db.contains_key(to_bytes("seed")));
+}
+
+TEST_CASE("resume() recovers from degraded state", "[degraded][resume]") {
+  TempDir td;
+
+  // max_file_bytes=30 triggers rotation once the file exceeds ~30 bytes.
+  // Each entry is ~23 bytes (15 hdr + 4 crc + 2 key + 2 value).
+  // k1 fits (23 bytes); k2 pushes the file to ~46 bytes, triggering rotation.
+  bytecask::DB db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 30});
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+
+  {
+    // Fault fires during rotation after k2 is committed (class T4).
+    bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+    REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")),
+                      std::system_error);
+  }
+  REQUIRE(db.is_degraded());
+
+  // resume() clears the degraded state.
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+
+  // Both k1 and k2 were committed before/during the fault — must still be visible.
+  CHECK(db.contains_key(to_bytes("k1")));
+  CHECK(db.contains_key(to_bytes("k2")));
+
+  // Subsequent writes succeed after resume().
+  REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
+  CHECK(db.contains_key(to_bytes("k3")));
 }
 
 // ---------------------------------------------------------------------------

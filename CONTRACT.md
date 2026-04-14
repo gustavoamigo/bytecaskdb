@@ -17,13 +17,14 @@ One section per write function. Plain language.
 **Durable**: a key-value pair is durable when it will survive a process
 crash and be present after recovery.
 
-**Poisoned**: the engine has detected an internal state divergence that
+**Degraded**: the engine has detected an internal state divergence that
 it cannot resolve on its own. Continuing to accept writes would risk
-persisting data that recovery would not reproduce. A poisoned DB must
-refuse all write operations with a `DbPoisoned` exception carrying a
+persisting data that recovery would not reproduce. A degraded DB must
+refuse all write operations with a `DbDegraded` exception carrying a
 diagnostic reason. Read operations remain available — the in-memory
-state is recovery-equivalent at the time of poisoning. Only a process
-restart (which triggers recovery) clears the poisoned state.
+state is recovery-equivalent at the time of degradation. The service
+calls `resume()` to attempt in-process recovery; on success the engine
+accepts writes again without a restart.
 
 **Recovery-equivalent**: the in-memory state agrees with what opening
 a fresh DB from the current on-disk files would produce.
@@ -79,8 +80,8 @@ If any I/O operation (append, sync) throws during execution:
   CRC-verify it. Valid CRC → the write is durable; publish state normally.
   Invalid CRC or short read → the engine must guarantee that a valid entry
   is subsequently written so recovery will reach a consistent state from
-  it. If that is not possible, the engine must poison the DB — only a
-  full recovery can bring the system back to a consistent state.
+  it. If that is not possible, the engine must degrade — `resume()` will
+  scan and truncate the active file to restore a consistent state.
 - The DB must remain operational for subsequent calls.
 
 ### Rotation Safety
@@ -98,7 +99,8 @@ If the isolation rotation itself fails:
   `BulkBegin`).
 - This is a consistency divergence: the caller believes the write is
   committed, but recovery will not produce it.
-- The engine must poison itself.
+- The engine must degrade itself. `resume()` scans the active file,
+  truncates the orphaned batch, and creates a fresh active file.
 
 ### Consistency
 
@@ -119,9 +121,9 @@ The specific guarantees:
 If the engine cannot maintain recovery-equivalence — because a commit-
 phase failure (rotation, state publication) leaves in-memory state in
 a configuration that recovery would not produce — the engine must
-poison the DB.
+degrade the DB.
 
-Poisoning is an acceptable outcome. The engine must not:
+Degrading is an acceptable outcome. The engine must not:
 
 1. Allow a caller to read a key-value pair that recovery would not
    produce.
@@ -242,7 +244,7 @@ be deferred until no external references remain.
 
 Same as `apply_batch_if`: in-memory state must be recovery-equivalent.
 If `vacuum_commit` would publish a state where a key references a file
-that does not contain the expected entry, the engine must poison
+that does not contain the expected entry, the engine must degrade
 itself.
 
 ---
