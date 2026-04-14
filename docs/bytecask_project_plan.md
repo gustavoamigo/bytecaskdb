@@ -37,7 +37,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-078 | Published library module boundary | Decision: use Path A — keep sub-components (radix_tree, data_file, hint_file, etc.) as top-level modules for isolated testing; enforce public boundary at install time by only shipping the bytecask.engine BMI. Revisit Path B (full-partition restructure) if airtight compiler-enforced encapsulation is needed. |
 | BC-041 | `ReadOptions::verify_checksums` flag | Allow skipping CRC verification on bulk scans for ~5% win. Mirrors LevelDB/RocksDB `verify_checksums` option. |
-| BC-090 | Error handling | Review Error handling, we haven't reviewed this part. BC-134 implemented DbPoisoned for isolation rotation failures; sync-failure poisoning is still open. |
+| BC-090 | Error handling | Review Error handling, we haven't reviewed this part. BC-134 implemented DbPoisoned for isolation rotation failures; BC-137 added poisoning on isolation sync failure; commit-sync-failure poisoning is still open. |
 | BC-091 | Logging | Logging? (what other projects use) |
 | BC-092 | UUIDv4 test | Test and protections if customers use UUIDv4 as key (Maybe we will need a Adaptive Radix Tree extension) |
 | BC-093 | Vacuum benchmarks | Add benchmark tests for the vacuum (with performance and data file reclaim tests) |
@@ -53,6 +53,11 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-138 | `invariants.h` — correctness validation helpers (Phase 2) | `tests/proof/invariants.h`: `Baseline`, `ExpectedDelta`, `capture_baseline`, `assert_consistent` (5 structural invariants), `assert_delta` (key membership, LSN advancement, poison state), `assert_recoverable` (persistence invariant via fresh recovery). 12 new `[invariants]` tests in `tests/invariants_test.cpp`. 210 total tests pass. Unblocks Phase 3 (Python test generator). |
+
+| ID | Title | Note |
+| --- | --- | --- |
+| BC-137 | Poison on isolation sync failure (class D fix) | Isolation sync failure was silently swallowed — if `fdatasync` failed during isolation, the orphaned batch markers might not be durable but the DB continued operating. Now poisons immediately. Extended `ScopedFaultInjector` with count-based skip set for independent class D testing. 198 total tests pass. |
 | BC-136 | Post-write rotation failure handling | Split step 6 rotation into two failure modes: (G) pre-rotation sync fails — state published, not poisoned, next write retries; (H) `rotate_active_file` fails after seal — DB poisoned (sealed file unusable), state published for LSN advancement. 2 new `[rotation_failure]` tests, 197 total pass. |
 | BC-135 | Partial write detection and poison-on-taint | `DataFile::append()` detects `writev` short writes via `tainted_` flag. For single-entry writes, `apply_batch_if` poisons the DB when the file is tainted (offset diverges from kernel fd position). Extended fault injector with `PostWriteMode` (`short_write`, `throw_after`) and `FAULT_INJECTION_POST_WRITE` macro. 3 new `[partial_write]` tests, 195 total pass. |
 | BC-134 | `DbPoisoned` — block writes on isolation rotation failure | If isolation rotation fails after an orphaned `BulkBegin`, the engine sets a poisoned flag via `deem_as_poisoned(reason)`. All writes (`put`, `del`, `apply_batch`, `apply_batch_if`, `vacuum`) throw `DbPoisoned` with a diagnostic reason. Reads remain available. Recovery (process restart) clears the state. `FAULT_INJECTION(io_rotate_file_creation)` checkpoint added to `rotate_active_file` for deterministic testing. 3 new `[poisoned]` tests, 192 total pass. |

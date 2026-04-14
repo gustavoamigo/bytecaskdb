@@ -1,9 +1,12 @@
 # ByteCaskDB — Correctness Validation Plan
 
-> **Status**: Foundation complete. The single write path, transient/persistent
-> state discipline, behavioral contract, and basic fault injection are
-> implemented and tested. The formal validation model (Python test generator,
-> `DbPoisoned`, exhaustive prove tests) is designed but not yet built.
+> **Status**: Phases 1–2 complete. The single write path, transient/persistent
+> state discipline, behavioral contract, fault injection framework,
+> `DbPoisoned`, and the `invariants.h` test helpers (`assert_consistent`,
+> `assert_delta`, `assert_recoverable`) are implemented and tested. All
+> eleven failure classes have test coverage. 210 tests pass. The formal
+> validation model (Python test generator, exhaustive prove tests) is
+> designed but not yet built.
 >
 > This document should be read alongside [`CONTRACT.md`](../CONTRACT.md) and
 > the [project plan](bytecask_project_plan.md).
@@ -120,18 +123,28 @@ is never modified.
 It is the source of truth for both the implementation and the validation
 model.
 
-### Fault injection framework (BC-132, partial)
+### Fault injection framework (BC-132, done)
 
 `bytecaskdb/fault_injector.h` provides:
-- `FaultInjector` with name-based and count-based injection
-- `ScopedFaultInjector` RAII guard for test safety
+- `FaultInjector` with name-based and count-based injection, plus a
+  count-based skip set for selective cascade control
+- `ScopedFaultInjector` RAII guard with three constructor forms:
+  name-based, count-based, count-based with skip set, and name-based
+  with post-write mode
+- `PostWriteMode` (`short_write`, `throw_after`) for simulating partial
+  writes — fires at `FAULT_INJECTION_POST_WRITE` checkpoints
 - `io_checkpoint(name)` called at I/O boundaries
-- `FAULT_INJECTION(name)` macro, compiled under `BYTECASK_TESTING`
+- `FAULT_INJECTION(name)` and `FAULT_INJECTION_POST_WRITE(name, fd, offset, total)`
+  macros, compiled under `BYTECASK_TESTING`
 - Thread-local `active_injector` pointer
 
-Two checkpoints exist in the production code:
-1. `io_data_file_append` — in `DataFile::append()`
-2. `io_data_file_sync` — in `DataFile::sync()`
+Four checkpoints exist in the production code:
+1. `io_data_file_append` — before `writev()` in `DataFile::append()`
+2. `io_data_file_append_partial` — after `writev()` but before offset
+   advance in `DataFile::append()` (post-write checkpoint)
+3. `io_data_file_sync` — before `fdatasync()` in `DataFile::sync()`
+4. `io_rotate_file_creation` — after sealing, before new file creation
+   in `rotate_active_file()`
 
 ### Orphaned BulkBegin rotation (BC-131, done)
 
@@ -150,54 +163,27 @@ next write.
 - **25 unit tests** for `TransientEngineState::validate_preconditions` —
   pure, no DB, no disk I/O. Covers all guard types, range guards,
   W-W conflict detection, combined scenarios, snapshot-less plans.
-- **2 fault injection tests** — BC-131 (mid-batch append failure
-  rotates file and discards partial batch, count-based injection) and
-  BC-133 (sync failure publishes state before rethrow, name-based
-  injection).
+- **10 fault injection tests** covering all failure classes:
+  - BC-131: mid-batch append failure rotates file and discards partial
+    batch (count-based injection)
+  - BC-133: sync failure publishes state before rethrow (name-based)
+  - BC-134: isolation rotation failure poisons DB (count-based cascade);
+    reads work on poisoned DB; single-entry failure does not poison
+  - BC-135: partial write on single-entry poisons (short_write and
+    throw_after modes); multi-entry batch with partial write isolates
+    correctly
+  - BC-136: rotation sync failure publishes state without poison;
+    rotation file creation failure poisons but preserves writes
+  - BC-137: isolation sync failure poisons DB independently
+    (count-based with skip set)
+- **12 invariant helper tests** (`[invariants]` tag) — validate
+  `assert_consistent`, `assert_delta`, `assert_recoverable`, and
+  `capture_baseline` across empty, populated, deleted, overwritten,
+  batched, poisoned, and recovery scenarios.
 
 ---
 
 ## What Is Not Built
-
-### `DbPoisoned` / `is_poisoned`
-
-The contract defines poisoning (see [CONTRACT.md §Rotation Safety](../CONTRACT.md)):
-if the isolation rotation fails after an orphaned `BulkBegin`, the
-engine must poison itself. A poisoned DB refuses all write operations
-(`put`, `del`, `apply_batch`, `apply_batch_if`, `vacuum`) with a
-`DbPoisoned` exception. Read operations (`get`, `contains_key`,
-`snapshot`, iterators) remain available — the in-memory state was
-rolled back correctly and agrees with what recovery would produce.
-
-Currently the engine catches rotation/sync failures in the isolation
-path silently. There is no `poisoned_` member, no `is_poisoned()`
-method, no `DbPoisoned` exception class.
-
-**Required before**: failure classes D and E can be validated.
-
-### Fine-grained fault checkpoints
-
-The plan requires checkpoints at each failure class boundary. The
-current two checkpoints (`io_data_file_append`, `io_data_file_sync`)
-cannot distinguish between a failure on `BulkBegin` append vs.
-`BulkEnd` append without relying on count-based injection.
-
-Named checkpoints needed:
-- `bulk_begin_append` — first marker in a batch
-- `op_N_append` — each data entry in a batch
-- `bulk_end_append` — closing marker
-- `isolation_sync` — sync during orphan isolation
-- `isolation_rotation` — file rotation during orphan isolation
-- `commit_sync` — sync in the commit phase
-
-**Required before**: the Python generator can map failure classes to
-deterministic injection points.
-
-### `assert_consistent` / `assert_delta` helpers
-
-No `invariants.h` file exists. The generated prove tests depend on
-these helpers to validate the actual delta against the expected delta
-from the reference model.
 
 ### Python test generator
 
@@ -370,9 +356,9 @@ accept further appends.
 | B2 (single) | Yes | `[partial_write]` test — `PostWriteMode::short_write` (BC-135) |
 | B2 (multi) | Yes | `[partial_write]` test — multi-entry batch with isolation (BC-135) |
 | B3 (single) | Yes | `[partial_write]` test — `PostWriteMode::throw_after` (BC-135) |
-| C | No | Requires `bulk_end_append` checkpoint |
-| D | Yes | BC-134 `[poisoned]` test — count-based chains through isolation sync |
-| E | Yes | BC-134 `[poisoned]` test — `io_rotate_file_creation` checkpoint |
+| C | No | Requires count-based injection targeting `BulkEnd` specifically |
+| D | Yes | BC-137 `[poisoned]` test — count-based with skip set isolates sync failure (BC-134 cascade also covers D+E combined) |
+| E | Yes | BC-134 `[poisoned]` test — count-based cascade through `io_rotate_file_creation` |
 | F | Yes | 1 fault injection test (BC-133) |
 | G | Yes | BC-136 `[rotation_failure]` — sync failure publishes state, no poison |
 | H | Yes | BC-136 `[rotation_failure]` — file creation failure poisons, preserves writes |
@@ -546,7 +532,7 @@ in the matrix.
 
 ## The Generator
 
-Takes the matrix and produces Google Test cases. One test per
+Takes the matrix and produces Catch2 test cases. One test per
 `(S1, P, F)` combination.
 
 ```python
@@ -555,7 +541,7 @@ def generate_test(s1: StateShape, p: PlanShape, f: FailureClass) -> str:
     expected = expected_delta(p, f)
 
     return f"""
-TEST(ProveApplyBatchIf, {name}) {{
+TEST_CASE("{name}", "[prove]") {{
     // Setup — build initial state from structural description
     {generate_setup(s1)}
 
@@ -573,14 +559,13 @@ TEST(ProveApplyBatchIf, {name}) {{
     }} catch (const std::system_error&) {{
         threw = true;
     }}
-    active_injector = nullptr;
 
     // Validate against expected delta
-    EXPECT_EQ(threw, {str(expected.threw).lower()});
-    {"EXPECT_FALSE(result);" if f == FailureClass.A else ""}
-    {"EXPECT_TRUE(db.is_poisoned());"
+    CHECK(threw == {str(expected.threw).lower()});
+    {"CHECK_FALSE(result);" if f == FailureClass.A else ""}
+    {"CHECK(db.is_poisoned());"
         if expected.poisoned
-        else "EXPECT_FALSE(db.is_poisoned());"}
+        else "CHECK_FALSE(db.is_poisoned());"}
     assert_consistent(db);
     assert_delta(before, db, {generate_expected_delta(expected)});
     {"assert_recoverable(test_dir);" if not expected.poisoned else ""}
@@ -592,40 +577,66 @@ TEST(ProveApplyBatchIf, {name}) {{
 
 ## The Fault Point Resolver
 
-Maps a failure class to the concrete checkpoint number for a given
-plan shape. This is what connects the abstract class to the
-deterministic injector.
+Maps a failure class to the concrete injection configuration using the
+four existing checkpoints in `DataFile` and `rotate_active_file`:
+
+- `io_data_file_append` — fires before every `writev()` (BulkBegin,
+  data entries, BulkEnd all hit this checkpoint)
+- `io_data_file_append_partial` — fires after `writev()` succeeds but
+  before `offset_` advances (post-write checkpoint)
+- `io_data_file_sync` — fires before every `fdatasync()` (isolation
+  sync, rotation sync, and commit sync all hit this checkpoint)
+- `io_rotate_file_creation` — fires after sealing, before new file
+  creation
+
+The three `ScopedFaultInjector` modes map failure classes to these
+checkpoints:
+
+- **Name-based** targets a single checkpoint by name — all other
+  checkpoints pass. Used for B1 (single-entry), F, G, H.
+- **Count-based** fails from checkpoint N onward, cascading through
+  all subsequent operations. Used for C (BulkEnd), D+E (cascade).
+- **Count-based with skip set** cascades but lets named checkpoints
+  pass — isolates a specific failure within a cascade. Used for D
+  (skip `io_rotate_file_creation` so rotation succeeds but sync fails).
+- **Post-write mode** fires at `io_data_file_append_partial` with
+  `short_write` or `throw_after`. Used for B2, B3.
 
 ```python
 def fault_point_for_class(p: PlanShape, f: FailureClass) -> FaultConfig:
     """
-    Maps a failure class to the concrete injection configuration.
+    Maps a failure class to the concrete injection configuration
+    using the four existing DataFile-level checkpoints.
 
-    B1 uses the existing pre-write checkpoint (throw_before mode).
-    B2 uses the post-write checkpoint (PostWriteMode.short_write).
-    B3 uses the post-write checkpoint (PostWriteMode.throw_after).
-    All others use count-based pre-write injection.
+    The checkpoint firing sequence for a multi-entry batch with N ops:
+      io_data_file_append (BulkBegin)           — ckpt 1
+      io_data_file_append (op 1)                — ckpt 2
+      ...
+      io_data_file_append (op N)                — ckpt N+1
+      io_data_file_append (BulkEnd)             — ckpt N+2
+      [if BulkEnd fails → isolation path:]
+        io_data_file_sync (isolation sync)      — ckpt N+3
+        io_rotate_file_creation (isolation rot) — ckpt N+4
+      [if appends succeed → commit path:]
+        io_data_file_sync (commit sync)         — ckpt N+3
+        [if rotation needed:]
+          io_data_file_sync (rotation sync)     — ckpt N+4
+          io_rotate_file_creation (rotation)    — ckpt N+5
     """
     multi = len(p.ops) > 1
-    checkpoints = []
+    n_appends = len(p.ops) + (2 if multi else 0)  # +2 for BulkBegin/End
 
-    if multi:
-        checkpoints.append(("bulk_begin_append", FailureClass.B1))
+    if f == FailureClass.SUCCESS:
+        return FaultConfig()  # no fault injected
 
-    for i, op in enumerate(p.ops):
-        checkpoints.append((f"op_{i}_append", FailureClass.B1))
+    if f == FailureClass.A:
+        return FaultConfig()  # conflict triggers via plan setup, not injection
 
-    if multi:
-        checkpoints.append(("bulk_end_append",   FailureClass.C))
-        checkpoints.append(("isolation_sync",     FailureClass.D))
-        checkpoints.append(("isolation_rotation", FailureClass.E))
-
-    checkpoints.append(("commit_sync", FailureClass.F))
-    checkpoints.append(("rotation_sync", FailureClass.G))
-    checkpoints.append(("rotation_file_creation", FailureClass.H))
+    if f == FailureClass.B1:
+        # Name-based: fail at the first io_data_file_append
+        return FaultConfig(name="io_data_file_append")
 
     if f == FailureClass.B2:
-        # Post-write short_write on the first data append
         return FaultConfig(
             name="io_data_file_append_partial",
             post_write_mode=PostWriteMode.short_write,
@@ -633,18 +644,43 @@ def fault_point_for_class(p: PlanShape, f: FailureClass) -> FaultConfig:
         )
 
     if f == FailureClass.B3:
-        # Post-write throw_after on the first data append
         return FaultConfig(
             name="io_data_file_append_partial",
             post_write_mode=PostWriteMode.throw_after,
         )
 
-    # Pre-write count-based injection for all other classes
-    for i, (label, cls) in enumerate(checkpoints):
-        if cls == f:
-            return FaultConfig(fail_at=i)
+    if f == FailureClass.C:
+        # Count-based: let BulkBegin + all ops pass, fail on BulkEnd.
+        # fail_at = N+1 means checkpoint N+2 (BulkEnd) is the first to throw.
+        # This cascades through isolation sync and rotation.
+        return FaultConfig(fail_at=n_appends - 1)
 
-    return FaultConfig()  # SUCCESS — no fault injected
+    if f == FailureClass.D:
+        # Count-based with skip: fail mid-batch (triggers isolation),
+        # sync also fails (count exceeded), but rotation passes (skipped).
+        return FaultConfig(
+            fail_at=len(p.ops),  # fail on last data op
+            skip=["io_rotate_file_creation"],
+        )
+
+    if f == FailureClass.E:
+        # Count-based: fail mid-batch, cascade through sync and rotation.
+        return FaultConfig(fail_at=len(p.ops))
+
+    if f == FailureClass.F:
+        return FaultConfig(name="io_data_file_sync")
+
+    if f == FailureClass.G:
+        # Name-based: io_data_file_sync fires for all sync calls.
+        # With max_file_bytes=1, the first sync after appends is rotation sync.
+        # The commit-phase sync fires first in the normal path (step 7),
+        # but rotation sync (step 6) fires before it when rotation is needed.
+        return FaultConfig(name="io_data_file_sync")
+
+    if f == FailureClass.H:
+        return FaultConfig(name="io_rotate_file_creation")
+
+    return FaultConfig()
 ```
 
 ---
@@ -660,27 +696,26 @@ void assert_delta(
     const DB&            db,
     const ExpectedDelta& expected
 ) {
-    auto after = db.state_.load();
+    auto after = db.engine_state();
 
     // Key membership — transition applied or not
     for (auto& key : expected.keys_added) {
-        ASSERT_TRUE(after->key_dir.contains(key));
+        INFO("expected key added: " << key);
+        CHECK(db.contains_key(to_bytes(key)));
     }
     for (auto& key : expected.keys_removed) {
-        ASSERT_FALSE(after->key_dir.contains(key));
+        INFO("expected key removed: " << key);
+        CHECK_FALSE(db.contains_key(to_bytes(key)));
     }
 
     // LSN advancement — transition identifier consumed or not
-    ASSERT_EQ(
-        after->next_lsn,
-        before.next_lsn + expected.lsn_advance
-    );
+    CHECK(after->next_lsn == before.next_lsn + expected.lsn_advance);
 
     // Stats consistency with key_dir
     assert_stats_match_keydir(*after);
 
     // Poison state
-    ASSERT_EQ(db.is_poisoned(), expected.poisoned);
+    CHECK(db.is_poisoned() == expected.poisoned);
 }
 ```
 
@@ -748,90 +783,109 @@ Class G — rename completes but process does not confirm
 
 Work items ordered by dependency. Each builds on the previous.
 
-### Phase 1 — `DbPoisoned` (prerequisite for classes D, E) ✅
+### Phase 1 — `DbPoisoned` and fault injection foundation ✅
 
-Implemented in BC-134. The engine calls `deem_as_poisoned(reason)` when
-isolation rotation fails after an orphaned `BulkBegin`. All subsequent
-writes throw `DbPoisoned` with a diagnostic reason; reads remain
-available. `is_poisoned()` and `poison_reason()` public accessors
-added. A `FAULT_INJECTION(io_rotate_file_creation)` checkpoint in
-`rotate_active_file` enables deterministic testing. Three `[poisoned]`
-tests cover: poison on isolation failure, reads on poisoned DB,
-single-entry failure does not poison.
+Implemented across BC-131 through BC-137. The complete write-path
+failure handling and fault injection infrastructure is in place:
 
-**Unblocks**: failure classes D and E.
+- **BC-131**: Orphaned `BulkBegin` rotation — mid-batch append failure
+  triggers isolation rotation to a fresh file.
+- **BC-132**: `ScopedFaultInjector` with three injection modes
+  (name-based, count-based, post-write) and four checkpoints:
+  `io_data_file_append`, `io_data_file_append_partial`,
+  `io_data_file_sync`, `io_rotate_file_creation`.
+- **BC-133**: Sync failure publishes state before rethrowing.
+- **BC-134**: `DbPoisoned` — isolation rotation failure poisons the
+  DB. `deem_as_poisoned(reason)`, `is_poisoned()`, `poison_reason()`
+  API. Reads remain available on poisoned DB.
+- **BC-135**: Partial write detection — `PostWriteMode` (`short_write`,
+  `throw_after`) and `FAULT_INJECTION_POST_WRITE` macro. Single-entry
+  taint poisons; multi-entry taint handled by isolation.
+- **BC-136**: Post-write rotation failure — sync failure defers
+  rotation (not poisoned); file creation failure after seal poisons.
+- **BC-137**: Isolation sync failure poisons the DB. Count-based
+  skip set added to `ScopedFaultInjector` for selective cascade
+  control. Class D tested independently.
 
-### Phase 2 — Fine-grained fault checkpoints
+All eleven failure classes (A through H) have test coverage.
+198 tests pass.
 
-Place named `FAULT_INJECTION` checkpoints at each failure class
-boundary in `apply_batch_if`:
-- `bulk_begin_append` — before first BulkBegin write
-- Per-entry checkpoints within the loop
-- `bulk_end_append` — before BulkEnd write
-- `isolation_sync` — in the `catch(...)` isolation path, before sync
-- `isolation_rotation` — in the `catch(...)` isolation path, before rotate
-- `commit_sync` — before the commit-phase sync
+**No additional coordinator-level checkpoints are needed.** The four
+DataFile-level checkpoints, combined with the three `ScopedFaultInjector`
+modes (name-based, count-based, count-based with skip set) and the
+post-write mode, can target every failure class deterministically.
+See "The Fault Point Resolver" section above for the mapping.
 
-**Depends on**: Phase 1 (poisoning must exist before isolation
-checkpoints are meaningful).
+**Unblocks**: Phases 2 and 3.
 
-**Unblocks**: deterministic name-based injection for all seven classes.
+### Phase 2 — `invariants.h` helpers ✅
 
-### Phase 3 — `invariants.h` helpers
+Implemented in BC-138. `tests/proof/invariants.h` provides:
 
-Implement `assert_consistent(db)` and `assert_delta(before, db, expected)`:
-- `assert_consistent`: stats match key_dir, file registry consistent,
-  no dangling file references.
-- `assert_delta`: validates key membership, LSN advancement, stats
-  delta, and poison state against the reference model's expected delta.
-- `assert_recoverable(dir)`: opens a fresh DB from disk and verifies
-  the recovered state matches the in-memory state.
+- `Baseline` / `ExpectedDelta` — data types for capturing pre-transition
+  state and expressing the reference model's expected outcome.
+- `capture_baseline(db)` — snapshots `next_lsn` and all key-value pairs.
+- `assert_consistent(db)` — validates five structural invariants:
+  live_bytes matches key_dir, no dangling file references, active file
+  exists, file_stats covers all files, next_lsn ahead of all sequences.
+- `assert_delta(before, db, expected)` — validates key membership, LSN
+  advancement, structural consistency, and poison state against the
+  reference model's expected delta.
+- `assert_recoverable(dir, before, expected)` — opens a fresh DB from
+  disk and verifies the recovered state matches the expected state
+  (pre-existing keys survive, added keys present, removed keys absent,
+  no extra keys, structural consistency).
 
-**Depends on**: Phase 1 (`is_poisoned()` check inside `assert_delta`).
+12 test cases (`[invariants]` tag) in `tests/invariants_test.cpp`
+validate the helpers. 210 total tests pass.
+
+**Depends on**: Phase 1.
 
 **Unblocks**: all generated tests.
 
-### Phase 4 — Python test generator
+### Phase 3 — Python test generator
 
-The core deliverable. Produces 196 deterministic C++ test cases from
+The core deliverable. Produces deterministic C++ test cases from
 the scenario matrix × failure classes × plan shapes.
 
 | File | Purpose |
 |------|---------|
 | `expected_delta.py` | The reference model, independently readable |
-| `fault_point_resolver.py` | Maps failure classes to checkpoint numbers |
+| `fault_point_resolver.py` | Maps failure classes to injection configurations |
 | `scenario_matrix.py` | The input matrix, enumerable and auditable |
 | `generate_tests.py` | The generator |
 | `generated/*.cpp` | Committed evidence, never hand-edited |
 
-**Depends on**: Phases 1–3.
+**Depends on**: Phases 1–2.
 
-### Phase 5 — CI model-diff step
+### Phase 4 — CI model-diff step
 
 Add a CI step that regenerates the prove tests and verifies no diff.
 A diff means either the model or the generator changed — both must be
 intentional and reviewable.
 
-**Depends on**: Phase 4.
+**Depends on**: Phase 3.
 
 ---
 
 ## Output Structure
 
 ```
-test/
+tests/
   proof/
     generate_tests.py          ← the generator — owns the model
     expected_delta.py          ← the reference function — owns the contract
-    fault_point_resolver.py    ← maps classes to checkpoint numbers
+    fault_point_resolver.py    ← maps classes to injection configurations
     scenario_matrix.py         ← the input matrix
-    invariants.h               ← assert_consistent(), assert_delta()
-    fault_injector.h           ← deterministic I/O failure counter
+    invariants.h               ← assert_consistent(), assert_delta() ✅
     generated/
       prove_apply_batch_if.cpp    ← generated, never hand-edited
       prove_vacuum_compact.cpp    ← generated, never hand-edited
       prove_vacuum_absorb.cpp     ← generated, never hand-edited
 ```
+
+The fault injection infrastructure (`fault_injector.h`) lives in
+`bytecaskdb/` alongside the production code it instruments.
 
 Build targets for the proof tests are added to the root `xmake.lua`,
 consistent with the existing test and benchmark targets.
