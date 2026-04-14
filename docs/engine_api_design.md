@@ -37,8 +37,8 @@ ByteCaskDB follows a **single-writer / multiple-reader (SWMR)** model:
 - Multiple readers may operate concurrently, isolated from writes by a persistent snapshot of the key directory loaded via `state_.load()`.
 - `WriteOptions::try_lock` lets write callers opt into a non-blocking lock attempt that throws `std::system_error(errc::resource_unavailable_try_again)` instead of blocking.
 - `ReadOptions::staleness_tolerance` lets readers trade freshness for throughput: a non-zero tolerance allows reading from a snapshot that is at most that many milliseconds old (bounded staleness). The default (0) provides read-your-writes session consistency.
-- A `SyncGroup` batches concurrent `fdatasync` calls so one sync can cover multiple writers, reducing syscall overhead under concurrent write workloads.
-- MVCC and snapshot isolation are not supported.
+- When `sync` is requested, `fdatasync` completes before the new state becomes visible to readers (durability before visibility).
+- MVCC snapshot isolation is provided via `snapshot()` + `apply_batch_if()`.
 
 ### Data File Lifecycle
 
@@ -423,4 +423,4 @@ while (!stop_requested) {
 | D11 | **File naming**: `data_{YYYYMMDDHHmmssUUUUUU}` using microsecond precision. Gives lexicographic == chronological ordering and avoids the false precision of nanosecond timestamps whose sub-microsecond bits are often zero on Linux. |
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be silently discarded with a logged warning. No partial-batch entries enter the key directory. |
-| D14 | **`DB` is not movable**: Both move constructor and move assignment are deleted. `DB` owns a mutex by `unique_ptr` and a `SyncGroup` with an internal background thread; move semantics would leave the source in an indeterminate state. Use `DB::open` exclusively and store the result in place (e.g. in a `std::optional<DB>`). |
+| D14 | **`DB` is not movable**: Both move constructor and move assignment are deleted. `DB` owns a mutex by `unique_ptr` and a `BackgroundWorker` with an internal thread; move semantics would leave the source in an indeterminate state. Use `DB::open` exclusively and store the result in place (e.g. in a `std::optional<DB>`). |

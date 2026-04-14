@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <atomic>
+#ifdef BYTECASK_TESTING
+#include "fault_injector.h"
+#endif
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstddef>
@@ -67,6 +70,7 @@ struct TempDir {
 
   ~TempDir() { std::filesystem::remove_all(path); }
 };
+
 
 } // namespace
 
@@ -2415,9 +2419,9 @@ TEST_CASE("apply_batch_if succeeds with no conflict", "[apply_batch_if]") {
   db.put({}, to_bytes("k"), to_bytes("v0"));
 
   auto snap = db.snapshot();
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE(db.apply_batch_if({}, std::move(plan)));
 
   const auto result = get_val(db, to_bytes("k"));
   REQUIRE(result.has_value());
@@ -2434,9 +2438,9 @@ TEST_CASE("apply_batch_if returns false on modified key",
   auto snap = db.snapshot();
   db.put({}, to_bytes("k"), to_bytes("interleaved"));
 
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE_FALSE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // Conflict: key appeared after snapshot — returns false.
@@ -2448,9 +2452,9 @@ TEST_CASE("apply_batch_if returns false when key appeared",
   auto snap = db.snapshot(); // "k" absent at snapshot time
   db.put({}, to_bytes("k"), to_bytes("appeared"));
 
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE_FALSE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // Conflict: key deleted after snapshot — returns false.
@@ -2463,9 +2467,9 @@ TEST_CASE("apply_batch_if returns false when key deleted",
   auto snap = db.snapshot();
   (void)db.del({}, to_bytes("k"));
 
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE_FALSE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // No conflict on disjoint keys: concurrent write touches "a", plan writes "b".
@@ -2478,9 +2482,9 @@ TEST_CASE("apply_batch_if no conflict on disjoint keys", "[apply_batch_if]") {
   auto snap = db.snapshot();
   db.put({}, to_bytes("a"), to_bytes("concurrent"));
 
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("b"), to_bytes("v1"));
-  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE(db.apply_batch_if({}, std::move(plan)));
 
   const auto result = get_val(db, to_bytes("b"));
   REQUIRE(result.has_value());
@@ -2494,8 +2498,8 @@ TEST_CASE("apply_batch_if empty plan is a no-op", "[apply_batch_if]") {
   db.put({}, to_bytes("k"), to_bytes("v0"));
 
   auto snap = db.snapshot();
-  bytecask::WritePlan plan;
-  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+  bytecask::WritePlan plan{std::move(snap)};
+  REQUIRE(db.apply_batch_if({}, std::move(plan)));
 
   CHECK(to_string(*get_val(db, to_bytes("k"))) == "v0");
 }
@@ -2512,10 +2516,10 @@ TEST_CASE("apply_batch_if ensure_present passes when key exists",
   db.put({}, to_bytes("k"), to_bytes("v0"));
 
   auto snap = db.snapshot();
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_present(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE(db.apply_batch_if({}, std::move(plan)));
   CHECK(to_string(*get_val(db, to_bytes("k"))) == "v1");
 }
 
@@ -2526,10 +2530,10 @@ TEST_CASE("apply_batch_if ensure_present fails when key absent",
   auto db = bytecask::DB::open(td.path / "db");
 
   auto snap = db.snapshot();
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_present(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE_FALSE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // ensure_absent succeeds when key does not exist.
@@ -2539,10 +2543,10 @@ TEST_CASE("apply_batch_if ensure_absent passes when key absent",
   auto db = bytecask::DB::open(td.path / "db");
 
   auto snap = db.snapshot();
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_absent(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE(db.apply_batch_if({}, std::move(plan)));
   CHECK(to_string(*get_val(db, to_bytes("k"))) == "v1");
 }
 
@@ -2554,10 +2558,10 @@ TEST_CASE("apply_batch_if ensure_absent fails when key exists",
   db.put({}, to_bytes("k"), to_bytes("v0"));
 
   auto snap = db.snapshot();
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_absent(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE_FALSE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // ensure_unchanged succeeds when no concurrent writes.
@@ -2568,10 +2572,10 @@ TEST_CASE("apply_batch_if ensure_unchanged passes without modification",
   db.put({}, to_bytes("k"), to_bytes("v0"));
 
   auto snap = db.snapshot();
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE(db.apply_batch_if({}, std::move(plan)));
   CHECK(to_string(*get_val(db, to_bytes("k"))) == "v1");
 }
 
@@ -2585,10 +2589,10 @@ TEST_CASE("apply_batch_if ensure_unchanged fails on modification",
   auto snap = db.snapshot();
   db.put({}, to_bytes("k"), to_bytes("concurrent"));
 
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE_FALSE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // ensure_unchanged on absent key — passes when still absent.
@@ -2598,9 +2602,9 @@ TEST_CASE("apply_batch_if ensure_unchanged passes for absent key staying absent"
   auto db = bytecask::DB::open(td.path / "db");
 
   auto snap = db.snapshot();
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("nonexistent"));
-  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // ensure_unchanged on absent key — fails when key appeared.
@@ -2612,9 +2616,9 @@ TEST_CASE("apply_batch_if ensure_unchanged fails when absent key appeared",
   auto snap = db.snapshot();
   db.put({}, to_bytes("k"), to_bytes("appeared"));
 
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("k"));
-  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE_FALSE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // ensure_range_unchanged succeeds when no keys in range were modified.
@@ -2629,10 +2633,10 @@ TEST_CASE("apply_batch_if ensure_range_unchanged passes when range clean",
   // Modify a key outside the guarded range.
   db.put({}, to_bytes("a"), to_bytes("modified"));
 
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // ensure_range_unchanged fails when a key in range was modified.
@@ -2645,9 +2649,9 @@ TEST_CASE("apply_batch_if ensure_range_unchanged fails on in-range modification"
   auto snap = db.snapshot();
   db.put({}, to_bytes("b"), to_bytes("modified"));
 
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("a"), to_bytes("c"));
-  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE_FALSE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // ensure_range_unchanged fails when a key in range was inserted.
@@ -2659,9 +2663,9 @@ TEST_CASE("apply_batch_if ensure_range_unchanged fails on in-range insertion",
   auto snap = db.snapshot();
   db.put({}, to_bytes("b"), to_bytes("inserted"));
 
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("a"), to_bytes("c"));
-  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE_FALSE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // ensure_range_unchanged fails when a key in range was deleted.
@@ -2674,9 +2678,9 @@ TEST_CASE("apply_batch_if ensure_range_unchanged fails on in-range deletion",
   auto snap = db.snapshot();
   (void)db.del({}, to_bytes("b"));
 
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("a"), to_bytes("c"));
-  REQUIRE_FALSE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE_FALSE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // Guards-only plan with no writes — validates consistency without disk I/O.
@@ -2686,9 +2690,9 @@ TEST_CASE("apply_batch_if guards-only plan with no writes", "[apply_batch_if]") 
   db.put({}, to_bytes("k"), to_bytes("v0"));
 
   auto snap = db.snapshot();
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("k"));
-  REQUIRE(db.apply_batch_if(snap, {}, std::move(plan)));
+  REQUIRE(db.apply_batch_if({}, std::move(plan)));
 }
 
 // Contradictory guards throw std::logic_error at build time.
@@ -2718,9 +2722,9 @@ TEST_CASE("apply_batch_if single-op writes no markers", "[apply_batch_if]") {
 
   const auto batch_if_bytes = measure_total([](auto &db) {
     auto snap = db.snapshot();
-    bytecask::WritePlan plan;
+    bytecask::WritePlan plan{std::move(snap)};
     plan.put(to_bytes("k"), to_bytes("value"));
-    (void)db.apply_batch_if(snap, {}, std::move(plan));
+    (void)db.apply_batch_if({}, std::move(plan));
   });
 
   CHECK(batch_if_bytes == put_bytes);
@@ -2749,4 +2753,401 @@ TEST_CASE("apply_batch single-op writes no markers", "[apply_batch_if]") {
 
   CHECK(batch_bytes == put_bytes);
 }
+
+// ---------------------------------------------------------------------------
+// Fault injection tests — directly exercise the BC-131 and BC-133 paths.
+// ---------------------------------------------------------------------------
+
+// BC-131: If append() throws mid-batch after BulkBegin has been written, the
+// engine force-rotates to a fresh active file. Recovery then sees an orphaned
+// BulkBegin with no matching BulkEnd and discards the partial batch entries.
+TEST_CASE("mid-batch append failure rotates file and discards partial batch",
+          "[fault_inject]") {
+  TempDir td;
+
+  // A 2-op batch produces: BulkBegin(0), Put-a(1), Put-b(2), BulkEnd(3).
+  // Fail on append call index 2 (Put-b): BulkBegin and Put-a are orphaned in
+  // the active file with no matching BulkEnd.
+  //
+  // The count-based injector fires from checkpoint 3 onward, which also
+  // fails the isolation rotation (io_rotate_file_creation) — poisoning
+  // this DB instance. That's expected: we're testing that recovery
+  // handles the orphaned BulkBegin correctly regardless.
+  {
+    auto db = bytecask::DB::open(td.path / "db");
+    // Write a key before the failure so recovery has something to find.
+    db.put({.sync = false}, to_bytes("c"), to_bytes("v3"));
+
+    bytecask::testing::ScopedFaultInjector fi{3};
+    bytecask::Batch batch;
+    batch.put(to_bytes("a"), to_bytes("v1"));
+    batch.put(to_bytes("b"), to_bytes("v2"));
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(batch)),
+                      std::system_error);
+  } // db closes, fi resets
+
+  // Reopen: recovery must discard the orphaned batch and retain only "c".
+  {
+    auto db2 = bytecask::DB::open(td.path / "db");
+    CHECK_FALSE(get_val(db2, to_bytes("a")).has_value());
+    CHECK_FALSE(get_val(db2, to_bytes("b")).has_value());
+    const auto vc = get_val(db2, to_bytes("c"));
+    REQUIRE(vc.has_value());
+    CHECK(to_string(*vc) == "v3");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Poisoned DB tests — mechanism smoke tests not covered by [prove] matrix.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("reads work on a poisoned DB", "[poisoned]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // Pre-populate before poisoning.
+  db.put({.sync = false}, to_bytes("x"), to_bytes("val_x"));
+
+  // Poison the DB.
+  {
+    bytecask::testing::ScopedFaultInjector fi{2};
+    bytecask::Batch batch;
+    batch.put(to_bytes("a"), to_bytes("v1"));
+    batch.put(to_bytes("b"), to_bytes("v2"));
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(batch)),
+                      std::system_error);
+  }
+  REQUIRE(db.is_poisoned());
+
+  // get — returns pre-poison data.
+  const auto val = get_val(db, to_bytes("x"));
+  REQUIRE(val.has_value());
+  CHECK(to_string(*val) == "val_x");
+
+  // contains_key — pure in-memory.
+  CHECK(db.contains_key(to_bytes("x")));
+  CHECK_FALSE(db.contains_key(to_bytes("a")));
+
+  // snapshot — frozen read-only view.
+  auto snap = db.snapshot();
+  bytecask::Bytes snap_out;
+  CHECK(snap.get(to_bytes("x"), snap_out));
+
+  // iter_from — lazy value fetch.
+  auto range = db.iter_from({}, to_bytes("x"));
+  CHECK(range.begin() != std::default_sentinel);
+
+  // keys_from — pure in-memory walk.
+  auto keys = db.keys_from({}, to_bytes("x"));
+  CHECK(keys.begin() != std::default_sentinel);
+}
+
+// ---------------------------------------------------------------------------
+// validate_preconditions unit tests
+// ---------------------------------------------------------------------------
+// These test TransientEngineState::validate_preconditions in isolation —
+// no DB, no disk I/O. We construct EngineState directly, call .transient(),
+// and verify each guard path.
+
+namespace {
+
+// Builds a minimal EngineState with the given key→KeyDirEntry pairs.
+auto make_state(
+    std::initializer_list<std::pair<std::string, bytecask::KeyDirEntry>> entries)
+    -> std::shared_ptr<bytecask::EngineState> {
+  auto s = std::make_shared<bytecask::EngineState>();
+  s->files = std::make_shared<
+      std::map<std::uint32_t, std::shared_ptr<bytecask::DataFile>>>();
+  s->active_file_id = 1;
+  s->next_file_id = 2;
+  s->next_lsn = 100;
+  for (const auto &[k, v] : entries) {
+    s->key_dir = s->key_dir.set(to_bytes(k), v);
+  }
+  return s;
+}
+
+auto make_snapshot(
+    std::initializer_list<std::pair<std::string, bytecask::KeyDirEntry>> entries)
+    -> bytecask::Snapshot {
+  return bytecask::Snapshot::from_state(make_state(entries));
+}
+
+} // namespace
+
+// --- Point guards without snapshot ---
+
+TEST_CASE("validate_preconditions: MustExist passes when key present",
+          "[validate_preconditions]") {
+  auto state = make_state({{"k", {10, 1, 0, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan;
+  plan.ensure_present(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: MustExist fails when key absent",
+          "[validate_preconditions]") {
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::WritePlan plan;
+  plan.ensure_present(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: MustBeAbsent passes when key absent",
+          "[validate_preconditions]") {
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::WritePlan plan;
+  plan.ensure_absent(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: MustBeAbsent fails when key present",
+          "[validate_preconditions]") {
+  auto state = make_state({{"k", {10, 1, 0, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan;
+  plan.ensure_absent(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: None precondition always passes",
+          "[validate_preconditions]") {
+  auto state = make_state({{"k", {10, 1, 0, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(plan));
+}
+
+// --- MustBeUnchanged (requires snapshot) ---
+
+TEST_CASE("validate_preconditions: MustBeUnchanged passes when key unchanged",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
+  auto state = make_state({{"k", {10, 1, 0, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: MustBeUnchanged fails when key modified",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
+  auto state = make_state({{"k", {20, 1, 100, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: MustBeUnchanged fails when key deleted",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: MustBeUnchanged passes when key absent in both",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({});
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: MustBeUnchanged fails when key appeared",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({});
+  auto state = make_state({{"k", {15, 1, 0, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+// --- Range guards ---
+
+TEST_CASE("validate_preconditions: range guard passes when range unchanged",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"a", {5, 1, 0, 3}}, {"b", {10, 1, 0, 5}}, {"d", {15, 1, 0, 4}}});
+  auto state = make_state({{"a", {5, 1, 0, 3}}, {"b", {10, 1, 0, 5}}, {"d", {15, 1, 0, 4}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
+  plan.put(to_bytes("x"), to_bytes("new"));
+  CHECK(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: range guard fails when key modified in range",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"b", {10, 1, 0, 5}}});
+  auto state = make_state({{"b", {20, 1, 100, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
+  plan.put(to_bytes("x"), to_bytes("new"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: range guard fails when key inserted in range",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({});
+  auto state = make_state({{"c", {20, 1, 0, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
+  plan.put(to_bytes("x"), to_bytes("new"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: range guard fails when key deleted in range",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"c", {10, 1, 0, 5}}});
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
+  plan.put(to_bytes("x"), to_bytes("new"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: range guard ignores keys outside range",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"a", {5, 1, 0, 3}}, {"b", {10, 1, 0, 5}}});
+  auto state = make_state({{"a", {50, 1, 0, 3}}, {"b", {10, 1, 0, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
+  plan.put(to_bytes("x"), to_bytes("new"));
+  CHECK(t.validate_preconditions(plan));
+}
+
+// --- Implicit W-W conflict detection (snapshot present) ---
+
+TEST_CASE("validate_preconditions: W-W passes when write key unchanged",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
+  auto state = make_state({{"k", {10, 1, 0, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: W-W fails when write key modified",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
+  auto state = make_state({{"k", {20, 1, 100, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: W-W fails when write key appeared",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({});
+  auto state = make_state({{"k", {15, 1, 0, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: W-W fails when write key deleted",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: W-W passes for new key absent in both",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({});
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("new_key"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: W-W skips guard-only keys",
+          "[validate_preconditions]") {
+  // Key "g" is guard-only (ensure_present), "k" is the write.
+  // "g" was modified concurrently but W-W only checks write keys.
+  auto snap = make_snapshot({{"g", {10, 1, 0, 5}}, {"k", {10, 1, 0, 5}}});
+  auto state = make_state({{"g", {20, 1, 100, 3}}, {"k", {10, 1, 0, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_present(to_bytes("g"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(plan));
+}
+
+// --- Combined scenarios ---
+
+TEST_CASE("validate_preconditions: multiple guards all pass",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"a", {5, 1, 0, 3}}, {"b", {10, 1, 0, 5}}});
+  auto state = make_state({{"a", {5, 1, 0, 3}}, {"b", {10, 1, 0, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_present(to_bytes("a"));
+  plan.ensure_unchanged(to_bytes("b"));
+  plan.put(to_bytes("a"), to_bytes("new_a"));
+  CHECK(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: one failing guard rejects plan",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"a", {5, 1, 0, 3}}, {"b", {10, 1, 0, 5}}});
+  auto state = make_state({{"a", {5, 1, 0, 3}}, {"b", {20, 1, 100, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_present(to_bytes("a"));
+  plan.ensure_unchanged(to_bytes("b"));
+  plan.put(to_bytes("a"), to_bytes("new_a"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: del with snapshot triggers W-W check",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
+  auto state = make_state({{"k", {20, 1, 100, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.del(to_bytes("k"));
+  CHECK_FALSE(t.validate_preconditions(plan));
+}
+
+TEST_CASE("validate_preconditions: no snapshot skips W-W checks",
+          "[validate_preconditions]") {
+  auto state = make_state({{"k", {20, 1, 0, 5}}});
+  auto t = state->transient();
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(plan));
+}
+
 #endif

@@ -74,6 +74,9 @@ export inline constexpr auto entry_size(std::size_t key_size,
   return kHeaderSize + key_size + value_size + kCrcSize;
 }
 
+// Forward declaration — defined in bytecask.cppm (primary interface).
+export class TransientEngineState;
+
 // ---------------------------------------------------------------------------
 // EngineState — immutable snapshot of all mutable engine state.
 //
@@ -83,6 +86,7 @@ export inline constexpr auto entry_size(std::size_t key_size,
 export struct EngineState {
   PersistentRadixTree<KeyDirEntry> key_dir;
   FileRegistry files;
+  std::map<std::uint32_t, FileStats> file_stats;
   std::uint32_t active_file_id{};
   std::uint32_t next_file_id{};
   std::uint64_t next_lsn{1};
@@ -95,29 +99,21 @@ export struct EngineState {
     return *files->at(active_file_id);
   }
 
-  // Pure transition: insert or overwrite a key after the I/O has been done.
-  [[nodiscard]] auto apply_put(std::span<const std::byte> key,
-                               std::uint64_t offset,
-                               std::uint32_t value_size) const -> EngineState {
-    auto s = *this;
-    s.key_dir = s.key_dir.set(
-        key, KeyDirEntry{s.next_lsn, s.active_file_id, offset, value_size});
-    ++s.next_lsn;
-    return s;
-  }
+  // Creates a mutable working copy for the write path.
+  // Defined in bytecask.cpp (needs TransientEngineState's full definition).
+  [[nodiscard]] auto transient() const -> TransientEngineState;
+};
 
-  // Pure transition: remove a key.
-  [[nodiscard]] auto apply_del(std::span<const std::byte> key) const
-      -> EngineState {
-    auto s = *this;
-    ++s.next_lsn;
-    s.key_dir = s.key_dir.erase(key);
-    return s;
-  }
-
-  // Pure transition: seal the active file and open a new one.
-  [[nodiscard]] auto apply_rotation(const std::filesystem::path &dir) const
-      -> EngineState;  // defined in bytecask.cpp (needs make_data_file_stem)
+// ---------------------------------------------------------------------------
+// AppendEntry — one record to write to a DataFile.
+// Produced by TransientEngineState::prepare_write, consumed by the
+// coordinator's IO loop. Borrows key/value from the WritePlan.
+// ---------------------------------------------------------------------------
+export struct AppendEntry {
+  std::uint64_t sequence;
+  EntryType entry_type;
+  std::span<const std::byte> key;
+  std::span<const std::byte> value;
 };
 
 // ---------------------------------------------------------------------------

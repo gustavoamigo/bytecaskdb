@@ -95,159 +95,124 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
   ┌─────────────────────────────────────────────────────────────┐
   │  write_mu_      std::mutex (heap-allocated)                 │  ← writers only
   │                                                             │
-  │  file_stats_    map<uint32_t, FileStats>                    │  ← writers only (under write_mu_)
-  │                                                             │
   │  state_         atomic<shared_ptr<EngineState>>             │  ← writer stores,
   │                                                             │    readers load (no write_mu_)
   └─────────────────────────────────────────────────────────────┘
 
   EngineState  (heap, reference-counted, never mutated in place)
-  ┌─────────────────────────────────────────────────┐
-  │  key_dir        PersistentRadixTree<KeyDirEntry> │  key → (file_id, offset, seq)
-  │  files          shared_ptr<FileMap>              │  file_id → open DataFile fd
-  │  active_file_id uint32_t                         │
-  │  next_file_id   uint32_t                         │  writer-only; monotonic file counter
-  │  next_lsn       uint64_t                         │  writer-only; monotonic sequence counter
-  └─────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────┐
+  │  key_dir         PersistentRadixTree<KeyDirEntry> │  key → (file_id, offset, seq)
+  │  files           shared_ptr<FileMap>              │  file_id → open DataFile fd
+  │  file_stats      map<uint32_t, FileStats>         │  per-file live/total bytes
+  │  active_file_id  uint32_t                         │
+  │  next_file_id    uint32_t                         │  writer-only; monotonic file counter
+  │  next_lsn        uint64_t                         │  writer-only; monotonic sequence counter
+  └──────────────────────────────────────────────────┘
 ```
 
-`EngineState` bundles all mutable engine state into a single immutable value. Each write operation produces a new `EngineState` via pure transition methods (`apply_put`, `apply_del`, `apply_rotation`). The old state stays alive as long as any reader holds a `shared_ptr` reference — the writer always allocates a fresh state and never mutates one in place.
+`EngineState` bundles all engine state into a single immutable value. Writers never mutate an `EngineState` in place; they create a `TransientEngineState` working copy, apply mutations, and publish the result via `persistent()`. The old state stays alive as long as any reader holds a `shared_ptr` reference.
 
-`next_file_id` and `next_lsn` are writer-only fields (readers never inspect them), but including them in `EngineState` makes transitions self-contained: `apply_put` bumps `next_lsn` internally, `apply_rotation` bumps `next_file_id`, so the writer never manages loose counters.
+`file_stats` lives inside `EngineState` so that the transient/persistent discipline covers all mutable state uniformly. The map is shallow-copied into `TransientEngineState` on each write — acceptable because the number of open files is small (typically < 100).
 
-##### Write path
+##### Write path — single coordinator
+
+All writes (`put`, `del`, `apply_batch`, `apply_batch_if`) route through a single coordinator: `DB::apply_batch_if`. The public methods `put`, `del`, and `apply_batch` are thin wrappers that build a `WritePlan` and delegate.
 
 ```
   Writer thread
   ─────────────
   1. acquire write_mu_
-     └─ serialises concurrent writers; readers never touch this mutex
 
-  2. append entry to active DataFile   (I/O, under write_mu_)
+  2. create TransientEngineState from current EngineState
+     └─ TransientRadixTree + shallow copies of files, file_stats, scalars
 
-  3. produce new EngineState via pure transition (e.g. state.apply_put(...))
+  3. validate_preconditions(plan)
+     └─ point guards, range guards, W-W checks — pure reads on transient
 
-  4. state_.store( make_shared<EngineState>(new_state) )
-     └─ atomically publishes the new immutable snapshot;
-        any subsequent state_.load() on any thread is
-        guaranteed to observe this or a later value
+  4. prepare_write(plan) → vector<AppendEntry>
+     └─ assigns LSNs, inserts BulkBegin/End markers — pure computation
 
-  5. release write_mu_
+  5. IO loop: for each AppendEntry, file.append(...)
+     └─ collects offsets; on mid-batch failure, rotate to isolate
+        orphaned BulkBegin (see "Rotate on batch failure")
 
-  6. sync_group_.sync(file)   ← group commit; see below
+  6. apply_writes(plan, io_result)
+     └─ updates key_dir, file_stats, LSN — pure in-memory mutations
+
+  7. if rotation needed:
+     a. sync + seal active file                (IO)
+     b. dispatch hint file write to background
+     c. open new DataFile                      (IO)
+     d. apply_rotate_file(new_file)            (state)
+
+  8. if opts.sync: active_file.sync()
+     └─ on failure, publish state before rethrow
+        (see "Sync failure: publish before rethrow")
+
+  9. state_.store(persistent())
+     └─ atomically publishes new immutable snapshot
+
+  10. release write_mu_
 ```
 
-##### Group commit (`SyncGroup`)
+##### TransientEngineState
 
-After releasing `write_mu_`, the writer calls `sync_group_.sync(file)` instead
-of `file->sync()` directly. `SyncGroup` uses a ticket-based protocol to batch
-concurrent `fdatasync` calls:
+`TransientEngineState` is the mutable working copy for all write-path state transitions. It follows the same `transient()` / `persistent()` pattern as `PersistentRadixTree` / `TransientRadixTree`.
 
-1. **Phase 1 — Take a ticket.**  The writer increments a monotonic counter
-   (`next_ticket_`) under the SyncGroup mutex, registering that its `writev`
-   has completed and its data is in the page cache.
+The coordinator (step 5 above) only performs IO. It never touches `key_dir`, `file_stats`, or LSN directly. The transient owns all state logic:
 
-2. **Phase 2 — Wait or lead.**  The writer waits until either
-   (a) `current_synced_ticket_ >= my_ticket` — a later sync already covered
-   its data, so it returns immediately; or
-   (b) `!syncing_` — no `fdatasync` is in flight, so it becomes the leader.
+- `validate_preconditions(plan)` — reads snapshot + current state, returns bool
+- `prepare_write(plan)` — assigns LSNs, returns `vector<AppendEntry>` for the IO loop
+- `apply_writes(plan, io_result)` — updates key_dir, file_stats, advances LSN
+- `apply_rotate_file(new_file)` — registers new file, updates active_file_id
+- `apply_vacuum(old_file_id, scan, new_file)` — remaps keys, updates registry + stats
+- `persistent() &&` — produces `shared_ptr<EngineState>` for publishing
 
-3. **Phase 3 — Sync.**  The leader snapshots `next_ticket_ - 1` as the batch
-   watermark, releases the lock, and calls `fdatasync` (wrapped in a try/catch
-   block to gracefully handle I/O exceptions by waking waiters before throwing).
-   Every ticket issued up to that watermark has a completed `writev`, so one syscall
-   covers them all. On return the leader advances `current_synced_ticket_` and
-   wakes all waiters.
+**Two-phase discipline**: IO happens first (steps 4-5), then pure state mutations (step 6). If IO throws, the transient is untouched — no partial state to unwind.
 
-**Invariant**: a writer's data is never assumed durable until an `fdatasync`
-that started *after* the writer's `writev` has completed. Writers can never
-piggyback on an in-flight sync that may have started before their data reached
-the page cache.
+##### Rotate on batch failure
 
-This amortises the ~2 ms `fdatasync` cost across N concurrent writers instead
-of serialising N × 2 ms.
+If `append()` throws mid-batch after `BulkBegin` has been written, the active file contains an orphaned `BulkBegin` with no matching `BulkEnd`. Without intervention, subsequent writes to the same file extend the region that `flush_hints_for` (and `vacuum_scan_and_copy`) treat as part of the incomplete batch — those entries would be silently discarded on recovery.
 
-**Historical note**: BC-051 removed an earlier `GroupWriter` implementation
-because benchmarks showed no benefit. Those benchmarks ran on tmpfs where
-`fdatasync` is a no-op (~0 ns). Re-benchmarking on a real block device
-(ext4 on NVMe) confirmed that `fdatasync` costs ~2 ms and serialised syncs are
-the dominant bottleneck for concurrent writes.
+The fix: the IO loop (step 5) is wrapped in `try/catch`. When the batch is multi-entry and IO fails, the catch block attempts to sync the tainted file and rotate to a fresh active file. If the isolation sync fails, the orphaned batch markers may not be durable — a crash could leave an unresolvable `BulkBegin` — so the engine is poisoned immediately instead of proceeding. If sync succeeds but the isolation rotation fails, the engine is also poisoned (see below). When isolation succeeds, the rotated state is published immediately so subsequent writes go to the clean file, and the exception is rethrown to the caller.
 
-##### Visibility before durability
+##### Poisoned state (`DbPoisoned`)
 
-Because `state_.store()` (which makes a write visible to readers) happens
-**inside** `write_mu_` before `sync_group_.sync()` (which calls `fdatasync`)
-**outside** it, there is a brief window between when a write becomes readable
-and when it is guaranteed to be on disk.
+If the isolation sync or rotation after an orphaned `BulkBegin` fails (e.g. `fdatasync` error on the tainted file, or filesystem error creating the new data file), the active file may retain the orphaned marker in a non-durable state. Any subsequent write to that file would appear to succeed in-process but be silently discarded by recovery — a consistency divergence between in-memory and on-disk state.
+
+When this happens, the engine calls `deem_as_poisoned(reason)` with a diagnostic string identifying the failed file, then rethrows the original exception. From that point:
+
+- **Writes blocked**: `put`, `del`, `apply_batch`, `apply_batch_if`, and `vacuum` throw `DbPoisoned` immediately. The reason string is available via `poison_reason()`.
+- **Reads available**: `get`, `contains_key`, `snapshot`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from` continue to work. The in-memory state was correctly rolled back (the transient was never persisted), so reads reflect the last successfully committed state.
+- **Recovery required**: the poisoned flag is in-memory only. Restarting the process runs recovery, which discards the orphaned `BulkBegin` and its trailing entries, restoring a clean state.
+
+Implementation: `poisoned_` is an `atomic<bool>` (release on write, acquire on read). The non-atomic `poison_reason_` string is safely published via the release/acquire pair — the string is written before `poisoned_.store(true, release)` and read after `poisoned_.load(acquire)`.
+
+##### Partial write detection (tainted file)
+
+If `writev` returns a short write (0 < written < total), `DataFile::append()` sets a `tainted_` flag before throwing. A tainted file has bytes on disk that `offset_` does not account for. The file is opened with `O_APPEND`, so the next `writev` would write at the kernel's true EOF (past the partial data), but `offset_` would still point to the old position — the offset returned by subsequent appends would be wrong.
+
+For multi-entry batches this is safe: the isolation rotation moves to a new file, abandoning the tainted one. For single-entry writes, the `apply_batch_if` catch block checks `file.is_tainted()` and poisons the DB if set. Recovery (process restart) discards the partial entry via CRC mismatch and restores a clean state.
+
+##### Post-write rotation failure
+
+After all appends succeed and mutations are applied, the engine may rotate the active file if it exceeds the size threshold. Rotation syncs the file, seals it, and creates a new active file. Two distinct failures can occur:
+
+- **Sync fails before seal**: the file is not sealed. The engine captures the exception, publishes the new state (writes are on disk, LSNs must advance), and rethrows. The DB is not poisoned — the next write retries rotation or continues appending.
+- **File creation fails after seal**: `rotate_active_file` calls `seal()` before creating the new file. If creation fails, the active file is sealed and cannot accept further appends. The engine poisons the DB and publishes state. Recovery creates a fresh active file.
+
+##### Sync failure: publish before rethrow
+
+If `fdatasync` fails (step 8), the writes are in the page cache but not guaranteed durable. The state is published to `state_.store()` before rethrowing the sync exception. This preserves in-process consistency: LSNs advance, the key directory reflects the writes, and the next write builds on the correct state. Without this, the old state would be reused, causing duplicate LSNs and data corruption on the next write. Sync failure affects crash safety (durability), not process correctness. The long-term fix is BC-090 (poisoned-DB flag on sync failure).
+
+##### Durability before visibility
+
+`state_.store()` happens **after** `fdatasync` (when sync is requested or rotation occurred). A write is never visible to readers until it is durable on disk.
 
 Consequences:
-- A reader can observe a value that would be lost in a crash-before-fsync.
-- After recovery, the in-memory state is consistent with what is on disk — the
-  lost write simply never reappears. The database itself is always internally
-  consistent.
-- The window exists only under `sync = true` writes; `sync = false` writes
-  have no durability guarantee at all.
-
-This is a deliberate trade-off, not an oversight. Moving `state_.store()`
-to after the `fdatasync` would close the window but would also force each
-write to hold `write_mu_` across the entire blocking syscall, serialising all
-concurrent writers and eliminating the SyncGroup group-commit benefit entirely.
-
-The only scenario where this matters in practice is when an external system
-reads a value from ByteCaskDB, acts on it irreversibly outside the database
-(e.g., charges a card, writes to a second store), and the process crashes
-before the fsync completes. This is a cross-system consistency problem that no
-embedded store can fully solve without two-phase commit across system
-boundaries.
-
-**Comparison with other stores**: PostgreSQL and SQLite WAL couple visibility
-to durability (readers block until the WAL fsync completes). Redis and Cassandra
-in async mode have the same window as ByteCaskDB and document it explicitly.
-RocksDB with `sync=true` fsyncs the WAL before returning to the caller,
-closing the window but serialising syncs.
-
-A future `WriteOptions::sync_before_visible` flag could close the window for
-callers that require it (see BC-125 in the backlog).
-
-##### Future evolution: `SyncGroup::change_state` (BC-126)
-
-The current write path scatters the three-phase protocol (acquire lock →
-`writev` + `state_.store` → release lock → `fdatasync`) across `put`, `del`,
-`commit_batch`, and `apply_batch_if`. This makes it easy to accidentally
-skip a phase or mis-sequence them in future call sites.
-
-A cleaner future design would centralise the entire protocol inside `SyncGroup`
-via a `change_state` interface:
-
-```cpp
-sync_group_.change_state([&] {
-    // Under write_mu_: append to page cache + update key directory
-    s.active_file().append(...);
-    state_.store(make_shared<EngineState>(std::move(s)));
-});
-// SyncGroup owns: acquire lock → run lambda → (release lock / fdatasync)
-// in the order determined by the durability policy.
-```
-
-`SyncGroup` would:
-1. Acquire `write_mu_`.
-2. Run the caller's lambda (writev + `state_.store`).
-3. Execute the fsync phase according to a construction-time `DurabilityPolicy`:
-   - `VisibleBeforeDurable` (current behaviour): release lock, then
-     `fdatasync` outside it via the ticket protocol.
-   - `DurableBeforeVisible`: `fdatasync` inside the lock before
-     `state_.store`, then release — closes the visibility window at the
-     cost of serialising concurrent writers.
-
-The policy should be a `DB::Options` field set at `open` time, not a
-per-call flag. Mixing policies on the same `SyncGroup` creates ambiguous
-ordering when a durable-before-visible write arrives while a
-visible-before-durable batch is in-flight. A single construction-time
-decision eliminates that class of problem entirely.
-
-The ticket-based phase structure of `SyncGroup` remains unchanged; only
-where `state_.store` fires relative to the ticket phases shifts. The
-refactor is ~50 lines plus a new `Options::durability_mode` field.
+- `write_mu_` is held across the entire write including `fdatasync`. Concurrent writers are serialised.
+- `sync = false` writes still have no durability guarantee, but visibility is immediate after the write completes under the lock.
+- After recovery, in-memory state is consistent with what is on disk.
 
 ##### Read path (no lock, no mutex)
 
@@ -441,16 +406,18 @@ struct FileStats {
 };
 ```
 
-`file_stats_` is a `std::map<uint32_t, FileStats>` member of `Bytecask` (not inside `EngineState`). It is updated under `write_mu_` on every write operation. Keeping it outside `EngineState` avoids an O(files) map copy on every write — `EngineState` is an immutable snapshot published via `atomic<shared_ptr>`, so embedding a `std::map` in it would force a deep copy on every transition.
+`file_stats` is a `std::map<uint32_t, FileStats>` inside `EngineState`. It is copied into `TransientEngineState` on each write and updated as part of the state transition. This keeps all mutable state under the transient/persistent discipline.
 
 The helper `entry_size(key_size, value_size)` returns `kHeaderSize + key_size + value_size + kCrcSize` and is used everywhere stats are updated.
 
 ##### Write-path updates
 
-- **On `put(key, value)`**: if the key already exists (overwrite), subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats_[old_entry.file_id].live_bytes`. Add `entry_size(key.size(), value.size())` to `file_stats_[active_file_id].live_bytes` and to `.total_bytes`.
-- **On `del(key)`**: if the key exists, subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats_[old_entry.file_id].live_bytes`. Add the tombstone size (`kHeaderSize + key.size() + kCrcSize`) to `file_stats_[active_file_id].total_bytes`. The tombstone is never added to `live_bytes` — tombstones are never referenced by the key directory.
-- **On `apply_batch`**: same per-operation logic as `put`/`del`. BulkBegin and BulkEnd markers each add `kHeaderSize + kCrcSize` to the active file's `total_bytes` only — they are never referenced by the key directory.
-- **On rotation**: the active file's stats are already accurate. Insert `FileStats{0, 0}` for the new active file.
+All stats updates happen inside `TransientEngineState::apply_writes`:
+
+- **On Put**: if the key already exists (overwrite), subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats[old_entry.file_id].live_bytes`. Add `entry_size(key.size(), value.size())` to `file_stats[active_file_id].live_bytes` and to `.total_bytes`.
+- **On Del**: if the key exists, subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats[old_entry.file_id].live_bytes`. Add the tombstone size (`kHeaderSize + key.size() + kCrcSize`) to `file_stats[active_file_id].total_bytes`. The tombstone is never added to `live_bytes` — tombstones are never referenced by the key directory.
+- **BulkBegin/BulkEnd markers**: each add `kHeaderSize + kCrcSize` to the active file's `total_bytes` only — they are never referenced by the key directory.
+- **On rotation**: `apply_rotate_file` inserts `FileStats{0, 0}` for the new active file.
 
 At vacuum time fragmentation is an O(1) integer division per file — no scanning, no I/O, no additional lock contention.
 
@@ -458,7 +425,7 @@ The active file's `live_bytes` may be non-zero (it holds the current live writes
 
 ##### Recovery stats reconstruction
 
-`file_stats_` must be rebuilt on startup. Both `total_bytes` and `live_bytes` are reconstructed without scanning data files or traversing the key directory:
+`file_stats` must be rebuilt on startup. Both `total_bytes` and `live_bytes` are reconstructed without scanning data files or traversing the key directory:
 
 - **`total_bytes`**: computed via `std::filesystem::file_size(path)` per sealed file in `open_and_prepare_files()`. Exact for append-only files. O(1) per file, no I/O beyond a `stat` call.
 - **`live_bytes`**: reconstructed as a side-effect of the existing hint-file recovery pass. The hint entry carries `key_size` (from `key.size()`) and `value_size`, so `entry_size(key_size, value_size)` is computable without touching the data file.
@@ -1220,6 +1187,42 @@ After `rotate_active_file()` seals a data file, it captures a `shared_ptr<DataFi
 The synchronous path in `flush_hints(EngineState&)` (called by the public `flush_hints()` method) reuses the same `flush_hints_for` helper, guaranteeing consistent hint-writing behaviour between the background and synchronous paths.
 
 The `~DB()` destructor seals the active file, then calls `flush_hints()` which drains the background worker and writes hint files for all sealed files. This guarantees that after a clean shutdown every data file has a companion `.hint` — the next `DB::open()` recovers purely from hint files with no raw `.data` scanning. `flush_hints()` is a private method; callers rely on the destructor for clean shutdown.
+
+---
+
+## Fault Injection Test Seam
+
+To directly test correctness paths that only activate on IO failures (BC-131, BC-133), `bytecask.data_file` exposes a thread-local fault injection API compiled exclusively when `BYTECASK_TESTING` is defined.
+
+### API
+
+```cpp
+// Fail the Nth next append() call. n=0 fails immediately; n=1 lets one through, etc.
+void fault_inject_nth_append(int n) noexcept;
+
+// Fail the Nth next sync() call. n=0 fails immediately.
+void fault_inject_nth_sync(int n) noexcept;
+
+// Reset all fault state to disabled. Call after each test (or use FaultGuard).
+void fault_inject_reset() noexcept;
+```
+
+Fault state is per-thread (`thread_local FaultHooks`), so tests on different threads don't interfere. Both functions throw `std::system_error(EINVAL)` when the countdown reaches zero, identical in type to a real IO failure.
+
+### Intended use
+
+The `FaultGuard` RAII helper in `bytecask_test.cpp` calls `fault_inject_reset()` on destruction, so the fault state is always cleared even when a test assertion fails.
+
+Tests enabled by this seam:
+- **`[fault_inject]` mid-batch append failure** (BC-131): confirms that a failed append after `BulkBegin` triggers rotation and that the orphaned batch is discarded by recovery.
+- **`[fault_inject]` sync failure publish** (BC-133): confirms that state is published before the sync exception is rethrown, keeping in-process LSNs consistent.
+
+### Design notes
+
+The seam is intentionally minimal:
+- Zero production overhead: the `#ifdef BYTECASK_TESTING` blocks compile away entirely in non-test builds.
+- Thread-local (not global) state: each thread has an independent countdown, avoiding cross-test interference in multi-threaded test runners.
+- No virtual dispatch, no interface changes: `DataFile` remains a concrete class.
 
 ---
 
