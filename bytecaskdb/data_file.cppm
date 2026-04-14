@@ -6,6 +6,9 @@
 module;
 #include <array>
 #include <cassert>
+#ifdef BYTECASK_TESTING
+#include "fault_injector.h"
+#endif
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -77,7 +80,7 @@ public:
   //   DataFile b = std::move(a);     // b: fd=5, a: fd=-1 (harmless destructor)
   DataFile(DataFile &&other) noexcept
       : path_{std::move(other.path_)}, fd_{other.fd_}, offset_{other.offset_},
-        sealed_{other.sealed_} {
+        sealed_{other.sealed_}, tainted_{other.tainted_} {
     other.fd_ = -1;
   }
 
@@ -96,6 +99,7 @@ public:
       fd_ = other.fd_;
       offset_ = other.offset_;
       sealed_ = other.sealed_;
+      tainted_ = other.tainted_;
       other.fd_ = -1;
     }
     return *this;
@@ -108,6 +112,9 @@ public:
   [[nodiscard]] auto append(std::uint64_t sequence, EntryType entry_type,
                             std::span<const std::byte> key,
                             std::span<const std::byte> value) -> Offset {
+#ifdef BYTECASK_TESTING
+    FAULT_INJECTION(io_data_file_append);
+#endif
     assert(!sealed_);
     const auto entry_offset = offset_;
 
@@ -122,7 +129,17 @@ public:
     }};
     const auto total = kHeaderSize + key.size() + value.size() + kCrcSize;
     const auto written = ::writev(fd_, iov.data(), std::ssize(iov));
+#ifdef BYTECASK_TESTING
+    // Post-write injection simulates partial or full writes followed by
+    // failure. In both cases, bytes are on disk that offset_ will not
+    // account for — the file is tainted before the checkpoint throws.
+    tainted_ = true;
+    FAULT_INJECTION_POST_WRITE(io_data_file_append_partial,
+                               fd_, entry_offset, total);
+    tainted_ = false;
+#endif
     if (written != narrow<ssize_t>(total)) {
+      if (written > 0) tainted_ = true;
       throw std::system_error{errno, std::generic_category(),
                               "DataFile::append: writev failed"};
     }
@@ -201,6 +218,9 @@ public:
   // Flushes all pending writes to physical storage via fdatasync.
   // Call after one or more append()s to guarantee crash-safety (Group Commit).
   void sync() {
+#ifdef BYTECASK_TESTING
+    FAULT_INJECTION(io_data_file_sync);
+#endif
     if (::fdatasync(fd_) != 0) {
       throw std::system_error{errno, std::generic_category(),
                               "DataFile::sync: fdatasync failed"};
@@ -218,11 +238,17 @@ public:
     return path_;
   }
 
+  // Returns true if a partial write was detected on this file. A tainted
+  // file has bytes on disk that offset_ does not account for — subsequent
+  // writes would land at incorrect offsets.
+  [[nodiscard]] auto is_tainted() const noexcept -> bool { return tainted_; }
+
 private:
   std::filesystem::path path_;
   int fd_{-1};
   Offset offset_{0};
   bool sealed_{false};
+  bool tainted_{false};
   // Fixed buffer holding the 15-byte header and 4-byte CRC for each append.
   // Avoids heap allocation on the hot write path.
   std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};

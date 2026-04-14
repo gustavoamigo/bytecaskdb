@@ -6,7 +6,6 @@
 module;
 #include <condition_variable>
 #include <cstddef>
-#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -16,70 +15,6 @@ module;
 export module bytecask.concurrency;
 
 namespace bytecask {
-
-// ---------------------------------------------------------------------------
-// SyncGroup — amortises fdatasync across concurrent writers.
-//
-// fdatasync is expensive (~2 ms). When N writers finish their writev at
-// roughly the same time, one fdatasync can cover all of them. SyncGroup
-// batches those writers so only one actually calls the sync callable
-// while the rest wait and piggyback on its result.
-//
-// Precondition: callers must have completed their writev before entering
-// sync(). The callable flushes data already in the page cache.
-//
-// Invariant: sync() does not return to a caller until a sync that started
-// *after* that caller's writev has completed successfully.
-// ---------------------------------------------------------------------------
-export class SyncGroup {
-public:
-  // Amortises a sync operation across concurrent callers. do_sync() is called
-  // by exactly one leader per batch; all others piggyback on its result.
-  void sync(std::invocable auto do_sync) {
-    std::unique_lock<std::mutex> lk{mu_};
-
-    // Phase 1: take a ticket — our writev is done, data is in page cache.
-    const auto my_ticket = next_ticket_++;
-
-    // Phase 2: wait until covered by a completed sync, or become leader.
-    cv_.wait(lk, [&] {
-      return current_synced_ticket_ >= my_ticket || !syncing_;
-    });
-
-    // A sync that started after our writev already covered us.
-    if (current_synced_ticket_ >= my_ticket) return;
-
-    // Phase 3: we are the leader — snapshot the watermark, sync, notify.
-    syncing_ = true;
-    const auto batch_end = next_ticket_ - 1;
-    lk.unlock();
-
-    try {
-      do_sync();
-    } catch (...) {
-      // If sync fails, reset the syncing flag and wake up waiters so they can
-      // retry (or handle their own failure). Do not advance the synced ticket.
-      lk.lock();
-      syncing_ = false;
-      lk.unlock();
-      cv_.notify_all();
-      throw;
-    }
-
-    lk.lock();
-    current_synced_ticket_ = batch_end;
-    syncing_ = false;
-    lk.unlock();
-    cv_.notify_all();
-  }
-
-private:
-  std::mutex mu_;
-  std::condition_variable cv_;
-  std::uint64_t next_ticket_{1};           // next ticket to hand out
-  std::uint64_t current_synced_ticket_{0}; // highest ticket on disk
-  bool syncing_{false};                    // is a sync in flight?
-};
 
 // ---------------------------------------------------------------------------
 // BackgroundWorker — single persistent background thread for deferred work.

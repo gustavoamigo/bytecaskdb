@@ -1014,6 +1014,13 @@ public:
     return PersistentRadixTree<V>{std::move(root_), size_};
   }
 
+  // Iteration support for range scans on the transient tree.
+  // Shares the same internal structure as PersistentRadixTree.
+  [[nodiscard]] auto lower_bound(std::span<const std::byte> key) const
+      -> RadixTreeIterator<V> {
+    return RadixTreeIterator<V>{root_, key};
+  }
+
 private:
   IntrusivePtr<Node<V>> root_;
   std::size_t size_{0};
@@ -1590,6 +1597,7 @@ private:
   }
 
   friend class PersistentRadixTree<V>;
+  friend class TransientRadixTree<V>;
 };
 
 // Out-of-line: PersistentRadixTree::begin()
