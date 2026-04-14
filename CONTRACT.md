@@ -69,8 +69,9 @@ be invalidated.
 If any I/O operation (append, sync) throws during execution:
 
 - The caller must receive the exception.
-- The published in-memory state must reflect zero operations from this
-  call.
+- The published key directory must reflect zero operations from this call.
+  `next_lsn` must be advanced past all LSNs consumed by appends that reached
+  the file, to prevent reuse of those sequence numbers on the next write.
 - The disk may contain none, some, or all of the bytes from this
   write. The engine must not assume what was written. The engine must
   guarantee that a valid entry is subsequently written so recovery
@@ -161,10 +162,14 @@ on disk but not reflected in the published counter.
   must always be greater than any sequence number that exists on disk.
   A future write must never reuse an LSN already present on disk.
 
-- **next_lsn advances only on successful commit.** If a write fails
-  before state is published, the published counter must be unchanged.
-  LSNs consumed by the failed write become permanent gaps. Gaps are
-  safe. Reuse is not.
+- **next_lsn advances past all consumed LSNs.** If an append fails
+  before any bytes reach disk (classes B1, A), `next_lsn` is unchanged —
+  no bytes were written. If an append reaches disk but the subsequent
+  `fdatasync` fails (classes F and G), `next_lsn` must be advanced past
+  all consumed LSNs. The bytes are in the page cache; reusing those LSNs
+  on the next write would create ambiguous sequence numbers for the same
+  key. Key-directory changes are not published in these cases — the write
+  is not visible to callers. Gaps are safe. Reuse is not.
 
 - **Recovery produces the same next_lsn as a clean run.** Given the
   same committed writes, opening a fresh DB from disk must produce

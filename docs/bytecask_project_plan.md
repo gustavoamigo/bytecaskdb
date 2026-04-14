@@ -17,6 +17,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | --- | --- | --- |
 | BC-102 | File format reference document | Created `docs/file_format.md` with full layout spec for `.data` and `.hint` files; added to README documentation table. |
 | BC-110 | MariaDB storage engine integration — design | Design doc (`docs/mariadb_engine_design.md`) and phased plan for `ha_bytecask` plugin. Branch: `feature/mariadb-engine`. |
+| BC-155 | Gate visibility behind `fdatasync` on F/G failures | Key changes no longer published on sync failure (classes F and G). Only `next_lsn` advances to prevent LSN reuse. Aligns ByteCaskDB with all five peers. `[f_visibility]`/`[g_visibility]` tests added; 172 proof tests updated. |
 ## Backlog
 
 ### MariaDB Engine Integration
@@ -37,7 +38,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-078 | Published library module boundary | Decision: use Path A — keep sub-components (radix_tree, data_file, hint_file, etc.) as top-level modules for isolated testing; enforce public boundary at install time by only shipping the bytecask.engine BMI. Revisit Path B (full-partition restructure) if airtight compiler-enforced encapsulation is needed. |
 | BC-041 | `ReadOptions::verify_checksums` flag | Allow skipping CRC verification on bulk scans for ~5% win. Mirrors LevelDB/RocksDB `verify_checksums` option. |
-| BC-090 | Error handling | Review Error handling, we haven't reviewed this part. BC-134 implemented DbPoisoned for isolation rotation failures; BC-137 added poisoning on isolation sync failure; commit-sync-failure poisoning is still open. |
+| BC-090 | Error handling | Review Error handling, we haven't reviewed this part. BC-134 implemented DbPoisoned for isolation rotation failures; BC-137 added poisoning on isolation sync failure; BC-155 closed the F/G visibility gap (key changes no longer published on sync failure). |
 | BC-091 | Logging | Logging? (what other projects use) |
 | BC-092 | UUIDv4 test | Test and protections if customers use UUIDv4 as key (Maybe we will need a Adaptive Radix Tree extension) |
 | BC-093 | Vacuum benchmarks | Add benchmark tests for the vacuum (with performance and data file reclaim tests) |

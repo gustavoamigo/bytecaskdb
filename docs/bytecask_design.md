@@ -198,16 +198,22 @@ For multi-entry batches this is safe: the isolation rotation moves to a new file
 
 After all appends succeed and mutations are applied, the engine may rotate the active file if it exceeds the size threshold. Rotation syncs the file, seals it, and creates a new active file. Two distinct failures can occur:
 
-- **Sync fails before seal**: the file is not sealed. The engine captures the exception, publishes the new state (writes are on disk, LSNs must advance), and rethrows. The DB is not poisoned — the next write retries rotation or continues appending.
+- **Sync fails before seal**: the file is not sealed. The engine captures the exception, advances `next_lsn` past consumed LSNs, and rethrows without publishing key changes. The DB is not poisoned — the next write retries rotation or continues appending.
 - **File creation fails after seal**: `rotate_active_file` calls `seal()` before creating the new file. If creation fails, the active file is sealed and cannot accept further appends. The engine poisons the DB and publishes state. Recovery creates a fresh active file.
 
-##### Sync failure: publish before rethrow
+##### Sync failure: advance LSN, discard key changes
 
-If `fdatasync` fails (step 8), the writes are in the page cache but not guaranteed durable. The state is published to `state_.store()` before rethrowing the sync exception. This preserves in-process consistency: LSNs advance, the key directory reflects the writes, and the next write builds on the correct state. Without this, the old state would be reused, causing duplicate LSNs and data corruption on the next write. Sync failure affects crash safety (durability), not process correctness. The long-term fix is BC-090 (poisoned-DB flag on sync failure).
+If `fdatasync` fails (step 8 or the rotation sync at step 7a), the write is not
+confirmed durable. Key-directory changes are not published — the written key is not
+visible to callers. `next_lsn` is advanced past the consumed sequence numbers to
+prevent LSN reuse for bytes now in the page cache. The caller receives the
+exception and must retry. This matches the contract of every other peer engine.
 
 ##### Durability before visibility
 
-`state_.store()` happens **after** `fdatasync` (when sync is requested or rotation occurred). A write is never visible to readers until it is durable on disk.
+`state_.store()` happens **after** `fdatasync` in all cases. A write is never
+visible to readers until it is durable on disk (or explicitly chosen as
+`sync=false` by the caller).
 
 Consequences:
 - `write_mu_` is held across the entire write including `fdatasync`. Concurrent writers are serialised.
@@ -1215,7 +1221,7 @@ The `FaultGuard` RAII helper in `bytecask_test.cpp` calls `fault_inject_reset()`
 
 Tests enabled by this seam:
 - **`[fault_inject]` mid-batch append failure** (BC-131): confirms that a failed append after `BulkBegin` triggers rotation and that the orphaned batch is discarded by recovery.
-- **`[fault_inject]` sync failure publish** (BC-133): confirms that state is published before the sync exception is rethrown, keeping in-process LSNs consistent.
+- **`[f_visibility]`/`[g_visibility]`** (BC-155): confirms that key changes are not published on sync failure — written key is absent after F or G failure, engine not poisoned.
 
 ### Design notes
 

@@ -235,27 +235,17 @@ healthy but fails on the next append. Poisoning is the correct response.
 | C | No — partial write | No | No | Yes | Yes |
 | D | No — partial write | No | No | Yes | Yes |
 | E | No — partial write | No | No | Yes | Yes |
-| F | Yes — fully | Yes — full delta | Yes | Yes | No |
-| G | Yes — fully | Yes — full delta | Yes | Yes | No |
+| F | Yes — fully | No — lsn only | Yes | Yes | No |
+| G | Yes — fully | No — lsn only | Yes | Yes | No |
 | H | Yes — fully | Yes — full delta | Yes | Yes | Yes |
 
-Note on classes F and G — durability vs persistence: The data is written
-via `writev` (in page cache) and the state is published, but `fdatasync`
-failed — the transition is not yet durable to power loss. A power failure
-before the next successful sync could lose the data. However:
-
-- A clean process shutdown flushes page cache. The data survives.
-- The next successful `fdatasync` on the same file (triggered by the
-  next write or rotation) flushes all preceding pages.
-- Reads see the data immediately — it is in the page cache.
-
-The current design does not poison on sync failure. Poisoning would
-discard a write that is very likely to survive, and the caller receives
-the exception and can retry or sync explicitly. The durability guarantee
-for F/G is: the transition is persisted to page cache and will become
-durable on the next successful sync, clean shutdown, or kernel flush.
-Between the failed sync and one of those events, a power failure or
-kernel crash can lose it.
+Note on classes F and G — key changes unpublished, LSN advanced: The data
+is written via `writev` and reaches the file, but `fdatasync` fails — the
+transition is not confirmed durable. Key-directory changes are NOT published:
+the written key is invisible to subsequent reads, and the caller must retry.
+`next_lsn` is advanced past all consumed sequence numbers to prevent LSN
+reuse for bytes now in the page cache. The engine is not poisoned — subsequent
+writes proceed normally, and the next write may retry the rotation if G failed.
 
 Class H is similar — the transition is persisted — but the engine is
 also poisoned because the sealed active file cannot accept further

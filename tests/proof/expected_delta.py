@@ -81,10 +81,17 @@ def expected_delta(
         return Delta([], [], 0, poisoned=True, threw=True)
 
     if failure == FailureClass.F:
-        return _full_delta(plan, key_labels, existing_keys, threw=True)
+        # Sync failed after writev — bytes in page cache but not confirmed
+        # durable. Key changes are NOT published in-session (BC-155). LSN
+        # still advances to prevent reuse of sequence numbers now on disk.
+        n = plan.write_count
+        return Delta([], [], n + (2 if n > 1 else 0), poisoned=False, threw=True)
 
     if failure == FailureClass.G:
-        return _full_delta(plan, key_labels, existing_keys, threw=True)
+        # Rotation sync failed — same contract as F: key changes unpublished,
+        # LSN advances past consumed values.
+        n = plan.write_count
+        return Delta([], [], n + (2 if n > 1 else 0), poisoned=False, threw=True)
 
     if failure == FailureClass.H:
         return _full_delta(

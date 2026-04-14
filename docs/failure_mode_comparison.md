@@ -31,27 +31,32 @@ The commit primitive and visibility gate determine what "partial write" and
 | **B1** — `writev = -1`, nothing on disk | Throws; no state change; no poison | `seen_error` latch on writer; `SetBGError` at severity level; write not visible | `bg_error_` permanently set; DB poisoned | `PAGER_ERROR`; transaction rolled back; recoverable without reopen | Transaction aborted; error code returned; no poison unless meta-page write involved | `WT_RET_PANIC`; connection immediately poisoned |
 | **B2** — partial bytes on disk (short write) | Multi-entry: isolate via isolation rotation. Single-entry: poison | Undetectable at write time (`Append` returns `Status`, not byte count); caught at recovery via CRC mismatch | Same structural blind spot as RocksDB; tail corruption tolerated at recovery | Cumulative checksum + commit-frame requirement; partial frame invisible by construction | Data-page partial: safe (not reachable from valid meta); meta-page partial: old meta intact | Pre-zeroed files + trailing-zero heuristic + CRC; recovery stops at partial record |
 | **B3** — all bytes on disk, valid CRC, error returned | Multi: orphaned, isolation-rotated. Single: poison; recovery **will** find the write | Treated as B1 at write time (poison); valid CRC record replayed in `kPointInTimeRecovery` | Treated as B1 (poison); valid record replayed on recovery | `PAGER_ERROR` at write time; if commit frame present, full transaction replayed from WAL | Data-page: error returned, no poison; on next open, committed meta found and replayed | Treated as B1 (panic); valid CRC → record replayed during `__wt_log_scan` |
-| **F** — `fdatasync` fails after state publish | **Throws, NOT poisoned**; transition in page cache; no retry obligation | `SyncInternal` fails → `SetBGError(kHardError+)`; write not visible (sync precedes sequence publish); `DB::Resume()` or close+reopen | `logfile_->Sync()` fails → `bg_error_` permanently set; write not visible; must close+reopen | `PAGER_ERROR`; recoverable within same connection; under `NORMAL` sync, per-commit sync is deferred | `MDB_FDATASYNC` failure → meta write blocked → transaction aborted; likely `MDB_FATAL_ERROR`; close+reopen | `ENOTSUP` silently disables dirty sync; other errors propagated; log server error → panic |
-| **G** — post-write rotation `fdatasync` fails | **Throws, NOT poisoned**; transition persisted in page cache; retry on next write | `SwitchMemtable` sync failure → `SetBGError(Corruption)` → close+reopen required | Old `logfile_->Close()` failure → `bg_error_` permanently set; close+reopen | Checkpoint sync failure: `SQLITE_IOERR`; connection remains open; pager error state, recoverable | N/A — no log rotation | Rotation sync failure: propagated error; subsequent write on stalled file → `WT_RET_PANIC` |
+| **F** — `fdatasync` fails after state publish | **Throws, NOT poisoned**; key changes not published; `next_lsn` advanced past consumed LSNs; caller must retry | `SyncInternal` fails → `SetBGError(kHardError+)`; write not visible (sync precedes sequence publish); `DB::Resume()` or close+reopen | `logfile_->Sync()` fails → `bg_error_` permanently set; write not visible; must close+reopen | `PAGER_ERROR`; recoverable within same connection; under `NORMAL` sync, per-commit sync is deferred | `MDB_FDATASYNC` failure → meta write blocked → transaction aborted; likely `MDB_FATAL_ERROR`; close+reopen | `ENOTSUP` silently disables dirty sync; other errors propagated; log server error → panic |
+| **G** — post-write rotation `fdatasync` fails | **Throws, NOT poisoned**; key changes not published; `next_lsn` advanced; next write retries rotation | `SwitchMemtable` sync failure → `SetBGError(Corruption)` → close+reopen required | Old `logfile_->Close()` failure → `bg_error_` permanently set; close+reopen | Checkpoint sync failure: `SQLITE_IOERR`; connection remains open; pager error state, recoverable | N/A — no log rotation | Rotation sync failure: propagated error; subsequent write on stalled file → `WT_RET_PANIC` |
 | **H** — active file sealed, new file creation fails | Poison; restart required | Before any writes: recoverable per-write error. After committed writes: `SetBGError(Corruption)` → close+reopen | New log creation fails: recoverable (file number reclaimed). Old log close fails: permanent poison | WAL created once at mode activation; creation failure → mode reverts to prior journaling; not analogous | N/A — single-file environment | File creation: propagated error, no immediate panic; after ~10K yield attempts: `EBUSY`; subsequent write failure → panic |
 
 ---
 
 ## Key Observations
 
-### 1. Class F/G: ByteCaskDB publishes before durability — an intentional outlier
+### 1. Class F/G: ByteCaskDB now gates visibility behind `fdatasync`
 
-Every other engine gates reader visibility behind a successful `fdatasync`.
-ByteCaskDB publishes state before the exception propagates and does not poison
-on F or G, accepting "page-cache durability" as sufficient. The rationale is
-coherent for an append-only file: a clean process shutdown flushes the page
-cache; the next successful `fdatasync` on the same file covers all preceding
-pages; and a power failure between the failed sync and one of those events is
-the only remaining risk. No other engine among the five takes this position.
+All six engines now agree that a failed `fdatasync` must not make a write
+visible. ByteCaskDB previously published key-directory changes before the
+exception propagated on F and G (accepting "page-cache durability" as
+sufficient). As of BC-155, key changes are not published on sync failure.
+`next_lsn` is still advanced past consumed sequence numbers to prevent LSN
+reuse for bytes now in the page cache. The caller receives the exception and
+must retry the write.
 
-This is a documented, deliberate tradeoff: a transition in state F or G has
-`writev`-level persistence (survives clean shutdown) but not `fdatasync`-level
-durability (may be lost on power failure or kernel crash before the next sync).
+ByteCaskDB diverges from most peers on **what happens next**: it does not
+poison the DB on F or G. LevelDB permanently latches `bg_error_`; RocksDB
+sets `kHardError` (requiring `DB::Resume()` or close+reopen); LMDB escalates
+to `MDB_FATAL_ERROR`; WiredTiger panics the connection. SQLite WAL is the
+closest: `PAGER_ERROR` is recoverable within the same connection without
+restart — analogous to ByteCaskDB's approach of staying operational and letting
+the caller retry. This is the remaining gap addressed by BC-159 (`DbDegraded`
++ `DB::resume()`).
 
 ### 2. Partial write detection varies widely
 
@@ -104,6 +109,106 @@ All other engines have fixed recovery behavior. ByteCaskDB's append+hint-file
 recovery is structurally closest to WiredTiger's `__wt_log_scan`: scan forward,
 CRC-verify each record, stop at the first invalid entry. Hint files provide a
 parallel-reconstruction acceleration path on top of that.
+
+### 6. No engine retries disk IO — fail-fast is the universal strategy
+
+None of the five comparison engines retry a failed `write()` or `fdatasync()`
+internally. The dominant pattern is **fail-fast and propagate**: report the
+error to the caller immediately and let the application or orchestrator decide
+the response.
+
+The reasoning is consistent across all engines:
+
+- **Masking hardware problems.** A transient `EIO` may be the first symptom
+  of a dying disk. Retrying and succeeding once does not mean the next write
+  will land.
+- **Violating ordering guarantees.** If a retry changes the order of writes
+  relative to visibility, durability invariants break.
+- **Unbounded latency.** POSIX provides no timeout mechanism for regular file
+  IO (see observation 8), so retrying disk IO means the engine has no way to
+  bound how long a caller waits.
+
+Engines differ only in *how aggressively* they react after propagation:
+
+| Reaction | Engines | Behavior |
+|---|---|---|
+| Instant panic / poison | WiredTiger, LevelDB | One IO error → entire DB unusable until restart |
+| Severity-tiered poison | RocksDB | Soft errors recoverable via `DB::Resume()`; hard errors require restart |
+| Recoverable in-session | SQLite WAL | `PAGER_ERROR` → discard dirty pages → next transaction starts clean |
+| Propagate, don't poison (sync failures) | ByteCaskDB (class F/G) | Throw to caller; don't latch error state |
+
+WiredTiger is the extreme: `WT_RET_PANIC` on *any* write failure. The MongoDB
+team's position is that crashing the node and letting the replica set elect a
+new primary is preferable to serving reads from a potentially inconsistent
+state. LevelDB's one-way `bg_error_` latch is only slightly less aggressive.
+
+PostgreSQL is a notable external reference: `pg_pwrite()` wraps `pwrite()` in
+a retry loop for `EINTR`, and WAL writes retry short writes (continue writing
+remaining bytes). But `fdatasync` failures are **not** retried — they trigger
+a `PANIC` and crash recovery.
+
+No production storage engine uses exponential backoff for disk IO. Backoff is
+a network/contention strategy. Disk IO either works or it doesn't — retrying
+a `write()` that returned `EIO` after a delay will not help because the failure
+indicates a hardware or filesystem problem, not transient contention. The only
+backoff-like behavior in this space is lock-contention retry: SQLite's
+`sqlite3_busy_timeout` (stepped retry for lock contention, not IO errors) and
+WiredTiger's log-slot yield loop (~10K iterations waiting for a consolidation
+slot under high concurrency — spin-wait for a lock, not IO retry).
+
+### 7. Idempotency strategies for write-path recovery
+
+After a failed IO, the engine often cannot determine whether the operation
+partially completed. Each engine's idempotency strategy determines how safely
+the same write can be re-attempted.
+
+| Strategy | Used by | Mechanism |
+|---|---|---|
+| Append-only + CRC | ByteCaskDB, RocksDB, LevelDB, WiredTiger | Appending is naturally idempotent for failure: a partial append is detected by CRC on recovery and truncated. The write can be re-appended. |
+| COW + meta-page flip | LMDB | Data pages are written to new locations; the meta-page flip is the atomic commit. A failed write leaves no trace in the committed state — retry the entire transaction. |
+| Cumulative CRC + commit-frame | SQLite WAL | The commit frame is the idempotency boundary. Without it, all preceding frames are invisible. Retry = re-run entire transaction. |
+| Temp-then-rename | ByteCaskDB (hint files), PostgreSQL (control file) | Write to a temp file, `fdatasync`, then `rename()`. The rename is the atomic visibility gate. If any step fails, the temp file is orphaned and harmless. |
+
+The common pattern: **make the visibility gate atomic and separate from the
+data write**, so a failed write is either invisible (retry the whole thing) or
+fully visible (no retry needed).
+
+### 8. POSIX provides no timeout for regular file IO
+
+All engines in this comparison block the calling thread unconditionally during
+disk IO. No engine implements IO timeouts at the engine level.
+
+`read()`, `write()`, `pwrite()`, `fdatasync()`, and `fsync()` on regular files
+are unconditionally blocking with no timeout parameter. The multiplexing
+mechanisms (`select()`, `poll()`, `epoll()`) do not work on regular files —
+they always report regular files as immediately ready. `O_NONBLOCK` has no
+effect on regular files per POSIX.
+
+The practical consequence: if a disk hangs (bad sector, NFS stall, cgroup
+throttle), the calling thread hangs indefinitely in kernel space (`D` state on
+Linux — uninterruptible sleep). This is not a bug in any engine; it is a
+fundamental POSIX limitation. Mitigations exist but are not widely adopted:
+
+- **Watchdog threads** that detect hung IO and trigger a process restart
+  (PostgreSQL's `recovery_timeout`, though that targets replication, not local
+  IO).
+- **`io_uring` with `IORING_OP_LINK_TIMEOUT`** — the closest mechanism to a
+  real IO timeout on Linux. No major storage engine uses `io_uring` for
+  write-path IO in production as of 2026 (RocksDB has experimental support
+  via `PosixRandomRWFile`). Even with `io_uring`, a "timed out" IO is still
+  in-flight in the kernel — a disk write submitted to the block layer cannot
+  be cancelled.
+- **Filesystem-level timeouts** (e.g. NFS `timeo` mount option, or ext4's
+  `errors=panic` which triggers a kernel panic on IO error rather than
+  hanging).
+
+Because every engine shares this constraint, the per-write blocking behavior
+is consistent across the comparison: RocksDB's `WriteImpl()` holds writers in
+a write group that blocks until `fdatasync` completes; LevelDB's `Write()` holds
+the mutex and blocks; SQLite blocks in `xWrite` / `xSync` VFS calls;
+WiredTiger's log-slot consolidation means multiple threads block waiting for a
+single slow IO; and ByteCaskDB holds the write lock for the entire `writev` +
+state publish.
 
 ---
 

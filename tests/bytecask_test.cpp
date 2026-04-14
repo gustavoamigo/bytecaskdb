@@ -2843,6 +2843,55 @@ TEST_CASE("reads work on a poisoned DB", "[poisoned]") {
 }
 
 // ---------------------------------------------------------------------------
+// F/G visibility tests — BC-155: key changes not published on sync failure.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("class F: key not visible after commit sync failure", "[f_visibility]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("new_key"), to_bytes("new_val"));
+
+  {
+    // io_data_file_sync fires on the commit fdatasync (class F).
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    REQUIRE_THROWS_AS(db.apply_batch_if({.sync = true}, std::move(plan)),
+                      std::system_error);
+  }
+
+  // Key must not be visible — write was not confirmed durable.
+  CHECK_FALSE(db.contains_key(to_bytes("new_key")));
+  CHECK_FALSE(db.is_poisoned());
+}
+
+TEST_CASE("class G: key not visible after rotation sync failure", "[g_visibility]") {
+  TempDir td;
+  // max_file_bytes=1 forces rotation after the first write.
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+
+  // Seed one key to ensure there is something to rotate past.
+  db.put({.sync = false}, to_bytes("seed"), to_bytes("v"));
+
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("new_key"), to_bytes("new_val"));
+
+  {
+    // sync=false means no commit sync, so the only io_data_file_sync
+    // checkpoint that fires is the pre-rotation sync (class G).
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    REQUIRE_THROWS_AS(db.apply_batch_if({.sync = false}, std::move(plan)),
+                      std::system_error);
+  }
+
+  // Key must not be visible — write was not confirmed durable.
+  CHECK_FALSE(db.contains_key(to_bytes("new_key")));
+  CHECK_FALSE(db.is_poisoned());
+  // Pre-existing key must still be visible.
+  CHECK(db.contains_key(to_bytes("seed")));
+}
+
+// ---------------------------------------------------------------------------
 // validate_preconditions unit tests
 // ---------------------------------------------------------------------------
 // These test TransientEngineState::validate_preconditions in isolation —
