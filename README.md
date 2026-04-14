@@ -167,6 +167,11 @@ namespace bytecask {
 struct Options {
     uint64_t max_file_bytes{64 * 1024 * 1024};  // active file rotation threshold (default 64 MiB)
     unsigned recovery_threads{4};                // parallelism for hint-file replay at open
+    // When true (default): any CRC error during recovery causes DB::open to throw.
+    // When false: corrupt entries and hint files are skipped; DB opens with the
+    // keys that were successfully recovered. A warning is printed to stderr for
+    // each skipped item.
+    bool fail_recovery_on_crc_errors{true};
 };
 
 struct WriteOptions {
