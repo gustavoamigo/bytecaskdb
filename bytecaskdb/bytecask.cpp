@@ -537,6 +537,7 @@ auto DB::apply_batch_if(WriteOptions opts,
   auto &file = t.active_file();
   std::vector<std::uint64_t> offsets;
   offsets.reserve(entries.size());
+  bool b3_recovered = false;
   try {
     for (const auto &entry : entries) {
       offsets.push_back(file.append(
@@ -569,12 +570,25 @@ auto DB::apply_batch_if(WriteOptions opts,
         throw;
       }
     } else if (file.is_tainted()) {
-      deem_as_poisoned(std::format(
-          "partial write detected on '{}': file position diverged from "
-          "offset tracking. Writes blocked until restart.",
-          file.path().string()));
+      // BC-156: attempt read-back before poisoning — writev may have written
+      // the full entry despite returning an error (class B3). If CRC verifies,
+      // the entry is durable; treat as success and fall through to publish.
+      const auto &e = entries.front();
+      if (auto off = file.try_recover_failed_append(
+              narrow<std::uint16_t>(e.key.size()),
+              narrow<std::uint32_t>(e.value.size()))) {
+        offsets.push_back(*off);
+        b3_recovered = true;
+      } else {
+        deem_as_poisoned(std::format(
+            "partial write detected on '{}': file position diverged from "
+            "offset tracking. Writes blocked until restart.",
+            file.path().string()));
+      }
     }
-    throw;
+    if (!b3_recovered) {
+      throw;
+    }
   }
 
   // 5. Apply mutations (pure, no IO).

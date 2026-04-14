@@ -74,8 +74,15 @@ def expected_delta(
     if failure == FailureClass.C:
         return Delta([], [], 0, poisoned=True, threw=True)
 
-    if failure in (FailureClass.B2, FailureClass.B3):
+    if failure == FailureClass.B2:
         return Delta([], [], 0, poisoned=plan.is_single_entry, threw=True)
+
+    if failure == FailureClass.B3:
+        if plan.is_single_entry:
+            # BC-156: read-back confirms CRC valid → publish normally, no throw.
+            return _full_delta(plan, key_labels, existing_keys)
+        # Multi-entry B3: batch framing discards the orphaned entry; no poison.
+        return Delta([], [], 0, poisoned=False, threw=True)
 
     if failure in (FailureClass.D, FailureClass.E):
         return Delta([], [], 0, poisoned=True, threw=True)

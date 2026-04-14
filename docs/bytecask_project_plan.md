@@ -18,6 +18,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-102 | File format reference document | Created `docs/file_format.md` with full layout spec for `.data` and `.hint` files; added to README documentation table. |
 | BC-110 | MariaDB storage engine integration — design | Design doc (`docs/mariadb_engine_design.md`) and phased plan for `ha_bytecask` plugin. Branch: `feature/mariadb-engine`. |
 | BC-155 | Gate visibility behind `fdatasync` on F/G failures | Key changes no longer published on sync failure (classes F and G). Only `next_lsn` advances to prevent LSN reuse. Aligns ByteCaskDB with all five peers. `[f_visibility]`/`[g_visibility]` tests added; 172 proof tests updated. |
+| BC-156 | Read-back verification before poison on B3 single-entry | `DataFile::try_recover_failed_append` added. On B3, engine reads back the entry and CRC-verifies before poisoning. Valid CRC → publish normally, no poison. `[data_file]` unit tests + proof tests updated. |
 ## Backlog
 
 ### MariaDB Engine Integration

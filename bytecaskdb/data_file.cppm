@@ -243,6 +243,30 @@ public:
   // writes would land at incorrect offsets.
   [[nodiscard]] auto is_tainted() const noexcept -> bool { return tainted_; }
 
+  // Attempts to recover a failed append by reading back the entry at offset_
+  // (unchanged because append() threw before advancing it) and CRC-verifying it.
+  // Valid CRC → advances offset_, clears tainted_, returns the pre-write offset.
+  // Short read or CRC mismatch → returns std::nullopt. Does not throw.
+  [[nodiscard]] auto try_recover_failed_append(
+      std::uint16_t key_size, std::uint32_t value_size) noexcept
+      -> std::optional<Offset> {
+    const auto total = kHeaderSize + key_size + value_size + kCrcSize;
+    std::vector<std::byte> buf(total);
+    const auto pre_write_offset = offset_;
+    if (::pread(fd_, buf.data(), total, narrow<off_t>(pre_write_offset)) !=
+        narrow<ssize_t>(total)) {
+      return std::nullopt;
+    }
+    try {
+      parse_header_and_verify(std::span{buf});
+    } catch (...) {
+      return std::nullopt;
+    }
+    offset_ += static_cast<Offset>(total);
+    tainted_ = false;
+    return pre_write_offset;
+  }
+
 private:
   std::filesystem::path path_;
   int fd_{-1};
