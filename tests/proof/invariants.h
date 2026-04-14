@@ -54,7 +54,7 @@ struct ExpectedDelta {
   std::vector<std::string> keys_added;
   std::vector<std::string> keys_removed;
   std::uint64_t lsn_advance;
-  bool poisoned;
+  bool degraded;
 };
 
 // ---- Core functions ------------------------------------------------------
@@ -132,8 +132,15 @@ inline void assert_delta(const Baseline &before, const DB &db,
   // Structural consistency.
   assert_consistent(db);
 
-  // Poison state.
-  CHECK(db.is_poisoned() == expected.poisoned);
+  // Degraded state.
+  CHECK(db.is_degraded() == expected.degraded);
+}
+
+// Calls resume() and verifies the engine recovers fully.
+inline void assert_resumable(DB &db) {
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  assert_consistent(db);
 }
 
 // Opens a fresh DB from on-disk files and verifies the recovered state matches

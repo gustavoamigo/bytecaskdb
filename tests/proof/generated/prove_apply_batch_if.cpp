@@ -24,6 +24,7 @@ namespace {
 using bytecask::testing::assert_consistent;
 using bytecask::testing::assert_delta;
 using bytecask::testing::assert_recoverable;
+using bytecask::testing::assert_resumable;
 using bytecask::testing::Baseline;
 using bytecask::testing::capture_baseline;
 using bytecask::testing::ExpectedDelta;
@@ -50,7 +51,7 @@ TEST_CASE("prove__empty_db__single_put__success", "[prove]") {
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -79,7 +80,7 @@ TEST_CASE("prove__empty_db__single_put__append_fails_nothing_written", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -110,7 +111,7 @@ TEST_CASE("prove__empty_db__single_put__append_fails_partial_write", "[prove]") 
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -131,8 +132,9 @@ TEST_CASE("prove__empty_db__single_put__append_fails_partial_write", "[prove]") 
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__single_put__append_fails_after_full_write", "[prove]") {
@@ -142,7 +144,7 @@ TEST_CASE("prove__empty_db__single_put__append_fails_after_full_write", "[prove]
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -173,7 +175,7 @@ TEST_CASE("prove__empty_db__single_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -206,7 +208,7 @@ TEST_CASE("prove__empty_db__single_delete__success", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -235,7 +237,7 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_nothing_written", "[prov
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -266,7 +268,7 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_partial_write", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -287,8 +289,9 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_partial_write", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__single_delete__append_fails_after_full_write", "[prove]") {
@@ -298,7 +301,7 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_after_full_write", "[pro
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -329,7 +332,7 @@ TEST_CASE("prove__empty_db__single_delete__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -362,7 +365,7 @@ TEST_CASE("prove__empty_db__multi_put__success", "[prove]") {
         .keys_added = {"p0", "p1"},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -392,7 +395,7 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_nothing_written", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -424,7 +427,7 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_partial_write", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -457,7 +460,7 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_after_full_write", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -490,7 +493,7 @@ TEST_CASE("prove__empty_db__multi_put__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -511,8 +514,9 @@ TEST_CASE("prove__empty_db__multi_put__on_bulk_end_append", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__multi_put__isolation_sync_fails", "[prove]") {
@@ -522,7 +526,7 @@ TEST_CASE("prove__empty_db__multi_put__isolation_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -543,8 +547,9 @@ TEST_CASE("prove__empty_db__multi_put__isolation_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__multi_put__isolation_rotation_fails", "[prove]") {
@@ -554,7 +559,7 @@ TEST_CASE("prove__empty_db__multi_put__isolation_rotation_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -575,8 +580,9 @@ TEST_CASE("prove__empty_db__multi_put__isolation_rotation_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__multi_put__commit_sync_fails", "[prove]") {
@@ -586,7 +592,7 @@ TEST_CASE("prove__empty_db__multi_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -620,7 +626,7 @@ TEST_CASE("prove__empty_db__mixed_batch__success", "[prove]") {
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -650,7 +656,7 @@ TEST_CASE("prove__empty_db__mixed_batch__append_fails_nothing_written", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -682,7 +688,7 @@ TEST_CASE("prove__empty_db__mixed_batch__append_fails_partial_write", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -715,7 +721,7 @@ TEST_CASE("prove__empty_db__mixed_batch__append_fails_after_full_write", "[prove
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -748,7 +754,7 @@ TEST_CASE("prove__empty_db__mixed_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -769,8 +775,9 @@ TEST_CASE("prove__empty_db__mixed_batch__on_bulk_end_append", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__mixed_batch__isolation_sync_fails", "[prove]") {
@@ -780,7 +787,7 @@ TEST_CASE("prove__empty_db__mixed_batch__isolation_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -801,8 +808,9 @@ TEST_CASE("prove__empty_db__mixed_batch__isolation_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__mixed_batch__isolation_rotation_fails", "[prove]") {
@@ -812,7 +820,7 @@ TEST_CASE("prove__empty_db__mixed_batch__isolation_rotation_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -833,8 +841,9 @@ TEST_CASE("prove__empty_db__mixed_batch__isolation_rotation_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__mixed_batch__commit_sync_fails", "[prove]") {
@@ -844,7 +853,7 @@ TEST_CASE("prove__empty_db__mixed_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -878,7 +887,7 @@ TEST_CASE("prove__empty_db__large_batch__success", "[prove]") {
         .keys_added = {"p0", "p1", "p2"},
         .keys_removed = {},
         .lsn_advance = 5,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -909,7 +918,7 @@ TEST_CASE("prove__empty_db__large_batch__append_fails_nothing_written", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -942,7 +951,7 @@ TEST_CASE("prove__empty_db__large_batch__append_fails_partial_write", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -976,7 +985,7 @@ TEST_CASE("prove__empty_db__large_batch__append_fails_after_full_write", "[prove
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1010,7 +1019,7 @@ TEST_CASE("prove__empty_db__large_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1032,8 +1041,9 @@ TEST_CASE("prove__empty_db__large_batch__on_bulk_end_append", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__large_batch__isolation_sync_fails", "[prove]") {
@@ -1043,7 +1053,7 @@ TEST_CASE("prove__empty_db__large_batch__isolation_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1065,8 +1075,9 @@ TEST_CASE("prove__empty_db__large_batch__isolation_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__large_batch__isolation_rotation_fails", "[prove]") {
@@ -1076,7 +1087,7 @@ TEST_CASE("prove__empty_db__large_batch__isolation_rotation_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1098,8 +1109,9 @@ TEST_CASE("prove__empty_db__large_batch__isolation_rotation_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__large_batch__commit_sync_fails", "[prove]") {
@@ -1109,7 +1121,7 @@ TEST_CASE("prove__empty_db__large_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 5,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1144,7 +1156,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__success", "[prove]") {
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1175,7 +1187,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_nothing_written
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1208,7 +1220,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_partial_write",
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1231,8 +1243,9 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_partial_write",
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_after_full_write", "[prove]") {
@@ -1242,7 +1255,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_after_full_writ
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1275,7 +1288,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__commit_sync_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1310,7 +1323,7 @@ TEST_CASE("prove__empty_db__conflicting_plan__before_any_io", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1343,7 +1356,7 @@ TEST_CASE("prove__single_key__single_put__success", "[prove]") {
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1373,7 +1386,7 @@ TEST_CASE("prove__single_key__single_put__append_fails_nothing_written", "[prove
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1405,7 +1418,7 @@ TEST_CASE("prove__single_key__single_put__append_fails_partial_write", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1427,8 +1440,9 @@ TEST_CASE("prove__single_key__single_put__append_fails_partial_write", "[prove]"
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__single_put__append_fails_after_full_write", "[prove]") {
@@ -1438,7 +1452,7 @@ TEST_CASE("prove__single_key__single_put__append_fails_after_full_write", "[prov
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1470,7 +1484,7 @@ TEST_CASE("prove__single_key__single_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1504,7 +1518,7 @@ TEST_CASE("prove__single_key__single_delete__success", "[prove]") {
         .keys_added = {},
         .keys_removed = {"k0"},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1534,7 +1548,7 @@ TEST_CASE("prove__single_key__single_delete__append_fails_nothing_written", "[pr
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1566,7 +1580,7 @@ TEST_CASE("prove__single_key__single_delete__append_fails_partial_write", "[prov
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1588,8 +1602,9 @@ TEST_CASE("prove__single_key__single_delete__append_fails_partial_write", "[prov
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__single_delete__append_fails_after_full_write", "[prove]") {
@@ -1599,7 +1614,7 @@ TEST_CASE("prove__single_key__single_delete__append_fails_after_full_write", "[p
         .keys_added = {},
         .keys_removed = {"k0"},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1631,7 +1646,7 @@ TEST_CASE("prove__single_key__single_delete__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1665,7 +1680,7 @@ TEST_CASE("prove__single_key__multi_put__success", "[prove]") {
         .keys_added = {"p0", "p1"},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1696,7 +1711,7 @@ TEST_CASE("prove__single_key__multi_put__append_fails_nothing_written", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1729,7 +1744,7 @@ TEST_CASE("prove__single_key__multi_put__append_fails_partial_write", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1763,7 +1778,7 @@ TEST_CASE("prove__single_key__multi_put__append_fails_after_full_write", "[prove
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1797,7 +1812,7 @@ TEST_CASE("prove__single_key__multi_put__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1819,8 +1834,9 @@ TEST_CASE("prove__single_key__multi_put__on_bulk_end_append", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__multi_put__isolation_sync_fails", "[prove]") {
@@ -1830,7 +1846,7 @@ TEST_CASE("prove__single_key__multi_put__isolation_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1852,8 +1868,9 @@ TEST_CASE("prove__single_key__multi_put__isolation_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__multi_put__isolation_rotation_fails", "[prove]") {
@@ -1863,7 +1880,7 @@ TEST_CASE("prove__single_key__multi_put__isolation_rotation_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1885,8 +1902,9 @@ TEST_CASE("prove__single_key__multi_put__isolation_rotation_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__multi_put__commit_sync_fails", "[prove]") {
@@ -1896,7 +1914,7 @@ TEST_CASE("prove__single_key__multi_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1931,7 +1949,7 @@ TEST_CASE("prove__single_key__mixed_batch__success", "[prove]") {
         .keys_added = {"p0"},
         .keys_removed = {"k0"},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1962,7 +1980,7 @@ TEST_CASE("prove__single_key__mixed_batch__append_fails_nothing_written", "[prov
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -1995,7 +2013,7 @@ TEST_CASE("prove__single_key__mixed_batch__append_fails_partial_write", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2029,7 +2047,7 @@ TEST_CASE("prove__single_key__mixed_batch__append_fails_after_full_write", "[pro
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2063,7 +2081,7 @@ TEST_CASE("prove__single_key__mixed_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2085,8 +2103,9 @@ TEST_CASE("prove__single_key__mixed_batch__on_bulk_end_append", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__mixed_batch__isolation_sync_fails", "[prove]") {
@@ -2096,7 +2115,7 @@ TEST_CASE("prove__single_key__mixed_batch__isolation_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2118,8 +2137,9 @@ TEST_CASE("prove__single_key__mixed_batch__isolation_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__mixed_batch__isolation_rotation_fails", "[prove]") {
@@ -2129,7 +2149,7 @@ TEST_CASE("prove__single_key__mixed_batch__isolation_rotation_fails", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2151,8 +2171,9 @@ TEST_CASE("prove__single_key__mixed_batch__isolation_rotation_fails", "[prove]")
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__mixed_batch__commit_sync_fails", "[prove]") {
@@ -2162,7 +2183,7 @@ TEST_CASE("prove__single_key__mixed_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2197,7 +2218,7 @@ TEST_CASE("prove__single_key__large_batch__success", "[prove]") {
         .keys_added = {"p0", "p1", "p2"},
         .keys_removed = {},
         .lsn_advance = 5,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2229,7 +2250,7 @@ TEST_CASE("prove__single_key__large_batch__append_fails_nothing_written", "[prov
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2263,7 +2284,7 @@ TEST_CASE("prove__single_key__large_batch__append_fails_partial_write", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2298,7 +2319,7 @@ TEST_CASE("prove__single_key__large_batch__append_fails_after_full_write", "[pro
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2333,7 +2354,7 @@ TEST_CASE("prove__single_key__large_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2356,8 +2377,9 @@ TEST_CASE("prove__single_key__large_batch__on_bulk_end_append", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__large_batch__isolation_sync_fails", "[prove]") {
@@ -2367,7 +2389,7 @@ TEST_CASE("prove__single_key__large_batch__isolation_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2390,8 +2412,9 @@ TEST_CASE("prove__single_key__large_batch__isolation_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__large_batch__isolation_rotation_fails", "[prove]") {
@@ -2401,7 +2424,7 @@ TEST_CASE("prove__single_key__large_batch__isolation_rotation_fails", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2424,8 +2447,9 @@ TEST_CASE("prove__single_key__large_batch__isolation_rotation_fails", "[prove]")
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__large_batch__commit_sync_fails", "[prove]") {
@@ -2435,7 +2459,7 @@ TEST_CASE("prove__single_key__large_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 5,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2471,7 +2495,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__success", "[prove]") {
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2504,7 +2528,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_nothing_writt
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2539,7 +2563,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_partial_write
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2564,8 +2588,9 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_partial_write
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__single_put_with_guards__append_fails_after_full_write", "[prove]") {
@@ -2575,7 +2600,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_after_full_wr
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2610,7 +2635,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__commit_sync_fails", "[prov
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2647,7 +2672,7 @@ TEST_CASE("prove__single_key__conflicting_plan__before_any_io", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2681,7 +2706,7 @@ TEST_CASE("prove__populated_db__single_put__success", "[prove]") {
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2720,7 +2745,7 @@ TEST_CASE("prove__populated_db__single_put__append_fails_nothing_written", "[pro
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2761,7 +2786,7 @@ TEST_CASE("prove__populated_db__single_put__append_fails_partial_write", "[prove
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2792,8 +2817,9 @@ TEST_CASE("prove__populated_db__single_put__append_fails_partial_write", "[prove
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__single_put__append_fails_after_full_write", "[prove]") {
@@ -2803,7 +2829,7 @@ TEST_CASE("prove__populated_db__single_put__append_fails_after_full_write", "[pr
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2844,7 +2870,7 @@ TEST_CASE("prove__populated_db__single_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2887,7 +2913,7 @@ TEST_CASE("prove__populated_db__single_delete__success", "[prove]") {
         .keys_added = {},
         .keys_removed = {"k0"},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2926,7 +2952,7 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_nothing_written", "[
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -2967,7 +2993,7 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_partial_write", "[pr
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2998,8 +3024,9 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_partial_write", "[pr
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__single_delete__append_fails_after_full_write", "[prove]") {
@@ -3009,7 +3036,7 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_after_full_write", "
         .keys_added = {},
         .keys_removed = {"k0"},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3050,7 +3077,7 @@ TEST_CASE("prove__populated_db__single_delete__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3093,7 +3120,7 @@ TEST_CASE("prove__populated_db__multi_put__success", "[prove]") {
         .keys_added = {"p0", "p1"},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3133,7 +3160,7 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_nothing_written", "[prov
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3175,7 +3202,7 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_partial_write", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3218,7 +3245,7 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_after_full_write", "[pro
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3261,7 +3288,7 @@ TEST_CASE("prove__populated_db__multi_put__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3292,8 +3319,9 @@ TEST_CASE("prove__populated_db__multi_put__on_bulk_end_append", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__multi_put__isolation_sync_fails", "[prove]") {
@@ -3303,7 +3331,7 @@ TEST_CASE("prove__populated_db__multi_put__isolation_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3334,8 +3362,9 @@ TEST_CASE("prove__populated_db__multi_put__isolation_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__multi_put__isolation_rotation_fails", "[prove]") {
@@ -3345,7 +3374,7 @@ TEST_CASE("prove__populated_db__multi_put__isolation_rotation_fails", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3376,8 +3405,9 @@ TEST_CASE("prove__populated_db__multi_put__isolation_rotation_fails", "[prove]")
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__multi_put__commit_sync_fails", "[prove]") {
@@ -3387,7 +3417,7 @@ TEST_CASE("prove__populated_db__multi_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3431,7 +3461,7 @@ TEST_CASE("prove__populated_db__mixed_batch__success", "[prove]") {
         .keys_added = {"p0"},
         .keys_removed = {"k0"},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3471,7 +3501,7 @@ TEST_CASE("prove__populated_db__mixed_batch__append_fails_nothing_written", "[pr
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3513,7 +3543,7 @@ TEST_CASE("prove__populated_db__mixed_batch__append_fails_partial_write", "[prov
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3556,7 +3586,7 @@ TEST_CASE("prove__populated_db__mixed_batch__append_fails_after_full_write", "[p
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3599,7 +3629,7 @@ TEST_CASE("prove__populated_db__mixed_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3630,8 +3660,9 @@ TEST_CASE("prove__populated_db__mixed_batch__on_bulk_end_append", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__mixed_batch__isolation_sync_fails", "[prove]") {
@@ -3641,7 +3672,7 @@ TEST_CASE("prove__populated_db__mixed_batch__isolation_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3672,8 +3703,9 @@ TEST_CASE("prove__populated_db__mixed_batch__isolation_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__mixed_batch__isolation_rotation_fails", "[prove]") {
@@ -3683,7 +3715,7 @@ TEST_CASE("prove__populated_db__mixed_batch__isolation_rotation_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3714,8 +3746,9 @@ TEST_CASE("prove__populated_db__mixed_batch__isolation_rotation_fails", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__mixed_batch__commit_sync_fails", "[prove]") {
@@ -3725,7 +3758,7 @@ TEST_CASE("prove__populated_db__mixed_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3769,7 +3802,7 @@ TEST_CASE("prove__populated_db__large_batch__success", "[prove]") {
         .keys_added = {"p0", "p1", "p2"},
         .keys_removed = {},
         .lsn_advance = 5,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3810,7 +3843,7 @@ TEST_CASE("prove__populated_db__large_batch__append_fails_nothing_written", "[pr
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3853,7 +3886,7 @@ TEST_CASE("prove__populated_db__large_batch__append_fails_partial_write", "[prov
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3897,7 +3930,7 @@ TEST_CASE("prove__populated_db__large_batch__append_fails_after_full_write", "[p
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -3941,7 +3974,7 @@ TEST_CASE("prove__populated_db__large_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3973,8 +4006,9 @@ TEST_CASE("prove__populated_db__large_batch__on_bulk_end_append", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__large_batch__isolation_sync_fails", "[prove]") {
@@ -3984,7 +4018,7 @@ TEST_CASE("prove__populated_db__large_batch__isolation_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4016,8 +4050,9 @@ TEST_CASE("prove__populated_db__large_batch__isolation_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__large_batch__isolation_rotation_fails", "[prove]") {
@@ -4027,7 +4062,7 @@ TEST_CASE("prove__populated_db__large_batch__isolation_rotation_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4059,8 +4094,9 @@ TEST_CASE("prove__populated_db__large_batch__isolation_rotation_fails", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__large_batch__commit_sync_fails", "[prove]") {
@@ -4070,7 +4106,7 @@ TEST_CASE("prove__populated_db__large_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 5,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4115,7 +4151,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__success", "[prove]") {
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4157,7 +4193,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_nothing_wri
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4201,7 +4237,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_partial_wri
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4235,8 +4271,9 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_partial_wri
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_after_full_write", "[prove]") {
@@ -4246,7 +4283,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_after_full_
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4290,7 +4327,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__commit_sync_fails", "[pr
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4336,7 +4373,7 @@ TEST_CASE("prove__populated_db__conflicting_plan__before_any_io", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4379,7 +4416,7 @@ TEST_CASE("prove__rotation_threshold__single_put__success", "[prove]") {
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4409,7 +4446,7 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_nothing_written",
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4441,7 +4478,7 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_partial_write", "
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4463,8 +4500,9 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_partial_write", "
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__single_put__append_fails_after_full_write", "[prove]") {
@@ -4474,7 +4512,7 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_after_full_write"
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4506,7 +4544,7 @@ TEST_CASE("prove__rotation_threshold__single_put__commit_sync_fails", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4540,7 +4578,7 @@ TEST_CASE("prove__rotation_threshold__single_put__rotation_sync_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4574,7 +4612,7 @@ TEST_CASE("prove__rotation_threshold__single_put__rotation_file_creation_fails",
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4595,6 +4633,7 @@ TEST_CASE("prove__rotation_threshold__single_put__rotation_file_creation_fails",
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -4606,7 +4645,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__success", "[prove]") {
         .keys_added = {},
         .keys_removed = {"k0"},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4636,7 +4675,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_nothing_writte
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4668,7 +4707,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_partial_write"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4690,8 +4729,9 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_partial_write"
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__single_delete__append_fails_after_full_write", "[prove]") {
@@ -4701,7 +4741,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_after_full_wri
         .keys_added = {},
         .keys_removed = {"k0"},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4733,7 +4773,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__commit_sync_fails", "[prove
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4767,7 +4807,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__rotation_sync_fails", "[pro
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4801,7 +4841,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__rotation_file_creation_fail
         .keys_added = {},
         .keys_removed = {"k0"},
         .lsn_advance = 1,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4822,6 +4862,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__rotation_file_creation_fail
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -4833,7 +4874,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__success", "[prove]") {
         .keys_added = {"p0", "p1"},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4864,7 +4905,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_nothing_written", 
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4897,7 +4938,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_partial_write", "[
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4931,7 +4972,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_after_full_write",
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -4965,7 +5006,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__on_bulk_end_append", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4987,8 +5028,9 @@ TEST_CASE("prove__rotation_threshold__multi_put__on_bulk_end_append", "[prove]")
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__multi_put__isolation_sync_fails", "[prove]") {
@@ -4998,7 +5040,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__isolation_sync_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5020,8 +5062,9 @@ TEST_CASE("prove__rotation_threshold__multi_put__isolation_sync_fails", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__multi_put__isolation_rotation_fails", "[prove]") {
@@ -5031,7 +5074,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__isolation_rotation_fails", "[pr
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5053,8 +5096,9 @@ TEST_CASE("prove__rotation_threshold__multi_put__isolation_rotation_fails", "[pr
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails", "[prove]") {
@@ -5064,7 +5108,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails", "[prove]") 
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5099,7 +5143,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__rotation_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5134,7 +5178,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__rotation_file_creation_fails", 
         .keys_added = {"p0", "p1"},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5156,6 +5200,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__rotation_file_creation_fails", 
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -5167,7 +5212,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__success", "[prove]") {
         .keys_added = {"p0"},
         .keys_removed = {"k0"},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5198,7 +5243,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__append_fails_nothing_written"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5231,7 +5276,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__append_fails_partial_write", 
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5265,7 +5310,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__append_fails_after_full_write
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5299,7 +5344,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__on_bulk_end_append", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5321,8 +5366,9 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__on_bulk_end_append", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__mixed_batch__isolation_sync_fails", "[prove]") {
@@ -5332,7 +5378,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__isolation_sync_fails", "[prov
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5354,8 +5400,9 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__isolation_sync_fails", "[prov
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__mixed_batch__isolation_rotation_fails", "[prove]") {
@@ -5365,7 +5412,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__isolation_rotation_fails", "[
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5387,8 +5434,9 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__isolation_rotation_fails", "[
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__mixed_batch__commit_sync_fails", "[prove]") {
@@ -5398,7 +5446,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__commit_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5433,7 +5481,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__rotation_sync_fails", "[prove
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5468,7 +5516,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__rotation_file_creation_fails"
         .keys_added = {"p0"},
         .keys_removed = {"k0"},
         .lsn_advance = 4,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5490,6 +5538,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__rotation_file_creation_fails"
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -5501,7 +5550,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__success", "[prove]") {
         .keys_added = {"p0", "p1", "p2"},
         .keys_removed = {},
         .lsn_advance = 5,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5533,7 +5582,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__append_fails_nothing_written"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5567,7 +5616,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__append_fails_partial_write", 
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5602,7 +5651,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__append_fails_after_full_write
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5637,7 +5686,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__on_bulk_end_append", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5660,8 +5709,9 @@ TEST_CASE("prove__rotation_threshold__large_batch__on_bulk_end_append", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__large_batch__isolation_sync_fails", "[prove]") {
@@ -5671,7 +5721,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__isolation_sync_fails", "[prov
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5694,8 +5744,9 @@ TEST_CASE("prove__rotation_threshold__large_batch__isolation_sync_fails", "[prov
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__large_batch__isolation_rotation_fails", "[prove]") {
@@ -5705,7 +5756,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__isolation_rotation_fails", "[
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5728,8 +5779,9 @@ TEST_CASE("prove__rotation_threshold__large_batch__isolation_rotation_fails", "[
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__large_batch__commit_sync_fails", "[prove]") {
@@ -5739,7 +5791,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__commit_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 5,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5775,7 +5827,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__rotation_sync_fails", "[prove
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 5,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5811,7 +5863,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__rotation_file_creation_fails"
         .keys_added = {"p0", "p1", "p2"},
         .keys_removed = {},
         .lsn_advance = 5,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5834,6 +5886,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__rotation_file_creation_fails"
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -5845,7 +5898,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__success", "[prove]
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5878,7 +5931,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_nothi
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5913,7 +5966,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_parti
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5938,8 +5991,9 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_parti
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_after_full_write", "[prove]") {
@@ -5949,7 +6003,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_after
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -5984,7 +6038,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__commit_sync_fails"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -6021,7 +6075,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__rotation_sync_fail
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {
@@ -6058,7 +6112,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__rotation_file_crea
         .keys_added = {"p0"},
         .keys_removed = {},
         .lsn_advance = 1,
-        .poisoned = true,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -6082,6 +6136,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__rotation_file_crea
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -6093,7 +6148,7 @@ TEST_CASE("prove__rotation_threshold__conflicting_plan__before_any_io", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 0,
-        .poisoned = false,
+        .degraded = false,
     };
   Baseline before;
   {

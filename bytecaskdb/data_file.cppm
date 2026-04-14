@@ -267,6 +267,17 @@ public:
     return pre_write_offset;
   }
 
+  // Truncates the file to new_size bytes and resets offset_ accordingly.
+  // Clears tainted_. Throws std::system_error on failure.
+  void truncate(Offset new_size) {
+    if (::ftruncate(fd_, narrow<off_t>(new_size)) != 0) {
+      throw std::system_error{errno, std::system_category(),
+                              "DataFile::truncate"};
+    }
+    offset_ = new_size;
+    tainted_ = false;
+  }
+
 private:
   std::filesystem::path path_;
   int fd_{-1};

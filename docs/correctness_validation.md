@@ -147,11 +147,11 @@ class FailureClass(Enum):
     B2 = "append_fails_partial_write"     # writev returns short, file tainted
     B3 = "append_fails_after_full_write"  # writev ok, post-write fault, file tainted
     C  = "on_bulk_end_append"         # BulkEnd write fails — orphan isolation
-    D  = "isolation_sync_fails"       # sync during orphan isolation fails — poison
-    E  = "isolation_rotation_fails"   # rotation during orphan isolation fails — poison
+    D  = "isolation_sync_fails"       # sync during orphan isolation fails — degrade
+    E  = "isolation_rotation_fails"   # rotation during orphan isolation fails — degrade
     F  = "commit_sync_fails"          # sync in commit phase — persisted, throws
     G  = "rotation_sync_fails"        # post-write rotation sync fails — persisted, throws
-    H  = "rotation_file_creation_fails"  # post-write rotation fails after seal — poison
+    H  = "rotation_file_creation_fails"  # post-write rotation fails after seal — degrade
 ```
 
 ### Write outcome subclasses (B1, B2, B3)
@@ -187,18 +187,18 @@ returns a short write (`written > 0`). In the `apply_batch_if` catch
 block, if `!multi && file.is_tainted()`, the engine calls
 `DataFile::try_recover_failed_append`: it preads the entry at the
 pre-write offset and CRC-verifies it. Valid CRC → publish normally
-(B3 — write actually succeeded). Invalid CRC → poison the DB (B2).
+(B3 — write actually succeeded). Invalid CRC → degrade the DB (B2).
 
 B2 and B3 differ in recovery behavior for single-entry writes:
 
 - **B2 (single)** — partial bytes on disk. The entry has an invalid CRC
   or is truncated. Recovery skips it. The transition is not recovered.
 - **B3 (single)** — all bytes on disk, valid CRC. As of BC-156, the engine
-  attempts a read-back before poisoning: `pread` the entry at the known
+  attempts a read-back before degrading: `pread` the entry at the known
   offset and CRC-verify it. Valid CRC → the write is durable; the engine
   publishes state normally and returns success to the caller (no throw, no
-  poison). Invalid CRC or short read → poison as for B2. Before BC-156, B3
-  always poisoned — the recovery note below applied then but not now.
+  degrade). Invalid CRC or short read → degrade as for B2. Before BC-156, B3
+  always degraded — the recovery note below applied then but not now.
 
   *Recovery note (pre-BC-156 / B2 reference):* For B2, the partial bytes on
   disk have an invalid CRC; recovery skips the entry and the transition is
@@ -214,23 +214,24 @@ can occur at this point:
 - **G — rotation sync fails**: The pre-rotation `fdatasync` fails.
   The file is not sealed. The transition is fully persisted (appends
   succeeded), so the state is published and the exception is rethrown.
-  The DB is not poisoned — the next write will retry rotation or
+  The DB is not degraded — the next write will retry rotation or
   continue appending to the same file.
 - **H — rotation file creation fails**: The sync succeeded but
   `rotate_active_file` fails after sealing the active file. The sealed
   file cannot accept further appends (`assert(!sealed_)` would fire).
-  The engine poisons the DB and publishes the state (writes are on disk,
-  LSNs must advance). Recovery (process restart) clears the sealed file
-  problem by creating a fresh active file.
+  The engine degrades the DB and publishes the state (writes are on disk,
+  LSNs must advance). `resume()` creates a fresh active file and clears
+  the degraded state.
 
 Key insight: `rotate_active_file` calls `seal()` before creating the new
 file. If file creation fails, the active file is sealed and unusable.
-Publishing state without poisoning would leave an engine that appears
-healthy but fails on the next append. Poisoning is the correct response.
+Publishing state without degrading would leave an engine that appears
+healthy but fails on the next append. Degrading is the correct response;
+`resume()` restores normal operation.
 
 ### Class Behavior Summary
 
-| Class | Transition persisted | key_dir changes | LSN advances | Throws | Poisoned |
+| Class | Transition persisted | key_dir changes | LSN advances | Throws | Degraded |
 |-------|---------------------|-----------------|--------------|--------|----------|
 | SUCCESS | Yes — fully | Yes — full delta | Yes | No | No |
 | A | No — not attempted | No | No | No (returns false) | No |
@@ -238,7 +239,7 @@ healthy but fails on the next append. Poisoning is the correct response.
 | B2 (multi) | No — partial write | No | No | Yes | No (isolation rotates) |
 | B2 (single) | No — partial write | No | No | Yes | Yes (tainted) |
 | B3 (multi) | No — orphaned batch | No | No | Yes | No (isolation rotates) |
-| B3 (single) | Yes — full write, valid CRC | Yes — read-back verifies CRC, publishes if valid (BC-156) | No (in-process) | Yes | No — B3 no longer poisons; B2 still poisons |
+| B3 (single) | Yes — full write, valid CRC | Yes — read-back verifies CRC, publishes if valid (BC-156) | No (in-process) | Yes | No — B3 no longer degrades; B2 still degrades |
 | C | No — partial write | No | No | Yes | Yes |
 | D | No — partial write | No | No | Yes | Yes |
 | E | No — partial write | No | No | Yes | Yes |
@@ -251,11 +252,11 @@ is written via `writev` and reaches the file, but `fdatasync` fails — the
 transition is not confirmed durable. Key-directory changes are NOT published:
 the written key is invisible to subsequent reads, and the caller must retry.
 `next_lsn` is advanced past all consumed sequence numbers to prevent LSN
-reuse for bytes now in the page cache. The engine is not poisoned — subsequent
+reuse for bytes now in the page cache. The engine is not degraded — subsequent
 writes proceed normally, and the next write may retry the rotation if G failed.
 
 Class H is similar — the transition is persisted — but the engine is
-also poisoned because the sealed active file cannot accept further
+also degraded because the sealed active file cannot accept further
 appends.
 
 ---
@@ -339,7 +340,9 @@ Each test follows the same structure:
 4. Inject fault per `FaultConfig`
 5. Execute `apply_batch_if`
 6. `assert_delta(before, db, expected)` — validates key membership,
-   LSN advancement, structural consistency, and poison state
+   LSN advancement, structural consistency, and degraded state.
+   For degraded cases, `assert_resumable(db)` is called immediately after
+   to verify that `resume()` restores consistent state in-process.
 7. `assert_recoverable(dir, before, expected)` — validates persistence
    invariant via fresh recovery (where applicable)
 
@@ -380,8 +383,11 @@ I/O checkpoints:
   live_bytes matches key_dir, no dangling file references, active file
   exists, file_stats covers all files, next_lsn ahead of all sequences.
 - `assert_delta(before, db, expected)` — validates key membership, LSN
-  advancement, structural consistency, and poison state against the
+  advancement, structural consistency, and degraded state against the
   reference model's expected delta.
+- `assert_resumable(db)` — calls `resume()` and verifies the engine clears
+  the degraded flag and passes `assert_consistent`. Inserted immediately
+  after `assert_delta` for all degraded failure classes (C, D, E, H).
 - `assert_recoverable(dir, before, expected)` — opens a fresh DB from
   disk and verifies the recovered state matches the expected state
   (pre-existing keys survive, added keys present, removed keys absent,
@@ -402,9 +408,14 @@ smoke testing not covered by the proof matrix:
 - `mid-batch append failure rotates file and discards partial batch`
   (`[fault_inject]`) — tests `apply_batch` (not `apply_batch_if`)
   recovery by reopening the DB and verifying orphaned batch discard.
-- `reads work on a poisoned DB` (`[poisoned]`) — tests the full read
+- `reads work on a degraded DB` (`[degraded]`) — tests the full read
   API surface (`get`, `contains_key`, `snapshot`, `iter_from`,
-  `keys_from`) on a poisoned DB instance.
+  `keys_from`) on a degraded DB instance, then calls `resume()` to
+  verify in-process recovery.
+- `resume() recovers from degraded state` (`[degraded][resume]`) — injects
+  `io_rotate_file_creation` to trigger class T4 (post-write rotation fail),
+  verifies `DbDegraded` is thrown, calls `resume()`, and confirms writes
+  succeed afterward.
 
 ---
 
