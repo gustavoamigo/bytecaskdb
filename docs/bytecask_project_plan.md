@@ -53,6 +53,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-139 | Python test generator — correctness proof tests (Phase 3) | `tests/proof/`: `scenario_matrix.py` (4 state shapes × 7 plan shapes × 11 failure classes, 172 valid combinations), `expected_delta.py` (pure reference model), `fault_point_resolver.py` (maps failures to `ScopedFaultInjector` configs), `generate_tests.py` (produces `prove_apply_batch_if.cpp`). 172 `[prove]` Catch2 tests validate every (StateShape, PlanShape, FailureClass) combination for `apply_batch_if`. Finding: class C poisons (corrected from original model). 382 total tests pass. |
 | BC-138 | `invariants.h` — correctness validation helpers (Phase 2) | `tests/proof/invariants.h`: `Baseline`, `ExpectedDelta`, `capture_baseline`, `assert_consistent` (5 structural invariants), `assert_delta` (key membership, LSN advancement, poison state), `assert_recoverable` (persistence invariant via fresh recovery). 12 new `[invariants]` tests in `tests/invariants_test.cpp`. 210 total tests pass. Unblocks Phase 3 (Python test generator). |
 
 | ID | Title | Note |

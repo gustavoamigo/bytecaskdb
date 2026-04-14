@@ -1,12 +1,12 @@
 # ByteCaskDB — Correctness Validation Plan
 
-> **Status**: Phases 1–2 complete. The single write path, transient/persistent
+> **Status**: Phases 1–3 complete. The single write path, transient/persistent
 > state discipline, behavioral contract, fault injection framework,
-> `DbPoisoned`, and the `invariants.h` test helpers (`assert_consistent`,
-> `assert_delta`, `assert_recoverable`) are implemented and tested. All
-> eleven failure classes have test coverage. 210 tests pass. The formal
-> validation model (Python test generator, exhaustive prove tests) is
-> designed but not yet built.
+> `DbPoisoned`, the `invariants.h` test helpers, and the Python test
+> generator are implemented and tested. 172 generated proof tests cover
+> every valid (StateShape, PlanShape, FailureClass) combination for
+> `apply_batch_if`. 382 total tests pass. The CI model-diff step
+> (Phase 4) is not yet configured.
 >
 > This document should be read alongside [`CONTRACT.md`](../CONTRACT.md) and
 > the [project plan](bytecask_project_plan.md).
@@ -185,16 +185,6 @@ next write.
 
 ## What Is Not Built
 
-### Python test generator
-
-The core deliverable of the formal validation model. None of the
-planned files exist:
-- `generate_tests.py` — the generator
-- `expected_delta.py` — the reference model
-- `fault_point_resolver.py` — maps classes to checkpoint numbers
-- `scenario_matrix.py` — the input matrix
-- `generated/*.cpp` — committed evidence
-
 ### CI model-diff step
 
 A CI step that regenerates tests and verifies no diff. Not yet
@@ -333,7 +323,7 @@ healthy but fails on the next append. Poisoning is the correct response.
 | B2 (single) | No — partial write | No | No | Yes | Yes (tainted) |
 | B3 (multi) | No — full write | No | No | Yes | No (isolation rotates) |
 | B3 (single) | No — full write | No | No | Yes | Yes (tainted) |
-| C | No — partial write | No | No | Yes | No |
+| C | No — partial write | No | No | Yes | Yes |
 | D | No — partial write | No | No | Yes | Yes |
 | E | No — partial write | No | No | Yes | Yes |
 | F | Yes — fully | Yes — full delta | Yes | Yes | No |
@@ -404,16 +394,27 @@ def expected_delta(P: PlanShape, F: FailureClass) -> Delta:
             threw        = False,
         )
 
-    elif F in {FailureClass.B1, FailureClass.C}:
+    elif F in {FailureClass.B1}:
         # Transition not fully persisted — must not be applied.
         # B1: writev returned -1, no bytes on disk. Safe.
-        # C: BulkEnd failed, isolation rotates. Safe.
         return Delta(
             keys_added   = [],
             keys_removed = [],
             lsn_advance  = 0,       # published next_lsn unchanged
             stats_delta  = NoDelta,
             poisoned     = False,
+            threw        = True,
+        )
+
+    elif F == FailureClass.C:
+        # BulkEnd failed — partial batch on disk, isolation rotates.
+        # Engine detects incomplete batch and poisons.
+        return Delta(
+            keys_added   = [],
+            keys_removed = [],
+            lsn_advance  = 0,
+            stats_delta  = NoDelta,
+            poisoned     = True,
             threw        = True,
         )
 
@@ -843,20 +844,44 @@ validate the helpers. 210 total tests pass.
 
 **Unblocks**: all generated tests.
 
-### Phase 3 — Python test generator
+### Phase 3 — Python test generator ✅
 
-The core deliverable. Produces deterministic C++ test cases from
-the scenario matrix × failure classes × plan shapes.
+Implemented in BC-139. All four Python modules and the generated C++
+test file are in place:
 
 | File | Purpose |
 |------|---------|
-| `expected_delta.py` | The reference model, independently readable |
-| `fault_point_resolver.py` | Maps failure classes to injection configurations |
-| `scenario_matrix.py` | The input matrix, enumerable and auditable |
-| `generate_tests.py` | The generator |
-| `generated/*.cpp` | Committed evidence, never hand-edited |
+| `tests/proof/scenario_matrix.py` | 4 state shapes × 7 plan shapes × 11 failure classes; validity filter yields 172 combinations |
+| `tests/proof/expected_delta.py` | Pure reference model: `expected_delta(plan, failure, ...)` → `Delta` |
+| `tests/proof/fault_point_resolver.py` | Maps (state, plan, failure) → `FaultConfig` for `ScopedFaultInjector` |
+| `tests/proof/generate_tests.py` | Generator: produces `prove_apply_batch_if.cpp` (172 Catch2 `[prove]` tests) |
+| `tests/proof/generated/prove_apply_batch_if.cpp` | Committed evidence — never hand-edited |
+
+**Scope**: `apply_batch_if` only (no vacuum). Invalid combinations
+are silently skipped (4 elimination rules reduce 308 → 172 tests).
+
+Every test follows the same structure:
+1. Set up initial DB state from `StateShape`
+2. Capture baseline
+3. Construct `WritePlan` from `PlanShape`
+4. Inject fault per `FaultConfig`
+5. Execute `apply_batch_if`
+6. `assert_delta(before, db, expected)` — validates key membership,
+   LSN advancement, structural consistency, and poison state
+7. `assert_recoverable(dir, before, expected)` — validates persistence
+   invariant via fresh recovery (where applicable)
+
+Regeneration (`python3 tests/proof/generate_tests.py`) is deterministic
+and produces no diff. 382 total tests pass (210 existing + 172 prove).
 
 **Depends on**: Phases 1–2.
+
+**Findings during implementation**: Class C (`on_bulk_end_append`) was
+originally modeled as non-poisoning. The proof tests revealed that the
+engine poisons on BulkEnd failure (partial batch on disk triggers
+poison). The reference model and behavior summary table were corrected.
+
+**Unblocks**: CI model-diff step (Phase 4).
 
 ### Phase 4 — CI model-diff step
 
