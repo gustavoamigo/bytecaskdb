@@ -10,7 +10,7 @@
 ## Conceptual Model
 
 The append-only data file is a persistence mechanism for `EngineState`
-transitions. Conceptually, we can this that the database *is* `EngineState`. 
+transitions. Conceptually, we can think of the database as *being* `EngineState`. 
 The file exists only to make `EngineState` recoverable after a crash.
 
 A write operation is a state transition. It is correct if and only if:
@@ -165,23 +165,37 @@ can produce three outcomes:
 - **B2 — partial write**: `writev` returns 0 < N < total. N bytes are
   on disk, kernel fd position advanced by N. `offset_` is not advanced
   (the throw in `append()` skips `offset_ +=`). The file is `tainted`.
-- **B3 — full write + failure**: `writev` returns total (all bytes on
-  disk), but the caller throws before `offset_` advances. Only possible
-  via fault injection (`PostWriteMode::throw_after`). The file is
-  `tainted`.
+- **B3 — full write + error return**: `writev` writes all bytes to
+  disk successfully, but an error is returned to the caller (simulated
+  by `PostWriteMode::throw_after`, which throws after `writev` returns
+  but before `offset_` advances). The entry is structurally complete on
+  disk with a valid CRC. The file is `tainted`.
 
 For multi-entry batches, B2 and B3 are safe: the isolation rotation
-moves to a new file, abandoning the tainted one. For single-entry
-writes, there is no isolation — `offset_` diverges from the kernel's
-file position (the file was opened with `O_APPEND`). The next `writev`
-would write at the kernel's true EOF (past the stale bytes), but
-`offset_` would still point to the old position. The returned offset
-for subsequent entries would be wrong — silent corruption.
+moves to a new file, abandoning the tainted one. Recovery discards the
+orphaned batch because the BulkBegin/BulkEnd framing is incomplete.
+
+For single-entry writes, there is no isolation — `offset_` diverges
+from the kernel's file position (the file was opened with `O_APPEND`).
+The next `writev` would write at the kernel's true EOF (past the stale
+bytes), but `offset_` would still point to the old position. The
+returned offset for subsequent entries would be wrong — silent
+corruption.
 
 The fix: `DataFile::append()` sets `tainted_ = true` when `writev`
 returns a short write (`written > 0`). In the `apply_batch_if` catch
 block, if `!multi && file.is_tainted()`, the engine poisons the DB.
-Recovery (process restart) clears the state.
+
+B2 and B3 differ in recovery behavior for single-entry writes:
+
+- **B2 (single)** — partial bytes on disk. The entry has an invalid CRC
+  or is truncated. Recovery skips it. The transition is not recovered.
+- **B3 (single)** — all bytes on disk, valid CRC. Recovery *will* parse
+  and include the entry. The transition is recovered. This is correct:
+  the write succeeded at the I/O level, and recovery should honor it.
+  The engine poisons because the in-process state is inconsistent (it
+  received an error and did not publish), but recovery from a restart
+  produces the correct state.
 
 ### Post-write rotation failure subclasses (G, H)
 
@@ -216,8 +230,8 @@ healthy but fails on the next append. Poisoning is the correct response.
 | B1 | No — nothing written | No | No | Yes | No |
 | B2 (multi) | No — partial write | No | No | Yes | No (isolation rotates) |
 | B2 (single) | No — partial write | No | No | Yes | Yes (tainted) |
-| B3 (multi) | No — full write | No | No | Yes | No (isolation rotates) |
-| B3 (single) | No — full write | No | No | Yes | Yes (tainted) |
+| B3 (multi) | No — orphaned batch | No | No | Yes | No (isolation rotates) |
+| B3 (single) | Yes — full write, valid CRC | No (not published) | No (in-process) | Yes | Yes (tainted) |
 | C | No — partial write | No | No | Yes | Yes |
 | D | No — partial write | No | No | Yes | Yes |
 | E | No — partial write | No | No | Yes | Yes |
@@ -225,11 +239,27 @@ healthy but fails on the next append. Poisoning is the correct response.
 | G | Yes — fully | Yes — full delta | Yes | Yes | No |
 | H | Yes — fully | Yes — full delta | Yes | Yes | Yes |
 
-Note: Classes F and G are the cases where the transition is fully persisted
-but the caller receives an exception. The state is published before the
-exception is rethrown. Class H is similar — the transition is persisted —
-but the engine is also poisoned because the sealed active file cannot
-accept further appends.
+Note on classes F and G — durability vs persistence: The data is written
+via `writev` (in page cache) and the state is published, but `fdatasync`
+failed — the transition is not yet durable to power loss. A power failure
+before the next successful sync could lose the data. However:
+
+- A clean process shutdown flushes page cache. The data survives.
+- The next successful `fdatasync` on the same file (triggered by the
+  next write or rotation) flushes all preceding pages.
+- Reads see the data immediately — it is in the page cache.
+
+The current design does not poison on sync failure. Poisoning would
+discard a write that is very likely to survive, and the caller receives
+the exception and can retry or sync explicitly. The durability guarantee
+for F/G is: the transition is persisted to page cache and will become
+durable on the next successful sync, clean shutdown, or kernel flush.
+Between the failed sync and one of those events, a power failure or
+kernel crash can lose it.
+
+Class H is similar — the transition is persisted — but the engine is
+also poisoned because the sealed active file cannot accept further
+appends.
 
 ---
 
@@ -238,10 +268,11 @@ accept further appends.
 ### Single write path
 
 All mutations — `put`, `del`, `apply_batch`, `apply_batch_if` — route
-through `apply_batch_if` as the single coordinator. The two-phase
-discipline is enforced: I/O first (`DataFile::append`), then pure
-in-memory state mutations (`TransientEngineState::apply_writes`), then
-publish (`TransientEngineState::persistent()`).
+through `apply_batch_if` as the single coordinator under `write_mu_`
+(one writer at a time). The two-phase discipline is enforced: I/O first
+(`DataFile::append`), then pure in-memory state mutations
+(`TransientEngineState::apply_writes`), then publish
+(`TransientEngineState::persistent()`).
 
 `TransientEngineState` is the mutable working copy of engine state.
 It provides:
@@ -265,7 +296,7 @@ model.
 `bytecaskdb/fault_injector.h` provides:
 - `FaultInjector` with name-based and count-based injection, plus a
   count-based skip set for selective cascade control
-- `ScopedFaultInjector` RAII guard with three constructor forms:
+- `ScopedFaultInjector` RAII guard with four constructor forms:
   name-based, count-based, count-based with skip set, and name-based
   with post-write mode
 - `PostWriteMode` (`short_write`, `throw_after`) for simulating partial
