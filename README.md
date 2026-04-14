@@ -12,14 +12,14 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 
 ## Features
 
-- **Sequential write path** — every `put`, `del`, and `apply_batch` performs a single sequential append; no WAL, no random writes, just one I/O operation per write.
+- **Sequential write path** — all I/O is sequential appends; no random writes. Every `put` and `del` is one append. `apply_batch` with N operations appends a begin marker, N entries, and an end marker in a single `writev` — still no WAL, no random writes.
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
 - **Atomic writes** — every `put` and `del` is atomic. `apply_batch` makes multiple puts and deletes atomic as a group.
-- **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch_if(snap, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add `ensure_unchanged` / range guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
+- **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch_if(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. The snapshot is embedded in the `WritePlan` at construction time. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add `ensure_unchanged` / range guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
-- **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex; `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
-- **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and data files that act as a write-ahead log ensure durability.
+- **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex; on the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
+- **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a poisoned state: reads remain available, all writes throw `DbPoisoned`, and only a process restart clears the state.
 
 ## Performance
 
@@ -73,9 +73,9 @@ Latency stays flat as the dataset grows: ByteCaskDB always reads from the OS pag
 
 ### Read-While-Writing (1M keys, 1 writer + N readers, Sync, CRC disabled)
 
-> Two read consistency modes: the default acquires a per-read epoch lock; **BoundedStaleness** snapshots the keydir once per write batch, eliminating reader-writer contention at the cost of readers seeing writes that are at most one batch behind.
+> Two read consistency modes, both controlled via `ReadOptions::staleness_tolerance`: the default (`staleness_tolerance = 0`) refreshes the thread-local snapshot on every write, guaranteeing same-thread read-your-writes; setting `staleness_tolerance > 0` refreshes only when the tolerance window has elapsed — the hot path is a single relaxed load with no locked instructions or refcount traffic.
 
-| Readers | ByteCaskDB | ByteCaskDB BoundedStaleness | RocksDB |
+| Readers | ByteCaskDB | ByteCaskDB (staleness_tolerance > 0) | RocksDB |
 |---:|---:|---:|---:|
 | 2 | 2.54 Mops/s | 2.61 Mops/s | 1.12 Mops/s |
 | 4 | 4.26 Mops/s | 4.46 Mops/s | 2.14 Mops/s |
@@ -128,12 +128,12 @@ db.apply_batch({}, std::move(batch));
 // applies the plan only if every precondition holds.
 auto snap = db.snapshot();
 Bytes balance_out;
-snap.get(to_bytes("account:42"), balance_out);
+bool found = snap.get(to_bytes("account:42"), balance_out);
 // ... compute new_balance ...
-WritePlan plan;
+WritePlan plan{std::move(snap)};          // snapshot embedded in the plan
 plan.ensure_unchanged(to_bytes("account:42"));   // guard: no concurrent write
 plan.put(to_bytes("account:42"), new_balance);
-if (!db.apply_batch_if(snap, {}, std::move(plan))) {
+if (!db.apply_batch_if({}, std::move(plan))) {
     // a concurrent writer modified "account:42" — retry
 }
 
@@ -164,20 +164,41 @@ for (auto& key : db.rkeys_from({}, to_bytes("user:~"))) { ... }
 ```cpp
 namespace bytecask {
 
+struct Options {
+    uint64_t max_file_bytes{64 * 1024 * 1024};  // active file rotation threshold (default 64 MiB)
+    unsigned recovery_threads{4};                // parallelism for hint-file replay at open
+};
+
+struct WriteOptions {
+    bool sync{true};      // call fdatasync after write (default true)
+    bool try_lock{false}; // non-blocking lock; throws std::system_error(EBUSY) if contended
+};
+
+struct ReadOptions {
+    // staleness_tolerance == 0 (default): refresh thread-local snapshot on every write.
+    // staleness_tolerance  > 0: refresh only when the last write is older than this window.
+    std::chrono::milliseconds staleness_tolerance{0};
+    bool verify_checksums{false}; // CRC-verify each value read from disk (default false)
+};
+
 class DB {
 public:
+    // DB is non-copyable and non-moveable; open() relies on mandatory copy elision.
     [[nodiscard]] static auto open(std::filesystem::path dir,
                                    Options opts = {}) -> DB;
 
     // Writes value for key into out, reusing its capacity. Returns true if found.
-    // Throws std::system_error on I/O failure or std::runtime_error on CRC mismatch.
+    // Throws std::system_error on I/O failure, std::runtime_error on CRC mismatch,
+    // or DbPoisoned if the engine is poisoned.
     [[nodiscard]] auto get(const ReadOptions& opts,
                            BytesView key, Bytes& out) const -> bool;
 
     // Writes key → value. Overwrites any existing value.
+    // Throws std::system_error on I/O failure or DbPoisoned if the engine is poisoned.
     void put(const WriteOptions& opts, BytesView key, BytesView value);
 
     // Writes a tombstone for key. Returns true if the key existed.
+    // Throws std::system_error on I/O failure or DbPoisoned if the engine is poisoned.
     [[nodiscard]] auto del(const WriteOptions& opts, BytesView key) -> bool;
 
     [[nodiscard]] auto contains_key(BytesView key) const -> bool;
@@ -189,10 +210,11 @@ public:
     // Holds open referenced data files until destroyed — vacuum deferred automatically.
     [[nodiscard]] auto snapshot() const -> Snapshot;
 
-    // Applies plan atomically iff every guard holds (key present/absent/unchanged,
-    // range unchanged) and no write key was modified since snap.
-    // Returns false on conflict; throws std::system_error on I/O failure.
-    [[nodiscard]] auto apply_batch_if(const Snapshot& snap, WriteOptions opts,
+    // Applies plan atomically iff every guard holds and no write key was modified
+    // since the plan's snapshot. Returns true if committed (including when the plan
+    // is empty — no-op). Returns false on conflict.
+    // Throws std::system_error on I/O failure or DbPoisoned if the engine is poisoned.
+    [[nodiscard]] auto apply_batch_if(WriteOptions opts,
                                       WritePlan plan) -> bool;
 
     [[nodiscard]] auto iter_from(const ReadOptions& opts, BytesView from = {}) const
@@ -209,12 +231,56 @@ public:
 
     // Returns true if a file was vacuumed, false if no file qualified.
     [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
+
+    // True if the engine has entered a poisoned state from an unrecoverable write-path failure.
+    // Reads remain available; all write operations throw DbPoisoned. Only a process restart clears it.
+    [[nodiscard]] auto is_poisoned() const noexcept -> bool;
+    [[nodiscard]] auto poison_reason() const noexcept -> const std::string&;
 };
+
+// Frozen, move-only, read-only view of DB state at a point in time.
+// Holds open any referenced data files until destroyed.
+class Snapshot {
+public:
+    [[nodiscard]] auto get(BytesView key, Bytes& out) const -> bool;
+    [[nodiscard]] auto contains_key(BytesView key) const -> bool;
+    [[nodiscard]] auto iter_from(BytesView from = {}) const
+        -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
+    [[nodiscard]] auto keys_from(BytesView from = {}) const
+        -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
+    [[nodiscard]] auto riter_from(BytesView from = {}) const
+        -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
+    [[nodiscard]] auto rkeys_from(BytesView from = {}) const
+        -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
+};
+
+// Conditional write plan for apply_batch_if.
+// Construct with WritePlan(snap) to enable ensure_unchanged / ensure_range_unchanged guards;
+// those methods throw std::logic_error if called on a snapshot-less WritePlan().
+class WritePlan {
+public:
+    WritePlan();                         // snapshot-less: only ensure_present/ensure_absent available
+    explicit WritePlan(Snapshot snap);   // snapshot embedded; all guards available
+
+    void put(BytesView key, BytesView value);
+    void del(BytesView key);
+
+    void ensure_present(BytesView key);                         // guard: key must exist
+    void ensure_absent(BytesView key);                          // guard: key must be absent
+    void ensure_unchanged(BytesView key);                       // guard: key unchanged since snapshot
+    void ensure_range_unchanged(BytesView from, BytesView to);  // guard: no key change in [from, to)
+
+    [[nodiscard]] auto has_snapshot() const noexcept -> bool;
+};
+
+// Thrown by write operations when the engine is in a poisoned state.
+class DbPoisoned : public std::runtime_error { /* ... */ };
 
 } // namespace bytecask
 ```
 
-Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; key-not-found is signalled by `get` returning `false`; `apply_batch_if` returns `false` on precondition or W-W conflict (conflicts are expected outcomes, not exceptional errors).
+Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; write operations on a poisoned engine throw `DbPoisoned` (a `std::runtime_error` subclass, catchable separately). Key-not-found is signalled by `get` returning `false`; `apply_batch_if` returns `false` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors.
+
 
 ## Architecture
 
@@ -237,11 +303,11 @@ ByteCaskDB is designed around four core tenets, in priority order:
   └── Sealed Files   read-only .data + .hint files      (older segments)
 ```
 
-**Write path**: all writes route through a single coordinator (`apply_batch_if`). Each write appends a CRC-32-verified, length-prefixed record to the active data file, then applies pure in-memory state transitions via `TransientEngineState`. When `sync` is requested, `fdatasync` completes before the new state becomes visible to readers.
+**Write path**: all writes route through a single coordinator (`apply_batch_if`). Each write appends one or more CRC-32-verified, length-prefixed records to the active data file (single-entry writes: one record; multi-entry batches: begin marker + N entry records + end marker), then applies pure in-memory state transitions via `TransientEngineState`. When `sync` is requested, `fdatasync` completes before the new state becomes visible to readers.
 
 **Read path**: readers obtain an immutable snapshot of the engine state, look up the key in the radix tree to find its file and offset, then read the value directly. Reads are lock-free and scale linearly across cores.
 
-**Recovery**: on `open`, the engine replays hint files (compact per-file indexes written atomically at rotation time) to rebuild the key directory, then scans the active file's tail for entries written after the last hint flush. Recovery is parallelised across files for fast startup.
+**Recovery**: on `open`, the engine generates a hint file for any data file that lacks one (including the most recent active file), then replays all hint files in parallel to rebuild the key directory. Hint files are compact per-file indexes written atomically (`write → fdatasync → rename`) by a background worker after each file rotation and synchronously at engine close. No raw data-file scan is performed — recovery reads only hint files.
 
 See [`docs/bytecask_design.md`](docs/bytecask_design.md) for the full design reference.
 
