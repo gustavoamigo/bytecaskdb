@@ -19,6 +19,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-110 | MariaDB storage engine integration — design | Design doc (`docs/mariadb_engine_design.md`) and phased plan for `ha_bytecask` plugin. Branch: `feature/mariadb-engine`. |
 | BC-155 | Gate visibility behind `fdatasync` on F/G failures | Key changes no longer published on sync failure (classes F and G). Only `next_lsn` advances to prevent LSN reuse. Aligns ByteCaskDB with all five peers. `[f_visibility]`/`[g_visibility]` tests added; 172 proof tests updated. |
 | BC-156 | Read-back verification before poison on B3 single-entry | `DataFile::try_recover_failed_append` added. On B3, engine reads back the entry and CRC-verifies before poisoning. Valid CRC → publish normally, no poison. `[data_file]` unit tests + proof tests updated. |
+| BC-157 | Parallel recovery terminate bug + `fail_recovery_on_crc_errors` option | Fix `std::terminate` in `recovery_load_parallel` (exception escaping jthread lambda). Add `Options::fail_recovery_on_crc_errors` (default `true`). When `false`: corrupt hint files skipped with stderr warning, DB opens with partial recovery. `[recovery_strict]`/`[recovery_lenient]`/`[recovery_parallel_terminate_fix]` tests added. |
 ## Backlog
 
 ### MariaDB Engine Integration

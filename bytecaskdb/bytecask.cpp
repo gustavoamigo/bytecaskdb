@@ -10,6 +10,7 @@ module;
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
 #endif
@@ -384,9 +385,10 @@ DB::DB(std::filesystem::path dir, Options opts)
   s.files =
       std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>();
   if (opts.recovery_threads <= 1) {
-    s = recovery_load_serial(std::move(s));
+    s = recovery_load_serial(std::move(s), opts.fail_recovery_on_crc_errors);
   } else {
-    s = recovery_load_parallel(std::move(s), opts.recovery_threads);
+    s = recovery_load_parallel(std::move(s), opts.recovery_threads,
+                               opts.fail_recovery_on_crc_errors);
   }
   s.active_file_id = s.next_file_id++;
   const auto stem = make_data_file_stem();
@@ -848,7 +850,8 @@ void DB::rotate_active_file(TransientEngineState &t,
 // mid-write) is silently discarded. Idempotent: skips files whose .hint
 // already exists.
 void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
-                               const std::filesystem::path &dir) {
+                               const std::filesystem::path &dir,
+                               bool strict) {
   const auto stem = file->path().stem().string();
   const auto hint_path = dir / (stem + ".hint");
   const auto tmp_path = dir / (stem + ".hint.tmp");
@@ -871,35 +874,44 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
   std::vector<PendingHint> all_hints; // all confirmed entries across the file
   Offset off = 0;
 
-  while (auto result = file->scan(off)) {
-    const auto entry_off = off;
-    const auto &[entry, next] = *result;
-    switch (entry.entry_type) {
-    case EntryType::BulkBegin:
-      in_batch = true;
-      pending.clear();
-      break;
-    case EntryType::BulkEnd:
-      for (auto &pe : pending) {
-        all_hints.push_back(std::move(pe));
-      }
-      pending.clear();
-      in_batch = false;
-      break;
-    case EntryType::Put:
-    case EntryType::Delete:
-      if (in_batch) {
-        pending.push_back({entry.sequence, entry.entry_type, entry_off,
-                           narrow<std::uint32_t>(entry.value.size()),
-                           entry.key});
-      } else {
-        all_hints.push_back({entry.sequence, entry.entry_type, entry_off,
+  try {
+    while (auto result = file->scan(off)) {
+      const auto entry_off = off;
+      const auto &[entry, next] = *result;
+      switch (entry.entry_type) {
+      case EntryType::BulkBegin:
+        in_batch = true;
+        pending.clear();
+        break;
+      case EntryType::BulkEnd:
+        for (auto &pe : pending) {
+          all_hints.push_back(std::move(pe));
+        }
+        pending.clear();
+        in_batch = false;
+        break;
+      case EntryType::Put:
+      case EntryType::Delete:
+        if (in_batch) {
+          pending.push_back({entry.sequence, entry.entry_type, entry_off,
                              narrow<std::uint32_t>(entry.value.size()),
                              entry.key});
+        } else {
+          all_hints.push_back({entry.sequence, entry.entry_type, entry_off,
+                               narrow<std::uint32_t>(entry.value.size()),
+                               entry.key});
+        }
+        break;
       }
-      break;
+      off = next;
     }
-    off = next;
+  } catch (const std::exception &e) {
+    if (strict) throw;
+    std::cerr << "bytecask: truncated entry in " << file->path()
+              << " while generating hint file, recovering up to this point: "
+              << e.what() << "\n";
+    // Fall through — write hint file with entries collected so far.
+    in_batch = false;  // discard any pending incomplete batch
   }
 
   if (in_batch) {
@@ -1182,7 +1194,7 @@ auto DB::acquire_write_lock(const WriteOptions &opts)
 // Phase 1 shared by serial and parallel recovery: remove stale .hint.tmp
 // files, open all data files, seal them, register in s.files, and
 // generate missing hint files. Returns the RecoveredFile list.
-auto DB::recovery_prepare_files(EngineState &s)
+auto DB::recovery_prepare_files(EngineState &s, bool strict)
     -> std::vector<RecoveredFile> {
   for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
     const auto &p = dir_entry.path();
@@ -1207,7 +1219,7 @@ auto DB::recovery_prepare_files(EngineState &s)
 
     const auto hint_path = dir_ / (p.stem().string() + ".hint");
     if (!std::filesystem::exists(hint_path)) {
-      flush_hints_for(data_file, dir_);
+      flush_hints_for(data_file, dir_, strict);
     }
 
     files.push_back({file_id, std::move(data_file), hint_path,
@@ -1219,7 +1231,9 @@ auto DB::recovery_prepare_files(EngineState &s)
 
 // Builds a RecoveryResult from a subset of hint files.
 // Each worker calls this independently — no shared mutable state.
-auto DB::recovery_build_from_hints(std::span<RecoveredFile> files)
+// When strict is false, corrupt or unreadable hint files are skipped
+// with a warning instead of throwing.
+auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
     -> RecoveryResult {
   std::uint64_t max_lsn = 0;
   auto t = PersistentRadixTree<KeyDirEntry>{}.transient();
@@ -1238,30 +1252,37 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files)
   };
 
   for (auto &[file_id, data_file, hint_path, tb] : files) {
-    auto hint = HintFile::OpenForRead(hint_path);
-    auto scanner = hint.make_scanner();
-    while (auto he = scanner.next()) {
-      if (he->entry_type == EntryType::Put) {
-        const auto k = Key{he->key};
-        const auto tomb_it = tombstones.find(k);
-        if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
-          if (he->sequence > max_lsn) max_lsn = he->sequence;
-          continue;
+    try {
+      auto hint = HintFile::OpenForRead(hint_path);
+      auto scanner = hint.make_scanner();
+      while (auto he = scanner.next()) {
+        if (he->entry_type == EntryType::Put) {
+          const auto k = Key{he->key};
+          const auto tomb_it = tombstones.find(k);
+          if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
+            if (he->sequence > max_lsn) max_lsn = he->sequence;
+            continue;
+          }
+          t.upsert(he->key,
+                   KeyDirEntry{he->sequence, file_id, he->file_offset,
+                               he->value_size},
+                   lsn_wins);
+        } else if (he->entry_type == EntryType::Delete) {
+          const auto k = Key{he->key};
+          auto &tomb_seq = tombstones[k];
+          if (he->sequence > tomb_seq) tomb_seq = he->sequence;
+          const auto existing = t.get(he->key);
+          if (existing && existing->sequence < he->sequence) {
+            t.erase(he->key);
+          }
         }
-        t.upsert(he->key,
-                 KeyDirEntry{he->sequence, file_id, he->file_offset,
-                             he->value_size},
-                 lsn_wins);
-      } else if (he->entry_type == EntryType::Delete) {
-        const auto k = Key{he->key};
-        auto &tomb_seq = tombstones[k];
-        if (he->sequence > tomb_seq) tomb_seq = he->sequence;
-        const auto existing = t.get(he->key);
-        if (existing && existing->sequence < he->sequence) {
-          t.erase(he->key);
-        }
+        if (he->sequence > max_lsn) max_lsn = he->sequence;
       }
-      if (he->sequence > max_lsn) max_lsn = he->sequence;
+    } catch (const std::exception &e) {
+      if (strict) throw;
+      std::fprintf(stderr,
+                   "bytecask: skipping hint file '%s' due to CRC error: %s\n",
+                   hint_path.string().c_str(), e.what());
     }
   }
 
@@ -1319,8 +1340,8 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 // then recovers exclusively from hints — single code path.
 // Returns a new EngineState with key_dir populated and next_lsn set to
 // max_seen + 1. next_file_id is advanced for each recovered file.
-auto DB::recovery_load_serial(EngineState s) -> EngineState {
-  auto files = recovery_prepare_files(s);
+auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
+  auto files = recovery_prepare_files(s, strict);
 
   for (const auto &rf : files) {
     s.file_stats[rf.file_id].total_bytes = rf.total_bytes;
@@ -1331,40 +1352,47 @@ auto DB::recovery_load_serial(EngineState s) -> EngineState {
   std::map<Key, std::uint64_t> tombstones;
 
   for (auto &[file_id, data_file, hint_path, tb] : files) {
-    auto hint = HintFile::OpenForRead(hint_path);
-    auto scanner = hint.make_scanner();
-    while (auto he = scanner.next()) {
-      if (he->entry_type == EntryType::Put) {
-        const auto k = Key{he->key};
-        const auto tomb_it = tombstones.find(k);
-        if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
-          if (he->sequence > max_lsn) max_lsn = he->sequence;
-          continue;
-        }
-        const auto existing = transient_key_dir.get(he->key);
-        if (!existing || existing->sequence < he->sequence) {
-          if (existing) {
+    try {
+      auto hint = HintFile::OpenForRead(hint_path);
+      auto scanner = hint.make_scanner();
+      while (auto he = scanner.next()) {
+        if (he->entry_type == EntryType::Put) {
+          const auto k = Key{he->key};
+          const auto tomb_it = tombstones.find(k);
+          if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
+            if (he->sequence > max_lsn) max_lsn = he->sequence;
+            continue;
+          }
+          const auto existing = transient_key_dir.get(he->key);
+          if (!existing || existing->sequence < he->sequence) {
+            if (existing) {
+              s.file_stats[existing->file_id].live_bytes -=
+                  entry_size(he->key.size(), existing->value_size);
+            }
+            s.file_stats[file_id].live_bytes +=
+                entry_size(he->key.size(), he->value_size);
+            transient_key_dir.set(he->key,
+                                  KeyDirEntry{he->sequence, file_id,
+                                              he->file_offset, he->value_size});
+          }
+        } else if (he->entry_type == EntryType::Delete) {
+          const auto k = Key{he->key};
+          auto &tomb_seq = tombstones[k];
+          if (he->sequence > tomb_seq) tomb_seq = he->sequence;
+          const auto existing = transient_key_dir.get(he->key);
+          if (existing && existing->sequence < he->sequence) {
             s.file_stats[existing->file_id].live_bytes -=
                 entry_size(he->key.size(), existing->value_size);
+            transient_key_dir.erase(he->key);
           }
-          s.file_stats[file_id].live_bytes +=
-              entry_size(he->key.size(), he->value_size);
-          transient_key_dir.set(he->key,
-                                KeyDirEntry{he->sequence, file_id,
-                                            he->file_offset, he->value_size});
         }
-      } else if (he->entry_type == EntryType::Delete) {
-        const auto k = Key{he->key};
-        auto &tomb_seq = tombstones[k];
-        if (he->sequence > tomb_seq) tomb_seq = he->sequence;
-        const auto existing = transient_key_dir.get(he->key);
-        if (existing && existing->sequence < he->sequence) {
-          s.file_stats[existing->file_id].live_bytes -=
-              entry_size(he->key.size(), existing->value_size);
-          transient_key_dir.erase(he->key);
-        }
+        if (he->sequence > max_lsn) max_lsn = he->sequence;
       }
-      if (he->sequence > max_lsn) max_lsn = he->sequence;
+    } catch (const std::exception &e) {
+      if (strict) throw;
+      std::fprintf(stderr,
+                   "bytecask: skipping hint file '%s' due to CRC error: %s\n",
+                   hint_path.string().c_str(), e.what());
     }
   }
 
@@ -1376,9 +1404,9 @@ auto DB::recovery_load_serial(EngineState s) -> EngineState {
 // Parallel recovery: file-level partitioning with sequential accumulator merge.
 // Round-robin assigns files to W workers, each builds a RecoveryResult,
 // then results are merged one-at-a-time into an accumulator as workers finish.
-auto DB::recovery_load_parallel(EngineState s,
-                                      unsigned recovery_threads) -> EngineState {
-  auto files = recovery_prepare_files(s);
+auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
+                                bool strict) -> EngineState {
+  auto files = recovery_prepare_files(s, strict);
 
   if (files.empty()) {
     return s;
@@ -1401,6 +1429,7 @@ auto DB::recovery_load_parallel(EngineState s,
   std::mutex queue_mu;
   std::condition_variable queue_cv;
   std::vector<RecoveryResult> queue;
+  std::vector<std::exception_ptr> worker_errors(W, nullptr);
   unsigned finished_count = 0;
 
   {
@@ -1408,11 +1437,18 @@ auto DB::recovery_load_parallel(EngineState s,
     threads.reserve(W);
     for (unsigned i = 0; i < W; ++i) {
       threads.emplace_back([&, i] {
-        auto result = recovery_build_from_hints(worker_files[i]);
-        std::unique_lock<std::mutex> lk{queue_mu};
-        queue.push_back(std::move(result));
-        ++finished_count;
-        queue_cv.notify_one();
+        try {
+          auto result = recovery_build_from_hints(worker_files[i], strict);
+          std::unique_lock<std::mutex> lk{queue_mu};
+          queue.push_back(std::move(result));
+          ++finished_count;
+          queue_cv.notify_one();
+        } catch (...) {
+          std::unique_lock<std::mutex> lk{queue_mu};
+          worker_errors[i] = std::current_exception();
+          ++finished_count;  // still advances so main thread doesn't deadlock
+          queue_cv.notify_one();
+        }
       });
     }
 
@@ -1423,23 +1459,33 @@ auto DB::recovery_load_parallel(EngineState s,
 
     while (merged_count < W) {
       std::unique_lock<std::mutex> lk{queue_mu};
-      queue_cv.wait(lk, [&] { return !queue.empty(); });
-      auto incoming = std::move(queue.back());
-      queue.pop_back();
+      queue_cv.wait(lk, [&] { return finished_count > merged_count; });
+      std::vector<RecoveryResult> local;
+      local.swap(queue);
+      merged_count = finished_count;  // advance past all finished, including errored
       lk.unlock();
 
-      if (!acc_initialized) {
-        acc = std::move(incoming);
-        acc_initialized = true;
-      } else {
-        acc = recovery_merge_results(std::move(acc), std::move(incoming));
+      for (auto &incoming : local) {
+        if (!acc_initialized) {
+          acc = std::move(incoming);
+          acc_initialized = true;
+        } else {
+          acc = recovery_merge_results(std::move(acc), std::move(incoming));
+        }
       }
-      ++merged_count;
     }
 
     // Store final result for phases 4-5 (threads join at scope exit).
     queue.clear();
     queue.push_back(std::move(acc));
+  }
+
+  // Threads are joined. Propagate any worker exceptions now.
+  for (const auto &err : worker_errors) {
+    if (err) {
+      if (strict) std::rethrow_exception(err);
+      // lenient: warning already emitted inside recovery_build_from_hints
+    }
   }
 
   auto &final_result = queue[0];

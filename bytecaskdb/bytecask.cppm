@@ -157,6 +157,11 @@ export struct Options {
   // Number of threads used to rebuild the key directory at open time.
   // 1 selects the serial path; >1 uses file-level fan-in parallelism.
   unsigned recovery_threads{4};
+  // When true (default): any CRC error during recovery causes DB::open to
+  // throw std::runtime_error. When false: corrupt entries and hint files are
+  // skipped; the DB opens with whatever was successfully recovered, and a
+  // warning is printed to stderr for each skipped item.
+  bool fail_recovery_on_crc_errors{true};
 };
 
 // ---------------------------------------------------------------------------
@@ -608,8 +613,11 @@ private:
 
   // Hint file management
   // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint exists.
+  // strict=true (default): throws on data-file CRC error. strict=false: stops
+  // at the first corrupt entry and writes a partial hint for the valid prefix.
   static void flush_hints_for(const std::shared_ptr<DataFile> &file,
-                               const std::filesystem::path &dir);
+                               const std::filesystem::path &dir,
+                               bool strict = true);
   // Writes hint files for all sealed files in s.
   void flush_hints(const EngineState &s);
   // Drains background hint tasks then writes all sealed hint files.
@@ -645,18 +653,19 @@ private:
 
   // Recovery
   // Phase 1: opens all data files, seals them, generates missing hint files.
-  auto recovery_prepare_files(EngineState &s) -> std::vector<RecoveredFile>;
+  auto recovery_prepare_files(EngineState &s, bool strict)
+      -> std::vector<RecoveredFile>;
   // Builds a RecoveryResult from a set of hint files; no shared mutable state.
-  static auto recovery_build_from_hints(std::span<RecoveredFile> files)
-      -> RecoveryResult;
+  static auto recovery_build_from_hints(std::span<RecoveredFile> files,
+                                        bool strict) -> RecoveryResult;
   // Merges two RecoveryResults with LSN-based conflict resolution.
   static auto recovery_merge_results(RecoveryResult a, RecoveryResult b)
       -> RecoveryResult;
   // Reconstructs key_dir from hint files using a single thread.
-  auto recovery_load_serial(EngineState s) -> EngineState;
+  auto recovery_load_serial(EngineState s, bool strict) -> EngineState;
   // Reconstructs key_dir using file-level fan-in parallelism.
-  auto recovery_load_parallel(EngineState s, unsigned recovery_threads)
-      -> EngineState;
+  auto recovery_load_parallel(EngineState s, unsigned recovery_threads,
+                               bool strict) -> EngineState;
 
   // Member variables
   std::filesystem::path dir_;

@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <map>
 #include <random>
 #include <ranges>
@@ -71,6 +72,32 @@ struct TempDir {
   ~TempDir() { std::filesystem::remove_all(path); }
 };
 
+// Flips a byte in the middle of path to invalidate its CRC checksum.
+void corrupt_file_middle(const std::filesystem::path &path) {
+  const auto size = std::filesystem::file_size(path);
+  if (size == 0) return;
+  const auto pos = size / 2;
+  std::fstream f{path, std::ios::in | std::ios::out | std::ios::binary};
+  f.seekg(static_cast<std::streamoff>(pos));
+  char c{};
+  f.get(c);
+  f.seekp(static_cast<std::streamoff>(pos));
+  c ^= static_cast<char>(0xFF);
+  f.put(c);
+}
+
+// Returns .hint files in dir sorted by name (ascending timestamp order).
+auto list_hint_files(const std::filesystem::path &dir)
+    -> std::vector<std::filesystem::path> {
+  std::vector<std::filesystem::path> paths;
+  for (const auto &e : std::filesystem::directory_iterator{dir}) {
+    if (e.path().extension() == ".hint") {
+      paths.push_back(e.path());
+    }
+  }
+  std::sort(paths.begin(), paths.end());
+  return paths;
+}
 
 } // namespace
 
@@ -819,6 +846,102 @@ TEST_CASE("DB parallel recovery: matches serial result",
     REQUIRE(it != parallel_kv.end());
     CHECK(it->second == v);
   }
+}
+
+// ---------------------------------------------------------------------------
+// BC-157: fail_recovery_on_crc_errors — strict mode (default)
+//
+// Corrupt one hint file; strict recovery (fail_recovery_on_crc_errors=true)
+// must throw std::runtime_error from DB::open.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB recovery: strict mode throws on corrupt hint file",
+          "[bytecask][recovery][recovery_strict]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  // Three writes with max_file_bytes=1 → three sealed data files, three hint files.
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+    db.put({}, to_bytes("key_first"),  to_bytes("v1"));
+    db.put({}, to_bytes("key_second"), to_bytes("v2"));
+    db.put({}, to_bytes("key_third"),  to_bytes("v3"));
+  }
+
+  // Corrupt the second hint file (middle of three by timestamp sort).
+  const auto hints = list_hint_files(db_path);
+  REQUIRE(hints.size() >= 2);
+  corrupt_file_middle(hints[1]);
+
+  // Default options → fail_recovery_on_crc_errors=true → must throw.
+  REQUIRE_THROWS_AS(bytecask::DB::open(db_path), std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// BC-157: fail_recovery_on_crc_errors — lenient mode
+//
+// Same corruption; lenient recovery must open successfully.
+// Keys from the corrupt file are absent; keys from clean files are present.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB recovery: lenient mode opens with partial recovery on corrupt hint",
+          "[bytecask][recovery][recovery_lenient]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+    db.put({}, to_bytes("key_first"),  to_bytes("v1"));
+    db.put({}, to_bytes("key_second"), to_bytes("v2"));
+    db.put({}, to_bytes("key_third"),  to_bytes("v3"));
+  }
+
+  const auto hints = list_hint_files(db_path);
+  REQUIRE(hints.size() >= 2);
+  corrupt_file_middle(hints[1]);
+
+  // Lenient recovery must succeed even with a corrupt hint file.
+  bytecask::DB db =
+      bytecask::DB::open(db_path, {.max_file_bytes = 1,
+                                   .fail_recovery_on_crc_errors = false});
+  CHECK_FALSE(db.is_poisoned());
+
+  // Keys from uncorrupted files must be present.
+  CHECK(get_val(db, to_bytes("key_first")).has_value());
+  CHECK(get_val(db, to_bytes("key_third")).has_value());
+  // Key from the corrupt file must be absent.
+  CHECK_FALSE(get_val(db, to_bytes("key_second")).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// BC-157: parallel recovery terminate bug fix
+//
+// Before the fix, an exception escaping a jthread lambda called std::terminate.
+// This test verifies that a corrupt hint file with recovery_threads>1 and
+// fail_recovery_on_crc_errors=true raises std::runtime_error — not std::terminate.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB parallel recovery: corrupt hint throws instead of terminating",
+          "[bytecask][recovery][recovery_parallel_terminate_fix]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+    db.put({}, to_bytes("k1"), to_bytes("v1"));
+    db.put({}, to_bytes("k2"), to_bytes("v2"));
+    db.put({}, to_bytes("k3"), to_bytes("v3"));
+    db.put({}, to_bytes("k4"), to_bytes("v4"));
+  }
+
+  const auto hints = list_hint_files(db_path);
+  REQUIRE(hints.size() >= 2);
+  corrupt_file_middle(hints[1]);
+
+  // recovery_threads>1 + strict mode → must throw, not terminate.
+  REQUIRE_THROWS_AS(
+      bytecask::DB::open(db_path,
+                         {.max_file_bytes = 1,
+                          .recovery_threads = 4,
+                          .fail_recovery_on_crc_errors = true}),
+      std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------
