@@ -174,11 +174,11 @@ The coordinator (step 5 above) only performs IO. It never touches `key_dir`, `fi
 
 If `append()` throws mid-batch after `BulkBegin` has been written, the active file contains an orphaned `BulkBegin` with no matching `BulkEnd`. Without intervention, subsequent writes to the same file extend the region that `flush_hints_for` (and `vacuum_scan_and_copy`) treat as part of the incomplete batch — those entries would be silently discarded on recovery.
 
-The fix: the IO loop (step 5) is wrapped in `try/catch`. When the batch is multi-entry and IO fails, the catch block syncs (swallowed — best-effort durability for any preceding entries) and rotates to a fresh active file. The rotated state is published immediately so subsequent writes go to the clean file. The exception is then rethrown to the caller. If the isolation rotation itself fails, the engine is poisoned (see below).
+The fix: the IO loop (step 5) is wrapped in `try/catch`. When the batch is multi-entry and IO fails, the catch block attempts to sync the tainted file and rotate to a fresh active file. If the isolation sync fails, the orphaned batch markers may not be durable — a crash could leave an unresolvable `BulkBegin` — so the engine is poisoned immediately instead of proceeding. If sync succeeds but the isolation rotation fails, the engine is also poisoned (see below). When isolation succeeds, the rotated state is published immediately so subsequent writes go to the clean file, and the exception is rethrown to the caller.
 
 ##### Poisoned state (`DbPoisoned`)
 
-If the isolation rotation after an orphaned `BulkBegin` fails (e.g. filesystem error creating the new data file), the active file retains the orphaned marker. Any subsequent write to that file would appear to succeed in-process but be silently discarded by recovery — a consistency divergence between in-memory and on-disk state.
+If the isolation sync or rotation after an orphaned `BulkBegin` fails (e.g. `fdatasync` error on the tainted file, or filesystem error creating the new data file), the active file may retain the orphaned marker in a non-durable state. Any subsequent write to that file would appear to succeed in-process but be silently discarded by recovery — a consistency divergence between in-memory and on-disk state.
 
 When this happens, the engine calls `deem_as_poisoned(reason)` with a diagnostic string identifying the failed file, then rethrows the original exception. From that point:
 

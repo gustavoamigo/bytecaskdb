@@ -2836,14 +2836,14 @@ TEST_CASE("sync failure publishes state before rethrowing", "[fault_inject]") {
 //   ckpt 5: io_rotate_file_creation (isolation) — throws → poison
 // ---------------------------------------------------------------------------
 
-TEST_CASE("isolation rotation failure poisons the DB", "[poisoned]") {
+TEST_CASE("isolation failure poisons the DB", "[poisoned]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
 
   CHECK_FALSE(db.is_poisoned());
 
   // Fail from the 3rd checkpoint onward — mid-batch append triggers
-  // isolation, whose rotation also fails.
+  // isolation, whose sync also fails (count cascades).
   {
     bytecask::testing::ScopedFaultInjector fi{2};
     bytecask::Batch batch;
@@ -2853,9 +2853,9 @@ TEST_CASE("isolation rotation failure poisons the DB", "[poisoned]") {
                       std::system_error);
   }
 
-  // Engine must be poisoned.
+  // Engine must be poisoned — isolation sync failure detected.
   REQUIRE(db.is_poisoned());
-  CHECK(db.poison_reason().find("orphaned BulkBegin") != std::string::npos);
+  CHECK(db.poison_reason().find("isolation sync failed") != std::string::npos);
 
   // Writes must throw DbPoisoned.
   CHECK_THROWS_AS(db.put({.sync = false}, to_bytes("z"), to_bytes("z")),
@@ -2921,6 +2921,43 @@ TEST_CASE("single-entry failure does not poison the DB", "[poisoned]") {
   // DB remains operational for writes.
   REQUIRE_NOTHROW(db.put({.sync = false}, to_bytes("k"), to_bytes("v")));
   CHECK(get_val(db, to_bytes("k")).has_value());
+}
+
+TEST_CASE("isolation sync failure poisons the DB", "[poisoned]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // Pre-populate so we can verify reads survive poisoning.
+  db.put({.sync = false}, to_bytes("x"), to_bytes("val_x"));
+
+  CHECK_FALSE(db.is_poisoned());
+
+  // Class D: batch append fails → isolation sync fails → rotation would
+  // succeed. Skip io_rotate_file_creation so the cascade doesn't also
+  // fail rotation; io_data_file_sync still fails (count exceeded).
+  {
+    bytecask::testing::ScopedFaultInjector fi{2,
+        {"io_rotate_file_creation"}};
+    bytecask::Batch batch;
+    batch.put(to_bytes("a"), to_bytes("v1"));
+    batch.put(to_bytes("b"), to_bytes("v2"));
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(batch)),
+                      std::system_error);
+  }
+
+  // Engine must be poisoned — isolation sync failure detected.
+  REQUIRE(db.is_poisoned());
+  CHECK(db.poison_reason().find("isolation sync failed") != std::string::npos);
+
+  // Writes must throw DbPoisoned.
+  CHECK_THROWS_AS(db.put({.sync = false}, to_bytes("z"), to_bytes("z")),
+                  bytecask::DbPoisoned);
+
+  // Reads still work on pre-poison data.
+  auto val = get_val(db, to_bytes("x"));
+  REQUIRE(val.has_value());
+  CHECK(to_string(*val) == "val_x");
+  CHECK_FALSE(db.contains_key(to_bytes("a")));
 }
 
 // ---------------------------------------------------------------------------

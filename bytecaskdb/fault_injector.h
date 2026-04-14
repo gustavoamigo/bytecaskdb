@@ -10,11 +10,13 @@
 
 #ifdef BYTECASK_TESTING
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <system_error>
 #include <unistd.h>
+#include <vector>
 
 namespace bytecask::testing {
 
@@ -51,6 +53,11 @@ struct FaultInjector {
   int         call_count = 0;  // number of checkpoints passed so far
   std::string last_checkpoint; // name of the last checkpoint that fired
 
+  // Count-based skip set — checkpoints matching these names pass even
+  // when call_count exceeds fail_at. Allows testing scenarios where some
+  // operations in a cascade succeed while others fail.
+  std::vector<std::string> skip_names;
+
   std::error_code error = std::make_error_code(std::errc::io_error);
 
   PostWriteMode post_write_mode{PostWriteMode::none};
@@ -67,7 +74,9 @@ struct FaultInjector {
     }
 
     // Count-based — targets the Nth checkpoint in sequence
-    if (fail_at >= 0 && call_count > fail_at) {
+    if (fail_at >= 0 && call_count > fail_at
+        && std::find(skip_names.begin(), skip_names.end(), name)
+               == skip_names.end()) {
       throw std::system_error{error,
           std::string{"fault injection at: "} + name};
     }
@@ -129,6 +138,14 @@ struct ScopedFaultInjector {
   // Count-based injection
   explicit ScopedFaultInjector(int fail_at) {
     inj.fail_at = fail_at;
+    active_injector = &inj;
+  }
+
+  // Count-based injection with skip set — cascade failures but let
+  // named checkpoints in the skip set pass through.
+  ScopedFaultInjector(int fail_at, std::initializer_list<std::string> skip) {
+    inj.fail_at = fail_at;
+    inj.skip_names = {skip.begin(), skip.end()};
     active_injector = &inj;
   }
 

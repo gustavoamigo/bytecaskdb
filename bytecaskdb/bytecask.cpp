@@ -536,8 +536,20 @@ auto DB::apply_batch_if(WriteOptions opts,
     }
   } catch (...) {
     if (multi) {
+      // Isolation path: sync the tainted file, then rotate to a new one.
+      // If sync fails, the orphaned batch markers may not be durable —
+      // a crash could leave an unresolvable BulkBegin. Poison.
+      // If rotation fails, the active file has the orphan. Poison.
       try {
-        try { file.sync(); } catch (...) {}
+        file.sync();
+      } catch (...) {
+        deem_as_poisoned(std::format(
+            "isolation sync failed for '{}': orphaned batch markers "
+            "may not be durable. Writes blocked until restart.",
+            file.path().string()));
+        throw;
+      }
+      try {
         rotate_active_file(t, current);
         state_.store(std::move(t).persistent());
         state_time_.store(now_ns(), std::memory_order_release);
