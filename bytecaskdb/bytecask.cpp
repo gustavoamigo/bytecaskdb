@@ -319,6 +319,14 @@ auto TransientEngineState::is_rotation_needed(std::uint64_t threshold) const
   return files_->at(active_file_id_)->size() >= threshold;
 }
 
+auto TransientEngineState::next_lsn() const noexcept -> std::uint64_t {
+  return next_lsn_;
+}
+
+void TransientEngineState::advance_next_lsn(std::uint64_t new_lsn) noexcept {
+  next_lsn_ = new_lsn;
+}
+
 auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   auto s = std::make_shared<EngineState>();
   s->key_dir = std::move(key_dir_).persistent();
@@ -602,22 +610,28 @@ auto DB::apply_batch_if(WriteOptions opts,
     }
   }
 
-  // 7. Durability before visibility.
-  // On sync failure, publish state for process consistency before
-  // rethrowing — sync failure affects durability (crash safety),
-  // not in-process correctness. Skip if rotation already failed.
+  // 7. Commit sync.
+  // If sync fails (class F or G), do not publish key changes — the write has
+  // not been confirmed durable. Advance next_lsn only, to prevent reuse of
+  // LSN values already written to the page cache. Key changes remain invisible
+  // to callers; the write is lost from the engine's perspective.
   std::exception_ptr sync_err;
   if (!rotation_err && opts.sync) {
     try { file.sync(); }
     catch (...) { sync_err = std::current_exception(); }
   }
 
-  // 8. Publish — writes are on disk. State must reflect them regardless
-  // of rotation or sync failure.
+  // 8. Publish.
+  if (rotation_err || sync_err) {
+    auto lsn_only = current->transient();
+    lsn_only.advance_next_lsn(t.next_lsn());
+    state_.store(std::move(lsn_only).persistent());
+    state_time_.store(now_ns(), std::memory_order_release);
+    if (rotation_err) std::rethrow_exception(rotation_err);
+    std::rethrow_exception(sync_err);
+  }
   state_.store(std::move(t).persistent());
   state_time_.store(now_ns(), std::memory_order_release);
-  if (rotation_err) std::rethrow_exception(rotation_err);
-  if (sync_err) std::rethrow_exception(sync_err);
   return true;
 }
 

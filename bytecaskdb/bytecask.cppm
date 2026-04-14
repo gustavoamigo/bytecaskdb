@@ -409,6 +409,15 @@ public:
   [[nodiscard]] auto active_file_id() const noexcept -> std::uint32_t;
   [[nodiscard]] auto is_rotation_needed(std::uint64_t threshold) const -> bool;
 
+  // Returns the current next_lsn value — used to capture the post-write LSN
+  // before consuming the transient on sync failure (F/G).
+  [[nodiscard]] auto next_lsn() const noexcept -> std::uint64_t;
+
+  // Advances next_lsn_ to new_lsn without applying any key-dir or file-stats
+  // changes. Used on F/G sync failure to prevent LSN reuse for bytes already
+  // in the page cache, while keeping key changes unpublished.
+  void advance_next_lsn(std::uint64_t new_lsn) noexcept;
+
   // Commit: consume the transient and produce a new immutable EngineState.
   [[nodiscard]] auto persistent() && -> std::shared_ptr<EngineState>;
 

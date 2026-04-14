@@ -201,8 +201,14 @@ def gen_delta_literal(delta: Delta) -> str:
     )
 
 
-def should_check_recovery(delta: Delta) -> bool:
-    """Recovery check when not poisoned OR transition was persisted."""
+def should_check_recovery(delta: Delta, failure: FailureClass) -> bool:
+    """Recovery check: skipped when not recoverable or sync failure diverged."""
+    if failure in (FailureClass.F, FailureClass.G):
+        # In-session and recovery visibility diverge after sync failure (BC-155):
+        # bytes are physically in the page cache and appear in recovery after a
+        # clean shutdown, but key changes were not published in-session. Checking
+        # assert_recoverable would fail spuriously. Addressed by BC-157 RecoveryMode.
+        return False
     return not delta.poisoned or delta.lsn_advance > 0
 
 
@@ -262,12 +268,23 @@ def gen_test(
     parts.append("  }")
 
     # Recovery
-    if should_check_recovery(delta):
+    if should_check_recovery(delta, failure):
         parts.append("  assert_recoverable(dir, before, expected);")
     else:
-        parts.append(
-            "  // Recovery skipped: poisoned with unpersisted transition."
-        )
+        if failure in (FailureClass.F, FailureClass.G):
+            parts.append(
+                "  // Recovery skipped: sync failed — in-session and recovery visibility"
+            )
+            parts.append(
+                "  // diverge (write physically in page cache; recovery outcome depends"
+            )
+            parts.append(
+                "  // on whether fdatasync error was transient). Addressed by BC-157."
+            )
+        else:
+            parts.append(
+                "  // Recovery skipped: poisoned with unpersisted transition."
+            )
 
     parts.append("}")
     return "\n".join(parts)
