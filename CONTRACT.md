@@ -73,11 +73,14 @@ If any I/O operation (append, sync) throws during execution:
   `next_lsn` must be advanced past all LSNs consumed by appends that reached
   the file, to prevent reuse of those sequence numbers on the next write.
 - The disk may contain none, some, or all of the bytes from this
-  write. The engine must not assume what was written. The engine must
-  guarantee that a valid entry is subsequently written so recovery
-  will reach a consistent state from it. If that is not possible, the
-  engine must poison the DB — only a full recovery can bring the
-  system back to a consistent state.
+  write. The engine must not assume what was written. For a single-entry
+  write where the file is tainted (bytes may have landed), the engine
+  must attempt a read-back: `pread` the entry at the known offset and
+  CRC-verify it. Valid CRC → the write is durable; publish state normally.
+  Invalid CRC or short read → the engine must guarantee that a valid entry
+  is subsequently written so recovery will reach a consistent state from
+  it. If that is not possible, the engine must poison the DB — only a
+  full recovery can bring the system back to a consistent state.
 - The DB must remain operational for subsequent calls.
 
 ### Rotation Safety

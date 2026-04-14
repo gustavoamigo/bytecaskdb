@@ -184,18 +184,25 @@ corruption.
 
 The fix: `DataFile::append()` sets `tainted_ = true` when `writev`
 returns a short write (`written > 0`). In the `apply_batch_if` catch
-block, if `!multi && file.is_tainted()`, the engine poisons the DB.
+block, if `!multi && file.is_tainted()`, the engine calls
+`DataFile::try_recover_failed_append`: it preads the entry at the
+pre-write offset and CRC-verifies it. Valid CRC → publish normally
+(B3 — write actually succeeded). Invalid CRC → poison the DB (B2).
 
 B2 and B3 differ in recovery behavior for single-entry writes:
 
 - **B2 (single)** — partial bytes on disk. The entry has an invalid CRC
   or is truncated. Recovery skips it. The transition is not recovered.
-- **B3 (single)** — all bytes on disk, valid CRC. Recovery *will* parse
-  and include the entry. The transition is recovered. This is correct:
-  the write succeeded at the I/O level, and recovery should honor it.
-  The engine poisons because the in-process state is inconsistent (it
-  received an error and did not publish), but recovery from a restart
-  produces the correct state.
+- **B3 (single)** — all bytes on disk, valid CRC. As of BC-156, the engine
+  attempts a read-back before poisoning: `pread` the entry at the known
+  offset and CRC-verify it. Valid CRC → the write is durable; the engine
+  publishes state normally and returns success to the caller (no throw, no
+  poison). Invalid CRC or short read → poison as for B2. Before BC-156, B3
+  always poisoned — the recovery note below applied then but not now.
+
+  *Recovery note (pre-BC-156 / B2 reference):* For B2, the partial bytes on
+  disk have an invalid CRC; recovery skips the entry and the transition is
+  not recovered.
 
 ### Post-write rotation failure subclasses (G, H)
 
@@ -231,7 +238,7 @@ healthy but fails on the next append. Poisoning is the correct response.
 | B2 (multi) | No — partial write | No | No | Yes | No (isolation rotates) |
 | B2 (single) | No — partial write | No | No | Yes | Yes (tainted) |
 | B3 (multi) | No — orphaned batch | No | No | Yes | No (isolation rotates) |
-| B3 (single) | Yes — full write, valid CRC | No (not published) | No (in-process) | Yes | Yes (tainted) |
+| B3 (single) | Yes — full write, valid CRC | Yes — read-back verifies CRC, publishes if valid (BC-156) | No (in-process) | Yes | No — B3 no longer poisons; B2 still poisons |
 | C | No — partial write | No | No | Yes | Yes |
 | D | No — partial write | No | No | Yes | Yes |
 | E | No — partial write | No | No | Yes | Yes |

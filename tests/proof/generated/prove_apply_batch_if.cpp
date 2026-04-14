@@ -139,10 +139,10 @@ TEST_CASE("prove__empty_db__single_put__append_fails_after_full_write", "[prove]
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {},
+        .keys_added = {"p0"},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .poisoned = true,
+        .lsn_advance = 1,
+        .poisoned = false,
     };
   Baseline before;
   {
@@ -156,15 +156,14 @@ TEST_CASE("prove__empty_db__single_put__append_fails_after_full_write", "[prove]
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE_THROWS_AS(
+      REQUIRE(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
+                            std::move(plan)));
     }
 
     assert_delta(before, db, expected);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__single_put__commit_sync_fails", "[prove]") {
@@ -298,8 +297,8 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_after_full_write", "[pro
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .poisoned = true,
+        .lsn_advance = 1,
+        .poisoned = false,
     };
   Baseline before;
   {
@@ -313,15 +312,14 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_after_full_write", "[pro
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE_THROWS_AS(
+      REQUIRE(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
+                            std::move(plan)));
     }
 
     assert_delta(before, db, expected);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__single_delete__commit_sync_fails", "[prove]") {
@@ -1241,10 +1239,10 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_after_full_writ
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {},
+        .keys_added = {"p0"},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .poisoned = true,
+        .lsn_advance = 1,
+        .poisoned = false,
     };
   Baseline before;
   {
@@ -1260,15 +1258,14 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_after_full_writ
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE_THROWS_AS(
+      REQUIRE(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
+                            std::move(plan)));
     }
 
     assert_delta(before, db, expected);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__empty_db__single_put_with_guards__commit_sync_fails", "[prove]") {
@@ -1438,10 +1435,10 @@ TEST_CASE("prove__single_key__single_put__append_fails_after_full_write", "[prov
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {},
+        .keys_added = {"p0"},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .poisoned = true,
+        .lsn_advance = 1,
+        .poisoned = false,
     };
   Baseline before;
   {
@@ -1456,15 +1453,14 @@ TEST_CASE("prove__single_key__single_put__append_fails_after_full_write", "[prov
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE_THROWS_AS(
+      REQUIRE(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
+                            std::move(plan)));
     }
 
     assert_delta(before, db, expected);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__single_put__commit_sync_fails", "[prove]") {
@@ -1601,9 +1597,9 @@ TEST_CASE("prove__single_key__single_delete__append_fails_after_full_write", "[p
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
         .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .poisoned = true,
+        .keys_removed = {"k0"},
+        .lsn_advance = 1,
+        .poisoned = false,
     };
   Baseline before;
   {
@@ -1618,15 +1614,14 @@ TEST_CASE("prove__single_key__single_delete__append_fails_after_full_write", "[p
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE_THROWS_AS(
+      REQUIRE(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
+                            std::move(plan)));
     }
 
     assert_delta(before, db, expected);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__single_delete__commit_sync_fails", "[prove]") {
@@ -2577,10 +2572,10 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_after_full_wr
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {},
+        .keys_added = {"p0"},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .poisoned = true,
+        .lsn_advance = 1,
+        .poisoned = false,
     };
   Baseline before;
   {
@@ -2598,15 +2593,14 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_after_full_wr
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE_THROWS_AS(
+      REQUIRE(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
+                            std::move(plan)));
     }
 
     assert_delta(before, db, expected);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__single_key__single_put_with_guards__commit_sync_fails", "[prove]") {
@@ -2806,10 +2800,10 @@ TEST_CASE("prove__populated_db__single_put__append_fails_after_full_write", "[pr
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {},
+        .keys_added = {"p0"},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .poisoned = true,
+        .lsn_advance = 1,
+        .poisoned = false,
     };
   Baseline before;
   {
@@ -2833,15 +2827,14 @@ TEST_CASE("prove__populated_db__single_put__append_fails_after_full_write", "[pr
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE_THROWS_AS(
+      REQUIRE(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
+                            std::move(plan)));
     }
 
     assert_delta(before, db, expected);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__single_put__commit_sync_fails", "[prove]") {
@@ -3014,9 +3007,9 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_after_full_write", "
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
         .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .poisoned = true,
+        .keys_removed = {"k0"},
+        .lsn_advance = 1,
+        .poisoned = false,
     };
   Baseline before;
   {
@@ -3040,15 +3033,14 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_after_full_write", "
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE_THROWS_AS(
+      REQUIRE(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
+                            std::move(plan)));
     }
 
     assert_delta(before, db, expected);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__single_delete__commit_sync_fails", "[prove]") {
@@ -4251,10 +4243,10 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_after_full_
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {},
+        .keys_added = {"p0"},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .poisoned = true,
+        .lsn_advance = 1,
+        .poisoned = false,
     };
   Baseline before;
   {
@@ -4281,15 +4273,14 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_after_full_
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE_THROWS_AS(
+      REQUIRE(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
+                            std::move(plan)));
     }
 
     assert_delta(before, db, expected);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__populated_db__single_put_with_guards__commit_sync_fails", "[prove]") {
@@ -4480,10 +4471,10 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_after_full_write"
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {},
+        .keys_added = {"p0"},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .poisoned = true,
+        .lsn_advance = 1,
+        .poisoned = false,
     };
   Baseline before;
   {
@@ -4498,15 +4489,14 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_after_full_write"
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE_THROWS_AS(
+      REQUIRE(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
+                            std::move(plan)));
     }
 
     assert_delta(before, db, expected);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__single_put__commit_sync_fails", "[prove]") {
@@ -4709,9 +4699,9 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_after_full_wri
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
         .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .poisoned = true,
+        .keys_removed = {"k0"},
+        .lsn_advance = 1,
+        .poisoned = false,
     };
   Baseline before;
   {
@@ -4726,15 +4716,14 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_after_full_wri
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE_THROWS_AS(
+      REQUIRE(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
+                            std::move(plan)));
     }
 
     assert_delta(before, db, expected);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__single_delete__commit_sync_fails", "[prove]") {
@@ -5957,10 +5946,10 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_after
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {},
+        .keys_added = {"p0"},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .poisoned = true,
+        .lsn_advance = 1,
+        .poisoned = false,
     };
   Baseline before;
   {
@@ -5978,15 +5967,14 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_after
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE_THROWS_AS(
+      REQUIRE(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
+                            std::move(plan)));
     }
 
     assert_delta(before, db, expected);
   }
-  // Recovery skipped: poisoned with unpersisted transition.
+  assert_recoverable(dir, before, expected);
 }
 
 TEST_CASE("prove__rotation_threshold__single_put_with_guards__commit_sync_fails", "[prove]") {
