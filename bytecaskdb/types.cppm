@@ -4,7 +4,9 @@
 // ByteCaskDB — common error codes and stored value types
 
 module;
+#include <cstddef>
 #include <cstdint>
+#include <span>
 
 export module bytecask.types;
 
@@ -19,6 +21,13 @@ export enum class EntryType : std::uint8_t {
   Delete = 0x02,    // Tombstone — key present, value empty
   BulkBegin = 0x03, // Start of atomic batch — key and value empty
   BulkEnd = 0x04,   // End of atomic batch   — key and value empty
+};
+
+export struct AppendEntry {
+  std::uint64_t sequence;
+  EntryType entry_type;
+  std::span<const std::byte> key;
+  std::span<const std::byte> value;
 };
 
 } // namespace bytecask

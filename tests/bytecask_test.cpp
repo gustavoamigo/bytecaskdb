@@ -638,13 +638,13 @@ TEST_CASE("DB recovery: incomplete batch is discarded",
     // Manually write a data file simulating a crash mid-batch.
     bytecask::DataFile df(db_path / "data_00000000000000000000000001.data");
     // Standalone entry — should survive.
-    std::ignore = df.append(1, bytecask::EntryType::Put, to_bytes("good"),
+    std::ignore = df.append_entry(1, bytecask::EntryType::Put, to_bytes("good"),
                             to_bytes("value1"));
     // Begin batch, write some entries, but never write BulkEnd.
-    std::ignore = df.append(2, bytecask::EntryType::BulkBegin, {}, {});
-    std::ignore = df.append(3, bytecask::EntryType::Put, to_bytes("orphan_a"),
+    std::ignore = df.append_entry(2, bytecask::EntryType::BulkBegin, {}, {});
+    std::ignore = df.append_entry(3, bytecask::EntryType::Put, to_bytes("orphan_a"),
                             to_bytes("lost1"));
-    std::ignore = df.append(4, bytecask::EntryType::Put, to_bytes("orphan_b"),
+    std::ignore = df.append_entry(4, bytecask::EntryType::Put, to_bytes("orphan_b"),
                             to_bytes("lost2"));
     // No BulkEnd — simulates crash.
     df.sync();
@@ -686,9 +686,9 @@ TEST_CASE("DB recovery: order-independent tombstone",
     // File with a Put for "gone" (seq=1) and "alive" (seq=2).
     {
       bytecask::DataFile df(db_path / std::format("{}.data", put_stem));
-      std::ignore = df.append(1, bytecask::EntryType::Put, to_bytes("gone"),
+      std::ignore = df.append_entry(1, bytecask::EntryType::Put, to_bytes("gone"),
                               to_bytes("v1"));
-      std::ignore = df.append(2, bytecask::EntryType::Put, to_bytes("alive"),
+      std::ignore = df.append_entry(2, bytecask::EntryType::Put, to_bytes("alive"),
                               to_bytes("v2"));
       df.sync();
     }
@@ -696,7 +696,7 @@ TEST_CASE("DB recovery: order-independent tombstone",
     // File with a Delete for "gone" (seq=3) — higher LSN wins.
     {
       bytecask::DataFile df(db_path / std::format("{}.data", del_stem));
-      std::ignore = df.append(3, bytecask::EntryType::Delete,
+      std::ignore = df.append_entry(3, bytecask::EntryType::Delete,
                               to_bytes("gone"), {});
       df.sync();
     }

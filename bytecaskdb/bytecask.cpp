@@ -552,13 +552,9 @@ auto DB::apply_batch_if(WriteOptions opts,
   // chance that any bytes already in the page cache reach durable storage,
   // so resume() can replay valid entries written before the failure.
   auto &file = t.active_file();
-  std::vector<std::uint64_t> offsets;
-  offsets.reserve(entries.size());
+  std::vector<std::uint64_t> offsets(entries.size());
   try {
-    for (const auto &entry : entries) {
-      offsets.push_back(file.append(
-          entry.sequence, entry.entry_type, entry.key, entry.value));
-    }
+    file.append_entries(entries, offsets);
   } catch (...) {
     try { file.sync(); } catch (...) {}
     // Advance past all LSNs consumed by prepare_write — conservative even for
@@ -959,7 +955,7 @@ auto DB::vacuum_scan_and_copy(
           existing->file_offset == entry_off &&
           existing->sequence == entry.sequence) {
         const auto new_off =
-            dest_file.append(entry.sequence, EntryType::Put, entry.key,
+            dest_file.append_entry(entry.sequence, EntryType::Put, entry.key,
                              entry.value);
         const auto val_size = narrow<std::uint32_t>(entry.value.size());
         const auto sz = entry_size(entry.key.size(), entry.value.size());
@@ -973,7 +969,7 @@ auto DB::vacuum_scan_and_copy(
     }
     case EntryType::Delete: {
       std::ignore =
-          dest_file.append(entry.sequence, EntryType::Delete, entry.key, {});
+          dest_file.append_entry(entry.sequence, EntryType::Delete, entry.key, {});
       result.total_bytes += entry_size(entry.key.size(), 0);
       break;
     }
