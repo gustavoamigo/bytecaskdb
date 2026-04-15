@@ -533,67 +533,31 @@ auto DB::apply_batch_if(WriteOptions opts,
   }
 
   // 4. IO phase — coordinator's job (can throw).
-  // If a multi-entry batch fails mid-write after BulkBegin, the file
-  // has an orphaned BulkBegin. Force-rotate to isolate it: subsequent
-  // writes to the same file would be treated as part of the incomplete
-  // batch by flush_hints_for and silently discarded on recovery.
-  const bool multi = !entries.empty() &&
-                     entries.front().entry_type == EntryType::BulkBegin;
+  // Any append failure — whether nothing reached disk, a partial write, or
+  // a full write that returned an error — leaves the file in an indeterminate
+  // state. Degrade unconditionally: do not attempt in-flight recovery.
+  // resume() will scan the active file, truncate any garbage, and restore
+  // normal operation. A best-effort sync before degrading maximises the
+  // chance that any bytes already in the page cache reach durable storage,
+  // so resume() can replay valid entries written before the failure.
   auto &file = t.active_file();
   std::vector<std::uint64_t> offsets;
   offsets.reserve(entries.size());
-  bool b3_recovered = false;
   try {
     for (const auto &entry : entries) {
       offsets.push_back(file.append(
           entry.sequence, entry.entry_type, entry.key, entry.value));
     }
   } catch (...) {
-    if (multi) {
-      // Isolation path: sync the tainted file, then rotate to a new one.
-      // If sync fails, the orphaned batch markers may not be durable —
-      // a crash could leave an unresolvable BulkBegin. Poison.
-      // If rotation fails, the active file has the orphan. Poison.
-      try {
-        file.sync();
-      } catch (...) {
-        deem_as_degraded(std::format(
-            "isolation sync failed for '{}': orphaned batch markers "
-            "may not be durable. Writes blocked until resume().",
-            file.path().string()));
-        throw;
-      }
-      try {
-        rotate_active_file(t, current);
-        state_.store(std::move(t).persistent());
-        state_time_.store(now_ns(), std::memory_order_release);
-      } catch (...) {
-        deem_as_degraded(std::format(
-            "isolation rotation failed for '{}': orphaned BulkBegin "
-            "cannot be isolated. Call resume() to recover.",
-            file.path().string()));
-        throw;
-      }
-    } else if (file.is_tainted()) {
-      // BC-156: attempt read-back before poisoning — writev may have written
-      // the full entry despite returning an error (class B3). If CRC verifies,
-      // the entry is durable; treat as success and fall through to publish.
-      const auto &e = entries.front();
-      if (auto off = file.try_recover_failed_append(
-              narrow<std::uint16_t>(e.key.size()),
-              narrow<std::uint32_t>(e.value.size()))) {
-        offsets.push_back(*off);
-        b3_recovered = true;
-      } else {
-        deem_as_degraded(std::format(
-            "partial write detected on '{}': file position diverged from "
-            "offset tracking. Call resume() to recover.",
-            file.path().string()));
-      }
-    }
-    if (!b3_recovered) {
-      throw;
-    }
+    try { file.sync(); } catch (...) {}
+    // Advance past all LSNs consumed by prepare_write — conservative even for
+    // B1 (pre-writev fault) because userspace cannot determine whether bytes
+    // reached disk. entries.back().sequence is the highest LSN assigned.
+    publish_lsn_advance(current, entries.back().sequence + 1);
+    deem_as_degraded(std::format(
+        "append IO error on '{}': call resume() to recover.",
+        file.path().string()));
+    throw;
   }
 
   // 5. Apply mutations (pure, no IO).
@@ -601,54 +565,54 @@ auto DB::apply_batch_if(WriteOptions opts,
 
   // 6. Rotation — IO is coordinator's job, state change is transient's.
   // Two failure modes with different outcomes:
-  //   - Pre-rotation sync fails: the file is not sealed. Publish state
-  //     (writes applied, no rotation) to preserve LSN monotonicity.
-  //   - rotate_active_file fails after sealing: the active file is sealed
-  //     and no new file was created. Publishing would leave a sealed active
-  //     file — subsequent appends would fail. Must poison.
-  std::exception_ptr rotation_err;
+  //   - Pre-rotation sync fails (G): bytes in page cache. Advance next_lsn to
+  //     prevent reuse of sequence numbers now on disk; do not publish key
+  //     changes (write not confirmed durable).
+  //   - rotate_active_file fails after sealing (H): the write IS durable
+  //     (sync succeeded). Publish full state so key changes are visible, then
+  //     degrade — the sealed file cannot accept further appends until resume()
+  //     creates a new active file.
   if (t.is_rotation_needed(rotation_threshold_)) {
     try {
       file.sync();
     } catch (...) {
-      rotation_err = std::current_exception();
+      publish_lsn_advance(current, t.next_lsn());   // G
+      deem_as_degraded(std::format(
+          "rotation fdatasync failed on '{}': bytes in page cache but "
+          "durability not confirmed. Call resume() to recover.",
+          file.path().string()));
+      throw;
     }
-    if (!rotation_err) {
-      try {
-        rotate_active_file(t, current);
-      } catch (...) {
-        deem_as_degraded(std::format(
-            "post-write rotation failed for '{}': active file is sealed "
-            "but new file could not be created. Call resume() to recover.",
-            file.path().string()));
-        // Publish state so LSNs advance — reads remain correct.
-        state_.store(std::move(t).persistent());
-        state_time_.store(now_ns(), std::memory_order_release);
-        throw;
-      }
+    try {
+      rotate_active_file(t, current);
+    } catch (...) {
+      deem_as_degraded(std::format(                 // H
+          "post-write rotation failed for '{}': active file is sealed "
+          "but new file could not be created. Call resume() to recover.",
+          file.path().string()));
+      state_.store(std::move(t).persistent());
+      state_time_.store(now_ns(), std::memory_order_release);
+      throw;
     }
   }
 
   // 7. Commit sync.
-  // If sync fails (class F or G), do not publish key changes — the write has
-  // not been confirmed durable. Advance next_lsn only, to prevent reuse of
-  // LSN values already written to the page cache. Key changes remain invisible
-  // to callers; the write is lost from the engine's perspective.
-  std::exception_ptr sync_err;
-  if (!rotation_err && opts.sync) {
-    try { file.sync(); }
-    catch (...) { sync_err = std::current_exception(); }
+  // Sync failed (F): bytes in page cache but not confirmed durable. Advance
+  // next_lsn to prevent reuse; do not publish key changes.
+  if (opts.sync) {
+    try {
+      file.sync();
+    } catch (...) {
+      publish_lsn_advance(current, t.next_lsn());   // F
+      deem_as_degraded(std::format(
+          "commit fdatasync failed on '{}': bytes in page cache but "
+          "durability not confirmed. Call resume() to recover.",
+          file.path().string()));
+      throw;
+    }
   }
 
   // 8. Publish.
-  if (rotation_err || sync_err) {
-    auto lsn_only = current->transient();
-    lsn_only.advance_next_lsn(t.next_lsn());
-    state_.store(std::move(lsn_only).persistent());
-    state_time_.store(now_ns(), std::memory_order_release);
-    if (rotation_err) std::rethrow_exception(rotation_err);
-    std::rethrow_exception(sync_err);
-  }
   state_.store(std::move(t).persistent());
   state_time_.store(now_ns(), std::memory_order_release);
   return true;
@@ -1153,6 +1117,14 @@ void DB::vacuum_absorb_file(std::uint32_t file_id) {
 #pragma endregion
 
 #pragma region State access
+
+void DB::publish_lsn_advance(const std::shared_ptr<const EngineState> &current,
+                              std::uint64_t target_lsn) {
+  auto lsn_only = current->transient();
+  lsn_only.advance_next_lsn(target_lsn);
+  state_.store(std::move(lsn_only).persistent());
+  state_time_.store(now_ns(), std::memory_order_release);
+}
 
 void DB::deem_as_degraded(std::string reason) {
   degraded_reason_ = std::move(reason);

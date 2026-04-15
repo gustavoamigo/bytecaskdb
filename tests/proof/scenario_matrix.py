@@ -23,8 +23,6 @@ class FailureClass(Enum):
     B2 = "append_fails_partial_write"
     B3 = "append_fails_after_full_write"
     C = "on_bulk_end_append"
-    D = "isolation_sync_fails"
-    E = "isolation_rotation_fails"
     F = "commit_sync_fails"
     G = "rotation_sync_fails"
     H = "rotation_file_creation_fails"
@@ -82,7 +80,7 @@ PLAN_SHAPES = [
 
 FAILURE_CLASSES = list(FailureClass)
 
-MULTI_ENTRY_ONLY_CLASSES = {FailureClass.C, FailureClass.D, FailureClass.E}
+MULTI_ENTRY_ONLY_CLASSES = {FailureClass.C}
 ROTATION_ONLY_CLASSES = {FailureClass.G, FailureClass.H}
 
 

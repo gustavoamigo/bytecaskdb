@@ -139,7 +139,12 @@ public:
     tainted_ = false;
 #endif
     if (written != narrow<ssize_t>(total)) {
-      if (written > 0) tainted_ = true;
+      // Any writev failure — whether the call returned -1 (possibly with
+      // bytes in the page cache on FUSE/network filesystems) or a short
+      // write — leaves the file in an indeterminate state. Always mark
+      // tainted so the caller degrades rather than attempting in-flight
+      // recovery. resume() will restore a consistent state.
+      tainted_ = true;
       throw std::system_error{errno, std::generic_category(),
                               "DataFile::append: writev failed"};
     }
@@ -238,34 +243,11 @@ public:
     return path_;
   }
 
-  // Returns true if a partial write was detected on this file. A tainted
-  // file has bytes on disk that offset_ does not account for — subsequent
-  // writes would land at incorrect offsets.
+  // Returns true if any writev failure has been detected on this file.
+  // A tainted file has bytes on disk that offset_ does not account for —
+  // subsequent writes would land at incorrect offsets. Used by vacuum_absorb
+  // to detect whether truncation is needed after a failed copy.
   [[nodiscard]] auto is_tainted() const noexcept -> bool { return tainted_; }
-
-  // Attempts to recover a failed append by reading back the entry at offset_
-  // (unchanged because append() threw before advancing it) and CRC-verifying it.
-  // Valid CRC → advances offset_, clears tainted_, returns the pre-write offset.
-  // Short read or CRC mismatch → returns std::nullopt. Does not throw.
-  [[nodiscard]] auto try_recover_failed_append(
-      std::uint16_t key_size, std::uint32_t value_size) noexcept
-      -> std::optional<Offset> {
-    const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    std::vector<std::byte> buf(total);
-    const auto pre_write_offset = offset_;
-    if (::pread(fd_, buf.data(), total, narrow<off_t>(pre_write_offset)) !=
-        narrow<ssize_t>(total)) {
-      return std::nullopt;
-    }
-    try {
-      parse_header_and_verify(std::span{buf});
-    } catch (...) {
-      return std::nullopt;
-    }
-    offset_ += static_cast<Offset>(total);
-    tainted_ = false;
-    return pre_write_offset;
-  }
 
   // Truncates the file to new_size bytes and resets offset_ accordingly.
   // Clears tainted_. Throws std::system_error on failure.

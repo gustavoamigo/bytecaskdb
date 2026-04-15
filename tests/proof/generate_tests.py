@@ -202,13 +202,11 @@ def gen_delta_literal(delta: Delta) -> str:
 
 
 def should_check_recovery(delta: Delta, failure: FailureClass) -> bool:
-    """Recovery check: skipped only when sync failure causes visibility divergence."""
+    """Recovery check: skipped for F/G — sync failed, page-cache bytes may
+    survive to resume() and be committed then. assert_resumable covers this."""
     if failure in (FailureClass.F, FailureClass.G):
-        # In-session and recovery visibility diverge after sync failure (BC-155):
-        # bytes are physically in the page cache and appear in recovery after a
-        # clean shutdown, but key changes were not published in-session.
         return False
-    return True  # resume() restores consistency for C/D/E/H before db scope closes
+    return True  # resume() restores consistency for B1/B2/B3/C/H before db scope closes
 
 
 def gen_test(
@@ -274,13 +272,13 @@ def gen_test(
     else:
         if failure in (FailureClass.F, FailureClass.G):
             parts.append(
-                "  // Recovery skipped: sync failed — in-session and recovery visibility"
+                "  // Recovery skipped: sync failed — page-cache bytes may survive"
             )
             parts.append(
-                "  // diverge (write physically in page cache; recovery outcome depends"
+                "  // to resume() and be committed then. assert_resumable covers"
             )
             parts.append(
-                "  // on whether fdatasync error was transient). Addressed by BC-157."
+                "  // the in-process recovery path."
             )
         else:
             parts.append(

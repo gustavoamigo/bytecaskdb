@@ -73,34 +73,23 @@ If any I/O operation (append, sync) throws during execution:
 - The published key directory must reflect zero operations from this call.
   `next_lsn` must be advanced past all LSNs consumed by appends that reached
   the file, to prevent reuse of those sequence numbers on the next write.
-- The disk may contain none, some, or all of the bytes from this
-  write. The engine must not assume what was written. For a single-entry
-  write where the file is tainted (bytes may have landed), the engine
-  must attempt a read-back: `pread` the entry at the known offset and
-  CRC-verify it. Valid CRC → the write is durable; publish state normally.
-  Invalid CRC or short read → the engine must guarantee that a valid entry
-  is subsequently written so recovery will reach a consistent state from
-  it. If that is not possible, the engine must degrade — `resume()` will
-  scan and truncate the active file to restore a consistent state.
+- The disk may contain none, some, or all of the bytes from this write.
+  The engine must not assume what was written. Any append failure —
+  whether nothing reached disk, a partial write, or a full write that
+  returned an error — degrades the engine unconditionally. Any `fdatasync`
+  failure (commit sync or rotation sync) likewise degrades the engine:
+  bytes are in the OS page cache but durability is not confirmed, and the
+  key directory does not reflect those bytes. `resume()` scans the active
+  file, truncates garbage, replays valid committed entries, and creates a
+  fresh active file, restoring normal operation.
 - The DB must remain operational for subsequent calls.
 
 ### Rotation Safety
 
 If a multi-entry batch fails mid-write, an orphaned `BulkBegin` marker
-may exist on the active file. The engine must isolate it by rotating
-the active file so that subsequent writes are not silently discarded
-on recovery.
-
-If the isolation rotation itself fails:
-
-- The active file still contains the orphaned `BulkBegin`.
-- Any subsequent write to that file would appear to succeed but would
-  be silently discarded by recovery (it falls after an unmatched
-  `BulkBegin`).
-- This is a consistency divergence: the caller believes the write is
-  committed, but recovery will not produce it.
-- The engine must degrade itself. `resume()` scans the active file,
-  truncates the orphaned batch, and creates a fresh active file.
+may exist on the active file. The engine degrades: `resume()` scans the
+active file, truncates the orphaned batch (no `BulkEnd` found), and creates
+a fresh active file.
 
 ### Consistency
 
@@ -168,13 +157,18 @@ on disk but not reflected in the published counter.
   A future write must never reuse an LSN already present on disk.
 
 - **next_lsn advances past all consumed LSNs.** If an append fails
-  before any bytes reach disk (classes B1, A), `next_lsn` is unchanged —
-  no bytes were written. If an append reaches disk but the subsequent
-  `fdatasync` fails (classes F and G), `next_lsn` must be advanced past
-  all consumed LSNs. The bytes are in the page cache; reusing those LSNs
-  on the next write would create ambiguous sequence numbers for the same
-  key. Key-directory changes are not published in these cases — the write
-  is not visible to callers. Gaps are safe. Reuse is not.
+  (classes B1, B2, B3), `next_lsn` must be advanced past all LSNs consumed
+  by the failed call. Whether or not bytes reached disk is indeterminate from
+  userspace — POSIX does not guarantee that `writev = -1` means no bytes were
+  written (FUSE and network filesystems may write bytes and still return an
+  error). The engine always advances conservatively: gaps are safe, reuse is
+  not. If an append reaches disk but the subsequent `fdatasync` fails
+  (classes F and G), `next_lsn` must likewise be advanced past all consumed
+  LSNs. The bytes are in the page cache; reusing those LSNs on the next write
+  would create ambiguous sequence numbers for the same key. Key-directory
+  changes are not published in these cases — the write is not visible to
+  callers. The engine degrades on F and G: `resume()` is required before
+  further writes are accepted. Gaps are safe. Reuse is not.
 
 - **Recovery produces the same next_lsn as a clean run.** Given the
   same committed writes, opening a fresh DB from disk must produce

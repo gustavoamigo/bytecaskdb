@@ -156,7 +156,9 @@ TEST_CASE("assert_delta detects degraded", "[invariants]") {
 
   auto before = capture_baseline(db);
 
-  // Class D+E cascade: count-based injection at checkpoint 2 degrades the DB.
+  // Mid-batch append failure: fi{2} fires on the 3rd checkpoint (op2 in the
+  // 2-op batch), after BulkBegin and op1 have already reached disk. The engine
+  // degrades and next_lsn advances past all consumed LSNs (4 = 2 ops + 2 markers).
   {
     bytecask::testing::ScopedFaultInjector fi{2};
     bytecask::Batch batch;
@@ -169,7 +171,7 @@ TEST_CASE("assert_delta detects degraded", "[invariants]") {
   assert_delta(before, db, ExpectedDelta{
       .keys_added = {},
       .keys_removed = {},
-      .lsn_advance = 0,
+      .lsn_advance = 4,
       .degraded = true,
   });
   assert_resumable(db);
