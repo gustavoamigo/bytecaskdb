@@ -3113,8 +3113,6 @@ auto make_state(
     std::initializer_list<std::pair<std::string, bytecask::KeyDirEntry>> entries)
     -> std::shared_ptr<bytecask::EngineState> {
   auto s = std::make_shared<bytecask::EngineState>();
-  s->files = std::make_shared<
-      std::map<std::uint32_t, std::shared_ptr<bytecask::DataFile>>>();
   s->active_file_id = 1;
   s->next_file_id = 2;
   s->next_lsn = 100;
@@ -3428,7 +3426,9 @@ auto make_state_with_stats(
     std::map<std::uint32_t, bytecask::FileStats> stats = {})
     -> std::shared_ptr<bytecask::EngineState> {
   auto s = make_state(entries);
-  s->file_stats = std::move(stats);
+  auto fstats_t = s->file_stats.transient();
+  for (const auto &[id, fs] : stats) fstats_t.set(id, fs);
+  s->file_stats = std::move(fstats_t).persistent();
   return s;
 }
 
@@ -3472,9 +3472,9 @@ TEST_CASE("apply_resume: put with higher LSN overwrites existing",
   CHECK(kv->file_offset == 200);
   CHECK(kv->value_size == 8);
   // Old file's live_bytes decreased.
-  CHECK(s->file_stats.at(2).live_bytes == 0);
+  CHECK(s->file_stats.get(2)->live_bytes == 0);
   // New file's live_bytes increased.
-  CHECK(s->file_stats.at(1).live_bytes == bytecask::entry_size(2, 8));
+  CHECK(s->file_stats.get(1)->live_bytes == bytecask::entry_size(2, 8));
 }
 
 TEST_CASE("apply_resume: put with lower LSN is ignored",
@@ -3494,8 +3494,8 @@ TEST_CASE("apply_resume: put with lower LSN is ignored",
   CHECK(kv->sequence == 50);
   CHECK(kv->file_id == 2);
   // file_stats unchanged.
-  CHECK(s->file_stats.at(2).live_bytes == bytecask::entry_size(2, 5));
-  CHECK(s->file_stats.at(1).live_bytes == 0);
+  CHECK(s->file_stats.get(2)->live_bytes == bytecask::entry_size(2, 5));
+  CHECK(s->file_stats.get(1)->live_bytes == 0);
 }
 
 TEST_CASE("apply_resume: delete removes key when LSN is higher",
@@ -3511,7 +3511,7 @@ TEST_CASE("apply_resume: delete removes key when LSN is higher",
 
   auto s = std::move(t).persistent();
   CHECK_FALSE(s->key_dir.get(to_bytes("k1")).has_value());
-  CHECK(s->file_stats.at(2).live_bytes == 0);
+  CHECK(s->file_stats.get(2)->live_bytes == 0);
 }
 
 TEST_CASE("apply_resume: delete is ignored when LSN is lower",
@@ -3568,7 +3568,7 @@ TEST_CASE("apply_resume: empty entries is a no-op",
 
   auto s = std::move(t).persistent();
   CHECK(s->key_dir.get(to_bytes("k1")).has_value());
-  CHECK(s->file_stats.at(1).live_bytes == 42);
+  CHECK(s->file_stats.get(1)->live_bytes == 42);
   CHECK(s->next_lsn == 100);
 }
 

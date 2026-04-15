@@ -84,13 +84,13 @@ inline void assert_consistent(const DB &db) {
 
     // 2. No dangling file references.
     INFO("key references file_id=" << entry.file_id);
-    CHECK(state->files->contains(entry.file_id));
+    CHECK(state->files.contains(entry.file_id));
 
     // 5. Track max sequence for next_lsn check.
     if (entry.sequence > max_seq) max_seq = entry.sequence;
   }
 
-  for (const auto &[file_id, fs] : state->file_stats) {
+  for (const auto [file_id, fs] : state->file_stats) {
     auto it = computed_live.find(file_id);
     auto expected_live = (it != computed_live.end()) ? it->second : 0ULL;
     INFO("file_id=" << file_id << " live_bytes");
@@ -98,10 +98,10 @@ inline void assert_consistent(const DB &db) {
   }
 
   // 3. Active file exists.
-  CHECK(state->files->contains(state->active_file_id));
+  CHECK(state->files.contains(state->active_file_id));
 
   // 4. file_stats covers all files.
-  for (const auto &[file_id, _] : *state->files) {
+  for (const auto [file_id, _] : state->files) {
     INFO("file_id=" << file_id << " missing from file_stats");
     CHECK(state->file_stats.contains(file_id));
   }
@@ -230,7 +230,9 @@ inline auto capture_vacuum_baseline(const DB &db) -> VacuumBaseline {
   VacuumBaseline bl;
   bl.keys = capture_baseline(db);
   auto state = db.engine_state();
-  bl.file_stats = state->file_stats;
+  for (const auto [file_id, fs] : state->file_stats) {
+    bl.file_stats.emplace(file_id, fs);
+  }
   return bl;
 }
 
@@ -240,7 +242,7 @@ inline auto find_vacuum_target(const DB &db) -> std::uint32_t {
   auto state = db.engine_state();
   std::uint32_t target_id{};
   double worst_frag = 0.0;
-  for (const auto &[file_id, fs] : state->file_stats) {
+  for (const auto [file_id, fs] : state->file_stats) {
     if (file_id == state->active_file_id) continue;
     if (fs.total_bytes == 0) continue;
     const double frag = 1.0 - static_cast<double>(fs.live_bytes) /
@@ -264,7 +266,7 @@ inline void assert_vacuum_success(const DB &db, const VacuumBaseline &before,
 
   // Vacuumed file must be gone.
   INFO("vacuumed file_id=" << vacuumed_file_id << " must be removed from state");
-  CHECK_FALSE(state->files->contains(vacuumed_file_id));
+  CHECK_FALSE(state->files.contains(vacuumed_file_id));
   CHECK_FALSE(state->file_stats.contains(vacuumed_file_id));
 
   // next_lsn unchanged — vacuum does not advance LSN.
@@ -282,9 +284,9 @@ inline void assert_vacuum_success(const DB &db, const VacuumBaseline &before,
 
   // total_bytes for active file must match actual file size.
   auto active_id = state->active_file_id;
-  auto actual_size = state->files->at(active_id)->size();
+  auto actual_size = (*state->files.get(active_id))->size();
   INFO("active file total_bytes staleness check");
-  CHECK(state->file_stats.at(active_id).total_bytes == actual_size);
+  CHECK(state->file_stats.get(active_id)->total_bytes == actual_size);
 
   assert_consistent(db);
 }
@@ -299,7 +301,7 @@ inline void assert_vacuum_no_change(const DB &db, const VacuumBaseline &before,
 
   // Vacuumed file must still be present.
   INFO("vacuumed file_id=" << vacuumed_file_id << " must remain after failure");
-  CHECK(state->files->contains(vacuumed_file_id));
+  CHECK(state->files.contains(vacuumed_file_id));
   CHECK(state->file_stats.contains(vacuumed_file_id));
 
   // next_lsn unchanged.
@@ -319,17 +321,17 @@ inline void assert_vacuum_no_change(const DB &db, const VacuumBaseline &before,
   for (const auto &[file_id, fs] : before.file_stats) {
     INFO("file_id=" << file_id << " file_stats must be unchanged after failed vacuum");
     if (state->file_stats.contains(file_id)) {
-      CHECK(state->file_stats.at(file_id).live_bytes == fs.live_bytes);
-      CHECK(state->file_stats.at(file_id).total_bytes == fs.total_bytes);
+      CHECK(state->file_stats.get(file_id)->live_bytes == fs.live_bytes);
+      CHECK(state->file_stats.get(file_id)->total_bytes == fs.total_bytes);
     }
   }
 
   // total_bytes for active file must match actual file size (no dead bytes
   // were written without updating stats).
   auto active_id = state->active_file_id;
-  auto actual_size = state->files->at(active_id)->size();
+  auto actual_size = (*state->files.get(active_id))->size();
   INFO("active file total_bytes staleness check after failed vacuum");
-  CHECK(state->file_stats.at(active_id).total_bytes == actual_size);
+  CHECK(state->file_stats.get(active_id)->total_bytes == actual_size);
 
   assert_consistent(db);
 }

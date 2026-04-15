@@ -20,6 +20,7 @@ import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.radix_tree;
 import bytecask.types;
+import bytecask.u32_map;
 import bytecask.util;
 
 namespace bytecask {
@@ -44,10 +45,9 @@ struct FileStats {
 };
 #endif
 
-// File registry: a copy-on-write map from file_id to shared DataFile.
-// The outer shared_ptr is copied into iterators at construction — O(1),
-// independent lifetime from DB. Rotation clones the inner map,
-// inserts the new file, then atomically replaces the outer shared_ptr.
+// File registry: a COW map from file_id to shared DataFile.
+// PersistentU32Map provides O(1) snapshot sharing; rotation and vacuum
+// fork a transient, mutate it, and freeze — no O(N) map clone.
 
 // ---------------------------------------------------------------------------
 // KeyDirEntry — one slot in the in-memory key directory.
@@ -83,18 +83,18 @@ export class TransientEngineState;
 // ---------------------------------------------------------------------------
 export struct EngineState {
   PersistentRadixTree<KeyDirEntry> key_dir;
-  std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>> files;
-  std::map<std::uint32_t, FileStats> file_stats;
+  PersistentU32Map<std::shared_ptr<DataFile>> files;
+  PersistentU32Map<FileStats> file_stats;
   std::uint32_t active_file_id{};
   std::uint32_t next_file_id{};
   std::uint64_t next_lsn{1};
 
   [[nodiscard]] auto active_file() -> DataFile & {
-    return *files->at(active_file_id);
+    return **files.get(active_file_id);
   }
 
   [[nodiscard]] auto active_file() const -> const DataFile & {
-    return *files->at(active_file_id);
+    return **files.get(active_file_id);
   }
 
   // Creates a mutable working copy for the write path.
@@ -196,7 +196,7 @@ export struct RecoveryResult {
   PersistentRadixTree<KeyDirEntry> key_dir;
   std::map<Key, std::uint64_t> tombstones;
   std::uint64_t max_lsn{0};
-  std::map<std::uint32_t, FileStats> file_stats;
+  PersistentU32Map<FileStats> file_stats;
 };
 
 } // namespace bytecask
