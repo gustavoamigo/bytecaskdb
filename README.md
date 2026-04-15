@@ -27,9 +27,10 @@ Benchmarked against [RocksDB](https://rocksdb.org/) at 1 M keys. The tables belo
 
 - **Reads are 2–3× faster** once the working set exceeds RocksDB's block cache (from ~500 k keys onward).
 - **Concurrent reads scale linearly** — lock-free snapshots, no shared mutex.
-- **Sequential writes are comparable** — both engines append; ±10 % across all write benchmarks. No write amplification from compaction, so Sync Delete is 2× faster.
+- **Sequential writes are comparable** — both engines append; ±15 % across single-threaded write benchmarks. No write amplification from compaction, so Sync Delete is 2.3× faster.
+- **Concurrent sync writes scale via group commit** — at 32 threads, sync puts reach 4.5–4.8× RocksDB throughput as writers share a single `fdatasync` call.
 - **Range scans over values are slower** — each value is a separate disk read. Key-only iteration (`keys_from`) is a pure in-memory tree walk.
-- **Recovery is fast and parallel** — hint files replayed across all cores with full CRC verification. 1 M keys in ~60 ms, 10 M in ~580 ms at 16 threads.
+- **Recovery is fast and parallel** — hint files replayed across all cores with full CRC verification. 1 M keys in ~56 ms, 10 M in ~513 ms at 16 threads.
 
 See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md) for the full benchmark report with all thread counts, dataset sizes, and hardware details.
 
@@ -41,12 +42,12 @@ See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md)
 
 | Operation | ByteCaskDB | RocksDB | Notes |
 |-----------|----------|---------|-------|
-| Put (NoSync) | 157 Kops/s | **166 Kops/s** | Comparable with an edge for RocksDB. Sequential append on both sides |
-| Put (Sync) | 435 ops/s |**478.0 ops/s** | Comparable  with an edge for RocksDB. Disk-bound — limited by `fdatasync` round-trip latency |
-| Get | **1.34 Mops/s** | 575 Kops/s | **2.3×** — in-memory radix tree lookup; no block cache miss risk |
-| Del (Sync) | **657 ops/s** | 320 ops/s | **2.1×** — single tombstone append vs RocksDB write amplification |
-| Range-50 | 30 K scans/s | **87 K scans/s** | RocksDB prefetches sequential blocks; ByteCaskDB fetches each value individually. |
-| MixedBatch (Sync) | 34 Kops/s | 33 Kops/s | Comparable |
+| Put (NoSync) | 146 Kops/s | **171 Kops/s** | Comparable with an edge for RocksDB. Sequential append on both sides |
+| Put (Sync) | **477 ops/s** | 466 ops/s | Comparable. Disk-bound — limited by `fdatasync` round-trip latency |
+| Get | **1.22 Mops/s** | 548 Kops/s | **2.2×** — in-memory radix tree lookup; no block cache miss risk |
+| Del (Sync) | **667 ops/s** | 291 ops/s | **2.3×** — single tombstone append vs RocksDB write amplification |
+| Range-50 | 28 K scans/s | **83 K scans/s** | RocksDB prefetches sequential blocks; ByteCaskDB fetches each value individually. |
+| MixedBatch (Sync) | **41 Kops/s** | 32 Kops/s | **1.3×** — atomic batch with single `writev` + `fdatasync` |
 
 ByteCaskDB's read advantage grows with dataset size: at 50k keys RocksDB's block cache covers the entire working set and leads; from 500k keys onward the cache misses and ByteCaskDB pulls ahead by **2–3×**.
 
@@ -54,8 +55,8 @@ ByteCaskDB's read advantage grows with dataset size: at 50k keys RocksDB's block
 
 | Percentile | ByteCaskDB | RocksDB |
 |-----------|---------|----------|
-| p50 | **680 ns** | 1.57 µs |
-| p99 | **1.15 µs** | 3.96 µs |
+| p50 | **782 ns** | 1.63 µs |
+| p99 | **1.13 µs** | 4.26 µs |
 
 Latency stays flat as the dataset grows: ByteCaskDB always reads from the OS page cache at a known offset; RocksDB's latency climbs when key metadata exceeds the block cache.
 
@@ -65,22 +66,34 @@ Latency stays flat as the dataset grows: ByteCaskDB always reads from the OS pag
 
 | Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
-| 2 | **2.56 Mops/s** | 1.13 Mops/s | 2.27× |
-| 4 | **4.27 Mops/s** | 2.15 Mops/s | 1.99× |
-| 8 | **6.10 Mops/s** | 4.44 Mops/s | 1.37× |
-| 16 | **8.61 Mops/s** | 6.17 Mops/s | 1.40× |
-| 32 | **11.43 Mops/s** | 8.30 Mops/s | 1.38× |
+| 2 | **2.11 Mops/s** | 894 Kops/s | 2.37× |
+| 4 | **3.69 Mops/s** | 2.06 Mops/s | 1.79× |
+| 8 | **5.64 Mops/s** | 4.27 Mops/s | 1.32× |
+| 16 | **7.57 Mops/s** | 6.72 Mops/s | 1.13× |
+| 32 | **10.85 Mops/s** | 8.76 Mops/s | 1.24× |
+
+### Concurrent Sync Writes — `PutMT/Sync` (1M keys)
+
+> Group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost.
+
+| Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
+|---:|---:|---:|:---:|
+| 2 | 482 ops/s | **710 ops/s** | 0.68× |
+| 4 | 955 ops/s | **1.1 Kops/s** | 0.89× |
+| 8 | **1.8 Kops/s** | 1.8 Kops/s | 1.02× |
+| 16 | **4.0 Kops/s** | 1.6 Kops/s | 2.52× |
+| 32 | **9.5 Kops/s** | 2.1 Kops/s | 4.46× |
+| 64 | **18.7 Kops/s** | 5.4 Kops/s | 3.49× |
 
 ### Read-While-Writing (1M keys, 1 writer + N readers, Sync, CRC disabled)
 
-> Two read consistency modes, both controlled via `ReadOptions::staleness_tolerance`: the default (`staleness_tolerance = 0`) refreshes the thread-local snapshot on every write, guaranteeing same-thread read-your-writes; setting `staleness_tolerance > 0` refreshes only when the tolerance window has elapsed — the hot path is a single relaxed load with no locked instructions or refcount traffic.
-
-| Readers | ByteCaskDB | ByteCaskDB (staleness_tolerance > 0) | RocksDB |
-|---:|---:|---:|---:|
-| 2 | 2.54 Mops/s | 2.61 Mops/s | 1.12 Mops/s |
-| 4 | 4.26 Mops/s | 4.46 Mops/s | 2.14 Mops/s |
-| 8 | 5.94 Mops/s | 6.22 Mops/s | 4.30 Mops/s |
-| 16 | 8.55 Mops/s | 9.34 Mops/s | 6.27 Mops/s |
+| Readers | ByteCaskDB | RocksDB |
+|---:|---:|---:|
+| 2 | **2.20 Mops/s** | 1.05 Mops/s |
+| 4 | **3.59 Mops/s** | 2.03 Mops/s |
+| 8 | **5.37 Mops/s** | 4.24 Mops/s |
+| 16 | **7.35 Mops/s** | 6.31 Mops/s |
+| 32 | **10.75 Mops/s** | 10.27 Mops/s |
 
 ### Recovery
 
@@ -88,18 +101,18 @@ Recovery is the process that runs when ByteCaskDB opens an existing database: it
 
 | Keys | Threads | Recovery Time | Speedup vs 1T |
 |---:|---:|---:|---:|
-| 1M | 1 | 252 ms | — |
-| 1M | 4 | 87 ms | 2.9× |
-| 1M | 8 | 63 ms | 4.0× |
-| 1M | 16 | 61 ms | 4.1× |
-| 10M | 1 | 2.74 s | — |
-| 10M | 4 | 0.96 s | 2.9× |
-| 10M | 8 | 0.64 s | 4.3× |
-| 10M | 16 | 0.58 s | 4.7× |
+| 1M | 1 | 249 ms | — |
+| 1M | 4 | 86 ms | 2.9× |
+| 1M | 8 | 61 ms | 4.1× |
+| 1M | 16 | 56 ms | 4.4× |
+| 10M | 1 | 2.48 s | — |
+| 10M | 4 | 0.89 s | 2.8× |
+| 10M | 8 | 0.58 s | 4.3× |
+| 10M | 16 | 0.51 s | 4.9× |
 
 ---
 
-_Tested on AMD Ryzen 7 3700X (8C/16T), Samsung SSD 860 EVO SATA (483 MiB/s read), 31 GiB RAM. Each result is the mean of 3 runs. Benchmark source: [`benchmarks/engine_bench.cpp`](benchmarks/engine_bench.cpp)._
+_Tested on AMD Ryzen 7 3700X (8C/16T), Samsung SSD 860 EVO SATA (484 MiB/s read), 31 GiB RAM. Each result is the mean of 5 runs. Benchmark source: [`benchmarks/engine_bench.cpp`](benchmarks/engine_bench.cpp)._
 
 ## Quick Start
 

@@ -50,6 +50,18 @@ set_languages("c++23")
 set_policy("build.c++.modules", true)
 add_cxflags(table.unpack(common_flags))
 
+if is_mode("release") or is_mode("releasedbg") then
+    add_cxflags("-O3", "-fomit-frame-pointer")
+end
+
+-- LTO and -march=native applied per-target to avoid polluting dependency package builds.
+local function add_release_opts(t)
+    if is_mode("release") or is_mode("releasedbg") then
+        t:set("policy", "build.optimization.lto", true)
+        t:add("cxflags", "-march=native", {force = true})
+    end
+end
+
 target("bytecask_tests")
     set_kind("binary")
     -- For VS Code / clangd support, run: scripts/gen_compile_commands.sh
@@ -58,6 +70,7 @@ target("bytecask_tests")
     add_packages("catch2", "crc32c")
     add_defines("BYTECASK_TESTING")
     on_load(apply_sanitizer)
+    on_load(add_release_opts)
 
 target("bytecask_bench")
     set_kind("binary")
@@ -67,6 +80,7 @@ target("bytecask_bench")
     add_packages("benchmark", "crc32c")
     add_defines("BYTECASK_TESTING")
     on_load(apply_sanitizer)
+    on_load(add_release_opts)
 
 target("engine_bench")
     set_kind("binary")
@@ -75,6 +89,7 @@ target("engine_bench")
     add_cxflags("-Wno-global-constructors")
     add_packages("benchmark", "crc32c", "leveldb", "rocksdb")
     on_load(apply_sanitizer)
+    on_load(add_release_opts)
 
 -- Static library target for out-of-tree consumers (e.g. the MariaDB plugin).
 -- Compiles all C++23 module sources and exposes them via libbytecask.a.

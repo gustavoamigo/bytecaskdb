@@ -205,11 +205,18 @@ struct BcAdapter {
        const std::vector<std::byte> *populate_val)
         : dir{tag}, engine{bytecask::DB::open(dir.path)} {
       if (populate_keys) {
+        constexpr std::size_t kPopulateBatchSize = 100;
         bytecask::WriteOptions wo;
+        wo.sync = false;
         const auto n = populate_keys->size();
-        for (std::size_t i = 0; i < n; ++i) {
-          wo.sync = (i % 30000 == 29999) || (i == n - 1);
-          engine.put(wo, bc_key((*populate_keys)[i]), bc_val(*populate_val));
+        for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
+          auto end = std::min(i + kPopulateBatchSize, n);
+          bytecask::Batch batch;
+          for (std::size_t j = i; j < end; ++j) {
+            batch.put(bc_key((*populate_keys)[j]), bc_val(*populate_val));
+          }
+          wo.sync = (end == n);
+          engine.apply_batch(wo, std::move(batch));
         }
       }
     }
@@ -409,10 +416,18 @@ template <bool UseCache = true> struct RdbAdapter {
         throw std::runtime_error{"RocksDB open failed: " + s.ToString()};
 
       if (populate_keys) {
+        constexpr std::size_t kPopulateBatchSize = 100;
         rocksdb::WriteOptions wo;
         wo.sync = false;
-        for (const auto &k : *populate_keys) {
-          s = raw->Put(wo, rdb_slice(k), rdb_val_slice(*populate_val));
+        const auto n = populate_keys->size();
+        for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
+          auto end = std::min(i + kPopulateBatchSize, n);
+          rocksdb::WriteBatch wb;
+          for (std::size_t j = i; j < end; ++j) {
+            wb.Put(rdb_slice((*populate_keys)[j]),
+                   rdb_val_slice(*populate_val));
+          }
+          s = raw->Write(wo, &wb);
           if (!s.ok())
             throw std::runtime_error{"RocksDB put failed: " + s.ToString()};
         }
@@ -922,12 +937,19 @@ struct ParRecoverySetup {
 
   ParRecoverySetup() : keys{generate_prefixed_keys(kDatasetSize)} {
     auto db = bytecask::DB::open(dir.path, {.max_file_bytes = kParRecoveryThreshold});
+    constexpr std::size_t kPopulateBatchSize = 100;
     bytecask::WriteOptions wo;
+    wo.sync = false;
     static const std::vector<std::byte> tiny_val{std::byte{0x42}};
     const auto n = keys.size();
-    for (std::size_t i = 0; i < n; ++i) {
-      wo.sync = (i == n - 1);
-      db.put(wo, bc_key(keys[i]), bc_val(tiny_val));
+    for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
+      auto end = std::min(i + kPopulateBatchSize, n);
+      bytecask::Batch batch;
+      for (std::size_t j = i; j < end; ++j) {
+        batch.put(bc_key(keys[j]), bc_val(tiny_val));
+      }
+      wo.sync = (end == n);
+      db.apply_batch(wo, std::move(batch));
     }
     // db destructs here — seals active file, writes all hint files.
   }
