@@ -5,8 +5,6 @@
 // group write batching.
 
 module;
-#include <algorithm>
-#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <exception>
@@ -85,14 +83,6 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// WriteGroupOpts — tuning parameters for WriteGroup's adaptive wait window.
-// ---------------------------------------------------------------------------
-export struct WriteGroupOpts {
-  std::chrono::microseconds max_wait{200};
-  std::size_t target_batch{8};
-};
-
-// ---------------------------------------------------------------------------
 // WriteGroup — leader-applies-all write batching (Template Method pattern).
 //
 // The algorithm skeleton lives here: enqueue → elect leader → drain queue →
@@ -100,20 +90,13 @@ export struct WriteGroupOpts {
 // batch execution logic is injected via a BatchExecutor callback at
 // construction time.
 //
-// On the first drain (leader just elected, queue typically has 1 slot), the
-// leader waits up to an adaptive window for more writers to arrive. The wait
-// exits early when the queue reaches target_batch. An EMA of batch sizes
-// tracks natural concurrency: when batches fill naturally, the wait shrinks
-// to zero.
-//
 // submit() is non-template — it takes a Slot&.
 // ---------------------------------------------------------------------------
 export class WriteGroup {
 public:
   explicit WriteGroup(
-      std::move_only_function<void(std::vector<Slot *> &)> executor,
-      WriteGroupOpts opts = {})
-      : executor_{std::move(executor)}, opts_{opts} {}
+      std::move_only_function<void(std::vector<Slot *> &)> executor)
+      : executor_{std::move(executor)} {}
 
   WriteGroup(const WriteGroup &) = delete;
   WriteGroup &operator=(const WriteGroup &) = delete;
@@ -129,8 +112,6 @@ public:
       lk.unlock();
       leader_loop();
       lk.lock();
-    } else {
-      leader_cv_.notify_one();
     }
 
     cv_.wait(lk, [&] { return slot.done; });
@@ -139,15 +120,7 @@ public:
   }
 
 private:
-  auto effective_wait() const -> std::chrono::microseconds {
-    auto scale = std::clamp(
-        1.0 - ema_batch_ / static_cast<double>(opts_.target_batch), 0.0, 1.0);
-    return std::chrono::microseconds{static_cast<long long>(
-        static_cast<double>(opts_.max_wait.count()) * scale)};
-  }
-
   void leader_loop() {
-    bool first_drain = true;
     while (true) {
       std::vector<Slot *> batch;
       {
@@ -156,17 +129,6 @@ private:
           leader_active_ = false;
           return;
         }
-
-        if (first_drain && queue_.size() < opts_.target_batch) {
-          auto wait = effective_wait();
-          if (wait > std::chrono::microseconds::zero()) {
-            leader_cv_.wait_for(lk, wait, [&] {
-              return queue_.size() >= opts_.target_batch;
-            });
-          }
-          first_drain = false;
-        }
-
         batch.swap(queue_);
       }
 
@@ -179,9 +141,6 @@ private:
         }
       }
 
-      ema_batch_ = 0.25 * static_cast<double>(batch.size())
-                  + 0.75 * ema_batch_;
-
       {
         std::unique_lock<std::mutex> lk{queue_mu_};
         for (auto *s : batch) s->done = true;
@@ -191,13 +150,10 @@ private:
   }
 
   std::move_only_function<void(std::vector<Slot *> &)> executor_;
-  WriteGroupOpts opts_;
   std::mutex queue_mu_;
   std::vector<Slot *> queue_;
   bool leader_active_{false};
-  double ema_batch_{1.0};
   std::condition_variable cv_;
-  std::condition_variable leader_cv_;
 };
 
 // ---------------------------------------------------------------------------
