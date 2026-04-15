@@ -409,6 +409,12 @@ public:
   void apply_vacuum(std::uint32_t old_file_id, const VacuumScanResult &scan,
                     std::shared_ptr<DataFile> new_sealed_file);
 
+  // State transition: replay valid committed entries from a resume() scan.
+  // Uses LSN-wins resolution to update key_dir and file_stats. Advances
+  // next_lsn past the highest LSN in the entries. Cannot fail.
+  void apply_resume(std::uint32_t file_id,
+                    const std::vector<ResumeEntry> &entries);
+
   // Pure queries the coordinator needs for IO decisions.
   [[nodiscard]] auto active_file() -> DataFile &;
   [[nodiscard]] auto active_file_id() const noexcept -> std::uint32_t;

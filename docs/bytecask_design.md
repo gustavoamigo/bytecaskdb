@@ -187,11 +187,12 @@ When this happens, the engine calls `deem_as_degraded(reason)` with a diagnostic
 - **Recovery via `resume()`**: the degraded flag is in-memory only. The service calls `resume()` to attempt in-process recovery without a restart. `resume()` runs a universal recovery process:
   1. Acquires the write lock.
   2. Scans the active file (batch-aware) to find the last valid committed offset. Orphaned `BulkBegin` batches are excluded — if a `BulkBegin` has no matching `BulkEnd`, `valid_offset` is reset to the batch start.
-  3. Calls `ftruncate` to remove garbage bytes and orphaned batch markers up to `valid_offset`.
-  4. Calls `fdatasync` to persist the truncation.
-  5. Seals the active file and dispatches hint generation (both idempotent).
-  6. Creates a new active file and publishes the new engine state.
-  7. Clears the `degraded_` flag.
+  3. Replays valid committed entries into the key directory using LSN-wins resolution: for each Put whose LSN exceeds the current key_dir entry (or the key is absent), update key_dir and file_stats; for each Delete whose LSN exceeds the current entry, erase the key. This recovers entries that were written to the data file but never published to EngineState (e.g. sync-failure paths where only next_lsn was advanced, or degraded-state transitions that occurred between IO and state publication). Also advances `next_lsn` past the highest LSN seen on disk.
+  4. Calls `ftruncate` to remove garbage bytes and orphaned batch markers up to `valid_offset`.
+  5. Calls `fdatasync` to persist the truncation.
+  6. Seals the active file and dispatches hint generation (both idempotent).
+  7. Creates a new active file and publishes the new engine state.
+  8. Clears the `degraded_` flag.
   If any step throws, the engine stays degraded and the caller may retry. Recovery is idempotent.
 
 Implementation: `degraded_` is an `atomic<bool>` (release on write, acquire on read). The non-atomic `degraded_reason_` string is safely published via the release/acquire pair — the string is written before `degraded_.store(true, release)` and read after `degraded_.load(acquire)`.

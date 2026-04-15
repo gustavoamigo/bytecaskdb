@@ -127,6 +127,18 @@ export struct VacuumMapping {
   std::uint32_t value_size;
 };
 
+// ---------------------------------------------------------------------------
+// ResumeEntry — one valid committed entry collected during resume()'s scan.
+// Passed to TransientEngineState::apply_resume for key_dir replay.
+// ---------------------------------------------------------------------------
+export struct ResumeEntry {
+  std::uint64_t sequence;
+  EntryType entry_type;
+  std::uint64_t file_offset;
+  std::uint32_t value_size;
+  std::vector<std::byte> key;
+};
+
 export struct VacuumScanResult {
   std::vector<VacuumMapping> mappings;
   std::uint64_t live_bytes{0};
