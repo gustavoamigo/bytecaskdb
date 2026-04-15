@@ -69,36 +69,41 @@ def expected_delta(
         return Delta([], [], 0, degraded=False, threw=False)
 
     if failure == FailureClass.B1:
-        return Delta([], [], 0, degraded=False, threw=True)
+        # Advance conservatively: the engine cannot determine from userspace
+        # whether bytes reached disk (POSIX does not guarantee writev=-1 means
+        # no bytes written). Gaps are safe; reuse is not.
+        n = plan.write_count
+        return Delta([], [], n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.C:
-        return Delta([], [], 0, degraded=True, threw=True)
+        # Append failed mid-batch (on BulkEnd). Prior entries (BulkBegin, data
+        # entries) may be on disk. Advance conservatively past all consumed LSNs.
+        # resume() truncates the orphaned batch and sets next_lsn from disk.
+        n = plan.write_count
+        return Delta([], [], n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.B2:
-        return Delta([], [], 0, degraded=plan.is_single_entry, threw=True)
+        n = plan.write_count
+        return Delta([], [], n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.B3:
-        if plan.is_single_entry:
-            # BC-156: read-back confirms CRC valid → publish normally, no throw.
-            return _full_delta(plan, key_labels, existing_keys)
-        # Multi-entry B3: batch framing discards the orphaned entry; no degrade.
-        return Delta([], [], 0, degraded=False, threw=True)
-
-    if failure in (FailureClass.D, FailureClass.E):
-        return Delta([], [], 0, degraded=True, threw=True)
+        # Any append error — including a full write that returned an error —
+        # degrades unconditionally. resume() replays valid on-disk entries.
+        n = plan.write_count
+        return Delta([], [], n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.F:
-        # Sync failed after writev — bytes in page cache but not confirmed
-        # durable. Key changes are NOT published in-session (BC-155). LSN
-        # still advances to prevent reuse of sequence numbers now on disk.
+        # Commit fdatasync failed — bytes in page cache but not confirmed
+        # durable. Key changes are NOT published in-session. LSN advances to
+        # prevent reuse. Engine degrades (BC-164); resume() restores writes.
         n = plan.write_count
-        return Delta([], [], n + (2 if n > 1 else 0), degraded=False, threw=True)
+        return Delta([], [], n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.G:
-        # Rotation sync failed — same contract as F: key changes unpublished,
-        # LSN advances past consumed values.
+        # Rotation fdatasync failed — same contract as F: bytes in page cache,
+        # key changes unpublished, LSN advances, engine degrades (BC-164).
         n = plan.write_count
-        return Delta([], [], n + (2 if n > 1 else 0), degraded=False, threw=True)
+        return Delta([], [], n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.H:
         return _full_delta(

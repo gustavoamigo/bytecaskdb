@@ -143,66 +143,37 @@ operation failed, not what the key bytes were.
 class FailureClass(Enum):
     SUCCESS = "success"               # no failure — transition fully persisted
     A  = "before_any_io"              # conflict check fails — no I/O attempted
-    B1 = "append_fails_nothing_written"   # writev returns -1, no bytes on disk
+    B1 = "append_fails_nothing_written"   # writev returns -1
     B2 = "append_fails_partial_write"     # writev returns short, file tainted
     B3 = "append_fails_after_full_write"  # writev ok, post-write fault, file tainted
-    C  = "on_bulk_end_append"         # BulkEnd write fails — orphan isolation
-    D  = "isolation_sync_fails"       # sync during orphan isolation fails — degrade
-    E  = "isolation_rotation_fails"   # rotation during orphan isolation fails — degrade
-    F  = "commit_sync_fails"          # sync in commit phase — persisted, throws
-    G  = "rotation_sync_fails"        # post-write rotation sync fails — persisted, throws
+    C  = "on_bulk_end_append"         # BulkEnd write fails — degrade
+    F  = "commit_sync_fails"          # commit fdatasync fails — bytes in page cache, not confirmed durable
+    G  = "rotation_sync_fails"        # pre-rotation fdatasync fails — bytes in page cache, not confirmed durable
     H  = "rotation_file_creation_fails"  # post-write rotation fails after seal — degrade
 ```
 
 ### Write outcome subclasses (B1, B2, B3)
 
-The original class B ("append fails mid-batch") assumed `writev` either
-fully succeeds or fails before writing anything. In reality, `writev`
-can produce three outcomes:
+`writev` can produce three outcomes when it fails:
 
-- **B1 — nothing written**: `writev` returns -1. No bytes on disk.
-  `offset_` is unchanged, kernel fd position is unchanged. Safe.
-- **B2 — partial write**: `writev` returns 0 < N < total. N bytes are
-  on disk, kernel fd position advanced by N. `offset_` is not advanced
-  (the throw in `append()` skips `offset_ +=`). The file is `tainted`.
-- **B3 — full write + error return**: `writev` writes all bytes to
-  disk successfully, but an error is returned to the caller (simulated
-  by `PostWriteMode::throw_after`, which throws after `writev` returns
-  but before `offset_` advances). The entry is structurally complete on
-  disk with a valid CRC. The file is `tainted`.
+- **B1 — error return**: `writev` returns -1. POSIX does not guarantee that
+  no bytes reached the page cache — FUSE and network filesystems may not
+  follow the Linux regular-file convention. The engine treats any `writev`
+  failure as indeterminate: `tainted_` is always set, and the engine degrades.
+- **B2 — partial write**: `writev` returns 0 < N < total. N bytes are on
+  disk, kernel fd position advanced by N. `offset_` is not advanced (the
+  throw in `append()` skips `offset_ +=`). The file is `tainted`.
+- **B3 — full write + error return**: `writev` writes all bytes to disk
+  successfully, but an error is returned to the caller (simulated by
+  `PostWriteMode::throw_after`). The entry is structurally complete on disk
+  with a valid CRC. The file is `tainted`.
 
-For multi-entry batches, B2 and B3 are safe: the isolation rotation
-moves to a new file, abandoning the tainted one. Recovery discards the
-orphaned batch because the BulkBegin/BulkEnd framing is incomplete.
-
-For single-entry writes, there is no isolation — `offset_` diverges
-from the kernel's file position (the file was opened with `O_APPEND`).
-The next `writev` would write at the kernel's true EOF (past the stale
-bytes), but `offset_` would still point to the old position. The
-returned offset for subsequent entries would be wrong — silent
-corruption.
-
-The fix: `DataFile::append()` sets `tainted_ = true` when `writev`
-returns a short write (`written > 0`). In the `apply_batch_if` catch
-block, if `!multi && file.is_tainted()`, the engine calls
-`DataFile::try_recover_failed_append`: it preads the entry at the
-pre-write offset and CRC-verifies it. Valid CRC → publish normally
-(B3 — write actually succeeded). Invalid CRC → degrade the DB (B2).
-
-B2 and B3 differ in recovery behavior for single-entry writes:
-
-- **B2 (single)** — partial bytes on disk. The entry has an invalid CRC
-  or is truncated. Recovery skips it. The transition is not recovered.
-- **B3 (single)** — all bytes on disk, valid CRC. As of BC-156, the engine
-  attempts a read-back before degrading: `pread` the entry at the known
-  offset and CRC-verify it. Valid CRC → the write is durable; the engine
-  publishes state normally and returns success to the caller (no throw, no
-  degrade). Invalid CRC or short read → degrade as for B2. Before BC-156, B3
-  always degraded — the recovery note below applied then but not now.
-
-  *Recovery note (pre-BC-156 / B2 reference):* For B2, the partial bytes on
-  disk have an invalid CRC; recovery skips the entry and the transition is
-  not recovered.
+All three subclasses degrade the engine unconditionally. A best-effort
+`sync()` is called before degrading so that any bytes already in the page
+cache reach durable storage — `resume()` can then replay valid committed
+entries written before the failure. `resume()` scans the active file,
+truncates any incomplete or orphaned content, and creates a fresh active
+file.
 
 ### Post-write rotation failure subclasses (G, H)
 
@@ -212,10 +183,11 @@ so, it syncs the file and rotates to a new one. Two distinct failures
 can occur at this point:
 
 - **G — rotation sync fails**: The pre-rotation `fdatasync` fails.
-  The file is not sealed. The transition is fully persisted (appends
-  succeeded), so the state is published and the exception is rethrown.
-  The DB is not degraded — the next write will retry rotation or
-  continue appending to the same file.
+  The file is not sealed. Bytes are in the page cache but durability is
+  not confirmed. Key-directory changes are NOT published. `next_lsn`
+  advances past all consumed LSNs. The engine degrades; `resume()` scans
+  the active file, replays any valid committed entries, and creates a
+  fresh active file.
 - **H — rotation file creation fails**: The sync succeeded but
   `rotate_active_file` fails after sealing the active file. The sealed
   file cannot accept further appends (`assert(!sealed_)` would fire).
@@ -235,25 +207,30 @@ healthy but fails on the next append. Degrading is the correct response;
 |-------|---------------------|-----------------|--------------|--------|----------|
 | SUCCESS | Yes — fully | Yes — full delta | Yes | No | No |
 | A | No — not attempted | No | No | No (returns false) | No |
-| B1 | No — nothing written | No | No | Yes | No |
-| B2 (multi) | No — partial write | No | No | Yes | No (isolation rotates) |
-| B2 (single) | No — partial write | No | No | Yes | Yes (tainted) |
-| B3 (multi) | No — orphaned batch | No | No | Yes | No (isolation rotates) |
-| B3 (single) | Yes — full write, valid CRC | Yes — read-back verifies CRC, publishes if valid (BC-156) | No (in-process) | Yes | No — B3 no longer degrades; B2 still degrades |
-| C | No — partial write | No | No | Yes | Yes |
-| D | No — partial write | No | No | Yes | Yes |
-| E | No — partial write | No | No | Yes | Yes |
-| F | Yes — fully | No — lsn only | Yes | Yes | No |
-| G | Yes — fully | No — lsn only | Yes | Yes | No |
+| B1 | No — indeterminate | No | Yes | Yes | Yes |
+| B2 | No — partial write | No | Yes | Yes | Yes |
+| B3 | No — indeterminate | No | Yes | Yes | Yes |
+| C | No — orphaned BulkBegin | No | Yes | Yes | Yes |
+| F | No — page cache only | No — lsn only | Yes | Yes | Yes |
+| G | No — page cache only | No — lsn only | Yes | Yes | Yes |
 | H | Yes — fully | Yes — full delta | Yes | Yes | Yes |
 
-Note on classes F and G — key changes unpublished, LSN advanced: The data
-is written via `writev` and reaches the file, but `fdatasync` fails — the
-transition is not confirmed durable. Key-directory changes are NOT published:
-the written key is invisible to subsequent reads, and the caller must retry.
-`next_lsn` is advanced past all consumed sequence numbers to prevent LSN
-reuse for bytes now in the page cache. The engine is not degraded — subsequent
-writes proceed normally, and the next write may retry the rotation if G failed.
+Note on classes B1/B2/B3 — LSN advanced, engine degraded: Any `writev`
+failure leaves the file in an indeterminate state — POSIX does not guarantee
+`writev = -1` means no bytes were written. `next_lsn` is advanced past all
+consumed sequence numbers unconditionally (conservative: gaps are safe, reuse
+is not). Key-directory changes are NOT published. The engine degrades;
+`resume()` scans the active file, truncates garbage, and restores normal
+operation.
+
+Note on classes F and G — key changes unpublished, LSN advanced, engine degraded:
+Bytes are written via `writev` and reach the page cache, but `fdatasync` fails —
+durability is not confirmed. Key-directory changes are NOT published: the written
+key is invisible to subsequent reads, and the caller must retry. `next_lsn` is
+advanced past all consumed sequence numbers to prevent LSN reuse. The engine
+degrades; `resume()` scans the active file, replays any valid committed entries
+(including F/G bytes if they survived in the page cache to `sync()`), and creates
+a fresh active file.
 
 Class H is similar — the transition is persisted — but the engine is
 also degraded because the sealed active file cannot accept further
@@ -325,28 +302,32 @@ Six additional checkpoints exist in `bytecask.cpp` (compiled under `BYTECASK_TES
 10. `io_vacuum_compact_rename` — before `std::filesystem::rename()` in
     `vacuum_compact_file()`
 
-### Orphaned BulkBegin rotation
+### Orphaned BulkBegin degrade
 
 If a multi-entry batch fails mid-write after `BulkBegin`, the engine
-force-rotates to isolate the orphaned marker. Without this, subsequent
-writes to the same file would be silently discarded on recovery.
+degrades unconditionally. `resume()` scans the active file, truncates
+back to the last valid committed offset (discarding the orphaned
+`BulkBegin` and any partial entries that follow it), syncs, seals the
+file, and opens a fresh active file.
 
-### Sync failure publish-before-rethrow
+### Sync failure degrade-then-rethrow
 
-If `fdatasync` fails after all appends succeed, the engine publishes
-the new state before rethrowing. This prevents duplicate LSNs on the
-next write.
+If `fdatasync` fails after all appends succeed (classes F and G), the
+engine advances `next_lsn` past all consumed LSNs, degrades the DB, and
+rethrows. Key-directory changes are not published — the write is invisible
+to callers. Degrading forces `resume()` before further writes are accepted;
+`resume()` scans the active file and replays any valid committed entries.
 
 ---
 
 ## Proof Test Generator
 
-### apply_batch_if — 172 tests
+### apply_batch_if — 148 tests
 
-172 generated Catch2 tests (`[prove_apply_batch_if]` tag) cover every valid
+148 generated Catch2 tests (`[prove_apply_batch_if]` tag) cover every valid
 (StateShape, PlanShape, FailureClass) combination for `apply_batch_if`.
-The scenario matrix is 4 state shapes × 7 plan shapes × 11 failure
-classes = 308 total; 4 elimination rules reduce this to 172 valid tests.
+The scenario matrix is 4 state shapes × 7 plan shapes × 9 failure
+classes = 252 total; 4 elimination rules reduce this to 148 valid tests.
 
 Each test follows the same structure:
 1. Set up initial DB state from `StateShape`
@@ -479,9 +460,7 @@ The four `ScopedFaultInjector` modes map failure classes to the four
 I/O checkpoints:
 
 - **Name-based** — targets a single checkpoint. Used for B1, F, G, H.
-- **Count-based** — fails from checkpoint N onward, cascading. Used for C, D, E.
-- **Count-based with skip set** — cascades but lets named checkpoints
-  pass. Used for D (skip `io_rotate_file_creation`).
+- **Count-based** — fails from checkpoint N onward, cascading. Used for C.
 - **Post-write mode** — fires at `io_data_file_append_partial` with
   `short_write` or `throw_after`. Used for B2, B3.
 
@@ -500,7 +479,7 @@ I/O checkpoints:
   reference model's expected delta.
 - `assert_resumable(db)` — calls `resume()` and verifies the engine clears
   the degraded flag and passes `assert_consistent`. Inserted immediately
-  after `assert_delta` for all degraded failure classes (C, D, E, H).
+  after `assert_delta` for all degraded failure classes (B1, B2, B3, C, F, G, H).
 - `assert_recoverable(dir, before, expected)` — opens a fresh DB from
   disk and verifies the recovered state matches the expected state
   (pre-existing keys survive, added keys present, removed keys absent,

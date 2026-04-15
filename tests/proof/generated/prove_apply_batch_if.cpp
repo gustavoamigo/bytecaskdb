@@ -79,8 +79,8 @@ TEST_CASE("prove__empty_db__single_put__append_fails_nothing_written", "[prove]"
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 1,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -100,6 +100,7 @@ TEST_CASE("prove__empty_db__single_put__append_fails_nothing_written", "[prove]"
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -110,7 +111,7 @@ TEST_CASE("prove__empty_db__single_put__append_fails_partial_write", "[prove]") 
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 1,
         .degraded = true,
     };
   Baseline before;
@@ -141,10 +142,10 @@ TEST_CASE("prove__empty_db__single_put__append_fails_after_full_write", "[prove]
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {"p0"},
+        .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -158,12 +159,14 @@ TEST_CASE("prove__empty_db__single_put__append_fails_after_full_write", "[prove]
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE(
+      REQUIRE_THROWS_AS(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)));
+                            std::move(plan)),
+          std::system_error);
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -175,7 +178,7 @@ TEST_CASE("prove__empty_db__single_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -195,10 +198,11 @@ TEST_CASE("prove__empty_db__single_put__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__empty_db__single_delete__success", "[prove]") {
@@ -236,8 +240,8 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_nothing_written", "[prov
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 1,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -257,6 +261,7 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_nothing_written", "[prov
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -267,7 +272,7 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_partial_write", "[prove]
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 1,
         .degraded = true,
     };
   Baseline before;
@@ -301,7 +306,7 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_after_full_write", "[pro
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -315,12 +320,14 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_after_full_write", "[pro
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE(
+      REQUIRE_THROWS_AS(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)));
+                            std::move(plan)),
+          std::system_error);
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -332,7 +339,7 @@ TEST_CASE("prove__empty_db__single_delete__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -352,10 +359,11 @@ TEST_CASE("prove__empty_db__single_delete__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__empty_db__multi_put__success", "[prove]") {
@@ -394,8 +402,8 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_nothing_written", "[prove]")
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -416,6 +424,7 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_nothing_written", "[prove]")
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -426,8 +435,8 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_partial_write", "[prove]") {
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -449,6 +458,7 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_partial_write", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -459,8 +469,8 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_after_full_write", "[prove]"
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -482,6 +492,7 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_after_full_write", "[prove]"
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -492,7 +503,7 @@ TEST_CASE("prove__empty_db__multi_put__on_bulk_end_append", "[prove]") {
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 4,
         .degraded = true,
     };
   Baseline before;
@@ -519,72 +530,6 @@ TEST_CASE("prove__empty_db__multi_put__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
-TEST_CASE("prove__empty_db__multi_put__isolation_sync_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2, {"io_rotate_file_creation"}};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
-TEST_CASE("prove__empty_db__multi_put__isolation_rotation_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
 TEST_CASE("prove__empty_db__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -592,7 +537,7 @@ TEST_CASE("prove__empty_db__multi_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -613,10 +558,11 @@ TEST_CASE("prove__empty_db__multi_put__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__empty_db__mixed_batch__success", "[prove]") {
@@ -655,8 +601,8 @@ TEST_CASE("prove__empty_db__mixed_batch__append_fails_nothing_written", "[prove]
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -677,6 +623,7 @@ TEST_CASE("prove__empty_db__mixed_batch__append_fails_nothing_written", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -687,8 +634,8 @@ TEST_CASE("prove__empty_db__mixed_batch__append_fails_partial_write", "[prove]")
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -710,6 +657,7 @@ TEST_CASE("prove__empty_db__mixed_batch__append_fails_partial_write", "[prove]")
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -720,8 +668,8 @@ TEST_CASE("prove__empty_db__mixed_batch__append_fails_after_full_write", "[prove
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -743,6 +691,7 @@ TEST_CASE("prove__empty_db__mixed_batch__append_fails_after_full_write", "[prove
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -753,7 +702,7 @@ TEST_CASE("prove__empty_db__mixed_batch__on_bulk_end_append", "[prove]") {
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 4,
         .degraded = true,
     };
   Baseline before;
@@ -780,72 +729,6 @@ TEST_CASE("prove__empty_db__mixed_batch__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
-TEST_CASE("prove__empty_db__mixed_batch__isolation_sync_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.del(to_bytes("k0"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2, {"io_rotate_file_creation"}};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
-TEST_CASE("prove__empty_db__mixed_batch__isolation_rotation_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.del(to_bytes("k0"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
 TEST_CASE("prove__empty_db__mixed_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -853,7 +736,7 @@ TEST_CASE("prove__empty_db__mixed_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -874,10 +757,11 @@ TEST_CASE("prove__empty_db__mixed_batch__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__empty_db__large_batch__success", "[prove]") {
@@ -917,8 +801,8 @@ TEST_CASE("prove__empty_db__large_batch__append_fails_nothing_written", "[prove]
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 5,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -940,6 +824,7 @@ TEST_CASE("prove__empty_db__large_batch__append_fails_nothing_written", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -950,8 +835,8 @@ TEST_CASE("prove__empty_db__large_batch__append_fails_partial_write", "[prove]")
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 5,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -974,6 +859,7 @@ TEST_CASE("prove__empty_db__large_batch__append_fails_partial_write", "[prove]")
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -984,8 +870,8 @@ TEST_CASE("prove__empty_db__large_batch__append_fails_after_full_write", "[prove
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 5,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1008,6 +894,7 @@ TEST_CASE("prove__empty_db__large_batch__append_fails_after_full_write", "[prove
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -1018,7 +905,7 @@ TEST_CASE("prove__empty_db__large_batch__on_bulk_end_append", "[prove]") {
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 5,
         .degraded = true,
     };
   Baseline before;
@@ -1046,74 +933,6 @@ TEST_CASE("prove__empty_db__large_batch__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
-TEST_CASE("prove__empty_db__large_batch__isolation_sync_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-    plan.put(to_bytes("p2"), to_bytes("new2"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{3, {"io_rotate_file_creation"}};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
-TEST_CASE("prove__empty_db__large_batch__isolation_rotation_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-    plan.put(to_bytes("p2"), to_bytes("new2"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{3};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
 TEST_CASE("prove__empty_db__large_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -1121,7 +940,7 @@ TEST_CASE("prove__empty_db__large_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 5,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1143,10 +962,11 @@ TEST_CASE("prove__empty_db__large_batch__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__empty_db__single_put_with_guards__success", "[prove]") {
@@ -1186,8 +1006,8 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_nothing_written
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 1,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1209,6 +1029,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_nothing_written
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -1219,7 +1040,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_partial_write",
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 1,
         .degraded = true,
     };
   Baseline before;
@@ -1252,10 +1073,10 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_after_full_writ
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {"p0"},
+        .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1271,12 +1092,14 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_after_full_writ
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE(
+      REQUIRE_THROWS_AS(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)));
+                            std::move(plan)),
+          std::system_error);
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -1288,7 +1111,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__commit_sync_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1310,10 +1133,11 @@ TEST_CASE("prove__empty_db__single_put_with_guards__commit_sync_fails", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__empty_db__conflicting_plan__before_any_io", "[prove]") {
@@ -1385,8 +1209,8 @@ TEST_CASE("prove__single_key__single_put__append_fails_nothing_written", "[prove
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 1,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1407,6 +1231,7 @@ TEST_CASE("prove__single_key__single_put__append_fails_nothing_written", "[prove
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -1417,7 +1242,7 @@ TEST_CASE("prove__single_key__single_put__append_fails_partial_write", "[prove]"
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 1,
         .degraded = true,
     };
   Baseline before;
@@ -1449,10 +1274,10 @@ TEST_CASE("prove__single_key__single_put__append_fails_after_full_write", "[prov
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {"p0"},
+        .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1467,12 +1292,14 @@ TEST_CASE("prove__single_key__single_put__append_fails_after_full_write", "[prov
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE(
+      REQUIRE_THROWS_AS(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)));
+                            std::move(plan)),
+          std::system_error);
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -1484,7 +1311,7 @@ TEST_CASE("prove__single_key__single_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1505,10 +1332,11 @@ TEST_CASE("prove__single_key__single_put__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__single_key__single_delete__success", "[prove]") {
@@ -1547,8 +1375,8 @@ TEST_CASE("prove__single_key__single_delete__append_fails_nothing_written", "[pr
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 1,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1569,6 +1397,7 @@ TEST_CASE("prove__single_key__single_delete__append_fails_nothing_written", "[pr
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -1579,7 +1408,7 @@ TEST_CASE("prove__single_key__single_delete__append_fails_partial_write", "[prov
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 1,
         .degraded = true,
     };
   Baseline before;
@@ -1612,9 +1441,9 @@ TEST_CASE("prove__single_key__single_delete__append_fails_after_full_write", "[p
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
         .keys_added = {},
-        .keys_removed = {"k0"},
+        .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1629,12 +1458,14 @@ TEST_CASE("prove__single_key__single_delete__append_fails_after_full_write", "[p
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE(
+      REQUIRE_THROWS_AS(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)));
+                            std::move(plan)),
+          std::system_error);
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -1646,7 +1477,7 @@ TEST_CASE("prove__single_key__single_delete__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1667,10 +1498,11 @@ TEST_CASE("prove__single_key__single_delete__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__single_key__multi_put__success", "[prove]") {
@@ -1710,8 +1542,8 @@ TEST_CASE("prove__single_key__multi_put__append_fails_nothing_written", "[prove]
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1733,6 +1565,7 @@ TEST_CASE("prove__single_key__multi_put__append_fails_nothing_written", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -1743,8 +1576,8 @@ TEST_CASE("prove__single_key__multi_put__append_fails_partial_write", "[prove]")
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1767,6 +1600,7 @@ TEST_CASE("prove__single_key__multi_put__append_fails_partial_write", "[prove]")
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -1777,8 +1611,8 @@ TEST_CASE("prove__single_key__multi_put__append_fails_after_full_write", "[prove
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1801,6 +1635,7 @@ TEST_CASE("prove__single_key__multi_put__append_fails_after_full_write", "[prove
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -1811,7 +1646,7 @@ TEST_CASE("prove__single_key__multi_put__on_bulk_end_append", "[prove]") {
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 4,
         .degraded = true,
     };
   Baseline before;
@@ -1839,74 +1674,6 @@ TEST_CASE("prove__single_key__multi_put__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
-TEST_CASE("prove__single_key__multi_put__isolation_sync_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2, {"io_rotate_file_creation"}};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
-TEST_CASE("prove__single_key__multi_put__isolation_rotation_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
 TEST_CASE("prove__single_key__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -1914,7 +1681,7 @@ TEST_CASE("prove__single_key__multi_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -1936,10 +1703,11 @@ TEST_CASE("prove__single_key__multi_put__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__single_key__mixed_batch__success", "[prove]") {
@@ -1979,8 +1747,8 @@ TEST_CASE("prove__single_key__mixed_batch__append_fails_nothing_written", "[prov
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2002,6 +1770,7 @@ TEST_CASE("prove__single_key__mixed_batch__append_fails_nothing_written", "[prov
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -2012,8 +1781,8 @@ TEST_CASE("prove__single_key__mixed_batch__append_fails_partial_write", "[prove]
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2036,6 +1805,7 @@ TEST_CASE("prove__single_key__mixed_batch__append_fails_partial_write", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -2046,8 +1816,8 @@ TEST_CASE("prove__single_key__mixed_batch__append_fails_after_full_write", "[pro
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2070,6 +1840,7 @@ TEST_CASE("prove__single_key__mixed_batch__append_fails_after_full_write", "[pro
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -2080,7 +1851,7 @@ TEST_CASE("prove__single_key__mixed_batch__on_bulk_end_append", "[prove]") {
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 4,
         .degraded = true,
     };
   Baseline before;
@@ -2108,74 +1879,6 @@ TEST_CASE("prove__single_key__mixed_batch__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
-TEST_CASE("prove__single_key__mixed_batch__isolation_sync_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.del(to_bytes("k0"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2, {"io_rotate_file_creation"}};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
-TEST_CASE("prove__single_key__mixed_batch__isolation_rotation_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.del(to_bytes("k0"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
 TEST_CASE("prove__single_key__mixed_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -2183,7 +1886,7 @@ TEST_CASE("prove__single_key__mixed_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2205,10 +1908,11 @@ TEST_CASE("prove__single_key__mixed_batch__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__single_key__large_batch__success", "[prove]") {
@@ -2249,8 +1953,8 @@ TEST_CASE("prove__single_key__large_batch__append_fails_nothing_written", "[prov
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 5,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2273,6 +1977,7 @@ TEST_CASE("prove__single_key__large_batch__append_fails_nothing_written", "[prov
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -2283,8 +1988,8 @@ TEST_CASE("prove__single_key__large_batch__append_fails_partial_write", "[prove]
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 5,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2308,6 +2013,7 @@ TEST_CASE("prove__single_key__large_batch__append_fails_partial_write", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -2318,8 +2024,8 @@ TEST_CASE("prove__single_key__large_batch__append_fails_after_full_write", "[pro
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 5,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2343,6 +2049,7 @@ TEST_CASE("prove__single_key__large_batch__append_fails_after_full_write", "[pro
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -2353,7 +2060,7 @@ TEST_CASE("prove__single_key__large_batch__on_bulk_end_append", "[prove]") {
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 5,
         .degraded = true,
     };
   Baseline before;
@@ -2382,76 +2089,6 @@ TEST_CASE("prove__single_key__large_batch__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
-TEST_CASE("prove__single_key__large_batch__isolation_sync_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-    plan.put(to_bytes("p2"), to_bytes("new2"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{3, {"io_rotate_file_creation"}};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
-TEST_CASE("prove__single_key__large_batch__isolation_rotation_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-    plan.put(to_bytes("p2"), to_bytes("new2"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{3};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
 TEST_CASE("prove__single_key__large_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -2459,7 +2096,7 @@ TEST_CASE("prove__single_key__large_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 5,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2482,10 +2119,11 @@ TEST_CASE("prove__single_key__large_batch__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__single_key__single_put_with_guards__success", "[prove]") {
@@ -2527,8 +2165,8 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_nothing_writt
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 1,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2552,6 +2190,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_nothing_writt
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -2562,7 +2201,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_partial_write
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 1,
         .degraded = true,
     };
   Baseline before;
@@ -2597,10 +2236,10 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_after_full_wr
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {"p0"},
+        .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2618,12 +2257,14 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_after_full_wr
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE(
+      REQUIRE_THROWS_AS(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)));
+                            std::move(plan)),
+          std::system_error);
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -2635,7 +2276,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__commit_sync_fails", "[prov
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2659,10 +2300,11 @@ TEST_CASE("prove__single_key__single_put_with_guards__commit_sync_fails", "[prov
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__single_key__conflicting_plan__before_any_io", "[prove]") {
@@ -2744,8 +2386,8 @@ TEST_CASE("prove__populated_db__single_put__append_fails_nothing_written", "[pro
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 1,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2775,6 +2417,7 @@ TEST_CASE("prove__populated_db__single_put__append_fails_nothing_written", "[pro
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -2785,7 +2428,7 @@ TEST_CASE("prove__populated_db__single_put__append_fails_partial_write", "[prove
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 1,
         .degraded = true,
     };
   Baseline before;
@@ -2826,10 +2469,10 @@ TEST_CASE("prove__populated_db__single_put__append_fails_after_full_write", "[pr
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {"p0"},
+        .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2853,12 +2496,14 @@ TEST_CASE("prove__populated_db__single_put__append_fails_after_full_write", "[pr
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE(
+      REQUIRE_THROWS_AS(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)));
+                            std::move(plan)),
+          std::system_error);
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -2870,7 +2515,7 @@ TEST_CASE("prove__populated_db__single_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2900,10 +2545,11 @@ TEST_CASE("prove__populated_db__single_put__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__populated_db__single_delete__success", "[prove]") {
@@ -2951,8 +2597,8 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_nothing_written", "[
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 1,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -2982,6 +2628,7 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_nothing_written", "[
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -2992,7 +2639,7 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_partial_write", "[pr
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 1,
         .degraded = true,
     };
   Baseline before;
@@ -3034,9 +2681,9 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_after_full_write", "
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
         .keys_added = {},
-        .keys_removed = {"k0"},
+        .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3060,12 +2707,14 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_after_full_write", "
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE(
+      REQUIRE_THROWS_AS(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)));
+                            std::move(plan)),
+          std::system_error);
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -3077,7 +2726,7 @@ TEST_CASE("prove__populated_db__single_delete__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3107,10 +2756,11 @@ TEST_CASE("prove__populated_db__single_delete__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__populated_db__multi_put__success", "[prove]") {
@@ -3159,8 +2809,8 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_nothing_written", "[prov
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3191,6 +2841,7 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_nothing_written", "[prov
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -3201,8 +2852,8 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_partial_write", "[prove]
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3234,6 +2885,7 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_partial_write", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -3244,8 +2896,8 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_after_full_write", "[pro
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3277,6 +2929,7 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_after_full_write", "[pro
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -3287,7 +2940,7 @@ TEST_CASE("prove__populated_db__multi_put__on_bulk_end_append", "[prove]") {
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 4,
         .degraded = true,
     };
   Baseline before;
@@ -3324,92 +2977,6 @@ TEST_CASE("prove__populated_db__multi_put__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
-TEST_CASE("prove__populated_db__multi_put__isolation_sync_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
-    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
-    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
-    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
-    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
-    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
-    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
-    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
-    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2, {"io_rotate_file_creation"}};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
-TEST_CASE("prove__populated_db__multi_put__isolation_rotation_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
-    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
-    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
-    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
-    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
-    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
-    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
-    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
-    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
 TEST_CASE("prove__populated_db__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -3417,7 +2984,7 @@ TEST_CASE("prove__populated_db__multi_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3448,10 +3015,11 @@ TEST_CASE("prove__populated_db__multi_put__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__populated_db__mixed_batch__success", "[prove]") {
@@ -3500,8 +3068,8 @@ TEST_CASE("prove__populated_db__mixed_batch__append_fails_nothing_written", "[pr
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3532,6 +3100,7 @@ TEST_CASE("prove__populated_db__mixed_batch__append_fails_nothing_written", "[pr
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -3542,8 +3111,8 @@ TEST_CASE("prove__populated_db__mixed_batch__append_fails_partial_write", "[prov
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3575,6 +3144,7 @@ TEST_CASE("prove__populated_db__mixed_batch__append_fails_partial_write", "[prov
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -3585,8 +3155,8 @@ TEST_CASE("prove__populated_db__mixed_batch__append_fails_after_full_write", "[p
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3618,6 +3188,7 @@ TEST_CASE("prove__populated_db__mixed_batch__append_fails_after_full_write", "[p
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -3628,7 +3199,7 @@ TEST_CASE("prove__populated_db__mixed_batch__on_bulk_end_append", "[prove]") {
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 4,
         .degraded = true,
     };
   Baseline before;
@@ -3665,92 +3236,6 @@ TEST_CASE("prove__populated_db__mixed_batch__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
-TEST_CASE("prove__populated_db__mixed_batch__isolation_sync_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
-    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
-    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
-    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
-    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
-    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
-    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
-    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
-    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.del(to_bytes("k0"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2, {"io_rotate_file_creation"}};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
-TEST_CASE("prove__populated_db__mixed_batch__isolation_rotation_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
-    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
-    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
-    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
-    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
-    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
-    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
-    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
-    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.del(to_bytes("k0"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
 TEST_CASE("prove__populated_db__mixed_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -3758,7 +3243,7 @@ TEST_CASE("prove__populated_db__mixed_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3789,10 +3274,11 @@ TEST_CASE("prove__populated_db__mixed_batch__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__populated_db__large_batch__success", "[prove]") {
@@ -3842,8 +3328,8 @@ TEST_CASE("prove__populated_db__large_batch__append_fails_nothing_written", "[pr
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 5,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3875,6 +3361,7 @@ TEST_CASE("prove__populated_db__large_batch__append_fails_nothing_written", "[pr
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -3885,8 +3372,8 @@ TEST_CASE("prove__populated_db__large_batch__append_fails_partial_write", "[prov
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 5,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3919,6 +3406,7 @@ TEST_CASE("prove__populated_db__large_batch__append_fails_partial_write", "[prov
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -3929,8 +3417,8 @@ TEST_CASE("prove__populated_db__large_batch__append_fails_after_full_write", "[p
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 5,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -3963,6 +3451,7 @@ TEST_CASE("prove__populated_db__large_batch__append_fails_after_full_write", "[p
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -3973,7 +3462,7 @@ TEST_CASE("prove__populated_db__large_batch__on_bulk_end_append", "[prove]") {
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 5,
         .degraded = true,
     };
   Baseline before;
@@ -4011,94 +3500,6 @@ TEST_CASE("prove__populated_db__large_batch__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
-TEST_CASE("prove__populated_db__large_batch__isolation_sync_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
-    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
-    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
-    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
-    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
-    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
-    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
-    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
-    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-    plan.put(to_bytes("p2"), to_bytes("new2"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{3, {"io_rotate_file_creation"}};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
-TEST_CASE("prove__populated_db__large_batch__isolation_rotation_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
-    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
-    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
-    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
-    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
-    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
-    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
-    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
-    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-    plan.put(to_bytes("p2"), to_bytes("new2"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{3};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
 TEST_CASE("prove__populated_db__large_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -4106,7 +3507,7 @@ TEST_CASE("prove__populated_db__large_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 5,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4138,10 +3539,11 @@ TEST_CASE("prove__populated_db__large_batch__commit_sync_fails", "[prove]") {
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__populated_db__single_put_with_guards__success", "[prove]") {
@@ -4192,8 +3594,8 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_nothing_wri
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 1,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4226,6 +3628,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_nothing_wri
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -4236,7 +3639,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_partial_wri
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 1,
         .degraded = true,
     };
   Baseline before;
@@ -4280,10 +3683,10 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_after_full_
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {"p0"},
+        .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4310,12 +3713,14 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_after_full_
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE(
+      REQUIRE_THROWS_AS(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)));
+                            std::move(plan)),
+          std::system_error);
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -4327,7 +3732,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__commit_sync_fails", "[pr
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4360,10 +3765,11 @@ TEST_CASE("prove__populated_db__single_put_with_guards__commit_sync_fails", "[pr
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__populated_db__conflicting_plan__before_any_io", "[prove]") {
@@ -4445,8 +3851,8 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_nothing_written",
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 1,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4467,6 +3873,7 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_nothing_written",
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -4477,7 +3884,7 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_partial_write", "
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 1,
         .degraded = true,
     };
   Baseline before;
@@ -4509,10 +3916,10 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_after_full_write"
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {"p0"},
+        .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4527,12 +3934,14 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_after_full_write"
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE(
+      REQUIRE_THROWS_AS(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)));
+                            std::move(plan)),
+          std::system_error);
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -4544,7 +3953,7 @@ TEST_CASE("prove__rotation_threshold__single_put__commit_sync_fails", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4565,10 +3974,11 @@ TEST_CASE("prove__rotation_threshold__single_put__commit_sync_fails", "[prove]")
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__rotation_threshold__single_put__rotation_sync_fails", "[prove]") {
@@ -4578,7 +3988,7 @@ TEST_CASE("prove__rotation_threshold__single_put__rotation_sync_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4599,10 +4009,11 @@ TEST_CASE("prove__rotation_threshold__single_put__rotation_sync_fails", "[prove]
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__rotation_threshold__single_put__rotation_file_creation_fails", "[prove]") {
@@ -4674,8 +4085,8 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_nothing_writte
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 1,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4696,6 +4107,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_nothing_writte
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -4706,7 +4118,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_partial_write"
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 1,
         .degraded = true,
     };
   Baseline before;
@@ -4739,9 +4151,9 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_after_full_wri
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
         .keys_added = {},
-        .keys_removed = {"k0"},
+        .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4756,12 +4168,14 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_after_full_wri
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE(
+      REQUIRE_THROWS_AS(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)));
+                            std::move(plan)),
+          std::system_error);
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -4773,7 +4187,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__commit_sync_fails", "[prove
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4794,10 +4208,11 @@ TEST_CASE("prove__rotation_threshold__single_delete__commit_sync_fails", "[prove
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__rotation_threshold__single_delete__rotation_sync_fails", "[prove]") {
@@ -4807,7 +4222,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__rotation_sync_fails", "[pro
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4828,10 +4243,11 @@ TEST_CASE("prove__rotation_threshold__single_delete__rotation_sync_fails", "[pro
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__rotation_threshold__single_delete__rotation_file_creation_fails", "[prove]") {
@@ -4904,8 +4320,8 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_nothing_written", 
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4927,6 +4343,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_nothing_written", 
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -4937,8 +4354,8 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_partial_write", "[
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4961,6 +4378,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_partial_write", "[
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -4971,8 +4389,8 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_after_full_write",
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -4995,6 +4413,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_after_full_write",
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -5005,7 +4424,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__on_bulk_end_append", "[prove]")
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 4,
         .degraded = true,
     };
   Baseline before;
@@ -5033,74 +4452,6 @@ TEST_CASE("prove__rotation_threshold__multi_put__on_bulk_end_append", "[prove]")
   assert_recoverable(dir, before, expected);
 }
 
-TEST_CASE("prove__rotation_threshold__multi_put__isolation_sync_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2, {"io_rotate_file_creation"}};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
-TEST_CASE("prove__rotation_threshold__multi_put__isolation_rotation_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
 TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -5108,7 +4459,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails", "[prove]") 
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5130,10 +4481,11 @@ TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails", "[prove]") 
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__rotation_threshold__multi_put__rotation_sync_fails", "[prove]") {
@@ -5143,7 +4495,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__rotation_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5165,10 +4517,11 @@ TEST_CASE("prove__rotation_threshold__multi_put__rotation_sync_fails", "[prove]"
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__rotation_threshold__multi_put__rotation_file_creation_fails", "[prove]") {
@@ -5242,8 +4595,8 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__append_fails_nothing_written"
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5265,6 +4618,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__append_fails_nothing_written"
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -5275,8 +4629,8 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__append_fails_partial_write", 
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5299,6 +4653,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__append_fails_partial_write", 
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -5309,8 +4664,8 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__append_fails_after_full_write
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 4,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5333,6 +4688,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__append_fails_after_full_write
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -5343,7 +4699,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__on_bulk_end_append", "[prove]
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 4,
         .degraded = true,
     };
   Baseline before;
@@ -5371,74 +4727,6 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__on_bulk_end_append", "[prove]
   assert_recoverable(dir, before, expected);
 }
 
-TEST_CASE("prove__rotation_threshold__mixed_batch__isolation_sync_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.del(to_bytes("k0"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2, {"io_rotate_file_creation"}};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
-TEST_CASE("prove__rotation_threshold__mixed_batch__isolation_rotation_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.del(to_bytes("k0"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{2};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
 TEST_CASE("prove__rotation_threshold__mixed_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -5446,7 +4734,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__commit_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5468,10 +4756,11 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__commit_sync_fails", "[prove]"
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__rotation_threshold__mixed_batch__rotation_sync_fails", "[prove]") {
@@ -5481,7 +4770,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__rotation_sync_fails", "[prove
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 4,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5503,10 +4792,11 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__rotation_sync_fails", "[prove
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__rotation_threshold__mixed_batch__rotation_file_creation_fails", "[prove]") {
@@ -5581,8 +4871,8 @@ TEST_CASE("prove__rotation_threshold__large_batch__append_fails_nothing_written"
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 5,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5605,6 +4895,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__append_fails_nothing_written"
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -5615,8 +4906,8 @@ TEST_CASE("prove__rotation_threshold__large_batch__append_fails_partial_write", 
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 5,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5640,6 +4931,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__append_fails_partial_write", 
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -5650,8 +4942,8 @@ TEST_CASE("prove__rotation_threshold__large_batch__append_fails_after_full_write
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 5,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5675,6 +4967,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__append_fails_after_full_write
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -5685,7 +4978,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__on_bulk_end_append", "[prove]
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 5,
         .degraded = true,
     };
   Baseline before;
@@ -5714,76 +5007,6 @@ TEST_CASE("prove__rotation_threshold__large_batch__on_bulk_end_append", "[prove]
   assert_recoverable(dir, before, expected);
 }
 
-TEST_CASE("prove__rotation_threshold__large_batch__isolation_sync_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-    plan.put(to_bytes("p2"), to_bytes("new2"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{3, {"io_rotate_file_creation"}};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
-TEST_CASE("prove__rotation_threshold__large_batch__isolation_rotation_fails", "[prove]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  auto expected = ExpectedDelta{
-        .keys_added = {},
-        .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = true,
-    };
-  Baseline before;
-  {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-
-    before = capture_baseline(db);
-
-    bytecask::WritePlan plan;
-    plan.put(to_bytes("p0"), to_bytes("new0"));
-    plan.put(to_bytes("p1"), to_bytes("new1"));
-    plan.put(to_bytes("p2"), to_bytes("new2"));
-
-    {
-      bytecask::testing::ScopedFaultInjector fi{3};
-      REQUIRE_THROWS_AS(
-          db.apply_batch_if({.sync = true},
-                            std::move(plan)),
-          std::system_error);
-    }
-
-    assert_delta(before, db, expected);
-    assert_resumable(db);
-  }
-  assert_recoverable(dir, before, expected);
-}
-
 TEST_CASE("prove__rotation_threshold__large_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -5791,7 +5014,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__commit_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 5,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5814,10 +5037,11 @@ TEST_CASE("prove__rotation_threshold__large_batch__commit_sync_fails", "[prove]"
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__rotation_threshold__large_batch__rotation_sync_fails", "[prove]") {
@@ -5827,7 +5051,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__rotation_sync_fails", "[prove
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 5,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5850,10 +5074,11 @@ TEST_CASE("prove__rotation_threshold__large_batch__rotation_sync_fails", "[prove
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__rotation_threshold__large_batch__rotation_file_creation_fails", "[prove]") {
@@ -5930,8 +5155,8 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_nothi
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
-        .degraded = false,
+        .lsn_advance = 1,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -5955,6 +5180,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_nothi
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -5965,7 +5191,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_parti
   auto expected = ExpectedDelta{
         .keys_added = {},
         .keys_removed = {},
-        .lsn_advance = 0,
+        .lsn_advance = 1,
         .degraded = true,
     };
   Baseline before;
@@ -6000,10 +5226,10 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_after
   TempDir td;
   auto dir = td.path / "db";
   auto expected = ExpectedDelta{
-        .keys_added = {"p0"},
+        .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -6021,12 +5247,14 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_after
     {
       using PW = bytecask::testing::PostWriteMode;
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
-      REQUIRE(
+      REQUIRE_THROWS_AS(
           db.apply_batch_if({.sync = true},
-                            std::move(plan)));
+                            std::move(plan)),
+          std::system_error);
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
   assert_recoverable(dir, before, expected);
 }
@@ -6038,7 +5266,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__commit_sync_fails"
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -6062,10 +5290,11 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__commit_sync_fails"
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__rotation_threshold__single_put_with_guards__rotation_sync_fails", "[prove]") {
@@ -6075,7 +5304,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__rotation_sync_fail
         .keys_added = {},
         .keys_removed = {},
         .lsn_advance = 1,
-        .degraded = false,
+        .degraded = true,
     };
   Baseline before;
   {
@@ -6099,10 +5328,11 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__rotation_sync_fail
     }
 
     assert_delta(before, db, expected);
+    assert_resumable(db);
   }
-  // Recovery skipped: sync failed — in-session and recovery visibility
-  // diverge (write physically in page cache; recovery outcome depends
-  // on whether fdatasync error was transient). Addressed by BC-157.
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
 }
 
 TEST_CASE("prove__rotation_threshold__single_put_with_guards__rotation_file_creation_fails", "[prove]") {

@@ -2987,6 +2987,10 @@ TEST_CASE("class F: key not visible after commit sync failure", "[f_visibility]"
 
   // Key must not be visible — write was not confirmed durable.
   CHECK_FALSE(db.contains_key(to_bytes("new_key")));
+  // Engine must be degraded — bytes in page cache, key_dir diverges.
+  CHECK(db.is_degraded());
+  // resume() clears the degraded state.
+  REQUIRE_NOTHROW(db.resume());
   CHECK_FALSE(db.is_degraded());
 }
 
@@ -3011,8 +3015,14 @@ TEST_CASE("class G: key not visible after rotation sync failure", "[g_visibility
 
   // Key must not be visible — write was not confirmed durable.
   CHECK_FALSE(db.contains_key(to_bytes("new_key")));
-  CHECK_FALSE(db.is_degraded());
+  // Engine must be degraded — bytes in page cache, key_dir diverges.
+  CHECK(db.is_degraded());
   // Pre-existing key must still be visible.
+  CHECK(db.contains_key(to_bytes("seed")));
+  // resume() clears the degraded state.
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  // Pre-existing key still visible after resume.
   CHECK(db.contains_key(to_bytes("seed")));
 }
 
@@ -3057,77 +3067,36 @@ TEST_CASE("resume() replays unpublished entries from active file",
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
   CHECK(db.contains_key(to_bytes("k1")));
 
-  // k2 written to disk but key changes NOT published (class F sync failure).
-  // Data is appended to the active file, but fdatasync fails → only next_lsn
-  // advanced, key_dir not updated. k2 is invisible.
+  // k2 written to page cache but key changes NOT published (class F sync
+  // failure). fdatasync fails → engine degrades; k2 bytes in page cache.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
     REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")),
                       std::system_error);
   }
   CHECK_FALSE(db.contains_key(to_bytes("k2")));
-  CHECK_FALSE(db.is_degraded());  // F doesn't degrade
-
-  // k3 also written to disk with unpublished key changes (another class F).
-  {
-    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
-    REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")),
-                      std::system_error);
-  }
-  CHECK_FALSE(db.contains_key(to_bytes("k3")));
-
-  // Now trigger degradation so resume() can run. Use a batch write with
-  // io_rotate_file_creation fault (rotation after a batch that pushes the
-  // file past max_file_bytes). Switch to small threshold first.
-  // Alternatively, use a simpler approach: degrade via an orphaned BulkBegin.
-  {
-    // Count-based injection: fail on the 2nd checkpoint (mid-batch append).
-    // First checkpoint passes (BulkBegin written), second fails → orphaned
-    // BulkBegin → isolation needed. Skip io_data_file_sync so that the
-    // isolation sync succeeds, but fail io_rotate_file_creation.
-    bytecask::testing::ScopedFaultInjector fi{
-        "io_rotate_file_creation"};
-    // Need a batch that succeeds IO but fails rotation.
-    // Use max_file_bytes=1 on a second DB? No, easier: just make the batch
-    // fail mid-write to trigger the isolation → rotation path.
-  }
-  // Simpler: use a batch with count-based injection to cause mid-write failure,
-  // then let isolation rotation fail.
-  {
-    bytecask::testing::ScopedFaultInjector fi{
-        2, {"io_data_file_sync"}};  // skip sync, fail on 2nd non-sync checkpoint
-    bytecask::Batch batch;
-    batch.put(to_bytes("a"), to_bytes("va"));
-    batch.put(to_bytes("b"), to_bytes("vb"));
-    REQUIRE_THROWS(db.apply_batch({.sync = false}, std::move(batch)));
-  }
+  // F degrades the engine immediately.
   REQUIRE(db.is_degraded());
 
-  // Before resume: k2 and k3 are invisible (unpublished sync-failure writes).
-  CHECK_FALSE(db.contains_key(to_bytes("k2")));
-  CHECK_FALSE(db.contains_key(to_bytes("k3")));
-
-  // resume() should scan the active file and replay k2 and k3.
+  // resume() scans the active file. The k2 bytes are in the page cache
+  // and pread sees them. resume() replays k2 into key_dir, then syncs
+  // (confirming durability), seals the file, and opens a fresh active file.
   REQUIRE_NOTHROW(db.resume());
   CHECK_FALSE(db.is_degraded());
 
-  // All committed keys visible: k1 was always visible; k2 and k3 replayed.
+  // k1 was always committed and must still be visible.
   CHECK(db.contains_key(to_bytes("k1")));
+  // k2 was replayed by resume() from the page-cache bytes.
   CHECK(db.contains_key(to_bytes("k2")));
-  CHECK(db.contains_key(to_bytes("k3")));
 
   // Verify actual values.
   auto v = get_val(db, to_bytes("k2"));
   REQUIRE(v.has_value());
   CHECK(to_string(*v) == "v2");
 
-  v = get_val(db, to_bytes("k3"));
-  REQUIRE(v.has_value());
-  CHECK(to_string(*v) == "v3");
-
   // Subsequent writes work.
-  REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k4"), to_bytes("v4")));
-  CHECK(db.contains_key(to_bytes("k4")));
+  REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
+  CHECK(db.contains_key(to_bytes("k3")));
 }
 
 // ---------------------------------------------------------------------------

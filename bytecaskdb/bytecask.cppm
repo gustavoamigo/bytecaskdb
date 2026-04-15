@@ -628,6 +628,11 @@ private:
   void rotate_active_file(TransientEngineState &t,
                           const std::shared_ptr<const EngineState> &current);
 
+  // Publishes an LSN-only state (key_dir unchanged) advanced to target_lsn.
+  // Called on any IO failure where bytes may have reached disk.
+  void publish_lsn_advance(const std::shared_ptr<const EngineState> &current,
+                            std::uint64_t target_lsn);
+
   // Degrade — sets the engine to write-blocked state with a reason.
   void deem_as_degraded(std::string reason);
 

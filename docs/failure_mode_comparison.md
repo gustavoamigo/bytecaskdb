@@ -28,35 +28,41 @@ The commit primitive and visibility gate determine what "partial write" and
 
 | Failure class | ByteCaskDB | RocksDB | LevelDB | SQLite WAL | LMDB | WiredTiger |
 |---|---|---|---|---|---|---|
-| **B1** — `writev = -1`, nothing on disk | Throws; no state change; no degrade | `seen_error` latch on writer; `SetBGError` at severity level; write not visible | `bg_error_` permanently set; DB poisoned | `PAGER_ERROR`; transaction rolled back; recoverable without reopen | Transaction aborted; error code returned; no poison unless meta-page write involved | `WT_RET_PANIC`; connection immediately poisoned |
-| **B2** — partial bytes on disk (short write) | Multi-entry: isolate via isolation rotation. Single-entry: degrade (`DbDegraded`); `resume()` recovers | Undetectable at write time (`Append` returns `Status`, not byte count); caught at recovery via CRC mismatch | Same structural blind spot as RocksDB; tail corruption tolerated at recovery | Cumulative checksum + commit-frame requirement; partial frame invisible by construction | Data-page partial: safe (not reachable from valid meta); meta-page partial: old meta intact | Pre-zeroed files + trailing-zero heuristic + CRC; recovery stops at partial record |
-| **B3** — all bytes on disk, valid CRC, error returned | Multi: orphaned, isolation-rotated. Single: read-back CRC verification (BC-156) — valid CRC → publish normally, no degrade; invalid CRC → degrade | Treated as B1 at write time (poison); valid CRC record replayed in `kPointInTimeRecovery` | Treated as B1 (poison); valid record replayed on recovery | `PAGER_ERROR` at write time; if commit frame present, full transaction replayed from WAL | Data-page: error returned, no poison; on next open, committed meta found and replayed | Treated as B1 (panic); valid CRC → record replayed during `__wt_log_scan` |
-| **F** — `fdatasync` fails after state publish | **Throws, NOT degraded**; key changes not published; `next_lsn` advanced past consumed LSNs; caller must retry | `SyncInternal` fails → `SetBGError(kHardError+)`; write not visible (sync precedes sequence publish); `DB::Resume()` or close+reopen | `logfile_->Sync()` fails → `bg_error_` permanently set; write not visible; must close+reopen | `PAGER_ERROR`; recoverable within same connection; under `NORMAL` sync, per-commit sync is deferred | `MDB_FDATASYNC` failure → meta write blocked → transaction aborted; likely `MDB_FATAL_ERROR`; close+reopen | `ENOTSUP` silently disables dirty sync; other errors propagated; log server error → panic |
-| **G** — post-write rotation `fdatasync` fails | **Throws, NOT degraded**; key changes not published; `next_lsn` advanced; next write retries rotation | `SwitchMemtable` sync failure → `SetBGError(Corruption)` → close+reopen required | Old `logfile_->Close()` failure → `bg_error_` permanently set; close+reopen | Checkpoint sync failure: `SQLITE_IOERR`; connection remains open; pager error state, recoverable | N/A — no log rotation | Rotation sync failure: propagated error; subsequent write on stalled file → `WT_RET_PANIC` |
+| **B1** — write call returns an error before any bytes reach disk | Throws; degrades (`DbDegraded`); `resume()` recovers. Any `writev` failure — including a possible partial write on FUSE/network filesystems — is treated as indeterminate. No in-flight recovery is attempted. | `seen_error` latch on writer; `SetBGError` at severity level; write not visible | `bg_error_` permanently set; DB poisoned | `PAGER_ERROR`; transaction rolled back; recoverable without reopen | Transaction aborted; error code returned; no poison unless meta-page write involved | `WT_RET_PANIC`; connection immediately poisoned |
+| **B2** — partial bytes on disk (short write) | Throws; degrades unconditionally (`DbDegraded`); `resume()` recovers | Undetectable at write time (`Append` returns `Status`, not byte count); caught at recovery via CRC mismatch | Same structural blind spot as RocksDB; tail corruption tolerated at recovery | Cumulative checksum + commit-frame requirement; partial frame invisible by construction | Data-page partial: safe (not reachable from valid meta); meta-page partial: old meta intact | Pre-zeroed files + trailing-zero heuristic + CRC; recovery stops at partial record |
+| **B3** — all bytes on disk, valid CRC, error returned | Throws; degrades unconditionally. A best-effort sync before degrading maximises the chance that page-cache bytes reach durable storage, so `resume()` can replay valid committed entries. | Treated as B1 at write time (poison); valid CRC record replayed in `kPointInTimeRecovery` | Treated as B1 (poison); valid record replayed on recovery | `PAGER_ERROR` at write time; if commit frame present, full transaction replayed from WAL | Data-page: error returned, no poison; on next open, committed meta found and replayed | Treated as B1 (panic); valid CRC → record replayed during `__wt_log_scan` |
+| **F** — commit `fdatasync` fails (bytes in page cache, not confirmed durable) | **Throws, degraded (`DbDegraded`)**; key changes not published; `next_lsn` advanced past consumed LSNs; `resume()` required before further writes. If page-cache bytes survive to `resume()`, the write is committed at that point. | `SyncInternal` fails → `SetBGError(kHardError+)`; write not visible (sync precedes sequence publish); `DB::Resume()` or close+reopen | `logfile_->Sync()` fails → `bg_error_` permanently set; write not visible; must close+reopen | `PAGER_ERROR`; recoverable within same connection; under `NORMAL` sync, per-commit sync is deferred | `MDB_FDATASYNC` failure → meta write blocked → transaction aborted; likely `MDB_FATAL_ERROR`; close+reopen | `ENOTSUP` silently disables dirty sync; other errors propagated; log server error → panic |
+| **G** — post-write rotation `fdatasync` fails | **Throws, degraded (`DbDegraded`)**; key changes not published; `next_lsn` advanced; `resume()` required before further writes. | `SwitchMemtable` sync failure → `SetBGError(Corruption)` → close+reopen required | Old `logfile_->Close()` failure → `bg_error_` permanently set; close+reopen | Checkpoint sync failure: `SQLITE_IOERR`; connection remains open; pager error state, recoverable | N/A — no log rotation | Rotation sync failure: propagated error; subsequent write on stalled file → `WT_RET_PANIC` |
 | **H** — active file sealed, new file creation fails | Degrade (`DbDegraded`); `resume()` creates new active file without restart | Before any writes: recoverable per-write error. After committed writes: `SetBGError(Corruption)` → close+reopen | New log creation fails: recoverable (file number reclaimed). Old log close fails: permanent poison | WAL created once at mode activation; creation failure → mode reverts to prior journaling; not analogous | N/A — single-file environment | File creation: propagated error, no immediate panic; after ~10K yield attempts: `EBUSY`; subsequent write failure → panic |
 
 ---
 
 ## Key Observations
 
-### 1. Class F/G: ByteCaskDB now gates visibility behind `fdatasync`
+### 1. Class F/G: ByteCaskDB degrades on `fdatasync` failure
 
-All six engines now agree that a failed `fdatasync` must not make a write
-visible. ByteCaskDB previously published key-directory changes before the
-exception propagated on F and G (accepting "page-cache durability" as
-sufficient). As of BC-155, key changes are not published on sync failure.
+All six engines agree that a failed `fdatasync` must not make a write
+visible. Key changes are not published on sync failure.
 `next_lsn` is still advanced past consumed sequence numbers to prevent LSN
-reuse for bytes now in the page cache. The caller receives the exception and
-must retry the write.
+reuse for bytes now in the page cache.
 
-ByteCaskDB diverges from most peers on **what happens next**: it does not
-degrade the DB on F or G. LevelDB permanently latches `bg_error_`; RocksDB
-sets `kHardError` (requiring `DB::Resume()` or close+reopen); LMDB escalates
-to `MDB_FATAL_ERROR`; WiredTiger panics the connection. SQLite WAL is the
+ByteCaskDB now degrades on F and G: writes throw `DbDegraded` until
+`resume()` is called. When `fdatasync` fails, bytes are in the page cache
+but not confirmed durable, and the key directory does not reflect those
+bytes. Continuing to accept writes in this state would leave data on disk
+that recovery could replay, but that is invisible to the in-memory state —
+a divergence. `resume()` scans the active file, replays any valid committed
+entries (including any F/G bytes that survived in the page cache), and
+creates a fresh active file. If the page-cache bytes survive to `resume()`,
+they are committed at that point.
+
+LevelDB permanently latches `bg_error_`; RocksDB sets `kHardError`
+(requiring `DB::Resume()` or close+reopen); LMDB escalates to
+`MDB_FATAL_ERROR`; WiredTiger panics the connection. SQLite WAL is the
 closest: `PAGER_ERROR` is recoverable within the same connection without
-restart — analogous to ByteCaskDB's approach of staying operational and letting
-the caller retry. BC-159 (`DbDegraded` + `DB::resume()`) extends this to
-classes B2, C, D, E, H: the engine degrades rather than permanently blocking,
+restart — analogous to ByteCaskDB's `DbDegraded` + `resume()`. The
+`DbDegraded` + `DB::resume()` design extends this to all failure classes
+(B1/B2/B3/C/F/G/H): the engine degrades rather than permanently blocking,
 and `resume()` restores normal operation without a restart.
 
 ### 2. Partial write detection varies widely
@@ -77,18 +83,17 @@ to any reader.
 
 | Engine | Permanent block? | In-session recovery? | Resume API? |
 |---|---|---|---|
-| ByteCaskDB | No — `DbDegraded` (B2/C/D/E/H); `resume()` restores writes | Yes — `resume()` | `DB::resume()` |
+| ByteCaskDB | No — `DbDegraded` (B1/B2/B3/C/F/G/H); `resume()` restores writes | Yes — `resume()` | `DB::resume()` |
 | RocksDB | Severity-dependent | `DB::Resume()` for kHardError | Yes |
 | LevelDB | Yes — one-way latch | No | No |
 | SQLite WAL | No — `PAGER_ERROR` is recoverable | Yes (discard page cache) | Implicit |
 | LMDB | Yes (meta-page failures) | No | No |
 | WiredTiger | Yes (write failures panic immediately) | No | No |
 
-ByteCaskDB's `DbDegraded` + `resume()` model (BC-159) aligns it
-with RocksDB's severity tiers: transient failure classes (B2/C/D/E/H)
+ByteCaskDB's `DbDegraded` + `resume()` model aligns it
+with RocksDB's severity tiers: all IO failure classes (B1/B2/B3/C/F/G/H)
 enter a degraded state, and `resume()` performs a universal recovery
-(scan → truncate → sync → rotate) to restore normal operation. F/G
-never degrade — the engine stays operational and the caller retries.
+(scan → truncate → sync → rotate) to restore normal operation.
 
 ### 4. Rotation failure asymmetry in LevelDB
 

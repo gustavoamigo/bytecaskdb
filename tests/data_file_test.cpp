@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// ByteCaskDB — unit tests for DataFile read-back recovery (BC-156)
+// ByteCaskDB — unit tests for DataFile writev failure handling.
+// Any writev failure (partial write, full write + error, writev = -1)
+// marks the file as tainted. No in-flight recovery is attempted.
 
 #include <catch2/catch_test_macros.hpp>
 #include <cstddef>
@@ -26,19 +28,10 @@ auto to_bytes(std::string_view sv) -> std::span<const std::byte> {
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// BC-156: try_recover_failed_append
-//
-// B3 scenario: writev succeeds (full entry on disk), then throws before
-// offset_ advances. The engine must read back and CRC-verify the entry
-// instead of immediately poisoning.
-// ---------------------------------------------------------------------------
-
-TEST_CASE("DataFile::try_recover_failed_append: B3 valid CRC — returns offset "
-          "and advances file",
+TEST_CASE("DataFile::append: B3 full write + error return — file is tainted",
           "[data_file]") {
   const auto path =
-      std::filesystem::temp_directory_path() / "bc_test_b3_valid.data";
+      std::filesystem::temp_directory_path() / "bc_test_b3_tainted.data";
   std::filesystem::remove(path);
 
   bytecask::DataFile file{path};
@@ -53,26 +46,18 @@ TEST_CASE("DataFile::try_recover_failed_append: B3 valid CRC — returns offset 
                       std::system_error);
   }
 
+  // Full entry on disk but writev reported an error — file must be tainted.
+  // No silent recovery is attempted; the engine degrades and resume() handles it.
   CHECK(file.is_tainted());
   CHECK(file.size() == 0); // offset_ not advanced — append threw before updating it
-
-  const auto recovered = file.try_recover_failed_append(
-      static_cast<std::uint16_t>(key.size()),
-      static_cast<std::uint32_t>(val.size()));
-
-  REQUIRE(recovered.has_value());
-  CHECK(*recovered == 0);         // entry sits at the start of the file
-  CHECK(file.size() > 0);         // offset_ advanced past the entry
-  CHECK_FALSE(file.is_tainted()); // tainted cleared — file is consistent again
 
   std::filesystem::remove(path);
 }
 
-TEST_CASE("DataFile::try_recover_failed_append: B2 truncated entry — returns "
-          "nullopt, file stays tainted",
+TEST_CASE("DataFile::append: B2 partial write — file is tainted",
           "[data_file]") {
   const auto path =
-      std::filesystem::temp_directory_path() / "bc_test_b2_invalid.data";
+      std::filesystem::temp_directory_path() / "bc_test_b2_tainted.data";
   std::filesystem::remove(path);
 
   bytecask::DataFile file{path};
@@ -88,13 +73,7 @@ TEST_CASE("DataFile::try_recover_failed_append: B2 truncated entry — returns "
   }
 
   CHECK(file.is_tainted());
-
-  const auto recovered = file.try_recover_failed_append(
-      static_cast<std::uint16_t>(key.size()),
-      static_cast<std::uint32_t>(val.size()));
-
-  CHECK_FALSE(recovered.has_value()); // CRC invalid → cannot recover
-  CHECK(file.is_tainted());           // still tainted — caller must poison
+  CHECK(file.size() == 0);
 
   std::filesystem::remove(path);
 }

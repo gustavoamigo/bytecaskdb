@@ -62,17 +62,6 @@ def resolve_fault(
         # Fail on BulkEnd — the last append checkpoint.
         return FaultConfig(fail_at=n_appends - 1)
 
-    if failure == FailureClass.D:
-        # Fail mid-batch, cascade through isolation sync, but let rotation
-        # pass so only the sync failure is exercised.
-        return FaultConfig(
-            fail_at=n, skip_names=["io_rotate_file_creation"]
-        )
-
-    if failure == FailureClass.E:
-        # Fail mid-batch, cascade through sync and rotation.
-        return FaultConfig(fail_at=n)
-
     if failure == FailureClass.F:
         if state.at_rotation:
             # On rotation_threshold the rotation sync fires first at the same
