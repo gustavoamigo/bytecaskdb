@@ -29,6 +29,7 @@ module;
 #include <system_error>
 #include <thread>
 #include <time.h>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -1453,9 +1454,12 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
   auto files = recovery_prepare_files(s, strict);
 
-  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
+  // Use a plain hash map for live_bytes accumulation — in-place mutation is
+  // O(1) per entry vs. the copy-out/write-back overhead of TransientU32Map::update().
+  // Converted to PersistentU32Map once at the end.
+  std::unordered_map<std::uint32_t, FileStats> fstats_scratch;
   for (const auto &rf : files) {
-    fstats_t.set(rf.file_id, FileStats{0, rf.total_bytes});
+    fstats_scratch.emplace(rf.file_id, FileStats{0, rf.total_bytes});
   }
 
   std::uint64_t max_lsn = 0;
@@ -1479,13 +1483,10 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
             if (existing) {
               const auto dec =
                   entry_size(he->key.size(), existing->value_size);
-              const auto ef = existing->file_id;
-              fstats_t.update(ef,
-                              [dec](FileStats &fs) { fs.live_bytes -= dec; });
+              fstats_scratch[existing->file_id].live_bytes -= dec;
             }
             const auto inc = entry_size(he->key.size(), he->value_size);
-            fstats_t.update(file_id,
-                            [inc](FileStats &fs) { fs.live_bytes += inc; });
+            fstats_scratch[file_id].live_bytes += inc;
             transient_key_dir.set(he->key,
                                   KeyDirEntry{he->sequence, file_id,
                                               he->file_offset, he->value_size});
@@ -1498,8 +1499,7 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
           if (existing && existing->sequence < he->sequence) {
             const auto dec =
                 entry_size(he->key.size(), existing->value_size);
-            const auto ef = existing->file_id;
-            fstats_t.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+            fstats_scratch[existing->file_id].live_bytes -= dec;
             transient_key_dir.erase(he->key);
           }
         }
@@ -1513,6 +1513,8 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
     }
   }
 
+  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
+  for (const auto &[id, fs] : fstats_scratch) fstats_t.set(id, fs);
   s.key_dir = std::move(transient_key_dir).persistent();
   s.file_stats = std::move(fstats_t).persistent();
   s.next_lsn = max_lsn + 1;
@@ -1609,16 +1611,20 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
   auto &final_result = queue[0];
 
   // Phase 4: recompute live_bytes once from the fully-merged tree.
-  auto fstats_t = final_result.file_stats.transient();
-  for (const auto [fid, _] : final_result.file_stats) {
-    fstats_t.update(fid, [](FileStats &fs) { fs.live_bytes = 0; });
-  }
+  // Accumulate into a hash map (O(1) in-place), then apply to PersistentU32Map
+  // in a single pass over the (small) file set — avoids O(N) radix tree
+  // mutations for N key_dir entries.
+  std::unordered_map<std::uint32_t, std::uint64_t> live_accum;
   for (auto it = final_result.key_dir.begin(); it != std::default_sentinel;
        ++it) {
     const auto &[key_span, kde] = *it;
-    const auto inc = entry_size(key_span.size(), kde.value_size);
-    fstats_t.update(kde.file_id,
-                    [inc](FileStats &fs) { fs.live_bytes += inc; });
+    live_accum[kde.file_id] += entry_size(key_span.size(), kde.value_size);
+  }
+  auto fstats_t = final_result.file_stats.transient();
+  for (const auto [fid, _] : final_result.file_stats) {
+    const auto acc_it = live_accum.find(fid);
+    const auto live = (acc_it != live_accum.end()) ? acc_it->second : 0ULL;
+    fstats_t.update(fid, [live](FileStats &fs) { fs.live_bytes = live; });
   }
   final_result.file_stats = std::move(fstats_t).persistent();
 
