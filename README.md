@@ -18,7 +18,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch_if(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. The snapshot is embedded in the `WritePlan` at construction time. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add `ensure_unchanged` / range guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
-- **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex; on the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
+- **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex with group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost. On the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
 - **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a degraded state: reads remain available, all writes throw `DbDegraded`, and the service calls `resume()` to recover without a restart.
 
 ## Performance
@@ -176,7 +176,7 @@ struct Options {
 
 struct WriteOptions {
     bool sync{true};      // call fdatasync after write (default true)
-    bool try_lock{false}; // non-blocking lock; throws std::system_error(EBUSY) if contended
+    bool solo{false};     // bypass group commit — route to solo writer (for benchmarking)
 };
 
 struct ReadOptions {
@@ -315,7 +315,7 @@ ByteCaskDB is designed around four core tenets, in priority order:
   └── Sealed Files   read-only .data + .hint files      (older segments)
 ```
 
-**Write path**: all writes route through a single coordinator (`apply_batch_if`). Each write appends one or more CRC-32-verified, length-prefixed records to the active data file (single-entry writes: one record; multi-entry batches: begin marker + N entry records + end marker), then applies pure in-memory state transitions via `TransientEngineState`. When `sync` is requested, `fdatasync` completes before the new state becomes visible to readers.
+**Write path**: all writes route through a single coordinator (`apply_batch_if`). Concurrent sync writers are batched via group commit — the first writer becomes leader, drains the queue, and executes all pending writes under one lock hold with a single `fdatasync`. Each write appends CRC-32-verified, length-prefixed records to the active data file, then applies pure in-memory state transitions via `TransientEngineState`. Durability before visibility: `state_.store()` happens after `fdatasync`.
 
 **Read path**: readers obtain an immutable snapshot of the engine state, look up the key in the radix tree to find its file and offset, then read the value directly. Reads are lock-free and scale linearly across cores.
 

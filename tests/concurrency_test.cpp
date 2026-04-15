@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// ByteCaskDB — concurrency stress tests for reader-writer lock and epoch reclamation
+// ByteCaskDB — concurrency primitive tests: BackgroundWorker, SoloWriter,
+// WriteGroup
 
 #include <atomic>
+#include <barrier>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -78,4 +82,214 @@ TEST_CASE("BackgroundWorker can dispatch after drain", "[concurrency]") {
   w.dispatch([&] { ++count; });
   w.drain();
   CHECK(count.load() == 2);
+}
+
+// ---------------------------------------------------------------------------
+// SoloWriter
+// ---------------------------------------------------------------------------
+
+TEST_CASE("SoloWriter submit calls executor once", "[concurrency]") {
+  std::atomic<int> exec_calls{0};
+  bytecask::SoloWriter sw{
+      [&](std::vector<bytecask::Slot *> & /*batch*/) { ++exec_calls; }};
+
+  bytecask::Slot slot;
+  sw.submit(slot);
+  CHECK(exec_calls.load() == 1);
+}
+
+TEST_CASE("SoloWriter serialises when executor locks", "[concurrency]") {
+  std::mutex mu;
+  std::atomic<int> concurrent{0};
+  std::atomic<int> max_concurrent{0};
+  bytecask::SoloWriter sw{
+      [&](std::vector<bytecask::Slot *> & /*batch*/) {
+        std::lock_guard<std::mutex> lk{mu};
+        auto c = ++concurrent;
+        auto m = max_concurrent.load();
+        while (c > m && !max_concurrent.compare_exchange_weak(m, c)) {
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        --concurrent;
+      }};
+
+  constexpr int kThreads = 4;
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&] {
+      bytecask::Slot slot;
+      sw.submit(slot);
+    });
+  }
+  for (auto &t : threads) t.join();
+
+  CHECK(max_concurrent.load() == 1);
+}
+
+TEST_CASE("SoloWriter executor exception propagates to caller", "[concurrency]") {
+  bytecask::SoloWriter sw{
+      [][[noreturn]](std::vector<bytecask::Slot *> & /*batch*/) {
+        throw std::runtime_error("solo fail");
+      }};
+
+  bytecask::Slot slot;
+  CHECK_THROWS_AS(sw.submit(slot), std::runtime_error);
+}
+
+TEST_CASE("SoloWriter remains usable after exception", "[concurrency]") {
+  std::atomic<int> call_count{0};
+  bytecask::SoloWriter sw{
+      [&](std::vector<bytecask::Slot *> & /*batch*/) {
+        if (++call_count == 1) throw std::runtime_error("fail once");
+      }};
+
+  bytecask::Slot slot1;
+  CHECK_THROWS(sw.submit(slot1));
+
+  bytecask::Slot slot2;
+  sw.submit(slot2);
+  CHECK(call_count.load() == 2);
+}
+
+// ---------------------------------------------------------------------------
+// WriteGroup
+// ---------------------------------------------------------------------------
+
+TEST_CASE("WriteGroup single submit calls executor once", "[concurrency]") {
+  std::atomic<int> exec_calls{0};
+  bytecask::WriteGroup wg{[&](std::vector<bytecask::Slot *> & /*batch*/) {
+    ++exec_calls;
+  }};
+
+  bytecask::Slot slot;
+  wg.submit(slot);
+  CHECK(exec_calls.load() == 1);
+}
+
+TEST_CASE("WriteGroup concurrent submits are batched", "[concurrency]") {
+  std::atomic<int> exec_calls{0};
+  std::atomic<int> total_slots{0};
+  bytecask::WriteGroup wg{[&](std::vector<bytecask::Slot *> &batch) {
+    ++exec_calls;
+    total_slots += static_cast<int>(batch.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }};
+
+  constexpr int kThreads = 8;
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  std::atomic<int> returned{0};
+
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&] {
+      bytecask::Slot slot;
+      wg.submit(slot);
+      ++returned;
+    });
+  }
+
+  for (auto &t : threads) t.join();
+
+  CHECK(returned.load() == kThreads);
+  CHECK(total_slots.load() == kThreads);
+  CHECK(exec_calls.load() >= 1);
+  CHECK(exec_calls.load() <= kThreads);
+}
+
+TEST_CASE("WriteGroup executor exception propagates to the failing slot",
+          "[concurrency]") {
+  bytecask::WriteGroup wg{[](std::vector<bytecask::Slot *> &batch) {
+    batch[0]->err = std::make_exception_ptr(std::runtime_error("test error"));
+  }};
+
+  bytecask::Slot slot;
+  CHECK_THROWS_AS(wg.submit(slot), std::runtime_error);
+}
+
+TEST_CASE("WriteGroup remains usable after executor exception", "[concurrency]") {
+  std::atomic<int> call_count{0};
+  bytecask::WriteGroup wg{[&](std::vector<bytecask::Slot *> &batch) {
+    ++call_count;
+    if (call_count.load() == 1) {
+      batch[0]->err = std::make_exception_ptr(std::runtime_error("fail once"));
+    }
+  }};
+
+  bytecask::Slot slot1;
+  CHECK_THROWS(wg.submit(slot1));
+
+  bytecask::Slot slot2;
+  wg.submit(slot2);
+  CHECK(call_count.load() == 2);
+}
+
+TEST_CASE("WriteGroup executor throw propagates to all waiting slots",
+          "[concurrency]") {
+  constexpr int kSubmitters = 3;
+  bytecask::WriteGroup wg{
+      [][[noreturn]](std::vector<bytecask::Slot *> & /*batch*/) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        throw std::runtime_error("executor boom");
+      }};
+
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+  std::atomic<int> threw{0};
+  std::vector<std::thread> threads;
+  threads.reserve(kSubmitters);
+  for (int i = 0; i < kSubmitters; ++i) {
+    threads.emplace_back([&] {
+      bytecask::Slot slot;
+      ++ready;
+      while (!start.load()) std::this_thread::yield();
+      try {
+        wg.submit(slot);
+      } catch (const std::runtime_error &) {
+        ++threw;
+      }
+    });
+  }
+
+  while (ready.load() != kSubmitters) std::this_thread::yield();
+  start.store(true);
+
+  for (auto &thread : threads) thread.join();
+  CHECK(threw.load() == kSubmitters);
+}
+
+TEST_CASE("WriteGroup aborted slots receive WriteGroupAborted", "[concurrency]") {
+  std::atomic<int> aborted_count{0};
+  std::atomic<int> succeeded_count{0};
+  constexpr int kThreads = 4;
+  std::barrier<> sync_point(kThreads);
+
+  bytecask::WriteGroup wg{[](std::vector<bytecask::Slot *> &batch) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    for (std::size_t i = 1; i < batch.size(); ++i) {
+      batch[i]->err = std::make_exception_ptr(bytecask::WriteGroupAborted{});
+    }
+  }};
+
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&] {
+      sync_point.arrive_and_wait();
+      bytecask::Slot slot;
+      try {
+        wg.submit(slot);
+        ++succeeded_count;
+      } catch (const bytecask::WriteGroupAborted &) {
+        ++aborted_count;
+      }
+    });
+  }
+
+  for (auto &t : threads) t.join();
+
+  CHECK(succeeded_count.load() >= 1);
+  CHECK(aborted_count.load() >= 1);
+  CHECK(succeeded_count.load() + aborted_count.load() == kThreads);
 }

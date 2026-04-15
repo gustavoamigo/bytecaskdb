@@ -804,6 +804,51 @@ template <typename A, bool Sync> void BM_PutMT(benchmark::State &state) {
   attach_jitter(state, samples);
 }
 
+// ──────────── PutMT with periodic sync (timed durability) ────────────────────
+// Each thread writes NoSync and issues one Sync put when ≥50 ms have elapsed
+// since its last sync. Measures write throughput under a realistic "periodic
+// durability" pattern. Group commit amortises the fdatasync calls that land
+// in the same window.
+
+template <typename A>
+void BM_PutMT_PeriodicSync(benchmark::State &state) {
+  static std::vector<std::string> shared_keys =
+      generate_prefixed_keys(kDatasetSize);
+  static std::vector<std::byte> shared_val = make_value();
+  static auto shared_db =
+      std::make_unique<typename A::Db>("put_mt_ps", nullptr, nullptr);
+
+  constexpr auto kSyncInterval = std::chrono::milliseconds{50};
+
+  const auto thread_offset =
+      static_cast<std::size_t>(state.thread_index()) * (kDatasetSize / 8);
+  std::size_t idx = thread_offset;
+  std::vector<double> samples;
+  samples.reserve(std::min(kMaxSamples, std::size_t{10000}));
+
+  auto last_sync = std::chrono::steady_clock::now();
+
+  for (auto _ : state) {
+    const auto &k = shared_keys[idx % shared_keys.size()];
+    auto now = std::chrono::steady_clock::now();
+    bool do_sync = (now - last_sync) >= kSyncInterval;
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    A::put(*shared_db, k, shared_val, do_sync);
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (do_sync) last_sync = now;
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    ++idx;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.counters["ops_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  attach_jitter(state, samples);
+}
+
 // ──────────── ReadWhileWriting (read throughput with background writer) ────
 // N reader threads benchmarked while a single background writer continuously
 // puts keys. Isolates read throughput under write pressure — the writer does
@@ -1013,10 +1058,28 @@ BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads
 BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads(4) ; 
 BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads(8) ; 
 BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads(16); 
+BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads(32);
+BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads(64);
 BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(2) ; 
 BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(4) ; 
 BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(8) ; 
 BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(16); 
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(32);
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(64);
+
+// --- Multithreaded Put with periodic sync (50 ms interval) ---
+BENCH(BM_PutMT_PeriodicSync<Bc>)   ->Name("ByteCaskDB/PutMT/PeriodicSync") ->Threads(2) ;
+BENCH(BM_PutMT_PeriodicSync<Bc>)   ->Name("ByteCaskDB/PutMT/PeriodicSync") ->Threads(4) ;
+BENCH(BM_PutMT_PeriodicSync<Bc>)   ->Name("ByteCaskDB/PutMT/PeriodicSync") ->Threads(8) ;
+BENCH(BM_PutMT_PeriodicSync<Bc>)   ->Name("ByteCaskDB/PutMT/PeriodicSync") ->Threads(16);
+BENCH(BM_PutMT_PeriodicSync<Bc>)   ->Name("ByteCaskDB/PutMT/PeriodicSync") ->Threads(32);
+BENCH(BM_PutMT_PeriodicSync<Bc>)   ->Name("ByteCaskDB/PutMT/PeriodicSync") ->Threads(64);
+BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(2) ;
+BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(4) ;
+BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(8) ;
+BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(16);
+BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(32);
+BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(64);
 
 
 // clang-format on
