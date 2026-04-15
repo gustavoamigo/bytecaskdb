@@ -42,6 +42,7 @@ import bytecask.data_file;
 import bytecask.hint_file;
 import bytecask.radix_tree;
 import bytecask.types;
+import bytecask.u32_map;
 import bytecask.util;
 
 namespace bytecask {
@@ -85,8 +86,9 @@ auto now_ns() -> std::int64_t {
 #pragma region TransientEngineState
 
 TransientEngineState::TransientEngineState(
-    TransientRadixTree<KeyDirEntry> key_dir, std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>> files,
-    std::map<std::uint32_t, FileStats> file_stats,
+    TransientRadixTree<KeyDirEntry> key_dir,
+    TransientU32Map<std::shared_ptr<DataFile>> files,
+    TransientU32Map<FileStats> file_stats,
     std::uint32_t active_file_id, std::uint32_t next_file_id,
     std::uint64_t next_lsn)
     : key_dir_{std::move(key_dir)}, files_{std::move(files)},
@@ -95,7 +97,7 @@ TransientEngineState::TransientEngineState(
 
 auto EngineState::transient() const -> TransientEngineState {
   return TransientEngineState{
-      key_dir.transient(), files, file_stats,
+      key_dir.transient(), files.transient(), file_stats.transient(),
       active_file_id, next_file_id, next_lsn};
 }
 
@@ -213,7 +215,9 @@ void TransientEngineState::apply_writes(
 
   // Account for BulkBegin marker.
   if (multi) {
-    file_stats_[active_file_id_].total_bytes += kHeaderSize + kCrcSize;
+    file_stats_.update(active_file_id_, [](FileStats &fs) {
+      fs.total_bytes += kHeaderSize + kCrcSize;
+    });
     ++next_lsn_;
     ++io_idx;
   }
@@ -223,14 +227,16 @@ void TransientEngineState::apply_writes(
     if (action.write == WritePlan::Write::Put) {
       const auto existing = key_dir_.get(key_span);
       if (existing) {
-        file_stats_[existing->file_id].live_bytes -=
-            entry_size(key_span.size(), existing->value_size);
+        const auto dec = entry_size(key_span.size(), existing->value_size);
+        const auto ef = existing->file_id;
+        file_stats_.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
       }
       const auto val_size = narrow<std::uint32_t>(action.value.size());
       const auto sz = entry_size(key_span.size(), val_size);
-      auto &st = file_stats_[active_file_id_];
-      st.live_bytes += sz;
-      st.total_bytes += sz;
+      file_stats_.update(active_file_id_, [sz](FileStats &fs) {
+        fs.live_bytes += sz;
+        fs.total_bytes += sz;
+      });
       key_dir_.set(key_span, KeyDirEntry{next_lsn_, active_file_id_,
                                           offsets[io_idx], val_size});
       ++next_lsn_;
@@ -238,11 +244,13 @@ void TransientEngineState::apply_writes(
     } else if (action.write == WritePlan::Write::Del) {
       const auto existing = key_dir_.get(key_span);
       if (existing) {
-        file_stats_[existing->file_id].live_bytes -=
-            entry_size(key_span.size(), existing->value_size);
+        const auto dec = entry_size(key_span.size(), existing->value_size);
+        const auto ef = existing->file_id;
+        file_stats_.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
       }
-      file_stats_[active_file_id_].total_bytes +=
-          entry_size(key_span.size(), 0);
+      const auto del_sz = entry_size(key_span.size(), 0);
+      file_stats_.update(active_file_id_,
+                         [del_sz](FileStats &fs) { fs.total_bytes += del_sz; });
       key_dir_.erase(key_span);
       ++next_lsn_;
       ++io_idx;
@@ -251,7 +259,9 @@ void TransientEngineState::apply_writes(
 
   // Account for BulkEnd marker.
   if (multi) {
-    file_stats_[active_file_id_].total_bytes += kHeaderSize + kCrcSize;
+    file_stats_.update(active_file_id_, [](FileStats &fs) {
+      fs.total_bytes += kHeaderSize + kCrcSize;
+    });
     ++next_lsn_;
     ++io_idx;
   }
@@ -260,12 +270,8 @@ void TransientEngineState::apply_writes(
 void TransientEngineState::apply_rotate_file(
     std::shared_ptr<DataFile> new_file) {
   active_file_id_ = next_file_id_++;
-  auto next_files =
-      std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>(
-          *files_);
-  next_files->emplace(active_file_id_, std::move(new_file));
-  files_ = std::move(next_files);
-  file_stats_[active_file_id_] = FileStats{};
+  files_.set(active_file_id_, std::move(new_file));
+  file_stats_.set(active_file_id_, FileStats{});
 }
 
 void TransientEngineState::apply_vacuum(
@@ -287,23 +293,21 @@ void TransientEngineState::apply_vacuum(
     }
   }
 
-  auto next_files =
-      std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>(
-          *files_);
-  next_files->erase(old_file_id);
+  files_.erase(old_file_id);
   if (new_sealed_file) {
-    next_files->emplace(dest_file_id, std::move(new_sealed_file));
+    files_.set(dest_file_id, std::move(new_sealed_file));
   }
-  files_ = std::move(next_files);
 
   file_stats_.erase(old_file_id);
   if (dest_file_id != active_file_id_) {
-    file_stats_[dest_file_id] =
-        FileStats{actual_live_bytes, scan.total_bytes};
+    file_stats_.set(dest_file_id,
+                    FileStats{actual_live_bytes, scan.total_bytes});
   } else {
-    auto &active_stats = file_stats_[dest_file_id];
-    active_stats.live_bytes += actual_live_bytes;
-    active_stats.total_bytes += scan.total_bytes;
+    file_stats_.update(dest_file_id, [actual_live_bytes,
+                                      total = scan.total_bytes](FileStats &fs) {
+      fs.live_bytes += actual_live_bytes;
+      fs.total_bytes += total;
+    });
   }
 }
 
@@ -318,11 +322,14 @@ void TransientEngineState::apply_resume(
       const auto existing = key_dir_.get(key_span);
       if (!existing || existing->sequence < e.sequence) {
         if (existing) {
-          file_stats_[existing->file_id].live_bytes -=
-              entry_size(key_span.size(), existing->value_size);
+          const auto dec = entry_size(key_span.size(), existing->value_size);
+          const auto ef = existing->file_id;
+          file_stats_.update(ef,
+                             [dec](FileStats &fs) { fs.live_bytes -= dec; });
         }
-        file_stats_[file_id].live_bytes +=
-            entry_size(key_span.size(), e.value_size);
+        const auto inc = entry_size(key_span.size(), e.value_size);
+        file_stats_.update(file_id,
+                           [inc](FileStats &fs) { fs.live_bytes += inc; });
         key_dir_.set(key_span,
                      KeyDirEntry{e.sequence, file_id, e.file_offset,
                                  e.value_size});
@@ -330,8 +337,9 @@ void TransientEngineState::apply_resume(
     } else if (e.entry_type == EntryType::Delete) {
       const auto existing = key_dir_.get(key_span);
       if (existing && existing->sequence < e.sequence) {
-        file_stats_[existing->file_id].live_bytes -=
-            entry_size(key_span.size(), existing->value_size);
+        const auto dec = entry_size(key_span.size(), existing->value_size);
+        const auto ef = existing->file_id;
+        file_stats_.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
         key_dir_.erase(key_span);
       }
     }
@@ -343,7 +351,7 @@ void TransientEngineState::apply_resume(
 }
 
 auto TransientEngineState::active_file() -> DataFile & {
-  return *files_->at(active_file_id_);
+  return **files_.get(active_file_id_);
 }
 
 auto TransientEngineState::active_file_id() const noexcept -> std::uint32_t {
@@ -352,7 +360,7 @@ auto TransientEngineState::active_file_id() const noexcept -> std::uint32_t {
 
 auto TransientEngineState::is_rotation_needed(std::uint64_t threshold) const
     -> bool {
-  return files_->at(active_file_id_)->size() >= threshold;
+  return (*files_.get(active_file_id_))->size() >= threshold;
 }
 
 auto TransientEngineState::next_lsn() const noexcept -> std::uint64_t {
@@ -366,8 +374,8 @@ void TransientEngineState::advance_next_lsn(std::uint64_t new_lsn) noexcept {
 auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   auto s = std::make_shared<EngineState>();
   s->key_dir = std::move(key_dir_).persistent();
-  s->files = std::move(files_);
-  s->file_stats = std::move(file_stats_);
+  s->files = std::move(files_).persistent();
+  s->file_stats = std::move(file_stats_).persistent();
   s->active_file_id = active_file_id_;
   s->next_file_id = next_file_id_;
   s->next_lsn = next_lsn_;
@@ -385,8 +393,6 @@ DB::DB(std::filesystem::path dir, Options opts)
       state_{std::make_shared<EngineState>()} {
   std::filesystem::create_directories(dir_);
   EngineState s;
-  s.files =
-      std::make_shared<std::map<std::uint32_t, std::shared_ptr<DataFile>>>();
   if (opts.recovery_threads <= 1) {
     s = recovery_load_serial(std::move(s), opts.fail_recovery_on_crc_errors);
   } else {
@@ -395,9 +401,13 @@ DB::DB(std::filesystem::path dir, Options opts)
   }
   s.active_file_id = s.next_file_id++;
   const auto stem = make_data_file_stem();
-  s.files->emplace(s.active_file_id,
-                   std::make_shared<DataFile>(dir_ / (stem + ".data")));
-  s.file_stats[s.active_file_id] = FileStats{};
+  auto new_active = std::make_shared<DataFile>(dir_ / (stem + ".data"));
+  auto files_t = s.files.transient();
+  files_t.set(s.active_file_id, new_active);
+  s.files = std::move(files_t).persistent();
+  auto fstats_t = s.file_stats.transient();
+  fstats_t.set(s.active_file_id, FileStats{});
+  s.file_stats = std::move(fstats_t).persistent();
   state_.store(std::make_shared<EngineState>(std::move(s)));
   state_time_.store(now_ns(), std::memory_order_release);
 }
@@ -411,9 +421,9 @@ DB::DB(std::filesystem::path dir, Options opts)
 // At destruction no readers are active.
 DB::~DB() {
   auto s = state_.load();
-  if (s->files && !s->files->empty()) {
+  if (!s->files.empty()) {
     try {
-      auto &active = *s->files->at(s->active_file_id);
+      auto &active = **s->files.get(s->active_file_id);
       active.sync();
       active.seal();
     } catch (...) {}
@@ -454,7 +464,7 @@ auto DB::get(const ReadOptions &opts, BytesView key,
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   thread_local Bytes io_buf;
 #pragma clang diagnostic pop
-  s->files->at(kv->file_id)
+  (*s->files.get(kv->file_id))
       ->read_value(kv->file_offset, narrow<std::uint16_t>(key.size()),
                    kv->value_size, opts.verify_checksums, io_buf, out);
   return true;
@@ -635,7 +645,7 @@ auto Snapshot::get(BytesView key, Bytes &out) const -> bool {
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   thread_local Bytes io_buf;
 #pragma clang diagnostic pop
-  state_->files->at(kv->file_id)
+  (*state_->files.get(kv->file_id))
       ->read_value(kv->file_offset, narrow<std::uint16_t>(key.size()),
                    kv->value_size, /*verify_checksums=*/true, io_buf, out);
   return true;
@@ -746,7 +756,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   vacuum_purge_stale_files();
 
   // Snapshot file_stats and active-file info.
-  std::map<std::uint32_t, FileStats> stats_snap;
+  PersistentU32Map<FileStats> stats_snap;
   std::uint32_t active_id{};
   std::uint64_t active_size{};
   {
@@ -759,7 +769,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   // Find the highest-fragmentation sealed file above threshold.
   std::uint32_t target_id{};
   double worst_frag = 0.0;
-  for (const auto &[fid, fs] : stats_snap) {
+  for (const auto [fid, fs] : stats_snap) {
     if (fid == active_id) continue;
     if (fs.total_bytes == 0) continue;
     const auto frag = 1.0 - static_cast<double>(fs.live_bytes) /
@@ -774,7 +784,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 
   // Absorb only if the file is small (below absorb_threshold) and its live
   // data fits in the active file without triggering rotation.
-  const auto target_live = stats_snap.at(target_id).live_bytes;
+  const auto target_live = stats_snap.get(target_id)->live_bytes;
   if (target_live <= opts.absorb_threshold &&
       target_live + active_size <= rotation_threshold_) {
     vacuum_absorb_file(target_id);
@@ -794,7 +804,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 void DB::rotate_active_file(TransientEngineState &t,
                             const std::shared_ptr<const EngineState> &current) {
   t.active_file().seal();
-  auto sealed_file = current->files->at(t.active_file_id());
+  auto sealed_file = *current->files.get(t.active_file_id());
   auto dir = dir_;
   worker_.dispatch([f = std::move(sealed_file), d = std::move(dir)] {
     flush_hints_for(f, d);
@@ -905,7 +915,7 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
 
 // Writes hint files for all sealed data files in the given state.
 void DB::flush_hints(const EngineState &s) {
-  for (auto &[file_id, file] : *s.files) {
+  for (const auto [file_id, file] : s.files) {
     if (file_id == s.active_file_id) {
       continue;
     }
@@ -1041,7 +1051,7 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
 // once no in-flight readers reference it.
 void DB::vacuum_defer_old_file(
     const std::shared_ptr<const EngineState> &snap, std::uint32_t file_id) {
-  auto old_data_file = snap->files->at(file_id);
+  auto old_data_file = *snap->files.get(file_id);
   auto old_hint_path =
       dir_ / (old_data_file->path().stem().string() + ".hint");
   stale_files_.push_back({std::move(old_data_file), std::move(old_hint_path)});
@@ -1053,7 +1063,7 @@ void DB::vacuum_defer_old_file(
 // The old file is deferred for cleanup when no readers reference it.
 void DB::vacuum_compact_file(std::uint32_t file_id) {
   auto snap = state_.load();
-  const auto &old_file = *snap->files->at(file_id);
+  const auto &old_file = **snap->files.get(file_id);
 
   const auto stem = make_data_file_stem();
   const auto tmp_data_path = dir_ / (stem + ".data.tmp");
@@ -1092,7 +1102,7 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
 // The old file is deferred for cleanup when no readers reference it.
 void DB::vacuum_absorb_file(std::uint32_t file_id) {
   auto snap = state_.load();
-  const auto &old_file = *snap->files->at(file_id);
+  const auto &old_file = **snap->files.get(file_id);
 
   {
     std::lock_guard<std::mutex> wg{*write_mu_};
@@ -1139,7 +1149,7 @@ void DB::resume() {
 
   auto current = state_.load();
   const auto old_file_id = current->active_file_id;
-  auto &file = *current->files->at(old_file_id);
+  auto &file = **current->files.get(old_file_id);
 
   // Scan the active file (batch-aware) to find the last valid committed offset
   // and collect valid committed entries for key_dir replay. Entries written to
@@ -1213,7 +1223,7 @@ void DB::resume() {
   // Seal and dispatch hint generation. Both are idempotent: seal() is a flag
   // set, and flush_hints_for skips files whose .hint already exists.
   file.seal();
-  worker_.dispatch([f = current->files->at(old_file_id), d = dir_] {
+  worker_.dispatch([f = *current->files.get(old_file_id), d = dir_] {
     flush_hints_for(f, d);
   });
 
@@ -1227,7 +1237,9 @@ void DB::resume() {
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.
   auto t = current->transient();
-  t.file_stats()[old_file_id].total_bytes = valid_offset;
+  t.file_stats().update(old_file_id, [valid_offset](FileStats &fs) {
+    fs.total_bytes = valid_offset;
+  });
   t.apply_resume(old_file_id, committed);
   t.apply_rotate_file(std::move(new_file));
   state_.store(std::move(t).persistent());
@@ -1300,6 +1312,7 @@ auto DB::recovery_prepare_files(EngineState &s, bool strict)
   }
 
   std::vector<RecoveredFile> files;
+  auto files_t = s.files.transient();
 
   for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
     const auto &p = dir_entry.path();
@@ -1310,7 +1323,7 @@ auto DB::recovery_prepare_files(EngineState &s, bool strict)
     const auto file_id = s.next_file_id++;
     auto data_file = std::make_shared<DataFile>(p);
     data_file->seal();
-    s.files->emplace(file_id, data_file);
+    files_t.set(file_id, data_file);
 
     const auto hint_path = dir_ / (p.stem().string() + ".hint");
     if (!std::filesystem::exists(hint_path)) {
@@ -1321,6 +1334,7 @@ auto DB::recovery_prepare_files(EngineState &s, bool strict)
                      std::filesystem::file_size(p)});
   }
 
+  s.files = std::move(files_t).persistent();
   return files;
 }
 
@@ -1333,10 +1347,10 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
   std::uint64_t max_lsn = 0;
   auto t = PersistentRadixTree<KeyDirEntry>{}.transient();
   std::map<Key, std::uint64_t> tombstones;
-  std::map<std::uint32_t, FileStats> fstats;
+  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
 
   for (const auto &rf : files) {
-    fstats[rf.file_id].total_bytes = rf.total_bytes;
+    fstats_t.set(rf.file_id, FileStats{0, rf.total_bytes});
   }
 
   // live_bytes are NOT tracked per-entry here — Phase 4 in
@@ -1382,7 +1396,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
   }
 
   return {std::move(t).persistent(), std::move(tombstones), max_lsn,
-          std::move(fstats)};
+          std::move(fstats_t).persistent()};
 }
 
 // Merges two RecoveryResults. Tree merge uses LSN-based conflict
@@ -1392,10 +1406,11 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
 // after the final merge to avoid O(N × log₂ W) redundant traversals.
 auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 -> RecoveryResult {
-  auto &merged_stats = a.file_stats;
-  for (auto &[fid, fs] : b.file_stats) {
-    merged_stats[fid] = fs;
+  auto merged_stats_t = a.file_stats.transient();
+  for (const auto [fid, fs] : b.file_stats) {
+    merged_stats_t.set(fid, fs);
   }
+  a.file_stats = std::move(merged_stats_t).persistent();
 
   auto lsn_resolver = [](const KeyDirEntry &x, const KeyDirEntry &y) {
     return (x.sequence >= y.sequence) ? x : y;
@@ -1427,7 +1442,7 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
   }
 
   return {std::move(merged), std::move(merged_tombs),
-          std::max(a.max_lsn, b.max_lsn), std::move(merged_stats)};
+          std::max(a.max_lsn, b.max_lsn), std::move(a.file_stats)};
 }
 
 // Reconstructs the key directory from hint files (serial path).
@@ -1438,8 +1453,9 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
   auto files = recovery_prepare_files(s, strict);
 
+  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
   for (const auto &rf : files) {
-    s.file_stats[rf.file_id].total_bytes = rf.total_bytes;
+    fstats_t.set(rf.file_id, FileStats{0, rf.total_bytes});
   }
 
   std::uint64_t max_lsn = 0;
@@ -1461,11 +1477,15 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
           const auto existing = transient_key_dir.get(he->key);
           if (!existing || existing->sequence < he->sequence) {
             if (existing) {
-              s.file_stats[existing->file_id].live_bytes -=
+              const auto dec =
                   entry_size(he->key.size(), existing->value_size);
+              const auto ef = existing->file_id;
+              fstats_t.update(ef,
+                              [dec](FileStats &fs) { fs.live_bytes -= dec; });
             }
-            s.file_stats[file_id].live_bytes +=
-                entry_size(he->key.size(), he->value_size);
+            const auto inc = entry_size(he->key.size(), he->value_size);
+            fstats_t.update(file_id,
+                            [inc](FileStats &fs) { fs.live_bytes += inc; });
             transient_key_dir.set(he->key,
                                   KeyDirEntry{he->sequence, file_id,
                                               he->file_offset, he->value_size});
@@ -1476,8 +1496,10 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
           if (he->sequence > tomb_seq) tomb_seq = he->sequence;
           const auto existing = transient_key_dir.get(he->key);
           if (existing && existing->sequence < he->sequence) {
-            s.file_stats[existing->file_id].live_bytes -=
+            const auto dec =
                 entry_size(he->key.size(), existing->value_size);
+            const auto ef = existing->file_id;
+            fstats_t.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
             transient_key_dir.erase(he->key);
           }
         }
@@ -1492,6 +1514,7 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
   }
 
   s.key_dir = std::move(transient_key_dir).persistent();
+  s.file_stats = std::move(fstats_t).persistent();
   s.next_lsn = max_lsn + 1;
   return s;
 }
@@ -1586,21 +1609,23 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
   auto &final_result = queue[0];
 
   // Phase 4: recompute live_bytes once from the fully-merged tree.
-  auto &final_stats = final_result.file_stats;
-  for (auto &[fid, fs] : final_stats) {
-    fs.live_bytes = 0;
+  auto fstats_t = final_result.file_stats.transient();
+  for (const auto [fid, _] : final_result.file_stats) {
+    fstats_t.update(fid, [](FileStats &fs) { fs.live_bytes = 0; });
   }
   for (auto it = final_result.key_dir.begin(); it != std::default_sentinel;
        ++it) {
     const auto &[key_span, kde] = *it;
-    final_stats[kde.file_id].live_bytes +=
-        entry_size(key_span.size(), kde.value_size);
+    const auto inc = entry_size(key_span.size(), kde.value_size);
+    fstats_t.update(kde.file_id,
+                    [inc](FileStats &fs) { fs.live_bytes += inc; });
   }
+  final_result.file_stats = std::move(fstats_t).persistent();
 
   // Phase 5: assembly.
   s.key_dir = std::move(final_result.key_dir);
   s.next_lsn = final_result.max_lsn + 1;
-  s.file_stats = std::move(final_stats);
+  s.file_stats = std::move(final_result.file_stats);
   return s;
 }
 

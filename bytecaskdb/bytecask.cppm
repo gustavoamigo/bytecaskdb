@@ -27,6 +27,7 @@ import bytecask.concurrency;
 import bytecask.data_file;
 import bytecask.radix_tree;
 import bytecask.types;
+import bytecask.u32_map;
 import bytecask.util;
 
 namespace bytecask {
@@ -251,7 +252,7 @@ public:
     if (!has_cached_) {
       auto [key_span, dir_entry] = *cur_;
       cached_.first = Key{key_span};
-      state_->files->at(dir_entry.file_id)
+      (*state_->files.get(dir_entry.file_id))
           ->read_value(dir_entry.file_offset,
                       narrow<std::uint16_t>(key_span.size()),
                       dir_entry.value_size, verify_checksums_,
@@ -431,8 +432,7 @@ public:
 
   // Returns a mutable reference to file_stats_. Used by resume() to update
   // total_bytes for a truncated active file before publishing state.
-  [[nodiscard]] auto file_stats() noexcept
-      -> std::map<std::uint32_t, FileStats> & {
+  [[nodiscard]] auto file_stats() noexcept -> TransientU32Map<FileStats> & {
     return file_stats_;
   }
 
@@ -443,15 +443,15 @@ private:
   friend class DB;
   friend struct EngineState;
   TransientEngineState(TransientRadixTree<KeyDirEntry> key_dir,
-                       std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>> files,
-                       std::map<std::uint32_t, FileStats> file_stats,
+                       TransientU32Map<std::shared_ptr<DataFile>> files,
+                       TransientU32Map<FileStats> file_stats,
                        std::uint32_t active_file_id,
                        std::uint32_t next_file_id,
                        std::uint64_t next_lsn);
 
   TransientRadixTree<KeyDirEntry> key_dir_;
-  std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>> files_;
-  std::map<std::uint32_t, FileStats> file_stats_;
+  TransientU32Map<std::shared_ptr<DataFile>> files_;
+  TransientU32Map<FileStats> file_stats_;
   std::uint32_t active_file_id_;
   std::uint32_t next_file_id_;
   std::uint64_t next_lsn_;
@@ -545,7 +545,9 @@ public:
   // Only available in test builds (BYTECASK_TESTING).
   [[nodiscard]] auto file_stats() const -> std::map<std::uint32_t, FileStats> {
     auto s = state_.load();
-    return s->file_stats;
+    std::map<std::uint32_t, FileStats> result;
+    for (const auto [id, fs] : s->file_stats) result.emplace(id, fs);
+    return result;
   }
 
   // Returns the current engine state for invariant checking.
