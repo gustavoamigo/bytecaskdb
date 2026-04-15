@@ -199,6 +199,156 @@ inline void assert_recoverable(const std::filesystem::path &dir,
   assert_consistent(recovered);
 }
 
+// Opens a fresh DB and verifies that specific keys are present/absent.
+// Used by resume and vacuum proof tests for recovery validation.
+inline void assert_keys_recoverable(
+    const std::filesystem::path &dir,
+    const std::vector<std::string> &keys_present,
+    const std::vector<std::string> &keys_absent = {}) {
+  auto recovered = DB::open(dir);
+  for (const auto &key : keys_present) {
+    INFO("key must be present after recovery: " << key);
+    CHECK(recovered.contains_key(to_bytes(key)));
+  }
+  for (const auto &key : keys_absent) {
+    INFO("key must be absent after recovery: " << key);
+    CHECK_FALSE(recovered.contains_key(to_bytes(key)));
+  }
+  assert_consistent(recovered);
+}
+
+// ---- Vacuum baseline and helpers -----------------------------------------
+
+// Owned snapshot of DB state before a vacuum operation.
+struct VacuumBaseline {
+  Baseline keys;
+  std::map<std::uint32_t, FileStats> file_stats;  // pre-vacuum per-file stats
+};
+
+// Captures key-values, next_lsn, and per-file stats for vacuum tests.
+inline auto capture_vacuum_baseline(const DB &db) -> VacuumBaseline {
+  VacuumBaseline bl;
+  bl.keys = capture_baseline(db);
+  auto state = db.engine_state();
+  bl.file_stats = state->file_stats;
+  return bl;
+}
+
+// Returns the file_id of the sealed file vacuum() would select — the one with
+// the highest fragmentation above 0, matching DB::vacuum()'s selection logic.
+inline auto find_vacuum_target(const DB &db) -> std::uint32_t {
+  auto state = db.engine_state();
+  std::uint32_t target_id{};
+  double worst_frag = 0.0;
+  for (const auto &[file_id, fs] : state->file_stats) {
+    if (file_id == state->active_file_id) continue;
+    if (fs.total_bytes == 0) continue;
+    const double frag = 1.0 - static_cast<double>(fs.live_bytes) /
+                                  static_cast<double>(fs.total_bytes);
+    if (frag > worst_frag) {
+      worst_frag = frag;
+      target_id = file_id;
+    }
+  }
+  if (worst_frag == 0.0) FAIL("no fragmented sealed file found for vacuum");
+  return target_id;
+}
+
+// Verifies that vacuum succeeded: vacuumed_file_id removed from state, all
+// pre-vacuum keys readable with correct values, next_lsn unchanged,
+// total_bytes for the active file matches its actual size (no staleness),
+// assert_consistent passes.
+inline void assert_vacuum_success(const DB &db, const VacuumBaseline &before,
+                                  std::uint32_t vacuumed_file_id) {
+  auto state = db.engine_state();
+
+  // Vacuumed file must be gone.
+  INFO("vacuumed file_id=" << vacuumed_file_id << " must be removed from state");
+  CHECK_FALSE(state->files->contains(vacuumed_file_id));
+  CHECK_FALSE(state->file_stats.contains(vacuumed_file_id));
+
+  // next_lsn unchanged — vacuum does not advance LSN.
+  CHECK(state->next_lsn == before.keys.next_lsn);
+
+  // All pre-vacuum keys must be present with correct values.
+  for (const auto &[key, value] : before.keys.key_values) {
+    INFO("pre-vacuum key must survive vacuum: " << key);
+    CHECK(db.contains_key(to_bytes(key)));
+    Bytes out;
+    if (db.get({}, to_bytes(key), out)) {
+      CHECK(out == value);
+    }
+  }
+
+  // total_bytes for active file must match actual file size.
+  auto active_id = state->active_file_id;
+  auto actual_size = state->files->at(active_id)->size();
+  INFO("active file total_bytes staleness check");
+  CHECK(state->file_stats.at(active_id).total_bytes == actual_size);
+
+  assert_consistent(db);
+}
+
+// Verifies that vacuum failed cleanly: vacuumed_file_id still in state, all
+// pre-vacuum keys intact with correct values, next_lsn unchanged,
+// file_stats unchanged from baseline (no partial stat updates),
+// total_bytes for active file matches its actual size, assert_consistent passes.
+inline void assert_vacuum_no_change(const DB &db, const VacuumBaseline &before,
+                                    std::uint32_t vacuumed_file_id) {
+  auto state = db.engine_state();
+
+  // Vacuumed file must still be present.
+  INFO("vacuumed file_id=" << vacuumed_file_id << " must remain after failure");
+  CHECK(state->files->contains(vacuumed_file_id));
+  CHECK(state->file_stats.contains(vacuumed_file_id));
+
+  // next_lsn unchanged.
+  CHECK(state->next_lsn == before.keys.next_lsn);
+
+  // All pre-vacuum keys must be present with correct values.
+  for (const auto &[key, value] : before.keys.key_values) {
+    INFO("pre-vacuum key must survive failed vacuum: " << key);
+    CHECK(db.contains_key(to_bytes(key)));
+    Bytes out;
+    if (db.get({}, to_bytes(key), out)) {
+      CHECK(out == value);
+    }
+  }
+
+  // file_stats must be unchanged from baseline (vacuum_commit never ran).
+  for (const auto &[file_id, fs] : before.file_stats) {
+    INFO("file_id=" << file_id << " file_stats must be unchanged after failed vacuum");
+    if (state->file_stats.contains(file_id)) {
+      CHECK(state->file_stats.at(file_id).live_bytes == fs.live_bytes);
+      CHECK(state->file_stats.at(file_id).total_bytes == fs.total_bytes);
+    }
+  }
+
+  // total_bytes for active file must match actual file size (no dead bytes
+  // were written without updating stats).
+  auto active_id = state->active_file_id;
+  auto actual_size = state->files->at(active_id)->size();
+  INFO("active file total_bytes staleness check after failed vacuum");
+  CHECK(state->file_stats.at(active_id).total_bytes == actual_size);
+
+  assert_consistent(db);
+}
+
+// Opens a fresh DB and verifies all pre-vacuum keys survive.
+inline void assert_vacuum_recoverable(const std::filesystem::path &dir,
+                                      const VacuumBaseline &before) {
+  auto recovered = DB::open(dir);
+  for (const auto &[key, value] : before.keys.key_values) {
+    INFO("key must survive vacuum and recovery: " << key);
+    CHECK(recovered.contains_key(to_bytes(key)));
+    Bytes out;
+    if (recovered.get({}, to_bytes(key), out)) {
+      CHECK(out == value);
+    }
+  }
+  assert_consistent(recovered);
+}
+
 }  // namespace bytecask::testing
 
 #endif  // BYTECASK_TESTING
