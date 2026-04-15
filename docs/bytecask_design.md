@@ -122,6 +122,8 @@ All writes (`put`, `del`, `apply_batch`, `apply_batch_if`) route through a singl
 
 **WriteGroup**: the first writer to arrive becomes the leader, drains the queue of pending slots, and executes them all under one lock hold. N concurrent sync writes share a single `fdatasync` instead of paying N separate calls. This is the dominant performance win — fdatasync is ~2 ms; writev is ~microseconds.
 
+**Adaptive wait window**: on the first drain (when the leader is newly elected and the queue typically has 1 slot), the leader waits up to `max_wait` (default 200 µs) for more writers to arrive before draining. The wait exits early when `target_batch` (default 8) writers are queued. An exponential moving average (EMA) of batch sizes tracks natural concurrency: `effective_wait = max_wait × clamp(1 − ema / target_batch, 0, 1)`. When batches fill naturally under high load, the EMA rises and the wait shrinks to zero — no overhead. When writers are sparse, the full wait is used, and catching even one more writer halves the per-write fdatasync cost. Subsequent drains within the same leader tenure don't wait — the batch execution time itself is the natural batching window.
+
 **SoloWriter**: same `submit(Slot&)` interface, no internal batching. The executor acquires `write_mu_` and processes the single slot. Provides a uniform interface for routing.
 
 Both executors follow a three-phase pattern:
