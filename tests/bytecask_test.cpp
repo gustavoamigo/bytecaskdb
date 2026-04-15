@@ -3046,6 +3046,90 @@ TEST_CASE("resume() recovers from degraded state", "[degraded][resume]") {
   CHECK(db.contains_key(to_bytes("k3")));
 }
 
+TEST_CASE("resume() replays unpublished entries from active file",
+          "[degraded][resume]") {
+  TempDir td;
+
+  // Use a large max_file_bytes to keep everything on one active file.
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1'000'000});
+
+  // k1 committed normally — baseline.
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  CHECK(db.contains_key(to_bytes("k1")));
+
+  // k2 written to disk but key changes NOT published (class F sync failure).
+  // Data is appended to the active file, but fdatasync fails → only next_lsn
+  // advanced, key_dir not updated. k2 is invisible.
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")),
+                      std::system_error);
+  }
+  CHECK_FALSE(db.contains_key(to_bytes("k2")));
+  CHECK_FALSE(db.is_degraded());  // F doesn't degrade
+
+  // k3 also written to disk with unpublished key changes (another class F).
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")),
+                      std::system_error);
+  }
+  CHECK_FALSE(db.contains_key(to_bytes("k3")));
+
+  // Now trigger degradation so resume() can run. Use a batch write with
+  // io_rotate_file_creation fault (rotation after a batch that pushes the
+  // file past max_file_bytes). Switch to small threshold first.
+  // Alternatively, use a simpler approach: degrade via an orphaned BulkBegin.
+  {
+    // Count-based injection: fail on the 2nd checkpoint (mid-batch append).
+    // First checkpoint passes (BulkBegin written), second fails → orphaned
+    // BulkBegin → isolation needed. Skip io_data_file_sync so that the
+    // isolation sync succeeds, but fail io_rotate_file_creation.
+    bytecask::testing::ScopedFaultInjector fi{
+        "io_rotate_file_creation"};
+    // Need a batch that succeeds IO but fails rotation.
+    // Use max_file_bytes=1 on a second DB? No, easier: just make the batch
+    // fail mid-write to trigger the isolation → rotation path.
+  }
+  // Simpler: use a batch with count-based injection to cause mid-write failure,
+  // then let isolation rotation fail.
+  {
+    bytecask::testing::ScopedFaultInjector fi{
+        2, {"io_data_file_sync"}};  // skip sync, fail on 2nd non-sync checkpoint
+    bytecask::Batch batch;
+    batch.put(to_bytes("a"), to_bytes("va"));
+    batch.put(to_bytes("b"), to_bytes("vb"));
+    REQUIRE_THROWS(db.apply_batch({.sync = false}, std::move(batch)));
+  }
+  REQUIRE(db.is_degraded());
+
+  // Before resume: k2 and k3 are invisible (unpublished sync-failure writes).
+  CHECK_FALSE(db.contains_key(to_bytes("k2")));
+  CHECK_FALSE(db.contains_key(to_bytes("k3")));
+
+  // resume() should scan the active file and replay k2 and k3.
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+
+  // All committed keys visible: k1 was always visible; k2 and k3 replayed.
+  CHECK(db.contains_key(to_bytes("k1")));
+  CHECK(db.contains_key(to_bytes("k2")));
+  CHECK(db.contains_key(to_bytes("k3")));
+
+  // Verify actual values.
+  auto v = get_val(db, to_bytes("k2"));
+  REQUIRE(v.has_value());
+  CHECK(to_string(*v) == "v2");
+
+  v = get_val(db, to_bytes("k3"));
+  REQUIRE(v.has_value());
+  CHECK(to_string(*v) == "v3");
+
+  // Subsequent writes work.
+  REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k4"), to_bytes("v4")));
+  CHECK(db.contains_key(to_bytes("k4")));
+}
+
 // ---------------------------------------------------------------------------
 // validate_preconditions unit tests
 // ---------------------------------------------------------------------------
@@ -3352,6 +3436,191 @@ TEST_CASE("validate_preconditions: no snapshot skips W-W checks",
   bytecask::WritePlan plan;
   plan.put(to_bytes("k"), to_bytes("v1"));
   CHECK(t.validate_preconditions(plan));
+}
+
+// ---------------------------------------------------------------------------
+// apply_resume unit tests
+// ---------------------------------------------------------------------------
+// These test TransientEngineState::apply_resume in isolation — no DB, no
+// disk I/O. We construct EngineState directly, call .transient(), apply
+// resume entries, and verify key_dir, file_stats, and next_lsn.
+
+namespace {
+
+auto make_resume_entry(std::uint64_t seq, bytecask::EntryType type,
+                       std::string key, std::uint64_t file_off = 0,
+                       std::uint32_t val_size = 0) -> bytecask::ResumeEntry {
+  return {seq, type, file_off, val_size,
+          {to_bytes(key).begin(), to_bytes(key).end()}};
+}
+
+auto make_state_with_stats(
+    std::initializer_list<std::pair<std::string, bytecask::KeyDirEntry>> entries,
+    std::map<std::uint32_t, bytecask::FileStats> stats = {})
+    -> std::shared_ptr<bytecask::EngineState> {
+  auto s = make_state(entries);
+  s->file_stats = std::move(stats);
+  return s;
+}
+
+} // namespace
+
+TEST_CASE("apply_resume: put inserts new key into empty key_dir",
+          "[apply_resume]") {
+  auto state = make_state_with_stats({}, {{1, {0, 0}}});
+  auto t = state->transient();
+
+  std::vector<bytecask::ResumeEntry> entries{
+      make_resume_entry(50, bytecask::EntryType::Put, "k1", 0, 4)};
+  t.apply_resume(1, entries);
+
+  auto s = std::move(t).persistent();
+  auto kv = s->key_dir.get(to_bytes("k1"));
+  REQUIRE(kv.has_value());
+  CHECK(kv->sequence == 50);
+  CHECK(kv->file_id == 1);
+  CHECK(kv->file_offset == 0);
+  CHECK(kv->value_size == 4);
+}
+
+TEST_CASE("apply_resume: put with higher LSN overwrites existing",
+          "[apply_resume]") {
+  // file_id=2 holds existing key at seq=10
+  auto state = make_state_with_stats(
+      {{"k1", {10, 2, 100, 5}}},
+      {{1, {0, 0}}, {2, {bytecask::entry_size(2, 5), 0}}});
+  auto t = state->transient();
+
+  std::vector<bytecask::ResumeEntry> entries{
+      make_resume_entry(50, bytecask::EntryType::Put, "k1", 200, 8)};
+  t.apply_resume(1, entries);
+
+  auto s = std::move(t).persistent();
+  auto kv = s->key_dir.get(to_bytes("k1"));
+  REQUIRE(kv.has_value());
+  CHECK(kv->sequence == 50);
+  CHECK(kv->file_id == 1);
+  CHECK(kv->file_offset == 200);
+  CHECK(kv->value_size == 8);
+  // Old file's live_bytes decreased.
+  CHECK(s->file_stats.at(2).live_bytes == 0);
+  // New file's live_bytes increased.
+  CHECK(s->file_stats.at(1).live_bytes == bytecask::entry_size(2, 8));
+}
+
+TEST_CASE("apply_resume: put with lower LSN is ignored",
+          "[apply_resume]") {
+  auto state = make_state_with_stats(
+      {{"k1", {50, 2, 100, 5}}},
+      {{1, {0, 0}}, {2, {bytecask::entry_size(2, 5), 0}}});
+  auto t = state->transient();
+
+  std::vector<bytecask::ResumeEntry> entries{
+      make_resume_entry(10, bytecask::EntryType::Put, "k1", 200, 8)};
+  t.apply_resume(1, entries);
+
+  auto s = std::move(t).persistent();
+  auto kv = s->key_dir.get(to_bytes("k1"));
+  REQUIRE(kv.has_value());
+  CHECK(kv->sequence == 50);
+  CHECK(kv->file_id == 2);
+  // file_stats unchanged.
+  CHECK(s->file_stats.at(2).live_bytes == bytecask::entry_size(2, 5));
+  CHECK(s->file_stats.at(1).live_bytes == 0);
+}
+
+TEST_CASE("apply_resume: delete removes key when LSN is higher",
+          "[apply_resume]") {
+  auto state = make_state_with_stats(
+      {{"k1", {10, 2, 100, 5}}},
+      {{1, {0, 0}}, {2, {bytecask::entry_size(2, 5), 0}}});
+  auto t = state->transient();
+
+  std::vector<bytecask::ResumeEntry> entries{
+      make_resume_entry(50, bytecask::EntryType::Delete, "k1")};
+  t.apply_resume(1, entries);
+
+  auto s = std::move(t).persistent();
+  CHECK_FALSE(s->key_dir.get(to_bytes("k1")).has_value());
+  CHECK(s->file_stats.at(2).live_bytes == 0);
+}
+
+TEST_CASE("apply_resume: delete is ignored when LSN is lower",
+          "[apply_resume]") {
+  auto state = make_state_with_stats(
+      {{"k1", {50, 2, 100, 5}}},
+      {{1, {0, 0}}, {2, {bytecask::entry_size(2, 5), 0}}});
+  auto t = state->transient();
+
+  std::vector<bytecask::ResumeEntry> entries{
+      make_resume_entry(10, bytecask::EntryType::Delete, "k1")};
+  t.apply_resume(1, entries);
+
+  auto s = std::move(t).persistent();
+  auto kv = s->key_dir.get(to_bytes("k1"));
+  REQUIRE(kv.has_value());
+  CHECK(kv->sequence == 50);
+}
+
+TEST_CASE("apply_resume: advances next_lsn past highest seen LSN",
+          "[apply_resume]") {
+  auto state = make_state_with_stats({}, {{1, {0, 0}}});
+  state->next_lsn = 10;
+  auto t = state->transient();
+
+  std::vector<bytecask::ResumeEntry> entries{
+      make_resume_entry(25, bytecask::EntryType::Put, "a", 0, 3),
+      make_resume_entry(30, bytecask::EntryType::Put, "b", 100, 4)};
+  t.apply_resume(1, entries);
+
+  CHECK(t.next_lsn() == 31);
+}
+
+TEST_CASE("apply_resume: does not regress next_lsn when entries have lower LSN",
+          "[apply_resume]") {
+  auto state = make_state_with_stats({}, {{1, {0, 0}}});
+  state->next_lsn = 100;
+  auto t = state->transient();
+
+  std::vector<bytecask::ResumeEntry> entries{
+      make_resume_entry(5, bytecask::EntryType::Put, "a", 0, 3)};
+  t.apply_resume(1, entries);
+
+  CHECK(t.next_lsn() == 100);
+}
+
+TEST_CASE("apply_resume: empty entries is a no-op",
+          "[apply_resume]") {
+  auto state = make_state_with_stats({{"k1", {10, 1, 0, 5}}}, {{1, {42, 100}}});
+  auto t = state->transient();
+
+  std::vector<bytecask::ResumeEntry> entries;
+  t.apply_resume(1, entries);
+
+  auto s = std::move(t).persistent();
+  CHECK(s->key_dir.get(to_bytes("k1")).has_value());
+  CHECK(s->file_stats.at(1).live_bytes == 42);
+  CHECK(s->next_lsn == 100);
+}
+
+TEST_CASE("apply_resume: multiple entries replayed in order",
+          "[apply_resume]") {
+  auto state = make_state_with_stats({}, {{1, {0, 0}}});
+  state->next_lsn = 1;
+  auto t = state->transient();
+
+  std::vector<bytecask::ResumeEntry> entries{
+      make_resume_entry(10, bytecask::EntryType::Put, "k1", 0, 5),
+      make_resume_entry(11, bytecask::EntryType::Put, "k2", 100, 8),
+      make_resume_entry(12, bytecask::EntryType::Delete, "k1")};
+  t.apply_resume(1, entries);
+
+  auto s = std::move(t).persistent();
+  CHECK_FALSE(s->key_dir.get(to_bytes("k1")).has_value());
+  auto kv2 = s->key_dir.get(to_bytes("k2"));
+  REQUIRE(kv2.has_value());
+  CHECK(kv2->sequence == 11);
+  CHECK(s->next_lsn == 13);
 }
 
 #endif

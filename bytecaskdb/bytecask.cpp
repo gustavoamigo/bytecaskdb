@@ -307,6 +307,41 @@ void TransientEngineState::apply_vacuum(
   }
 }
 
+void TransientEngineState::apply_resume(
+    std::uint32_t file_id, const std::vector<ResumeEntry> &entries) {
+  std::uint64_t max_lsn = 0;
+  for (const auto &e : entries) {
+    const std::span<const std::byte> key_span{e.key};
+    if (e.sequence > max_lsn) max_lsn = e.sequence;
+
+    if (e.entry_type == EntryType::Put) {
+      const auto existing = key_dir_.get(key_span);
+      if (!existing || existing->sequence < e.sequence) {
+        if (existing) {
+          file_stats_[existing->file_id].live_bytes -=
+              entry_size(key_span.size(), existing->value_size);
+        }
+        file_stats_[file_id].live_bytes +=
+            entry_size(key_span.size(), e.value_size);
+        key_dir_.set(key_span,
+                     KeyDirEntry{e.sequence, file_id, e.file_offset,
+                                 e.value_size});
+      }
+    } else if (e.entry_type == EntryType::Delete) {
+      const auto existing = key_dir_.get(key_span);
+      if (existing && existing->sequence < e.sequence) {
+        file_stats_[existing->file_id].live_bytes -=
+            entry_size(key_span.size(), existing->value_size);
+        key_dir_.erase(key_span);
+      }
+    }
+  }
+
+  if (max_lsn >= next_lsn_) {
+    next_lsn_ = max_lsn + 1;
+  }
+}
+
 auto TransientEngineState::active_file() -> DataFile & {
   return *files_->at(active_file_id_);
 }
@@ -1150,36 +1185,60 @@ void DB::resume() {
   const auto old_file_id = current->active_file_id;
   auto &file = *current->files->at(old_file_id);
 
-  // Scan the active file (batch-aware) to find the last valid committed offset.
-  // Orphaned BulkBegin batches are excluded: if a batch start is found but no
-  // matching BulkEnd, valid_offset is reset to batch_start (discarding it).
+  // Scan the active file (batch-aware) to find the last valid committed offset
+  // and collect valid committed entries for key_dir replay. Entries written to
+  // disk but never published to EngineState (sync-failure paths, degraded
+  // transitions between IO and state publication) would otherwise be invisible
+  // until cold restart.
   Offset valid_offset = 0;
   Offset off = 0;
   bool in_batch = false;
   Offset batch_start = 0;
+  std::vector<ResumeEntry> committed;
+  std::vector<ResumeEntry> pending;  // staging buffer for current batch
   try {
     while (auto result = file.scan(off)) {
+      const auto entry_off = off;
       const auto &[entry, next] = *result;
       switch (entry.entry_type) {
         case EntryType::BulkBegin:
           in_batch = true;
           batch_start = off;
+          pending.clear();
           break;
         case EntryType::BulkEnd:
           in_batch = false;
           valid_offset = next;
+          for (auto &pe : pending) {
+            committed.push_back(std::move(pe));
+          }
+          pending.clear();
           break;
         case EntryType::Put:
-        case EntryType::Delete:
-          if (!in_batch) valid_offset = next;
+        case EntryType::Delete: {
+          ResumeEntry re{entry.sequence, entry.entry_type, entry_off,
+                         narrow<std::uint32_t>(entry.value.size()),
+                         entry.key};
+          if (in_batch) {
+            pending.push_back(std::move(re));
+          } else {
+            valid_offset = next;
+            committed.push_back(std::move(re));
+          }
           break;
+        }
       }
       off = next;
     }
   } catch (...) {
     // Stop at first CRC error — valid_offset is the last known-good position.
+    // Discard any pending incomplete batch.
+    pending.clear();
   }
-  if (in_batch) valid_offset = batch_start;  // discard orphaned batch
+  if (in_batch) {
+    valid_offset = batch_start;  // discard orphaned batch
+    pending.clear();
+  }
 
   // Remove garbage bytes / orphaned batch markers via truncation.
   if (file.size() != valid_offset) {
@@ -1200,9 +1259,11 @@ void DB::resume() {
   const auto stem = make_data_file_stem();
   auto new_file = std::make_shared<DataFile>(dir_ / (stem + ".data"));
 
-  // Build and publish new state.
+  // Build and publish new state. Replay scanned entries into key_dir so that
+  // entries on disk but not yet in EngineState become visible.
   auto t = current->transient();
   t.file_stats()[old_file_id].total_bytes = valid_offset;
+  t.apply_resume(old_file_id, committed);
   t.apply_rotate_file(std::move(new_file));
   state_.store(std::move(t).persistent());
   state_time_.store(now_ns(), std::memory_order_release);
@@ -1255,8 +1316,6 @@ auto DB::acquire_write_lock(const WriteOptions &opts)
   }
   return std::unique_lock<std::mutex>{*write_mu_};
 }
-
-#pragma endregion
 
 #pragma endregion
 
