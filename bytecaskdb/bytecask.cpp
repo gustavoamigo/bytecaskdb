@@ -376,38 +376,6 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
 
 #pragma endregion
 
-#pragma region FileStats helpers
-
-// Marks an existing entry as dead in its file's stats.
-void stats_retire_entry(std::map<std::uint32_t, FileStats> &fs,
-                        BytesView key, const KeyDirEntry &old) {
-  fs[old.file_id].live_bytes -= entry_size(key.size(), old.value_size);
-}
-
-// Records a new Put entry: live + total on the active file.
-void stats_publish_put(std::map<std::uint32_t, FileStats> &fs,
-                       std::uint32_t active_file_id, BytesView key,
-                       BytesView value) {
-  const auto sz = entry_size(key.size(), value.size());
-  auto &st = fs[active_file_id];
-  st.live_bytes += sz;
-  st.total_bytes += sz;
-}
-
-// Records a tombstone (Delete): total only on the active file.
-void stats_publish_tombstone(std::map<std::uint32_t, FileStats> &fs,
-                             std::uint32_t active_file_id, BytesView key) {
-  fs[active_file_id].total_bytes += entry_size(key.size(), 0);
-}
-
-// Records a bulk marker (BulkBegin / BulkEnd): total only.
-void stats_publish_bulk_marker(std::map<std::uint32_t, FileStats> &fs,
-                               std::uint32_t active_file_id) {
-  fs[active_file_id].total_bytes += kHeaderSize + kCrcSize;
-}
-
-#pragma endregion
-
 #pragma region Construction
 
 // Opens dir, runs recovery, creates initial active data file.
