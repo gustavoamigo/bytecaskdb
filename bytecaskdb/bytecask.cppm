@@ -443,14 +443,14 @@ private:
   friend class DB;
   friend struct EngineState;
   TransientEngineState(TransientRadixTree<KeyDirEntry> key_dir,
-                       FileRegistry files,
+                       std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>> files,
                        std::map<std::uint32_t, FileStats> file_stats,
                        std::uint32_t active_file_id,
                        std::uint32_t next_file_id,
                        std::uint64_t next_lsn);
 
   TransientRadixTree<KeyDirEntry> key_dir_;
-  FileRegistry files_;
+  std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>> files_;
   std::map<std::uint32_t, FileStats> file_stats_;
   std::uint32_t active_file_id_;
   std::uint32_t next_file_id_;

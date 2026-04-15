@@ -85,7 +85,7 @@ auto now_ns() -> std::int64_t {
 #pragma region TransientEngineState
 
 TransientEngineState::TransientEngineState(
-    TransientRadixTree<KeyDirEntry> key_dir, FileRegistry files,
+    TransientRadixTree<KeyDirEntry> key_dir, std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>> files,
     std::map<std::uint32_t, FileStats> file_stats,
     std::uint32_t active_file_id, std::uint32_t next_file_id,
     std::uint64_t next_lsn)
