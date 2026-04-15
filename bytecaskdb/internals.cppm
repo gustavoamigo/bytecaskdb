@@ -48,8 +48,6 @@ struct FileStats {
 // The outer shared_ptr is copied into iterators at construction — O(1),
 // independent lifetime from DB. Rotation clones the inner map,
 // inserts the new file, then atomically replaces the outer shared_ptr.
-export using FileRegistry =
-    std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>>;
 
 // ---------------------------------------------------------------------------
 // KeyDirEntry — one slot in the in-memory key directory.
@@ -85,7 +83,7 @@ export class TransientEngineState;
 // ---------------------------------------------------------------------------
 export struct EngineState {
   PersistentRadixTree<KeyDirEntry> key_dir;
-  FileRegistry files;
+  std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>> files;
   std::map<std::uint32_t, FileStats> file_stats;
   std::uint32_t active_file_id{};
   std::uint32_t next_file_id{};
