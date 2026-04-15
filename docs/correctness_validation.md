@@ -312,6 +312,19 @@ Four checkpoints exist in the production code:
 4. `io_rotate_file_creation` — after sealing, before new file creation
    in `rotate_active_file()`
 
+Six additional checkpoints exist in `bytecask.cpp` (compiled under `BYTECASK_TESTING`):
+
+5. `io_resume_truncate` — before `file.truncate()` in `resume()` (only
+   reached when the active file has orphaned bytes to discard)
+6. `io_resume_sync` — before `file.sync()` in `resume()`
+7. `io_resume_file_creation` — before creating the new active `DataFile`
+   in `resume()`
+8. `io_vacuum_absorb_sync` — before `active.sync()` in `vacuum_absorb_file()`
+9. `io_vacuum_compact_tmp_create` — before constructing the temporary
+   `DataFile` in `vacuum_compact_file()`
+10. `io_vacuum_compact_rename` — before `std::filesystem::rename()` in
+    `vacuum_compact_file()`
+
 ### Orphaned BulkBegin rotation
 
 If a multi-entry batch fails mid-write after `BulkBegin`, the engine
@@ -328,7 +341,9 @@ next write.
 
 ## Proof Test Generator
 
-172 generated Catch2 tests (`[prove]` tag) cover every valid
+### apply_batch_if — 172 tests
+
+172 generated Catch2 tests (`[prove_apply_batch_if]` tag) cover every valid
 (StateShape, PlanShape, FailureClass) combination for `apply_batch_if`.
 The scenario matrix is 4 state shapes × 7 plan shapes × 11 failure
 classes = 308 total; 4 elimination rules reduce this to 172 valid tests.
@@ -346,11 +361,77 @@ Each test follows the same structure:
 7. `assert_recoverable(dir, before, expected)` — validates persistence
    invariant via fresh recovery (where applicable)
 
-Scope is `apply_batch_if` only (no vacuum). Invalid combinations
-are silently skipped. Regeneration (`python3 tests/proof/generate_tests.py`)
-is deterministic and produces no diff.
+### resume() — 7 tests
+
+7 generated Catch2 tests (`[prove_resume]` tag) cover every valid
+(DegradeShape, ResumeFailureClass) combination.
+
+Two degrade shapes establish a degraded DB before resume is called:
+
+- **degrade_H** — `io_rotate_file_creation` fires on a put at the
+  rotation threshold. The write committed (both keys are in key_dir),
+  rotation failed. No orphaned bytes — `valid_offset == file.size()`.
+- **degrade_C** — `ScopedFaultInjector{fail_at=3}` on a 2-op batch.
+  BulkEnd at checkpoint 3 fails; subsequent isolation sync and rotation
+  also fail (cascade). k0 committed; orphaned BulkBegin+p0+p1 bytes
+  remain in the active file. `resume()` truncates back to after k0.
+
+Three resume failure classes (R1/R2/R3) plus SUCCESS yield 7 valid
+combinations (R1 is filtered for degrade_H because the truncation guard
+`file.size() != valid_offset` is false — the fault point is unreachable).
+
+Each R1/R2/R3 test uses a two-phase pattern:
+1. Establish degraded state
+2. Inject resume fault → `resume()` throws, engine stays degraded
+3. Clean resume → `REQUIRE_NOTHROW`, `is_degraded()` false, `assert_consistent`
+4. `assert_keys_recoverable` after DB scope closes
+
+This directly proves: *resume always eventually recovers once the underlying fault clears.*
+
+### vacuum_absorb — 6 tests
+
+6 generated Catch2 tests (`[prove_vacuum_absorb]` tag) cover two state
+shapes × three failure classes (SUCCESS, VA1, VA2).
+
+State shapes create a DB with exactly one sealed file having fragmentation > 0:
+
+- **low_fragmentation** — sealed file with 2 entries, 1 dead (50% frag)
+- **mostly_dead** — sealed file with 6 entries, 5 dead (~83% frag)
+
+Both use `absorb_threshold=UINT64_MAX` to force the absorb path.
+Failure classes: SUCCESS, VA1 (`io_data_file_append`), VA2 (`io_vacuum_absorb_sync`).
+
+Each test uses `capture_vacuum_baseline` / `find_vacuum_target` before
+the vacuum call, then `assert_vacuum_success` or `assert_vacuum_no_change`
+after. The `assert_vacuum_no_change` helper explicitly checks
+`file_stats[active_id].total_bytes == actual_file_size` — this detects
+the stale-stats invariant violation that would result if `vacuum_absorb_file`
+failed to truncate the active file back after a sync failure. Each test
+ends with `assert_vacuum_recoverable` after the DB scope closes.
+
+### vacuum_compact — 10 tests
+
+10 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover two state
+shapes × five failure classes (SUCCESS, VC1–VC4).
+
+Same state shapes as absorb but `absorb_threshold=0` forces the compact
+path. `mostly_dead` uses `max_file_bytes=150` to pack all 6 keys into one
+sealed file so `live_bytes > 0` — preventing the edge case where
+`absorb_threshold=0` is still satisfied and absorb is taken.
+
+Failure classes: SUCCESS, VC1 (`io_vacuum_compact_tmp_create`),
+VC2 (`io_data_file_append`), VC3 (`io_data_file_sync`),
+VC4 (`io_vacuum_compact_rename`).
+
+VC4 is the most critical: the tmp file is fully synced and renamed
+(a new `.data` file exists on disk) but `vacuum_commit` has not run —
+the old file is still in the published state. `assert_vacuum_recoverable`
+confirms that recovery does not replay the orphaned new file as a
+secondary source and sees only the data the old file guaranteed.
 
 ### Source files
+
+**apply_batch_if module** (root of `tests/proof/`):
 
 | File | Role |
 |------|------|
@@ -358,7 +439,39 @@ is deterministic and produces no diff.
 | [`scenario_matrix.py`](../tests/proof/scenario_matrix.py) | State shapes, plan shapes, failure classes, validity filter |
 | [`fault_point_resolver.py`](../tests/proof/fault_point_resolver.py) | Maps (state, plan, failure) → `ScopedFaultInjector` configuration |
 | [`generate_tests.py`](../tests/proof/generate_tests.py) | Generates `prove_apply_batch_if.cpp` from the matrix |
-| [`invariants.h`](../tests/proof/invariants.h) | `capture_baseline`, `assert_consistent`, `assert_delta`, `assert_recoverable` |
+
+**resume module** (`tests/proof/resume/`):
+
+| File | Role |
+|------|------|
+| `scenario_matrix.py` | DegradeShape (H, C), ResumeFailureClass (SUCCESS, R1–R3), validity filter |
+| `fault_point_resolver.py` | Maps failure class → fault checkpoint name |
+| `expected_delta.py` | Reference model: keys present/absent after all resume calls |
+| `generate_tests.py` | Generates `prove_resume.cpp` |
+
+**vacuum_absorb module** (`tests/proof/vacuum_absorb/`):
+
+| File | Role |
+|------|------|
+| `scenario_matrix.py` | AbsorbStateShape (low_fragmentation, mostly_dead), VacuumAbsorbFailureClass |
+| `fault_point_resolver.py` | Maps failure class → fault checkpoint name |
+| `expected_delta.py` | Reference model: threw/file_removed outcome |
+| `generate_tests.py` | Generates `prove_vacuum_absorb.cpp` |
+
+**vacuum_compact module** (`tests/proof/vacuum_compact/`):
+
+| File | Role |
+|------|------|
+| `scenario_matrix.py` | CompactStateShape (low_fragmentation, mostly_dead), VacuumCompactFailureClass |
+| `fault_point_resolver.py` | Maps failure class → fault checkpoint name |
+| `expected_delta.py` | Reference model: threw/file_removed outcome |
+| `generate_tests.py` | Generates `prove_vacuum_compact.cpp` |
+
+**Shared invariants** (`tests/proof/`):
+
+| File | Role |
+|------|------|
+| [`invariants.h`](../tests/proof/invariants.h) | `capture_baseline`, `assert_consistent`, `assert_delta`, `assert_recoverable`, `assert_resumable`, `assert_keys_recoverable`, `VacuumBaseline`, `capture_vacuum_baseline`, `find_vacuum_target`, `assert_vacuum_success`, `assert_vacuum_no_change`, `assert_vacuum_recoverable` |
 
 ### Fault injection modes
 
@@ -392,15 +505,45 @@ I/O checkpoints:
   disk and verifies the recovered state matches the expected state
   (pre-existing keys survive, added keys present, removed keys absent,
   no extra keys, structural consistency).
+- `assert_keys_recoverable(dir, keys_present, keys_absent)` — lighter
+  recovery check used by resume proof tests: opens a fresh DB and
+  checks specific keys present/absent plus `assert_consistent`.
+- `VacuumBaseline` / `capture_vacuum_baseline(db)` — snapshots key-values,
+  `next_lsn`, and per-file `FileStats` before a vacuum operation.
+- `find_vacuum_target(db)` — returns the file_id of the sealed file with
+  the highest fragmentation, matching `DB::vacuum()`'s selection logic.
+- `assert_vacuum_success(db, before, vacuumed_file_id)` — verifies the
+  vacuumed file is removed from state, all pre-vacuum keys readable with
+  correct values, `next_lsn` unchanged, `total_bytes` for the active
+  file matches its actual size, `assert_consistent` passes.
+- `assert_vacuum_no_change(db, before, vacuumed_file_id)` — verifies the
+  vacuumed file is still in state, all keys intact, `next_lsn` unchanged,
+  `file_stats` unchanged from baseline, the active file's tracked size
+  matches its actual on-disk size (detecting a failed absorb that wrote
+  bytes without rolling them back), `assert_consistent`.
+- `assert_vacuum_recoverable(dir, before)` — opens a fresh DB and verifies
+  all pre-vacuum keys survive recovery with correct values.
 
 12 test cases (`[invariants]` tag) in `tests/invariants_test.cpp`
 smoke-test the helpers themselves.
 
 ### Test coverage
 
-All eleven failure classes are covered by the 172 `[prove]` tests.
-Each class is exercised across all valid (StateShape, PlanShape)
-combinations.
+All eleven failure classes for `apply_batch_if` are covered by the 172
+`[prove_apply_batch_if]` tests. Each class is exercised across all valid
+(StateShape, PlanShape) combinations.
+
+All three resume failure classes (R1–R3) plus both degrade shapes are
+covered by the 7 `[prove_resume]` tests. R1 is correctly excluded for
+degrade_H (fault point unreachable).
+
+All three vacuum_absorb failure classes across both state shapes are
+covered by the 6 `[prove_vacuum_absorb]` tests.
+
+All five vacuum_compact failure classes across both state shapes are
+covered by the 10 `[prove_vacuum_compact]` tests.
+
+Total generated proof tests: **195**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
@@ -425,13 +568,34 @@ smoke testing not covered by the proof matrix:
 tests/
   proof/
     __init__.py                    ← Python package marker
-    generate_tests.py              ← the generator — owns the model
-    expected_delta.py              ← the reference function — owns the contract
-    fault_point_resolver.py        ← maps classes to injection configurations
-    scenario_matrix.py             ← the input matrix
-    invariants.h                   ← assert_consistent(), assert_delta()
+    generate_tests.py              ← apply_batch_if generator
+    expected_delta.py              ← apply_batch_if reference model
+    fault_point_resolver.py        ← apply_batch_if fault configs
+    scenario_matrix.py             ← apply_batch_if input matrix
+    invariants.h                   ← shared assert helpers for all proof suites
+    resume/
+      __init__.py
+      scenario_matrix.py
+      expected_delta.py
+      fault_point_resolver.py
+      generate_tests.py
+    vacuum_absorb/
+      __init__.py
+      scenario_matrix.py
+      expected_delta.py
+      fault_point_resolver.py
+      generate_tests.py
+    vacuum_compact/
+      __init__.py
+      scenario_matrix.py
+      expected_delta.py
+      fault_point_resolver.py
+      generate_tests.py
     generated/
       prove_apply_batch_if.cpp     ← generated, never hand-edited
+      prove_resume.cpp             ← generated, never hand-edited
+      prove_vacuum_absorb.cpp      ← generated, never hand-edited
+      prove_vacuum_compact.cpp     ← generated, never hand-edited
 ```
 
 The fault injection infrastructure (`fault_injector.h`) lives in

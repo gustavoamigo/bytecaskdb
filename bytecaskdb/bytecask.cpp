@@ -1097,11 +1097,17 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
 
   VacuumScanResult scan;
   {
+#ifdef BYTECASK_TESTING
+    FAULT_INJECTION(io_vacuum_compact_tmp_create);
+#endif
     DataFile tmp_file(tmp_data_path);
     scan = vacuum_scan_and_copy(snap, old_file, tmp_file, file_id);
     tmp_file.sync();
   }
 
+#ifdef BYTECASK_TESTING
+  FAULT_INJECTION(io_vacuum_compact_rename);
+#endif
   std::filesystem::rename(tmp_data_path, final_data_path);
   auto new_file = std::make_shared<DataFile>(final_data_path);
   new_file->seal();
@@ -1127,9 +1133,19 @@ void DB::vacuum_absorb_file(std::uint32_t file_id) {
   {
     std::lock_guard<std::mutex> wg{*write_mu_};
     auto &active = snap->active_file();
-    auto scan = vacuum_scan_and_copy(snap, old_file, active, file_id);
-    active.sync();
-    vacuum_commit(file_id, scan, nullptr);
+    const auto pre_vacuum_offset = active.size();
+    try {
+      auto scan = vacuum_scan_and_copy(snap, old_file, active, file_id);
+#ifdef BYTECASK_TESTING
+      FAULT_INJECTION(io_vacuum_absorb_sync);
+#endif
+      active.sync();
+      vacuum_commit(file_id, scan, nullptr);
+    } catch (...) {
+      // Roll back bytes written during copy so file_stats stays consistent.
+      try { active.truncate(pre_vacuum_offset); } catch (...) {}
+      throw;
+    }
   }
   vacuum_defer_old_file(snap, file_id);
 }
@@ -1210,10 +1226,16 @@ void DB::resume() {
 
   // Remove garbage bytes / orphaned batch markers via truncation.
   if (file.size() != valid_offset) {
+#ifdef BYTECASK_TESTING
+    FAULT_INJECTION(io_resume_truncate);
+#endif
     file.truncate(valid_offset);  // throws std::system_error → stays degraded
   }
 
   // Sync the truncated file (may throw → stays degraded).
+#ifdef BYTECASK_TESTING
+  FAULT_INJECTION(io_resume_sync);
+#endif
   file.sync();
 
   // Seal and dispatch hint generation. Both are idempotent: seal() is a flag
@@ -1225,6 +1247,9 @@ void DB::resume() {
 
   // Create the new active file (may throw → stays degraded).
   const auto stem = make_data_file_stem();
+#ifdef BYTECASK_TESTING
+  FAULT_INJECTION(io_resume_file_creation);
+#endif
   auto new_file = std::make_shared<DataFile>(dir_ / (stem + ".data"));
 
   // Build and publish new state. Replay scanned entries into key_dir so that

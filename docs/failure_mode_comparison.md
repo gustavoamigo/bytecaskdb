@@ -214,6 +214,49 @@ WiredTiger's log-slot consolidation means multiple threads block waiting for a
 single slow IO; and ByteCaskDB holds the write lock for the entire `writev` +
 state publish.
 
+### 9. Correctness contract documentation is rare
+
+ByteCaskDB's [`CONTRACT.md`](../CONTRACT.md) is a single plain-language
+document that specifies the behavioral guarantees of every write function:
+atomicity, durability, IO failure safety, LSN invariants, and poisoning
+conditions. No major embedded storage engine publishes an equivalent
+single-document correctness contract.
+
+| Engine | What exists | Gap vs. CONTRACT.md |
+|---|---|---|
+| **RocksDB** | Wiki pages on WAL recovery modes, `ErrorHandler` behavior, sync semantics. Scattered across `options.h` comments and GitHub wiki. | No unified per-function failure contract. IO failure behavior is documented post-hoc in bug reports and design docs, not as a binding spec. |
+| **LevelDB** | `include/leveldb/db.h` header comments (brief). `doc/impl.md` describes the LSM architecture. | Almost no failure-mode documentation. `bg_error_` behavior is discoverable only by reading source. No stated invariants for partial write. |
+| **SQLite** | `atomiccommit.html` (10K+ words on the commit protocol), the VFS interface spec, "How SQLite Is Tested." | Closest peer in ambition. Spread across multiple documents; no single per-function spec. The VFS boundary is well-specified; the pager's internal failure handling is documented as implementation detail, not as a guarantee. |
+| **LMDB** | `lmdb.h` header — detailed Doxygen comments on every API function. Two-meta-page design described in the source header. | Precise about return codes and preconditions. Does not cover internal failure-mode reasoning (e.g. what happens if `mdb_page_flush` short-writes). |
+| **WiredTiger** | `src/docs/` architecture guides. MongoDB maintains an internal "Storage Engine Technical Specification." | Public docs describe normal operation. Failure-mode behavior (`WT_RET_PANIC` conditions, recovery expectations) lives in source comments. |
+| **PostgreSQL** | `src/backend/access/transam/README` — detailed WAL protocol, checkpoint, and recovery invariant description. | Closest peer in spirit. Architecture explanation rather than per-function behavioral spec. Does not state "if `XLogWrite` short-writes, then X must hold." |
+
+Three properties distinguish CONTRACT.md from what exists elsewhere:
+
+1. **Per-function failure contracts.** Each write function (`apply_batch_if`,
+   `vacuum_compact`, `vacuum_absorb`, hint files) gets its own section with
+   explicit guarantees for atomicity, durability, IO failure, and consistency.
+   Other engines scatter equivalent information across header comments, wiki
+   pages, and source code.
+
+2. **Explicit IO failure classes as contract terms.** The contract specifies
+   behavior for "some bytes on disk," "all bytes on disk but error returned,"
+   "fdatasync fails" — the taxonomy from `correctness_validation.md`. Other
+   engines document the happy path well; failure behavior is typically
+   reverse-engineered from source.
+
+3. **LSN invariants as first-class guarantees.** Monotonicity, uniqueness,
+   gap safety, and no-reuse are stated as binding properties. In other
+   engines, sequence-number invariants are implicit in the implementation —
+   understanding what happens to RocksDB's sequence number after a failed
+   write requires reading `WriteImpl()`.
+
+The industry norm is implicit contracts: the code is the spec, tests are the
+proof, and failure behavior surfaces through bug reports and post-mortems.
+The engines that approach similar rigor are the ones that have been burned
+badly enough by subtle correctness bugs to invest in formal documentation
+after the fact — SQLite being the prime example.
+
 ---
 
 ## Sources and Methodology

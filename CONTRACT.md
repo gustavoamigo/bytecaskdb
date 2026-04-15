@@ -273,9 +273,10 @@ the old file while others already resolve from the active file.
 If any I/O throws during scan, copy, or sync:
 
 - The old file must remain in the published state, unchanged.
-- The active file may contain appended entries that are not referenced
-  by `key_dir`. These are dead bytes — harmless, accounted in
-  `total_bytes` on next vacuum or recovery.
+- The active file must be left in the same state it was in before the
+  absorb began. The engine must attempt to truncate any bytes appended
+  during the failed copy; if the truncate also fails, the active file
+  may contain dead bytes that are not referenced by `key_dir`.
 - The DB must remain operational.
 
 ### Locking
