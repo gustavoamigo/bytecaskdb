@@ -677,10 +677,15 @@ private:
   // Appends live entries from a sealed file into the active file, then removes the sealed file.
   void vacuum_absorb_file(std::uint32_t file_id);
 
-  // State access
-  // Returns a thread-local cached EngineState snapshot; refreshes on staleness.
-  [[nodiscard]] auto load_state(const ReadOptions &opts) const
+  // State access helpers — raw state_ / state_time_ access is confined here.
+  // Read path: thread-local cached snapshot, may be slightly stale.
+  [[nodiscard]] auto load_state_for_read(const ReadOptions &opts) const
       -> const std::shared_ptr<const EngineState> &;
+  // Write path: authoritative load, always current. Caller must hold write_mu_.
+  [[nodiscard]] auto load_state_for_write() const
+      -> std::shared_ptr<EngineState>;
+  // Publish new state + bump timestamp. Caller must hold write_mu_.
+  void store_state(std::shared_ptr<EngineState> s);
   // Writer executors — called by SoloWriter / WriteGroup.
   // Prepares and applies one slot against the transient. Pure in-memory:
   // no I/O. Appends prepared entries to all_entries; running_offset is

@@ -409,8 +409,7 @@ DB::DB(std::filesystem::path dir, Options opts)
   auto fstats_t = s.file_stats.transient();
   fstats_t.set(s.active_file_id, FileStats{});
   s.file_stats = std::move(fstats_t).persistent();
-  state_.store(std::make_shared<EngineState>(std::move(s)));
-  state_time_.store(now_ns(), std::memory_order_release);
+  store_state(std::make_shared<EngineState>(std::move(s)));
 }
 
 #pragma endregion
@@ -421,7 +420,7 @@ DB::DB(std::filesystem::path dir, Options opts)
 // all sealed files, then purges stale files.
 // At destruction no readers are active.
 DB::~DB() {
-  auto s = state_.load();
+  auto s = load_state_for_write();
   if (!s->files.empty()) {
     try {
       auto &active = **s->files.get(s->active_file_id);
@@ -454,7 +453,7 @@ DB::~DB() {
 // mismatch.
 auto DB::get(const ReadOptions &opts, BytesView key,
                    Bytes &out) const -> bool {
-  auto s = load_state(opts);
+  auto s = load_state_for_read(opts);
   const auto kv = s->key_dir.get(key);
   if (!kv) {
     return false;
@@ -489,7 +488,7 @@ auto DB::del(const WriteOptions &opts, BytesView key) -> bool {
 }
 
 auto DB::contains_key(BytesView key) const -> bool {
-  auto s = state_.load();
+  auto s = load_state_for_read(ReadOptions{});
   return s->key_dir.contains(key);
 }
 
@@ -518,7 +517,7 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
 
 auto DB::snapshot() const -> Snapshot {
   ReadOptions opts{};
-  return Snapshot{load_state(opts)};
+  return Snapshot{load_state_for_read(opts)};
 }
 
 // The single write path. Routes to either write_group_ (default) or
@@ -605,7 +604,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     return;
   }
 
-  auto current = state_.load();
+  auto current = load_state_for_write();
   auto t = current->transient();
   auto &file = t.active_file();
   auto running_offset = static_cast<std::uint64_t>(file.size());
@@ -664,8 +663,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
           "post-write rotation failed for '{}': active file is sealed "
           "but new file could not be created. Call resume() to recover.",
           file.path().string()));
-      state_.store(std::move(t).persistent());
-      state_time_.store(now_ns(), std::memory_order_release);
+      store_state(std::move(t).persistent());
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
       }
@@ -690,8 +688,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     }
   }
 
-  state_.store(std::move(t).persistent());
-  state_time_.store(now_ns(), std::memory_order_release);
+  store_state(std::move(t).persistent());
 }
 
 #pragma endregion
@@ -765,7 +762,7 @@ auto Snapshot::rkeys_from(BytesView from) const
 // Throws std::system_error on I/O failure.
 auto DB::iter_from(const ReadOptions &opts, BytesView from) const
     -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
-  auto s = state_.load();
+  auto s = load_state_for_read(opts);
   auto it = from.empty() ? s->key_dir.begin() : s->key_dir.lower_bound(from);
   return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
       EntryIterator{s, std::move(it), opts.verify_checksums},
@@ -774,9 +771,9 @@ auto DB::iter_from(const ReadOptions &opts, BytesView from) const
 
 // Returns an input range of keys >= from. Walks the in-memory key directory
 // only; no disk I/O.
-auto DB::keys_from(const ReadOptions & /*opts*/, BytesView from) const
+auto DB::keys_from(const ReadOptions &opts, BytesView from) const
     -> std::ranges::subrange<KeyIterator, std::default_sentinel_t> {
-  auto s = state_.load();
+  auto s = load_state_for_read(opts);
   auto it = from.empty() ? s->key_dir.begin() : s->key_dir.lower_bound(from);
   return std::ranges::subrange<KeyIterator, std::default_sentinel_t>{
       KeyIterator{std::move(it)}, std::default_sentinel};
@@ -784,7 +781,7 @@ auto DB::keys_from(const ReadOptions & /*opts*/, BytesView from) const
 
 auto DB::riter_from(const ReadOptions &opts, BytesView from) const
     -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator> {
-  auto s = state_.load();
+  auto s = load_state_for_read(opts);
   auto begin_it = from.empty()
       ? s->key_dir.rbegin().base()
       : s->key_dir.upper_bound(from);
@@ -793,9 +790,9 @@ auto DB::riter_from(const ReadOptions &opts, BytesView from) const
           ReverseEntryIterator{EntryIterator{s, std::move(end_it), opts.verify_checksums}}};
 }
 
-auto DB::rkeys_from(const ReadOptions & /*opts*/, BytesView from) const
+auto DB::rkeys_from(const ReadOptions &opts, BytesView from) const
     -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator> {
-  auto s = state_.load();
+  auto s = load_state_for_read(opts);
   auto begin_it = from.empty()
       ? s->key_dir.rbegin().base()
       : s->key_dir.upper_bound(from);
@@ -826,7 +823,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   std::uint32_t active_id{};
   std::uint64_t active_size{};
   {
-    auto s = state_.load();
+    auto s = load_state_for_write();
     stats_snap = s->file_stats;
     active_id = s->active_file_id;
     active_size = s->active_file().size();
@@ -992,7 +989,7 @@ void DB::flush_hints(const EngineState &s) {
 // Drains background hint tasks then writes hint files for all sealed files.
 void DB::flush_hints() {
   worker_.drain();
-  flush_hints(*state_.load());
+  flush_hints(*load_state_for_write());
 }
 
 #pragma endregion
@@ -1105,12 +1102,11 @@ void DB::vacuum_purge_stale_files() {
 void DB::vacuum_commit(std::uint32_t old_file_id,
                              const VacuumScanResult &scan,
                              std::shared_ptr<DataFile> new_sealed_file) {
-  auto current = state_.load();
+  auto current = load_state_for_write();
   auto t = current->transient();
   t.apply_vacuum(old_file_id, scan, std::move(new_sealed_file));
 
-  state_.store(std::move(t).persistent());
-  state_time_.store(now_ns(), std::memory_order_release);
+  store_state(std::move(t).persistent());
 }
 
 // Stashes the old data file and its hint path for deferred removal
@@ -1128,7 +1124,7 @@ void DB::vacuum_defer_old_file(
 // The new data file is written to .data.tmp, then renamed atomically.
 // The old file is deferred for cleanup when no readers reference it.
 void DB::vacuum_compact_file(std::uint32_t file_id) {
-  auto snap = state_.load();
+  auto snap = load_state_for_write();
   const auto &old_file = **snap->files.get(file_id);
 
   const auto stem = make_data_file_stem();
@@ -1167,7 +1163,7 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
 // NOT thread-safe (requires external synchronization).
 // The old file is deferred for cleanup when no readers reference it.
 void DB::vacuum_absorb_file(std::uint32_t file_id) {
-  auto snap = state_.load();
+  auto snap = load_state_for_write();
   const auto &old_file = **snap->files.get(file_id);
 
   {
@@ -1198,8 +1194,7 @@ void DB::publish_lsn_advance(const std::shared_ptr<const EngineState> &current,
                               std::uint64_t target_lsn) {
   auto lsn_only = current->transient();
   lsn_only.advance_next_lsn(target_lsn);
-  state_.store(std::move(lsn_only).persistent());
-  state_time_.store(now_ns(), std::memory_order_release);
+  store_state(std::move(lsn_only).persistent());
 }
 
 void DB::deem_as_degraded(std::string reason) {
@@ -1213,7 +1208,7 @@ void DB::resume() {
   auto guard = std::unique_lock<std::mutex>{*write_mu_};
   if (!is_degraded()) return;  // re-check under lock
 
-  auto current = state_.load();
+  auto current = load_state_for_write();
   const auto old_file_id = current->active_file_id;
   auto &file = **current->files.get(old_file_id);
 
@@ -1308,21 +1303,20 @@ void DB::resume() {
   });
   t.apply_resume(old_file_id, committed);
   t.apply_rotate_file(std::move(new_file));
-  state_.store(std::move(t).persistent());
-  state_time_.store(now_ns(), std::memory_order_release);
+  store_state(std::move(t).persistent());
 
   // Success: clear degraded flag.
   degraded_.store(false, std::memory_order_release);
 }
 
-// Returns the engine state from a thread-local cache.
+// Returns the engine state from a thread-local cache (read path only).
 // The hot path is a single relaxed load of state_time_ (plain MOV on x86).
 // The snapshot is refreshed only when the last write timestamp exceeds
 // staleness_tolerance (session mode: tolerance=0, refreshes on every write).
 // Returns a reference to the thread-local snapshot. The snapshot stays
-// alive until the same thread calls load_state again, so callers must
-// not stash the reference across a second load_state call.
-auto DB::load_state(const ReadOptions &opts) const
+// alive until the same thread calls load_state_for_read again, so callers must
+// not stash the reference across a second load_state_for_read call.
+auto DB::load_state_for_read(const ReadOptions &opts) const
     -> const std::shared_ptr<const EngineState> & {
   struct TlState {
     std::shared_ptr<const EngineState> snapshot;
@@ -1343,6 +1337,15 @@ auto DB::load_state(const ReadOptions &opts) const
     tl.last_write_time = wt;
   }
   return tl.snapshot;
+}
+
+auto DB::load_state_for_write() const -> std::shared_ptr<EngineState> {
+  return state_.load();
+}
+
+void DB::store_state(std::shared_ptr<EngineState> s) {
+  state_.store(std::move(s));
+  state_time_.store(now_ns(), std::memory_order_release);
 }
 
 #pragma endregion
