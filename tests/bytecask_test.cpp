@@ -2387,6 +2387,118 @@ TEST_CASE("vacuum compact stats consistency", "[vacuum][filestats]") {
 }
 
 // ---------------------------------------------------------------------------
+// vacuum_compact_file: batch entries are compacted correctly
+//
+// apply_batch writes BulkBegin + entries + BulkEnd markers. Vacuum must
+// buffer entries inside BulkBegin..BulkEnd and emit them only when BulkEnd
+// is seen, preserving atomicity semantics in the compacted file.
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum compact handles batch entries", "[vacuum]") {
+  TempDir td;
+  // max_file_bytes=1 forces rotation after each write, but apply_batch
+  // writes the entire batch (including markers) to the active file before
+  // rotation is checked. So the batch lands in one sealed file.
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+
+  // Write single keys first to create dead entries that make the batch file
+  // qualify for vacuum.
+  db.put({}, to_bytes("a"), to_bytes("old_a"));
+  db.put({}, to_bytes("b"), to_bytes("old_b"));
+
+  // Now write a batch that overwrites both keys.
+  bytecask::Batch batch;
+  batch.put(to_bytes("a"), to_bytes("new_a"));
+  batch.put(to_bytes("b"), to_bytes("new_b"));
+  db.apply_batch({}, std::move(batch));
+
+  // Vacuum — the file with the batch should be compacted.
+  while (db.vacuum({.fragmentation_threshold = 0.0})) {}
+
+  // Both keys should have the batch values.
+  auto va = get_val(db, to_bytes("a"));
+  auto vb = get_val(db, to_bytes("b"));
+  REQUIRE(va.has_value());
+  REQUIRE(vb.has_value());
+  CHECK(to_string(*va) == "new_a");
+  CHECK(to_string(*vb) == "new_b");
+
+  // Stats: only live entries remain.
+  std::uint64_t total_live = 0;
+  for (const auto &[fid, fs] : db.file_stats()) {
+    total_live += fs.live_bytes;
+  }
+  CHECK(total_live == esize("a", "new_a") + esize("b", "new_b"));
+}
+
+// ---------------------------------------------------------------------------
+// vacuum_compact_file: batch with deletes
+//
+// A batch that puts one key and deletes another. After vacuum, the put
+// should survive and the delete target should be absent.
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum compact handles batch with mixed put/del", "[vacuum]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+
+  db.put({}, to_bytes("keep"), to_bytes("old"));
+  db.put({}, to_bytes("gone"), to_bytes("val"));
+
+  bytecask::Batch batch;
+  batch.put(to_bytes("keep"), to_bytes("updated"));
+  batch.del(to_bytes("gone"));
+  db.apply_batch({}, std::move(batch));
+
+  // Vacuum until stable (limit iterations to avoid infinite loop).
+  for (int i = 0; i < 10 && db.vacuum({.fragmentation_threshold = 0.0}); ++i) {}
+
+  auto vk = get_val(db, to_bytes("keep"));
+  REQUIRE(vk.has_value());
+  CHECK(to_string(*vk) == "updated");
+  CHECK_FALSE(db.contains_key(to_bytes("gone")));
+}
+
+// ---------------------------------------------------------------------------
+// vacuum: stale file deferred when snapshot holds a reference
+//
+// When a snapshot is alive that references a vacuumed file, the physical
+// file deletion is deferred until the snapshot is dropped.
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum defers stale file purge while snapshot is alive",
+          "[vacuum]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+
+  db.put({}, to_bytes("k"), to_bytes("v1"));
+  db.put({}, to_bytes("k"), to_bytes("v2")); // kills v1 → file qualifies
+
+  {
+    // Take a snapshot that pins the old file.
+    auto snap = db.snapshot();
+
+    // Vacuum compacts the dead file, but the snapshot holds a reference.
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+
+    // The key is still readable from the live DB.
+    auto v = get_val(db, to_bytes("k"));
+    REQUIRE(v.has_value());
+    CHECK(to_string(*v) == "v2");
+
+    // The snapshot can still read the old value (frozen view).
+    bytecask::Bytes snap_out;
+    CHECK(snap.get(to_bytes("k"), snap_out));
+  }
+  // Snapshot dropped — stale file can now be purged.
+
+  // Another vacuum pass should purge the stale file.
+  (void)db.vacuum({.fragmentation_threshold = 0.0});
+
+  // DB still consistent.
+  auto v = get_val(db, to_bytes("k"));
+  REQUIRE(v.has_value());
+  CHECK(to_string(*v) == "v2");
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot tests
 // ---------------------------------------------------------------------------
 
@@ -3171,6 +3283,105 @@ TEST_CASE("resume() replays unpublished entries from active file",
   CHECK(to_string(*v) == "v2");
 
   // Subsequent writes work.
+  REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
+  CHECK(db.contains_key(to_bytes("k3")));
+}
+
+TEST_CASE("writes throw DbDegraded on a degraded engine", "[degraded]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+
+  // Degrade via sync failure (class F).
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("a"), to_bytes("v")),
+                      std::system_error);
+  }
+  REQUIRE(db.is_degraded());
+
+  // put must throw DbDegraded.
+  REQUIRE_THROWS_AS(db.put({.sync = false}, to_bytes("k2"), to_bytes("v2")),
+                    bytecask::DbDegraded);
+
+  // del must throw DbDegraded.
+  REQUIRE_THROWS_AS((void)db.del({.sync = false}, to_bytes("k1")),
+                    bytecask::DbDegraded);
+
+  // apply_batch must throw DbDegraded.
+  {
+    bytecask::Batch batch;
+    batch.put(to_bytes("k3"), to_bytes("v3"));
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(batch)),
+                      bytecask::DbDegraded);
+  }
+
+  // apply_batch_if must throw DbDegraded.
+  {
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k4"), to_bytes("v4"));
+    REQUIRE_THROWS_AS(
+        (void)db.apply_batch_if({.sync = false}, std::move(plan)),
+        bytecask::DbDegraded);
+  }
+
+  // After resume, writes succeed again.
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  REQUIRE_NOTHROW(db.put({.sync = false}, to_bytes("k5"), to_bytes("v5")));
+  CHECK(db.contains_key(to_bytes("k5")));
+}
+
+TEST_CASE("resume() discards pending batch on CRC error in active file",
+          "[degraded][resume]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1'000'000});
+
+  // Committed entries — baseline.
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+
+  // Write a batch that lands on disk (append succeeds) but sync fails,
+  // degrading the engine. The batch bytes are in the page cache.
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    bytecask::Batch batch;
+    batch.put(to_bytes("b1"), to_bytes("bv1"));
+    batch.put(to_bytes("b2"), to_bytes("bv2"));
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = true}, std::move(batch)),
+                      std::system_error);
+  }
+  REQUIRE(db.is_degraded());
+
+  // Corrupt the active data file — flip a byte in the batch region so
+  // resume's scan hits a CRC error mid-batch.
+  for (auto &e : std::filesystem::directory_iterator(td.path / "db")) {
+    if (e.path().extension() == ".data") {
+      auto sz = std::filesystem::file_size(e.path());
+      if (sz > 10) {
+        std::fstream f{e.path(), std::ios::in | std::ios::out | std::ios::binary};
+        // Corrupt near the end — where the batch entries live.
+        f.seekp(static_cast<std::streamoff>(sz - 5));
+        char c{};
+        f.get(c);
+        f.seekp(static_cast<std::streamoff>(sz - 5));
+        c ^= static_cast<char>(0xFF);
+        f.put(c);
+      }
+    }
+  }
+
+  // resume() should recover — the CRC error causes pending.clear() and
+  // the incomplete batch is discarded via truncation.
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+
+  // Committed entries before the batch must survive.
+  CHECK(db.contains_key(to_bytes("k1")));
+  CHECK(db.contains_key(to_bytes("k2")));
+
+  // Writes succeed after resume.
   REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
   CHECK(db.contains_key(to_bytes("k3")));
 }

@@ -15,9 +15,9 @@
         }
       },
       "extensions": [
-        "ms-vscode.cmake-tools", 
-        
-        "tboox.xmake-vscode"
+        "ms-vscode.cmake-tools",
+        "tboox.xmake-vscode",
+        "ryanluker.vscode-coverage-gutters"
       ]
     }
   },

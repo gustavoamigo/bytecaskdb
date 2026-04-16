@@ -28,6 +28,10 @@ __pycache__/
 perf*.data
 perf*.data.old
 
+# Coverage output
+coverage/
+lcov.info
+
 # Local MariaDB instance for plugin smoke tests
 .mariadb_local/
 

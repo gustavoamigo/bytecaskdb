@@ -13,6 +13,13 @@ option("sanitizer")
     set_description("Enable sanitizer (address, thread, or empty to disable)")
 option_end()
 
+-- Coverage option: `xmake f --coverage=true`
+option("coverage")
+    set_default("")
+    set_showmenu(true)
+    set_description("Enable LLVM source-based code coverage (true or empty to disable)")
+option_end()
+
 -- Common flags shared by all targets
 local common_flags = {
     "-Weverything", "-Wno-c++98-compat", "-Wno-c++98-compat-pedantic",
@@ -47,6 +54,17 @@ local function apply_sanitizer(t)
     end
 end
 
+-- Apply LLVM source-based coverage flags to a target if the option is set.
+local function apply_coverage(t)
+    local cov = get_config("coverage")
+    if cov and cov ~= "" then
+        t:add("cxflags", "--target=x86_64-redhat-linux-gnu", {force = true})
+        t:add("ldflags", "--target=x86_64-redhat-linux-gnu", {force = true})
+        t:add("cxflags", "-fprofile-instr-generate", "-fcoverage-mapping", {force = true})
+        t:add("ldflags", "-fprofile-instr-generate", {force = true})
+    end
+end
+
 -- Global defaults applied to all targets
 set_toolchains("clang")
 set_languages("c++23")
@@ -72,8 +90,11 @@ target("bytecask_tests")
     add_includedirs("bytecaskdb", "tests")
     add_packages("catch2", "crc32c")
     add_defines("BYTECASK_TESTING")
-    on_load(apply_sanitizer)
-    on_load(add_release_opts)
+    on_config(function(t)
+        apply_sanitizer(t)
+        apply_coverage(t)
+        add_release_opts(t)
+    end)
 
 target("bytecask_bench")
     set_kind("binary")
@@ -82,8 +103,10 @@ target("bytecask_bench")
     add_cxflags("-Wno-global-constructors")
     add_packages("benchmark", "crc32c")
     add_defines("BYTECASK_TESTING")
-    on_load(apply_sanitizer)
-    on_load(add_release_opts)
+    on_config(function(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
 
 target("engine_bench")
     set_kind("binary")
@@ -91,8 +114,10 @@ target("engine_bench")
     add_files("benchmarks/engine_bench.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
     add_cxflags("-Wno-global-constructors")
     add_packages("benchmark", "crc32c", "leveldb", "rocksdb")
-    on_load(apply_sanitizer)
-    on_load(add_release_opts)
+    on_config(function(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
 
 -- Static library target for out-of-tree consumers (e.g. the MariaDB plugin).
 -- Compiles all C++23 module sources and exposes them via libbytecask.a.
@@ -109,6 +134,6 @@ target("bytecask")
     add_cxxflags("-fPIC", {force = true})  -- required when linking into a shared object (e.g. MariaDB plugin)
     add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp", "src/bytecask_c.cpp")
     add_packages("crc32c")
-    on_load(apply_sanitizer)
+    on_config(apply_sanitizer)
 
 

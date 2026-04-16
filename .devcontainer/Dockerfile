@@ -15,6 +15,7 @@ RUN dnf install -y \
     xmake \
     clang \
     clang-tools-extra \
+    llvm \
     libcxx \
     libcxx-devel \
     libcxx-static \
