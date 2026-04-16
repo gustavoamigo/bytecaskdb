@@ -554,6 +554,15 @@ public:
     return get_impl(root_, key);
   }
 
+  // Returns a pointer to the value stored in the tree node, or nullptr.
+  // Valid for the lifetime of this tree instance.
+  [[nodiscard]] auto get_ptr(std::span<const std::byte> key) const noexcept
+      -> const V * {
+    if (!root_)
+      return nullptr;
+    return get_ptr_impl(root_, key);
+  }
+
   [[nodiscard]] auto contains(std::span<const std::byte> key) const -> bool {
     return get(key).has_value();
   }
@@ -620,30 +629,37 @@ private:
   // entire node tree alive (parents own IntrusivePtr children).
   static auto get_impl(const IntrusivePtr<Node<V>> &node,
                        std::span<const std::byte> key) -> std::optional<V> {
+    auto *p = get_ptr_impl(node, key);
+    if (!p)
+      return std::nullopt;
+    return *p;
+  }
+
+  static auto get_ptr_impl(const IntrusivePtr<Node<V>> &node,
+                            std::span<const std::byte> key) noexcept
+      -> const V * {
     auto remaining = key;
     const Node<V> *cur = node.get();
     while (cur) {
       auto prefix_span =
           std::span<const std::byte>{cur->prefix.data(), cur->prefix.size()};
       auto cpl = common_prefix_length(prefix_span, remaining);
-      if (cpl < prefix_span.size()) {
-        // Key diverges within this node's prefix — not found.
-        return std::nullopt;
-      }
+      if (cpl < prefix_span.size())
+        return nullptr;
       remaining = remaining.subspan(cpl);
       if (remaining.empty()) {
         if (cur->has_value())
-          return cur->value_;
-        return std::nullopt;
+          return &cur->value_;
+        return nullptr;
       }
       auto transition = remaining[0];
       remaining = remaining.subspan(1);
       auto *child = cur->find_child(transition);
       if (!child)
-        return std::nullopt;
+        return nullptr;
       cur = child->second.get();
     }
-    return std::nullopt;
+    return nullptr;
   }
 
   // -- set (returns new root + whether a new key was inserted) --
@@ -966,6 +982,13 @@ public:
     if (!root_)
       return std::nullopt;
     return PersistentRadixTree<V>::get_impl(root_, key);
+  }
+
+  [[nodiscard]] auto get_ptr(std::span<const std::byte> key) const noexcept
+      -> const V * {
+    if (!root_)
+      return nullptr;
+    return PersistentRadixTree<V>::get_ptr_impl(root_, key);
   }
 
   [[nodiscard]] auto contains(std::span<const std::byte> key) const -> bool {
