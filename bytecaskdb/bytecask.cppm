@@ -118,10 +118,10 @@ export struct WriteOptions {
   // the next explicit sync or clean engine shutdown.
   bool sync{true};
 
-  // When false (default), the write lock is acquired with a blocking wait.
-  // When true, a non-blocking try_lock is attempted; if the lock is already
-  // held, throws std::system_error with errc::resource_unavailable_try_again.
-  bool try_lock{false};
+  // When true, bypasses the write group and executes the write alone under
+  // write_mu_. Default false — writes go through the group commit path.
+  // Set to true to benchmark solo vs group performance.
+  bool solo{false};
 };
 
 // Controls consistency behaviour for read operations (get, contains_key).
@@ -396,10 +396,10 @@ public:
   [[nodiscard]] auto prepare_write(const WritePlan &plan) const
       -> std::vector<AppendEntry>;
 
-  // State transition: apply all writes from a plan using IO results (offsets).
+  // State transition: apply all writes from a plan using pre-computed offsets.
   // Cannot fail — pure in-memory mutations.
   void apply_writes(const WritePlan &plan,
-                     const std::vector<std::uint64_t> &offsets);
+                     std::span<const std::uint64_t> offsets);
 
   // State transition: register a new file as active after rotation.
   // Cannot fail.
@@ -472,6 +472,13 @@ public:
       : std::runtime_error(reason) {}
   ~DbDegraded() override;
 };
+
+// Default group-write byte-size threshold: plans above this size are routed
+// to the solo writer (a large batch would monopolize the group).
+export inline constexpr std::uint64_t kGroupWriteMaxBytes = 256ULL * 1024;
+
+// Forward declaration — defined after WritePlan.
+export struct EngineSlot;
 
 // ---------------------------------------------------------------------------
 // DB — the public interface to a ByteCaskDB database.
@@ -674,9 +681,18 @@ private:
   // Returns a thread-local cached EngineState snapshot; refreshes on staleness.
   [[nodiscard]] auto load_state(const ReadOptions &opts) const
       -> const std::shared_ptr<const EngineState> &;
-  // Acquires write_mu_; blocking or try-lock based on opts.try_lock.
-  auto acquire_write_lock(const WriteOptions &opts)
-      -> std::unique_lock<std::mutex>;
+  // Writer executors — called by SoloWriter / WriteGroup.
+  // Prepares and applies one slot against the transient. Pure in-memory:
+  // no I/O. Appends prepared entries to all_entries; running_offset is
+  // advanced by the total byte size produced. Returns false on validation
+  // failure (sets slot.result).
+  auto execute_slot(TransientEngineState &t, EngineSlot &slot,
+                    std::vector<AppendEntry> &all_entries,
+                    std::uint64_t &running_offset) -> bool;
+  // Executor callback shared by solo_writer_ and write_group_. Three phases:
+  // (1) per-slot validate/prepare/apply in-memory, (2) one append_entries,
+  // (3) sync/rotate/publish.
+  void execute_slots(std::vector<Slot *> &batch);
 
   // Recovery
   // Phase 1: opens all data files, seals them, generates missing hint files.
@@ -717,6 +733,12 @@ private:
   std::unique_ptr<std::mutex> vacuum_mu_{std::make_unique<std::mutex>()};
   // Protected by vacuum_mu_.
   std::vector<StaleFile> stale_files_;
+  // Solo writer — single-slot execution under write_mu_. Same submit()
+  // interface as WriteGroup. Used for large batches or opts.solo benchmarking.
+  SoloWriter solo_writer_{[this](auto &b) { execute_slots(b); }};
+  // Group writer — leader-applies-all batching. Amortises fdatasync across
+  // concurrent writers. Default path for small writes.
+  WriteGroup write_group_{[this](auto &b) { execute_slots(b); }};
   // Declared last so it destructs first, joining the background thread before
   // any other member is destroyed.
   mutable BackgroundWorker worker_;
@@ -880,6 +902,21 @@ private:
     return n;
   }
 
+  // Estimated total I/O bytes for all write operations, including
+  // BulkBegin/BulkEnd markers for multi-op plans.
+  [[nodiscard]] auto write_bytes() const noexcept -> std::uint64_t {
+    std::uint64_t bytes = 0;
+    std::size_t wc = 0;
+    for (const auto &[k, a] : actions_) {
+      if (a.write == Write::None) continue;
+      bytes += entry_size(k.size(),
+                          a.write == Write::Put ? a.value.size() : 0);
+      ++wc;
+    }
+    if (wc > 1) bytes += 2 * (kHeaderSize + kCrcSize);
+    return bytes;
+  }
+
   auto action_for(BytesView key) -> KeyAction & {
     auto k = Bytes{key.begin(), key.end()};
     return actions_[std::move(k)];
@@ -898,6 +935,18 @@ private:
   std::vector<RangeGuard> range_guards_;
   friend class DB;
   friend class TransientEngineState;
+};
+
+// ---------------------------------------------------------------------------
+// EngineSlot — extends Slot with domain-specific fields for the write path.
+//
+// Stack-allocated by each caller of apply_batch_if. Both SoloWriter and
+// WriteGroup executors static_cast Slot* to EngineSlot*.
+// ---------------------------------------------------------------------------
+export struct EngineSlot : Slot {
+  WritePlan plan;
+  WriteOptions opts;
+  bool result{true};
 };
 
 } // namespace bytecask

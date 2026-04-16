@@ -119,9 +119,9 @@ TEST_CASE("DataFile appends two entries with correct offsets and sequences",
 
   {
     bytecask::DataFile df{tmp};
-    const auto offset0 = df.append(1, bytecask::EntryType::Put,
+    const auto offset0 = df.append_entry(1, bytecask::EntryType::Put,
                                    to_bytes("key1"), to_bytes("val1"));
-    const auto offset1 = df.append(2, bytecask::EntryType::Put,
+    const auto offset1 = df.append_entry(2, bytecask::EntryType::Put,
                                    to_bytes("key2"), to_bytes("val2"));
 
     CHECK(offset0 == 0);
@@ -165,10 +165,10 @@ TEST_CASE("DataFile::read round-trips entries at recorded offsets",
   std::filesystem::remove(tmp);
 
   bytecask::DataFile df{tmp};
-  const auto off0 = df.append(7, bytecask::EntryType::Put, to_bytes("hello"),
+  const auto off0 = df.append_entry(7, bytecask::EntryType::Put, to_bytes("hello"),
                               to_bytes("world"));
   const auto off1 =
-      df.append(8, bytecask::EntryType::Put, to_bytes("foo"), to_bytes("bar"));
+      df.append_entry(8, bytecask::EntryType::Put, to_bytes("foo"), to_bytes("bar"));
   df.sync();
 
   const auto r0 = df.scan(off0);
@@ -210,7 +210,7 @@ TEST_CASE("DataFile::append byte layout matches serialize_entry", "[datafile]") 
   {
     bytecask::DataFile df{tmp};
     [[maybe_unused]] auto off =
-        df.append(seq, bytecask::EntryType::Put, to_bytes(key), to_bytes(value));
+        df.append_entry(seq, bytecask::EntryType::Put, to_bytes(key), to_bytes(value));
     df.sync();
   }
 

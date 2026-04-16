@@ -209,7 +209,7 @@ auto TransientEngineState::prepare_write(const WritePlan &plan) const
 }
 
 void TransientEngineState::apply_writes(
-    const WritePlan &plan, const std::vector<std::uint64_t> &offsets) {
+    const WritePlan &plan, std::span<const std::uint64_t> offsets) {
   std::size_t io_idx = 0;
   const auto wc = plan.write_count();
   const bool multi = wc > 1;
@@ -518,115 +518,177 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
 
 auto DB::snapshot() const -> Snapshot { return Snapshot{state_.load()}; }
 
-// The single write path. Validates preconditions, runs IO, applies state
-// transitions via TransientEngineState, handles rotation and sync.
-// put/del/apply_batch are thin wrappers that construct a WritePlan and
-// delegate here.
+// The single write path. Routes to either write_group_ (default) or
+// solo_writer_ depending on plan characteristics. put/del/apply_batch are
+// thin wrappers that construct a WritePlan and delegate here.
 auto DB::apply_batch_if(WriteOptions opts,
                         WritePlan plan) -> bool {
   if (is_degraded()) throw DbDegraded{degraded_reason_};
   if (plan.empty()) return true;
 
-  auto guard = acquire_write_lock(opts);
-  auto current = state_.load();
+  EngineSlot slot;
+  slot.plan = std::move(plan);
+  slot.opts = opts;
+  slot.sync = opts.sync;
 
-  // 1. Create transient working copy.
-  auto t = current->transient();
+  const bool use_solo = opts.solo
+      || slot.plan.write_bytes() > kGroupWriteMaxBytes;
 
-  // 2. Validate preconditions (TransientEngineState decides).
-  if (!t.validate_preconditions(plan)) return false;
+  if (use_solo) {
+    solo_writer_.submit(slot);
+  } else {
+    write_group_.submit(slot);
+  }
 
-  // 3. Prepare IO plan (TransientEngineState assigns LSNs, inserts markers).
-  auto entries = t.prepare_write(plan);
-  if (entries.empty()) {
-    // Guards-only plan with no writes.
+  return slot.result;
+}
+
+#pragma endregion
+
+#pragma region Writer executors
+
+// Prepares and applies one slot against the transient. Pure in-memory: no
+// I/O. Entries are appended to all_entries; running_offset is advanced by
+// the total byte size of entries produced. Returns false on validation
+// failure (slot.result set to false).
+auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
+                      std::vector<AppendEntry> &all_entries,
+                      std::uint64_t &running_offset) -> bool {
+  if (slot.plan.empty()) {
+    slot.result = true;
     return true;
   }
 
-  // 4. IO phase — coordinator's job (can throw).
-  // Any append failure — whether nothing reached disk, a partial write, or
-  // a full write that returned an error — leaves the file in an indeterminate
-  // state. Degrade unconditionally: do not attempt in-flight recovery.
-  // resume() will scan the active file, truncate any garbage, and restore
-  // normal operation. A best-effort sync before degrading maximises the
-  // chance that any bytes already in the page cache reach durable storage,
-  // so resume() can replay valid entries written before the failure.
+  if (!t.validate_preconditions(slot.plan)) {
+    slot.result = false;
+    return false;
+  }
+
+  auto entries = t.prepare_write(slot.plan);
+  if (entries.empty()) {
+    slot.result = true;
+    return true;
+  }
+
+  // Pre-compute offsets from running_offset (tracks the file position
+  // across all slots in the group, without actual I/O).
+  std::vector<std::uint64_t> offsets(entries.size());
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    offsets[i] = running_offset;
+    running_offset += entry_size(entries[i].key.size(),
+                                 entries[i].value.size());
+  }
+
+  t.apply_writes(slot.plan, offsets);
+
+  all_entries.insert(all_entries.end(),
+                     std::make_move_iterator(entries.begin()),
+                     std::make_move_iterator(entries.end()));
+
+  slot.result = true;
+  return true;
+}
+
+// Executor callback shared by solo_writer_ and write_group_. Three phases:
+// (1) per-slot validate/prepare/apply in-memory, collecting entries;
+// (2) one append_entries call for all collected entries;
+// (3) sync/rotate/publish once.
+void DB::execute_slots(std::vector<Slot *> &batch) {
+  std::lock_guard<std::mutex> wg{*write_mu_};
+
+  if (is_degraded()) {
+    auto ex = std::make_exception_ptr(DbDegraded{degraded_reason_});
+    for (auto *s : batch) s->err = ex;
+    return;
+  }
+
+  auto current = state_.load();
+  auto t = current->transient();
   auto &file = t.active_file();
-  std::vector<std::uint64_t> offsets;
-  offsets.reserve(entries.size());
+  auto running_offset = static_cast<std::uint64_t>(file.size());
+  std::vector<AppendEntry> all_entries;
+  auto any_sync = false;
+
+  // Phase 1: pure in-memory — validate, prepare, pre-compute offsets,
+  // apply_writes for each slot sequentially.
+  for (auto *s : batch) {
+    auto &slot = static_cast<EngineSlot &>(*s);
+    slot.sync = slot.opts.sync;
+    execute_slot(t, slot, all_entries, running_offset);
+    any_sync |= slot.opts.sync;
+  }
+
+  if (all_entries.empty()) return;
+
+  // Phase 2: one I/O call for all collected entries.
+  std::vector<std::uint64_t> io_offsets(all_entries.size());
   try {
-    for (const auto &entry : entries) {
-      offsets.push_back(file.append(
-          entry.sequence, entry.entry_type, entry.key, entry.value));
-    }
+    file.append_entries(all_entries, io_offsets);
   } catch (...) {
+    auto ex = std::current_exception();
     try { file.sync(); } catch (...) {}
-    // Advance past all LSNs consumed by prepare_write — conservative even for
-    // B1 (pre-writev fault) because userspace cannot determine whether bytes
-    // reached disk. entries.back().sequence is the highest LSN assigned.
-    publish_lsn_advance(current, entries.back().sequence + 1);
+    publish_lsn_advance(current, t.next_lsn());
     deem_as_degraded(std::format(
         "append IO error on '{}': call resume() to recover.",
         file.path().string()));
-    throw;
+    for (auto *s : batch) {
+      if (!s->err) s->err = ex;
+    }
+    return;
   }
 
-  // 5. Apply mutations (pure, no IO).
-  t.apply_writes(plan, offsets);
-
-  // 6. Rotation — IO is coordinator's job, state change is transient's.
-  // Two failure modes with different outcomes:
-  //   - Pre-rotation sync fails (G): bytes in page cache. Advance next_lsn to
-  //     prevent reuse of sequence numbers now on disk; do not publish key
-  //     changes (write not confirmed durable).
-  //   - rotate_active_file fails after sealing (H): the write IS durable
-  //     (sync succeeded). Publish full state so key changes are visible, then
-  //     degrade — the sealed file cannot accept further appends until resume()
-  //     creates a new active file.
+  // Phase 3: sync/rotate/publish.
   if (t.is_rotation_needed(rotation_threshold_)) {
     try {
       file.sync();
     } catch (...) {
-      publish_lsn_advance(current, t.next_lsn());   // G
+      auto ex = std::current_exception();
+      publish_lsn_advance(current, t.next_lsn());
       deem_as_degraded(std::format(
           "rotation fdatasync failed on '{}': bytes in page cache but "
           "durability not confirmed. Call resume() to recover.",
           file.path().string()));
-      throw;
+      for (auto *s : batch) {
+        if (!s->err) s->err = ex;
+      }
+      return;
     }
     try {
       rotate_active_file(t, current);
     } catch (...) {
-      deem_as_degraded(std::format(                 // H
+      auto ex = std::current_exception();
+      deem_as_degraded(std::format(
           "post-write rotation failed for '{}': active file is sealed "
           "but new file could not be created. Call resume() to recover.",
           file.path().string()));
       state_.store(std::move(t).persistent());
       state_time_.store(now_ns(), std::memory_order_release);
-      throw;
+      for (auto *s : batch) {
+        if (!s->err) s->err = ex;
+      }
+      return;
     }
   }
 
-  // 7. Commit sync.
-  // Sync failed (F): bytes in page cache but not confirmed durable. Advance
-  // next_lsn to prevent reuse; do not publish key changes.
-  if (opts.sync) {
+  if (any_sync) {
     try {
       file.sync();
     } catch (...) {
-      publish_lsn_advance(current, t.next_lsn());   // F
+      auto ex = std::current_exception();
+      publish_lsn_advance(current, t.next_lsn());
       deem_as_degraded(std::format(
           "commit fdatasync failed on '{}': bytes in page cache but "
           "durability not confirmed. Call resume() to recover.",
           file.path().string()));
-      throw;
+      for (auto *s : batch) {
+        if (!s->err) s->err = ex;
+      }
+      return;
     }
   }
 
-  // 8. Publish.
   state_.store(std::move(t).persistent());
   state_time_.store(now_ns(), std::memory_order_release);
-  return true;
 }
 
 #pragma endregion
@@ -959,7 +1021,7 @@ auto DB::vacuum_scan_and_copy(
           existing->file_offset == entry_off &&
           existing->sequence == entry.sequence) {
         const auto new_off =
-            dest_file.append(entry.sequence, EntryType::Put, entry.key,
+            dest_file.append_entry(entry.sequence, EntryType::Put, entry.key,
                              entry.value);
         const auto val_size = narrow<std::uint32_t>(entry.value.size());
         const auto sz = entry_size(entry.key.size(), entry.value.size());
@@ -973,7 +1035,7 @@ auto DB::vacuum_scan_and_copy(
     }
     case EntryType::Delete: {
       std::ignore =
-          dest_file.append(entry.sequence, EntryType::Delete, entry.key, {});
+          dest_file.append_entry(entry.sequence, EntryType::Delete, entry.key, {});
       result.total_bytes += entry_size(entry.key.size(), 0);
       break;
     }
@@ -1145,7 +1207,7 @@ void DB::deem_as_degraded(std::string reason) {
 void DB::resume() {
   if (!is_degraded()) return;
 
-  auto guard = acquire_write_lock({.sync = false, .try_lock = false});
+  auto guard = std::unique_lock<std::mutex>{*write_mu_};
   if (!is_degraded()) return;  // re-check under lock
 
   auto current = state_.load();
@@ -1278,21 +1340,6 @@ auto DB::load_state(const ReadOptions &opts) const
     tl.last_write_time = wt;
   }
   return tl.snapshot;
-}
-
-// Acquires the write mutex. Blocking or try-lock based on opts.try_lock.
-auto DB::acquire_write_lock(const WriteOptions &opts)
-    -> std::unique_lock<std::mutex> {
-  if (opts.try_lock) {
-    std::unique_lock<std::mutex> lk{*write_mu_, std::try_to_lock};
-    if (!lk.owns_lock()) {
-      throw std::system_error{
-          std::make_error_code(std::errc::resource_unavailable_try_again),
-          "bytecask: write lock unavailable"};
-    }
-    return lk;
-  }
-  return std::unique_lock<std::mutex>{*write_mu_};
 }
 
 #pragma endregion

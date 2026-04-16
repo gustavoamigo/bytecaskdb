@@ -114,46 +114,45 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
 
 `file_stats` lives inside `EngineState` so that the transient/persistent discipline covers all mutable state uniformly. The map is shallow-copied into `TransientEngineState` on each write — acceptable because the number of open files is small (typically < 100).
 
-##### Write path — single coordinator
+##### Write path — group commit
 
-All writes (`put`, `del`, `apply_batch`, `apply_batch_if`) route through a single coordinator: `DB::apply_batch_if`. The public methods `put`, `del`, and `apply_batch` are thin wrappers that build a `WritePlan` and delegate.
+All writes (`put`, `del`, `apply_batch`, `apply_batch_if`) route through a single coordinator: `DB::apply_batch_if`. The public methods `put`, `del`, and `apply_batch` are thin wrappers that build a `WritePlan` and delegate. Each write is packaged into an `EngineSlot` and submitted to either `SoloWriter` (single-slot, no batching) or `WriteGroup` (leader-applies-all batching).
+
+**Routing**: a write goes to `SoloWriter` when `WriteOptions::solo` is set (benchmarking) or when the plan's byte size exceeds `kGroupWriteMaxBytes` (256 KiB). All other writes go to `WriteGroup`.
+
+**WriteGroup**: the first writer to arrive becomes the leader, drains the queue of pending slots, and executes them all under one lock hold. N concurrent sync writes share a single `fdatasync` instead of paying N separate calls. This is the dominant performance win — fdatasync is ~2 ms; writev is ~microseconds.
+
+**SoloWriter**: same `submit(Slot&)` interface, no internal batching. The executor acquires `write_mu_` and processes the single slot. Provides a uniform interface for routing.
+
+Both executors follow a three-phase pattern:
 
 ```
-  Writer thread
-  ─────────────
-  1. acquire write_mu_
+  Phase 1: pure in-memory (per-slot, sequential)
+  ──────────────────────────────────────────────
+  For each slot:
+    1. validate_preconditions(plan)
+       └─ point guards, range guards, W-W checks — pure reads on transient
+    2. prepare_write(plan) → vector<AppendEntry>
+       └─ assigns LSNs, inserts BulkBegin/End markers — pure computation
+    3. pre-compute offsets from running_offset
+       └─ entry sizes are deterministic (header + key + value + CRC)
+    4. apply_writes(plan, offsets)
+       └─ updates key_dir, file_stats, LSN — pure in-memory mutations
+    5. collect entries into all_entries
 
-  2. create TransientEngineState from current EngineState
-     └─ TransientRadixTree + shallow copies of files, file_stats, scalars
+  Phase 2: one I/O call
+  ─────────────────────
+  file.append_entries(all_entries)
+    └─ single writev for all entries across all slots in the batch
 
-  3. validate_preconditions(plan)
-     └─ point guards, range guards, W-W checks — pure reads on transient
-
-  4. prepare_write(plan) → vector<AppendEntry>
-     └─ assigns LSNs, inserts BulkBegin/End markers — pure computation
-
-  5. IO loop: for each AppendEntry, file.append(...)
-     └─ collects offsets; on mid-batch failure, rotate to isolate
-        orphaned BulkBegin (see "Rotate on batch failure")
-
-  6. apply_writes(plan, io_result)
-     └─ updates key_dir, file_stats, LSN — pure in-memory mutations
-
-  7. if rotation needed:
-     a. sync + seal active file                (IO)
-     b. dispatch hint file write to background
-     c. open new DataFile                      (IO)
-     d. apply_rotate_file(new_file)            (state)
-
-  8. if opts.sync: active_file.sync()
-     └─ on failure, publish state before rethrow
-        (see "Sync failure: publish before rethrow")
-
-  9. state_.store(persistent())
-     └─ atomically publishes new immutable snapshot
-
-  10. release write_mu_
+  Phase 3: sync / rotate / publish
+  ────────────────────────────────
+  1. if rotation needed: sync + seal + rotate
+  2. if any_sync: fdatasync            ← amortized across all slots
+  3. state_.store(persistent())        ← atomically publishes new snapshot
 ```
+
+The sequential per-slot processing in Phase 1 preserves the serial correctness model exactly. Each slot's `validate_preconditions` sees the key_dir after all previous slots' writes. A `del` with `ensure_present` in slot 2 correctly sees slot 1's `put`.
 
 ##### TransientEngineState
 
@@ -168,7 +167,7 @@ The coordinator (step 5 above) only performs IO. It never touches `key_dir`, `fi
 - `apply_vacuum(old_file_id, scan, new_file)` — remaps keys, updates registry + stats
 - `persistent() &&` — produces `shared_ptr<EngineState>` for publishing
 
-**Two-phase discipline**: IO happens first (steps 4-5), then pure state mutations (step 6). If IO throws, the transient is untouched — no partial state to unwind.
+**Three-phase discipline**: Phase 1 is pure in-memory (validate, prepare, compute offsets, apply_writes). Phase 2 is a single IO call. Phase 3 is sync/rotate/publish. If IO throws, the transient's state mutations are already applied but never published — the transient is discarded and the engine degrades.
 
 ##### Rotate on batch failure
 
@@ -346,11 +345,6 @@ With `staleness_tolerance > 0` the window is irrelevant: the snapshot is held fo
 The benefit is pronounced at high thread counts where session-mode readers contend for the internal spinlock inside `atomic<shared_ptr>` on every refresh.
 
 `engine_bench` compares ByteCaskDB against LevelDB and RocksDB across Put, Get, Del, Range50, Mixed, MixedBatch, PutMT, and MixedMT benchmarks at both NoSync and Sync durability levels. RocksDB compression is disabled (`kNoCompression`) and values are 1 KiB of random (incompressible) bytes so neither LevelDB nor RocksDB gains an advantage from Snappy/block-cache effects.
-
-`WriteOptions::try_lock` (default `false`) controls write-lock acquisition behaviour:
-
-- `false` (default) — blocking acquire via `std::unique_lock`. The caller waits until the lock is available.
-- `true` — non-blocking attempt via `std::unique_lock::try_lock()`. If the lock is already held, the call throws `std::system_error` with `std::errc::resource_unavailable_try_again` instead of waiting.
 
 ### File Registry
 

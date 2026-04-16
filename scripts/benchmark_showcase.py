@@ -48,7 +48,7 @@ FULL_RECOVERY_SIZES  = [50_000, 1_000_000, 10_000_000]
 QUICK_REGULAR_SIZES  = [10_000, 50_000]
 QUICK_RECOVERY_SIZES = [50_000, 1_000_000]
 
-REPETITIONS = 3
+REPETITIONS = 5
 
 # ---------------------------------------------------------------------------
 # Build
@@ -217,9 +217,7 @@ def find_mt(means: dict[str, dict], prefix: str) -> dict[int, dict]:
     Google Benchmark emits for multi-threaded fixtures.
 
     Only matches names where threads:N follows the prefix directly (with at
-    most a 'real_time/' segment in between). This prevents a prefix like
-    'ByteCaskDB/ReadAndWriteLoad/Sync' from accidentally matching the longer
-    'ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness/...' names.
+    most a 'real_time/' segment in between).
     """
     result: dict[int, dict] = {}
     for name, bench in means.items():
@@ -227,8 +225,8 @@ def find_mt(means: dict[str, dict], prefix: str) -> dict[int, dict]:
             continue
         suffix = name[len(prefix):].lstrip("/")
         # Require the suffix to start directly with 'real_time/threads:N' or
-        # 'threads:N' — no extra sub-path level (e.g. 'BoundedStaleness/...')
-        # between the prefix and the thread count.
+        # 'threads:N' — no extra sub-path level between the prefix and the
+        # thread count.
         if not re.match(r"(?:real_time/)?threads:\d+$", suffix):
             continue
         m = re.search(r"(?:threads:)(\d+)$", suffix)
@@ -412,31 +410,22 @@ def section_regular(size: int, data: dict) -> str:
     # ── Read-while-writing ─────────────────────────────────────────────────
     bc_rww    = find_mt(means, "ByteCaskDB/ReadAndWriteLoad/Sync")
     rdb_rww   = find_mt(means, "RocksDB/ReadAndWriteLoad/Sync")
-    bc_rww_bs = find_mt(means, "ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")
     if bc_rww or rdb_rww:
         L.append(
             "### Read-While-Writing — 1 writer + N readers, Sync _(CRC disabled)_\n"
         )
         L.append(
-            "> **BoundedStaleness** is a ByteCaskDB read mode where readers observe "
-            "the keydir snapshot from the previous completed write batch instead of "
-            "acquiring a per-read epoch lock. This eliminates reader-writer "
-            "contention at high thread counts at the cost of seeing writes that are "
-            "at most one batch behind.\n"
+            "| Readers | ByteCaskDB | RocksDB |"
         )
-        L.append(
-            "| Readers | ByteCaskDB | ByteCaskDB BoundedStaleness | RocksDB |"
-        )
-        L.append("|---:|---:|---:|---:|")
+        L.append("|---:|---:|---:|")
         for t in sorted(set(list(bc_rww) + list(rdb_rww))):
             bc_v  = _val(bc_rww.get(t),    "ops_per_us")
-            bc_bs = _val(bc_rww_bs.get(t), "ops_per_us")
             rdb_v = _val(rdb_rww.get(t),   "ops_per_us")
-            best  = max(v for v in [bc_v, bc_bs, rdb_v] if v is not None)
+            bc_wins  = bc_v  is not None and rdb_v is not None and bc_v  >= rdb_v
+            rdb_wins = rdb_v is not None and bc_v  is not None and rdb_v > bc_v
             L.append(
-                f"| {t} | {_bold(fmt_throughput(bc_v),  bc_v  == best)} "
-                f"| {_bold(fmt_throughput(bc_bs), bc_bs == best)} "
-                f"| {_bold(fmt_throughput(rdb_v), rdb_v == best)} |"
+                f"| {t} | {_bold(fmt_throughput(bc_v),  bc_wins)} "
+                f"| {_bold(fmt_throughput(rdb_v), rdb_wins)} |"
             )
         L.append("")
 

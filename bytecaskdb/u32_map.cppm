@@ -86,11 +86,7 @@ public:
   // structural mutations on any transient derived from this snapshot.
   [[nodiscard]] auto get(std::uint32_t key) const noexcept -> const V * {
     const auto encoded = encode_key(key);
-    auto it = tree_.lower_bound(std::span<const std::byte>{encoded});
-    if (it == std::default_sentinel) return nullptr;
-    const auto &[found_bytes, val_ref] = *it;
-    if (found_bytes.size() != 4 || decode_key(found_bytes) != key) return nullptr;
-    return &val_ref;
+    return tree_.get_ptr(std::span<const std::byte>{encoded});
   }
 
   [[nodiscard]] auto contains(std::uint32_t key) const noexcept -> bool {
@@ -136,11 +132,7 @@ public:
   // Safe for immediate use; do not retain across set()/erase() calls.
   [[nodiscard]] auto get(std::uint32_t key) const noexcept -> const V * {
     const auto encoded = encode_key(key);
-    auto it = tree_.lower_bound(std::span<const std::byte>{encoded});
-    if (it == std::default_sentinel) return nullptr;
-    const auto &[found_bytes, val_ref] = *it;
-    if (found_bytes.size() != 4 || decode_key(found_bytes) != key) return nullptr;
-    return &val_ref;
+    return tree_.get_ptr(std::span<const std::byte>{encoded});
   }
 
   [[nodiscard]] auto contains(std::uint32_t key) const noexcept -> bool {

@@ -1,20 +1,160 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// ByteCaskDB — reader-writer lock and epoch-based memory reclamation
+// ByteCaskDB — concurrency primitives: background worker, solo writer,
+// group write batching.
 
 module;
 #include <condition_variable>
 #include <cstddef>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
+#include <utility>
+#include <vector>
 
 export module bytecask.concurrency;
 
 namespace bytecask {
+
+// ---------------------------------------------------------------------------
+// WriteGroupAborted — thrown to callers whose slot was not executed
+// because a prior slot in the same batch failed.
+// ---------------------------------------------------------------------------
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wweak-vtables"
+export class WriteGroupAborted : public std::runtime_error {
+public:
+  WriteGroupAborted()
+      : std::runtime_error(
+            "bytecask: write group aborted — operation was not attempted") {}
+};
+#pragma clang diagnostic pop
+
+// ---------------------------------------------------------------------------
+// Slot — base type for writer submit interfaces.
+//
+// Carries sync/done/err fields. The engine extends it (e.g. EngineSlot) with
+// domain-specific data; executors static_cast Slot* to the derived type.
+// ---------------------------------------------------------------------------
+export struct Slot {
+  bool sync{false};
+  bool done{false};
+  std::exception_ptr err;
+};
+
+// ---------------------------------------------------------------------------
+// SoloWriter — single-slot writer with the same submit() interface as
+// WriteGroup.
+//
+// Wraps the single slot in a one-element vector and calls the same executor
+// signature as WriteGroup. No batching, no internal mutex — the executor is
+// responsible for its own serialisation (e.g. acquiring write_mu_). Provides
+// a uniform interface so the engine can share a single executor implementation.
+// ---------------------------------------------------------------------------
+export class SoloWriter {
+public:
+  explicit SoloWriter(
+      std::move_only_function<void(std::vector<Slot *> &)> executor)
+      : executor_{std::move(executor)} {}
+
+  SoloWriter(const SoloWriter &) = delete;
+  SoloWriter &operator=(const SoloWriter &) = delete;
+
+  void submit(Slot &slot) {
+    slot.done = false;
+    slot.err = nullptr;
+    std::vector<Slot *> batch{&slot};
+    try {
+      executor_(batch);
+    } catch (...) {
+      slot.err = std::current_exception();
+    }
+    slot.done = true;
+    if (slot.err) std::rethrow_exception(slot.err);
+  }
+
+private:
+  std::move_only_function<void(std::vector<Slot *> &)> executor_;
+};
+
+// ---------------------------------------------------------------------------
+// WriteGroup — leader-applies-all write batching (Template Method pattern).
+//
+// The algorithm skeleton lives here: enqueue → elect leader → drain queue →
+// call executor → mark done → wake → loop until empty. The domain-specific
+// batch execution logic is injected via a BatchExecutor callback at
+// construction time.
+//
+// submit() is non-template — it takes a Slot&.
+// ---------------------------------------------------------------------------
+export class WriteGroup {
+public:
+  explicit WriteGroup(
+      std::move_only_function<void(std::vector<Slot *> &)> executor)
+      : executor_{std::move(executor)} {}
+
+  WriteGroup(const WriteGroup &) = delete;
+  WriteGroup &operator=(const WriteGroup &) = delete;
+
+  void submit(Slot &slot) {
+    std::unique_lock<std::mutex> lk{queue_mu_};
+    slot.done = false;
+    slot.err = nullptr;
+    queue_.push_back(&slot);
+
+    if (!leader_active_) {
+      leader_active_ = true;
+      lk.unlock();
+      leader_loop();
+      lk.lock();
+    }
+
+    cv_.wait(lk, [&] { return slot.done; });
+
+    if (slot.err) std::rethrow_exception(slot.err);
+  }
+
+private:
+  void leader_loop() {
+    while (true) {
+      std::vector<Slot *> batch;
+      {
+        std::unique_lock<std::mutex> lk{queue_mu_};
+        if (queue_.empty()) {
+          leader_active_ = false;
+          return;
+        }
+        batch.swap(queue_);
+      }
+
+      try {
+        executor_(batch);
+      } catch (...) {
+        auto ex = std::current_exception();
+        for (auto *s : batch) {
+          if (!s->err) s->err = ex;
+        }
+      }
+
+      {
+        std::unique_lock<std::mutex> lk{queue_mu_};
+        for (auto *s : batch) s->done = true;
+      }
+      cv_.notify_all();
+    }
+  }
+
+  std::move_only_function<void(std::vector<Slot *> &)> executor_;
+  std::mutex queue_mu_;
+  std::vector<Slot *> queue_;
+  bool leader_active_{false};
+  std::condition_variable cv_;
+};
 
 // ---------------------------------------------------------------------------
 // BackgroundWorker — single persistent background thread for deferred work.
