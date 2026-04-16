@@ -470,6 +470,8 @@ export class DbDegraded : public std::runtime_error {
 public:
   explicit DbDegraded(const std::string &reason)
       : std::runtime_error(reason) {}
+  DbDegraded(const DbDegraded &) = default;
+  auto operator=(const DbDegraded &) -> DbDegraded & = default;
   ~DbDegraded() override;
 };
 

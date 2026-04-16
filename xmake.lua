@@ -25,6 +25,9 @@ local common_flags = {
     -- -Wswitch-enum catches unhandled enum values; -Wswitch-default conflicts with
     -- exhaustive switches that list all enum cases and need no default.
     "-Wno-switch-default",
+    -- fault_injector.h inline functions are included in multiple module units;
+    -- Clang flags duplicate definitions but they are harmless ODR-compliant inlines.
+    "-Wno-decls-in-multiple-modules",
 }
 
 -- Apply sanitizer flags to a target if the option is set.
