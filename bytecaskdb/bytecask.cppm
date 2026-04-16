@@ -814,6 +814,12 @@ public:
 // available — calling ensure_unchanged or ensure_range_unchanged on a
 // snapshot-less plan throws std::logic_error (programming error).
 //
+// Implicit W-W check: when a snapshot is present, apply_batch_if
+// automatically rejects the plan if any key in the write set (put or del)
+// was modified since the snapshot. This means ensure_unchanged is only
+// needed for read-only dependencies — keys whose value influenced the
+// plan but that the plan does not modify.
+//
 // Guards and writes on the same key are merged. Contradictory guards
 // throw std::logic_error at build time.
 // ---------------------------------------------------------------------------
