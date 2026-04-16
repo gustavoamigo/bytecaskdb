@@ -97,14 +97,14 @@ target("engine_bench")
 -- import them without the matching toolchain; the MariaDB plugin instead
 -- uses the stable header-based C API in include/bytecask_c.h.
 --
--- Note: src/bytecask_c.cpp is intentionally excluded here.
--- It is MIT-clean but compiled by mariadb/CMakeLists.txt only,
--- keeping libbytecask.a free of C ABI symbols for pure C++23 tests.
+-- src/bytecask_c.cpp is compiled here (not in mariadb/CMakeLists.txt) because
+-- it imports the C++23 bytecask module and must be built with the same
+-- toolchain that produced the BMIs.
 target("bytecask")
     set_kind("static")
     set_default(false)
     add_cxxflags("-fPIC", {force = true})  -- required when linking into a shared object (e.g. MariaDB plugin)
-    add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
+    add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp", "src/bytecask_c.cpp")
     add_packages("crc32c")
     on_load(apply_sanitizer)
 

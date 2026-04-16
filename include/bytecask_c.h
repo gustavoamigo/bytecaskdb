@@ -13,6 +13,11 @@
 //     it and must eventually call bytecask_close().
 //   - bytecask_iter_*() return a heap-allocated opaque iterator. The caller
 //     owns it and must eventually call bytecask_iter_free().
+//   - bytecask_snapshot() returns a heap-allocated opaque snapshot. The caller
+//     owns it and must eventually call bytecask_snapshot_free().
+//   - bytecask_write_plan_new*() return a heap-allocated opaque write plan.
+//     Plans are consumed by bytecask_apply_batch_if(); if not applied, free
+//     with bytecask_write_plan_free().
 //   - Value buffers written by get/iter functions are heap-allocated by the
 //     callee and owned by the caller; free with bytecask_free_buf().
 //
@@ -32,8 +37,10 @@ extern "C" {
 // Opaque handle types
 // ---------------------------------------------------------------------------
 
-typedef struct bytecask_db   bytecask_db_t;
-typedef struct bytecask_iter bytecask_iter_t;
+typedef struct bytecask_db         bytecask_db_t;
+typedef struct bytecask_iter       bytecask_iter_t;
+typedef struct bytecask_snapshot   bytecask_snapshot_t;
+typedef struct bytecask_write_plan bytecask_write_plan_t;
 
 // ---------------------------------------------------------------------------
 // Open / close
@@ -111,6 +118,104 @@ int bytecask_iter_value(const bytecask_iter_t *iter,
 
 // Frees the iterator and all resources it holds.
 void bytecask_iter_free(bytecask_iter_t *iter);
+
+// ---------------------------------------------------------------------------
+// Snapshots
+//
+// A snapshot is a frozen, read-only view of the database at a point in time.
+// Holds open any data files referenced at snapshot time until freed.
+// ---------------------------------------------------------------------------
+
+// Creates a snapshot of the current database state.
+// Returns NULL on failure; call bytecask_errmsg() for details.
+bytecask_snapshot_t *bytecask_snapshot(bytecask_db_t *db);
+
+// Looks up key in the snapshot.  Same semantics as bytecask_get().
+int bytecask_snapshot_get(const bytecask_snapshot_t *snap,
+                          const uint8_t *key, size_t key_len,
+                          uint8_t **out_val, size_t *out_val_len);
+
+// Returns 1 if key exists in the snapshot (no I/O), 0 if absent.
+int bytecask_snapshot_contains_key(const bytecask_snapshot_t *snap,
+                                   const uint8_t *key, size_t key_len);
+
+// Opens a forward iterator on the snapshot, positioned at the first key >= from.
+// Returns NULL on error.
+bytecask_iter_t *bytecask_snapshot_iter_open(bytecask_snapshot_t *snap,
+                                             const uint8_t *from,
+                                             size_t from_len);
+
+// Frees the snapshot and releases all held resources.
+void bytecask_snapshot_free(bytecask_snapshot_t *snap);
+
+// ---------------------------------------------------------------------------
+// Write plans (conditional atomic writes)
+//
+// A WritePlan accumulates put/del operations and optional precondition guards.
+// bytecask_apply_batch_if() applies the plan atomically iff all guards hold.
+// ---------------------------------------------------------------------------
+
+// Creates an empty write plan without a snapshot.
+// Only ensure_present / ensure_absent guards are available.
+bytecask_write_plan_t *bytecask_write_plan_new(void);
+
+// Creates an empty write plan backed by a snapshot.
+// All guards are available, including ensure_unchanged and ensure_range_unchanged.
+// The snapshot is consumed — caller must not use snap after this call.
+bytecask_write_plan_t *bytecask_write_plan_new_with_snapshot(
+    bytecask_snapshot_t *snap);
+
+// Adds a put operation to the plan.
+void bytecask_write_plan_put(bytecask_write_plan_t *plan,
+                             const uint8_t *key, size_t key_len,
+                             const uint8_t *val, size_t val_len);
+
+// Adds a delete operation to the plan.
+void bytecask_write_plan_del(bytecask_write_plan_t *plan,
+                             const uint8_t *key, size_t key_len);
+
+// Guard: key must exist at apply time.
+void bytecask_write_plan_ensure_present(bytecask_write_plan_t *plan,
+                                        const uint8_t *key, size_t key_len);
+
+// Guard: key must be absent at apply time.
+void bytecask_write_plan_ensure_absent(bytecask_write_plan_t *plan,
+                                       const uint8_t *key, size_t key_len);
+
+// Guard: key must not have been modified since the plan's snapshot.
+// Requires a snapshot-backed plan; returns -1 (sets errmsg) otherwise.
+int bytecask_write_plan_ensure_unchanged(bytecask_write_plan_t *plan,
+                                         const uint8_t *key, size_t key_len);
+
+// Guard: no key in [from, to) must have been modified since the plan's snapshot.
+// Requires a snapshot-backed plan; returns -1 (sets errmsg) otherwise.
+int bytecask_write_plan_ensure_range_unchanged(bytecask_write_plan_t *plan,
+                                               const uint8_t *from,
+                                               size_t from_len,
+                                               const uint8_t *to,
+                                               size_t to_len);
+
+// Frees the write plan.  No-op if plan is NULL.
+// Do not call after bytecask_apply_batch_if() — that consumes the plan.
+void bytecask_write_plan_free(bytecask_write_plan_t *plan);
+
+// Applies the plan atomically iff all guards hold and no written key was
+// modified since the plan's snapshot.
+// Returns 1 if committed, 0 on conflict, -1 on error.
+// The plan is consumed (freed) regardless of outcome — caller must not use
+// it after this call.
+int bytecask_apply_batch_if(bytecask_db_t *db,
+                            bytecask_write_plan_t *plan,
+                            int sync);
+
+// ---------------------------------------------------------------------------
+// Vacuum
+// ---------------------------------------------------------------------------
+
+// Runs one vacuum pass: selects the highest-fragmentation sealed file and
+// reclaims dead space.
+// Returns 1 if a file was vacuumed, 0 if no file qualified, -1 on error.
+int bytecask_vacuum(bytecask_db_t *db);
 
 // ---------------------------------------------------------------------------
 // Memory helpers

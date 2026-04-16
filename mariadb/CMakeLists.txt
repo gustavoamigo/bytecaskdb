@@ -113,8 +113,9 @@ add_library(ha_bytecaskdb MODULE
   bytecaskdb_plugin.cc
   key_encoding.cc
   row_encoding.cc
-  # C ABI bridge — MIT-clean; compiled here so libbytecask.a stays free of C symbols.
-  "${BYTECASK_ROOT}/src/bytecask_c.cpp"
+  # bytecask_c.cpp is compiled into libbytecask.a by xmake (it imports the
+  # C++23 bytecask module and must be built with the same toolchain that
+  # produced the BMIs).  The C API symbols are linked in via bytecask_static.
 )
 
 target_include_directories(ha_bytecaskdb PRIVATE
