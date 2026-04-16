@@ -10,6 +10,7 @@ module;
 #include "fault_injector.h"
 #endif
 #include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <fcntl.h>
@@ -54,6 +55,7 @@ public:
           errno, std::generic_category(),
           std::format("DataFile: cannot open '{}'", path_.string())};
     }
+    ::posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
     offset_ = std::filesystem::file_size(path_);
   }
 
@@ -109,7 +111,7 @@ public:
   // hdr_crc_buf_ by data_entry; key and value are passed as direct iovecs.
   // No heap allocation, no copy of key/value data.
   // Precondition: the file must not have been sealed.
-  [[nodiscard]] auto append(std::uint64_t sequence, EntryType entry_type,
+  [[nodiscard]] auto append_entry(std::uint64_t sequence, EntryType entry_type,
                             std::span<const std::byte> key,
                             std::span<const std::byte> value) -> Offset {
 #ifdef BYTECASK_TESTING
@@ -151,6 +153,81 @@ public:
 
     offset_ += static_cast<Offset>(total);
     return entry_offset;
+  }
+
+  // Batch-appends multiple entries in as few writev() calls as possible.
+  // Each chunk of up to kMaxEntriesPerWritev entries is written with a single
+  // writev(). Offsets are written into offsets_out (must be same size as
+  // entries). Failure semantics identical to append_entry: tainted + throw.
+  void append_entries(std::span<const AppendEntry> entries,
+                      std::span<Offset> offsets_out) {
+    assert(entries.size() == offsets_out.size());
+    if (entries.empty()) return;
+    assert(!sealed_);
+
+    static constexpr std::size_t kIovecsPerEntry = 4;
+    static constexpr std::size_t kMaxEntriesPerWritev =
+        IOV_MAX / kIovecsPerEntry;
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+    thread_local std::vector<std::array<std::byte, kHeaderSize + kCrcSize>>
+        hdr_crcs;
+    thread_local std::vector<::iovec> iov;
+#pragma clang diagnostic pop
+
+    for (std::size_t base = 0; base < entries.size();
+         base += kMaxEntriesPerWritev) {
+      const auto chunk_end =
+          std::min(base + kMaxEntriesPerWritev, entries.size());
+      const auto chunk_size = chunk_end - base;
+
+      hdr_crcs.resize(chunk_size);
+      iov.resize(chunk_size * kIovecsPerEntry);
+
+      std::size_t total_bytes = 0;
+      std::size_t serialized = 0;
+      for (std::size_t i = 0; i < chunk_size; ++i) {
+        const auto &e = entries[base + i];
+
+#ifdef BYTECASK_TESTING
+        testing_fault_injection_append(iov, serialized, total_bytes);
+#endif
+
+        offsets_out[base + i] = offset_ + static_cast<Offset>(total_bytes);
+
+        write_header_and_crc(hdr_crcs[i], e.sequence, e.entry_type,
+                             e.key, e.value);
+
+        const auto iov_base = i * kIovecsPerEntry;
+        iov[iov_base] = {hdr_crcs[i].data(), kHeaderSize};
+        iov[iov_base + 1] = {const_cast<std::byte *>(e.key.data()),
+                              e.key.size()};
+        iov[iov_base + 2] = {const_cast<std::byte *>(e.value.data()),
+                              e.value.size()};
+        iov[iov_base + 3] = {hdr_crcs[i].data() + kHeaderSize, kCrcSize};
+
+        total_bytes += kHeaderSize + e.key.size() + e.value.size() + kCrcSize;
+        ++serialized;
+      }
+
+      const auto written =
+          ::writev(fd_, iov.data(), narrow<int>(chunk_size * kIovecsPerEntry));
+
+#ifdef BYTECASK_TESTING
+      tainted_ = true;
+      FAULT_INJECTION_POST_WRITE(io_data_file_append_partial,
+                                 fd_, offset_, total_bytes);
+      tainted_ = false;
+#endif
+      if (written != narrow<ssize_t>(total_bytes)) {
+        tainted_ = true;
+        throw std::system_error{errno, std::generic_category(),
+                                "DataFile::append_entries: writev failed"};
+      }
+
+      offset_ += static_cast<Offset>(total_bytes);
+    }
   }
 
   // Reads and deserializes the entry at the given offset. Returns the entry
@@ -269,6 +346,27 @@ private:
   // Fixed buffer holding the 15-byte header and 4-byte CRC for each append.
   // Avoids heap allocation on the hot write path.
   std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};
+
+#ifdef BYTECASK_TESTING
+  void testing_fault_injection_append(std::span<const ::iovec> iov_buf,
+                                      std::size_t serialized,
+                                      std::size_t byte_count) {
+    static constexpr std::size_t kIovecsPerEntry = 4;
+    try {
+      FAULT_INJECTION(io_data_file_append);
+    } catch (...) {
+      if (serialized > 0) {
+        const auto written =
+            ::writev(fd_, iov_buf.data(), narrow<int>(serialized * kIovecsPerEntry));
+        if (written == narrow<ssize_t>(byte_count)) {
+          offset_ += static_cast<Offset>(byte_count);
+        }
+      }
+      tainted_ = true;
+      throw;
+    }
+  }
+#endif
 };
 
 } // namespace bytecask

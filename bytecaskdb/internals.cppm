@@ -103,18 +103,6 @@ export struct EngineState {
 };
 
 // ---------------------------------------------------------------------------
-// AppendEntry — one record to write to a DataFile.
-// Produced by TransientEngineState::prepare_write, consumed by the
-// coordinator's IO loop. Borrows key/value from the WritePlan.
-// ---------------------------------------------------------------------------
-export struct AppendEntry {
-  std::uint64_t sequence;
-  EntryType entry_type;
-  std::span<const std::byte> key;
-  std::span<const std::byte> value;
-};
-
-// ---------------------------------------------------------------------------
 // VacuumMapping — per-live-entry mapping produced during vacuum I/O phase.
 // The commit phase uses these to remap key_dir entries.
 // ---------------------------------------------------------------------------

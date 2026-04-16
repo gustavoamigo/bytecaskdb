@@ -638,13 +638,13 @@ TEST_CASE("DB recovery: incomplete batch is discarded",
     // Manually write a data file simulating a crash mid-batch.
     bytecask::DataFile df(db_path / "data_00000000000000000000000001.data");
     // Standalone entry — should survive.
-    std::ignore = df.append(1, bytecask::EntryType::Put, to_bytes("good"),
+    std::ignore = df.append_entry(1, bytecask::EntryType::Put, to_bytes("good"),
                             to_bytes("value1"));
     // Begin batch, write some entries, but never write BulkEnd.
-    std::ignore = df.append(2, bytecask::EntryType::BulkBegin, {}, {});
-    std::ignore = df.append(3, bytecask::EntryType::Put, to_bytes("orphan_a"),
+    std::ignore = df.append_entry(2, bytecask::EntryType::BulkBegin, {}, {});
+    std::ignore = df.append_entry(3, bytecask::EntryType::Put, to_bytes("orphan_a"),
                             to_bytes("lost1"));
-    std::ignore = df.append(4, bytecask::EntryType::Put, to_bytes("orphan_b"),
+    std::ignore = df.append_entry(4, bytecask::EntryType::Put, to_bytes("orphan_b"),
                             to_bytes("lost2"));
     // No BulkEnd — simulates crash.
     df.sync();
@@ -686,9 +686,9 @@ TEST_CASE("DB recovery: order-independent tombstone",
     // File with a Put for "gone" (seq=1) and "alive" (seq=2).
     {
       bytecask::DataFile df(db_path / std::format("{}.data", put_stem));
-      std::ignore = df.append(1, bytecask::EntryType::Put, to_bytes("gone"),
+      std::ignore = df.append_entry(1, bytecask::EntryType::Put, to_bytes("gone"),
                               to_bytes("v1"));
-      std::ignore = df.append(2, bytecask::EntryType::Put, to_bytes("alive"),
+      std::ignore = df.append_entry(2, bytecask::EntryType::Put, to_bytes("alive"),
                               to_bytes("v2"));
       df.sync();
     }
@@ -696,7 +696,7 @@ TEST_CASE("DB recovery: order-independent tombstone",
     // File with a Delete for "gone" (seq=3) — higher LSN wins.
     {
       bytecask::DataFile df(db_path / std::format("{}.data", del_stem));
-      std::ignore = df.append(3, bytecask::EntryType::Delete,
+      std::ignore = df.append_entry(3, bytecask::EntryType::Delete,
                               to_bytes("gone"), {});
       df.sync();
     }
@@ -1365,52 +1365,6 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
 }
 
 // ---------------------------------------------------------------------------
-// Test: try_lock throws when the write lock is already held
-// ---------------------------------------------------------------------------
-TEST_CASE("DB try_lock throws when lock held",
-          "[bytecask][concurrency]") {
-  TempDir td;
-  auto db = bytecask::DB::open(td.path / "db");
-
-  // Use a background thread to hold the write lock via a blocking put.
-  // Thread 1: hold the write lock by doing a slow batch of puts.
-  std::thread writer([&] {
-    // We need the lock to be held while the main thread tries try_lock.
-    // Use a big batch so the lock is held long enough.
-    bytecask::Batch batch;
-    for (int i = 0; i < 10000; ++i) {
-      auto key = std::format("key_{:05d}", i);
-      auto val = std::format("val_{:05d}", i);
-      batch.put(to_bytes(key), to_bytes(val));
-    }
-    db.apply_batch(bytecask::WriteOptions{.sync = false}, std::move(batch));
-  });
-
-  // Thread 2 (main): try_lock put while the writer may be holding the lock.
-  // We spin-try to catch the contention window; if we never hit it, the
-  // test still passes — we're just testing the mechanism works at all.
-  bool caught_contention = false;
-  for (int attempt = 0; attempt < 100'000 && !caught_contention; ++attempt) {
-    try {
-      db.put(bytecask::WriteOptions{.sync = false, .try_lock = true},
-             to_bytes("probe"), to_bytes("x"));
-    } catch (const std::system_error &e) {
-      if (e.code() == std::errc::resource_unavailable_try_again) {
-        caught_contention = true;
-      }
-    }
-  }
-
-  writer.join();
-
-  // We cannot guarantee the race is always hit, but if we did see the
-  // contention, verify it was the right error.
-  if (caught_contention) {
-    CHECK(caught_contention);
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Test: concurrent blocking writers are serialised — no data corruption
 // ---------------------------------------------------------------------------
 TEST_CASE("DB blocking writes are serialised",
@@ -1448,29 +1402,6 @@ TEST_CASE("DB blocking writes are serialised",
       CHECK(to_string(*result) == expected_val);
     }
   }
-}
-
-// ---------------------------------------------------------------------------
-// Test: try_lock on del and apply_batch — non-blocking semantics work for
-// all write operations, not just put.
-// ---------------------------------------------------------------------------
-TEST_CASE("DB try_lock works for del and apply_batch",
-          "[bytecask][concurrency]") {
-  TempDir td;
-  auto db = bytecask::DB::open(td.path / "db");
-
-  db.put({}, to_bytes("k"), to_bytes("v"));
-
-  // When no contention, try_lock succeeds normally.
-  const bytecask::WriteOptions try_opts{.sync = false, .try_lock = true};
-  CHECK(db.del(try_opts, to_bytes("k")));
-  CHECK_FALSE(get_val(db, to_bytes("k")).has_value());
-
-  bytecask::Batch batch;
-  batch.put(to_bytes("b1"), to_bytes("bv1"));
-  REQUIRE_NOTHROW(db.apply_batch(try_opts, std::move(batch)));
-  REQUIRE(get_val(db, to_bytes("b1")).has_value());
-  CHECK(to_string(*get_val(db, to_bytes("b1"))) == "bv1");
 }
 
 // ---------------------------------------------------------------------------
@@ -1621,6 +1552,151 @@ TEST_CASE("DB group commit correctness", "[bytecask][concurrency]") {
       auto result = get_val(db, to_bytes(key));
       REQUIRE(result.has_value());
       CHECK(to_string(*result) == expected_val);
+    }
+  }
+}
+
+TEST_CASE("DB group commit concurrent put+del", "[bytecask][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  constexpr int kKeys = 100;
+  for (int i = 0; i < kKeys; ++i) {
+    db.put(bytecask::WriteOptions{.sync = false},
+           to_bytes(std::format("gd_{:04d}", i)),
+           to_bytes(std::format("val_{:04d}", i)));
+  }
+
+  constexpr int kThreads = 4;
+  constexpr int kOps = 50;
+
+  auto worker = [&](int tid) {
+    for (int i = 0; i < kOps; ++i) {
+      auto key = std::format("gd_{:04d}", (tid * 25 + i) % kKeys);
+      if (i % 2 == 0) {
+        db.put(bytecask::WriteOptions{.sync = true}, to_bytes(key),
+               to_bytes(std::format("new_t{}_{}", tid, i)));
+      } else {
+        std::ignore = db.del(bytecask::WriteOptions{.sync = true},
+                             to_bytes(key));
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) threads.emplace_back(worker, t);
+  for (auto &t : threads) t.join();
+
+  for (int i = 0; i < kKeys; ++i) {
+    auto key = std::format("gd_{:04d}", i);
+    auto result = get_val(db, to_bytes(key));
+    if (result.has_value()) {
+      CHECK(!result->empty());
+    }
+  }
+}
+
+TEST_CASE("DB group commit solo fallback for large batches",
+          "[bytecask][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  std::string big_value(300 * 1024, 'X');
+  db.put(bytecask::WriteOptions{.sync = true}, to_bytes("big_key"),
+         to_bytes(big_value));
+
+  auto result = get_val(db, to_bytes("big_key"));
+  REQUIRE(result.has_value());
+  CHECK(result->size() == big_value.size());
+}
+
+TEST_CASE("DB group commit with opts.solo bypasses group",
+          "[bytecask][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  constexpr int kThreads = 4;
+  constexpr int kOps = 50;
+
+  auto worker = [&](int tid) {
+    for (int i = 0; i < kOps; ++i) {
+      auto key = std::format("solo_t{}_{:04d}", tid, i);
+      auto val = std::format("sv_t{}_{:04d}", tid, i);
+      db.put(bytecask::WriteOptions{.sync = true, .solo = true},
+             to_bytes(key), to_bytes(val));
+    }
+  };
+
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) threads.emplace_back(worker, t);
+  for (auto &t : threads) t.join();
+
+  for (int t = 0; t < kThreads; ++t) {
+    for (int i = 0; i < kOps; ++i) {
+      auto key = std::format("solo_t{}_{:04d}", t, i);
+      auto expected = std::format("sv_t{}_{:04d}", t, i);
+      auto result = get_val(db, to_bytes(key));
+      REQUIRE(result.has_value());
+      CHECK(to_string(*result) == expected);
+    }
+  }
+}
+
+TEST_CASE("DB group commit apply_batch_if conflict returns false",
+          "[bytecask][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put(bytecask::WriteOptions{.sync = false}, to_bytes("ck"),
+         to_bytes("v1"));
+
+  auto snap = db.snapshot();
+
+  db.put(bytecask::WriteOptions{.sync = false}, to_bytes("ck"),
+         to_bytes("v2"));
+
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("ck"));
+  plan.put(to_bytes("ck"), to_bytes("v3"));
+
+  CHECK_FALSE(db.apply_batch_if({}, std::move(plan)));
+
+  auto result = get_val(db, to_bytes("ck"));
+  REQUIRE(result.has_value());
+  CHECK(to_string(*result) == "v2");
+}
+
+TEST_CASE("DB group commit recovery preserves all keys",
+          "[bytecask][concurrency]") {
+  TempDir td;
+  auto dir = td.path / "db";
+
+  constexpr int kThreads = 4;
+  constexpr int kOps = 50;
+
+  {
+    auto db = bytecask::DB::open(dir);
+    auto worker = [&](int tid) {
+      for (int i = 0; i < kOps; ++i) {
+        auto key = std::format("rc_t{}_{:04d}", tid, i);
+        auto val = std::format("rv_t{}_{:04d}", tid, i);
+        db.put(bytecask::WriteOptions{.sync = true}, to_bytes(key),
+               to_bytes(val));
+      }
+    };
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) threads.emplace_back(worker, t);
+    for (auto &t : threads) t.join();
+  }
+
+  auto db = bytecask::DB::open(dir);
+  for (int t = 0; t < kThreads; ++t) {
+    for (int i = 0; i < kOps; ++i) {
+      auto key = std::format("rc_t{}_{:04d}", t, i);
+      auto expected = std::format("rv_t{}_{:04d}", t, i);
+      auto result = get_val(db, to_bytes(key));
+      REQUIRE(result.has_value());
+      CHECK(to_string(*result) == expected);
     }
   }
 }

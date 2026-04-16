@@ -33,9 +33,8 @@ ByteCaskDB uses `PersistentRadixTree<KeyDirEntry>` as the in-memory key director
 
 ByteCaskDB follows a **single-writer / multiple-reader (SWMR)** model:
 
-- Exactly one writer may operate at a time (`write_mu_` serialises `put`, `del`, `apply_batch`).
+- Exactly one writer may operate at a time (`write_mu_` serialises `put`, `del`, `apply_batch`). Concurrent sync writers are batched via group commit.
 - Multiple readers may operate concurrently, isolated from writes by a persistent snapshot of the key directory loaded via `state_.load()`.
-- `WriteOptions::try_lock` lets write callers opt into a non-blocking lock attempt that throws `std::system_error(errc::resource_unavailable_try_again)` instead of blocking.
 - `ReadOptions::staleness_tolerance` lets readers trade freshness for throughput: a non-zero tolerance allows reading from a snapshot that is at most that many milliseconds old (bounded staleness). The default (0) provides read-your-writes session consistency.
 - When `sync` is requested, `fdatasync` completes before the new state becomes visible to readers (durability before visibility).
 - MVCC snapshot isolation is provided via `snapshot()` + `apply_batch_if()`.
@@ -151,10 +150,9 @@ struct WriteOptions {
     // Set to false for higher throughput when durability can be relaxed.
     bool sync{true};
 
-    // When false (default), the write lock is acquired with a blocking wait.
-    // When true, throws std::system_error(errc::resource_unavailable_try_again)
-    // if the lock is already held.
-    bool try_lock{false};
+    // When true, bypasses the write group and executes the write alone under
+    // write_mu_. Default false — writes go through the group commit path.
+    bool solo{false};
 };
 ```
 
@@ -305,14 +303,12 @@ public:
                            BytesView key, Bytes& out) const -> bool;
 
     // Writes key → value. Overwrites any existing value.
-    // opts.sync controls fdatasync; opts.try_lock controls lock mode.
-    // Throws std::system_error on I/O failure or lock contention (try_lock).
+    // Throws std::system_error on I/O failure or DbDegraded if degraded.
     void put(const WriteOptions& opts, BytesView key, BytesView value);
 
     // Writes a tombstone for key.
     // Returns true if the key existed and was removed, false if it was absent.
-    // opts.sync controls fdatasync; opts.try_lock controls lock mode.
-    // Throws std::system_error on I/O failure or lock contention (try_lock).
+    // Throws std::system_error on I/O failure or DbDegraded if degraded.
     [[nodiscard]] auto del(const WriteOptions& opts, BytesView key) -> bool;
 
     // Returns true if key exists in the index (no disk I/O).
@@ -323,7 +319,7 @@ public:
     // Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
     // batch is consumed (move-only). No-op if batch.empty().
     // opts.sync controls whether a single fdatasync is issued at the end.
-    // Throws std::system_error on I/O failure or lock contention (try_lock).
+    // Throws std::system_error on I/O failure or DbDegraded if degraded.
     void apply_batch(const WriteOptions& opts, Batch batch);
 
     // ── Range iteration ───────────────────────────────────────────────────
@@ -418,7 +414,7 @@ while (!stop_requested) {
 | D6 | **`KeyIterator` source**: In-memory only — walks the radix-tree key directory without opening any data file. |
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
 | D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1). |
-| D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. `WriteOptions::try_lock` enables non-blocking write attempts. `ReadOptions::staleness_tolerance` enables bounded-staleness reads. |
+| D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. Concurrent sync writers are batched via group commit. `ReadOptions::staleness_tolerance` enables bounded-staleness reads. |
 | D10 | **Vacuum**: Online. `vacuum()` is safe to call from a background thread. Only the brief commit step (key-dir remap + file swap) blocks writers via `write_mu_`. A separate `vacuum_mu_` serialises concurrent `vacuum()` calls. |
 | D11 | **File naming**: `data_{YYYYMMDDHHmmssUUUUUU}` using microsecond precision. Gives lexicographic == chronological ordering and avoids the false precision of nanosecond timestamps whose sub-microsecond bits are often zero on Linux. |
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
