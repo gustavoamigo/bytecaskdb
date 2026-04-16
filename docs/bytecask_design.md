@@ -1295,6 +1295,12 @@ Conflict is detected by comparing `KeyDirEntry::sequence` between the snapshot s
 
 On the first conflict detected, `BatchConflict` is thrown before any I/O is performed. If no conflict is found, the batch is applied identically to `apply_batch`.
 
+#### Implicit W-W check on write keys
+
+When a `WritePlan` carries a snapshot, `apply_batch_if` automatically checks every key in the write set (put or del) for concurrent modification — the caller does not need to call `ensure_unchanged` on keys they intend to write. This closes a common concurrency hole: without it, a plan could read a key, compute a new value, and write it back without noticing a concurrent writer already changed that key.
+
+`ensure_unchanged` is for read-only dependencies: keys whose value influenced the plan's decisions but that the plan does not modify. For example, reading a price to compute an order total — the price key is a read dependency but not in the write set, so it needs an explicit guard.
+
 ### `BatchConflict`
 
 `export struct BatchConflict : std::exception` — no payload, just the exception type. Thrown by `apply_batch_if()`. Callers catch by type and retry.

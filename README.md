@@ -15,7 +15,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Sequential write path** — all I/O is sequential appends; no random writes. Every `put` and `del` is one append. `apply_batch` with N operations appends a begin marker, N entries, and an end marker in a single `writev` — still no WAL, no random writes.
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
 - **Atomic writes** — every `put` and `del` is atomic. `apply_batch` makes multiple puts and deletes atomic as a group.
-- **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch_if(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. The snapshot is embedded in the `WritePlan` at construction time. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add `ensure_unchanged` / range guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
+- **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch_if(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex with group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost. On the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
@@ -139,17 +139,28 @@ batch.put(to_bytes("user:3"), to_bytes("carol"));
 batch.del(to_bytes("user:1"));
 db.apply_batch({}, std::move(batch));
 
-// Conflict-safe CAS write — reads from a consistent snapshot,
-// applies the plan only if every precondition holds.
+// Decrement stock — write keys are checked for conflicts automatically.
 auto snap = db.snapshot();
-Bytes balance_out;
-bool found = snap.get(to_bytes("account:42"), balance_out);
-// ... compute new_balance ...
-WritePlan plan{std::move(snap)};          // snapshot embedded in the plan
-plan.ensure_unchanged(to_bytes("account:42"));   // guard: no concurrent write
-plan.put(to_bytes("account:42"), new_balance);
+Bytes stock_out;
+snap.get(to_bytes("stock:widget"), stock_out);
+// ... decrement stock count ...
+WritePlan plan{std::move(snap)};
+plan.put(to_bytes("stock:widget"), new_stock);
 if (!db.apply_batch_if({}, std::move(plan))) {
-    // a concurrent writer modified "account:42" — retry
+    // another writer changed stock:widget since our snapshot — retry
+}
+
+// Place order at current price — ensure_unchanged guards keys you read
+// but don't write. Write keys are checked automatically.
+auto snap2 = db.snapshot();
+Bytes price_out;
+snap2.get(to_bytes("price:widget"), price_out);
+// ... compute order_total from price ...
+WritePlan order{std::move(snap2)};
+order.ensure_unchanged(to_bytes("price:widget"));  // reject if price changed
+order.put(to_bytes("order:99"), order_total);
+if (!db.apply_batch_if({}, std::move(order))) {
+    // price changed since snapshot — re-read price and recompute
 }
 
 // Prefix scan — in-memory key walk, values fetched lazily from disk.
@@ -230,9 +241,11 @@ public:
     // Holds open referenced data files until destroyed — vacuum deferred automatically.
     [[nodiscard]] auto snapshot() const -> Snapshot;
 
-    // Applies plan atomically iff every guard holds and no write key was modified
-    // since the plan's snapshot. Returns true if committed (including when the plan
-    // is empty — no-op). Returns false on conflict.
+    // Applies plan atomically iff every explicit guard holds and no write key
+    // was modified since the plan's snapshot (implicit W-W check). The implicit
+    // check means ensure_unchanged is only needed for keys you read but don't
+    // write. Returns true if committed (including when the plan is empty — no-op).
+    // Returns false on conflict.
     // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
     [[nodiscard]] auto apply_batch_if(WriteOptions opts,
                                       WritePlan plan) -> bool;
@@ -284,6 +297,10 @@ public:
 // Conditional write plan for apply_batch_if.
 // Construct with WritePlan(snap) to enable ensure_unchanged / ensure_range_unchanged guards;
 // those methods throw std::logic_error if called on a snapshot-less WritePlan().
+// When a snapshot is present, apply_batch_if automatically rejects the plan if any
+// write key (put or del) changed since the snapshot — no explicit guard needed on
+// keys in the write set. Use ensure_unchanged for read-only dependencies: keys whose
+// value influenced the plan but that the plan does not modify.
 class WritePlan {
 public:
     WritePlan();                         // snapshot-less: only ensure_present/ensure_absent available
