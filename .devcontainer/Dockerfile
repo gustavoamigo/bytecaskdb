@@ -19,6 +19,8 @@ RUN dnf install -y \
     libcxx-devel \
     libcxx-static \
     cmake \
+    mariadb \
+    mariadb-server \
     mariadb-devel \
     google-crc32c-devel \
     && dnf clean all

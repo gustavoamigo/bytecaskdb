@@ -101,13 +101,14 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   auto key = encode_pk(buf);
   auto val = encode_row(table, buf);
 
-  // Use sync=1 (durable write) by default.  Phase 3 will route this through
-  // the transaction layer with configurable durability.
-  int rc = bytecask_put(g_db,
-                         key.data(), key.size(),
-                         val.data(), val.size(),
-                         /*sync=*/1);
-  if (rc != 0) {
+  auto *plan = bytecask_write_plan_new();
+  if (!plan) { return HA_ERR_GENERIC; }
+
+  bytecask_write_plan_put(plan, key.data(), key.size(),
+                          val.data(), val.size());
+
+  int rc = bytecask_apply_batch_if(g_db, plan, /*sync=*/1);
+  if (rc < 0) {
     const char *err = bytecask_errmsg();
     fprintf(stderr, "[ha_bytecaskdb] write_row failed: %s\n",
             err ? err : "unknown");

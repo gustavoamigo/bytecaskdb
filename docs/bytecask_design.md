@@ -36,7 +36,7 @@ ByteCaskDB is being integrated as a MariaDB pluggable storage engine (`ha_byteca
 
 ByteCaskDB uses C++23 modules internally, which are not portable across compilation unit boundaries when linking external code. To cross this boundary (e.g. the MariaDB plugin), a stable `extern "C"` API is provided:
 
-- **`include/bytecask_c.h`**: flat C header with opaque `bytecask_db_t*` / `bytecask_iter_t*` handles. No C++ types, no module imports.
+- **`include/bytecask_c.h`**: flat C header with opaque `bytecask_db_t*` / `bytecask_iter_t*` / `bytecask_snapshot_t*` / `bytecask_write_plan_t*` handles. No C++ types, no module imports. Covers: open/close, put/del/get, forward iteration, snapshots, conditional atomic writes (`apply_batch_if` via `WritePlan`), and vacuum.
 - **`src/bytecask_c.cpp`**: implementation that imports `bytecask` (the C++23 module) and forwards calls through the C API. Compiled into `libbytecask.a`.
 - **`xmake.lua` `bytecask` target**: static library combining all engine module objects plus `bytecask_c.cpp`.
 

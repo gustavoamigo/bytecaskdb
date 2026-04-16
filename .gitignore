@@ -28,5 +28,8 @@ __pycache__/
 perf*.data
 perf*.data.old
 
+# Local MariaDB instance for plugin smoke tests
+.mariadb_local/
+
 .notes
 

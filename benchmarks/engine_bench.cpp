@@ -53,6 +53,8 @@
 // RocksDB
 #include <rocksdb/db.h>
 #include <rocksdb/table.h>
+#include <rocksdb/utilities/optimistic_transaction_db.h>
+#include <rocksdb/utilities/transaction.h>
 #include <rocksdb/write_batch.h>
 
 // ByteCaskDB (C++20 modules)
@@ -81,6 +83,12 @@ static const std::size_t kDatasetSize = [] {
 }();
 
 static constexpr std::size_t kMaxSamples = 1'000'000;
+static const int kCasStockItems = [] {
+  const char *env = std::getenv("BC_CAS_STOCK_ITEMS");
+  if (env && *env)
+    return std::stoi(env);
+  return 100;
+}();
 
 // ---------------------------------------------------------------------------
 // Key / value helpers
@@ -143,6 +151,41 @@ auto rdb_slice(const std::string &s) -> rocksdb::Slice {
 
 auto rdb_val_slice(const std::vector<std::byte> &v) -> rocksdb::Slice {
   return {bytes_to_chars(v), v.size()};
+}
+
+// ---------------------------------------------------------------------------
+// CAS benchmark helpers
+// ---------------------------------------------------------------------------
+
+auto generate_stock_keys() -> std::vector<std::string> {
+  std::vector<std::string> keys;
+  keys.reserve(kCasStockItems);
+  for (int i = 0; i < kCasStockItems; ++i) {
+    std::ostringstream oss;
+    oss << "stock:" << std::setfill('0') << std::setw(3) << i;
+    keys.push_back(oss.str());
+  }
+  return keys;
+}
+
+auto encode_u64(std::uint64_t v) -> std::vector<std::byte> {
+  std::vector<std::byte> buf(sizeof(v));
+  std::memcpy(buf.data(), &v, sizeof(v));
+  return buf;
+}
+
+auto decode_u64_bytes(const bytecask::Bytes &buf) -> std::uint64_t {
+  std::uint64_t v = 0;
+  if (buf.size() >= sizeof(v))
+    std::memcpy(&v, buf.data(), sizeof(v));
+  return v;
+}
+
+auto decode_u64_str(const std::string &buf) -> std::uint64_t {
+  std::uint64_t v = 0;
+  if (buf.size() >= sizeof(v))
+    std::memcpy(&v, buf.data(), sizeof(v));
+  return v;
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +337,62 @@ struct BcAdapterStale : BcAdapter {
     auto found = db.engine.get(ro, bc_key(k), value);
     benchmark::DoNotOptimize(found);
     benchmark::DoNotOptimize(value.data());
+  }
+};
+
+struct BcCasAdapter {
+  struct Db {
+    TmpDir dir;
+    bytecask::DB engine;
+    std::vector<std::string> stock_keys;
+
+    explicit Db(std::string_view tag)
+        : dir{tag}, engine{bytecask::DB::open(dir.path)},
+          stock_keys{generate_stock_keys()} {
+      auto background_keys = generate_prefixed_keys(kDatasetSize);
+      auto background_val = make_value();
+      constexpr std::size_t kPopulateBatchSize = 100;
+      bytecask::WriteOptions wo;
+      wo.sync = false;
+      const auto n = background_keys.size();
+      for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
+        auto end = std::min(i + kPopulateBatchSize, n);
+        bytecask::Batch batch;
+        for (std::size_t j = i; j < end; ++j) {
+          batch.put(bc_key(background_keys[j]), bc_val(background_val));
+        }
+        engine.apply_batch(wo, std::move(batch));
+      }
+      bytecask::Batch stock_batch;
+      auto zero = encode_u64(0);
+      for (const auto &k : stock_keys) {
+        stock_batch.put(bc_key(k), bc_val(zero));
+      }
+      wo.sync = true;
+      engine.apply_batch(wo, std::move(stock_batch));
+    }
+  };
+
+  template <bool Sync>
+  static auto cas_increment(Db &db, const std::string &key)
+      -> std::uint64_t {
+    std::uint64_t attempts = 0;
+    bytecask::WriteOptions wo;
+    wo.sync = Sync;
+    for (;;) {
+      ++attempts;
+      auto snap = db.engine.snapshot();
+      bytecask::Bytes out;
+      (void)snap.get(bc_key(key), out);
+      auto new_val = encode_u64(decode_u64_bytes(out) + 1);
+
+      bytecask::WritePlan plan{std::move(snap)};
+      plan.ensure_unchanged(bc_key(key));
+      plan.put(bc_key(key), bc_val(new_val));
+
+      if (db.engine.apply_batch_if(wo, std::move(plan)))
+        return attempts;
+    }
   }
 };
 
@@ -506,6 +605,89 @@ template <bool UseCache = true> struct RdbAdapter {
     benchmark::DoNotOptimize(s);
   }
 };
+
+struct RdbCasAdapter {
+  struct Db {
+    TmpDir dir;
+    rocksdb::OptimisticTransactionDB *txn_db{nullptr};
+    std::vector<std::string> stock_keys;
+
+    explicit Db(std::string_view tag)
+        : dir{tag}, stock_keys{generate_stock_keys()} {
+      rocksdb::Options opts;
+      opts.create_if_missing = true;
+      auto s = rocksdb::OptimisticTransactionDB::Open(
+          opts, dir.path.string(), &txn_db);
+      if (!s.ok())
+        throw std::runtime_error{
+            "OptimisticTransactionDB open failed: " + s.ToString()};
+
+      auto background_keys = generate_prefixed_keys(kDatasetSize);
+      auto background_val = make_value();
+      constexpr std::size_t kPopulateBatchSize = 100;
+      rocksdb::WriteOptions wo;
+      wo.sync = false;
+      const auto n = background_keys.size();
+      for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
+        auto end = std::min(i + kPopulateBatchSize, n);
+        rocksdb::WriteBatch wb;
+        for (std::size_t j = i; j < end; ++j) {
+          wb.Put(rdb_slice(background_keys[j]),
+                 rdb_val_slice(background_val));
+        }
+        s = txn_db->Write(wo, &wb);
+        if (!s.ok())
+          throw std::runtime_error{"RocksDB populate failed: " + s.ToString()};
+      }
+
+      wo.sync = true;
+      auto zero = encode_u64(0);
+      rocksdb::WriteBatch stock_wb;
+      for (const auto &k : stock_keys) {
+        stock_wb.Put(rdb_slice(k), rdb_val_slice(zero));
+      }
+      s = txn_db->Write(wo, &stock_wb);
+      if (!s.ok())
+        throw std::runtime_error{
+            "OptimisticTransactionDB stock populate failed: " + s.ToString()};
+    }
+
+    ~Db() { delete txn_db; }
+    Db(const Db &) = delete;
+    Db &operator=(const Db &) = delete;
+  };
+
+  template <bool Sync>
+  static auto cas_increment(Db &db, const std::string &key)
+      -> std::uint64_t {
+    rocksdb::WriteOptions wo;
+    wo.sync = Sync;
+    rocksdb::ReadOptions ro;
+    std::uint64_t attempts = 0;
+
+    for (;;) {
+      ++attempts;
+      auto *txn = db.txn_db->BeginTransaction(wo);
+      std::string value;
+      auto s = txn->GetForUpdate(ro, rdb_slice(key), &value);
+      if (!s.ok() && !s.IsNotFound()) {
+        delete txn;
+        throw std::runtime_error{"GetForUpdate failed: " + s.ToString()};
+      }
+      auto new_val = encode_u64(decode_u64_str(value) + 1);
+      txn->Put(rdb_slice(key),
+               rocksdb::Slice(bytes_to_chars(new_val), new_val.size()));
+      s = txn->Commit();
+      delete txn;
+      if (s.ok())
+        return attempts;
+      if (s.IsTryAgain() || s.IsBusy())
+        continue;
+      throw std::runtime_error{"CAS commit failed: " + s.ToString()};
+    }
+  }
+};
+
 // ===========================================================================
 // Generic benchmark templates
 // ===========================================================================
@@ -924,6 +1106,53 @@ void BM_ReadWhileWriting(benchmark::State &state) {
 
 
 
+// ──────────── CAS (Compare-And-Swap) multithreaded ──────────────────────────
+// N threads concurrently read-modify-write 100 stock counters using optimistic
+// concurrency control. Each iteration is one successful CAS; retries on
+// conflict are counted but not benchmarked as separate iterations.
+
+template <typename CasAdapter, bool Sync>
+void BM_CasMT(benchmark::State &state) {
+  static auto shared_db =
+      std::make_unique<typename CasAdapter::Db>("cas_mt");
+
+  std::mt19937 rng{static_cast<unsigned>(state.thread_index()) * 31337u + 42u};
+  std::uniform_int_distribution<int> key_dist{0, kCasStockItems - 1};
+
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+  std::uint64_t total_attempts = 0;
+
+  for (auto _ : state) {
+    const auto &key =
+        shared_db->stock_keys[static_cast<std::size_t>(key_dist(rng))];
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    auto attempts = CasAdapter::template cas_increment<Sync>(*shared_db, key);
+    const auto t1 = std::chrono::high_resolution_clock::now();
+
+    total_attempts += attempts;
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+  }
+
+  auto iters = static_cast<double>(state.iterations());
+  auto attempts = static_cast<double>(total_attempts);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.counters["successful_ops_per_us"] =
+      benchmark::Counter(iters, benchmark::Counter::kIsRate);
+  state.counters["total_attempts_per_us"] =
+      benchmark::Counter(attempts, benchmark::Counter::kIsRate);
+  state.counters["conflict_rate"] = benchmark::Counter(
+      (attempts - iters) / attempts, benchmark::Counter::kAvgThreads);
+  state.counters["avg_attempts"] = benchmark::Counter(
+      attempts / iters, benchmark::Counter::kAvgThreads);
+  attach_jitter(state, samples);
+}
+
+
+
 // ──────────── Parallel Recovery ──────────────────────────────────────────────
 // Measures startup recovery with varying thread counts.
 // Uses kDatasetSize keys with 1-byte values so hint-file parsing dominates.
@@ -1102,6 +1331,31 @@ BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threa
 BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(16);
 BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(32);
 BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(64);
+
+// --- Multithreaded CAS (optimistic concurrency: read-modify-write with conflict retry) ---
+using BcCas  = BcCasAdapter;
+using RdbCas = RdbCasAdapter;
+
+BENCH(BM_CasMT<BcCas, false>)  ->Name("ByteCaskDB/CasMT/NoSync") ->Threads(2);
+BENCH(BM_CasMT<BcCas, false>)  ->Name("ByteCaskDB/CasMT/NoSync") ->Threads(4);
+BENCH(BM_CasMT<BcCas, false>)  ->Name("ByteCaskDB/CasMT/NoSync") ->Threads(8);
+BENCH(BM_CasMT<BcCas, false>)  ->Name("ByteCaskDB/CasMT/NoSync") ->Threads(16);
+BENCH(BM_CasMT<BcCas, false>)  ->Name("ByteCaskDB/CasMT/NoSync") ->Threads(32);
+BENCH(BM_CasMT<BcCas, true>)   ->Name("ByteCaskDB/CasMT/Sync")   ->Threads(2);
+BENCH(BM_CasMT<BcCas, true>)   ->Name("ByteCaskDB/CasMT/Sync")   ->Threads(4);
+BENCH(BM_CasMT<BcCas, true>)   ->Name("ByteCaskDB/CasMT/Sync")   ->Threads(8);
+BENCH(BM_CasMT<BcCas, true>)   ->Name("ByteCaskDB/CasMT/Sync")   ->Threads(16);
+BENCH(BM_CasMT<BcCas, true>)   ->Name("ByteCaskDB/CasMT/Sync")   ->Threads(32);
+BENCH(BM_CasMT<RdbCas, false>) ->Name("RocksDB/CasMT/NoSync")    ->Threads(2);
+BENCH(BM_CasMT<RdbCas, false>) ->Name("RocksDB/CasMT/NoSync")    ->Threads(4);
+BENCH(BM_CasMT<RdbCas, false>) ->Name("RocksDB/CasMT/NoSync")    ->Threads(8);
+BENCH(BM_CasMT<RdbCas, false>) ->Name("RocksDB/CasMT/NoSync")    ->Threads(16);
+BENCH(BM_CasMT<RdbCas, false>) ->Name("RocksDB/CasMT/NoSync")    ->Threads(32);
+BENCH(BM_CasMT<RdbCas, true>)  ->Name("RocksDB/CasMT/Sync")      ->Threads(2);
+BENCH(BM_CasMT<RdbCas, true>)  ->Name("RocksDB/CasMT/Sync")      ->Threads(4);
+BENCH(BM_CasMT<RdbCas, true>)  ->Name("RocksDB/CasMT/Sync")      ->Threads(8);
+BENCH(BM_CasMT<RdbCas, true>)  ->Name("RocksDB/CasMT/Sync")      ->Threads(16);
+BENCH(BM_CasMT<RdbCas, true>)  ->Name("RocksDB/CasMT/Sync")      ->Threads(32);
 
 
 // clang-format on

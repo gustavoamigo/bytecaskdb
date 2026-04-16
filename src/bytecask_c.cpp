@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 
 #include "../include/bytecask_c.h"
 import bytecask;
@@ -38,6 +39,13 @@ static void set_errmsg(const char *msg) {
 }
 
 static void clear_errmsg() { tl_errmsg.clear(); }
+
+// ---------------------------------------------------------------------------
+// Helper — convert uint8_t pointer + length to BytesView
+// ---------------------------------------------------------------------------
+static bytecask::BytesView to_view(const uint8_t *p, std::size_t len) {
+  return {reinterpret_cast<const std::byte *>(p), len};
+}
 
 // ---------------------------------------------------------------------------
 // Opaque structs
@@ -65,6 +73,16 @@ struct bytecask_iter {
       valid = (cur != std::default_sentinel);
     }
   }
+};
+
+struct bytecask_snapshot {
+  bytecask::Snapshot snap;
+  explicit bytecask_snapshot(bytecask::Snapshot s) : snap{std::move(s)} {}
+};
+
+struct bytecask_write_plan {
+  bytecask::WritePlan plan;
+  explicit bytecask_write_plan(bytecask::WritePlan p) : plan{std::move(p)} {}
 };
 
 // ---------------------------------------------------------------------------
@@ -114,9 +132,7 @@ int bytecask_put(bytecask_db_t *db,
   try {
     bytecask::WriteOptions opts;
     opts.sync = (sync != 0);
-    db->db.put(opts,
-               bytecask::BytesView{reinterpret_cast<const std::byte *>(key), key_len},
-               bytecask::BytesView{reinterpret_cast<const std::byte *>(val), val_len});
+    db->db.put(opts, to_view(key, key_len), to_view(val, val_len));
     return 0;
   } catch (const std::exception &e) {
     set_errmsg(e.what());
@@ -136,9 +152,7 @@ int bytecask_del(bytecask_db_t *db,
   try {
     bytecask::WriteOptions opts;
     opts.sync = (sync != 0);
-    bool existed = db->db.del(
-        opts,
-        bytecask::BytesView{reinterpret_cast<const std::byte *>(key), key_len});
+    bool existed = db->db.del(opts, to_view(key, key_len));
     return existed ? 1 : 0;
   } catch (const std::exception &e) {
     set_errmsg(e.what());
@@ -163,10 +177,7 @@ int bytecask_get(bytecask_db_t *db,
   try {
     bytecask::ReadOptions opts{};
     bytecask::Bytes buf;
-    bool found = db->db.get(
-        opts,
-        bytecask::BytesView{reinterpret_cast<const std::byte *>(key), key_len},
-        buf);
+    bool found = db->db.get(opts, to_view(key, key_len), buf);
     if (!found) { return 0; }
     auto *copy = dup_bytes(buf.data(), buf.size());
     if (!copy && !buf.empty()) {
@@ -189,10 +200,7 @@ int bytecask_get(bytecask_db_t *db,
 int bytecask_contains_key(bytecask_db_t *db,
                           const uint8_t *key, std::size_t key_len) {
   if (!db) { return 0; }
-  return db->db.contains_key(
-             bytecask::BytesView{reinterpret_cast<const std::byte *>(key), key_len})
-             ? 1
-             : 0;
+  return db->db.contains_key(to_view(key, key_len)) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +215,7 @@ bytecask_iter_t *bytecask_iter_open(bytecask_db_t *db,
     bytecask::ReadOptions opts{};
     bytecask::BytesView from_view{};
     if (from && from_len > 0) {
-      from_view = bytecask::BytesView{reinterpret_cast<const std::byte *>(from), from_len};
+      from_view = to_view(from, from_len);
     }
     auto range = db->db.iter_from(opts, from_view);
     return new bytecask_iter{range.begin()};
@@ -277,6 +285,201 @@ int bytecask_iter_value(const bytecask_iter_t *iter,
 
 void bytecask_iter_free(bytecask_iter_t *iter) {
   delete iter;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots
+// ---------------------------------------------------------------------------
+
+bytecask_snapshot_t *bytecask_snapshot(bytecask_db_t *db) {
+  clear_errmsg();
+  if (!db) { set_errmsg("null db handle"); return nullptr; }
+  try {
+    return new struct bytecask_snapshot{db->db.snapshot()};
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return nullptr;
+  }
+}
+
+int bytecask_snapshot_get(const bytecask_snapshot_t *snap,
+                          const uint8_t *key, std::size_t key_len,
+                          uint8_t **out_val, std::size_t *out_val_len) {
+  clear_errmsg();
+  if (!snap || !out_val || !out_val_len) {
+    set_errmsg("null argument");
+    return -1;
+  }
+  *out_val = nullptr;
+  *out_val_len = 0;
+  try {
+    bytecask::Bytes buf;
+    bool found = snap->snap.get(to_view(key, key_len), buf);
+    if (!found) { return 0; }
+    auto *copy = dup_bytes(buf.data(), buf.size());
+    if (!copy && !buf.empty()) {
+      set_errmsg("out of memory");
+      return -1;
+    }
+    *out_val     = copy;
+    *out_val_len = buf.size();
+    return 1;
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return -1;
+  }
+}
+
+int bytecask_snapshot_contains_key(const bytecask_snapshot_t *snap,
+                                   const uint8_t *key, std::size_t key_len) {
+  if (!snap) { return 0; }
+  return snap->snap.contains_key(to_view(key, key_len)) ? 1 : 0;
+}
+
+bytecask_iter_t *bytecask_snapshot_iter_open(bytecask_snapshot_t *snap,
+                                             const uint8_t *from,
+                                             std::size_t from_len) {
+  clear_errmsg();
+  if (!snap) { set_errmsg("null snapshot handle"); return nullptr; }
+  try {
+    bytecask::BytesView from_view{};
+    if (from && from_len > 0) {
+      from_view = to_view(from, from_len);
+    }
+    auto range = snap->snap.iter_from(from_view);
+    return new bytecask_iter{range.begin()};
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return nullptr;
+  }
+}
+
+void bytecask_snapshot_free(bytecask_snapshot_t *snap) {
+  delete snap;
+}
+
+// ---------------------------------------------------------------------------
+// Write plans
+// ---------------------------------------------------------------------------
+
+bytecask_write_plan_t *bytecask_write_plan_new(void) {
+  return new bytecask_write_plan{bytecask::WritePlan{}};
+}
+
+bytecask_write_plan_t *bytecask_write_plan_new_with_snapshot(
+    bytecask_snapshot_t *snap) {
+  if (!snap) {
+    set_errmsg("null snapshot handle");
+    return nullptr;
+  }
+  auto *plan = new bytecask_write_plan{
+      bytecask::WritePlan{std::move(snap->snap)}};
+  delete snap;
+  return plan;
+}
+
+void bytecask_write_plan_put(bytecask_write_plan_t *plan,
+                             const uint8_t *key, std::size_t key_len,
+                             const uint8_t *val, std::size_t val_len) {
+  if (!plan) { return; }
+  plan->plan.put(to_view(key, key_len), to_view(val, val_len));
+}
+
+void bytecask_write_plan_del(bytecask_write_plan_t *plan,
+                             const uint8_t *key, std::size_t key_len) {
+  if (!plan) { return; }
+  plan->plan.del(to_view(key, key_len));
+}
+
+void bytecask_write_plan_ensure_present(bytecask_write_plan_t *plan,
+                                        const uint8_t *key,
+                                        std::size_t key_len) {
+  if (!plan) { return; }
+  plan->plan.ensure_present(to_view(key, key_len));
+}
+
+void bytecask_write_plan_ensure_absent(bytecask_write_plan_t *plan,
+                                       const uint8_t *key,
+                                       std::size_t key_len) {
+  if (!plan) { return; }
+  plan->plan.ensure_absent(to_view(key, key_len));
+}
+
+int bytecask_write_plan_ensure_unchanged(bytecask_write_plan_t *plan,
+                                         const uint8_t *key,
+                                         std::size_t key_len) {
+  clear_errmsg();
+  if (!plan) { set_errmsg("null plan handle"); return -1; }
+  try {
+    plan->plan.ensure_unchanged(to_view(key, key_len));
+    return 0;
+  } catch (const std::logic_error &e) {
+    set_errmsg(e.what());
+    return -1;
+  }
+}
+
+int bytecask_write_plan_ensure_range_unchanged(bytecask_write_plan_t *plan,
+                                               const uint8_t *from,
+                                               std::size_t from_len,
+                                               const uint8_t *to,
+                                               std::size_t to_len) {
+  clear_errmsg();
+  if (!plan) { set_errmsg("null plan handle"); return -1; }
+  try {
+    plan->plan.ensure_range_unchanged(to_view(from, from_len),
+                                      to_view(to, to_len));
+    return 0;
+  } catch (const std::logic_error &e) {
+    set_errmsg(e.what());
+    return -1;
+  }
+}
+
+void bytecask_write_plan_free(bytecask_write_plan_t *plan) {
+  delete plan;
+}
+
+// ---------------------------------------------------------------------------
+// apply_batch_if
+// ---------------------------------------------------------------------------
+
+int bytecask_apply_batch_if(bytecask_db_t *db,
+                            bytecask_write_plan_t *plan,
+                            int sync) {
+  clear_errmsg();
+  if (!db || !plan) {
+    set_errmsg(!db ? "null db handle" : "null plan handle");
+    delete plan;
+    return -1;
+  }
+  try {
+    bytecask::WriteOptions opts;
+    opts.sync = (sync != 0);
+    bool committed = db->db.apply_batch_if(opts, std::move(plan->plan));
+    delete plan;
+    return committed ? 1 : 0;
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    delete plan;
+    return -1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Vacuum
+// ---------------------------------------------------------------------------
+
+int bytecask_vacuum(bytecask_db_t *db) {
+  clear_errmsg();
+  if (!db) { set_errmsg("null db handle"); return -1; }
+  try {
+    bool vacuumed = db->db.vacuum();
+    return vacuumed ? 1 : 0;
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return -1;
+  }
 }
 
 // ---------------------------------------------------------------------------
