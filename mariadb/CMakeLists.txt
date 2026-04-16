@@ -111,6 +111,7 @@ endif()
 add_library(ha_bytecaskdb MODULE
   ha_bytecaskdb.cc
   bytecaskdb_plugin.cc
+  catalog.cc
   key_encoding.cc
   row_encoding.cc
   # bytecask_c.cpp is compiled into libbytecask.a by xmake (it imports the
@@ -164,3 +165,49 @@ set_target_properties(ha_bytecaskdb PROPERTIES
 )
 
 message(STATUS "Plugin target: ha_bytecaskdb.so")
+
+# ---------------------------------------------------------------------------
+# Unit tests for the encoding / catalog layer
+# ---------------------------------------------------------------------------
+# These compile catalog.cc, key_encoding.cc, row_encoding.cc against minimal
+# type stubs (no MariaDB server headers, no libbytecask).  Only pure encoding
+# logic is tested.
+
+# ---------------------------------------------------------------------------
+# Unit tests for the encoding / catalog layer
+# ---------------------------------------------------------------------------
+# These compile catalog.cc, key_encoding.cc, row_encoding.cc against minimal
+# type stubs (no MariaDB server headers, no libbytecask).  Only pure encoding
+# logic is tested.
+
+include(FetchContent)
+FetchContent_Declare(
+  Catch2
+  GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+  GIT_TAG        v3.7.1
+)
+FetchContent_MakeAvailable(Catch2)
+
+add_executable(mariadb_plugin_tests
+  tests/mariadb_encoding_test.cpp
+  catalog.cc
+  key_encoding.cc
+  row_encoding.cc
+)
+
+target_include_directories(mariadb_plugin_tests PRIVATE
+  # Stubs must come first so tests/my_global.h etc. win over MariaDB headers.
+  "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+target_compile_options(mariadb_plugin_tests PRIVATE -Wall -Wextra)
+
+target_link_libraries(mariadb_plugin_tests PRIVATE Catch2::Catch2WithMain)
+
+include(CTest)
+list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
+include(Catch)
+catch_discover_tests(mariadb_plugin_tests)
+
+message(STATUS "Test target: mariadb_plugin_tests")

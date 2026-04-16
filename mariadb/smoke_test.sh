@@ -75,6 +75,8 @@ stop_local_mariadb() {
 
 cleanup_sql() {
   run_sql "DROP TABLE IF EXISTS ${TEST_DB}.t;" 2>/dev/null || true
+  run_sql "DROP TABLE IF EXISTS ${TEST_DB}.t2;" 2>/dev/null || true
+  run_sql "DROP TABLE IF EXISTS ${TEST_DB}.t_renamed;" 2>/dev/null || true
   run_sql "DROP DATABASE IF EXISTS ${TEST_DB};" 2>/dev/null || true
   run_sql "UNINSTALL PLUGIN bytecaskdb;" 2>/dev/null || true
 }
@@ -223,6 +225,121 @@ check "3 rows after multiple inserts" "3" "$count"
 run_sql "DROP TABLE ${TEST_DB}.t;"
 tables=$(run_sql "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='${TEST_DB}' AND TABLE_NAME='t';")
 check "Table gone after DROP" "" "$tables"
+
+# ---------------------------------------------------------------------------
+# 5b. UPDATE, DELETE, PK lookup, RENAME, duplicate PK, restart persistence
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "--- Extended SQL tests ---"
+
+# Create a fresh table for the extended tests.
+run_sql "CREATE TABLE ${TEST_DB}.t (id INT PRIMARY KEY, name VARCHAR(100)) ENGINE=bytecaskdb;"
+run_sql "INSERT INTO ${TEST_DB}.t VALUES (1, 'alice');"
+run_sql "INSERT INTO ${TEST_DB}.t VALUES (2, 'bob');"
+run_sql "INSERT INTO ${TEST_DB}.t VALUES (3, 'carol');"
+
+# UPDATE value (PK unchanged)
+run_sql "UPDATE ${TEST_DB}.t SET name='ALICE' WHERE id=1;"
+result=$(run_sql "SELECT name FROM ${TEST_DB}.t WHERE id=1;")
+check "UPDATE value (PK unchanged)" "ALICE" "$result"
+
+# UPDATE PK (changes PK)
+run_sql "UPDATE ${TEST_DB}.t SET id=10 WHERE id=2;"
+result_old=$(run_sql "SELECT COUNT(*) FROM ${TEST_DB}.t WHERE id=2;")
+result_new=$(run_sql "SELECT name FROM ${TEST_DB}.t WHERE id=10;")
+check "UPDATE PK: old key gone" "0" "$result_old"
+check "UPDATE PK: new key present" "bob" "$result_new"
+
+# DELETE
+run_sql "DELETE FROM ${TEST_DB}.t WHERE id=3;"
+result=$(run_sql "SELECT COUNT(*) FROM ${TEST_DB}.t WHERE id=3;")
+check "DELETE removes row" "0" "$result"
+
+count=$(run_sql "SELECT COUNT(*) FROM ${TEST_DB}.t;")
+check "Row count after UPDATE+DELETE" "2" "$count"
+
+# PK point lookup (SELECT WHERE id=N uses index_read_map)
+result=$(run_sql "SELECT name FROM ${TEST_DB}.t WHERE id=1;")
+check "PK point lookup" "ALICE" "$result"
+
+# Duplicate PK rejection
+dup_result=$(run_sql "INSERT INTO ${TEST_DB}.t VALUES (1, 'duplicate');" 2>&1 || true)
+check "Duplicate PK rejected" "duplicate key" "$dup_result"
+
+# RENAME TABLE
+run_sql "RENAME TABLE ${TEST_DB}.t TO ${TEST_DB}.t_renamed;"
+result=$(run_sql "SELECT name FROM ${TEST_DB}.t_renamed WHERE id=1;")
+check "RENAME TABLE: data accessible under new name" "ALICE" "$result"
+
+# Verify old name is gone.
+old_result=$(run_sql "SELECT * FROM ${TEST_DB}.t;" 2>&1 || true)
+check "RENAME TABLE: old name gone" "doesn't exist" "$old_result"
+
+# Rename back for the DROP + recreate test.
+run_sql "RENAME TABLE ${TEST_DB}.t_renamed TO ${TEST_DB}.t;"
+
+# DROP + recreate should be empty.
+run_sql "DROP TABLE ${TEST_DB}.t;"
+run_sql "CREATE TABLE ${TEST_DB}.t (id INT PRIMARY KEY, name VARCHAR(100)) ENGINE=bytecaskdb;"
+count=$(run_sql "SELECT COUNT(*) FROM ${TEST_DB}.t;")
+check "DROP + recreate: table is empty" "0" "$count"
+
+run_sql "DROP TABLE ${TEST_DB}.t;"
+
+# ---------------------------------------------------------------------------
+# 5c. Restart persistence test
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "--- Restart persistence test ---"
+
+# Create and insert data.
+run_sql "CREATE TABLE ${TEST_DB}.t (id INT PRIMARY KEY, name VARCHAR(100)) ENGINE=bytecaskdb;"
+run_sql "INSERT INTO ${TEST_DB}.t VALUES (42, 'persistent');"
+run_sql "INSERT INTO ${TEST_DB}.t VALUES (43, 'survives');"
+
+# Stop MariaDB.
+stop_local_mariadb
+echo "  MariaDB stopped."
+
+# Restart MariaDB.
+mariadbd \
+  --datadir="${LOCAL_DIR}/data" \
+  --socket="${SOCK}" \
+  --port="${PORT}" \
+  --pid-file="${PID_FILE}" \
+  --skip-grant-tables \
+  --tmpdir="${LOCAL_DIR}/tmp" \
+  --plugin-dir="${BUILD_DIR}" \
+  --plugin-load-add="bytecaskdb=ha_bytecaskdb.so" \
+  --log-error="${LOG_FILE}" &
+
+for i in $(seq 1 30); do
+  if mariadb --socket="${SOCK}" -e "SELECT 1;" &>/dev/null; then
+    break
+  fi
+  if [[ "$i" -eq 30 ]]; then
+    echo "FATAL: MariaDB did not restart within 15 s.  Error log:"
+    tail -20 "${LOG_FILE}"
+    exit 1
+  fi
+  sleep 0.5
+done
+echo "  MariaDB restarted."
+
+# Verify data survived restart.
+result=$(run_sql "SELECT name FROM ${TEST_DB}.t WHERE id=42;" 2>&1 || true)
+check "Restart persistence: row 42" "persistent" "$result"
+
+result=$(run_sql "SELECT name FROM ${TEST_DB}.t WHERE id=43;" 2>&1 || true)
+check "Restart persistence: row 43" "survives" "$result"
+
+count=$(run_sql "SELECT COUNT(*) FROM ${TEST_DB}.t;" 2>&1 || true)
+check "Restart persistence: row count" "2" "$count"
+
+# Clean up.
+run_sql "DROP TABLE ${TEST_DB}.t;"
 
 # ---------------------------------------------------------------------------
 # 6. Summary
