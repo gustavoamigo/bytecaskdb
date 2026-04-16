@@ -21,6 +21,7 @@ Output:
     bytecask_benchmark_showcase_<YYYYMMDD_HHMMSS>.md  (repo root)
     bench_data/<timestamp>_<mode>/regular_<N>.json    (saved on each run)
     bench_data/<timestamp>_<mode>/recovery_<N>.json
+    bench_data/<timestamp>_<mode>/cas_<N>.json
 """
 
 from __future__ import annotations
@@ -47,6 +48,9 @@ FULL_REGULAR_SIZES   = [50_000, 500_000, 1_000_000]
 FULL_RECOVERY_SIZES  = [50_000, 1_000_000, 10_000_000]
 QUICK_REGULAR_SIZES  = [10_000, 50_000]
 QUICK_RECOVERY_SIZES = [50_000, 1_000_000]
+
+FULL_CAS_STOCK_ITEMS  = [100, 10_000]
+QUICK_CAS_STOCK_ITEMS = [100]
 
 REPETITIONS = 5
 
@@ -122,7 +126,7 @@ def _run(dataset_size: int, extra_flags: list[str]) -> dict:
 
 
 def run_regular(dataset_size: int) -> dict:
-    filt = _exclude_filter(["Recovery"])
+    filt = _exclude_filter(["Recovery", "CasMT"])
     if filt is None:
         raise RuntimeError("All benchmarks were excluded — nothing to run.")
     return _run(dataset_size, [f"--benchmark_filter={filt}"])
@@ -130,6 +134,36 @@ def run_regular(dataset_size: int) -> dict:
 
 def run_recovery(dataset_size: int) -> dict:
     return _run(dataset_size, ["--benchmark_filter=Recovery"])
+
+
+def run_cas(stock_items: int) -> dict:
+    """Run CAS benchmarks with the given number of stock items."""
+    run_tmp = TMPDIR / f"run_cas_{stock_items}"
+    run_tmp.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        out_path = f.name
+    try:
+        env = os.environ.copy()
+        env["BC_CAS_STOCK_ITEMS"] = str(stock_items)
+        env["BC_DATASET_SIZE"] = str(1_000_000)
+        env["TMPDIR"] = str(run_tmp)
+        cmd = [
+            str(BENCH_BINARY),
+            f"--benchmark_out={out_path}",
+            "--benchmark_out_format=json",
+            f"--benchmark_repetitions={REPETITIONS}",
+            "--benchmark_display_aggregates_only=true",
+            "--benchmark_filter=CasMT",
+        ]
+        print(f"  Running: BC_CAS_STOCK_ITEMS={stock_items} "
+              + " ".join(cmd[1:3]) + " ...")
+        subprocess.run(cmd, check=True, cwd=REPO_ROOT, env=env)
+        with open(out_path, encoding="utf-8") as f:
+            return json.load(f)
+    finally:
+        os.unlink(out_path)
+        shutil.rmtree(run_tmp, ignore_errors=True)
+
 
 # ---------------------------------------------------------------------------
 # Result extraction
@@ -518,6 +552,86 @@ def section_recovery(recovery: dict[int, dict]) -> str:
 
     return "\n".join(L)
 
+
+def _cas_throughput_table(
+    means: dict[str, dict],
+    sync_label: str,
+) -> list[str]:
+    """Build a CAS throughput + latency table for one Sync/NoSync mode."""
+    bc_mt  = find_mt(means, f"ByteCaskDB/CasMT/{sync_label}")
+    rdb_mt = find_mt(means, f"RocksDB/CasMT/{sync_label}")
+    if not bc_mt and not rdb_mt:
+        return []
+
+    L: list[str] = []
+    L.append(f"#### {sync_label}\n")
+    L.append(
+        "| Threads | ByteCaskDB | RocksDB "
+        "| BCDB p50 | RDB p50 | BCDB p99 | RDB p99 "
+        "| BCDB avg attempts | RDB avg attempts |"
+    )
+    L.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+
+    for t in sorted(set(list(bc_mt) + list(rdb_mt))):
+        bc_b  = bc_mt.get(t)
+        rdb_b = rdb_mt.get(t)
+        bc_v  = _val(bc_b,  "successful_ops_per_us")
+        rdb_v = _val(rdb_b, "successful_ops_per_us")
+        bc_wins  = bc_v is not None and rdb_v is not None and bc_v >= rdb_v
+        rdb_wins = rdb_v is not None and bc_v is not None and rdb_v > bc_v
+
+        bc_p50  = fmt_lat(_val(bc_b,  "lat_p50_ns"))
+        rdb_p50 = fmt_lat(_val(rdb_b, "lat_p50_ns"))
+        bc_p99  = fmt_lat(_val(bc_b,  "lat_p99_ns"))
+        rdb_p99 = fmt_lat(_val(rdb_b, "lat_p99_ns"))
+
+        bc_att  = _val(bc_b,  "avg_attempts")
+        rdb_att = _val(rdb_b, "avg_attempts")
+        bc_att_s  = f"{bc_att:.2f}"  if bc_att is not None else "—"
+        rdb_att_s = f"{rdb_att:.2f}" if rdb_att is not None else "—"
+
+        L.append(
+            f"| {t} "
+            f"| {_bold(fmt_throughput(bc_v), bc_wins)} "
+            f"| {_bold(fmt_throughput(rdb_v), rdb_wins)} "
+            f"| {bc_p50} | {rdb_p50} | {bc_p99} | {rdb_p99} "
+            f"| {bc_att_s} | {rdb_att_s} |"
+        )
+
+    L.append("")
+    return L
+
+
+def section_cas(cas_results: dict[int, dict]) -> str:
+    """Render the CAS (Compare-And-Swap) benchmark section."""
+    L: list[str] = []
+    L.append("# Optimistic Concurrency — CAS Benchmark\n")
+    L.append(
+        "> Concurrent read-modify-write (increment) on shared stock counters. "
+        "ByteCaskDB uses `WritePlan` + `apply_batch_if` with snapshot-based "
+        "conflict detection; RocksDB uses `OptimisticTransactionDB`. "
+        "Each iteration is one successful CAS — retries on conflict are "
+        "included in wall-clock time. Both databases are pre-populated "
+        "with 1M background keys.\n"
+    )
+
+    for stock_items in sorted(cas_results):
+        data  = cas_results[stock_items]
+        means = extract_means(data)
+        label = f"{stock_items:,} stock items"
+        contention = "high" if stock_items <= 100 else "low"
+        L.append(f"## {label} ({contention} contention)\n")
+
+        nosync_lines = _cas_throughput_table(means, "NoSync")
+        sync_lines   = _cas_throughput_table(means, "Sync")
+
+        if nosync_lines:
+            L.extend(nosync_lines)
+        if sync_lines:
+            L.extend(sync_lines)
+
+    return "\n".join(L)
+
 # ---------------------------------------------------------------------------
 # Full report
 # ---------------------------------------------------------------------------
@@ -527,6 +641,7 @@ def render_report(
     bm_context: dict,
     regular: dict[int, dict],
     recovery: dict[int, dict],
+    cas_results: dict[int, dict],
     mode: str,
     commit: str,
 ) -> str:
@@ -588,6 +703,11 @@ def render_report(
         "- Each engine is opened in a fresh, empty temporary directory "
         "per benchmark fixture."
     )
+    L.append(
+        "- **CAS benchmarks:** concurrent read-modify-write on shared stock counters, "
+        "pre-populated with 1M background keys. ByteCaskDB uses "
+        "`WritePlan` + `apply_batch_if`; RocksDB uses `OptimisticTransactionDB`."
+    )
     L.append("")
 
     # ── Throughput sections ────────────────────────────────────────────────
@@ -607,6 +727,11 @@ def render_report(
     L.append("# Recovery\n")
     L.append(section_recovery(recovery))
 
+    # ── CAS ──────────────────────────────────────────────────────────────
+    if cas_results:
+        L.append("")
+        L.append(section_cas(cas_results))
+
     L.append("---")
     L.append(f"_Generated by `scripts/benchmark_showcase.py` · {date_iso}_")
     return "\n".join(L)
@@ -619,10 +744,11 @@ def save_json(data: dict, path: Path) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-def load_from_json(json_dir: Path) -> tuple[dict[int, dict], dict[int, dict]]:
-    """Reconstruct regular and recovery dicts from a previously saved JSON directory."""
+def load_from_json(json_dir: Path) -> tuple[dict[int, dict], dict[int, dict], dict[int, dict]]:
+    """Reconstruct regular, recovery, and CAS dicts from a previously saved JSON directory."""
     regular: dict[int, dict] = {}
     recovery: dict[int, dict] = {}
+    cas: dict[int, dict] = {}
     for path in sorted(json_dir.glob("regular_*.json")):
         size = int(path.stem.split("_", 1)[1])
         with path.open(encoding="utf-8") as f:
@@ -631,11 +757,15 @@ def load_from_json(json_dir: Path) -> tuple[dict[int, dict], dict[int, dict]]:
         size = int(path.stem.split("_", 1)[1])
         with path.open(encoding="utf-8") as f:
             recovery[size] = json.load(f)
-    if not regular and not recovery:
+    for path in sorted(json_dir.glob("cas_*.json")):
+        items = int(path.stem.split("_", 1)[1])
+        with path.open(encoding="utf-8") as f:
+            cas[items] = json.load(f)
+    if not regular and not recovery and not cas:
         raise SystemExit(
-            f"No regular_*.json or recovery_*.json found in {json_dir}"
+            f"No regular_*.json, recovery_*.json, or cas_*.json found in {json_dir}"
         )
-    return regular, recovery
+    return regular, recovery, cas
 
 
 def git_commit() -> str:
@@ -668,6 +798,7 @@ def main() -> None:
 
     regular_sizes  = QUICK_REGULAR_SIZES  if quick else FULL_REGULAR_SIZES
     recovery_sizes = QUICK_RECOVERY_SIZES if quick else FULL_RECOVERY_SIZES
+    cas_stock_items = QUICK_CAS_STOCK_ITEMS if quick else FULL_CAS_STOCK_ITEMS
     mode = "Quick" if quick else "Full"
 
     print(f"\n=== ByteCaskDB Benchmark Showcase [{mode}] ===\n")
@@ -685,7 +816,7 @@ def main() -> None:
         if from_json_dir is not None:
             # ── Reload from saved JSONs ────────────────────────────────────
             print(f"=== Loading results from: {from_json_dir} ===")
-            regular, recovery = load_from_json(from_json_dir)
+            regular, recovery, cas_results = load_from_json(from_json_dir)
             # Infer mode label and sizes from loaded data.
             regular_sizes  = sorted(regular)
             recovery_sizes = sorted(recovery)
@@ -713,12 +844,25 @@ def main() -> None:
                 recovery[size] = run_recovery(size)
                 save_json(recovery[size], json_save_dir / f"recovery_{size}.json")
 
+            cas_results: dict[int, dict] = {}
+            items_str = ", ".join(str(s) for s in cas_stock_items)
+            print(f"\n=== CAS benchmarks ({items_str} stock items) ===")
+            for i, items in enumerate(cas_stock_items, 1):
+                print(f"\n[{i}/{len(cas_stock_items)}] {items} stock items (CAS)...")
+                cas_results[items] = run_cas(items)
+                save_json(cas_results[items], json_save_dir / f"cas_{items}.json")
+
             print(f"\n=== JSON data saved to: {json_save_dir.relative_to(REPO_ROOT)} ===")
 
         # Pull benchmark context (CPU info etc.) from the first result.
-        bm_context = next(iter(regular.values()), {}).get("context", {})
+        first_result = (
+            next(iter(regular.values()), None)
+            or next(iter(cas_results.values()), None)
+            or {}
+        )
+        bm_context = first_result.get("context", {})
 
-        report = render_report(hw, bm_context, regular, recovery, mode, commit)
+        report = render_report(hw, bm_context, regular, recovery, cas_results, mode, commit)
 
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = REPO_ROOT / f"bytecask_benchmark_showcase_{ts}.md"

@@ -516,7 +516,10 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
 
 #pragma region Snapshot and apply_batch_if
 
-auto DB::snapshot() const -> Snapshot { return Snapshot{state_.load()}; }
+auto DB::snapshot() const -> Snapshot {
+  ReadOptions opts{};
+  return Snapshot{load_state(opts)};
+}
 
 // The single write path. Routes to either write_group_ (default) or
 // solo_writer_ depending on plan characteristics. put/del/apply_batch are

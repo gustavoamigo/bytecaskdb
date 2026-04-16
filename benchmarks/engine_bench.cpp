@@ -662,14 +662,16 @@ struct RdbCasAdapter {
       -> std::uint64_t {
     rocksdb::WriteOptions wo;
     wo.sync = Sync;
-    rocksdb::ReadOptions ro;
     std::uint64_t attempts = 0;
 
     for (;;) {
       ++attempts;
       auto *txn = db.txn_db->BeginTransaction(wo);
+      txn->SetSnapshot();
+      rocksdb::ReadOptions snap_ro;
+      snap_ro.snapshot = txn->GetSnapshot();
       std::string value;
-      auto s = txn->GetForUpdate(ro, rdb_slice(key), &value);
+      auto s = txn->GetForUpdate(snap_ro, rdb_slice(key), &value);
       if (!s.ok() && !s.IsNotFound()) {
         delete txn;
         throw std::runtime_error{"GetForUpdate failed: " + s.ToString()};
