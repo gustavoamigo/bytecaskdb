@@ -3425,6 +3425,50 @@ TEST_CASE("resume() discards pending batch on CRC error in active file",
   CHECK(db.contains_key(to_bytes("k3")));
 }
 
+TEST_CASE("resume() with live snapshot on degraded DB",
+          "[degraded][resume]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // Pre-populate.
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+
+  // Degrade via orphaned BulkBegin (class C).
+  {
+    bytecask::testing::ScopedFaultInjector fi{2};
+    bytecask::Batch batch;
+    batch.put(to_bytes("a"), to_bytes("va"));
+    batch.put(to_bytes("b"), to_bytes("vb"));
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(batch)),
+                      std::system_error);
+  }
+  REQUIRE(db.is_degraded());
+
+  // Take snapshot while degraded — pins data files.
+  auto snap = db.snapshot();
+  bytecask::Bytes out;
+  CHECK(snap.get(to_bytes("k1"), out));
+  CHECK(snap.get(to_bytes("k2"), out));
+  CHECK_FALSE(snap.contains_key(to_bytes("a")));
+
+  // resume() with snapshot still alive.
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+
+  // Snapshot still readable — pinned files not deleted.
+  CHECK(snap.get(to_bytes("k1"), out));
+  CHECK(snap.get(to_bytes("k2"), out));
+
+  // Post-resume writes succeed.
+  REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
+  CHECK(db.contains_key(to_bytes("k3")));
+
+  // DB reads still correct.
+  CHECK(db.contains_key(to_bytes("k1")));
+  CHECK(db.contains_key(to_bytes("k2")));
+}
+
 // ---------------------------------------------------------------------------
 // validate_preconditions unit tests
 // ---------------------------------------------------------------------------

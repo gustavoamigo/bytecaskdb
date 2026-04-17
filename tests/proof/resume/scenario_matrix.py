@@ -13,6 +13,8 @@ from typing import Generator, Tuple
 class DegradeVia(Enum):
     H = "rotation_file_creation"  # io_rotate_file_creation: write committed, rotation fails
     C = "bulk_end_append"         # fail_at=3 on 2-op batch: BulkEnd+isolation all fail
+    F = "commit_sync"             # io_data_file_sync on sync=true: bytes in page cache
+    G = "rotation_sync"           # io_data_file_sync on sync=false + small max_file_bytes
 
 
 @dataclass(frozen=True)
@@ -26,11 +28,15 @@ class ResumeFailureClass(Enum):
     R1 = "truncate_fails"        # io_resume_truncate
     R2 = "sync_fails"            # io_resume_sync
     R3 = "file_creation_fails"   # io_resume_file_creation
+    DOUBLE = "double_resume"     # resume succeeds, then resume again (no-op)
+    CASCADE = "cascade_r2_r3"    # R2 fails, R3 fails, clean succeeds
 
 
 DEGRADE_SHAPES = [
     DegradeShape("degrade_H", DegradeVia.H),
     DegradeShape("degrade_C", DegradeVia.C),
+    DegradeShape("degrade_F", DegradeVia.F),
+    DegradeShape("degrade_G", DegradeVia.G),
 ]
 
 RESUME_FAILURE_CLASSES = list(ResumeFailureClass)
@@ -40,11 +46,13 @@ def is_valid_combination(
     degrade: DegradeShape, failure: ResumeFailureClass
 ) -> bool:
     # R1 requires orphaned bytes in the active file so that the truncation
-    # branch in resume() is actually reached. degrade_H has no orphaned bytes
-    # (write committed cleanly, valid_offset == file.size()) so the guard
-    # `if (file.size() != valid_offset)` skips truncate entirely — the fault
-    # point is unreachable and the test would pass vacuously.
-    if failure == ResumeFailureClass.R1 and degrade.degrade_via == DegradeVia.H:
+    # branch in resume() is actually reached. degrade_H, degrade_F, and
+    # degrade_G have no orphaned bytes (writes committed cleanly or bytes
+    # are valid entries in the page cache — valid_offset == file.size())
+    # so the guard `if (file.size() != valid_offset)` skips truncate
+    # entirely — the fault point is unreachable and the test would pass
+    # vacuously. Only degrade_C (orphaned BulkBegin) triggers truncation.
+    if failure == ResumeFailureClass.R1 and degrade.degrade_via != DegradeVia.C:
         return False
     return True
 
