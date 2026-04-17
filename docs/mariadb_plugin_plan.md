@@ -237,7 +237,9 @@ lookups, reverse PK range scan.
 **Gate:** full CRUD + PK point / range queries produce correct
 results, including under moderate concurrency.
 
-### Phase C — MariaDB-internal Layer 2 (`MariaDBTxn`)
+### Phase C — MariaDB-internal Layer 2 (`MariaDBTxn`) ✓
+
+**Status: Done.** Implemented with dual-structure write buffer (`ops_` log + `lookup_` map) preserving cross-key causality. 24 smoke tests pass (5 new transaction tests: BEGIN/COMMIT, BEGIN/ROLLBACK, RYOW, dup key within txn, autocommit).
 
 **Scope:** add statement-level and session-level atomicity using a
 custom, MariaDB-specific L2 built on top of the Layer 1 C API
