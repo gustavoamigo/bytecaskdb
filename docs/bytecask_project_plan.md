@@ -20,6 +20,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-102 | File format reference document | Created `docs/file_format.md` with full layout spec for `.data` and `.hint` files; added to README documentation table. |
 | BC-110 | MariaDB storage engine integration — design | Design doc (`docs/mariadb_engine_design.md`) and phased plan for `ha_bytecask` plugin. Branch: `feature/mariadb-engine`. |
 | BC-167 | C API: snapshot, WritePlan, apply_batch_if, vacuum, del_range | Expanded `bytecask_c.h` / `bytecask_c.cpp` with opaque handles for `Snapshot`, `WritePlan`, `apply_batch_if`, `vacuum`, and `del_range` (DB + WritePlan). MariaDB plugin `write_row` updated to use `apply_batch_if`. **Smoke test pending** — CMake build + MariaDB end-to-end (`mariadb/SMOKE_TEST.md`) not yet run. |
+| BC-191 | GitHub Actions CI for Python wheels | `build-wheels.yml` workflow builds Python wheels for Linux x86_64 (`manylinux_2_28`) and macOS (x86_64 + arm64) on Python 3.12 and 3.13. `scripts/build_wheel.sh` assembles wheels from xmake-built extension. `auditwheel`/`delocate` for platform repair. Wheels uploaded as GitHub Actions artifacts. `py.typed` marker + `__version__` added. |
 ## Backlog
 
 ### MariaDB Engine Integration
