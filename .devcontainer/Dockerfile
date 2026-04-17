@@ -24,6 +24,7 @@ RUN dnf install -y \
     mariadb-server \
     mariadb-devel \
     google-crc32c-devel \
+    python3-devel \
     && dnf clean all
 
 # Verify the environment
