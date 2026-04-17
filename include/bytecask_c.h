@@ -72,6 +72,13 @@ int bytecask_put(bytecask_db_t *db,
 int bytecask_del(bytecask_db_t *db, const uint8_t *key, size_t key_len,
                  int sync);
 
+// Deletes all keys in [from, to).  No-op if from >= to.
+// Returns 0 on success, -1 on error.
+int bytecask_del_range(bytecask_db_t *db,
+                       const uint8_t *from, size_t from_len,
+                       const uint8_t *to, size_t to_len,
+                       int sync);
+
 // ---------------------------------------------------------------------------
 // Read operations
 // ---------------------------------------------------------------------------
@@ -173,6 +180,11 @@ void bytecask_write_plan_put(bytecask_write_plan_t *plan,
 // Adds a delete operation to the plan.
 void bytecask_write_plan_del(bytecask_write_plan_t *plan,
                              const uint8_t *key, size_t key_len);
+
+// Adds a range delete operation to the plan: deletes all keys in [from, to).
+void bytecask_write_plan_del_range(bytecask_write_plan_t *plan,
+                                   const uint8_t *from, size_t from_len,
+                                   const uint8_t *to, size_t to_len);
 
 // Guard: key must exist at apply time.
 void bytecask_write_plan_ensure_present(bytecask_write_plan_t *plan,

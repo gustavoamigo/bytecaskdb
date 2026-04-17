@@ -75,6 +75,11 @@ struct PyBatch {
     batch->del(to_view(key));
   }
 
+  void del_range(nb::bytes from, nb::bytes to) {
+    check();
+    batch->del_range(to_view(from), to_view(to));
+  }
+
   auto take() -> bytecask::Batch {
     check();
     auto b = std::move(*batch);
@@ -111,6 +116,11 @@ struct PyWritePlan {
   void del(nb::bytes key) {
     check();
     plan->del(to_view(key));
+  }
+
+  void del_range(nb::bytes from, nb::bytes to) {
+    check();
+    plan->del_range(to_view(from), to_view(to));
   }
 
   void ensure_present(nb::bytes key) {
@@ -393,7 +403,8 @@ NB_MODULE(_bytecaskdb, m) {
   nb::class_<PyBatch>(m, "Batch")
       .def(nb::init<>())
       .def("put", &PyBatch::put, "key"_a, "value"_a)
-      .def("del_", &PyBatch::del, "key"_a);
+      .def("del_", &PyBatch::del, "key"_a)
+      .def("del_range", &PyBatch::del_range, "from_key"_a, "to_key"_a);
 
   // -------------------------------------------------------------------------
   // WritePlan
@@ -408,6 +419,7 @@ NB_MODULE(_bytecaskdb, m) {
            "snapshot"_a)
       .def("put", &PyWritePlan::put, "key"_a, "value"_a)
       .def("del_", &PyWritePlan::del, "key"_a)
+      .def("del_range", &PyWritePlan::del_range, "from_key"_a, "to_key"_a)
       .def("ensure_present", &PyWritePlan::ensure_present, "key"_a)
       .def("ensure_absent", &PyWritePlan::ensure_absent, "key"_a)
       .def("ensure_unchanged", &PyWritePlan::ensure_unchanged, "key"_a)
@@ -463,6 +475,17 @@ NB_MODULE(_bytecaskdb, m) {
             return self.db.del(wopts, k);
           },
           "key"_a, "opts"_a = nb::none())
+      .def(
+          "del_range",
+          [](PyDB &self, nb::bytes from_key, nb::bytes to_key,
+             std::optional<bytecask::WriteOptions> opts) {
+            auto f = to_view(from_key);
+            auto t = to_view(to_key);
+            auto wopts = opts.value_or(bytecask::WriteOptions{});
+            nb::gil_scoped_release release;
+            self.db.del_range(wopts, f, t);
+          },
+          "from_key"_a, "to_key"_a, "opts"_a = nb::none())
       .def(
           "contains_key",
           [](PyDB &self, nb::bytes key) -> bool {

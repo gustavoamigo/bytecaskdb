@@ -161,6 +161,27 @@ int bytecask_del(bytecask_db_t *db,
 }
 
 // ---------------------------------------------------------------------------
+// Del range
+// ---------------------------------------------------------------------------
+
+int bytecask_del_range(bytecask_db_t *db,
+                       const uint8_t *from, std::size_t from_len,
+                       const uint8_t *to, std::size_t to_len,
+                       int sync) {
+  clear_errmsg();
+  if (!db) { set_errmsg("null db handle"); return -1; }
+  try {
+    bytecask::WriteOptions opts;
+    opts.sync = (sync != 0);
+    db->db.del_range(opts, to_view(from, from_len), to_view(to, to_len));
+    return 0;
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return -1;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Get
 // ---------------------------------------------------------------------------
 
@@ -389,6 +410,13 @@ void bytecask_write_plan_del(bytecask_write_plan_t *plan,
                              const uint8_t *key, std::size_t key_len) {
   if (!plan) { return; }
   plan->plan.del(to_view(key, key_len));
+}
+
+void bytecask_write_plan_del_range(bytecask_write_plan_t *plan,
+                                   const uint8_t *from, std::size_t from_len,
+                                   const uint8_t *to, std::size_t to_len) {
+  if (!plan) { return; }
+  plan->plan.del_range(to_view(from, from_len), to_view(to, to_len));
 }
 
 void bytecask_write_plan_ensure_present(bytecask_write_plan_t *plan,
