@@ -26,8 +26,6 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-114 | Purge table keys on DROP TABLE | `ha_bytecaskdb::delete_table()` currently only removes the in-memory table_id mapping. Phase 1 follow-up: scan and `del()` all keys with the `[table_id]` prefix so storage is reclaimed. |
-| BC-115 | MariaDB Phase 2 — Basic CRUD + PK lookups | `delete_row`, `update_row`, `index_read` on PK, `store_lock` no-op, `external_lock` no-op. |
 | BC-116 | MariaDB Phase 3 — L2 Transaction + statement atomicity | Internal `MariaDBTxn` class on top of `snapshot()` + `apply_batch_if()`. `hton->commit/rollback`. OCC conflict → `HA_ERR_LOCK_DEADLOCK`. |
 | BC-117 | MariaDB Phase 4 — Secondary indexes | Key encoding `[index_id][sec_key][pk]`, atomic primary+secondary writes, `index_read/next/prev`. |
 | BC-118 | MariaDB Phase 5 — MVCC + lockless architecture | `HTON_MVCC`, `HTON_NO_LOCK_MANAGER`, `start_consistent_snapshot()`. |
@@ -58,6 +56,8 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-114 | Purge table keys on DROP TABLE | `delete_table()` upgraded from paginated point-delete loop to atomic `del_range` + catalog delete in a single `WritePlan`. O(1) disk I/O regardless of table size. |
+| BC-115 | MariaDB Phase 2 — Basic CRUD + PK lookups | `write_row` (with duplicate detection via `ensure_absent`), `update_row` (PK-changed and PK-unchanged), `delete_row`, full table scan (`rnd_init/next/end`), PK index access (`index_read`, `index_next`, `index_first`), `position`/`rnd_pos`. |
 | BC-190 | Causality proof tests | 10 new plan shapes (4 within-batch causality + 4 solo + 2 sequential overwrite) and 1 new state shape (`deleted_key` — tombstone in history) added to the proof test generator. Within-batch shapes target the same key for all operations; sequential shapes overwrite a pre-existing key across separate API calls. Combined with `rotation_threshold` state, this covers cross-file causality through recovery. Solo variants exercise the solo writer path. `expected_delta.py` rewritten with net-effect computation. `ExpectedDelta` extended with `expected_values` for value verification. Causality contract added to `CONTRACT.md`. 492 proof tests (was 148). 793 total tests pass. |
 | BC-187 | Range deletion (`del_range`) | `DB::del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append (O(1) disk I/O). New `EntryType::RangeDel = 0x05`: key = start_key, value = end_key. `Batch::del_range` and `WritePlan::del_range` for atomic batches and conditional writes. Hint file extended with trailing `[end_key_len: u16][end_key]` for RangeDel entries. Recovery (serial + parallel) tracks range tombstones and cross-applies during merge. Vacuum preserves range tombstones. `flush_hints_for` partitions RangeDel entries from point-entry dedup. 11 new tests including model-based recovery with range deletes. 443 tests pass. |
 | BC-185 | Runtime invariant checks on state publication | `store_state` refactored to accept old+new state; O(1) invariant checks (LSN, active_file_id, next_file_id monotonicity) run on every write in release. Debug builds add O(n) key_dir walk. Cold paths (`open`, `resume`) run full structural consistency check. On hot-path violation: degrade. On cold-path violation: throw. `CONTRACT.md` updated with Runtime Enforcement section. 4 new `[invariants]` tests. 432 tests pass. |
