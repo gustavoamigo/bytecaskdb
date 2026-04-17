@@ -1,0 +1,195 @@
+# SPDX-License-Identifier: MIT
+# Build Python wheels for bytecaskdb on Linux (manylinux_2_28) and macOS.
+#
+# Produces wheels as GitHub Actions artifacts. Download from the Actions tab.
+#
+# Linux builds run inside the manylinux container with LLVM 20.
+# macOS builds use Homebrew LLVM (latest, currently 20).
+
+name: Build Python wheels
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux x86_64 — manylinux_2_28
+  # ---------------------------------------------------------------------------
+  linux:
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    strategy:
+      matrix:
+        python: ["cp312-cp312", "cp313-cp313"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM toolchain
+        run: |
+          dnf module enable -y llvm-toolset:rhel8
+          dnf install -y \
+            clang clang-tools-extra llvm llvm-devel lld \
+            make ninja-build git cmake
+
+      - name: Install xmake
+        run: |
+          curl -fsSL https://xmake.io/shget.text | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Set up Python ${{ matrix.python }}
+        run: |
+          export PATH=/opt/python/${{ matrix.python }}/bin:$PATH
+          echo "/opt/python/${{ matrix.python }}/bin" >> $GITHUB_PATH
+          pip install nanobind pytest auditwheel
+
+      - name: Configure xmake
+        run: |
+          export XMAKE_ROOT=y
+          export RESOURCE_DIR=$(clang --print-resource-dir)
+          source ~/.xmake/profile
+          xmake f --toolchain=llvm \
+            --sdk=/usr/lib64/llvm20 \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            -y
+
+      - name: Build and test C++ engine
+        run: |
+          export XMAKE_ROOT=y
+          source ~/.xmake/profile
+          xmake build bytecask_tests
+          xmake run bytecask_tests
+
+      - name: Build Python extension
+        run: |
+          export XMAKE_ROOT=y
+          source ~/.xmake/profile
+          xmake build bytecaskdb_python
+
+      - name: Run Python tests
+        run: |
+          PYTHONPATH=bytecask-python python3 -m pytest bytecask-python/tests/ -v
+
+      - name: Build wheel
+        run: |
+          export XMAKE_ROOT=y
+          bash scripts/build_wheel.sh dist/raw
+
+      - name: Repair wheel (auditwheel)
+        run: |
+          mkdir -p dist/final
+          auditwheel repair dist/raw/*.whl -w dist/final --plat manylinux_2_28_x86_64
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-${{ matrix.python }}
+          path: dist/final/*.whl
+
+  # ---------------------------------------------------------------------------
+  # macOS x86_64
+  # ---------------------------------------------------------------------------
+  macos-x86_64:
+    runs-on: macos-13
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install LLVM and xmake
+        run: |
+          brew install llvm xmake
+
+      - name: Install Python dependencies
+        run: pip install nanobind pytest delocate
+
+      - name: Configure xmake
+        run: |
+          LLVM_PREFIX=$(brew --prefix llvm)
+          xmake f --toolchain=llvm --sdk="$LLVM_PREFIX" -y
+
+      - name: Build and test C++ engine
+        run: |
+          xmake build bytecask_tests
+          xmake run bytecask_tests
+
+      - name: Build Python extension
+        run: xmake build bytecaskdb_python
+
+      - name: Run Python tests
+        run: |
+          PYTHONPATH=bytecask-python python3 -m pytest bytecask-python/tests/ -v
+
+      - name: Build wheel
+        run: bash scripts/build_wheel.sh dist/raw
+
+      - name: Repair wheel (delocate)
+        run: |
+          mkdir -p dist/final
+          delocate-wheel -w dist/final dist/raw/*.whl
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-macos-x86_64-${{ matrix.python-version }}
+          path: dist/final/*.whl
+
+  # ---------------------------------------------------------------------------
+  # macOS arm64 (Apple Silicon)
+  # ---------------------------------------------------------------------------
+  macos-arm64:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install LLVM and xmake
+        run: |
+          brew install llvm xmake
+
+      - name: Install Python dependencies
+        run: pip install nanobind pytest delocate
+
+      - name: Configure xmake
+        run: |
+          LLVM_PREFIX=$(brew --prefix llvm)
+          xmake f --toolchain=llvm --sdk="$LLVM_PREFIX" -y
+
+      - name: Build and test C++ engine
+        run: |
+          xmake build bytecask_tests
+          xmake run bytecask_tests
+
+      - name: Build Python extension
+        run: xmake build bytecaskdb_python
+
+      - name: Run Python tests
+        run: |
+          PYTHONPATH=bytecask-python python3 -m pytest bytecask-python/tests/ -v
+
+      - name: Build wheel
+        run: bash scripts/build_wheel.sh dist/raw
+
+      - name: Repair wheel (delocate)
+        run: |
+          mkdir -p dist/final
+          delocate-wheel -w dist/final dist/raw/*.whl
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-macos-arm64-${{ matrix.python-version }}
+          path: dist/final/*.whl
