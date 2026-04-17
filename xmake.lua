@@ -1,12 +1,23 @@
 add_rules("mode.debug", "mode.release", "mode.releasedbg")
 
 add_requires("crc32c")
--- Test and benchmark dependencies — optional so `xmake build` (default targets)
--- doesn't download/build them unless the consuming target is explicitly built.
+-- Test dependency — optional so `xmake build` (default targets)
+-- doesn't download/build it unless the consuming target is explicitly built.
 add_requires("catch2 3.x", {optional = true})
-add_requires("benchmark", {optional = true})
-add_requires("leveldb", {optional = true})
-add_requires("rocksdb", {optional = true})
+
+-- Benchmark option: `xmake f --enable-benchmarks=true`
+-- Downloads benchmark, leveldb, and rocksdb only when enabled.
+option("enable-benchmarks")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Download and build benchmark dependencies (benchmark, leveldb, rocksdb)")
+option_end()
+
+if has_config("enable-benchmarks") then
+    add_requires("benchmark")
+    add_requires("leveldb")
+    add_requires("rocksdb")
+end
 
 -- Sanitizer option: `xmake f --sanitizer=address` or `--sanitizer=thread`
 option("sanitizer")
