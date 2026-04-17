@@ -69,7 +69,7 @@ jobs:
           xmake f --toolchain=llvm \
             --sdk=/usr/lib64/llvm20 \
             --cxflags="-resource-dir=${RESOURCE_DIR}" \
-            -y
+            -y -v
 
       - name: Build and test C++ engine
         run: |
@@ -129,7 +129,7 @@ jobs:
       - name: Configure xmake
         run: |
           LLVM_PREFIX=$(brew --prefix llvm)
-          xmake f --toolchain=llvm --sdk="$LLVM_PREFIX" -y
+          xmake f --toolchain=llvm --sdk="$LLVM_PREFIX" -y -v
 
       - name: Build and test C++ engine
         run: |
@@ -182,7 +182,7 @@ jobs:
       - name: Configure xmake
         run: |
           LLVM_PREFIX=$(brew --prefix llvm)
-          xmake f --toolchain=llvm --sdk="$LLVM_PREFIX" -y
+          xmake f --toolchain=llvm --sdk="$LLVM_PREFIX" -y -v
 
       - name: Build and test C++ engine
         run: |
