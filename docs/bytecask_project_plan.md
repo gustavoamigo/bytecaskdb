@@ -56,6 +56,8 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-185 | Runtime invariant checks on state publication | `store_state` refactored to accept old+new state; O(1) invariant checks (LSN, active_file_id, next_file_id monotonicity) run on every write in release. Debug builds add O(n) key_dir walk. Cold paths (`open`, `resume`) run full structural consistency check. On hot-path violation: degrade. On cold-path violation: throw. `CONTRACT.md` updated with Runtime Enforcement section. 4 new `[invariants]` tests. 432 tests pass. |
+| BC-186 | Fuzz data file and hint file parsers | Two buffer-level libFuzzer harnesses (`fuzz_data_entry`, `fuzz_hint_entry`) targeting `deserialize_entry` for both formats. Seed corpus generator (`gen_fuzz_corpus`) committed. Hint harness parses entries sequentially to exercise prefix compression. 3.7 M + 1.9 M executions in 60 s each, zero findings. `scripts/run_fuzz.sh` automates build and run. |
 | BC-171 | Clarify B1/B2/B3 collapse to same runtime behavior | Added note in `correctness_validation.md` making explicit that B1/B2/B3 are distinguished for modeling clarity only — the engine's runtime response is identical for all three. The distinction matters for reasoning about what `resume()` finds on disk, not the code path taken. |
 | BC-172 | Fix "lsn only" phrasing in Class Behavior Summary table | Changed F/G rows from "No — lsn only" to "No" under `key_dir changes` column. The LSN column already speaks for itself. |
 | BC-173 | Expand R1-filtered-for-degrade_H rationale | Expanded the one-liner into a self-contained explanation: `degrade_H` has no orphaned bytes (`file.size() == valid_offset`), so `resume()` skips truncation and the R1 fault point is unreachable. |
