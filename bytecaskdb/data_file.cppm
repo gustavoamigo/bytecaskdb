@@ -166,8 +166,14 @@ public:
     assert(!sealed_);
 
     static constexpr std::size_t kIovecsPerEntry = 4;
+#ifdef BYTECASK_TESTING
+    // Force multi-writev chunking so proof tests exercise the loop.
+    // A 5-entry large_batch becomes 3 writev calls (2+2+1).
+    static constexpr std::size_t kMaxEntriesPerWritev = 2;
+#else
     static constexpr std::size_t kMaxEntriesPerWritev =
         IOV_MAX / kIovecsPerEntry;
+#endif
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"

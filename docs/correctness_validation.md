@@ -794,6 +794,15 @@ evolvable. When a new failure class is identified, it is added to the
 matrix and all existing state shapes and plan shapes are automatically
 covered against it.
 
+`DataFile::append_entries` batches entries into `writev()` calls of up
+to `kMaxEntriesPerWritev` entries each. In production this is
+`IOV_MAX / 4` (256 entries on Linux) — larger than any realistic batch.
+Under `BYTECASK_TESTING`, the limit is lowered to 2 so that multi-entry
+batches (4–5 entries including markers) require 2–3 `writev()` calls.
+This forces the chunking loop through the existing proof matrix without
+adding new test shapes — the B1/B2/B3 failure classes now exercise
+partial writes where the first chunk committed and a later chunk failed.
+
 The correctness baseline this produces is a ratchet. Any change
 to the engine that breaks a generated test is rejected. The
 baseline moves forward or stays still, never backward. This makes
