@@ -622,6 +622,30 @@ smoke testing not covered by the proof matrix:
   takes a snapshot while degraded, calls `resume()`, verifies the snapshot
   remains readable (pinned files not deleted) and post-resume writes succeed.
 
+### ThreadSanitizer (TSan)
+
+The full test suite (428 test cases, 1.5 M+ assertions) runs clean under
+Clang ThreadSanitizer with `halt_on_error=0 history_size=4`. TSan
+instruments every memory access and synchronization operation at compile
+time, detecting data races that don't manifest as visible bugs on the
+current hardware but will surface under different CPUs, kernel versions,
+or load patterns.
+
+Concurrency code paths exercised:
+
+| Code path | Mechanism |
+|-----------|-----------|
+| State publication | `atomic<shared_ptr<EngineState>>` store/load |
+| State timestamp | `atomic<int64_t>` relaxed load/store |
+| Degraded flag | `atomic<bool>` acquire/release |
+| Write serialization | `unique_ptr<mutex>` |
+| Group commit | mutex + condition_variable |
+| Background worker | mutex + condition_variable |
+| Radix tree refcount | `atomic<uint32_t>` intrusive refcount |
+| Edit tag counter | `atomic<uint64_t>` relaxed fetch_add |
+
+Run: `scripts/run_sanitizer.sh thread` (or `address` for ASan).
+
 ---
 
 ## Output Structure

@@ -9,6 +9,11 @@ COV_DIR="$PROJECT_DIR/coverage"
 rm -rf "$COV_DIR"
 mkdir -p "$COV_DIR/html"
 
+# Detect and export the Clang target triple so xmake.lua can pass --target=
+# to the linker. See scripts/run_sanitizer.sh for rationale.
+export CLANG_TARGET_TRIPLE
+CLANG_TARGET_TRIPLE="$(clang --print-target-triple)"
+
 # Configure and build with coverage instrumentation
 echo "==> Configuring with coverage..."
 xmake f --coverage=true -m debug -y

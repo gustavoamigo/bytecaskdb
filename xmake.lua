@@ -39,27 +39,23 @@ local common_flags = {
     "-Wno-decls-in-multiple-modules",
 }
 
--- Detect target triple dynamically
-local function get_target_triple()
-    local triple = os.iorunv("clang", {"--print-target-triple"})
-    return triple and triple:trim() or ""
-end
-
--- Detect target triple dynamically
-local function get_target_triple()
-    local triple = os.iorunv("clang", {"--print-target-triple"})
-    return triple and triple:trim() or ""
-end
-
 -- Apply sanitizer flags to a target if the option is set.
+-- When the CLANG_TARGET_TRIPLE environment variable is set (e.g. by
+-- scripts/run_sanitizer.sh), --target= is passed so the linker finds
+-- platform-specific sanitizer runtime libraries. Without it, Clang may
+-- default to a generic triple that doesn't match the OS's library layout
+-- (e.g. x86_64-unknown-linux-gnu vs x86_64-redhat-linux-gnu on Fedora).
 local function apply_sanitizer(t)
     local san = get_config("sanitizer")
     if san and san ~= "" then
-        local triple = get_target_triple()
-        t:add("cxflags", "--target=" .. triple, {force = true})
-        t:add("ldflags", "--target=" .. triple, {force = true})
+        local triple = os.getenv("CLANG_TARGET_TRIPLE")
+        local target_flag = triple and ("--target=" .. triple) or nil
         t:add("cxflags", "-fsanitize=" .. san, {force = true})
         t:add("ldflags", "-fsanitize=" .. san, {force = true})
+        if target_flag then
+            t:add("cxflags", target_flag, {force = true})
+            t:add("ldflags", target_flag, {force = true})
+        end
         if san == "address" then
             t:add("cxflags", "-fno-omit-frame-pointer", {force = true})
         end
@@ -70,11 +66,14 @@ end
 local function apply_coverage(t)
     local cov = get_config("coverage")
     if cov and cov ~= "" then
-        local triple = get_target_triple()
-        t:add("cxflags", "--target=" .. triple, {force = true})
-        t:add("ldflags", "--target=" .. triple, {force = true})
+        local triple = os.getenv("CLANG_TARGET_TRIPLE")
+        local target_flag = triple and ("--target=" .. triple) or nil
         t:add("cxflags", "-fprofile-instr-generate", "-fcoverage-mapping", {force = true})
         t:add("ldflags", "-fprofile-instr-generate", {force = true})
+        if target_flag then
+            t:add("cxflags", target_flag, {force = true})
+            t:add("ldflags", target_flag, {force = true})
+        end
     end
 end
 
