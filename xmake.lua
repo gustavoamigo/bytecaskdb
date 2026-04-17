@@ -37,15 +37,25 @@ local common_flags = {
     "-Wno-decls-in-multiple-modules",
 }
 
+-- Detect target triple dynamically
+local function get_target_triple()
+    local triple = os.iorunv("clang", {"--print-target-triple"})
+    return triple and triple:trim() or ""
+end
+
+-- Detect target triple dynamically
+local function get_target_triple()
+    local triple = os.iorunv("clang", {"--print-target-triple"})
+    return triple and triple:trim() or ""
+end
+
 -- Apply sanitizer flags to a target if the option is set.
 local function apply_sanitizer(t)
     local san = get_config("sanitizer")
     if san and san ~= "" then
-        -- Fedora ships compiler-rt under x86_64-redhat-linux-gnu; Clang's
-        -- default triple (x86_64-unknown-linux-gnu) doesn't match, so we
-        -- override it so the linker finds the sanitizer runtime libs.
-        t:add("cxflags", "--target=x86_64-redhat-linux-gnu", {force = true})
-        t:add("ldflags", "--target=x86_64-redhat-linux-gnu", {force = true})
+        local triple = get_target_triple()
+        t:add("cxflags", "--target=" .. triple, {force = true})
+        t:add("ldflags", "--target=" .. triple, {force = true})
         t:add("cxflags", "-fsanitize=" .. san, {force = true})
         t:add("ldflags", "-fsanitize=" .. san, {force = true})
         if san == "address" then
@@ -58,8 +68,9 @@ end
 local function apply_coverage(t)
     local cov = get_config("coverage")
     if cov and cov ~= "" then
-        t:add("cxflags", "--target=x86_64-redhat-linux-gnu", {force = true})
-        t:add("ldflags", "--target=x86_64-redhat-linux-gnu", {force = true})
+        local triple = get_target_triple()
+        t:add("cxflags", "--target=" .. triple, {force = true})
+        t:add("ldflags", "--target=" .. triple, {force = true})
         t:add("cxflags", "-fprofile-instr-generate", "-fcoverage-mapping", {force = true})
         t:add("ldflags", "-fprofile-instr-generate", {force = true})
     end
@@ -67,6 +78,7 @@ end
 
 -- Global defaults applied to all targets
 set_toolchains("clang")
+add_syslinks("pthread")
 set_languages("c++23")
 set_policy("build.c++.modules", true)
 add_cxflags(table.unpack(common_flags))
