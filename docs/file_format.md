@@ -55,13 +55,14 @@ Both file formats share the same entry type discriminant:
 | 0x02  | `Delete`    | Tombstone — the key is present, value is empty. |
 | 0x03  | `BulkBegin` | Start-of-batch marker — key and value are empty. |
 | 0x04  | `BulkEnd`   | End-of-batch marker — key and value are empty.  |
+| 0x05  | `RangeDel`  | Range tombstone — key is start_key, value is end_key. Deletes all keys in [start, end). |
 
 A zero byte in the `EntryType` field always means corrupt or uninitialized
 storage. No valid type maps to 0, so the scanner can detect truncated writes
 without a separate magic number.
 
 `BulkBegin` and `BulkEnd` appear only in data files. Hint files contain only
-`Put` and `Delete` entries.
+`Put`, `Delete`, and `RangeDel` entries.
 
 ---
 
@@ -100,7 +101,7 @@ Total entry size: `15 + key_size + value_size + 4` bytes.
 | 0      | 8    | `sequence`   | u64 LE | Globally monotonic, never 0 | Log Sequence Number (LSN) |
 | 8      | 1    | `entry_type` | u8     | One of the values in the EntryType table | Entry kind |
 | 9      | 2    | `key_size`   | u16 LE | 0 for `BulkBegin`/`BulkEnd`; 1–65535 otherwise | Key length in bytes |
-| 11     | 4    | `value_size` | u32 LE | 0 for `Delete`/`BulkBegin`/`BulkEnd` | Value length in bytes |
+| 11     | 4    | `value_size` | u32 LE | 0 for `Delete`/`BulkBegin`/`BulkEnd`; for `RangeDel`, holds `end_key` length | Value length in bytes |
 
 ### Trailing CRC
 
@@ -129,6 +130,16 @@ writes at `max_lsn + 1`.
 have empty key and value (`key_size = 0`, `value_size = 0`). A batch that is
 not closed by a matching `BulkEnd` before a crash is discarded entirely during
 recovery — no partial-batch entries enter the key directory.
+
+### Range Tombstone (RangeDel)
+
+A `RangeDel` entry reuses the standard entry layout. The `key` field holds the
+start key (inclusive bound) and the `value` field holds the end key (exclusive
+bound). The semantics are `[start, end)` — a key `k` is deleted iff
+`start <= k < end`.
+
+On disk: `entry_type = 0x05`, `key_size = start_key length`,
+`value_size = end_key length`. Entry size: `15 + start_key_size + end_key_size + 4` bytes.
 
 ### Size Constants
 
@@ -193,7 +204,7 @@ Total entry size: `24 + suffix_len` bytes.
 | Offset | Size | Field         | Type   | Description |
 |--------|------|---------------|--------|-------------|
 | 0      | 8    | `sequence`    | u64 LE | LSN copied from the data file entry |
-| 8      | 1    | `entry_type`  | u8     | `Put` (0x01) or `Delete` (0x02) only |
+| 8      | 1    | `entry_type`  | u8     | `Put` (0x01), `Delete` (0x02), or `RangeDel` (0x05) |
 | 9      | 8    | `file_offset` | u64 LE | Byte offset of the entry in the companion `.data` file |
 | 17     | 4    | `value_size`  | u32 LE | Value length in bytes (0 for `Delete`) |
 | 21     | 1    | `prefix_len`  | u8     | Bytes shared with the previous entry's key (0 for the first entry; capped at 255) |
@@ -234,6 +245,24 @@ discards the hint file and regenerates it from the raw data file during recovery
 |-------------------|-------|---------|
 | `kHintHeaderSize` | 24    | Fixed header fields per entry |
 | File trailer      | 4     | CRC-32C trailer (one per file, not per entry) |
+
+### RangeDel Hint Entry Extension
+
+When `entry_type == RangeDel` (0x05), the hint entry appends the full end key
+after the start key suffix:
+
+```
+ [normal hint header: 24 bytes]
+ [start_key suffix:   suffix_len bytes]     ← prefix-compressed as usual
+ [end_key_len:        u16 LE, 2 bytes]      ← stored in full, no prefix compression
+ [end_key:            end_key_len bytes]
+```
+
+The `value_size` field in the hint header holds the end key length (same as in
+the data file). The end key is stored uncompressed because it bears no
+prefix relationship with the start key.
+
+Total RangeDel hint entry size: `24 + suffix_len + 2 + end_key_len` bytes.
 
 ---
 

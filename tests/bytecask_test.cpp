@@ -3963,3 +3963,544 @@ TEST_CASE("apply_resume: multiple entries replayed in order",
 }
 
 #endif
+
+// ---------------------------------------------------------------------------
+// del_range tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("del_range deletes keys in range and leaves others",
+          "[bytecask][del_range]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+  db.put({}, to_bytes("c"), to_bytes("3"));
+  db.put({}, to_bytes("d"), to_bytes("4"));
+  db.put({}, to_bytes("e"), to_bytes("5"));
+
+  // Delete [b, d) — should remove b and c, leave a, d, e.
+  db.del_range({}, to_bytes("b"), to_bytes("d"));
+
+  bytecask::Bytes out;
+  CHECK(db.get({}, to_bytes("a"), out));
+  CHECK_FALSE(db.get({}, to_bytes("b"), out));
+  CHECK_FALSE(db.get({}, to_bytes("c"), out));
+  CHECK(db.get({}, to_bytes("d"), out));
+  CHECK(db.get({}, to_bytes("e"), out));
+}
+
+TEST_CASE("del_range is a no-op when from >= to",
+          "[bytecask][del_range]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+
+  bytecask::Bytes out;
+
+  // from == to: no-op
+  db.del_range({}, to_bytes("a"), to_bytes("a"));
+  CHECK(db.get({}, to_bytes("a"), out));
+
+  // from > to: no-op
+  db.del_range({}, to_bytes("z"), to_bytes("a"));
+  CHECK(db.get({}, to_bytes("a"), out));
+  CHECK(db.get({}, to_bytes("b"), out));
+}
+
+TEST_CASE("del_range with no matching keys still writes entry",
+          "[bytecask][del_range]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("z"), to_bytes("2"));
+
+  // Range [m, n) covers no keys — entry written but no keys erased.
+  db.del_range({}, to_bytes("m"), to_bytes("n"));
+
+  bytecask::Bytes out;
+  CHECK(db.get({}, to_bytes("a"), out));
+  CHECK(db.get({}, to_bytes("z"), out));
+}
+
+TEST_CASE("del_range in batch combined with puts and deletes",
+          "[bytecask][del_range]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+  db.put({}, to_bytes("c"), to_bytes("3"));
+  db.put({}, to_bytes("d"), to_bytes("4"));
+
+  bytecask::Batch batch;
+  batch.put(to_bytes("e"), to_bytes("5"));
+  batch.del_range(to_bytes("b"), to_bytes("d"));
+  batch.del(to_bytes("a"));
+  db.apply_batch({}, std::move(batch));
+
+  bytecask::Bytes out;
+  CHECK_FALSE(db.get({}, to_bytes("a"), out));
+  CHECK_FALSE(db.get({}, to_bytes("b"), out));
+  CHECK_FALSE(db.get({}, to_bytes("c"), out));
+  CHECK(db.get({}, to_bytes("d"), out));
+  CHECK(db.get({}, to_bytes("e"), out));
+}
+
+TEST_CASE("del_range in WritePlan with guards",
+          "[bytecask][del_range]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+  db.put({}, to_bytes("c"), to_bytes("3"));
+
+  auto snap = db.snapshot();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.del_range(to_bytes("a"), to_bytes("c"));
+  plan.put(to_bytes("d"), to_bytes("4"));
+
+  CHECK(db.apply_batch_if({}, std::move(plan)));
+
+  bytecask::Bytes out;
+  CHECK_FALSE(db.get({}, to_bytes("a"), out));
+  CHECK_FALSE(db.get({}, to_bytes("b"), out));
+  CHECK(db.get({}, to_bytes("c"), out));
+  CHECK(db.get({}, to_bytes("d"), out));
+}
+
+TEST_CASE("del_range followed by put on same key — put wins",
+          "[bytecask][del_range]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("old"));
+  db.del_range({}, to_bytes("a"), to_bytes("b"));
+  db.put({}, to_bytes("a"), to_bytes("new"));
+
+  bytecask::Bytes out;
+  REQUIRE(db.get({}, to_bytes("a"), out));
+  CHECK(to_string(out) == "new");
+}
+
+TEST_CASE("del_range survives recovery",
+          "[bytecask][del_range][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+    db.put({}, to_bytes("a"), to_bytes("1"));
+    db.put({}, to_bytes("b"), to_bytes("2"));
+    db.put({}, to_bytes("c"), to_bytes("3"));
+    db.put({}, to_bytes("d"), to_bytes("4"));
+    db.del_range({}, to_bytes("b"), to_bytes("d"));
+    // Put after range delete — must survive.
+    db.put({}, to_bytes("b"), to_bytes("new_b"));
+  }
+
+  auto collect = [](bytecask::DB &db) {
+    std::map<std::string, std::string> kv;
+    for (auto [key, val] : db.iter_from({})) {
+      kv[to_string(key)] = to_string(val);
+    }
+    return kv;
+  };
+
+  // Serial recovery.
+  {
+    const auto p = td.path / "s1";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1,
+                                      .recovery_threads = 1});
+    auto kv = collect(db);
+    CHECK(kv.count("a") == 1);
+    CHECK(kv.count("b") == 1);
+    CHECK(kv["b"] == "new_b");
+    CHECK(kv.count("c") == 0);
+    CHECK(kv.count("d") == 1);
+  }
+
+  // Parallel recovery.
+  {
+    const auto p = td.path / "p2";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1,
+                                      .recovery_threads = 4});
+    auto kv = collect(db);
+    CHECK(kv.count("a") == 1);
+    CHECK(kv.count("b") == 1);
+    CHECK(kv["b"] == "new_b");
+    CHECK(kv.count("c") == 0);
+    CHECK(kv.count("d") == 1);
+  }
+}
+
+TEST_CASE("del_range survives vacuum",
+          "[bytecask][del_range][vacuum]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+
+  // Create some keys.
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+  db.put({}, to_bytes("c"), to_bytes("3"));
+
+  // Range delete to create tombstone.
+  db.del_range({}, to_bytes("a"), to_bytes("c"));
+
+  // Vacuum to compact files.
+  while (db.vacuum()) {}
+
+  bytecask::Bytes out;
+  CHECK_FALSE(db.get({}, to_bytes("a"), out));
+  CHECK_FALSE(db.get({}, to_bytes("b"), out));
+  CHECK(db.get({}, to_bytes("c"), out));
+}
+
+TEST_CASE("ensure_unchanged detects concurrent del_range",
+          "[bytecask][del_range][guards]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+  db.put({}, to_bytes("c"), to_bytes("3"));
+
+  auto snap = db.snapshot();
+
+  // Concurrent range delete.
+  db.del_range({}, to_bytes("a"), to_bytes("c"));
+
+  // Plan with ensure_unchanged on a key that was range-deleted.
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("b"));
+  plan.put(to_bytes("x"), to_bytes("new"));
+
+  CHECK_FALSE(db.apply_batch_if({}, std::move(plan)));
+}
+
+TEST_CASE("ensure_range_unchanged detects concurrent del_range",
+          "[bytecask][del_range][guards]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+
+  auto snap = db.snapshot();
+
+  // Concurrent range delete.
+  db.del_range({}, to_bytes("a"), to_bytes("b"));
+
+  // Plan guarding the range that was modified.
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_range_unchanged(to_bytes("a"), to_bytes("c"));
+  plan.put(to_bytes("x"), to_bytes("new"));
+
+  CHECK_FALSE(db.apply_batch_if({}, std::move(plan)));
+}
+
+// ---------------------------------------------------------------------------
+// Causality: operation order within a batch/plan must be preserved
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Batch: put then del_range — put is killed",
+          "[bytecask][del_range][causality]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  bytecask::Batch batch;
+  batch.put(to_bytes("key"), to_bytes("val"));
+  batch.del_range(to_bytes("a"), to_bytes("z"));
+  db.apply_batch({}, std::move(batch));
+
+  CHECK_FALSE(db.contains_key(to_bytes("key")));
+}
+
+TEST_CASE("Batch: del_range then put — put survives",
+          "[bytecask][del_range][causality]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // Pre-populate so del_range has something to delete.
+  db.put({}, to_bytes("key"), to_bytes("old"));
+
+  bytecask::Batch batch;
+  batch.del_range(to_bytes("a"), to_bytes("z"));
+  batch.put(to_bytes("key"), to_bytes("new"));
+  db.apply_batch({}, std::move(batch));
+
+  bytecask::Bytes out;
+  REQUIRE(db.get({}, to_bytes("key"), out));
+  CHECK(to_string(out) == "new");
+}
+
+TEST_CASE("WritePlan: put then del_range — put is killed",
+          "[bytecask][del_range][causality]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("key"), to_bytes("val"));
+  plan.del_range(to_bytes("a"), to_bytes("z"));
+  (void)db.apply_batch_if({}, std::move(plan));
+
+  CHECK_FALSE(db.contains_key(to_bytes("key")));
+}
+
+TEST_CASE("WritePlan: del_range then put — put survives",
+          "[bytecask][del_range][causality]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("key"), to_bytes("old"));
+
+  bytecask::WritePlan plan;
+  plan.del_range(to_bytes("a"), to_bytes("z"));
+  plan.put(to_bytes("key"), to_bytes("new"));
+  (void)db.apply_batch_if({}, std::move(plan));
+
+  bytecask::Bytes out;
+  REQUIRE(db.get({}, to_bytes("key"), out));
+  CHECK(to_string(out) == "new");
+}
+
+TEST_CASE("Batch: interleaved puts and del_range — correct causality",
+          "[bytecask][del_range][causality]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  bytecask::Batch batch;
+  batch.put(to_bytes("a"), to_bytes("1"));
+  batch.del_range(to_bytes("a"), to_bytes("z"));
+  batch.put(to_bytes("b"), to_bytes("2"));
+  db.apply_batch({}, std::move(batch));
+
+  CHECK_FALSE(db.contains_key(to_bytes("a"))); // killed by del_range
+  bytecask::Bytes out;
+  REQUIRE(db.get({}, to_bytes("b"), out));      // survives — after del_range
+  CHECK(to_string(out) == "2");
+}
+
+TEST_CASE("Causality survives recovery",
+          "[bytecask][del_range][causality][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::DB::open(db_path);
+
+    // Batch 1: del_range then put — put should survive.
+    bytecask::Batch b1;
+    b1.del_range(to_bytes("a"), to_bytes("z"));
+    b1.put(to_bytes("key:surv"), to_bytes("alive"));
+    db.apply_batch({}, std::move(b1));
+
+    // Batch 2: put then del_range — put should be killed.
+    bytecask::Batch b2;
+    b2.put(to_bytes("key:dead"), to_bytes("doomed"));
+    b2.del_range(to_bytes("key:d"), to_bytes("key:e"));
+    db.apply_batch({}, std::move(b2));
+  }
+
+  SECTION("serial recovery") {
+    auto db = bytecask::DB::open(db_path, {.recovery_threads = 1});
+    bytecask::Bytes out;
+    REQUIRE(db.get({}, to_bytes("key:surv"), out));
+    CHECK(to_string(out) == "alive");
+    CHECK_FALSE(db.contains_key(to_bytes("key:dead")));
+  }
+
+  SECTION("parallel recovery") {
+    auto db = bytecask::DB::open(db_path, {.recovery_threads = 4});
+    bytecask::Bytes out;
+    REQUIRE(db.get({}, to_bytes("key:surv"), out));
+    CHECK(to_string(out) == "alive");
+    CHECK_FALSE(db.contains_key(to_bytes("key:dead")));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Model-based recovery with range deletes
+// ---------------------------------------------------------------------------
+TEST_CASE("Recovery model-based: workload with range deletes",
+          "[bytecask][recovery][parallel][model]") {
+  std::mt19937 gen(77777);
+
+  auto rand_key = [&]() -> std::string {
+    static constexpr std::string_view alphabet = "mnopqr";
+    const auto len = std::uniform_int_distribution<int>(1, 5)(gen);
+    std::string k;
+    for (int i = 0; i < len; ++i) {
+      k += alphabet[static_cast<std::size_t>(std::uniform_int_distribution<int>(
+          0, static_cast<int>(alphabet.size()) - 1)(gen))];
+    }
+    return k;
+  };
+
+  auto rand_value = [&]() -> std::string {
+    const auto len = std::uniform_int_distribution<int>(1, 32)(gen);
+    std::string v(static_cast<std::size_t>(len), 'R');
+    for (auto &c : v) {
+      c = static_cast<char>(
+          std::uniform_int_distribution<int>('A', 'z')(gen));
+    }
+    return v;
+  };
+
+  TempDir td;
+  const auto db_path = td.path / "db";
+  std::map<std::string, std::string> oracle;
+
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+
+    constexpr int kOps = 2000;
+    for (int i = 0; i < kOps; ++i) {
+      const auto op = std::uniform_int_distribution<int>(0, 9)(gen);
+
+      if (op < 4) {
+        // 40% put
+        auto key = rand_key();
+        auto val = rand_value();
+        db.put({}, to_bytes(key), to_bytes(val));
+        oracle[key] = val;
+      } else if (op < 6) {
+        // 20% delete
+        auto key = rand_key();
+        std::ignore = db.del({}, to_bytes(key));
+        oracle.erase(key);
+      } else if (op < 8) {
+        // 20% batch with causality-sensitive ordering
+        auto from = rand_key();
+        auto to_key = rand_key();
+        if (from > to_key) std::swap(from, to_key);
+        if (from == to_key) to_key += "~";
+
+        auto put_key = rand_key();
+        auto put_val = rand_value();
+
+        // Alternate: half put-then-del_range, half del_range-then-put.
+        const bool put_first = (i % 2 == 0);
+
+        bytecask::Batch batch;
+        if (put_first) {
+          batch.put(to_bytes(put_key), to_bytes(put_val));
+          batch.del_range(to_bytes(from), to_bytes(to_key));
+        } else {
+          batch.del_range(to_bytes(from), to_bytes(to_key));
+          batch.put(to_bytes(put_key), to_bytes(put_val));
+        }
+        db.apply_batch({}, std::move(batch));
+
+        // Mirror to oracle in the same order.
+        if (put_first) {
+          oracle[put_key] = put_val;
+          auto it = oracle.lower_bound(from);
+          while (it != oracle.end() && it->first < to_key) {
+            it = oracle.erase(it);
+          }
+        } else {
+          auto it = oracle.lower_bound(from);
+          while (it != oracle.end() && it->first < to_key) {
+            it = oracle.erase(it);
+          }
+          oracle[put_key] = put_val;
+        }
+      } else {
+        // 20% standalone range delete
+        auto from = rand_key();
+        auto to_key = rand_key();
+        if (from > to_key) std::swap(from, to_key);
+        if (from == to_key) to_key += "~";
+        db.del_range({}, to_bytes(from), to_bytes(to_key));
+        auto it = oracle.lower_bound(from);
+        while (it != oracle.end() && it->first < to_key) {
+          it = oracle.erase(it);
+        }
+      }
+    }
+  }
+
+  auto collect = [](bytecask::DB &db) {
+    std::map<std::string, std::string> kv;
+    for (auto [key, val] : db.iter_from({})) {
+      kv[to_string(key)] = to_string(val);
+    }
+    return kv;
+  };
+
+  auto verify = [&](const std::string &label,
+                    const std::map<std::string, std::string> &recovered) {
+    INFO(label);
+    REQUIRE(recovered.size() == oracle.size());
+    for (const auto &[k, v] : oracle) {
+      INFO("key=\"" << k << "\"");
+      auto it = recovered.find(k);
+      REQUIRE(it != recovered.end());
+      CHECK(it->second == v);
+    }
+  };
+
+  auto collect_stats = [](bytecask::DB &db) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> vals;
+    for (const auto &[fid, fs] : db.file_stats()) {
+      vals.emplace_back(fs.live_bytes, fs.total_bytes);
+    }
+    std::ranges::sort(vals);
+    return vals;
+  };
+
+  int data_file_count = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".data")
+      ++data_file_count;
+  }
+  REQUIRE(data_file_count > 1);
+
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> serial_stats_vals;
+  {
+    const auto serial_path = td.path / "serial_baseline";
+    std::filesystem::copy(db_path, serial_path,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(serial_path, {.max_file_bytes = 1, .recovery_threads = 1});
+    verify("serial_baseline", collect(db));
+    serial_stats_vals = collect_stats(db);
+  }
+
+  SECTION("serial recovery") {
+    const auto p = td.path / "s1";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 1});
+    verify("serial", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
+  }
+
+  SECTION("parallel recovery (2 workers)") {
+    const auto p = td.path / "p2";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 2});
+    verify("parallel/2", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
+  }
+
+  SECTION("parallel recovery (W = file count)") {
+    const auto p = td.path / "pmax";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(
+        p, {.max_file_bytes = 1,
+            .recovery_threads = static_cast<unsigned>(data_file_count)});
+    verify("parallel/max", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
+  }
+}

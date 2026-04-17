@@ -111,11 +111,11 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
       plan.snap_ ? plan.snap_->state_.get() : nullptr;
 
   // 1. Point guards.
-  for (const auto &[key, action] : plan.actions_) {
+  for (const auto &[key, guard] : plan.guards_) {
     const std::span<const std::byte> key_span{key};
     const auto cur_entry = key_dir_.get(key_span);
 
-    switch (action.precondition) {
+    switch (guard.precondition) {
     case WritePlan::Precondition::MustExist:
       if (!cur_entry) return false;
       break;
@@ -161,9 +161,23 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
 
   // 3. Implicit W-W check on all write keys (only when snapshot present).
   if (snap_state) {
-    for (const auto &[key, action] : plan.actions_) {
-      if (action.write == WritePlan::Write::None) continue;
-      const std::span<const std::byte> key_span{key};
+    for (const auto &w : plan.writes_) {
+      const std::byte *key_data = nullptr;
+      std::size_t key_len = 0;
+      std::visit(
+          [&](const auto &op) {
+            using T = std::decay_t<decltype(op)>;
+            if constexpr (std::is_same_v<T, WritePlan::PointPut>) {
+              key_data = op.key.data();
+              key_len = op.key.size();
+            } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
+              key_data = op.key.data();
+              key_len = op.key.size();
+            }
+          },
+          w);
+      if (!key_data) continue; // RangeDel — skip
+      const std::span<const std::byte> key_span{key_data, key_len};
       const auto snap_entry = snap_state->key_dir.get(key_span);
       const auto cur_entry = key_dir_.get(key_span);
       const bool appeared = !snap_entry && cur_entry;
@@ -193,15 +207,27 @@ auto TransientEngineState::prepare_write(const WritePlan &plan) const
     entries.push_back({lsn++, EntryType::BulkBegin, {}, {}});
   }
 
-  for (const auto &[key, action] : plan.actions_) {
-    const std::span<const std::byte> key_span{key};
-    if (action.write == WritePlan::Write::Put) {
-      entries.push_back(
-          {lsn++, EntryType::Put, key_span,
-           std::span<const std::byte>{action.value}});
-    } else if (action.write == WritePlan::Write::Del) {
-      entries.push_back({lsn++, EntryType::Delete, key_span, {}});
-    }
+  for (const auto &w : plan.writes_) {
+    std::visit(
+        [&entries, &lsn](const auto &op) {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (std::is_same_v<T, WritePlan::PointPut>) {
+            entries.push_back(
+                {lsn++, EntryType::Put,
+                 std::span<const std::byte>{op.key},
+                 std::span<const std::byte>{op.value}});
+          } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
+            entries.push_back(
+                {lsn++, EntryType::Delete,
+                 std::span<const std::byte>{op.key}, {}});
+          } else {
+            entries.push_back(
+                {lsn++, EntryType::RangeDel,
+                 std::span<const std::byte>{op.from},
+                 std::span<const std::byte>{op.to}});
+          }
+        },
+        w);
   }
 
   if (multi) {
@@ -226,39 +252,80 @@ void TransientEngineState::apply_writes(
     ++io_idx;
   }
 
-  for (const auto &[key, action] : plan.actions_) {
-    const std::span<const std::byte> key_span{key};
-    if (action.write == WritePlan::Write::Put) {
-      const auto existing = key_dir_.get(key_span);
-      if (existing) {
-        const auto dec = entry_size(key_span.size(), existing->value_size);
-        const auto ef = existing->file_id;
-        file_stats_.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
-      }
-      const auto val_size = narrow<std::uint32_t>(action.value.size());
-      const auto sz = entry_size(key_span.size(), val_size);
-      file_stats_.update(active_file_id_, [sz](FileStats &fs) {
-        fs.live_bytes += sz;
-        fs.total_bytes += sz;
-      });
-      key_dir_.set(key_span, KeyDirEntry{next_lsn_, active_file_id_,
-                                          offsets[io_idx], val_size});
-      ++next_lsn_;
-      ++io_idx;
-    } else if (action.write == WritePlan::Write::Del) {
-      const auto existing = key_dir_.get(key_span);
-      if (existing) {
-        const auto dec = entry_size(key_span.size(), existing->value_size);
-        const auto ef = existing->file_id;
-        file_stats_.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
-      }
-      const auto del_sz = entry_size(key_span.size(), 0);
-      file_stats_.update(active_file_id_,
-                         [del_sz](FileStats &fs) { fs.total_bytes += del_sz; });
-      key_dir_.erase(key_span);
-      ++next_lsn_;
-      ++io_idx;
-    }
+  for (const auto &w : plan.writes_) {
+    std::visit(
+        [&](const auto &op) {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (std::is_same_v<T, WritePlan::PointPut>) {
+            const std::span<const std::byte> key_span{op.key};
+            const auto existing = key_dir_.get(key_span);
+            if (existing) {
+              const auto dec =
+                  entry_size(key_span.size(), existing->value_size);
+              const auto ef = existing->file_id;
+              file_stats_.update(
+                  ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+            }
+            const auto val_size = narrow<std::uint32_t>(op.value.size());
+            const auto sz = entry_size(key_span.size(), val_size);
+            file_stats_.update(active_file_id_, [sz](FileStats &fs) {
+              fs.live_bytes += sz;
+              fs.total_bytes += sz;
+            });
+            key_dir_.set(key_span, KeyDirEntry{next_lsn_, active_file_id_,
+                                                offsets[io_idx], val_size});
+            ++next_lsn_;
+            ++io_idx;
+          } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
+            const std::span<const std::byte> key_span{op.key};
+            const auto existing = key_dir_.get(key_span);
+            if (existing) {
+              const auto dec =
+                  entry_size(key_span.size(), existing->value_size);
+              const auto ef = existing->file_id;
+              file_stats_.update(
+                  ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+            }
+            const auto del_sz = entry_size(key_span.size(), 0);
+            file_stats_.update(active_file_id_, [del_sz](FileStats &fs) {
+              fs.total_bytes += del_sz;
+            });
+            key_dir_.erase(key_span);
+            ++next_lsn_;
+            ++io_idx;
+          } else {
+            // RangeDel: iterate key_dir in [from, to), decrement live_bytes
+            // on each affected file, erase from key_dir, then account for
+            // the entry itself (total_bytes only — tombstones are not live).
+            const std::span<const std::byte> from_span{op.from};
+            const std::span<const std::byte> to_span{op.to};
+
+            // Collect keys to erase — cannot erase during iteration.
+            std::vector<Key> to_erase;
+            for (auto it = key_dir_.lower_bound(from_span);
+                 it != std::default_sentinel; ++it) {
+              auto [key_span, entry] = *it;
+              if (Key{key_span} >= Key{to_span}) break;
+              const auto dec =
+                  entry_size(key_span.size(), entry.value_size);
+              const auto ef = entry.file_id;
+              file_stats_.update(
+                  ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+              to_erase.emplace_back(key_span);
+            }
+            for (const auto &k : to_erase) {
+              key_dir_.erase(std::span<const std::byte>{k});
+            }
+
+            const auto rd_sz = entry_size(op.from.size(), op.to.size());
+            file_stats_.update(active_file_id_, [rd_sz](FileStats &fs) {
+              fs.total_bytes += rd_sz;
+            });
+            ++next_lsn_;
+            ++io_idx;
+          }
+        },
+        w);
   }
 
   // Account for BulkEnd marker.
@@ -521,6 +588,13 @@ auto DB::del(const WriteOptions &opts, BytesView key) -> bool {
   return apply_batch_if(opts, std::move(plan));
 }
 
+void DB::del_range(const WriteOptions &opts, BytesView from, BytesView to) {
+  if (Key{from} >= Key{to}) return;
+  WritePlan plan;
+  plan.del_range(from, to);
+  (void)apply_batch_if(opts, std::move(plan));
+}
+
 auto DB::contains_key(BytesView key) const -> bool {
   auto s = load_state_for_read(ReadOptions{});
   return s->key_dir.contains(key);
@@ -538,6 +612,9 @@ void DB::apply_batch(const WriteOptions &opts, Batch batch) {
                      std::span<const std::byte>{o.value});
           } else if constexpr (std::is_same_v<T, BatchRemove>) {
             plan.del(std::span<const std::byte>{o.key});
+          } else if constexpr (std::is_same_v<T, BatchRangeDel>) {
+            plan.del_range(std::span<const std::byte>{o.from},
+                           std::span<const std::byte>{o.to});
           }
         },
         op);
@@ -940,6 +1017,7 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
     std::uint64_t file_off;
     std::uint32_t val_size;
     std::vector<std::byte> key;
+    std::vector<std::byte> end_key; // non-empty only for RangeDel
   };
 
   auto hint = HintFile::OpenForWrite(tmp_path);
@@ -969,11 +1047,22 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
         if (in_batch) {
           pending.push_back({entry.sequence, entry.entry_type, entry_off,
                              narrow<std::uint32_t>(entry.value.size()),
-                             entry.key});
+                             entry.key, {}});
         } else {
           all_hints.push_back({entry.sequence, entry.entry_type, entry_off,
                                narrow<std::uint32_t>(entry.value.size()),
-                               entry.key});
+                               entry.key, {}});
+        }
+        break;
+      case EntryType::RangeDel:
+        if (in_batch) {
+          pending.push_back({entry.sequence, EntryType::RangeDel, entry_off,
+                             narrow<std::uint32_t>(entry.value.size()),
+                             entry.key, entry.value});
+        } else {
+          all_hints.push_back({entry.sequence, EntryType::RangeDel, entry_off,
+                               narrow<std::uint32_t>(entry.value.size()),
+                               entry.key, entry.value});
         }
         break;
       }
@@ -993,7 +1082,17 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
               << " while generating hint file\n";
   }
 
-  // Sort by key asc; within equal keys, seq desc so first entry = authoritative.
+  // Partition: RangeDel entries must not participate in point-entry dedup
+  // (a RangeDel with start_key "user:" must not dedup with a Put for "user:").
+  auto range_del_begin = std::stable_partition(
+      all_hints.begin(), all_hints.end(),
+      [](const PendingHint &h) { return h.type != EntryType::RangeDel; });
+  std::vector<PendingHint> range_hints(
+      std::make_move_iterator(range_del_begin),
+      std::make_move_iterator(all_hints.end()));
+  all_hints.erase(range_del_begin, all_hints.end());
+
+  // Sort point entries by key asc; within equal keys, seq desc so first = authoritative.
   std::ranges::sort(all_hints, [](const auto &a, const auto &b) {
     return a.key < b.key || (a.key == b.key && a.seq > b.seq);
   });
@@ -1003,8 +1102,33 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
   }).begin();
   all_hints.erase(tail, all_hints.end());
 
-  for (const auto &pe : all_hints) {
-    hint.append(pe.seq, pe.type, pe.file_off, pe.key, pe.val_size);
+  // Sort range hints by start_key for prefix compression benefit.
+  std::ranges::sort(range_hints, [](const auto &a, const auto &b) {
+    return a.key < b.key || (a.key == b.key && a.seq > b.seq);
+  });
+
+  // Merge point and range entries into sorted key order for prefix compression.
+  // Range entries are interleaved by start_key.
+  std::vector<PendingHint> merged;
+  merged.reserve(all_hints.size() + range_hints.size());
+  auto pi = all_hints.begin();
+  auto ri = range_hints.begin();
+  while (pi != all_hints.end() && ri != range_hints.end()) {
+    if (pi->key <= ri->key) {
+      merged.push_back(std::move(*pi++));
+    } else {
+      merged.push_back(std::move(*ri++));
+    }
+  }
+  while (pi != all_hints.end()) merged.push_back(std::move(*pi++));
+  while (ri != range_hints.end()) merged.push_back(std::move(*ri++));
+
+  for (const auto &pe : merged) {
+    if (pe.type == EntryType::RangeDel) {
+      hint.append_range_del(pe.seq, pe.file_off, pe.key, pe.end_key);
+    } else {
+      hint.append(pe.seq, pe.type, pe.file_off, pe.key, pe.val_size);
+    }
   }
   hint.sync();
   std::filesystem::rename(tmp_path, hint_path);
@@ -1073,6 +1197,13 @@ auto DB::vacuum_scan_and_copy(
       result.total_bytes += entry_size(entry.key.size(), 0);
       break;
     }
+    case EntryType::RangeDel: {
+      std::ignore =
+          dest_file.append_entry(entry.sequence, EntryType::RangeDel,
+                                 entry.key, entry.value);
+      result.total_bytes += entry_size(entry.key.size(), entry.value.size());
+      break;
+    }
     case EntryType::BulkBegin:
     case EntryType::BulkEnd:
       break;
@@ -1098,6 +1229,7 @@ auto DB::vacuum_scan_and_copy(
       break;
     case EntryType::Put:
     case EntryType::Delete:
+    case EntryType::RangeDel:
       if (in_batch) {
         pending.push_back({entry, entry_off});
       } else {
@@ -1276,7 +1408,8 @@ void DB::resume() {
           pending.clear();
           break;
         case EntryType::Put:
-        case EntryType::Delete: {
+        case EntryType::Delete:
+        case EntryType::RangeDel: {
           ResumeEntry re{entry.sequence, entry.entry_type, entry_off,
                          narrow<std::uint32_t>(entry.value.size()),
                          entry.key};
@@ -1528,6 +1661,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
   std::uint64_t max_lsn = 0;
   auto t = PersistentRadixTree<KeyDirEntry>{}.transient();
   std::map<Key, std::uint64_t> tombstones;
+  std::vector<RangeTombstone> range_tombstones;
   auto fstats_t = PersistentU32Map<FileStats>{}.transient();
 
   for (const auto &rf : files) {
@@ -1553,6 +1687,18 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
             if (he->sequence > max_lsn) max_lsn = he->sequence;
             continue;
           }
+          // Check range tombstones — O(R) per Put, R expected small.
+          bool suppressed = false;
+          for (const auto &rt : range_tombstones) {
+            if (rt.seq >= he->sequence && k >= rt.start && k < rt.end) {
+              suppressed = true;
+              break;
+            }
+          }
+          if (suppressed) {
+            if (he->sequence > max_lsn) max_lsn = he->sequence;
+            continue;
+          }
           t.upsert(he->key,
                    KeyDirEntry{he->sequence, file_id, he->file_offset,
                                he->value_size},
@@ -1565,6 +1711,23 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
           if (existing && existing->sequence < he->sequence) {
             t.erase(he->key);
           }
+        } else if (he->entry_type == EntryType::RangeDel) {
+          const auto start = Key{he->key};
+          const auto end = Key{he->end_key};
+          range_tombstones.push_back({start, end, he->sequence});
+          // Erase keys in [start, end) with sequence < this tombstone.
+          std::vector<Key> to_erase;
+          for (auto it = t.lower_bound(he->key);
+               it != std::default_sentinel; ++it) {
+            auto [key_span, entry] = *it;
+            if (Key{key_span} >= end) break;
+            if (entry.sequence < he->sequence) {
+              to_erase.emplace_back(key_span);
+            }
+          }
+          for (const auto &ek : to_erase) {
+            t.erase(std::span<const std::byte>{ek});
+          }
         }
         if (he->sequence > max_lsn) max_lsn = he->sequence;
       }
@@ -1576,7 +1739,8 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
     }
   }
 
-  return {std::move(t).persistent(), std::move(tombstones), max_lsn,
+  return {std::move(t).persistent(), std::move(tombstones),
+          std::move(range_tombstones), max_lsn,
           std::move(fstats_t).persistent()};
 }
 
@@ -1622,7 +1786,37 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
     if (seq > existing) existing = seq;
   }
 
+  // Cross-apply range tombstones from both sides.
+  auto cross_apply_range_tombs =
+      [](PersistentRadixTree<KeyDirEntry> &tree,
+         const std::vector<RangeTombstone> &rts) {
+        for (const auto &rt : rts) {
+          std::vector<Key> to_erase;
+          for (auto it = tree.lower_bound(
+                   std::span<const std::byte>{rt.start.begin(), rt.start.size()});
+               it != std::default_sentinel; ++it) {
+            auto [key_span, entry] = *it;
+            if (Key{key_span} >= rt.end) break;
+            if (entry.sequence < rt.seq) {
+              to_erase.emplace_back(key_span);
+            }
+          }
+          for (const auto &ek : to_erase) {
+            tree = tree.erase(std::span<const std::byte>{ek});
+          }
+        }
+      };
+  cross_apply_range_tombs(merged, b.range_tombstones);
+  cross_apply_range_tombs(merged, a.range_tombstones);
+
+  // Union range tombstone vectors.
+  auto &merged_range_tombs = a.range_tombstones;
+  merged_range_tombs.insert(merged_range_tombs.end(),
+                            std::make_move_iterator(b.range_tombstones.begin()),
+                            std::make_move_iterator(b.range_tombstones.end()));
+
   return {std::move(merged), std::move(merged_tombs),
+          std::move(merged_range_tombs),
           std::max(a.max_lsn, b.max_lsn), std::move(a.file_stats)};
 }
 
@@ -1645,6 +1839,7 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
   std::uint64_t max_lsn = 0;
   auto transient_key_dir = s.key_dir.transient();
   std::map<Key, std::uint64_t> tombstones;
+  std::vector<RangeTombstone> range_tombstones;
 
   for (auto &[file_id, data_file, hint_path, tb] : files) {
     try {
@@ -1655,6 +1850,18 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
           const auto k = Key{he->key};
           const auto tomb_it = tombstones.find(k);
           if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
+            if (he->sequence > max_lsn) max_lsn = he->sequence;
+            continue;
+          }
+          // Check range tombstones.
+          bool suppressed = false;
+          for (const auto &rt : range_tombstones) {
+            if (rt.seq >= he->sequence && k >= rt.start && k < rt.end) {
+              suppressed = true;
+              break;
+            }
+          }
+          if (suppressed) {
             if (he->sequence > max_lsn) max_lsn = he->sequence;
             continue;
           }
@@ -1681,6 +1888,25 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
                 entry_size(he->key.size(), existing->value_size);
             fstats_scratch[existing->file_id].live_bytes -= dec;
             transient_key_dir.erase(he->key);
+          }
+        } else if (he->entry_type == EntryType::RangeDel) {
+          const auto start = Key{he->key};
+          const auto end = Key{he->end_key};
+          range_tombstones.push_back({start, end, he->sequence});
+          // Erase keys in [start, end) with sequence < this tombstone.
+          std::vector<Key> to_erase;
+          for (auto it = transient_key_dir.lower_bound(he->key);
+               it != std::default_sentinel; ++it) {
+            auto [key_span, entry] = *it;
+            if (Key{key_span} >= end) break;
+            if (entry.sequence < he->sequence) {
+              const auto dec = entry_size(key_span.size(), entry.value_size);
+              fstats_scratch[entry.file_id].live_bytes -= dec;
+              to_erase.emplace_back(key_span);
+            }
+          }
+          for (const auto &ek : to_erase) {
+            transient_key_dir.erase(std::span<const std::byte>{ek});
           }
         }
         if (he->sequence > max_lsn) max_lsn = he->sequence;

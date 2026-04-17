@@ -22,11 +22,12 @@ import bytecask.hint_entry;
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   auto buf = std::as_bytes(std::span{data, size});
   std::vector<std::byte> key_buf;
+  std::vector<std::byte> end_key_buf;
   std::size_t pos = 0;
   while (pos < size) {
     try {
       auto [entry, consumed] =
-          bytecask::deserialize_entry(buf.subspan(pos), key_buf);
+          bytecask::deserialize_entry(buf.subspan(pos), key_buf, end_key_buf);
       pos += consumed;
       (void)entry;
     } catch (const std::runtime_error &) {
