@@ -1502,14 +1502,14 @@ auto DB::load_state_for_read(const ReadOptions &opts) const
           opts.staleness_tolerance)
           .count();
   if (wt - tl.last_write_time > tolerance) {
-    tl.snapshot = state_.load();
+    tl.snapshot = load_state();
     tl.last_write_time = wt;
   }
   return tl.snapshot;
 }
 
 auto DB::load_state_for_write() const -> std::shared_ptr<EngineState> {
-  return state_.load();
+  return load_state();
 }
 
 void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
@@ -1549,12 +1549,12 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
   }
 #endif
 
-  state_.store(std::move(new_state));
+  store_state(std::move(new_state));
   state_time_.store(now_ns(), std::memory_order_release);
 }
 
 void DB::store_initial_state(std::shared_ptr<EngineState> s) {
-  state_.store(std::move(s));
+  store_state(std::move(s));
   state_time_.store(now_ns(), std::memory_order_release);
 }
 

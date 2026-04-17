@@ -570,7 +570,7 @@ public:
   // Returns a snapshot of per-file stats.
   // Only available in test builds (BYTECASK_TESTING).
   [[nodiscard]] auto file_stats() const -> std::map<std::uint32_t, FileStats> {
-    auto s = state_.load();
+    auto s = load_state();
     std::map<std::uint32_t, FileStats> result;
     for (const auto [id, fs] : s->file_stats) result.emplace(id, fs);
     return result;
@@ -579,7 +579,7 @@ public:
   // Returns the current engine state for invariant checking.
   // Only available in test builds (BYTECASK_TESTING).
   [[nodiscard]] auto engine_state() const -> std::shared_ptr<const EngineState> {
-    return state_.load();
+    return load_state();
   }
 
   // Exposed for testing: validates structural consistency of an EngineState.
@@ -746,13 +746,30 @@ private:
   auto recovery_load_parallel(EngineState s, unsigned recovery_threads,
                                bool strict) -> EngineState;
 
+  // Portable atomic load/store for shared_ptr. The C++20 specialization
+  // std::atomic<std::shared_ptr<T>> is not yet available in all libc++
+  // versions (e.g. Homebrew LLVM). The C++11 free functions work everywhere
+  // but are deprecated in libstdc++ — suppress the warning here once.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  auto load_state() const -> std::shared_ptr<EngineState> {
+    return std::atomic_load(&state_);
+  }
+  void store_state(std::shared_ptr<EngineState> s) {
+    std::atomic_store(&state_, std::move(s));
+  }
+#pragma clang diagnostic pop
+
   // Member variables
   std::filesystem::path dir_;
   int lock_fd_{-1};  // flock() on dir_/.lock; released by close() in ~DB()
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
-  // All mutable state — SWMR. Writers publish via state_.store()
-  // under write_mu_; readers call state_.load() (never acquiring write_mu_).
-  std::atomic<std::shared_ptr<EngineState>> state_;
+  // All mutable state — SWMR. Writers publish via atomic_store()
+  // under write_mu_; readers call atomic_load() (never acquiring write_mu_).
+  // Note: std::atomic<std::shared_ptr<T>> (C++20 P0718R2) is not yet
+  // available in all libc++ versions (e.g. Homebrew LLVM). Use the C++11
+  // free-function overloads instead.
+  std::shared_ptr<EngineState> state_;
   // Written (release) by every state_.store() with steady_clock::now().
   // Stale readers compare this against a thread-local timestamp with a
   // single relaxed load (plain MOV on x86) to decide whether to refresh.
