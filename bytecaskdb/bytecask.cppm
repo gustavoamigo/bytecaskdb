@@ -9,6 +9,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
