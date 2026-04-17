@@ -15,7 +15,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-169 | Python bindings via nanobind | `bytecask-python/` top-level package wrapping the C++23 engine modules directly via nanobind. Full API: DB, Snapshot, WritePlan, Batch, all iterator types, Options. `del_range` on DB, Batch, and WritePlan. GIL released on I/O paths. Context manager for Snapshot. Exception translation (DbDegraded→RuntimeError, system_error→OSError, logic_error→ValueError). xmake `bytecaskdb_python` target. 58 pytest tests + 3 examples. |
+| BC-169 | Python bindings via nanobind | `bytecask-python/` top-level package wrapping the C++23 engine modules directly via nanobind. Full API: DB, Snapshot, WritePlan, Batch, all iterator types, Options. `del_range` on DB, Batch, and WritePlan. Type stub (`_bytecaskdb.pyi`) for IDE autocomplete and type checking. Docstrings on all classes/methods for `help()`. GIL released on I/O paths. Context manager for Snapshot. Exception translation (DbDegraded→RuntimeError, system_error→OSError, logic_error→ValueError). xmake `bytecaskdb_python` target. 58 pytest tests + 3 examples. |
 | BC-170 | Directory lock — prevent multi-process concurrent open | `flock(LOCK_EX | LOCK_NB)` on `dir/.lock` in `DB::open()`. Second process gets `std::system_error`. Lock released in `~DB()`. `.lock` file stays as harmless sentinel. 4 `[lock]` tests. |
 | BC-102 | File format reference document | Created `docs/file_format.md` with full layout spec for `.data` and `.hint` files; added to README documentation table. |
 | BC-110 | MariaDB storage engine integration — design | Design doc (`docs/mariadb_engine_design.md`) and phased plan for `ha_bytecask` plugin. Branch: `feature/mariadb-engine`. |
