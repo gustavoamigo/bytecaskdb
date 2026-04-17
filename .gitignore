@@ -42,3 +42,6 @@ tests/fuzz/corpus/
 
 .notes
 
+# Local tools (e.g. nektos/act)
+bin/
+
