@@ -432,7 +432,9 @@ DB::DB(std::filesystem::path dir, Options opts)
     auto fstats_t = s.file_stats.transient();
     fstats_t.set(s.active_file_id, FileStats{});
     s.file_stats = std::move(fstats_t).persistent();
-    store_state(std::make_shared<EngineState>(std::move(s)));
+    auto initial = std::make_shared<EngineState>(std::move(s));
+    validate_state_consistency(*initial);
+    store_initial_state(std::move(initial));
   } catch (...) {
     ::close(lock_fd_);
     lock_fd_ = -1;
@@ -695,7 +697,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
           "post-write rotation failed for '{}': active file is sealed "
           "but new file could not be created. Call resume() to recover.",
           file.path().string()));
-      store_state(std::move(t).persistent());
+      store_state(current, std::move(t).persistent());
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
       }
@@ -720,7 +722,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     }
   }
 
-  store_state(std::move(t).persistent());
+  store_state(current, std::move(t).persistent());
 }
 
 #pragma endregion
@@ -1138,7 +1140,7 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
   auto t = current->transient();
   t.apply_vacuum(old_file_id, scan, std::move(new_sealed_file));
 
-  store_state(std::move(t).persistent());
+  store_state(current, std::move(t).persistent());
 }
 
 // Stashes the old data file and its hint path for deferred removal
@@ -1226,7 +1228,7 @@ void DB::publish_lsn_advance(const std::shared_ptr<const EngineState> &current,
                               std::uint64_t target_lsn) {
   auto lsn_only = current->transient();
   lsn_only.advance_next_lsn(target_lsn);
-  store_state(std::move(lsn_only).persistent());
+  store_state(current, std::move(lsn_only).persistent());
 }
 
 void DB::deem_as_degraded(std::string reason) {
@@ -1335,7 +1337,9 @@ void DB::resume() {
   });
   t.apply_resume(old_file_id, committed);
   t.apply_rotate_file(std::move(new_file));
-  store_state(std::move(t).persistent());
+  auto resumed = std::move(t).persistent();
+  validate_state_consistency(*resumed);
+  store_state(current, std::move(resumed));
 
   // Success: clear degraded flag.
   degraded_.store(false, std::memory_order_release);
@@ -1375,9 +1379,100 @@ auto DB::load_state_for_write() const -> std::shared_ptr<EngineState> {
   return state_.load();
 }
 
-void DB::store_state(std::shared_ptr<EngineState> s) {
+void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
+                     std::shared_ptr<EngineState> new_state) {
+  // O(1) invariant checks — always on, even in release.
+  if (new_state->next_lsn < old_state->next_lsn) {
+    deem_as_degraded(std::format(
+        "invariant violation: next_lsn regressed from {} to {}",
+        old_state->next_lsn, new_state->next_lsn));
+    return;
+  }
+  if (new_state->active_file_id < old_state->active_file_id) {
+    deem_as_degraded(std::format(
+        "invariant violation: active_file_id regressed from {} to {}",
+        old_state->active_file_id, new_state->active_file_id));
+    return;
+  }
+  if (new_state->next_file_id < old_state->next_file_id) {
+    deem_as_degraded(std::format(
+        "invariant violation: next_file_id regressed from {} to {}",
+        old_state->next_file_id, new_state->next_file_id));
+    return;
+  }
+
+#ifndef NDEBUG
+  // Debug-only O(n) check: next_lsn > max(all key_dir sequences).
+  std::uint64_t max_seq = 0;
+  for (auto it = new_state->key_dir.begin(); it != std::default_sentinel; ++it) {
+    auto [key_span, entry] = *it;
+    if (entry.sequence > max_seq) max_seq = entry.sequence;
+  }
+  if (max_seq > 0 && new_state->next_lsn <= max_seq) {
+    deem_as_degraded(std::format(
+        "invariant violation: next_lsn {} <= max key_dir sequence {}",
+        new_state->next_lsn, max_seq));
+    return;
+  }
+#endif
+
+  state_.store(std::move(new_state));
+  state_time_.store(now_ns(), std::memory_order_release);
+}
+
+void DB::store_initial_state(std::shared_ptr<EngineState> s) {
   state_.store(std::move(s));
   state_time_.store(now_ns(), std::memory_order_release);
+}
+
+void DB::validate_state_consistency(const EngineState &s) const {
+  // 1. Active file exists in files registry.
+  if (!s.files.contains(s.active_file_id)) {
+    throw std::runtime_error{std::format(
+        "state consistency: active_file_id {} not in files registry",
+        s.active_file_id)};
+  }
+
+  // 2. file_stats covers all files + no dangling file refs + live_bytes.
+  std::map<std::uint32_t, std::uint64_t> computed_live;
+  std::uint64_t max_seq = 0;
+  for (auto it = s.key_dir.begin(); it != std::default_sentinel; ++it) {
+    auto [key_span, entry] = *it;
+    if (!s.files.contains(entry.file_id)) {
+      throw std::runtime_error{std::format(
+          "state consistency: key references file_id {} not in registry",
+          entry.file_id)};
+    }
+    computed_live[entry.file_id] +=
+        entry_size(key_span.size(), entry.value_size);
+    if (entry.sequence > max_seq) max_seq = entry.sequence;
+  }
+
+  // 3. next_lsn ahead of all sequences.
+  if (max_seq > 0 && s.next_lsn <= max_seq) {
+    throw std::runtime_error{std::format(
+        "state consistency: next_lsn {} <= max key_dir sequence {}",
+        s.next_lsn, max_seq)};
+  }
+
+  // 4. file_stats covers all files.
+  for (const auto [file_id, _] : s.files) {
+    if (!s.file_stats.contains(file_id)) {
+      throw std::runtime_error{std::format(
+          "state consistency: file_id {} missing from file_stats", file_id)};
+    }
+  }
+
+  // 5. live_bytes matches key_dir.
+  for (const auto [file_id, fs] : s.file_stats) {
+    auto it = computed_live.find(file_id);
+    auto expected_live = (it != computed_live.end()) ? it->second : 0ULL;
+    if (fs.live_bytes != expected_live) {
+      throw std::runtime_error{std::format(
+          "state consistency: file_id {} live_bytes={} but key_dir says {}",
+          file_id, fs.live_bytes, expected_live)};
+    }
+  }
 }
 
 #pragma endregion

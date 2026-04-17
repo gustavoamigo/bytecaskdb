@@ -200,6 +200,12 @@ When this happens, the engine calls `deem_as_degraded(reason)` with a diagnostic
 
 Implementation: `degraded_` is an `atomic<bool>` (release on write, acquire on read). The non-atomic `degraded_reason_` string is safely published via the release/acquire pair — the string is written before `degraded_.store(true, release)` and read after `degraded_.load(acquire)`.
 
+##### Runtime invariant enforcement
+
+The engine validates structural invariants at runtime before publishing state, not just in tests. `store_state` compares old and new `EngineState` on every publication: `next_lsn`, `active_file_id`, and `next_file_id` must never regress. On violation the engine degrades (nothing published, writes blocked, reads remain available). Cost: three integer comparisons per write — unmeasurable against `writev` + `fdatasync`. Debug builds add a full `next_lsn > max(key_dir sequences)` walk.
+
+On cold paths (`DB::open()`, `resume()`), `validate_state_consistency` runs the full O(n) structural check: active file in registry, no dangling file references, `next_lsn` ahead of all sequences, `file_stats` covers all files, `live_bytes` matches `key_dir`. On violation it throws — the DB does not open or `resume()` fails.
+
 ##### Partial write detection (tainted file)
 
 If `writev` returns a short write (0 < written < total), `DataFile::append()` sets a `tainted_` flag before throwing. A tainted file has bytes on disk that `offset_` does not account for. The file is opened with `O_APPEND`, so the next `writev` would write at the kernel's true EOF (past the partial data), but `offset_` would still point to the old position — the offset returned by subsequent appends would be wrong.

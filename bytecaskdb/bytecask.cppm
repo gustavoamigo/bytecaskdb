@@ -564,6 +564,11 @@ public:
   [[nodiscard]] auto engine_state() const -> std::shared_ptr<const EngineState> {
     return state_.load();
   }
+
+  // Exposed for testing: validates structural consistency of an EngineState.
+  void test_validate_state_consistency(const EngineState &s) const {
+    validate_state_consistency(s);
+  }
 #endif
   // Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
   // batch is consumed (move-only). No-op if batch.empty().
@@ -687,7 +692,14 @@ private:
   [[nodiscard]] auto load_state_for_write() const
       -> std::shared_ptr<EngineState>;
   // Publish new state + bump timestamp. Caller must hold write_mu_.
-  void store_state(std::shared_ptr<EngineState> s);
+  // Runs O(1) invariant checks comparing old vs new; degrades on violation.
+  void store_state(const std::shared_ptr<const EngineState> &old_state,
+                   std::shared_ptr<EngineState> new_state);
+  // Publish initial state during construction (no previous state to compare).
+  void store_initial_state(std::shared_ptr<EngineState> s);
+  // Validates structural consistency of published state. Throws on violation.
+  // Called on cold paths only (open, resume).
+  void validate_state_consistency(const EngineState &s) const;
   // Writer executors — called by SoloWriter / WriteGroup.
   // Prepares and applies one slot against the transient. Pure in-memory:
   // no I/O. Appends prepared entries to all_entries; running_offset is

@@ -397,3 +397,47 @@ rename):
 - The next recovery must clean up the `.hint.tmp` and regenerate the
   hint file from the data file.
 - The engine must not lose data.
+
+---
+
+## Runtime Invariant Enforcement
+
+The engine validates structural invariants at runtime, not just in
+tests. Violations are detected before corrupted state becomes visible
+to readers.
+
+### Hot-path checks (every state publication, always on)
+
+`store_state` compares old and new `EngineState` before publishing:
+
+| Invariant | Rationale |
+|-----------|-----------|
+| `next_lsn` must not regress | Prevents LSN reuse (§Sequence Numbers). |
+| `active_file_id` must not regress | File IDs are monotonically assigned; rotation only moves forward. |
+| `next_file_id` must not regress | Same monotonicity as `active_file_id`. |
+
+On violation: the engine degrades (publishes nothing, writes blocked,
+reads remain available). Cost: three integer comparisons per write.
+
+### Hot-path checks (debug builds only)
+
+Under `NDEBUG=0`, `store_state` additionally walks the key directory
+to verify `next_lsn > max(all key_dir sequences)`. This is O(n) and
+too expensive for release builds.
+
+### Cold-path checks (open, resume — always on)
+
+`validate_state_consistency` runs the full structural check on the
+published state after `DB::open()` and `resume()`:
+
+| Invariant | Cost |
+|-----------|------|
+| Active file exists in files registry | O(1) |
+| No dangling file references in key_dir | O(n) |
+| `next_lsn > max(all key_dir sequences)` | O(n) |
+| `file_stats` covers all files | O(f) |
+| `live_bytes` matches key_dir | O(n) |
+
+On violation: throws `std::runtime_error`. The DB does not open or
+`resume()` fails. This is intentional — if recovery produces
+inconsistent state, the engine should not run.
