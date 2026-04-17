@@ -24,6 +24,14 @@ module;
 #include <utility>
 #include <vector>
 
+// macOS does not provide fdatasync; use F_FULLFSYNC which actually flushes
+// to physical storage (fdatasync on macOS is a no-op shim).
+#ifdef __APPLE__
+static inline int portable_fdatasync(int fd) { return fcntl(fd, F_FULLFSYNC); }
+#else
+static inline int portable_fdatasync(int fd) { return fdatasync(fd); }
+#endif
+
 export module bytecask.data_file;
 
 import bytecask.util;
@@ -309,7 +317,7 @@ public:
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_data_file_sync);
 #endif
-    if (::fdatasync(fd_) != 0) {
+    if (portable_fdatasync(fd_) != 0) {
       throw std::system_error{errno, std::generic_category(),
                               "DataFile::sync: fdatasync failed"};
     }

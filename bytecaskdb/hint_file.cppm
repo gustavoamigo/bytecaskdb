@@ -18,6 +18,12 @@ module;
 #include <unistd.h>
 #include <vector>
 
+#ifdef __APPLE__
+static inline int portable_fdatasync(int fd) { return fcntl(fd, F_FULLFSYNC); }
+#else
+static inline int portable_fdatasync(int fd) { return fdatasync(fd); }
+#endif
+
 export module bytecask.hint_file;
 
 import bytecask.hint_entry;
@@ -196,7 +202,7 @@ public:
                                 "HintFile::sync: write failed"};
       }
     }
-    if (::fdatasync(fd) != 0) {
+    if (portable_fdatasync(fd) != 0) {
       const auto err = errno;
       ::close(fd);
       throw std::system_error{err, std::generic_category(),
