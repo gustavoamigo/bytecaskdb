@@ -247,3 +247,64 @@ TEST_CASE("capture_baseline captures correct state", "[invariants]") {
   CHECK(bytecask::testing::to_string(bl.key_values.at("b")) == "2");
   CHECK(bl.next_lsn == db.engine_state()->next_lsn);
 }
+
+// ---------------------------------------------------------------------------
+// validate_state_consistency tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("validate_state_consistency passes on valid state", "[invariants]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+  auto state = db.engine_state();
+  REQUIRE_NOTHROW(db.test_validate_state_consistency(*state));
+}
+
+TEST_CASE("validate_state_consistency throws on regressed next_lsn",
+          "[invariants]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  auto state = db.engine_state();
+
+  // Construct a bad state with next_lsn set to 0.
+  auto bad = *state;
+  bad.next_lsn = 0;
+  REQUIRE_THROWS_AS(db.test_validate_state_consistency(bad),
+                    std::runtime_error);
+}
+
+TEST_CASE("validate_state_consistency throws on dangling file ref",
+          "[invariants]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  auto state = db.engine_state();
+
+  // Construct a bad state: remove the active file from the registry
+  // but keep key_dir pointing to it. We clear the active_file_id to
+  // a non-existent file to trigger the "active file missing" check.
+  auto bad = *state;
+  bad.active_file_id = 999;
+  REQUIRE_THROWS_AS(db.test_validate_state_consistency(bad),
+                    std::runtime_error);
+}
+
+TEST_CASE("validate_state_consistency throws on live_bytes mismatch",
+          "[invariants]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  auto state = db.engine_state();
+
+  // Corrupt live_bytes in file_stats.
+  auto bad = *state;
+  auto fstats_t = bad.file_stats.transient();
+  fstats_t.update(bad.active_file_id, [](bytecask::FileStats &fs) {
+    fs.live_bytes = 999999;
+  });
+  bad.file_stats = std::move(fstats_t).persistent();
+  REQUIRE_THROWS_AS(db.test_validate_state_consistency(bad),
+                    std::runtime_error);
+}
