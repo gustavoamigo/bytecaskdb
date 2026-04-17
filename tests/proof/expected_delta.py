@@ -16,6 +16,7 @@ from .scenario_matrix import FailureClass, OpType, PlanShape
 class Delta:
     keys_added: List[str]
     keys_removed: List[str]
+    expected_values: dict  # key -> value string (for value verification)
     lsn_advance: int
     degraded: bool
     threw: bool
@@ -28,22 +29,32 @@ def _full_delta(
     degraded: bool = False,
     threw: bool = False,
 ) -> Delta:
-    """Compute delta for a fully-persisted transition."""
+    """Compute delta for a fully-persisted transition.
+
+    Tracks the net effect per key: when multiple operations target the same
+    key (causality shapes), only the final operation determines the outcome.
+    """
     n = plan.write_count
     lsn_advance = n + (2 if n > 1 else 0)
 
-    keys_added = []
-    keys_removed = []
-    for op, label in zip(plan.ops, key_labels):
+    # Track final state per key: ("put", value_index) or "deleted".
+    final_state: dict = {}
+    for i, (op, label) in enumerate(zip(plan.ops, key_labels)):
         if op == OpType.PUT:
-            keys_added.append(label)
+            final_state[label] = ("put", i)
         elif op == OpType.DELETE:
-            if label in existing_keys:
-                keys_removed.append(label)
+            final_state[label] = "deleted"
+
+    keys_added = [k for k, s in final_state.items() if s != "deleted"]
+    keys_removed = [k for k, s in final_state.items() if s == "deleted"]
+    expected_values = {
+        k: f"new{s[1]}" for k, s in final_state.items() if s != "deleted"
+    }
 
     return Delta(
         keys_added=keys_added,
         keys_removed=keys_removed,
+        expected_values=expected_values,
         lsn_advance=lsn_advance,
         degraded=degraded,
         threw=threw,
@@ -66,44 +77,44 @@ def expected_delta(
         return _full_delta(plan, key_labels, existing_keys)
 
     if failure == FailureClass.A:
-        return Delta([], [], 0, degraded=False, threw=False)
+        return Delta([], [], {}, 0, degraded=False, threw=False)
 
     if failure == FailureClass.B1:
         # Advance conservatively: the engine cannot determine from userspace
         # whether bytes reached disk (POSIX does not guarantee writev=-1 means
         # no bytes written). Gaps are safe; reuse is not.
         n = plan.write_count
-        return Delta([], [], n + (2 if n > 1 else 0), degraded=True, threw=True)
+        return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.C:
         # Append failed mid-batch (on BulkEnd). Prior entries (BulkBegin, data
         # entries) may be on disk. Advance conservatively past all consumed LSNs.
         # resume() truncates the orphaned batch and sets next_lsn from disk.
         n = plan.write_count
-        return Delta([], [], n + (2 if n > 1 else 0), degraded=True, threw=True)
+        return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.B2:
         n = plan.write_count
-        return Delta([], [], n + (2 if n > 1 else 0), degraded=True, threw=True)
+        return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.B3:
         # Any append error — including a full write that returned an error —
         # degrades unconditionally. resume() replays valid on-disk entries.
         n = plan.write_count
-        return Delta([], [], n + (2 if n > 1 else 0), degraded=True, threw=True)
+        return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.F:
         # Commit fdatasync failed — bytes in page cache but not confirmed
         # durable. Key changes are NOT published in-session. LSN advances to
         # prevent reuse. Engine degrades (BC-164); resume() restores writes.
         n = plan.write_count
-        return Delta([], [], n + (2 if n > 1 else 0), degraded=True, threw=True)
+        return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.G:
         # Rotation fdatasync failed — same contract as F: bytes in page cache,
         # key changes unpublished, LSN advances, engine degrades (BC-164).
         n = plan.write_count
-        return Delta([], [], n + (2 if n > 1 else 0), degraded=True, threw=True)
+        return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.H:
         return _full_delta(

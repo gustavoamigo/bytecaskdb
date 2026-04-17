@@ -53,6 +53,7 @@ struct Baseline {
 struct ExpectedDelta {
   std::vector<std::string> keys_added;
   std::vector<std::string> keys_removed;
+  std::map<std::string, std::string> expected_values;  // key -> expected value
   std::uint64_t lsn_advance;
   bool degraded;
 };
@@ -125,6 +126,14 @@ inline void assert_delta(const Baseline &before, const DB &db,
     CHECK_FALSE(db.contains_key(to_bytes(key)));
   }
 
+  // Value verification (causality: last write determines value).
+  for (const auto &[key, value] : expected.expected_values) {
+    Bytes out;
+    INFO("expected value for key: " << key);
+    REQUIRE(db.get({}, to_bytes(key), out));
+    CHECK(to_string(out) == value);
+  }
+
   // LSN advancement.
   auto after = db.engine_state();
   CHECK(after->next_lsn == before.next_lsn + expected.lsn_advance);
@@ -154,12 +163,14 @@ inline void assert_recoverable(const std::filesystem::path &dir,
                                const ExpectedDelta &expected) {
   auto recovered = DB::open(dir);
 
-  // Pre-existing keys that were not removed must be present with correct values.
+  // Pre-existing keys that were not removed or overwritten must be present
+  // with their original values.
   for (const auto &[key, value] : before.key_values) {
     bool was_removed =
         std::ranges::find(expected.keys_removed, key) !=
         expected.keys_removed.end();
-    if (!was_removed) {
+    bool has_new_value = expected.expected_values.contains(key);
+    if (!was_removed && !has_new_value) {
       INFO("pre-existing key must survive recovery: " << key);
       CHECK(recovered.contains_key(to_bytes(key)));
       Bytes out;
@@ -179,6 +190,15 @@ inline void assert_recoverable(const std::filesystem::path &dir,
   for (const auto &key : expected.keys_removed) {
     INFO("removed key must be absent after recovery: " << key);
     CHECK_FALSE(recovered.contains_key(to_bytes(key)));
+  }
+
+  // Value verification (causality: last write determines value after recovery).
+  for (const auto &[key, value] : expected.expected_values) {
+    Bytes out;
+    INFO("expected value after recovery for key: " << key);
+    if (recovered.get({}, to_bytes(key), out)) {
+      CHECK(to_string(out) == value);
+    }
   }
 
   // No extra keys.

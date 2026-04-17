@@ -82,6 +82,31 @@ The engine must apply all writes in the plan and make them visible
 after return, or apply none. Partial application must never be
 observable by a subsequent `get()`, `contains_key()`, or `snapshot()`.
 
+### Causality
+
+If write A completes before write B begins, the observable state must
+reflect B, not A. This holds regardless of whether A and B are
+separate API calls, operations within the same batch, or a mix of
+both.
+
+Specifically:
+
+- **Across calls**: if `put(k, v1)` returns, then `put(k, v2)`
+  returns, a subsequent `get(k)` must return `v2`. If `put(k, v1)`
+  returns, then `del(k)` returns, `get(k)` must return false.
+- **Within a batch**: operations in a single `Batch` or `WritePlan`
+  are applied in insertion order. If a batch contains `put(k, v1)`
+  followed by `del(k)`, `get(k)` must return false. If it contains
+  `del(k)` followed by `put(k, v2)`, `get(k)` must return `v2`.
+- **Across files**: when a key exists in multiple data files (e.g.
+  after file rotation), the entry with the highest LSN determines
+  the key's state. Recovery must produce the same result regardless
+  of which files are replayed first.
+
+This ordering is preserved through recovery: hint file replay and
+parallel merge must produce the same causal result as the original
+writes.
+
 ### Durability
 
 If `opts.sync == true` and no exception is thrown, all writes must be
