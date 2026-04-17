@@ -59,7 +59,7 @@ export struct Slot {
 export class SoloWriter {
 public:
   explicit SoloWriter(
-      std::move_only_function<void(std::vector<Slot *> &)> executor)
+      std::function<void(std::vector<Slot *> &)> executor)
       : executor_{std::move(executor)} {}
 
   SoloWriter(const SoloWriter &) = delete;
@@ -79,7 +79,7 @@ public:
   }
 
 private:
-  std::move_only_function<void(std::vector<Slot *> &)> executor_;
+  std::function<void(std::vector<Slot *> &)> executor_;
 };
 
 // ---------------------------------------------------------------------------
@@ -95,7 +95,7 @@ private:
 export class WriteGroup {
 public:
   explicit WriteGroup(
-      std::move_only_function<void(std::vector<Slot *> &)> executor)
+      std::function<void(std::vector<Slot *> &)> executor)
       : executor_{std::move(executor)} {}
 
   WriteGroup(const WriteGroup &) = delete;
@@ -149,7 +149,7 @@ private:
     }
   }
 
-  std::move_only_function<void(std::vector<Slot *> &)> executor_;
+  std::function<void(std::vector<Slot *> &)> executor_;
   std::mutex queue_mu_;
   std::vector<Slot *> queue_;
   bool leader_active_{false};
