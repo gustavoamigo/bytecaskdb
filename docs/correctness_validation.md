@@ -162,11 +162,24 @@ class FailureClass(Enum):
   failure as indeterminate: `tainted_` is always set, and the engine degrades.
 - **B2 — partial write**: `writev` returns 0 < N < total. N bytes are on
   disk, kernel fd position advanced by N. `offset_` is not advanced (the
-  throw in `append()` skips `offset_ +=`). The file is `tainted`.
+  throw in `append()` skips `offset_ +=`). The file is `tainted`. This
+  class also covers sub-entry torn writes at the sector level: a power
+  loss mid-flush can land some 512-byte sectors on disk and not others,
+  even though `writev` never returned to the caller. On recovery, the
+  entry fails CRC verification and is truncated — the same mechanism that
+  handles B2 at the `writev` boundary.
 - **B3 — full write + error return**: `writev` writes all bytes to disk
   successfully, but an error is returned to the caller (simulated by
   `PostWriteMode::throw_after`). The entry is structurally complete on disk
   with a valid CRC. The file is `tainted`.
+
+B1, B2, and B3 are distinguished for modeling clarity — they represent
+different `writev` outcomes at the POSIX level. The engine's runtime
+response is identical for all three: set `tainted_`, degrade
+unconditionally, best-effort sync, then `resume()` scans and truncates.
+The distinction matters when reasoning about what bytes `resume()` may
+find on disk (nothing for B1, a partial entry for B2, a structurally
+complete entry for B3), but it does not affect the code path taken.
 
 All three subclasses degrade the engine unconditionally. A best-effort
 `sync()` is called before degrading so that any bytes already in the page
@@ -211,8 +224,8 @@ healthy but fails on the next append. Degrading is the correct response;
 | B2 | No — partial write | No | Yes | Yes | Yes |
 | B3 | No — indeterminate | No | Yes | Yes | Yes |
 | C | No — orphaned BulkBegin | No | Yes | Yes | Yes |
-| F | No — page cache only | No — lsn only | Yes | Yes | Yes |
-| G | No — page cache only | No — lsn only | Yes | Yes | Yes |
+| F | No — page cache only | No | Yes | Yes | Yes |
+| G | No — page cache only | No | Yes | Yes | Yes |
 | H | Yes — fully | Yes — full delta | Yes | Yes | Yes |
 
 Note on classes B1/B2/B3 — LSN advanced, engine degraded: Any `writev`
@@ -329,6 +342,47 @@ to callers. Degrading forces `resume()` before further writes are accepted;
 The scenario matrix is 4 state shapes × 7 plan shapes × 9 failure
 classes = 252 total; 4 elimination rules reduce this to 148 valid tests.
 
+#### State shapes
+
+| Shape | `num_keys` | `max_file_bytes` | What it tests |
+|-------|-----------|-----------------|---------------|
+| `empty_db` | 0 | — | Plan applied to a fresh database with no existing keys |
+| `single_key` | 1 | — | Overwrites, deletes, and guards against a single existing key |
+| `populated_db` | 10 | — | Multiple existing keys; exercises range guards and multi-key interactions |
+| `rotation_threshold` | 1 | 1 | Forces file rotation after the plan's writes — required for classes G and H |
+
+Shapes not currently covered: mid-vacuum (vacuum-in-flight during `apply_batch_if`),
+post-resume (DB that has been degraded and resumed), and multiple sealed files with
+cross-file tombstone interactions. These are deferred — the current shapes cover the
+four structurally distinct starting conditions for the write path.
+
+#### Plan shapes
+
+| Shape | Operations | Guards | Conflicting | What it tests |
+|-------|-----------|--------|-------------|---------------|
+| `single_put` | 1 put | No | No | Single-entry fast path (no BulkBegin/BulkEnd markers) |
+| `single_delete` | 1 delete | No | No | Tombstone write on the single-entry path |
+| `multi_put` | 2 puts | No | No | Multi-entry batch with BulkBegin/BulkEnd markers |
+| `mixed_batch` | 1 put + 1 delete | No | No | Mixed operation types in one batch |
+| `large_batch` | 3 puts | No | No | Larger batch — exercises per-entry fault injection at different positions |
+| `single_put_with_guards` | 1 put | Yes | No | Plan with `ensure_unchanged` guards plus a write |
+| `conflicting_plan` | 1 put | No | Yes | Plan that conflicts with current state — exercises class A (precondition rejection) |
+
+Shapes not currently covered: guards-without-writes (pure read-dependency check),
+delete-only multi-entry batches, and plans exceeding the `256 KiB` solo-writer
+threshold. These are deferred — the current shapes exercise every code path branch
+in `apply_batch_if` (single vs multi entry, with and without guards, conflict vs
+success).
+
+#### Elimination rules
+
+Four rules filter invalid (state, plan, failure) combinations:
+
+1. **Class C requires multi-entry batches** — C fires on `BulkEnd`, which is only emitted for batches with 2+ operations.
+2. **Class A requires a conflicting plan** — A is precondition rejection before any I/O; only `conflicting_plan` triggers it.
+3. **Conflicting plan only valid for class A** — a plan that fails preconditions never reaches the I/O path.
+4. **Classes G and H require `rotation_threshold` state** — rotation only occurs when the active file crosses the size threshold.
+
 Each test follows the same structure:
 1. Set up initial DB state from `StateShape`
 2. Capture baseline
@@ -358,8 +412,12 @@ Two degrade shapes establish a degraded DB before resume is called:
   remain in the active file. `resume()` truncates back to after k0.
 
 Three resume failure classes (R1/R2/R3) plus SUCCESS yield 7 valid
-combinations (R1 is filtered for degrade_H because the truncation guard
-`file.size() != valid_offset` is false — the fault point is unreachable).
+combinations. R1 (`io_resume_truncate`) is filtered for `degrade_H`
+because `degrade_H` degrades on a rotation failure *after* the write
+committed fully — the active file contains no orphaned or partial bytes,
+so `file.size() == valid_offset` and `resume()` skips the truncation
+branch entirely (see `bytecask.cpp` resume path: `if (file.size() !=
+valid_offset) { ... truncate ... }`). The R1 fault point is unreachable.
 
 Each R1/R2/R3 test uses a two-phase pattern:
 1. Establish degraded state
@@ -514,7 +572,7 @@ All eleven failure classes for `apply_batch_if` are covered by the 172
 
 All three resume failure classes (R1–R3) plus both degrade shapes are
 covered by the 7 `[prove_resume]` tests. R1 is correctly excluded for
-degrade_H (fault point unreachable).
+degrade_H (no orphaned bytes to truncate — fault point unreachable).
 
 All three vacuum_absorb failure classes across both state shapes are
 covered by the 6 `[prove_vacuum_absorb]` tests.
@@ -663,6 +721,38 @@ It claims exhaustive coverage of all structural failure classes for
 all plan shapes in the matrix. That coverage targets the failure
 modes that matter in practice.
 
+### What this does not cover
+
+The validation framework proves properties of state transitions under
+*software-modeled* failure classes — `writev` returning errors, short
+writes, and `fdatasync` failures. It does not cover failures that
+originate below the POSIX syscall boundary or outside the engine's
+control:
+
+- **Lying storage devices** — drives that ACK writes and lose them
+  (consumer SSDs with volatile write caches, USB drives). The engine
+  trusts that a successful `fdatasync` return means bytes are durable.
+- **Filesystem write reordering** — filesystems that reorder writes
+  across `fdatasync` boundaries (some network/FUSE filesystems). The
+  engine assumes `fdatasync` is a barrier.
+- **Silent `fdatasync` failures on Linux** — the "fsyncgate" issue
+  (PostgreSQL, 2018): on some kernel/filesystem combinations, `fsync`
+  can return success after an earlier async writeback error was consumed
+  by another fd. The engine trusts the return value (see "fdatasync
+  trust assumption" in `CONTRACT.md`).
+- **Bit rot at rest** — silent data corruption on disk between writes.
+  CRC verification catches this on read when `verify_checksums` is
+  enabled, but no periodic scrub is performed.
+- **Sub-sector torn writes** — a `writev` of a multi-sector entry can
+  partially land at the 512-byte sector level on power loss. CRC-per-
+  entry detects this on recovery (the entry fails CRC and is truncated),
+  which is the correct behavior — but the fault injector models failures
+  at the `writev` boundary, not the sector boundary.
+- **Hardware-level fault injection** — kernel block-layer error injection
+  (`dm-flakey`, `dm-dust`), power-cut testing rigs, or filesystem-
+  specific fault tools. The fault injector operates at the application
+  syscall layer only.
+
 ---
 
 ## Why This Approach
@@ -675,9 +765,8 @@ persisted or not. Eleven classes cover the entire behavioral space of
 `apply_batch_if` under I/O failure.
 
 The Python generator makes the model explicit, auditable, and
-evolvable. When a new failure class is identified — for example,
-when the WriteGroup is reintegrated — it is added to the matrix
-and all existing state shapes and plan shapes are automatically
+evolvable. When a new failure class is identified, it is added to the
+matrix and all existing state shapes and plan shapes are automatically
 covered against it.
 
 The correctness baseline this produces is a ratchet. Any change

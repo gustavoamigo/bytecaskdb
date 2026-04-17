@@ -22,12 +22,45 @@ it cannot resolve on its own. Continuing to accept writes would risk
 persisting data that recovery would not reproduce. A degraded DB must
 refuse all write operations with a `DbDegraded` exception carrying a
 diagnostic reason. Read operations remain available — the in-memory
-state is recovery-equivalent at the time of degradation. The service
+state satisfies the **Degraded State Invariant** (below). The service
 calls `resume()` to attempt in-process recovery; on success the engine
 accepts writes again without a restart.
 
+**Degraded State Invariant**: at the moment the engine enters a degraded
+state, the published in-memory state equals what recovery would produce
+from the current on-disk files. This is what makes reads safe during
+degradation. The invariant holds because every failure class that
+degrades the engine does so *without* publishing the failed transition:
+
+- Classes B1, B2, B3 (append failures): the in-memory state is never
+  updated — `apply_writes` is not reached because the I/O threw first.
+- Class C (orphaned BulkBegin): same as B — the partial batch is never
+  applied to in-memory state.
+- Classes F, G (sync failures): bytes are in the page cache but the
+  key-directory changes are not published. `next_lsn` advances to
+  prevent LSN reuse, but no key-value changes become visible.
+- Class H (rotation failure): the write succeeded and was published, but
+  the rotation to a new file failed. The published state is consistent
+  with what recovery would find — the committed entries are on disk.
+
+Therefore: the published state at degradation time corresponds only to
+fully-durable committed transitions, and reads against it are safe.
+
 **Recovery-equivalent**: the in-memory state agrees with what opening
 a fresh DB from the current on-disk files would produce.
+
+**fdatasync trust assumption**: the engine trusts that a successful
+`fdatasync` return means all preceding writes are durable on the
+underlying storage device. On Linux, this trust is not fully earned in
+all configurations — the "fsyncgate" issue (PostgreSQL, 2018) showed
+that on some kernel/filesystem combinations, `fsync` can return success
+after an earlier async writeback error was consumed by another fd.
+PostgreSQL's response was to `PANIC` on any `fsync` error; RocksDB added
+`track_and_verify_wals_in_manifest`. ByteCaskDB does not implement
+writeback error tracking. This is a deliberate simplicity choice for an
+embedded engine targeting local storage — the assumption is stated here
+so that it can be revisited if the engine is deployed on storage
+configurations where it does not hold.
 
 ---
 
@@ -64,6 +97,13 @@ If any precondition guard, range guard, or implicit W-W check fails,
 `apply_batch_if` must return `false`. The engine must not attempt any
 writes, perform I/O, or change state. The caller's snapshot must not
 be invalidated.
+
+A `WritePlan` with guards but no write operations (no `put` or `del`)
+is not empty — guards are evaluated. If all guards pass, the plan
+returns `true` with no I/O and no state change. If any guard fails,
+the plan returns `false`. This is intentional: it allows callers to
+validate preconditions without committing writes, using the same
+conflict-detection mechanism.
 
 ### I/O Failure Safety
 

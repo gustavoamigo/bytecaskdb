@@ -65,7 +65,34 @@ restart — analogous to ByteCaskDB's `DbDegraded` + `resume()`. The
 (B1/B2/B3/C/F/G/H): the engine degrades rather than permanently blocking,
 and `resume()` restores normal operation without a restart.
 
-### 2. Partial write detection varies widely
+### 2. The `fdatasync` trust assumption and fsyncgate
+
+All engines in this comparison trust `fdatasync`'s return value: success
+means the data is durable. On Linux, this trust has a known gap — the
+"fsyncgate" issue (2018) showed that on some kernel/filesystem
+combinations, `fsync` can return success after an earlier async writeback
+error was consumed by another fd, because the kernel clears the error
+flag on the first `fsync` call against the inode.
+
+Engine responses vary:
+
+| Engine | Response |
+|--------|----------|
+| PostgreSQL | `PANIC` on any `fsync` error; writeback error tracking added post-2018 |
+| RocksDB | `track_and_verify_wals_in_manifest` option; verify WAL checksums against manifest at open |
+| WiredTiger | `WT_RET_PANIC` on any write error — fsyncgate is subsumed by the general policy |
+| LevelDB | No specific mitigation; permanent `bg_error_` latch on any error |
+| SQLite WAL | Relies on the VFS abstraction; platform-specific VFS can add writeback tracking |
+| LMDB | COW + meta-page flip sidesteps — a successful `msync`/`fdatasync` of the meta page is the only sync that matters |
+| ByteCaskDB | Trusts `fdatasync` return value; no writeback error tracking |
+
+ByteCaskDB's position: this is a deliberate simplicity choice for an
+embedded engine targeting local storage with reliable `fdatasync`
+semantics (ext4, XFS, ZFS on Linux ≥ 4.13). The assumption is documented
+in `CONTRACT.md` so it can be revisited for deployments on storage
+configurations where it may not hold.
+
+### 3. Partial write detection varies widely
 
 SQLite WAL is the strongest: its cumulative checksum across all prior frames
 plus the commit-frame requirement makes partial writes or uncommitted
@@ -79,7 +106,7 @@ partial-write problem structurally for data pages — COW B-tree pages are only
 reachable after the meta-page flip, so partial data-page writes are invisible
 to any reader.
 
-### 3. Degraded/poison semantics diverge significantly on failure
+### 4. Degraded/poison semantics diverge significantly on failure
 
 | Engine | Permanent block? | In-session recovery? | Resume API? |
 |---|---|---|---|
@@ -95,7 +122,7 @@ with RocksDB's severity tiers: all IO failure classes (B1/B2/B3/C/F/G/H)
 enter a degraded state, and `resume()` performs a universal recovery
 (scan → truncate → sync → rotate) to restore normal operation.
 
-### 4. Rotation failure asymmetry in LevelDB
+### 5. Rotation failure asymmetry in LevelDB
 
 LevelDB distinguishes within the same rotation event: failing to create the
 *new* log file is recoverable (the old file is still intact and writable);
@@ -105,7 +132,7 @@ new file cannot be created, the sealed file cannot accept further appends.
 ByteCaskDB degrades rather than permanently blocking: `resume()` creates a
 fresh active file and restores writes without a restart.
 
-### 5. Recovery mode configurability
+### 6. Recovery mode configurability
 
 RocksDB uniquely exposes four explicit WAL recovery modes:
 
@@ -119,12 +146,19 @@ recovery is structurally closest to WiredTiger's `__wt_log_scan`: scan forward,
 CRC-verify each record, stop at the first invalid entry. Hint files provide a
 parallel-reconstruction acceleration path on top of that.
 
-### 6. No engine retries disk IO — fail-fast is the universal strategy
+### 7. No engine retries hardware IO errors — fail-fast is the universal strategy
 
 None of the five comparison engines retry a failed `write()` or `fdatasync()`
-internally. The dominant pattern is **fail-fast and propagate**: report the
-error to the caller immediately and let the application or orchestrator decide
-the response.
+that returns a hardware error (`EIO`). The dominant pattern is **fail-fast and
+propagate**: report the error to the caller immediately and let the application
+or orchestrator decide the response.
+
+Some engines do retry *transient* interruptions: PostgreSQL's `pg_pwrite()`
+wraps `pwrite()` in a retry loop for `EINTR`, and WAL writes continue on short
+writes (writing remaining bytes). SQLite's VFS retries `EINTR` on `xWrite`.
+These are not IO retries in the hardware-error sense — they handle signals and
+partial completions that are expected under normal operation. The universal rule
+is: **don't retry `EIO`**, not "don't retry any IO."
 
 The reasoning is consistent across all engines:
 
@@ -134,7 +168,7 @@ The reasoning is consistent across all engines:
 - **Violating ordering guarantees.** If a retry changes the order of writes
   relative to visibility, durability invariants break.
 - **Unbounded latency.** POSIX provides no timeout mechanism for regular file
-  IO (see observation 8), so retrying disk IO means the engine has no way to
+  IO (see observation 9), so retrying disk IO means the engine has no way to
   bound how long a caller waits.
 
 Engines differ only in *how aggressively* they react after propagation:
@@ -151,10 +185,9 @@ team's position is that crashing the node and letting the replica set elect a
 new primary is preferable to serving reads from a potentially inconsistent
 state. LevelDB's one-way `bg_error_` latch is only slightly less aggressive.
 
-PostgreSQL is a notable external reference: `pg_pwrite()` wraps `pwrite()` in
-a retry loop for `EINTR`, and WAL writes retry short writes (continue writing
-remaining bytes). But `fdatasync` failures are **not** retried — they trigger
-a `PANIC` and crash recovery.
+PostgreSQL is a notable external reference: despite retrying `EINTR` and short
+writes (see above), `fdatasync` failures are **not** retried — they trigger a
+`PANIC` and crash recovery.
 
 No production storage engine uses exponential backoff for disk IO. Backoff is
 a network/contention strategy. Disk IO either works or it doesn't — retrying
@@ -165,7 +198,7 @@ backoff-like behavior in this space is lock-contention retry: SQLite's
 WiredTiger's log-slot yield loop (~10K iterations waiting for a consolidation
 slot under high concurrency — spin-wait for a lock, not IO retry).
 
-### 7. Idempotency strategies for write-path recovery
+### 8. Idempotency strategies for write-path recovery
 
 After a failed IO, the engine often cannot determine whether the operation
 partially completed. Each engine's idempotency strategy determines how safely
@@ -182,7 +215,7 @@ The common pattern: **make the visibility gate atomic and separate from the
 data write**, so a failed write is either invisible (retry the whole thing) or
 fully visible (no retry needed).
 
-### 8. POSIX provides no timeout for regular file IO
+### 9. POSIX provides no timeout for regular file IO
 
 All engines in this comparison block the calling thread unconditionally during
 disk IO. No engine implements IO timeouts at the engine level.
@@ -219,7 +252,7 @@ WiredTiger's log-slot consolidation means multiple threads block waiting for a
 single slow IO; and ByteCaskDB holds the write lock for the entire `writev` +
 state publish.
 
-### 9. Correctness contract documentation is rare
+### 10. Correctness contract documentation is rare
 
 ByteCaskDB's [`CONTRACT.md`](../CONTRACT.md) is a single plain-language
 document that specifies the behavioral guarantees of every write function:
