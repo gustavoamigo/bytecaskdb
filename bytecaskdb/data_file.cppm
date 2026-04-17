@@ -63,7 +63,11 @@ public:
           errno, std::generic_category(),
           std::format("DataFile: cannot open '{}'", path_.string())};
     }
+    // Hint to the kernel that reads will be random (point lookups by offset).
+    // posix_fadvise is Linux-only; macOS has no equivalent.
+#ifndef __APPLE__
     ::posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
+#endif
     offset_ = std::filesystem::file_size(path_);
   }
 
