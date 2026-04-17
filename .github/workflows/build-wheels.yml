@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Build Python wheels for bytecaskdb on Linux (manylinux_2_28) and macOS.
 #
-# Produces wheels as GitHub Actions artifacts. Download from the Actions tab.
+# Wheels are uploaded as GitHub Actions artifacts and published to
+# GitHub Pages at:
+#   https://<user>.github.io/bytecaskdb/python/latest/
+#
+# Install with:
+#   pip install --index-url https://<user>.github.io/bytecaskdb/python/latest/ bytecaskdb
 #
 # Linux builds run inside the manylinux container with LLVM 20.
 # macOS builds use Homebrew LLVM (latest, currently 20).
@@ -12,6 +17,17 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+
+# Required for GitHub Pages deployment.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deployment at a time.
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -193,3 +209,48 @@ jobs:
         with:
           name: wheel-macos-arm64-${{ matrix.python-version }}
           path: dist/final/*.whl
+
+  # ---------------------------------------------------------------------------
+  # Publish wheels to GitHub Pages (PEP 503 simple repository)
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [linux, macos-x86_64, macos-arm64]
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: wheels
+          pattern: wheel-*
+          merge-multiple: true
+
+      - name: Build PEP 503 index
+        run: |
+          mkdir -p site/python/latest/bytecaskdb
+          cp wheels/*.whl site/python/latest/bytecaskdb/
+
+          # Generate package index page
+          cd site/python/latest/bytecaskdb
+          {
+            echo '<!DOCTYPE html><html><body>'
+            for whl in *.whl; do
+              echo "<a href=\"${whl}\">${whl}</a><br>"
+            done
+            echo '</body></html>'
+          } > index.html
+
+          # Generate root index pointing to the package
+          cd ..
+          echo '<!DOCTYPE html><html><body><a href="bytecaskdb/">bytecaskdb</a></body></html>' > index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
