@@ -26,7 +26,6 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-116 | MariaDB Phase 3 — L2 Transaction + statement atomicity | Internal `MariaDBTxn` class on top of `snapshot()` + `apply_batch_if()`. `hton->commit/rollback`. OCC conflict → `HA_ERR_LOCK_DEADLOCK`. |
 | BC-117 | MariaDB Phase 4 — Secondary indexes | Key encoding `[index_id][sec_key][pk]`, atomic primary+secondary writes, `index_read/next/prev`. |
 | BC-118 | MariaDB Phase 5 — MVCC + lockless architecture | `HTON_MVCC`, `HTON_NO_LOCK_MANAGER`, `start_consistent_snapshot()`. |
 | BC-120 | MariaDB Phase 6 — Replication + backup hooks | 2PC `prepare`, XA `recover`, `backup_stage` hooks. |
@@ -56,6 +55,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-116 | MariaDB Phase C — L2 Transaction + statement atomicity | Per-THD `MariaDBTxn` class with dual-structure write buffer (`ops_` log + `lookup_` map) over snapshot. `hton->commit/rollback/close_connection`. OCC conflict detection via `WritePlan` implicit W-W check → `HA_ERR_LOCK_DEADLOCK`. RYOW via `MergeIterator` (two-pointer merge of snapshot iter + write buffer). BEGIN/COMMIT, BEGIN/ROLLBACK, autocommit, duplicate key detection within txn. 24 smoke tests pass. |
 | BC-114 | Purge table keys on DROP TABLE | `delete_table()` upgraded from paginated point-delete loop to atomic `del_range` + catalog delete in a single `WritePlan`. O(1) disk I/O regardless of table size. |
 | BC-115 | MariaDB Phase 2 — Basic CRUD + PK lookups | `write_row` (with duplicate detection via `ensure_absent`), `update_row` (PK-changed and PK-unchanged), `delete_row`, full table scan (`rnd_init/next/end`), PK index access (`index_read`, `index_next`, `index_first`), `position`/`rnd_pos`. |
 | BC-190 | Causality proof tests | 10 new plan shapes (4 within-batch causality + 4 solo + 2 sequential overwrite) and 1 new state shape (`deleted_key` — tombstone in history) added to the proof test generator. Within-batch shapes target the same key for all operations; sequential shapes overwrite a pre-existing key across separate API calls. Combined with `rotation_threshold` state, this covers cross-file causality through recovery. Solo variants exercise the solo writer path. `expected_delta.py` rewritten with net-effect computation. `ExpectedDelta` extended with `expected_values` for value verification. Causality contract added to `CONTRACT.md`. 492 proof tests (was 148). 793 total tests pass. |

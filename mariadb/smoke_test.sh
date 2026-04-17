@@ -342,7 +342,47 @@ check "Restart persistence: row count" "2" "$count"
 run_sql "DROP TABLE ${TEST_DB}.t;"
 
 # ---------------------------------------------------------------------------
-# 6. Summary
+# 6. Transaction tests
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "--- Transaction tests ---"
+
+# BEGIN/COMMIT — two inserts committed together
+run_sql "CREATE TABLE ${TEST_DB}.txn1 (id INT PRIMARY KEY, name VARCHAR(50)) ENGINE=bytecaskdb;"
+run_sql "BEGIN; INSERT INTO ${TEST_DB}.txn1 VALUES (1,'a'); INSERT INTO ${TEST_DB}.txn1 VALUES (2,'b'); COMMIT;"
+count=$(run_sql "SELECT COUNT(*) FROM ${TEST_DB}.txn1;" 2>&1 || true)
+check "BEGIN/COMMIT: both rows visible" "2" "$count"
+run_sql "DROP TABLE ${TEST_DB}.txn1;"
+
+# BEGIN/ROLLBACK — inserts rolled back
+run_sql "CREATE TABLE ${TEST_DB}.txn2 (id INT PRIMARY KEY, name VARCHAR(50)) ENGINE=bytecaskdb;"
+run_sql "BEGIN; INSERT INTO ${TEST_DB}.txn2 VALUES (1,'a'); INSERT INTO ${TEST_DB}.txn2 VALUES (2,'b'); ROLLBACK;"
+count=$(run_sql "SELECT COUNT(*) FROM ${TEST_DB}.txn2;" 2>&1 || true)
+check "BEGIN/ROLLBACK: no rows" "0" "$count"
+run_sql "DROP TABLE ${TEST_DB}.txn2;"
+
+# RYOW within transaction — read your own writes
+run_sql "CREATE TABLE ${TEST_DB}.txn3 (id INT PRIMARY KEY, name VARCHAR(50)) ENGINE=bytecaskdb;"
+result=$(run_sql "BEGIN; INSERT INTO ${TEST_DB}.txn3 VALUES (1,'ryow'); SELECT name FROM ${TEST_DB}.txn3 WHERE id=1; ROLLBACK;" 2>&1 || true)
+check "RYOW within txn" "ryow" "$result"
+run_sql "DROP TABLE ${TEST_DB}.txn3;"
+
+# Duplicate key within transaction
+run_sql "CREATE TABLE ${TEST_DB}.txn4 (id INT PRIMARY KEY, name VARCHAR(50)) ENGINE=bytecaskdb;"
+result=$(run_sql "BEGIN; INSERT INTO ${TEST_DB}.txn4 VALUES (1,'first'); INSERT INTO ${TEST_DB}.txn4 VALUES (1,'dup'); ROLLBACK;" 2>&1 || true)
+check "Dup key within txn" "duplicate key" "$result"
+run_sql "DROP TABLE ${TEST_DB}.txn4;"
+
+# Autocommit single statement — should persist
+run_sql "CREATE TABLE ${TEST_DB}.txn5 (id INT PRIMARY KEY, name VARCHAR(50)) ENGINE=bytecaskdb;"
+run_sql "INSERT INTO ${TEST_DB}.txn5 VALUES (1,'auto');"
+count=$(run_sql "SELECT COUNT(*) FROM ${TEST_DB}.txn5;" 2>&1 || true)
+check "Autocommit persists" "1" "$count"
+run_sql "DROP TABLE ${TEST_DB}.txn5;"
+
+# ---------------------------------------------------------------------------
+# 7. Summary
 # ---------------------------------------------------------------------------
 
 echo ""

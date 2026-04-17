@@ -17,6 +17,7 @@
 
 #include "ha_bytecaskdb.h"
 #include "catalog.h"
+#include "bytecaskdb_txn.h"
 
 #include <cstdio>
 #include <cstring>
@@ -287,6 +288,32 @@ static handler *bytecaskdb_create_handler(handlerton *hton,
 }
 
 // ---------------------------------------------------------------------------
+// Handlerton callbacks — commit / rollback / close_connection
+// ---------------------------------------------------------------------------
+
+static int bytecaskdb_commit(handlerton *hton, THD *thd, bool all) {
+  auto *txn = static_cast<MariaDBTxn *>(thd_get_ha_data(thd, hton));
+  if (!txn) { return 0; }
+  return txn->commit(thd, all);
+}
+
+static int bytecaskdb_rollback(handlerton *hton, THD *thd, bool all) {
+  auto *txn = static_cast<MariaDBTxn *>(thd_get_ha_data(thd, hton));
+  if (!txn) { return 0; }
+  txn->rollback(thd, all);
+  return 0;
+}
+
+static int bytecaskdb_close_connection(handlerton *hton, THD *thd) {
+  auto *txn = static_cast<MariaDBTxn *>(thd_get_ha_data(thd, hton));
+  if (txn) {
+    delete txn;
+    thd_set_ha_data(thd, hton, nullptr);
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Plugin init / deinit
 // ---------------------------------------------------------------------------
 
@@ -294,8 +321,11 @@ static int bytecaskdb_init(void *p) {
   auto *hton = static_cast<handlerton *>(p);
   bytecaskdb_hton = hton;
 
-  hton->create        = bytecaskdb_create_handler;
-  hton->flags         = HTON_NO_FLAGS;
+  hton->create           = bytecaskdb_create_handler;
+  hton->commit           = bytecaskdb_commit;
+  hton->rollback         = bytecaskdb_rollback;
+  hton->close_connection = bytecaskdb_close_connection;
+  hton->flags            = HTON_NO_FLAGS;
 
   // Open the global database inside MariaDB's data directory.
   std::string db_path = std::string(mysql_real_data_home) + "bytecaskdb";

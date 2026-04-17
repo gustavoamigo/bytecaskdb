@@ -14,6 +14,7 @@
 #include "catalog.h"
 #include "key_encoding.h"
 #include "row_encoding.h"
+#include "bytecaskdb_txn.h"
 
 #include <cassert>
 #include <cstdio>
@@ -21,6 +22,16 @@
 #include <vector>
 
 namespace bytecaskdb {
+
+// Helper: get-or-create the per-THD MariaDBTxn from ha_data.
+static MariaDBTxn *get_or_create_txn(THD *thd, handlerton *hton) {
+  auto *txn = static_cast<MariaDBTxn *>(thd_get_ha_data(thd, hton));
+  if (!txn) {
+    txn = new MariaDBTxn(g_db);
+    thd_set_ha_data(thd, hton, txn);
+  }
+  return txn;
+}
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -48,6 +59,19 @@ ulong ha_bytecaskdb::index_flags(uint idx, uint /*part*/,
 THR_LOCK_DATA **ha_bytecaskdb::store_lock(THD * /*thd*/, THR_LOCK_DATA **to,
                                           enum thr_lock_type /*lock_type*/) {
   return to;
+}
+
+// ---------------------------------------------------------------------------
+// external_lock() — transaction lifecycle
+// ---------------------------------------------------------------------------
+
+int ha_bytecaskdb::external_lock(THD *thd, int lock_type) {
+  if (lock_type != F_UNLCK) {
+    auto *txn = get_or_create_txn(thd, bytecaskdb_hton);
+    txn->begin_if_needed(thd, bytecaskdb_hton);
+  }
+  // F_UNLCK: no-op — commit/rollback via handlerton callbacks.
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +162,8 @@ int ha_bytecaskdb::close() {
     bytecask_iter_free(index_iter_);
     index_iter_ = nullptr;
   }
+  merge_scan_.reset();
+  merge_index_.reset();
   return 0;
 }
 
@@ -191,24 +217,19 @@ int ha_bytecaskdb::rename_table(const char *from, const char *to) {
 int ha_bytecaskdb::write_row(const uchar *buf) {
   if (!g_db) { return HA_ERR_GENERIC; }
 
+  auto *txn = static_cast<MariaDBTxn *>(
+      thd_get_ha_data(ha_thd(), bytecaskdb_hton));
+  if (!txn) { return HA_ERR_GENERIC; }
+
   auto key = encode_current_pk(buf);
   auto val = encode_row(table, buf, schema_version_);
 
-  auto *plan = bytecask_write_plan_new();
-  if (!plan) { return HA_ERR_GENERIC; }
-
-  // Guard: reject if this PK already exists.
-  bytecask_write_plan_ensure_absent(plan, key.data(), key.size());
-  bytecask_write_plan_put(plan, key.data(), key.size(),
-                          val.data(), val.size());
-
-  int rc = bytecask_apply_batch_if(g_db, plan, /*sync=*/1);
-  if (rc == 0) {
+  // Eager dup check: lookup_ then snapshot.
+  if (txn->exists(key.data(), key.size())) {
     return HA_ERR_FOUND_DUPP_KEY;
   }
-  if (rc < 0) {
-    return HA_ERR_GENERIC;
-  }
+
+  txn->buffer_put(key.data(), key.size(), val.data(), val.size());
   return 0;
 }
 
@@ -219,32 +240,28 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
 int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
   if (!g_db) { return HA_ERR_GENERIC; }
 
+  auto *txn = static_cast<MariaDBTxn *>(
+      thd_get_ha_data(ha_thd(), bytecaskdb_hton));
+  if (!txn) { return HA_ERR_GENERIC; }
+
   auto old_pk = encode_current_pk(old_data);
   auto new_pk = encode_current_pk(new_data);
   auto new_val = encode_row(table, new_data, schema_version_);
 
-  auto *plan = bytecask_write_plan_new();
-  if (!plan) { return HA_ERR_GENERIC; }
-
   if (old_pk == new_pk) {
     // PK unchanged — simple overwrite.
-    bytecask_write_plan_put(plan, new_pk.data(), new_pk.size(),
-                            new_val.data(), new_val.size());
+    txn->buffer_put(new_pk.data(), new_pk.size(),
+                    new_val.data(), new_val.size());
   } else {
-    // PK changed — delete old, insert new with duplicate check.
-    bytecask_write_plan_del(plan, old_pk.data(), old_pk.size());
-    bytecask_write_plan_ensure_absent(plan, new_pk.data(), new_pk.size());
-    bytecask_write_plan_put(plan, new_pk.data(), new_pk.size(),
-                            new_val.data(), new_val.size());
+    // PK changed — dup check new pk, delete old, insert new.
+    if (txn->exists(new_pk.data(), new_pk.size())) {
+      return HA_ERR_FOUND_DUPP_KEY;
+    }
+    txn->buffer_del(old_pk.data(), old_pk.size());
+    txn->buffer_put(new_pk.data(), new_pk.size(),
+                    new_val.data(), new_val.size());
   }
 
-  int rc = bytecask_apply_batch_if(g_db, plan, /*sync=*/1);
-  if (rc == 0) {
-    return HA_ERR_FOUND_DUPP_KEY;
-  }
-  if (rc < 0) {
-    return HA_ERR_GENERIC;
-  }
   return 0;
 }
 
@@ -255,17 +272,12 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
 int ha_bytecaskdb::delete_row(const uchar *buf) {
   if (!g_db) { return HA_ERR_GENERIC; }
 
+  auto *txn = static_cast<MariaDBTxn *>(
+      thd_get_ha_data(ha_thd(), bytecaskdb_hton));
+  if (!txn) { return HA_ERR_GENERIC; }
+
   auto key = encode_current_pk(buf);
-
-  auto *plan = bytecask_write_plan_new();
-  if (!plan) { return HA_ERR_GENERIC; }
-
-  bytecask_write_plan_del(plan, key.data(), key.size());
-
-  int rc = bytecask_apply_batch_if(g_db, plan, /*sync=*/1);
-  if (rc < 0) {
-    return HA_ERR_GENERIC;
-  }
+  txn->buffer_del(key.data(), key.size());
   return 0;
 }
 
@@ -276,55 +288,37 @@ int ha_bytecaskdb::delete_row(const uchar *buf) {
 int ha_bytecaskdb::rnd_init(bool /*scan*/) {
   if (!g_db) { return HA_ERR_GENERIC; }
 
-  auto prefix = table_id_prefix(table_id_);
-  scan_iter_ = bytecask_iter_open(g_db, prefix.data(), prefix.size());
-  if (!scan_iter_) {
+  auto *txn = static_cast<MariaDBTxn *>(
+      thd_get_ha_data(ha_thd(), bytecaskdb_hton));
+  if (!txn) { return HA_ERR_GENERIC; }
+
+  auto lo = table_id_prefix(table_id_);
+  auto hi = table_id_upper_bound(table_id_);
+  merge_scan_ = txn->iter_prefix(lo.data(), lo.size(),
+                                  hi.data(), hi.size(), table_id_);
+  if (!merge_scan_) {
     return HA_ERR_GENERIC;
   }
   return 0;
 }
 
 int ha_bytecaskdb::rnd_next(uchar *buf) {
-  if (!scan_iter_) { return HA_ERR_END_OF_FILE; }
-
-  if (!bytecask_iter_valid(scan_iter_)) {
+  if (!merge_scan_ || !merge_scan_->valid()) {
     return HA_ERR_END_OF_FILE;
   }
 
-  uint8_t *key_buf = nullptr;
-  std::size_t key_len = 0;
-  if (bytecask_iter_key(scan_iter_, &key_buf, &key_len) != 0) {
-    return HA_ERR_GENERIC;
-  }
+  // Decode PK from key into record buffer.
+  decode_pk(table, merge_scan_->key_data(), merge_scan_->key_len(), buf);
 
-  if (!key_belongs_to_table(key_buf, key_len, table_id_)) {
-    bytecask_free_buf(key_buf);
-    return HA_ERR_END_OF_FILE;
-  }
+  // Decode row value.
+  decode_row(table, merge_scan_->value_data(), merge_scan_->value_len(), buf);
 
-  // Decode PK into the record buffer.
-  decode_pk(table, key_buf, key_len, buf);
-  bytecask_free_buf(key_buf);
-
-  // Read and decode value.
-  uint8_t *val_buf = nullptr;
-  std::size_t val_len = 0;
-  if (bytecask_iter_value(scan_iter_, &val_buf, &val_len) != 0) {
-    return HA_ERR_GENERIC;
-  }
-
-  decode_row(table, val_buf, val_len, buf);
-  bytecask_free_buf(val_buf);
-
-  bytecask_iter_next(scan_iter_);
+  merge_scan_->next();
   return 0;
 }
 
 int ha_bytecaskdb::rnd_end() {
-  if (scan_iter_) {
-    bytecask_iter_free(scan_iter_);
-    scan_iter_ = nullptr;
-  }
+  merge_scan_.reset();
   return 0;
 }
 
@@ -338,10 +332,7 @@ int ha_bytecaskdb::index_init(uint idx, bool /*sorted*/) {
 }
 
 int ha_bytecaskdb::index_end() {
-  if (index_iter_) {
-    bytecask_iter_free(index_iter_);
-    index_iter_ = nullptr;
-  }
+  merge_index_.reset();
   active_index = MAX_KEY;
   return 0;
 }
@@ -354,6 +345,10 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
                                    key_part_map keypart_map,
                                    enum ha_rkey_function find_flag) {
   if (!g_db) { return HA_ERR_GENERIC; }
+
+  auto *txn = static_cast<MariaDBTxn *>(
+      thd_get_ha_data(ha_thd(), bytecaskdb_hton));
+  if (!txn) { return HA_ERR_GENERIC; }
 
   // Build the search key from MariaDB's packed key format.
   uint pk_idx = table->s->primary_key;
@@ -368,11 +363,11 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
   std::memcpy(search_key.data() + 5, key, pk_len);
 
   if (find_flag == HA_READ_KEY_EXACT) {
-    // Point lookup via bytecask_get.
+    // Point lookup via txn->get().
     uint8_t *val_buf = nullptr;
     std::size_t val_len = 0;
-    int found = bytecask_get(g_db, search_key.data(), search_key.size(),
-                             &val_buf, &val_len);
+    int found = txn->get(search_key.data(), search_key.size(),
+                         &val_buf, &val_len);
     if (found < 0) { return HA_ERR_GENERIC; }
     if (found == 0) { return HA_ERR_KEY_NOT_FOUND; }
 
@@ -384,13 +379,11 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
     return 0;
   }
 
-  // Range scan: open iterator at search key.
-  if (index_iter_) {
-    bytecask_iter_free(index_iter_);
-  }
-  index_iter_ = bytecask_iter_open(g_db, search_key.data(),
-                                    search_key.size());
-  if (!index_iter_) { return HA_ERR_GENERIC; }
+  // Range scan: open merge iterator at search key.
+  auto hi = table_id_upper_bound(table_id_);
+  merge_index_ = txn->iter_prefix(search_key.data(), search_key.size(),
+                                   hi.data(), hi.size(), table_id_);
+  if (!merge_index_) { return HA_ERR_GENERIC; }
 
   return index_read_current(buf);
 }
@@ -400,8 +393,8 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
 // ---------------------------------------------------------------------------
 
 int ha_bytecaskdb::index_next(uchar *buf) {
-  if (!index_iter_) { return HA_ERR_END_OF_FILE; }
-  bytecask_iter_next(index_iter_);
+  if (!merge_index_ || !merge_index_->valid()) { return HA_ERR_END_OF_FILE; }
+  merge_index_->next();
   return index_read_current(buf);
 }
 
@@ -412,12 +405,15 @@ int ha_bytecaskdb::index_next(uchar *buf) {
 int ha_bytecaskdb::index_first(uchar *buf) {
   if (!g_db) { return HA_ERR_GENERIC; }
 
-  auto prefix = table_id_prefix(table_id_);
-  if (index_iter_) {
-    bytecask_iter_free(index_iter_);
-  }
-  index_iter_ = bytecask_iter_open(g_db, prefix.data(), prefix.size());
-  if (!index_iter_) { return HA_ERR_GENERIC; }
+  auto *txn = static_cast<MariaDBTxn *>(
+      thd_get_ha_data(ha_thd(), bytecaskdb_hton));
+  if (!txn) { return HA_ERR_GENERIC; }
+
+  auto lo = table_id_prefix(table_id_);
+  auto hi = table_id_upper_bound(table_id_);
+  merge_index_ = txn->iter_prefix(lo.data(), lo.size(),
+                                   hi.data(), hi.size(), table_id_);
+  if (!merge_index_) { return HA_ERR_GENERIC; }
 
   return index_read_current(buf);
 }
@@ -427,32 +423,12 @@ int ha_bytecaskdb::index_first(uchar *buf) {
 // ---------------------------------------------------------------------------
 
 int ha_bytecaskdb::index_read_current(uchar *buf) {
-  if (!index_iter_ || !bytecask_iter_valid(index_iter_)) {
+  if (!merge_index_ || !merge_index_->valid()) {
     return HA_ERR_END_OF_FILE;
   }
 
-  uint8_t *key_buf = nullptr;
-  std::size_t key_len = 0;
-  if (bytecask_iter_key(index_iter_, &key_buf, &key_len) != 0) {
-    return HA_ERR_GENERIC;
-  }
-
-  if (!key_belongs_to_table(key_buf, key_len, table_id_)) {
-    bytecask_free_buf(key_buf);
-    return HA_ERR_END_OF_FILE;
-  }
-
-  decode_pk(table, key_buf, key_len, buf);
-  bytecask_free_buf(key_buf);
-
-  uint8_t *val_buf = nullptr;
-  std::size_t val_len = 0;
-  if (bytecask_iter_value(index_iter_, &val_buf, &val_len) != 0) {
-    return HA_ERR_GENERIC;
-  }
-
-  decode_row(table, val_buf, val_len, buf);
-  bytecask_free_buf(val_buf);
+  decode_pk(table, merge_index_->key_data(), merge_index_->key_len(), buf);
+  decode_row(table, merge_index_->value_data(), merge_index_->value_len(), buf);
   return 0;
 }
 
@@ -469,10 +445,14 @@ void ha_bytecaskdb::position(const uchar *record) {
 int ha_bytecaskdb::rnd_pos(uchar *buf, uchar *pos) {
   if (!g_db) { return HA_ERR_GENERIC; }
 
+  auto *txn = static_cast<MariaDBTxn *>(
+      thd_get_ha_data(ha_thd(), bytecaskdb_hton));
+  if (!txn) { return HA_ERR_GENERIC; }
+
   uint8_t *val_buf = nullptr;
   std::size_t val_len = 0;
 
-  int found = bytecask_get(g_db, pos, ref_length, &val_buf, &val_len);
+  int found = txn->get(pos, ref_length, &val_buf, &val_len);
   if (found < 0) { return HA_ERR_GENERIC; }
   if (found == 0) { return HA_ERR_KEY_NOT_FOUND; }
 

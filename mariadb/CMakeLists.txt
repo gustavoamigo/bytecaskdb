@@ -111,6 +111,7 @@ endif()
 add_library(ha_bytecaskdb MODULE
   ha_bytecaskdb.cc
   bytecaskdb_plugin.cc
+  bytecaskdb_txn.cc
   catalog.cc
   key_encoding.cc
   row_encoding.cc

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "bytecask_c.h"
+#include "bytecaskdb_txn.h"
 
 namespace bytecaskdb {
 
@@ -93,6 +94,12 @@ public:
   int index_first(uchar *buf) override;
 
   // -------------------------------------------------------------------
+  // External lock — transaction lifecycle
+  // -------------------------------------------------------------------
+
+  int external_lock(THD *thd, int lock_type) override;
+
+  // -------------------------------------------------------------------
   // Position / random access by row reference
   // -------------------------------------------------------------------
 
@@ -104,8 +111,7 @@ public:
   // -------------------------------------------------------------------
 
   ulonglong table_flags() const override {
-    return HA_NO_TRANSACTIONS |
-           HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
+    return HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
            HA_PRIMARY_KEY_REQUIRED_FOR_DELETE |
            HA_TABLE_SCAN_ON_INDEX |
            HA_REC_NOT_IN_SEQ;
@@ -129,8 +135,10 @@ private:
   uint32_t table_id_{0};
   uint16_t schema_version_{1};
 
-  bytecask_iter_t *scan_iter_{nullptr};
-  bytecask_iter_t *index_iter_{nullptr};
+  bytecask_iter_t *scan_iter_{nullptr};     // TODO(phase-c): remove after read path migration
+  bytecask_iter_t *index_iter_{nullptr};    // TODO(phase-c): remove after read path migration
+  std::unique_ptr<MariaDBTxn::MergeIterator> merge_scan_;
+  std::unique_ptr<MariaDBTxn::MergeIterator> merge_index_;
 
   static void write_table_id_prefix(uint8_t *buf4, uint32_t table_id);
 };
