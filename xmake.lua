@@ -136,4 +136,55 @@ target("bytecask")
     add_packages("crc32c")
     on_config(apply_sanitizer)
 
-
+-- Python bindings via nanobind.
+-- Wraps the C++23 module interface directly (not the C API).
+-- Prerequisites: pip install nanobind
+-- Build: xmake build bytecaskdb_python
+-- Usage: PYTHONPATH=bytecask-python python3 your_script.py
+target("bytecaskdb_python")
+    set_kind("shared")
+    set_default(false)
+    add_files("bytecask-python/src/bytecaskdb_module.cpp")
+    add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
+    add_packages("crc32c")
+    -- nanobind requires compiling nb_combined.cpp from the nanobind package.
+    on_load(function(t)
+        local python = "python3"
+        -- Python include directory
+        local py_inc = os.iorunv(python, {"-c", "import sysconfig; print(sysconfig.get_path('include'))"})
+        t:add("includedirs", py_inc:trim())
+        -- nanobind include directory
+        local nb_inc = os.iorunv(python, {"-c", "import nanobind; print(nanobind.include_dir())"})
+        t:add("includedirs", nb_inc:trim())
+        -- nanobind bundled dependencies (robin-map)
+        local nb_pkg = os.iorunv(python, {"-c", "import os, nanobind; print(os.path.dirname(nanobind.__file__))"})
+        t:add("includedirs", path.join(nb_pkg:trim(), "ext", "robin_map", "include"))
+        -- nanobind source (nb_combined.cpp)
+        local nb_src = os.iorunv(python, {"-c", "import nanobind; print(nanobind.source_dir())"})
+        t:add("files", path.join(nb_src:trim(), "nb_combined.cpp"))
+        -- Extension suffix and output naming
+        local ext = os.iorunv(python, {"-c", "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"})
+        ext = ext:trim()  -- e.g. ".cpython-314-x86_64-linux-gnu.so"
+        -- Strip leading dot and .so suffix to get the tag
+        local tag = ext:match("^%.(.+)%.so$") or ext:match("^%.(.+)%.pyd$") or ""
+        t:set("basename", "_bytecaskdb." .. tag)
+        t:set("prefixname", "")  -- no "lib" prefix
+        t:set("extension", ".so")
+        t:set("targetdir", path.join(os.projectdir(), "bytecask-python", "bytecaskdb"))
+    end)
+    -- Suppress warnings from nanobind headers (third-party code).
+    add_cxxflags("-Wno-old-style-cast", "-Wno-extra-semi-stmt", "-Wno-shadow",
+                 "-Wno-covered-switch-default", "-Wno-cast-function-type-strict",
+                 "-Wno-sign-conversion", "-Wno-double-promotion", "-Wno-shadow-field",
+                 "-Wno-cast-qual", "-Wno-zero-as-null-pointer-constant",
+                 "-Wno-missing-field-initializers", "-Wno-float-equal",
+                 "-Wno-deprecated-declarations", "-Wno-nested-anon-types",
+                 "-Wno-gnu-anonymous-struct", "-Wno-unused-function",
+                 {force = true})
+    add_cxxflags("-fPIC", {force = true})
+    -- Python extension modules must not export all symbols.
+    add_ldflags("-Wl,--no-undefined", {force = true})
+    on_config(function(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
