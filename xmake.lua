@@ -1,7 +1,9 @@
 add_rules("mode.debug", "mode.release", "mode.releasedbg")
 
-add_requires("catch2 3.x")
 add_requires("crc32c")
+-- Test and benchmark dependencies — optional so `xmake build` (default targets)
+-- doesn't download/build them unless the consuming target is explicitly built.
+add_requires("catch2 3.x", {optional = true})
 add_requires("benchmark", {optional = true})
 add_requires("leveldb", {optional = true})
 add_requires("rocksdb", {optional = true})
@@ -97,6 +99,7 @@ end
 
 target("bytecask_tests")
     set_kind("binary")
+    set_default(false)
     -- For VS Code / clangd support, run: scripts/gen_compile_commands.sh
     add_files("tests/*.cpp", "tests/proof/generated/*.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
     add_includedirs("bytecaskdb", "tests")
@@ -108,7 +111,7 @@ target("bytecask_tests")
         add_release_opts(t)
     end)
 
-target("bytecask_bench")
+target("map_bench")
     set_kind("binary")
     set_default(false)
     add_files("benchmarks/map_bench.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
