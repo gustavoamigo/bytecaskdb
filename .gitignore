@@ -33,6 +33,9 @@ perf*.data.old
 coverage/
 lcov.info
 
+# Fuzz corpus (evolving; seed/ is committed, corpus/ is runtime-only)
+tests/fuzz/corpus/
+
 # Local MariaDB instance for plugin smoke tests
 .mariadb_local/
 

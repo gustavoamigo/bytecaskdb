@@ -646,6 +646,28 @@ Concurrency code paths exercised:
 
 Run: `scripts/run_sanitizer.sh thread` (or `address` for ASan).
 
+### Fuzz testing (libFuzzer)
+
+Two buffer-level fuzz harnesses exercise the parser code that handles
+adversarial input on recovery — the one code path where untrusted bytes
+from bad hardware or corruption reach the engine.
+
+**`fuzz_data_entry`** — feeds arbitrary bytes to
+`data_entry::deserialize_entry(span)`. Exercises header parsing, size
+validation, and CRC checking. 3.7 M executions/minute on seed corpus.
+
+**`fuzz_hint_entry`** — feeds arbitrary bytes to
+`hint_entry::deserialize_entry(span, key_buf)` in a sequential loop
+simulating `Scanner::next`. Exercises prefix compression key
+reconstruction and length validation across multiple entries. 1.9 M
+executions/minute on seed corpus.
+
+Both harnesses run with `-fsanitize=fuzzer,address` (libFuzzer + ASan).
+Seed corpus files (`tests/fuzz/seed/`) are committed; evolving corpus
+(`tests/fuzz/corpus/`) is gitignored.
+
+Run: `scripts/run_fuzz.sh fuzz_data_entry 300` (5-minute run).
+
 ---
 
 ## Output Structure

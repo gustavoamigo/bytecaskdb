@@ -202,3 +202,36 @@ target("bytecaskdb_python")
         apply_sanitizer(t)
         add_release_opts(t)
     end)
+
+-- Fuzz targets — buffer-level parser harnesses using libFuzzer + ASan.
+-- Build: CLANG_TARGET_TRIPLE=$(clang --print-target-triple) xmake f --sanitizer=fuzzer,address -m debug -y
+--        xmake build fuzz_data_entry   (or fuzz_hint_entry)
+-- Run:   ./build/.../fuzz_data_entry tests/fuzz/corpus/data_entry/ -max_total_time=60
+
+target("fuzz_data_entry")
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/fuzz/fuzz_data_entry.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
+    add_includedirs("bytecaskdb")
+    add_packages("crc32c")
+    add_defines("BYTECASK_TESTING")
+    on_config(apply_sanitizer)
+
+target("fuzz_hint_entry")
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/fuzz/fuzz_hint_entry.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
+    add_includedirs("bytecaskdb")
+    add_packages("crc32c")
+    add_defines("BYTECASK_TESTING")
+    on_config(apply_sanitizer)
+
+-- Seed corpus generator for fuzz targets.
+-- Build: xmake build gen_fuzz_corpus
+-- Run:   ./build/.../gen_fuzz_corpus   (writes to tests/fuzz/corpus/)
+target("gen_fuzz_corpus")
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/fuzz/gen_corpus.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
+    add_includedirs("bytecaskdb")
+    add_packages("crc32c")
