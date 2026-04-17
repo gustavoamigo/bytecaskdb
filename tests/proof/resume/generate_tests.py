@@ -46,7 +46,7 @@ def gen_degrade_setup(degrade: DegradeShape) -> str:
             "    }\n"
             "    REQUIRE(db.is_degraded());"
         )
-    else:  # DegradeVia.C
+    elif degrade.degrade_via == DegradeVia.C:
         return (
             "    // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd\n"
             "    // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).\n"
@@ -60,6 +60,34 @@ def gen_degrade_setup(degrade: DegradeShape) -> str:
             "      bytecask::testing::ScopedFaultInjector fi_degrade{3};\n"
             "      REQUIRE_THROWS_AS(\n"
             "          db.apply_batch({.sync = true}, std::move(batch)),\n"
+            "          std::system_error);\n"
+            "    }\n"
+            "    REQUIRE(db.is_degraded());"
+        )
+    elif degrade.degrade_via == DegradeVia.F:
+        return (
+            "    // Establish degrade_F: k0 committed (sync=false); p0 appended but\n"
+            "    // commit sync (fdatasync) fails. Bytes in page cache, key_dir not published.\n"
+            "    auto db = bytecask::DB::open(dir);\n"
+            '    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));\n'
+            "    {\n"
+            '      bytecask::testing::ScopedFaultInjector fi_degrade{"io_data_file_sync"};\n'
+            "      REQUIRE_THROWS_AS(\n"
+            '          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),\n'
+            "          std::system_error);\n"
+            "    }\n"
+            "    REQUIRE(db.is_degraded());"
+        )
+    else:  # DegradeVia.G
+        return (
+            "    // Establish degrade_G: k0 committed (sync=false); p0 appended with\n"
+            "    // sync=false on small max_file_bytes. Pre-rotation sync fails.\n"
+            "    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});\n"
+            '    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));\n'
+            "    {\n"
+            '      bytecask::testing::ScopedFaultInjector fi_degrade{"io_data_file_sync"};\n'
+            "      REQUIRE_THROWS_AS(\n"
+            '          db.put({.sync = false}, to_bytes("p0"), to_bytes("new0")),\n'
             "          std::system_error);\n"
             "    }\n"
             "    REQUIRE(db.is_degraded());"
@@ -78,11 +106,49 @@ def gen_fault_phase(fault_name: str) -> str:
     )
 
 
-def gen_clean_resume_and_checks(delta: ResumeDelta) -> str:
-    """Generate Phase 3: clean resume + key visibility checks."""
+def gen_cascade_phases(fault_names) -> str:
+    """Generate Phase 2+3: two sequential faults, each keeping engine degraded."""
+    parts: List[str] = []
+    for i, name in enumerate(fault_names, start=2):
+        parts.append(
+            f"    // Phase {i}: inject {name} → resume() throws, stays degraded.\n"
+            f"    {{\n"
+            f'      bytecask::testing::ScopedFaultInjector fi_resume{{"{name}"}};\n'
+            f"      REQUIRE_THROWS_AS(db.resume(), std::system_error);\n"
+            f"    }}\n"
+            f"    REQUIRE(db.is_degraded());"
+        )
+    return "\n\n".join(parts)
+
+
+def gen_double_resume(delta: ResumeDelta) -> str:
+    """Generate DOUBLE: first resume succeeds, second is a no-op."""
+    lines: List[str] = []
+    lines.append("    // First resume() succeeds.")
+    lines.append("    REQUIRE_NOTHROW(db.resume());")
+    lines.append("    REQUIRE_FALSE(db.is_degraded());")
+    for key in delta.keys_present:
+        lines.append(f'    CHECK(db.contains_key(to_bytes("{key}")));')
+    for key in delta.keys_absent:
+        lines.append(f'    CHECK_FALSE(db.contains_key(to_bytes("{key}")));')
+    lines.append("    assert_consistent(db);")
+    lines.append("")
+    lines.append("    // Second resume() is a no-op — engine already healthy.")
+    lines.append("    REQUIRE_NOTHROW(db.resume());")
+    lines.append("    REQUIRE_FALSE(db.is_degraded());")
+    for key in delta.keys_present:
+        lines.append(f'    CHECK(db.contains_key(to_bytes("{key}")));')
+    for key in delta.keys_absent:
+        lines.append(f'    CHECK_FALSE(db.contains_key(to_bytes("{key}")));')
+    lines.append("    assert_consistent(db);")
+    return "\n".join(lines)
+
+
+def gen_clean_resume_and_checks(delta: ResumeDelta, phase_num: int = 3) -> str:
+    """Generate clean resume + key visibility checks."""
     lines: List[str] = []
     lines.append(
-        "    // Phase 3: clean resume → clears degraded flag."
+        f"    // Phase {phase_num}: clean resume → clears degraded flag."
         if delta.first_threw
         else "    // resume() succeeds on first attempt."
     )
@@ -106,7 +172,7 @@ def gen_recovery_check(delta: ResumeDelta) -> str:
 def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     """Generate one complete TEST_CASE."""
     delta = resume_delta(degrade, failure)
-    fault_name = resolve_resume_fault(failure)
+    fault = resolve_resume_fault(failure)
     name = f"prove_resume__{degrade.label}__{failure.value}"
 
     parts: List[str] = []
@@ -117,11 +183,19 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     parts.append(gen_degrade_setup(degrade))
     parts.append("")
 
-    if fault_name:
-        parts.append(gen_fault_phase(fault_name))
+    if failure == ResumeFailureClass.DOUBLE:
+        parts.append(gen_double_resume(delta))
+    elif failure == ResumeFailureClass.CASCADE:
+        parts.append(gen_cascade_phases(fault))
         parts.append("")
+        parts.append(gen_clean_resume_and_checks(delta, phase_num=4))
+    elif fault:
+        parts.append(gen_fault_phase(fault))
+        parts.append("")
+        parts.append(gen_clean_resume_and_checks(delta))
+    else:
+        parts.append(gen_clean_resume_and_checks(delta))
 
-    parts.append(gen_clean_resume_and_checks(delta))
     parts.append("  }")
     parts.append(gen_recovery_check(delta))
     parts.append("}")

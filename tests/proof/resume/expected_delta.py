@@ -24,7 +24,7 @@ class ResumeDelta:
 def resume_delta(degrade: DegradeShape, failure: ResumeFailureClass) -> ResumeDelta:
     """
     Reference model: computes the expected observable state after resume()
-    completes (including a clean retry for R1/R2/R3 failure cases).
+    completes (including a clean retry for R1/R2/R3/CASCADE failure cases).
 
     degrade_H: k0 was committed before degradation; p0 was also committed
                (it triggered the rotation fault after the write succeeded).
@@ -34,13 +34,32 @@ def resume_delta(degrade: DegradeShape, failure: ResumeFailureClass) -> ResumeDe
                and all isolation attempts also failed (cascade from fail_at=3).
                Orphaned BulkBegin+p0+p1 bytes remain in the active file.
                resume() truncates back to after k0. Only k0 survives.
+
+    degrade_F: k0 was committed (sync=false); p0 was appended but commit
+               sync (fdatasync) failed. Bytes are in the page cache. resume()
+               scans the active file, finds p0 as a valid committed entry,
+               replays it. Both k0 and p0 survive.
+
+    degrade_G: k0 was committed (sync=false); p0 was appended with sync=false
+               on a small max_file_bytes DB. The pre-rotation sync failed.
+               Bytes are in the page cache. resume() scans and replays p0.
+               Both k0 and p0 survive.
     """
     if degrade.degrade_via == DegradeVia.H:
         keys_present = ["k0", "p0"]
         keys_absent: List[str] = []
-    else:  # DegradeVia.C
+    elif degrade.degrade_via == DegradeVia.C:
         keys_present = ["k0"]
         keys_absent = ["p0", "p1"]
+    elif degrade.degrade_via == DegradeVia.F:
+        keys_present = ["k0", "p0"]
+        keys_absent: List[str] = []
+    else:  # DegradeVia.G
+        keys_present = ["k0", "p0"]
+        keys_absent: List[str] = []
 
-    first_threw = failure != ResumeFailureClass.SUCCESS
+    first_threw = failure not in (
+        ResumeFailureClass.SUCCESS,
+        ResumeFailureClass.DOUBLE,
+    )
     return ResumeDelta(keys_present, keys_absent, first_threw)

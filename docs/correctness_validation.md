@@ -396,12 +396,12 @@ Each test follows the same structure:
 7. `assert_recoverable(dir, before, expected)` — validates persistence
    invariant via fresh recovery (where applicable)
 
-### resume() — 7 tests
+### resume() — 21 tests
 
-7 generated Catch2 tests (`[prove_resume]` tag) cover every valid
+21 generated Catch2 tests (`[prove_resume]` tag) cover every valid
 (DegradeShape, ResumeFailureClass) combination.
 
-Two degrade shapes establish a degraded DB before resume is called:
+Four degrade shapes establish a degraded DB before resume is called:
 
 - **degrade_H** — `io_rotate_file_creation` fires on a put at the
   rotation threshold. The write committed (both keys are in key_dir),
@@ -410,20 +410,41 @@ Two degrade shapes establish a degraded DB before resume is called:
   BulkEnd at checkpoint 3 fails; subsequent isolation sync and rotation
   also fail (cascade). k0 committed; orphaned BulkBegin+p0+p1 bytes
   remain in the active file. `resume()` truncates back to after k0.
+- **degrade_F** — `io_data_file_sync` fires on a `put(sync=true)`.
+  The entry bytes are in the page cache but commit sync (fdatasync)
+  failed. key_dir not published. `resume()` scans, finds the entry as
+  a valid committed record, and replays it.
+- **degrade_G** — `io_data_file_sync` fires on a `put(sync=false)`
+  with `max_file_bytes=1`. The pre-rotation sync fails. Same page-cache
+  state as F — `resume()` replays the entry.
 
-Three resume failure classes (R1/R2/R3) plus SUCCESS yield 7 valid
-combinations. R1 (`io_resume_truncate`) is filtered for `degrade_H`
-because `degrade_H` degrades on a rotation failure *after* the write
-committed fully — the active file contains no orphaned or partial bytes,
-so `file.size() == valid_offset` and `resume()` skips the truncation
+Six resume failure classes:
+
+- **SUCCESS** — clean resume on first attempt.
+- **R1** (`io_resume_truncate`) — truncation fails, stays degraded.
+- **R2** (`io_resume_sync`) — sync fails, stays degraded.
+- **R3** (`io_resume_file_creation`) — new active file creation fails.
+- **DOUBLE** — resume succeeds, then a second resume is called (no-op).
+- **CASCADE** — R2 fails, then R3 fails, then clean resume succeeds.
+
+R1 is filtered for degrade_H, degrade_F, and degrade_G: these shapes
+have no orphaned or partial bytes in the active file, so
+`file.size() == valid_offset` and `resume()` skips the truncation
 branch entirely (see `bytecask.cpp` resume path: `if (file.size() !=
-valid_offset) { ... truncate ... }`). The R1 fault point is unreachable.
+valid_offset) { ... truncate ... }`). R1 is only valid for degrade_C.
 
-Each R1/R2/R3 test uses a two-phase pattern:
+4 shapes × 6 classes = 24 minus 3 filtered = **21 tests**.
+
+Each R1/R2/R3 test uses a multi-phase pattern:
 1. Establish degraded state
 2. Inject resume fault → `resume()` throws, engine stays degraded
 3. Clean resume → `REQUIRE_NOTHROW`, `is_degraded()` false, `assert_consistent`
 4. `assert_keys_recoverable` after DB scope closes
+
+DOUBLE tests verify the second `resume()` is a no-op on a healthy engine.
+CASCADE tests inject two sequential faults (R2 then R3) before the clean
+resume, proving the engine tolerates repeated failures with different
+fault points.
 
 This directly proves: *resume always eventually recovers once the underlying fault clears.*
 
@@ -483,7 +504,7 @@ secondary source and sees only the data the old file guaranteed.
 
 | File | Role |
 |------|------|
-| `scenario_matrix.py` | DegradeShape (H, C), ResumeFailureClass (SUCCESS, R1–R3), validity filter |
+| `scenario_matrix.py` | DegradeShape (H, C, F, G), ResumeFailureClass (SUCCESS, R1–R3, DOUBLE, CASCADE), validity filter |
 | `fault_point_resolver.py` | Maps failure class → fault checkpoint name |
 | `expected_delta.py` | Reference model: keys present/absent after all resume calls |
 | `generate_tests.py` | Generates `prove_resume.cpp` |
@@ -570,9 +591,10 @@ All eleven failure classes for `apply_batch_if` are covered by the 172
 `[prove_apply_batch_if]` tests. Each class is exercised across all valid
 (StateShape, PlanShape) combinations.
 
-All three resume failure classes (R1–R3) plus both degrade shapes are
-covered by the 7 `[prove_resume]` tests. R1 is correctly excluded for
-degrade_H (no orphaned bytes to truncate — fault point unreachable).
+All three resume failure classes (R1–R3) plus DOUBLE and CASCADE across
+all four degrade shapes (H, C, F, G) are covered by the 21
+`[prove_resume]` tests. R1 is correctly excluded for degrade_H, degrade_F,
+and degrade_G (no orphaned bytes to truncate — fault point unreachable).
 
 All three vacuum_absorb failure classes across both state shapes are
 covered by the 6 `[prove_vacuum_absorb]` tests.
@@ -580,7 +602,7 @@ covered by the 6 `[prove_vacuum_absorb]` tests.
 All five vacuum_compact failure classes across both state shapes are
 covered by the 10 `[prove_vacuum_compact]` tests.
 
-Total generated proof tests: **195**.
+Total generated proof tests: **209**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
@@ -596,6 +618,9 @@ smoke testing not covered by the proof matrix:
   `io_rotate_file_creation` to trigger class T4 (post-write rotation fail),
   verifies `DbDegraded` is thrown, calls `resume()`, and confirms writes
   succeed afterward.
+- `resume() with live snapshot on degraded DB` (`[degraded][resume]`) —
+  takes a snapshot while degraded, calls `resume()`, verifies the snapshot
+  remains readable (pinned files not deleted) and post-resume writes succeed.
 
 ---
 
