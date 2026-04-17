@@ -719,6 +719,7 @@ private:
 
   // Member variables
   std::filesystem::path dir_;
+  int lock_fd_{-1};  // flock() on dir_/.lock; released by close() in ~DB()
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
   // All mutable state — SWMR. Writers publish via state_.store()
   // under write_mu_; readers call state_.load() (never acquiring write_mu_).

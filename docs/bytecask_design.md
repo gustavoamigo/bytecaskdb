@@ -75,6 +75,10 @@ ByteCaskDB follows a **single-writer / multiple-reader (SWMR)** model:
 - Multiple readers may operate concurrently.
 - MVCC and snapshot isolation are not supported.
 
+#### Directory lock
+
+A single process may hold a database directory open at a time. `DB::open()` acquires an exclusive advisory lock (`flock(LOCK_EX | LOCK_NB)`) on `dir/.lock` before recovery begins. A second process attempting to open the same directory receives a `std::system_error`. The lock is released when the `DB` is destroyed. The `.lock` file remains on disk as a harmless sentinel.
+
 #### Concurrency strategy
 
 ByteCaskDB's read path is designed so that **readers never acquire the write mutex**. The strategy combines two ideas:
@@ -1336,6 +1340,7 @@ When `batch.size() == 1`, both `apply_batch` and `apply_batch_if` skip the `Bulk
 | D14 | **Single-entry batch optimization**: When `apply_batch` or `apply_batch_if` is called with exactly one operation, the `BulkBegin`/`BulkEnd` marker writes are skipped. A single data entry is self-describing and CRC-protected, so the markers add no recovery benefit for a batch of size 1. |
 | D15 | **C ABI / shared-library link constraint**: `libbytecask.a` is compiled with `-fPIC` so it can be linked into a shared object (e.g. `ha_bytecaskdb.so`). Without `-fPIC`, clang emits `R_X86_64_TPOFF32`/`R_X86_64_32S` relocations illegal in a DSO. xmake syntax: `add_cxxflags("-fPIC", {force = true})` on the `bytecask` static target. |
 | D16 | **MariaDB plugin header ordering**: Server-internal headers require `server/my_global.h` before `handler.h`. The client-side stub does not define `MY_GLOBAL_INCLUDED`/`uchar`/`unlikely()`. Fedora layout: base `/usr/include/mysql`, server `/usr/include/mysql/server`, private `/usr/include/mysql/server/private`. CMake include order must be `server/private` → `server` → base. `-DMYSQL_SERVER` is required. `handlerton::state` does not exist in this MariaDB ABI; use `PLUGIN_LICENSE_GPL` (no MIT constant). |
+| D17 | **Directory locking**: One process per directory, enforced by `flock()` on `dir/.lock`. Advisory only — does not protect against uncooperative processes that bypass `DB::open()`. |
 
 ## Working agreement
 

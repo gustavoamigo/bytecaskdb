@@ -823,12 +823,12 @@ TEST_CASE("DB parallel recovery: matches serial result",
   }
 
   // Recover serially.
-  auto serial = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
-
-  // Collect serial results.
   std::map<std::string, std::string> serial_kv;
-  for (auto [key, val] : serial.iter_from({})) {
-    serial_kv[to_string(key)] = to_string(val);
+  {
+    auto serial = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
+    for (auto [key, val] : serial.iter_from({})) {
+      serial_kv[to_string(key)] = to_string(val);
+    }
   }
 
   // Recover in parallel.
@@ -2174,23 +2174,23 @@ TEST_CASE("vacuum compact removes dead entries", "[vacuum]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum compact preserves tombstones", "[vacuum]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+  {
+    auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
 
-  db.put({}, to_bytes("gone"), to_bytes("value"));
-  std::ignore = db.del({}, to_bytes("gone"));
-  // Now we have: file with Put("gone"), file with Delete("gone"), empty active.
+    db.put({}, to_bytes("gone"), to_bytes("value"));
+    std::ignore = db.del({}, to_bytes("gone"));
+    // Now we have: file with Put("gone"), file with Delete("gone"), empty active.
 
-  // Vacuum the file containing the Put (it's 100% dead).
-  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+    // Vacuum the file containing the Put (it's 100% dead).
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
-  // The key should still be absent.
-  CHECK_FALSE(db.contains_key(to_bytes("gone")));
+    // The key should still be absent.
+    CHECK_FALSE(db.contains_key(to_bytes("gone")));
+  }
 
   // Reopen to verify tombstone survives recovery.
-  {
-    auto db2 = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
-    CHECK_FALSE(db2.contains_key(to_bytes("gone")));
-  }
+  auto db2 = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+  CHECK_FALSE(db2.contains_key(to_bytes("gone")));
 }
 
 // ---------------------------------------------------------------------------
@@ -3010,6 +3010,45 @@ TEST_CASE("WritePlan contradictory guards throw logic_error",
   bytecask::WritePlan plan;
   plan.ensure_present(to_bytes("k"));
   REQUIRE_THROWS_AS(plan.ensure_absent(to_bytes("k")), std::logic_error);
+}
+
+TEST_CASE("DB rejects concurrent open on same directory", "[bytecask][lock]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  CHECK_THROWS_AS(bytecask::DB::open(td.path / "db"), std::system_error);
+}
+
+TEST_CASE("DB directory unlocked after close", "[bytecask][lock]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  {
+    auto db = bytecask::DB::open(db_path);
+    db.put({}, to_bytes("k"), to_bytes("v"));
+  }
+  auto db2 = bytecask::DB::open(db_path);
+  const auto result = get_val(db2, to_bytes("k"));
+  REQUIRE(result.has_value());
+  CHECK(to_string(*result) == "v");
+}
+
+TEST_CASE("DB lock file persists after close", "[bytecask][lock]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  { auto db = bytecask::DB::open(db_path); }
+  CHECK(std::filesystem::exists(db_path / ".lock"));
+}
+
+TEST_CASE("DB lock error includes directory path", "[bytecask][lock]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  auto db = bytecask::DB::open(db_path);
+  try {
+    auto db2 = bytecask::DB::open(db_path);
+    FAIL("expected std::system_error");
+  } catch (const std::system_error &e) {
+    CHECK(std::string_view{e.what()}.find(db_path.string())
+          != std::string_view::npos);
+  }
 }
 
 #ifdef BYTECASK_TESTING

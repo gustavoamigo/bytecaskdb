@@ -14,6 +14,7 @@ module;
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
 #endif
+#include <fcntl.h>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -26,9 +27,11 @@ module;
 #include <ranges>
 #include <span>
 #include <string>
+#include <sys/file.h>
 #include <system_error>
 #include <thread>
 #include <time.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -393,23 +396,48 @@ DB::DB(std::filesystem::path dir, Options opts)
     : dir_{std::move(dir)}, rotation_threshold_{opts.max_file_bytes},
       state_{std::make_shared<EngineState>()} {
   std::filesystem::create_directories(dir_);
-  EngineState s;
-  if (opts.recovery_threads <= 1) {
-    s = recovery_load_serial(std::move(s), opts.fail_recovery_on_crc_errors);
-  } else {
-    s = recovery_load_parallel(std::move(s), opts.recovery_threads,
-                               opts.fail_recovery_on_crc_errors);
+
+  // Acquire exclusive advisory lock on the database directory.
+  const auto lock_path = dir_ / ".lock";
+  lock_fd_ = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  if (lock_fd_ == -1) {
+    throw std::system_error{
+        errno, std::generic_category(),
+        std::format("DB: cannot open lock file '{}'", lock_path.string())};
   }
-  s.active_file_id = s.next_file_id++;
-  const auto stem = make_data_file_stem();
-  auto new_active = std::make_shared<DataFile>(dir_ / (stem + ".data"));
-  auto files_t = s.files.transient();
-  files_t.set(s.active_file_id, new_active);
-  s.files = std::move(files_t).persistent();
-  auto fstats_t = s.file_stats.transient();
-  fstats_t.set(s.active_file_id, FileStats{});
-  s.file_stats = std::move(fstats_t).persistent();
-  store_state(std::make_shared<EngineState>(std::move(s)));
+  if (::flock(lock_fd_, LOCK_EX | LOCK_NB) == -1) {
+    auto err = errno;
+    ::close(lock_fd_);
+    lock_fd_ = -1;
+    throw std::system_error{
+        err, std::generic_category(),
+        std::format("DB: directory '{}' is locked by another process",
+                    dir_.string())};
+  }
+
+  try {
+    EngineState s;
+    if (opts.recovery_threads <= 1) {
+      s = recovery_load_serial(std::move(s), opts.fail_recovery_on_crc_errors);
+    } else {
+      s = recovery_load_parallel(std::move(s), opts.recovery_threads,
+                                 opts.fail_recovery_on_crc_errors);
+    }
+    s.active_file_id = s.next_file_id++;
+    const auto stem = make_data_file_stem();
+    auto new_active = std::make_shared<DataFile>(dir_ / (stem + ".data"));
+    auto files_t = s.files.transient();
+    files_t.set(s.active_file_id, new_active);
+    s.files = std::move(files_t).persistent();
+    auto fstats_t = s.file_stats.transient();
+    fstats_t.set(s.active_file_id, FileStats{});
+    s.file_stats = std::move(fstats_t).persistent();
+    store_state(std::make_shared<EngineState>(std::move(s)));
+  } catch (...) {
+    ::close(lock_fd_);
+    lock_fd_ = -1;
+    throw;
+  }
 }
 
 #pragma endregion
@@ -438,6 +466,10 @@ DB::~DB() {
       std::filesystem::remove(path);
       std::filesystem::remove(sf.hint_path);
     } catch (...) {}
+  }
+  if (lock_fd_ != -1) {
+    ::close(lock_fd_);
+    lock_fd_ = -1;
   }
 }
 
