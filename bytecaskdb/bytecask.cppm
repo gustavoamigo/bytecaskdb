@@ -68,7 +68,13 @@ export struct BatchRemove {
   Bytes key;
 };
 
-export using BatchOperation = std::variant<BatchInsert, BatchRemove>;
+export struct BatchRangeDel {
+  Bytes from;
+  Bytes to; // exclusive — [from, to)
+};
+
+export using BatchOperation =
+    std::variant<BatchInsert, BatchRemove, BatchRangeDel>;
 
 // Move-only, single-use container of operations submitted atomically.
 // Consumed by DB::apply_batch().
@@ -87,6 +93,12 @@ public:
 
   void del(BytesView key) {
     operations_.emplace_back(BatchRemove{Bytes{key.begin(), key.end()}});
+  }
+
+  void del_range(BytesView from, BytesView to) {
+    operations_.emplace_back(
+        BatchRangeDel{Bytes{from.begin(), from.end()},
+                      Bytes{to.begin(), to.end()}});
   }
 
   [[nodiscard]] auto empty() const noexcept -> bool {
@@ -527,6 +539,10 @@ public:
   // Throws std::system_error on I/O failure or lock contention (try_lock).
   [[nodiscard]] auto del(const WriteOptions &opts, BytesView key) -> bool;
 
+  // Deletes all keys in [from, to). One append to the data file, one
+  // optional fdatasync. No-op if from >= to.
+  void del_range(const WriteOptions &opts, BytesView from, BytesView to);
+
   // Returns true if key exists in the index (no disk I/O).
   [[nodiscard]] auto contains_key(BytesView key) const -> bool;
 
@@ -842,18 +858,31 @@ public:
 export class WritePlan {
 public:
   enum class Precondition { None, MustExist, MustBeAbsent, MustBeUnchanged };
-  enum class Write { None, Put, Del };
 
-  struct KeyAction {
+  struct KeyGuard {
     Precondition precondition{Precondition::None};
-    Write write{Write::None};
-    Bytes value; // meaningful only when write == Put
   };
 
   struct RangeGuard {
     Bytes from;
     Bytes to; // exclusive — [from, to)
   };
+
+  struct PointPut {
+    Bytes key;
+    Bytes value;
+  };
+
+  struct PointDel {
+    Bytes key;
+  };
+
+  struct RangeDel {
+    Bytes from;
+    Bytes to; // exclusive — [from, to)
+  };
+
+  using WriteOp = std::variant<PointPut, PointDel, RangeDel>;
 
   WritePlan() = default;
   explicit WritePlan(Snapshot snap) : snap_{std::move(snap)} {}
@@ -865,15 +894,21 @@ public:
   // --- Writes (unconditional) ---
 
   void put(BytesView key, BytesView value) {
-    auto &a = action_for(key);
-    a.write = Write::Put;
-    a.value = Bytes{value.begin(), value.end()};
+    writes_.emplace_back(
+        PointPut{Bytes{key.begin(), key.end()},
+                 Bytes{value.begin(), value.end()}});
   }
 
   void del(BytesView key) {
-    auto &a = action_for(key);
-    a.write = Write::Del;
-    a.value.clear();
+    writes_.emplace_back(PointDel{Bytes{key.begin(), key.end()}});
+  }
+
+  // --- Range writes ---
+
+  void del_range(BytesView from, BytesView to) {
+    writes_.emplace_back(
+        RangeDel{Bytes{from.begin(), from.end()},
+                 Bytes{to.begin(), to.end()}});
   }
 
   // --- Point guards ---
@@ -916,48 +951,51 @@ public:
 
 private:
   [[nodiscard]] auto empty() const noexcept -> bool {
-    return actions_.empty() && range_guards_.empty();
+    return writes_.empty() && guards_.empty() && range_guards_.empty();
   }
 
-  // Number of write operations (Put or Del).
   [[nodiscard]] auto write_count() const noexcept -> std::size_t {
-    std::size_t n = 0;
-    for (const auto &[k, a] : actions_) {
-      if (a.write != Write::None) ++n;
-    }
-    return n;
+    return writes_.size();
   }
 
   // Estimated total I/O bytes for all write operations, including
   // BulkBegin/BulkEnd markers for multi-op plans.
   [[nodiscard]] auto write_bytes() const noexcept -> std::uint64_t {
     std::uint64_t bytes = 0;
-    std::size_t wc = 0;
-    for (const auto &[k, a] : actions_) {
-      if (a.write == Write::None) continue;
-      bytes += entry_size(k.size(),
-                          a.write == Write::Put ? a.value.size() : 0);
-      ++wc;
+    for (const auto &w : writes_) {
+      std::visit(
+          [&bytes](const auto &op) {
+            using T = std::decay_t<decltype(op)>;
+            if constexpr (std::is_same_v<T, PointPut>) {
+              bytes += entry_size(op.key.size(), op.value.size());
+            } else if constexpr (std::is_same_v<T, PointDel>) {
+              bytes += entry_size(op.key.size(), 0);
+            } else {
+              bytes += entry_size(op.from.size(), op.to.size());
+            }
+          },
+          w);
     }
-    if (wc > 1) bytes += 2 * (kHeaderSize + kCrcSize);
+    if (writes_.size() > 1) bytes += 2 * (kHeaderSize + kCrcSize);
     return bytes;
   }
 
-  auto action_for(BytesView key) -> KeyAction & {
+  auto guard_for(BytesView key) -> KeyGuard & {
     auto k = Bytes{key.begin(), key.end()};
-    return actions_[std::move(k)];
+    return guards_[std::move(k)];
   }
 
   void set_precondition(BytesView key, Precondition pre) {
-    auto &a = action_for(key);
-    if (a.precondition != Precondition::None && a.precondition != pre) {
+    auto &g = guard_for(key);
+    if (g.precondition != Precondition::None && g.precondition != pre) {
       throw std::logic_error{"WritePlan: contradictory guards on same key"};
     }
-    a.precondition = pre;
+    g.precondition = pre;
   }
 
   std::optional<Snapshot> snap_;
-  std::map<Bytes, KeyAction> actions_;
+  std::vector<WriteOp> writes_;
+  std::map<Bytes, KeyGuard> guards_;
   std::vector<RangeGuard> range_guards_;
   friend class DB;
   friend class TransientEngineState;

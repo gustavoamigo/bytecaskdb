@@ -55,7 +55,8 @@ public:
       if (pos_ >= buf_.size()) {
         return std::nullopt;
       }
-      auto [he, consumed] = deserialize_entry(buf_.subspan(pos_), key_buf_);
+      auto [he, consumed] =
+          deserialize_entry(buf_.subspan(pos_), key_buf_, end_key_buf_);
       pos_ += consumed;
       return he;
     }
@@ -63,7 +64,8 @@ public:
   private:
     std::span<const std::byte> buf_; // non-owning; excludes 4-byte CRC trailer
     std::size_t pos_{};
-    std::vector<std::byte> key_buf_; // backing store for HintEntry.key spans
+    std::vector<std::byte> key_buf_;     // backing store for HintEntry.key spans
+    std::vector<std::byte> end_key_buf_; // backing store for HintEntry.end_key spans
   };
 
   // Creates a write-mode HintFile that buffers entries in memory.
@@ -144,6 +146,28 @@ public:
                                          value_size, prefix_len, suffix);
     buf_.insert(buf_.end(), entry_buf.begin(), entry_buf.end());
     last_key_.assign(key.begin(), key.end());
+  }
+
+  // Encodes a RangeDel hint entry: prefix-compressed start_key followed by
+  // the full end_key. Must be called in sorted key order like append().
+  void append_range_del(std::uint64_t sequence, std::uint64_t file_offset,
+                        std::span<const std::byte> start_key,
+                        std::span<const std::byte> end_key) {
+    const auto shared = [&] {
+      const auto n = std::min(last_key_.size(), start_key.size());
+      std::size_t i = 0;
+      while (i < n && last_key_[i] == start_key[i]) {
+        ++i;
+      }
+      return i;
+    }();
+    const auto prefix_len =
+        static_cast<std::uint8_t>(std::min(shared, std::size_t{255}));
+    const auto suffix = start_key.subspan(prefix_len);
+    auto entry_buf = serialize_range_del_entry(sequence, file_offset,
+                                               prefix_len, suffix, end_key);
+    buf_.insert(buf_.end(), entry_buf.begin(), entry_buf.end());
+    last_key_.assign(start_key.begin(), start_key.end());
   }
 
   // Appends a 4-byte file-level CRC-32C over all buffered entry bytes, then

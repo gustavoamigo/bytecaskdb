@@ -14,7 +14,8 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 
 - **Sequential write path** — all I/O is sequential appends; no random writes. Every `put` and `del` is one append. `apply_batch` with N operations appends a begin marker, N entries, and an end marker in a single `writev` — still no WAL, no random writes.
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
-- **Atomic writes** — every `put` and `del` is atomic. `apply_batch` makes multiple puts and deletes atomic as a group.
+- **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append. In-memory cleanup walks the radix tree; disk cost is O(1) regardless of how many keys fall in the range. Available on `DB`, `Batch`, and `WritePlan`.
+- **Atomic writes** — every `put`, `del`, and `del_range` is atomic. `apply_batch` makes multiple puts, deletes, and range deletes atomic as a group.
 - **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch_if(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
@@ -132,6 +133,9 @@ Bytes out;
 bool found = db.get({}, to_bytes("user:1"), out);   // true; value in out
 bool existed = db.del({}, to_bytes("user:1"));       // false if key was absent
 
+// Range deletion — delete all keys in [from, to) with a single disk append.
+db.del_range({}, to_bytes("session:"), to_bytes("session:~"));
+
 // Atomic batch — all operations land atomically.
 Batch batch;
 batch.put(to_bytes("user:2"), to_bytes("bob"));
@@ -232,6 +236,10 @@ public:
     // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
     [[nodiscard]] auto del(const WriteOptions& opts, BytesView key) -> bool;
 
+    // Deletes all keys in [from, to) with a single data file append.
+    // No-op if from >= to. Throws std::system_error on I/O failure or DbDegraded.
+    void del_range(const WriteOptions& opts, BytesView from, BytesView to);
+
     [[nodiscard]] auto contains_key(BytesView key) const -> bool;
 
     // Atomically applies all operations in batch. Consumes batch (move-only).
@@ -308,6 +316,7 @@ public:
 
     void put(BytesView key, BytesView value);
     void del(BytesView key);
+    void del_range(BytesView from, BytesView to);  // range delete: [from, to)
 
     void ensure_present(BytesView key);                         // guard: key must exist
     void ensure_absent(BytesView key);                          // guard: key must be absent
@@ -315,6 +324,14 @@ public:
     void ensure_range_unchanged(BytesView from, BytesView to);  // guard: no key change in [from, to)
 
     [[nodiscard]] auto has_snapshot() const noexcept -> bool;
+};
+
+// Unconditional batch — groups multiple operations into a single atomic write.
+class Batch {
+public:
+    void put(BytesView key, BytesView value);
+    void del(BytesView key);
+    void del_range(BytesView from, BytesView to);  // range delete: [from, to)
 };
 
 // Thrown by write operations when the engine is in a degraded state.

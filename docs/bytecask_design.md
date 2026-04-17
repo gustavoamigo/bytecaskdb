@@ -158,6 +158,14 @@ Both executors follow a three-phase pattern:
 
 The sequential per-slot processing in Phase 1 preserves the serial correctness model exactly. Each slot's `validate_preconditions` sees the key_dir after all previous slots' writes. A `del` with `ensure_present` in slot 2 correctly sees slot 1's `put`.
 
+##### Range deletion (`del_range`)
+
+`del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append. The on-disk entry reuses the standard layout: `entry_type = RangeDel (0x05)`, `key = start_key`, `value = end_key`. No new header fields.
+
+On the write path, `prepare_write` emits one `AppendEntry` per range delete. `apply_writes` iterates the key directory from `lower_bound(from)` to the first key `>= to`, decrements `live_bytes` on each affected file, and erases the keys. The RangeDel entry itself contributes only to `total_bytes` (same as point Delete — tombstones are not live).
+
+Range deletes are supported on `DB::del_range`, `WritePlan::del_range`, and `Batch::del_range`. Inside a batch, they are framed by `BulkBegin`/`BulkEnd` like other operations. Existing guards (`ensure_unchanged`, `ensure_range_unchanged`, implicit W-W check) detect concurrent range deletes without changes — erased keys produce sequence mismatches.
+
 ##### TransientEngineState
 
 `TransientEngineState` is the mutable working copy for all write-path state transitions. It follows the same `transient()` / `persistent()` pattern as `PersistentRadixTree` / `TransientRadixTree`.

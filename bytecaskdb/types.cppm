@@ -21,6 +21,7 @@ export enum class EntryType : std::uint8_t {
   Delete = 0x02,    // Tombstone — key present, value empty
   BulkBegin = 0x03, // Start of atomic batch — key and value empty
   BulkEnd = 0x04,   // End of atomic batch   — key and value empty
+  RangeDel = 0x05,  // Range tombstone — key = start_key, value = end_key
 };
 
 export struct AppendEntry {

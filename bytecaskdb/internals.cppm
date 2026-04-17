@@ -180,9 +180,16 @@ export struct RecoveredFile {
   std::uint64_t total_bytes{0};
 };
 
+export struct RangeTombstone {
+  Key start;
+  Key end; // exclusive — [start, end)
+  std::uint64_t seq;
+};
+
 export struct RecoveryResult {
   PersistentRadixTree<KeyDirEntry> key_dir;
   std::map<Key, std::uint64_t> tombstones;
+  std::vector<RangeTombstone> range_tombstones;
   std::uint64_t max_lsn{0};
   PersistentU32Map<FileStats> file_stats;
 };

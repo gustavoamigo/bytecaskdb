@@ -45,6 +45,7 @@ export struct HintEntry {
   std::uint64_t file_offset{};
   std::span<const std::byte> key;
   std::uint32_t value_size{};
+  std::span<const std::byte> end_key; // non-empty only for RangeDel
 };
 
 // Serializes one hint entry into a flat byte vector (header + suffix, no CRC).
@@ -66,12 +67,39 @@ export auto serialize_entry(std::uint64_t sequence, EntryType entry_type,
   return buf;
 }
 
+// Serializes a RangeDel hint entry: normal header + start_key suffix, then
+// [end_key_len: u16 LE][end_key: end_key_len bytes]. The end_key is stored
+// in full (no prefix compression) so recovery can reconstruct both bounds
+// without reading the data file.
+export auto serialize_range_del_entry(std::uint64_t sequence,
+                                      std::uint64_t file_offset,
+                                      std::uint8_t prefix_len,
+                                      std::span<const std::byte> suffix,
+                                      std::span<const std::byte> end_key)
+    -> std::vector<std::byte> {
+  const auto base_size = kHintHeaderSize + suffix.size();
+  const auto end_key_trailer = sizeof(std::uint16_t) + end_key.size();
+  std::vector<std::byte> buf(base_size + end_key_trailer);
+  ByteWriter w{buf};
+  w.put(sequence);
+  w.put(static_cast<std::uint8_t>(EntryType::RangeDel));
+  w.put(file_offset);
+  w.put(narrow<std::uint32_t>(end_key.size())); // value_size = end_key length
+  w.put(prefix_len);
+  w.put(narrow<std::uint16_t>(suffix.size()));
+  w.put_bytes(suffix);
+  w.put(narrow<std::uint16_t>(end_key.size()));
+  w.put_bytes(end_key);
+  return buf;
+}
+
 // Deserializes one hint entry from the start of buf, updating key_buf
 // in-place for zero-copy prefix decompression.
 // Returns {entry, bytes_consumed}. entry.key spans key_buf; valid until
 // the next call. Throws std::runtime_error on a truncated entry.
 export auto deserialize_entry(std::span<const std::byte> buf,
-                              std::vector<std::byte> &key_buf)
+                              std::vector<std::byte> &key_buf,
+                              std::vector<std::byte> &end_key_buf)
     -> std::pair<HintEntry, std::size_t> {
   if (buf.size() < kHintHeaderSize) {
     throw std::runtime_error{"deserialize_entry (hint): truncated header"};
@@ -84,7 +112,7 @@ export auto deserialize_entry(std::span<const std::byte> buf,
   const auto prefix_len  = r.get<std::uint8_t>();
   const auto suffix_len  = r.get<std::uint16_t>();
 
-  const auto total = kHintHeaderSize + suffix_len;
+  auto total = kHintHeaderSize + suffix_len;
   if (buf.size() < total) {
     throw std::runtime_error{"deserialize_entry (hint): truncated entry"};
   }
@@ -94,11 +122,33 @@ export auto deserialize_entry(std::span<const std::byte> buf,
               buf.data() + kHintHeaderSize,
               suffix_len);
 
+  // For RangeDel, the end_key is appended after the start_key suffix.
+  std::span<const std::byte> end_key_span;
+  if (entry_type == EntryType::RangeDel) {
+    const auto trailer_offset = total;
+    if (buf.size() < trailer_offset + sizeof(std::uint16_t)) {
+      throw std::runtime_error{
+          "deserialize_entry (hint): truncated RangeDel end_key_len"};
+    }
+    const auto end_key_len =
+        read_le<std::uint16_t>(buf, trailer_offset);
+    total += sizeof(std::uint16_t) + end_key_len;
+    if (buf.size() < total) {
+      throw std::runtime_error{
+          "deserialize_entry (hint): truncated RangeDel end_key"};
+    }
+    end_key_buf.assign(
+        buf.data() + trailer_offset + sizeof(std::uint16_t),
+        buf.data() + trailer_offset + sizeof(std::uint16_t) + end_key_len);
+    end_key_span = std::span<const std::byte>{end_key_buf};
+  }
+
   return {HintEntry{.sequence    = sequence,
                     .entry_type  = entry_type,
                     .file_offset = file_offset,
                     .key         = std::span<const std::byte>{key_buf},
-                    .value_size  = value_size},
+                    .value_size  = value_size,
+                    .end_key     = end_key_span},
           total};
 }
 
