@@ -109,6 +109,7 @@ TEST_CASE("assert_delta on successful single put", "[invariants]") {
   assert_delta(before, db, ExpectedDelta{
       .keys_added = {"new_key"},
       .keys_removed = {},
+      .expected_values = {{"new_key", "value"}},
       .lsn_advance = 1,
       .degraded = false,
   });
@@ -125,6 +126,7 @@ TEST_CASE("assert_delta on successful single delete", "[invariants]") {
   assert_delta(before, db, ExpectedDelta{
       .keys_added = {},
       .keys_removed = {"k"},
+      .expected_values = {},
       .lsn_advance = 1,
       .degraded = false,
   });
@@ -144,6 +146,7 @@ TEST_CASE("assert_delta on successful batch", "[invariants]") {
   assert_delta(before, db, ExpectedDelta{
       .keys_added = {"a", "b"},
       .keys_removed = {},
+      .expected_values = {{"a", "1"}, {"b", "2"}},
       .lsn_advance = 4,
       .degraded = false,
   });
@@ -171,6 +174,7 @@ TEST_CASE("assert_delta detects degraded", "[invariants]") {
   assert_delta(before, db, ExpectedDelta{
       .keys_added = {},
       .keys_removed = {},
+      .expected_values = {},
       .lsn_advance = 4,
       .degraded = true,
   });
@@ -196,6 +200,7 @@ TEST_CASE("assert_recoverable after successful write", "[invariants]") {
   assert_recoverable(dir, before, ExpectedDelta{
       .keys_added = {"new_key"},
       .keys_removed = {},
+      .expected_values = {{"new_key", "value"}},
       .lsn_advance = 1,
       .degraded = false,
   });
@@ -224,6 +229,7 @@ TEST_CASE("assert_recoverable when transition not persisted",
   assert_recoverable(dir, before, ExpectedDelta{
       .keys_added = {},
       .keys_removed = {},
+      .expected_values = {},
       .lsn_advance = 0,
       .degraded = false,
   });

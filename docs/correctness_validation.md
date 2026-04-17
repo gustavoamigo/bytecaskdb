@@ -335,12 +335,12 @@ to callers. Degrading forces `resume()` before further writes are accepted;
 
 ## Proof Test Generator
 
-### apply_batch_if — 148 tests
+### apply_batch_if — 492 tests
 
-148 generated Catch2 tests (`[prove_apply_batch_if]` tag) cover every valid
+492 generated Catch2 tests (`[prove_apply_batch_if]` tag) cover every valid
 (StateShape, PlanShape, FailureClass) combination for `apply_batch_if`.
-The scenario matrix is 4 state shapes × 7 plan shapes × 9 failure
-classes = 252 total; 4 elimination rules reduce this to 148 valid tests.
+The scenario matrix is 5 state shapes × 17 plan shapes × 9 failure
+classes; 4 elimination rules reduce this to 492 valid tests.
 
 #### State shapes
 
@@ -350,11 +350,12 @@ classes = 252 total; 4 elimination rules reduce this to 148 valid tests.
 | `single_key` | 1 | — | Overwrites, deletes, and guards against a single existing key |
 | `populated_db` | 10 | — | Multiple existing keys; exercises range guards and multi-key interactions |
 | `rotation_threshold` | 1 | 1 | Forces file rotation after the plan's writes — required for classes G and H |
+| `deleted_key` | 1 (deleted) | — | k0 created then deleted — tombstone in write history, no live keys at baseline |
 
 Shapes not currently covered: mid-vacuum (vacuum-in-flight during `apply_batch_if`),
 post-resume (DB that has been degraded and resumed), and multiple sealed files with
 cross-file tombstone interactions. These are deferred — the current shapes cover the
-four structurally distinct starting conditions for the write path.
+five structurally distinct starting conditions for the write path.
 
 #### Plan shapes
 
@@ -367,12 +368,37 @@ four structurally distinct starting conditions for the write path.
 | `large_batch` | 3 puts | No | No | Larger batch — exercises per-entry fault injection at different positions |
 | `single_put_with_guards` | 1 put | Yes | No | Plan with `ensure_unchanged` guards plus a write |
 | `conflicting_plan` | 1 put | No | Yes | Plan that conflicts with current state — exercises class A (precondition rejection) |
+| `causality_overwrite` | 2 puts (same key) | No | No | Last write wins: `put(c0, v1), put(c0, v2)` — value must be v2 |
+| `causality_put_del` | 1 put + 1 delete (same key) | No | No | Put then delete: `put(c0, v1), del(c0)` — key must be absent |
+| `causality_del_put` | 1 delete + 1 put (same key) | No | No | Delete then put: `del(k0), put(k0, v1)` — key must have v1 |
+| `causality_put_del_put` | 1 put + 1 delete + 1 put (same key) | No | No | Three ops: `put(c0, v1), del(c0), put(c0, v2)` — value must be v2 |
+| `solo_causality_overwrite` | 2 puts (same key), solo | No | No | Same as `causality_overwrite` via solo writer path |
+| `solo_causality_put_del` | 1 put + 1 delete (same key), solo | No | No | Same as `causality_put_del` via solo writer path |
+| `solo_causality_del_put` | 1 delete + 1 put (same key), solo | No | No | Same as `causality_del_put` via solo writer path |
+| `solo_causality_put_del_put` | 1 put + 1 delete + 1 put (same key), solo | No | No | Same as `causality_put_del_put` via solo writer path |
+| `sequential_overwrite` | 1 put targeting k0 | No | No | Overwrites pre-existing k0 — sequential put-then-put causality across calls |
+| `solo_sequential_overwrite` | 1 put targeting k0, solo | No | No | Same as `sequential_overwrite` via solo writer path |
+
+The four `causality_*` shapes verify that operation ordering within a
+batch is preserved through all failure classes and recovery. Each shape
+targets the same key for every operation, so the net effect depends
+entirely on causal ordering. The four `solo_causality_*` shapes mirror
+them but route through the solo writer (`WriteOptions::solo = true`)
+instead of group commit, ensuring both write paths preserve causality.
+The `sequential_overwrite` shapes test causality across separate API
+calls: the setup writes k0, and the plan overwrites it. Combined with
+the `deleted_key` state (tombstone in history) and `rotation_threshold`
+state (cross-file writes), these cover sequential put-then-put,
+del-then-put, and cross-file causality.
+`assert_delta` and `assert_recoverable` verify both key presence and
+expected values (the `expected_values` field in `ExpectedDelta`).
 
 Shapes not currently covered: guards-without-writes (pure read-dependency check),
-delete-only multi-entry batches, and plans exceeding the `256 KiB` solo-writer
-threshold. These are deferred — the current shapes exercise every code path branch
-in `apply_batch_if` (single vs multi entry, with and without guards, conflict vs
-success).
+delete-only multi-entry batches, plans exceeding the `256 KiB` solo-writer
+threshold, and causality shapes with `del_range` (covered by manual tests in
+`bytecask_test.cpp`). These are deferred — the current shapes exercise every
+code path branch in `apply_batch_if` (single vs multi entry, with and without
+guards, conflict vs success, same-key causality).
 
 #### Elimination rules
 
@@ -390,7 +416,8 @@ Each test follows the same structure:
 4. Inject fault per `FaultConfig`
 5. Execute `apply_batch_if`
 6. `assert_delta(before, db, expected)` — validates key membership,
-   LSN advancement, structural consistency, and degraded state.
+   value correctness (causality), LSN advancement, structural consistency,
+   and degraded state.
    For degraded cases, `assert_resumable(db)` is called immediately after
    to verify that `resume()` restores consistent state in-process.
 7. `assert_recoverable(dir, before, expected)` — validates persistence

@@ -33,6 +33,7 @@ class StateShape:
     label: str
     num_keys: int
     max_file_bytes: Optional[int] = None
+    delete_after_create: bool = False  # create keys then delete them (tombstone state)
 
     @property
     def at_rotation(self) -> bool:
@@ -45,6 +46,8 @@ class PlanShape:
     ops: Tuple[OpType, ...]
     has_guards: bool = False
     is_conflicting: bool = False
+    causality_key: Optional[str] = None  # all ops target this key
+    use_solo: bool = False  # route through solo writer instead of group commit
 
     @property
     def is_single_entry(self) -> bool:
@@ -66,6 +69,7 @@ STATE_SHAPES = [
     StateShape("single_key", num_keys=1),
     StateShape("populated_db", num_keys=10),
     StateShape("rotation_threshold", num_keys=1, max_file_bytes=1),
+    StateShape("deleted_key", num_keys=1, delete_after_create=True),
 ]
 
 PLAN_SHAPES = [
@@ -76,6 +80,40 @@ PLAN_SHAPES = [
     PlanShape("large_batch", (OpType.PUT, OpType.PUT, OpType.PUT)),
     PlanShape("single_put_with_guards", (OpType.PUT,), has_guards=True),
     PlanShape("conflicting_plan", (OpType.PUT,), is_conflicting=True),
+    PlanShape("causality_overwrite", (OpType.PUT, OpType.PUT), causality_key="c0"),
+    PlanShape("causality_put_del", (OpType.PUT, OpType.DELETE), causality_key="c0"),
+    PlanShape("causality_del_put", (OpType.DELETE, OpType.PUT), causality_key="k0"),
+    PlanShape(
+        "causality_put_del_put",
+        (OpType.PUT, OpType.DELETE, OpType.PUT),
+        causality_key="c0",
+    ),
+    PlanShape(
+        "solo_causality_overwrite",
+        (OpType.PUT, OpType.PUT),
+        causality_key="c0",
+        use_solo=True,
+    ),
+    PlanShape(
+        "solo_causality_put_del",
+        (OpType.PUT, OpType.DELETE),
+        causality_key="c0",
+        use_solo=True,
+    ),
+    PlanShape(
+        "solo_causality_del_put",
+        (OpType.DELETE, OpType.PUT),
+        causality_key="k0",
+        use_solo=True,
+    ),
+    PlanShape(
+        "solo_causality_put_del_put",
+        (OpType.PUT, OpType.DELETE, OpType.PUT),
+        causality_key="c0",
+        use_solo=True,
+    ),
+    PlanShape("sequential_overwrite", (OpType.PUT,), causality_key="k0"),
+    PlanShape("solo_sequential_overwrite", (OpType.PUT,), causality_key="k0", use_solo=True),
 ]
 
 FAILURE_CLASSES = list(FailureClass)

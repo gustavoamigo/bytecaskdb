@@ -35,6 +35,8 @@ from tests.proof.scenario_matrix import (
 
 def key_labels_for(plan: PlanShape) -> List[str]:
     """Return the key name assigned to each op in the plan."""
+    if plan.causality_key:
+        return [plan.causality_key] * len(plan.ops)
     labels: List[str] = []
     put_idx = 0
     for op in plan.ops:
@@ -73,6 +75,11 @@ def gen_setup(state: StateShape) -> str:
         lines.append(
             f'    db.put({{.sync = false}}, to_bytes("k{i}"), to_bytes("v{i}"));'
         )
+    if state.delete_after_create:
+        for i in range(state.num_keys):
+            lines.append(
+                f'    (void)db.del({{.sync = false}}, to_bytes("k{i}"));'
+            )
     return "\n".join(lines)
 
 
@@ -165,23 +172,24 @@ def gen_execute(
 ) -> str:
     """Generate C++ to execute the transition."""
     sync_val = "false" if config.use_sync_false else "true"
+    solo_part = ", .solo = true" if plan.use_solo else ""
 
     if delta.threw:
         return (
             f"      REQUIRE_THROWS_AS(\n"
-            f"          db.apply_batch_if({{.sync = {sync_val}}},\n"
+            f"          db.apply_batch_if({{.sync = {sync_val}{solo_part}}},\n"
             f"                            std::move(plan)),\n"
             f"          std::system_error);"
         )
     if plan.is_conflicting:
         return (
             f"      REQUIRE_FALSE(\n"
-            f"          db.apply_batch_if({{.sync = {sync_val}}},\n"
+            f"          db.apply_batch_if({{.sync = {sync_val}{solo_part}}},\n"
             f"                            std::move(plan)));"
         )
     return (
         f"      REQUIRE(\n"
-        f"          db.apply_batch_if({{.sync = {sync_val}}},\n"
+        f"          db.apply_batch_if({{.sync = {sync_val}{solo_part}}},\n"
         f"                            std::move(plan)));"
     )
 
@@ -190,11 +198,19 @@ def gen_delta_literal(delta: Delta) -> str:
     """Generate C++ ExpectedDelta aggregate initializer."""
     ka = "{" + ", ".join(f'"{k}"' for k in delta.keys_added) + "}"
     kr = "{" + ", ".join(f'"{k}"' for k in delta.keys_removed) + "}"
+    if delta.expected_values:
+        ev_pairs = ", ".join(
+            f'{{"{k}", "{v}"}}' for k, v in delta.expected_values.items()
+        )
+        ev = "{" + ev_pairs + "}"
+    else:
+        ev = "{}"
     degraded = "true" if delta.degraded else "false"
     return (
         f"ExpectedDelta{{\n"
         f"        .keys_added = {ka},\n"
         f"        .keys_removed = {kr},\n"
+        f"        .expected_values = {ev},\n"
         f"        .lsn_advance = {delta.lsn_advance},\n"
         f"        .degraded = {degraded},\n"
         f"    }}"
