@@ -153,60 +153,22 @@ int ha_bytecaskdb::delete_table(const char *name) {
     return 0;  // Nothing to delete.
   }
 
-  // Paginated delete of all row keys for this table.
+  // Atomic del_range of all row keys + catalog entry in a single WritePlan.
   auto lower = table_id_prefix(tid.value());
   auto upper = table_id_upper_bound(tid.value());
+  auto cat_key = table_meta_key(name);
 
-  static constexpr int kBatchSize = 4096;
+  auto *plan = bytecask_write_plan_new();
+  if (!plan) { return HA_ERR_GENERIC; }
 
-  for (;;) {
-    auto *iter = bytecask_iter_open(g_db, lower.data(), lower.size());
-    if (!iter) { break; }
+  bytecask_write_plan_del_range(plan, lower.data(), lower.size(),
+                                upper.data(), upper.size());
+  bytecask_write_plan_del(plan, cat_key.data(), cat_key.size());
 
-    auto *plan = bytecask_write_plan_new();
-    if (!plan) {
-      bytecask_iter_free(iter);
-      break;
-    }
+  int rc = bytecask_apply_batch_if(g_db, plan, /*sync=*/1);
+  if (rc < 0) { return HA_ERR_GENERIC; }
 
-    int count = 0;
-    while (bytecask_iter_valid(iter) && count < kBatchSize) {
-      uint8_t *key = nullptr;
-      std::size_t key_len = 0;
-      if (bytecask_iter_key(iter, &key, &key_len) != 0) { break; }
-
-      // Past upper bound — done.
-      if (key_len >= upper.size() &&
-          std::memcmp(key, upper.data(), upper.size()) >= 0) {
-        bytecask_free_buf(key);
-        break;
-      }
-
-      bytecask_write_plan_del(plan, key, key_len);
-      bytecask_free_buf(key);
-      ++count;
-      bytecask_iter_next(iter);
-    }
-
-    bytecask_iter_free(iter);
-
-    if (count == 0) {
-      bytecask_write_plan_free(plan);
-      break;
-    }
-
-    int rc = bytecask_apply_batch_if(g_db, plan, /*sync=*/1);
-    if (rc < 0) {
-      return HA_ERR_GENERIC;
-    }
-
-    if (count < kBatchSize) {
-      break;  // Last batch.
-    }
-  }
-
-  // Delete catalog entry.
-  catalog_delete_table_meta(g_db, name);
+  catalog_evict_from_cache(name);
   return 0;
 }
 

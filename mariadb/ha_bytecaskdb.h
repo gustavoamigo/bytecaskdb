@@ -37,6 +37,7 @@ bool             catalog_put_table_meta(bytecask_db_t *db,
                                         const char *name);
 bool             catalog_delete_table_meta(bytecask_db_t *db,
                                            const char *name);
+void             catalog_evict_from_cache(const char *name);
 bool             catalog_rename_table_meta(bytecask_db_t *db,
                                            const char *from,
                                            const char *to);

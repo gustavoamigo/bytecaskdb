@@ -691,7 +691,7 @@ Keeping this short since the guide covers the MariaDB side.
 | DDL                       | Without `del_range` (Phase A–F)                       | With `del_range` (Phase G)                                                                      |
 |---------------------------|-------------------------------------------------------|-------------------------------------------------------------------------------------------------|
 | CREATE TABLE              | Allocate table_id, put `TableMeta`, index_ids.         | Same.                                                                                            |
-| DROP TABLE                | Paginated point-delete loop over table prefix + indexes. Not atomic; may leave orphans on crash. | Single `WritePlan` with two `del_range` + `TableMeta` delete. Atomic, O(1) I/O.                  |
+| DROP TABLE                | ~~Paginated point-delete loop~~ **Implemented:** atomic `del_range` + catalog delete in single `WritePlan`. O(1) I/O. | Single `WritePlan` with two `del_range` + `TableMeta` delete. Atomic, O(1) I/O.                  |
 | TRUNCATE TABLE            | Same paginated loop, `TableMeta` preserved.            | Two `del_range` calls; O(1) disk.                                                                |
 | DROP INDEX                | Paginated point-delete on index prefix.                | Single `del_range` on `[0x03|tid|iid, 0x03|tid|iid+1)`.                                          |
 | ALTER TABLE … ADD COLUMN  | Increment `schema_version` in `TableMeta`; decoding branches on version. No row rewrite if column has a default. | Same — no del_range needed.                                                                      |

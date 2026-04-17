@@ -194,6 +194,18 @@ bool catalog_delete_table_meta(bytecask_db_t *db, const char *name) {
   return true;
 }
 
+// Evicts a table from the in-memory catalog cache without touching the DB.
+// Used when the catalog key is already deleted as part of an atomic WritePlan.
+void catalog_evict_from_cache(const char *name) {
+  auto normalized = normalize_table_name(name);
+  std::lock_guard<std::mutex> lk{s_catalog_mu};
+  auto it = s_name_to_id.find(normalized);
+  if (it != s_name_to_id.end()) {
+    s_id_to_meta.erase(it->second);
+    s_name_to_id.erase(it);
+  }
+}
+
 // Atomically renames table metadata: deletes old key, inserts new key.
 bool catalog_rename_table_meta(bytecask_db_t *db,
                                const char *from, const char *to) {
