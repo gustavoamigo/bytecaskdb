@@ -23,6 +23,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+*.so
 
 # perf profiling data
 perf*.data
