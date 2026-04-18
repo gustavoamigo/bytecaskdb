@@ -208,12 +208,12 @@ TEST_CASE("prove_resume__degrade_C__success", "[prove_resume]") {
     auto db = bytecask::DB::open(dir);
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
-      bytecask::Batch batch;
-      batch.put(to_bytes("p0"), to_bytes("new0"));
-      batch.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
       bytecask::testing::ScopedFaultInjector fi_degrade{3};
       REQUIRE_THROWS_AS(
-          db.apply_batch({.sync = true}, std::move(batch)),
+          db.apply_batch({.sync = true}, std::move(plan)),
           std::system_error);
     }
     REQUIRE(db.is_degraded());
@@ -239,12 +239,12 @@ TEST_CASE("prove_resume__degrade_C__truncate_fails", "[prove_resume]") {
     auto db = bytecask::DB::open(dir);
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
-      bytecask::Batch batch;
-      batch.put(to_bytes("p0"), to_bytes("new0"));
-      batch.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
       bytecask::testing::ScopedFaultInjector fi_degrade{3};
       REQUIRE_THROWS_AS(
-          db.apply_batch({.sync = true}, std::move(batch)),
+          db.apply_batch({.sync = true}, std::move(plan)),
           std::system_error);
     }
     REQUIRE(db.is_degraded());
@@ -277,12 +277,12 @@ TEST_CASE("prove_resume__degrade_C__sync_fails", "[prove_resume]") {
     auto db = bytecask::DB::open(dir);
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
-      bytecask::Batch batch;
-      batch.put(to_bytes("p0"), to_bytes("new0"));
-      batch.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
       bytecask::testing::ScopedFaultInjector fi_degrade{3};
       REQUIRE_THROWS_AS(
-          db.apply_batch({.sync = true}, std::move(batch)),
+          db.apply_batch({.sync = true}, std::move(plan)),
           std::system_error);
     }
     REQUIRE(db.is_degraded());
@@ -315,12 +315,12 @@ TEST_CASE("prove_resume__degrade_C__file_creation_fails", "[prove_resume]") {
     auto db = bytecask::DB::open(dir);
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
-      bytecask::Batch batch;
-      batch.put(to_bytes("p0"), to_bytes("new0"));
-      batch.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
       bytecask::testing::ScopedFaultInjector fi_degrade{3};
       REQUIRE_THROWS_AS(
-          db.apply_batch({.sync = true}, std::move(batch)),
+          db.apply_batch({.sync = true}, std::move(plan)),
           std::system_error);
     }
     REQUIRE(db.is_degraded());
@@ -353,12 +353,12 @@ TEST_CASE("prove_resume__degrade_C__double_resume", "[prove_resume]") {
     auto db = bytecask::DB::open(dir);
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
-      bytecask::Batch batch;
-      batch.put(to_bytes("p0"), to_bytes("new0"));
-      batch.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
       bytecask::testing::ScopedFaultInjector fi_degrade{3};
       REQUIRE_THROWS_AS(
-          db.apply_batch({.sync = true}, std::move(batch)),
+          db.apply_batch({.sync = true}, std::move(plan)),
           std::system_error);
     }
     REQUIRE(db.is_degraded());
@@ -392,12 +392,12 @@ TEST_CASE("prove_resume__degrade_C__cascade_r2_r3", "[prove_resume]") {
     auto db = bytecask::DB::open(dir);
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
-      bytecask::Batch batch;
-      batch.put(to_bytes("p0"), to_bytes("new0"));
-      batch.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
       bytecask::testing::ScopedFaultInjector fi_degrade{3};
       REQUIRE_THROWS_AS(
-          db.apply_batch({.sync = true}, std::move(batch)),
+          db.apply_batch({.sync = true}, std::move(plan)),
           std::system_error);
     }
     REQUIRE(db.is_degraded());

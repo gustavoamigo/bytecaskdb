@@ -160,7 +160,7 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
     }
   }
 
-  int rc = bytecask_apply_batch_if(db_, plan, /*sync=*/1);
+  int rc = bytecask_apply_batch(db_, plan, /*sync=*/1);
   // plan is consumed regardless of outcome.
 
   if (rc == 1) {

@@ -23,20 +23,20 @@ Canonical location: `docs/bytecask_design.md`.
 
 ## Non-Goals (for now)
 
-- Multi-writer access, MVCC, or full transaction isolation. ByteCaskDB uses a SWMR model. Snapshot isolation via `snapshot()` and `apply_batch_if()` is available at Layer 1.
+- Multi-writer access, MVCC, or full transaction isolation. ByteCaskDB uses a SWMR model. Snapshot isolation via `snapshot()` and `apply_batch(WritePlan)` is available at Layer 1.
 - TTL or expiry.
 - Async I/O.
 - Background (auto) vacuum. Vacuum is called explicitly by the user.
 
 ## Integration: MariaDB Storage Engine
 
-ByteCaskDB is being integrated as a MariaDB pluggable storage engine (`ha_bytecask`). The plugin builds out-of-tree against MariaDB development headers and loads via `INSTALL PLUGIN`. The integration uses a MariaDB-internal L2 Transaction built directly on Layer 1 primitives (`snapshot()` + `apply_batch_if()`), separate from the public `Transaction` class in `transaction_design.md`. Full design: `docs/mariadb_engine_design.md`.
+ByteCaskDB is being integrated as a MariaDB pluggable storage engine (`ha_bytecask`). The plugin builds out-of-tree against MariaDB development headers and loads via `INSTALL PLUGIN`. The integration uses a MariaDB-internal L2 Transaction built directly on Layer 1 primitives (`snapshot()` + `apply_batch(WritePlan)`), separate from the public `Transaction` class in `transaction_design.md`. Full design: `docs/mariadb_engine_design.md`.
 
 ### C API / Shared Library Boundary
 
 ByteCaskDB uses C++23 modules internally, which are not portable across compilation unit boundaries when linking external code. To cross this boundary (e.g. the MariaDB plugin), a stable `extern "C"` API is provided:
 
-- **`include/bytecask_c.h`**: flat C header with opaque `bytecask_db_t*` / `bytecask_iter_t*` / `bytecask_snapshot_t*` / `bytecask_write_plan_t*` handles. No C++ types, no module imports. Covers: open/close, put/del/get, forward iteration, snapshots, conditional atomic writes (`apply_batch_if` via `WritePlan`), and vacuum.
+- **`include/bytecask_c.h`**: flat C header with opaque `bytecask_db_t*` / `bytecask_iter_t*` / `bytecask_snapshot_t*` / `bytecask_write_plan_t*` handles. No C++ types, no module imports. Covers: open/close, put/del/get, forward iteration, snapshots, conditional atomic writes (`apply_batch` via `WritePlan`), and vacuum.
 - **`src/bytecask_c.cpp`**: implementation that imports `bytecask` (the C++23 module) and forwards calls through the C API. Compiled into `libbytecask.a`.
 - **`xmake.lua` `bytecask` target**: static library combining all engine module objects plus `bytecask_c.cpp`.
 
@@ -120,7 +120,7 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
 
 ##### Write path — group commit
 
-All writes (`put`, `del`, `apply_batch`, `apply_batch_if`) route through a single coordinator: `DB::apply_batch_if`. The public methods `put`, `del`, and `apply_batch` are thin wrappers that build a `WritePlan` and delegate. Each write is packaged into an `EngineSlot` and submitted to either `SoloWriter` (single-slot, no batching) or `WriteGroup` (leader-applies-all batching).
+All writes (`put`, `del`, `apply_batch`) route through a single coordinator: `DB::apply_batch`. The public methods `put` and `del` are thin wrappers that build a `WritePlan` and delegate. Each write is packaged into an `EngineSlot` and submitted to either `SoloWriter` (single-slot, no batching) or `WriteGroup` (leader-applies-all batching).
 
 **Routing**: a write goes to `SoloWriter` when `WriteOptions::solo` is set (benchmarking) or when the plan's byte size exceeds `kGroupWriteMaxBytes` (256 KiB). All other writes go to `WriteGroup`.
 
@@ -164,7 +164,7 @@ The sequential per-slot processing in Phase 1 preserves the serial correctness m
 
 On the write path, `prepare_write` emits one `AppendEntry` per range delete. `apply_writes` iterates the key directory from `lower_bound(from)` to the first key `>= to`, decrements `live_bytes` on each affected file, and erases the keys. The RangeDel entry itself contributes only to `total_bytes` (same as point Delete — tombstones are not live).
 
-Range deletes are supported on `DB::del_range`, `WritePlan::del_range`, and `Batch::del_range`. Inside a batch, they are framed by `BulkBegin`/`BulkEnd` like other operations. Existing guards (`ensure_unchanged`, `ensure_range_unchanged`, implicit W-W check) detect concurrent range deletes without changes — erased keys produce sequence mismatches.
+Range deletes are supported on `DB::del_range` and `WritePlan::del_range`. Inside a batch, they are framed by `BulkBegin`/`BulkEnd` like other operations. Existing guards (`ensure_unchanged`, `ensure_range_unchanged`, implicit W-W check) detect concurrent range deletes without changes — erased keys produce sequence mismatches.
 
 ##### TransientEngineState
 
@@ -193,7 +193,7 @@ If the isolation sync or rotation after an orphaned `BulkBegin` fails (e.g. `fda
 
 When this happens, the engine calls `deem_as_degraded(reason)` with a diagnostic string identifying the failed file, then rethrows the original exception. From that point:
 
-- **Writes blocked**: `put`, `del`, `apply_batch`, `apply_batch_if`, and `vacuum` throw `DbDegraded` immediately. The reason string is available via `degraded_reason()`.
+- **Writes blocked**: `put`, `del`, `apply_batch`, and `vacuum` throw `DbDegraded` immediately. The reason string is available via `degraded_reason()`.
 - **Reads available**: `get`, `contains_key`, `snapshot`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from` continue to work. The in-memory state was correctly rolled back (the transient was never persisted), so reads reflect the last successfully committed state.
 - **Recovery via `resume()`**: the degraded flag is in-memory only. The service calls `resume()` to attempt in-process recovery without a restart. `resume()` runs a universal recovery process:
   1. Acquires the write lock.
@@ -218,7 +218,7 @@ On cold paths (`DB::open()`, `resume()`), `validate_state_consistency` runs the 
 
 If `writev` returns a short write (0 < written < total), `DataFile::append()` sets a `tainted_` flag before throwing. A tainted file has bytes on disk that `offset_` does not account for. The file is opened with `O_APPEND`, so the next `writev` would write at the kernel's true EOF (past the partial data), but `offset_` would still point to the old position — the offset returned by subsequent appends would be wrong.
 
-For multi-entry batches this is safe: the isolation rotation moves to a new file, abandoning the tainted one. For single-entry writes, the `apply_batch_if` catch block checks `file.is_tainted()` and degrades the DB if set. `resume()` then truncates the partial entry and restores a clean state.
+For multi-entry batches this is safe: the isolation rotation moves to a new file, abandoning the tainted one. For single-entry writes, the `apply_batch` catch block checks `file.is_tainted()` and degrades the DB if set. `resume()` then truncates the partial entry and restores a clean state.
 
 ##### Post-write rotation failure
 
@@ -681,7 +681,7 @@ We use fine-grained C++20 modules:
 - `bytecask.hint_file`: Hint file writer and reader (`HintFile`).
 - `bytecask.persistent_ordered_map`: Immutable sorted map (`PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`) backed by `immer::flex_vector`; retained for benchmarking.
 - `bytecask.radix_tree`: Persistent radix tree (`PersistentRadixTree<V>`, `TransientRadixTree<V>`, `RadixTreeIterator<V>`) with path compression and intrusive refcounting; used as the key directory.
-- `bytecask.engine`: Public engine API (`Bytecask`, `EngineState`, `Batch`, `KeyIterator`, `EntryIterator`, `FileRegistry`, type aliases).
+- `bytecask.engine`: Public engine API (`Bytecask`, `EngineState`, `KeyIterator`, `EntryIterator`, `FileRegistry`, type aliases).
 
 ### Current scope boundaries
 
@@ -959,41 +959,11 @@ using BytesView = std::span<const std::byte>;
 
 `std::byte` makes the intent clear (raw bytes, not text) and prevents accidental arithmetic. `Key` is kept distinct from `Bytes` so the key directory type (`PersistentOrderedMap<Key, KeyDirEntry>`) reads as its intent and provides a single point of change if the key type needs to evolve. `BytesView` as the universal input type avoids copies at call sites and accepts any contiguous range.
 
-### Batch
+### WritePlan
 
-```cpp
-struct BatchInsert {
-    Bytes key;
-    Bytes value;
-};
+`WritePlan` is the unified type for all write operations submitted to `apply_batch`. It carries both **writes** (`put`, `del`, `del_range`) and optional **guards** (`ensure_present`, `ensure_absent`, `ensure_unchanged`, `ensure_range_unchanged`). When constructed with a `Snapshot`, guards and implicit W-W checks are available; without a snapshot, only unconditional writes and `ensure_present`/`ensure_absent` guards are available.
 
-struct BatchRemove {
-    Bytes key;
-};
-
-using BatchOperation = std::variant<BatchInsert, BatchRemove>;
-
-class Batch {
-public:
-    Batch() = default;
-    Batch(const Batch&)            = delete;
-    Batch& operator=(const Batch&) = delete;
-    Batch(Batch&&) noexcept        = default;
-    Batch& operator=(Batch&&) noexcept = default;
-
-    void put(BytesView key, BytesView value);
-    void del(BytesView key);
-
-    [[nodiscard]] bool empty() const noexcept;
-    [[nodiscard]] std::size_t size() const noexcept;
-
-private:
-    std::vector<BatchOperation> operations_;
-    friend class Bytecask;
-};
-```
-
-`std::variant` over an inheritance hierarchy keeps `BatchOperation` a value type (no heap allocation per item, trivially movable). `Batch` is move-only and single-use; `Bytecask::apply_batch` consumes it by move.
+`WritePlan` is move-only and single-use; `DB::apply_batch` consumes it by move. See the Layer 1 section and `docs/transaction_design.md` for the full type definition and guard semantics.
 
 ### Iterators
 
@@ -1108,10 +1078,12 @@ public:
 
     // ── Batch ─────────────────────────────────────────────────────────────
 
-    // Atomically applies all operations in `batch` wrapped in BulkBegin/BulkEnd entries.
-    // `batch` is consumed (move-only). No-op if batch.empty().
-    // Throws std::system_error on I/O failure; the database is left consistent on failure.
-    void apply_batch(const WriteOptions& opts, Batch batch);
+    // Atomically applies all operations in `plan` wrapped in BulkBegin/BulkEnd entries.
+    // `plan` is consumed (move-only). No-op if plan is empty and has no guards.
+    // When the plan carries a snapshot, guards and implicit W-W checks are evaluated.
+    // Returns true if committed, false on conflict.
+    // Throws std::system_error on I/O failure or DbDegraded if degraded.
+    [[nodiscard]] auto apply_batch(const WriteOptions& opts, WritePlan plan) -> bool;
 
     // ── Range iteration ───────────────────────────────────────────────────
 
@@ -1148,11 +1120,11 @@ if (val) { /* use *val */ }
 bool existed = db.del(as_bytes("user:1")); // false if key was absent
 
 // Atomic batch.
-Batch batch;
-batch.put(as_bytes("user:2"), as_bytes("bob"));
-batch.put(as_bytes("user:3"), as_bytes("carol"));
-batch.del(as_bytes("user:1"));
-db.apply_batch(std::move(batch));
+WritePlan plan;
+plan.put(as_bytes("user:2"), as_bytes("bob"));
+plan.put(as_bytes("user:3"), as_bytes("carol"));
+plan.del(as_bytes("user:1"));
+db.apply_batch({}, std::move(plan));
 
 // Range scan (forward).
 for (auto& [key, value] : db.iter_from(as_bytes("user:"))) {
@@ -1274,7 +1246,7 @@ The seam is intentionally minimal:
 - `src/engine/radix_tree.cppm`: C++23 module (`bytecask.radix_tree`) — `PersistentRadixTree<V>`, `RadixTreeIterator<V>`
 - `src/engine/concurrency.cppm`: C++23 module (`bytecask.concurrency`) — `SyncGroup`, `BackgroundWorker`
 - `src/engine/internals.cppm`: internal partition `bytecask.engine:internals` — `EngineState`, `FileStats`, `KeyDirEntry`, `FileRegistry`, `Key`, `StaleFile`, `VacuumMapping`, `VacuumScanResult`, `RecoveredFile`, `RecoveryResult`, `entry_size`
-- `src/engine/bytecask.cppm`: primary interface unit `bytecask.engine` — public types (`Bytes`, `BytesView`, `VacuumOptions`, `Batch`, `WriteOptions`, `ReadOptions`, `Options`, `KeyIterator`, `EntryIterator`) and `Bytecask` class declaration
+- `src/engine/bytecask.cppm`: primary interface unit `bytecask.engine` — public types (`Bytes`, `BytesView`, `VacuumOptions`, `WritePlan`, `WriteOptions`, `ReadOptions`, `Options`, `KeyIterator`, `EntryIterator`) and `Bytecask` class declaration
 - `src/engine/bytecask.cpp`: implementation unit `bytecask.engine` — all `Bytecask` method bodies, recovery, vacuum, hint, rotation logic
 - `tests/data_entry_test.cpp`: behavior tests for data entry serialization and file append
 - `tests/hint_file_test.cpp`: behavior tests for hint file append, round-trip, and CRC panic
@@ -1289,7 +1261,7 @@ The seam is intentionally minimal:
 - Evolve the current executable into a real storage engine with separable components that can be tested independently.
 - Treat design changes as documentation changes: code and this file should move together.
 
-## Layer 1: `snapshot()` and `apply_batch_if()`
+## Layer 1: `snapshot()` and `apply_batch(WritePlan)`
 
 Two primitives added to `DB` in BC-103 providing snapshot isolation without any mandatory transaction wrapper.
 
@@ -1301,31 +1273,31 @@ The `shared_ptr` keeps all data files referenced at snapshot time alive. Vacuum'
 
 `Snapshot` exposes the same read API as `DB`: `get`, `contains_key`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from`.
 
-### `DB::apply_batch_if(snap, opts, batch)`
+### `DB::apply_batch(opts, plan) -> bool`
 
-Applies `batch` atomically only if no key in the batch was modified since `snap` was taken. Both the conflict check and the apply run under `write_mu_`, serialised with all other writers.
+Applies `plan` atomically only if all guards pass and no key in the write set was modified since the plan's snapshot was taken (when the plan carries a snapshot). Both the conflict check and the apply run under `write_mu_`, serialised with all other writers.
 
-Conflict is detected by comparing `KeyDirEntry::sequence` between the snapshot state and the current state for each key in the batch. Three conflict cases are detected:
+Conflict is detected by comparing `KeyDirEntry::sequence` between the snapshot state and the current state for each key in the write set. Three conflict cases are detected:
 
 1. Key absent in snapshot but present now (key appeared after snapshot).
 2. Key present in snapshot but absent now (key deleted after snapshot).
 3. Key present in both but with a different `sequence` (key modified after snapshot).
 
-On the first conflict detected, `BatchConflict` is thrown before any I/O is performed. If no conflict is found, the batch is applied identically to `apply_batch`.
+On the first conflict detected, `apply_batch` returns `false` before any I/O is performed. If no conflict is found, the writes are applied atomically.
 
 #### Implicit W-W check on write keys
 
-When a `WritePlan` carries a snapshot, `apply_batch_if` automatically checks every key in the write set (put or del) for concurrent modification — the caller does not need to call `ensure_unchanged` on keys they intend to write. This closes a common concurrency hole: without it, a plan could read a key, compute a new value, and write it back without noticing a concurrent writer already changed that key.
+When a `WritePlan` carries a snapshot, `apply_batch` automatically checks every key in the write set (put or del) for concurrent modification — the caller does not need to call `ensure_unchanged` on keys they intend to write. This closes a common concurrency hole: without it, a plan could read a key, compute a new value, and write it back without noticing a concurrent writer already changed that key.
 
 `ensure_unchanged` is for read-only dependencies: keys whose value influenced the plan's decisions but that the plan does not modify. For example, reading a price to compute an order total — the price key is a read dependency but not in the write set, so it needs an explicit guard.
 
-### `BatchConflict`
+### Conflict signalling
 
-`export struct BatchConflict : std::exception` — no payload, just the exception type. Thrown by `apply_batch_if()`. Callers catch by type and retry.
+`apply_batch` returns `bool`: `true` if committed, `false` on conflict (W-W or guard violation). Conflicts are expected outcomes in concurrent workloads — not errors. I/O failures remain exceptions (`std::system_error`).
 
 ### Single-entry batch optimization
 
-When `batch.size() == 1`, both `apply_batch` and `apply_batch_if` skip the `BulkBegin`/`BulkEnd` marker writes entirely. A single data entry is CRC-protected and self-describing — the markers add no recovery benefit. See D14.
+When the write set contains exactly one operation, `apply_batch` skips the `BulkBegin`/`BulkEnd` marker writes entirely. A single data entry is CRC-protected and self-describing — the markers add no recovery benefit. See D14.
 
 ## Immediate engineering constraints
 
@@ -1340,8 +1312,8 @@ When `batch.size() == 1`, both `apply_batch` and `apply_batch_if` skip the `Bulk
 |---|----------|
 | D1 | **Error handling**: Throw (`std::system_error` for I/O, `std::runtime_error` for corruption). These are panic-level events the caller cannot meaningfully recover from inline. `std::optional` covers the key-not-found case for `get`. No `std::expected` at this boundary — there are no anticipated recoverable error conditions in normal operation. |
 | D2 | **Config**: Deferred — removed from the initial API scope. |
-| D3 | **Batch ownership**: `Batch` is move-only (copy constructor and copy assignment deleted). Single-use by design. |
-| D4 | **Batch size limit**: None — the caller is responsible. |
+| D3 | **WritePlan ownership**: `WritePlan` is move-only (copy constructor and copy assignment deleted). Single-use by design. |
+| D4 | **WritePlan size limit**: None — the caller is responsible. |
 | D5 | **Iterator strategy**: Lazy — each `operator++` reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries. |
 | D6 | **`KeyIterator` source**: In-memory only — walks the B-Tree key directory without opening any data file. |
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
@@ -1351,7 +1323,7 @@ When `batch.size() == 1`, both `apply_batch` and `apply_batch_if` skip the `Bulk
 | D11 | **File naming**: `data_{YYYYMMDDHHmmssUUUUUU}` using microsecond precision. Gives lexicographic == chronological ordering and avoids the false precision of nanosecond timestamps whose sub-microsecond bits are often zero on Linux. |
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be discarded with a logged warning. No partial-batch entries enter the key directory. |
-| D14 | **Single-entry batch optimization**: When `apply_batch` or `apply_batch_if` is called with exactly one operation, the `BulkBegin`/`BulkEnd` marker writes are skipped. A single data entry is self-describing and CRC-protected, so the markers add no recovery benefit for a batch of size 1. |
+| D14 | **Single-entry batch optimization**: When `apply_batch` is called with exactly one operation, the `BulkBegin`/`BulkEnd` marker writes are skipped. A single data entry is self-describing and CRC-protected, so the markers add no recovery benefit for a write set of size 1. |
 | D15 | **C ABI / shared-library link constraint**: `libbytecask.a` is compiled with `-fPIC` so it can be linked into a shared object (e.g. `ha_bytecaskdb.so`). Without `-fPIC`, clang emits `R_X86_64_TPOFF32`/`R_X86_64_32S` relocations illegal in a DSO. xmake syntax: `add_cxxflags("-fPIC", {force = true})` on the `bytecask` static target. |
 | D16 | **MariaDB plugin header ordering**: Server-internal headers require `server/my_global.h` before `handler.h`. The client-side stub does not define `MY_GLOBAL_INCLUDED`/`uchar`/`unlikely()`. Fedora layout: base `/usr/include/mysql`, server `/usr/include/mysql/server`, private `/usr/include/mysql/server/private`. CMake include order must be `server/private` → `server` → base. `-DMYSQL_SERVER` is required. `handlerton::state` does not exist in this MariaDB ABI; use `PLUGIN_LICENSE_GPL` (no MIT constant). |
 | D17 | **Directory locking**: One process per directory, enforced by `flock()` on `dir/.lock`. Advisory only — does not protect against uncooperative processes that bypass `DB::open()`. |

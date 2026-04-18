@@ -27,11 +27,11 @@ def main():
         print(f"get(user:3) after delete = {gone}")  # None
 
         # --- Batch operations ---
-        batch = bc.Batch()
-        batch.put(b"user:10", b"dave")
-        batch.put(b"user:11", b"eve")
-        batch.del_(b"user:1")
-        db.apply_batch(batch)
+        plan = bc.WritePlan()
+        plan.put(b"user:10", b"dave")
+        plan.put(b"user:11", b"eve")
+        plan.del_(b"user:1")
+        db.apply_batch(plan)
 
         print(f"\nAfter batch:")
         print(f"  get(user:1) = {db.get(b'user:1')}")  # None (deleted)

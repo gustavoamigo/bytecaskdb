@@ -143,7 +143,7 @@ uint32_t catalog_alloc_table_id(bytecask_db_t *db) {
     bytecask_write_plan_put(plan, ckey.data(), ckey.size(),
                             new_val.data(), new_val.size());
 
-    int result = bytecask_apply_batch_if(db, plan, /*sync=*/1);
+    int result = bytecask_apply_batch(db, plan, /*sync=*/1);
     if (result == 1) {
       // Committed.
       std::lock_guard<std::mutex> lk{s_catalog_mu};
@@ -239,7 +239,7 @@ bool catalog_rename_table_meta(bytecask_db_t *db,
   bytecask_write_plan_del(plan, old_key.data(), old_key.size());
   bytecask_write_plan_put(plan, new_key.data(), new_key.size(),
                           new_val.data(), new_val.size());
-  int result = bytecask_apply_batch_if(db, plan, /*sync=*/1);
+  int result = bytecask_apply_batch(db, plan, /*sync=*/1);
   if (result != 1) {
     return false;
   }

@@ -59,45 +59,8 @@ struct PyDB {
 };
 
 // ---------------------------------------------------------------------------
-// PyBatch — wraps move-only Batch; single-use, consumed by apply_batch.
-// ---------------------------------------------------------------------------
-
-struct PyBatch {
-  std::optional<bytecask::Batch> batch{bytecask::Batch{}};
-
-  void put(nb::bytes key, nb::bytes value) {
-    check();
-    batch->put(to_view(key), to_view(value));
-  }
-
-  void del(nb::bytes key) {
-    check();
-    batch->del(to_view(key));
-  }
-
-  void del_range(nb::bytes from, nb::bytes to) {
-    check();
-    batch->del_range(to_view(from), to_view(to));
-  }
-
-  auto take() -> bytecask::Batch {
-    check();
-    auto b = std::move(*batch);
-    batch.reset();
-    return b;
-  }
-
-private:
-  void check() const {
-    if (!batch) {
-      throw std::runtime_error("Batch already consumed by apply_batch");
-    }
-  }
-};
-
-// ---------------------------------------------------------------------------
 // PyWritePlan — wraps move-only WritePlan; single-use, consumed by
-// apply_batch_if.
+// apply_batch.
 // ---------------------------------------------------------------------------
 
 struct PyWritePlan {
@@ -159,7 +122,7 @@ private:
   void check() const {
     if (!plan) {
       throw std::runtime_error(
-          "WritePlan already consumed by apply_batch_if");
+          "WritePlan already consumed by apply_batch");
     }
   }
 };
@@ -416,29 +379,14 @@ NB_MODULE(_bytecaskdb, m) {
            });
 
   // -------------------------------------------------------------------------
-  // Batch
-  // -------------------------------------------------------------------------
-
-  nb::class_<PyBatch>(m, "Batch",
-      "Unconditional atomic write batch. Consumed by DB.apply_batch().")
-      .def(nb::init<>())
-      .def("put", &PyBatch::put, "Stage a key-value write.",
-           "key"_a, "value"_a)
-      .def("del_", &PyBatch::del, "Stage a key deletion.",
-           "key"_a)
-      .def("del_range", &PyBatch::del_range,
-           "Stage a range deletion: all keys in [from_key, to_key).",
-           "from_key"_a, "to_key"_a);
-
-  // -------------------------------------------------------------------------
   // WritePlan
   // -------------------------------------------------------------------------
 
   nb::class_<PyWritePlan>(m, "WritePlan",
-      "Conditional atomic write plan for DB.apply_batch_if().\n\n"
-      "Construct without arguments for a snapshot-less plan. Construct\n"
-      "with a Snapshot to enable ensure_unchanged guards and automatic\n"
-      "write-write conflict detection.")
+      "Atomic write plan for DB.apply_batch().\n\n"
+      "Construct without arguments for a simple unconditional batch.\n"
+      "Construct with a Snapshot to enable ensure_unchanged guards and\n"
+      "automatic write-write conflict detection.")
       .def(nb::init<>())
       .def("__init__",
            [](PyWritePlan *self, bytecask::Snapshot *snap) {
@@ -542,25 +490,14 @@ NB_MODULE(_bytecaskdb, m) {
           "key"_a)
       .def(
           "apply_batch",
-          [](PyDB &self, PyBatch &batch,
-             std::optional<bytecask::WriteOptions> opts) {
-            auto b = batch.take();
-            auto wopts = opts.value_or(bytecask::WriteOptions{});
-            nb::gil_scoped_release release;
-            self.db.apply_batch(wopts, std::move(b));
-          },
-          "Atomically apply all operations in batch. Consumes batch.",
-          "batch"_a, "opts"_a = nb::none())
-      .def(
-          "apply_batch_if",
           [](PyDB &self, PyWritePlan &plan,
              std::optional<bytecask::WriteOptions> opts) -> bool {
             auto p = plan.take();
             auto wopts = opts.value_or(bytecask::WriteOptions{});
             nb::gil_scoped_release release;
-            return self.db.apply_batch_if(wopts, std::move(p));
+            return self.db.apply_batch(wopts, std::move(p));
           },
-          "Apply plan atomically if all guards hold. Return True if committed.",
+          "Apply plan atomically. Return True if committed, False on conflict.",
           "plan"_a, "opts"_a = nb::none())
       .def(
           "snapshot",

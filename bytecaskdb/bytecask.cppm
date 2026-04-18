@@ -56,64 +56,6 @@ export struct VacuumOptions {
   std::uint64_t absorb_threshold{1ULL * 1024 * 1024};
 };
 
-// ---------------------------------------------------------------------------
-// Batch
-// ---------------------------------------------------------------------------
-
-export struct BatchInsert {
-  Bytes key;
-  Bytes value;
-};
-
-export struct BatchRemove {
-  Bytes key;
-};
-
-export struct BatchRangeDel {
-  Bytes from;
-  Bytes to; // exclusive — [from, to)
-};
-
-export using BatchOperation =
-    std::variant<BatchInsert, BatchRemove, BatchRangeDel>;
-
-// Move-only, single-use container of operations submitted atomically.
-// Consumed by DB::apply_batch().
-export class Batch {
-public:
-  Batch() = default;
-  Batch(const Batch &) = delete;
-  Batch &operator=(const Batch &) = delete;
-  Batch(Batch &&) noexcept = default;
-  Batch &operator=(Batch &&) noexcept = default;
-
-  void put(BytesView key, BytesView value) {
-    operations_.emplace_back(BatchInsert{Bytes{key.begin(), key.end()},
-                                         Bytes{value.begin(), value.end()}});
-  }
-
-  void del(BytesView key) {
-    operations_.emplace_back(BatchRemove{Bytes{key.begin(), key.end()}});
-  }
-
-  void del_range(BytesView from, BytesView to) {
-    operations_.emplace_back(
-        BatchRangeDel{Bytes{from.begin(), from.end()},
-                      Bytes{to.begin(), to.end()}});
-  }
-
-  [[nodiscard]] auto empty() const noexcept -> bool {
-    return operations_.empty();
-  }
-
-  [[nodiscard]] auto size() const noexcept -> std::size_t {
-    return operations_.size();
-  }
-
-private:
-  std::vector<BatchOperation> operations_;
-  friend class DB;
-};
 
 // Default active-file size threshold: 64 MiB.
 export inline constexpr std::uint64_t kDefaultRotationThreshold =
@@ -587,23 +529,17 @@ public:
     validate_state_consistency(s);
   }
 #endif
-  // Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
-  // batch is consumed (move-only). No-op if batch.empty().
-  // opts.sync controls whether a single fdatasync is issued at the end.
-  // Rotates the active file after the sync if the threshold is reached.
-  // Throws std::system_error on I/O failure or lock contention (try_lock).
-  void apply_batch(const WriteOptions &opts, Batch batch);
-
   // Returns a frozen, move-only, read-only view of the DB at this instant.
   // Holds open any data files referenced at snapshot time until destroyed.
   [[nodiscard]] auto snapshot() const -> Snapshot;
 
   // Applies plan atomically iff all guards pass and no written key was
   // modified since snap. Returns true if committed, false on conflict.
+  // A guardless, snapshot-less plan always commits (returns true).
   // Throws std::system_error on I/O failure or lock contention (try_lock).
   // Returns true (no-op) if plan has no writes and no guards.
-  [[nodiscard]] auto apply_batch_if(WriteOptions opts,
-                                    WritePlan plan) -> bool;
+  [[nodiscard]] auto apply_batch(WriteOptions opts,
+                                 WritePlan plan) -> bool;
 
   // Returns an input range of (key, value) pairs with keys >= from.
   // Pass an empty span to start from the first key. Each dereference reads
@@ -855,7 +791,7 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// WritePlan — conditional write + guard vocabulary for apply_batch_if.
+// WritePlan — conditional write + guard vocabulary for apply_batch.
 //
 // Optionally carries a Snapshot that defines the reference point for
 // ensure_unchanged / ensure_range_unchanged guards. When constructed
@@ -863,7 +799,7 @@ public:
 // available — calling ensure_unchanged or ensure_range_unchanged on a
 // snapshot-less plan throws std::logic_error (programming error).
 //
-// Implicit W-W check: when a snapshot is present, apply_batch_if
+// Implicit W-W check: when a snapshot is present, apply_batch
 // automatically rejects the plan if any key in the write set (put or del)
 // was modified since the snapshot. This means ensure_unchanged is only
 // needed for read-only dependencies — keys whose value influenced the
@@ -1022,7 +958,7 @@ private:
 // ---------------------------------------------------------------------------
 // EngineSlot — extends Slot with domain-specific fields for the write path.
 //
-// Stack-allocated by each caller of apply_batch_if. Both SoloWriter and
+// Stack-allocated by each caller of apply_batch. Both SoloWriter and
 // WriteGroup executors static_cast Slot* to EngineSlot*.
 // ---------------------------------------------------------------------------
 export struct EngineSlot : Slot {

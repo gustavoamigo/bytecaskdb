@@ -30,7 +30,7 @@ Canonical location: `docs/mariadb_engine_design.md`.
 │  │    - L2 Transaction (internal)               │   │
 │  │    ↕                                         │   │
 │  │  libbytecask.so (or statically linked)       │   │
-│  │    - DB, Snapshot, WritePlan, apply_batch_if  │   │
+│  │    - DB, Snapshot, WritePlan, apply_batch  │   │
 │  └─────────────────────────────────────────────┘   │
 │                                                    │
 │  Data directory: /var/lib/mysql/<db>/<table>/       │
@@ -122,7 +122,7 @@ The `mariadb/` directory is a self-contained CMake project. It finds MariaDB hea
   - Captures a `Snapshot` at statement start (via `external_lock(F_RDLCK/F_WRLCK)`).
   - Buffers writes (`put`/`del`) from `write_row`/`update_row`/`delete_row`.
   - On `external_lock(F_UNLCK)` (autocommit) or explicit `COMMIT`:
-    builds a `WritePlan` from the buffered writes and calls `db.apply_batch_if(snap, opts, plan)`.
+    builds a `WritePlan` from the buffered writes and calls `db.apply_batch(snap, opts, plan)`.
   - On `ROLLBACK`: discards the write set.
   - Read-your-own-writes: `get()` checks the write buffer first, then falls through to the snapshot.
 - Register transaction with MariaDB coordinator via `trans_register_ha()`.
@@ -138,7 +138,7 @@ The public `Transaction` class (designed but not yet implemented) targets the By
 - The plugin needs to track MariaDB-specific state (THD pointer, table metadata, whether statement or session-level transaction).
 - The write buffer stores encoded KV pairs, not the original `(BytesView, BytesView)`.
 
-Building a thin `MariaDBTxn` directly on `snapshot()` + `apply_batch_if()` is simpler and more correct than trying to reuse a general-purpose `Transaction` class that would need MariaDB-specific hooks.
+Building a thin `MariaDBTxn` directly on `snapshot()` + `apply_batch()` is simpler and more correct than trying to reuse a general-purpose `Transaction` class that would need MariaDB-specific hooks.
 
 ### Phase 4 — Secondary Indexes
 
@@ -157,7 +157,7 @@ Building a thin `MariaDBTxn` directly on `snapshot()` + `apply_batch_if()` is si
 - `table_flags()`: `HA_MVCC | HA_NO_LOCK_MANAGER`.
 - `store_lock()` — confirmed no-op.
 - `external_lock()` — snapshot acquisition / release tied to statement boundaries.
-- Write-write conflict detection via `apply_batch_if()` returning false → `HA_ERR_LOCK_DEADLOCK`.
+- Write-write conflict detection via `apply_batch()` returning false → `HA_ERR_LOCK_DEADLOCK`.
 - `start_consistent_snapshot()` — for `mysqldump --single-transaction`.
 
 ### Phase 6 — Replication + Backup Hooks
@@ -183,9 +183,8 @@ What ByteCaskDB currently has vs. what the MariaDB integration needs:
 | `DB::get()` | ✅ | `index_read` (PK) |
 | `DB::del()` | ✅ | `delete_row` |
 | `DB::contains_key()` | ✅ | uniqueness checks |
-| `DB::apply_batch()` | ✅ | atomic multi-key writes |
+| `DB::apply_batch()` | ✅ | atomic multi-key writes, L2 Transaction commit (OCC) |
 | `DB::snapshot()` | ✅ | L2 Transaction reads |
-| `DB::apply_batch_if()` | ✅ | L2 Transaction commit (OCC) |
 | `WritePlan` with guards | ✅ | conflict detection at commit |
 | Forward iterators (`iter_from`, `keys_from`) | ✅ | `rnd_next`, `index_next`, range scans |
 | Reverse iterators (`riter_from`, `rkeys_from`) | ✅ | `index_prev`, descending scans |
@@ -200,7 +199,7 @@ What ByteCaskDB currently has vs. what the MariaDB integration needs:
 | **Shared library build target** | Phase 1 | **Must have** | Currently only builds as object files compiled into each binary. Need a `libbytecask.a` or `.so` target. Straightforward xmake/CMake addition. |
 | **C API wrapper** | Phase 1 | **Must have** | MariaDB plugins are C++ but link via C ABI boundaries. ByteCaskDB uses C++23 modules. Need a thin C++ wrapper with stable ABI (no module exports, no `std::span` in signatures). Can use `extern "C"` or a plain header with opaque types. |
 | **Row count estimate** | Phase 2+ | **Nice to have** | `ha_bytecaskdb::info()` can return `HA_POS_ERROR` (unknown) for `stats.records` — the optimizer still works, just with less accurate cost estimates. Revisit if optimizer quality matters. |
-| **Table-prefixed key encoding** | Phase 1 | **Must have** | Single DB instance per server (like MyRocks). All tables across all schemas share one ByteCaskDB, keys prefixed with `[table_id]`. Enables cross-table and cross-schema transactions via a single `apply_batch_if()` — no 2PC needed. |
+| **Table-prefixed key encoding** | Phase 1 | **Must have** | Single DB instance per server (like MyRocks). All tables across all schemas share one ByteCaskDB, keys prefixed with `[table_id]`. Enables cross-table and cross-schema transactions via a single `apply_batch()` — no 2PC needed. |
 | **`upper_bound()` / bounded iteration** | Phase 4 | **Should have** | Secondary index scans need bounded iteration (stop at index prefix boundary). Radix tree has `lower_bound()` and `upper_bound()` — need to verify the iterator stop condition works for prefix-bounded ranges. |
 | **Table metadata persistence** | Phase 2 | **Should have** | MariaDB's `.frm` file tracks schema. ByteCaskDB needs to persist table-level metadata (column count, types, index definitions) for recovery. Can store as a reserved key (`__meta__`) or a side file. |
 | **Configurable data directory** | Phase 1 | **Nice to have** | MariaDB expects data in `datadir/<db>/<table>/`. `DB::open()` already takes a path — just needs correct wiring. |
@@ -210,8 +209,8 @@ What ByteCaskDB currently has vs. what the MariaDB integration needs:
 | Concern | Why not needed |
 |---|---|
 | WAL / write-ahead log | ByteCaskDB's append-only data files with CRC + atomic batch markers provide crash recovery. No separate WAL needed. |
-| MVCC versioning | `snapshot()` + `apply_batch_if()` provide snapshot isolation via the SWMR model. No per-row version chain needed — ByteCaskDB's `EngineState` snapshot IS the MVCC mechanism. |
-| Per-key locking | OCC via `apply_batch_if()` replaces pessimistic locking. Conflicts return `false` → `HA_ERR_LOCK_DEADLOCK`. |
+| MVCC versioning | `snapshot()` + `apply_batch()` provide snapshot isolation via the SWMR model. No per-row version chain needed — ByteCaskDB's `EngineState` snapshot IS the MVCC mechanism. |
+| Per-key locking | OCC via `apply_batch()` replaces pessimistic locking. Conflicts return `false` → `HA_ERR_LOCK_DEADLOCK`. |
 | Background compaction | Vacuum is caller-driven. MariaDB plugin can run it periodically via a background thread. |
 
 ---
@@ -238,7 +237,7 @@ public:
   // Read-your-own-writes: checks write buffer, then snapshot.
   bool get(bytecask::BytesView key, bytecask::Bytes& out) const;
 
-  // Called from hton->commit. Builds WritePlan, calls apply_batch_if.
+  // Called from hton->commit. Builds WritePlan, calls apply_batch.
   // Returns 0 on success, HA_ERR_LOCK_DEADLOCK on conflict.
   int commit(bool sync);
 
@@ -270,14 +269,14 @@ external_lock(F_UNLCK)
   [autocommit]                  →       commit(sync=true)
                                           WritePlan plan;
                                           for each buffered write: plan.put/del(...)
-                                          db.apply_batch_if(snapshot, opts, plan)
+                                          db.apply_batch(snapshot, opts, plan)
   [explicit COMMIT]             →       commit(sync=true)
   [ROLLBACK]                    →       rollback()
 ```
 
 ### Conflict Handling
 
-When `apply_batch_if()` returns `false`, `commit()` returns `HA_ERR_LOCK_DEADLOCK`. MariaDB's retry logic (or the application) retries the statement. This is the standard pattern used by MyRocks.
+When `apply_batch()` returns `false`, `commit()` returns `HA_ERR_LOCK_DEADLOCK`. MariaDB's retry logic (or the application) retries the statement. This is the standard pattern used by MyRocks.
 
 ### Per-THD Storage
 
@@ -339,7 +338,7 @@ The `[table_id][index_id]` prefix ensures secondary indexes occupy a separate ke
 
 1. **C++23 modules across shared library boundary**: MariaDB plugins are compiled separately. ByteCaskDB uses C++23 modules internally. The plugin will need a stable header-based API (no module imports). Options: (a) a thin `bytecask.h` C++ header wrapping the module types, (b) a C API with opaque handles.
 
-2. ~~**One DB per table vs. one DB for the entire server**~~: **Resolved — single DB per server** (same approach as MyRocks). One `DB::open()` at plugin init, shared by all schemas and tables. Keys prefixed with `[table_id]`. This avoids 2PC for cross-table and cross-schema transactions — a single `apply_batch_if()` atomically commits writes across everything.
+2. ~~**One DB per table vs. one DB for the entire server**~~: **Resolved — single DB per server** (same approach as MyRocks). One `DB::open()` at plugin init, shared by all schemas and tables. Keys prefixed with `[table_id]`. This avoids 2PC for cross-table and cross-schema transactions — a single `apply_batch()` atomically commits writes across everything.
 
 3. **MariaDB version target**: MariaDB 10.6+ (LTS) or 11.x. The `handler` API is stable across versions. Development headers from the distro package should suffice.
 

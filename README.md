@@ -14,9 +14,9 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 
 - **Sequential write path** — all I/O is sequential appends; no random writes. Every `put` and `del` is one append. `apply_batch` with N operations appends a begin marker, N entries, and an end marker in a single `writev` — still no WAL, no random writes.
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
-- **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append. In-memory cleanup walks the radix tree; disk cost is O(1) regardless of how many keys fall in the range. Available on `DB`, `Batch`, and `WritePlan`.
+- **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append. In-memory cleanup walks the radix tree; disk cost is O(1) regardless of how many keys fall in the range. Available on `DB` and `WritePlan`.
 - **Atomic writes** — every `put`, `del`, and `del_range` is atomic. `apply_batch` makes multiple puts, deletes, and range deletes atomic as a group.
-- **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch_if(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
+- **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex with group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost. On the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
@@ -137,20 +137,20 @@ bool existed = db.del({}, to_bytes("user:1"));       // false if key was absent
 db.del_range({}, to_bytes("session:"), to_bytes("session:~"));
 
 // Atomic batch — all operations land atomically.
-Batch batch;
-batch.put(to_bytes("user:2"), to_bytes("bob"));
-batch.put(to_bytes("user:3"), to_bytes("carol"));
-batch.del(to_bytes("user:1"));
-db.apply_batch({}, std::move(batch));
+WritePlan plan;
+plan.put(to_bytes("user:2"), to_bytes("bob"));
+plan.put(to_bytes("user:3"), to_bytes("carol"));
+plan.del(to_bytes("user:1"));
+(void)db.apply_batch({}, std::move(plan));
 
 // Decrement stock — write keys are checked for conflicts automatically.
 auto snap = db.snapshot();
 Bytes stock_out;
 snap.get(to_bytes("stock:widget"), stock_out);
 // ... decrement stock count ...
-WritePlan plan{std::move(snap)};
-plan.put(to_bytes("stock:widget"), new_stock);
-if (!db.apply_batch_if({}, std::move(plan))) {
+WritePlan plan2{std::move(snap)};
+plan2.put(to_bytes("stock:widget"), new_stock);
+if (!db.apply_batch({}, std::move(plan2))) {
     // another writer changed stock:widget since our snapshot — retry
 }
 
@@ -163,7 +163,7 @@ snap2.get(to_bytes("price:widget"), price_out);
 WritePlan order{std::move(snap2)};
 order.ensure_unchanged(to_bytes("price:widget"));  // reject if price changed
 order.put(to_bytes("order:99"), order_total);
-if (!db.apply_batch_if({}, std::move(order))) {
+if (!db.apply_batch({}, std::move(order))) {
     // price changed since snapshot — re-read price and recompute
 }
 
@@ -242,21 +242,16 @@ public:
 
     [[nodiscard]] auto contains_key(BytesView key) const -> bool;
 
-    // Atomically applies all operations in batch. Consumes batch (move-only).
-    void apply_batch(const WriteOptions& opts, Batch batch);
+    // Atomically applies all operations in plan. When the plan has a snapshot
+    // or explicit guards, returns false on conflict. A guardless, snapshot-less
+    // plan always returns true (no conflict possible).
+    // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
+    [[nodiscard]] auto apply_batch(WriteOptions opts,
+                                   WritePlan plan) -> bool;
 
     // Returns a frozen, move-only, read-only view of the DB at this instant.
     // Holds open referenced data files until destroyed — vacuum deferred automatically.
     [[nodiscard]] auto snapshot() const -> Snapshot;
-
-    // Applies plan atomically iff every explicit guard holds and no write key
-    // was modified since the plan's snapshot (implicit W-W check). The implicit
-    // check means ensure_unchanged is only needed for keys you read but don't
-    // write. Returns true if committed (including when the plan is empty — no-op).
-    // Returns false on conflict.
-    // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
-    [[nodiscard]] auto apply_batch_if(WriteOptions opts,
-                                      WritePlan plan) -> bool;
 
     [[nodiscard]] auto iter_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
@@ -302,13 +297,14 @@ public:
         -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 };
 
-// Conditional write plan for apply_batch_if.
+// Write plan for apply_batch. Groups multiple operations into a single atomic write.
 // Construct with WritePlan(snap) to enable ensure_unchanged / ensure_range_unchanged guards;
 // those methods throw std::logic_error if called on a snapshot-less WritePlan().
-// When a snapshot is present, apply_batch_if automatically rejects the plan if any
+// When a snapshot is present, apply_batch automatically rejects the plan if any
 // write key (put or del) changed since the snapshot — no explicit guard needed on
 // keys in the write set. Use ensure_unchanged for read-only dependencies: keys whose
 // value influenced the plan but that the plan does not modify.
+// A guardless, snapshot-less WritePlan always commits successfully (no conflict possible).
 class WritePlan {
 public:
     WritePlan();                         // snapshot-less: only ensure_present/ensure_absent available
@@ -326,21 +322,13 @@ public:
     [[nodiscard]] auto has_snapshot() const noexcept -> bool;
 };
 
-// Unconditional batch — groups multiple operations into a single atomic write.
-class Batch {
-public:
-    void put(BytesView key, BytesView value);
-    void del(BytesView key);
-    void del_range(BytesView from, BytesView to);  // range delete: [from, to)
-};
-
 // Thrown by write operations when the engine is in a degraded state.
 class DbDegraded : public std::runtime_error { /* ... */ };
 
 } // namespace bytecask
 ```
 
-Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately). Key-not-found is signalled by `get` returning `false`; `apply_batch_if` returns `false` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors.
+Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately). Key-not-found is signalled by `get` returning `false`; `apply_batch` returns `false` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors.
 
 
 ## Architecture
@@ -364,7 +352,7 @@ ByteCaskDB is designed around four core tenets, in priority order:
   └── Sealed Files   read-only .data + .hint files      (older segments)
 ```
 
-**Write path**: all writes route through a single coordinator (`apply_batch_if`). Concurrent sync writers are batched via group commit — the first writer becomes leader, drains the queue, and executes all pending writes under one lock hold with a single `fdatasync`. Each write appends CRC-32-verified, length-prefixed records to the active data file, then applies pure in-memory state transitions via `TransientEngineState`. Durability before visibility: `state_.store()` happens after `fdatasync`.
+**Write path**: all writes route through a single coordinator (`apply_batch`). Concurrent sync writers are batched via group commit — the first writer becomes leader, drains the queue, and executes all pending writes under one lock hold with a single `fdatasync`. Each write appends CRC-32-verified, length-prefixed records to the active data file, then applies pure in-memory state transitions via `TransientEngineState`. Durability before visibility: `state_.store()` happens after `fdatasync`.
 
 **Read path**: readers obtain an immutable snapshot of the engine state, look up the key in the radix tree to find its file and offset, then read the value directly. Reads are lock-free and scale linearly across cores.
 

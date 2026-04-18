@@ -37,7 +37,7 @@ ByteCaskDB follows a **single-writer / multiple-reader (SWMR)** model:
 - Multiple readers may operate concurrently, isolated from writes by a persistent snapshot of the key directory loaded via `state_.load()`.
 - `ReadOptions::staleness_tolerance` lets readers trade freshness for throughput: a non-zero tolerance allows reading from a snapshot that is at most that many milliseconds old (bounded staleness). The default (0) provides read-your-writes session consistency.
 - When `sync` is requested, `fdatasync` completes before the new state becomes visible to readers (durability before visibility).
-- MVCC snapshot isolation is provided via `snapshot()` + `apply_batch_if()`.
+- MVCC snapshot isolation is provided via `snapshot()` + `apply_batch(WritePlan)`.
 
 ### Data File Lifecycle
 
@@ -194,41 +194,46 @@ struct VacuumOptions {
 
 ---
 
-## Batch
+## WritePlan
+
+`WritePlan` is the unified type for all write operations submitted to `apply_batch`. It carries both **writes** (`put`, `del`, `del_range`) and optional **guards** (`ensure_present`, `ensure_absent`, `ensure_unchanged`, `ensure_range_unchanged`).
 
 ```cpp
-struct BatchInsert {
-    Bytes key;
-    Bytes value;
-};
-
-struct BatchRemove {
-    Bytes key;
-};
-
-using BatchOperation = std::variant<BatchInsert, BatchRemove>;
-
-class Batch {
+class WritePlan {
 public:
-    Batch() = default;
-    Batch(const Batch&)            = delete;
-    Batch& operator=(const Batch&) = delete;
-    Batch(Batch&&) noexcept        = default;
-    Batch& operator=(Batch&&) noexcept = default;
+    WritePlan();                         // snapshot-less: only ensure_present/ensure_absent available
+    explicit WritePlan(Snapshot snap);   // snapshot embedded; all guards available
+
+    WritePlan(const WritePlan&)            = delete;
+    WritePlan& operator=(const WritePlan&) = delete;
+    WritePlan(WritePlan&&) noexcept        = default;
+    WritePlan& operator=(WritePlan&&) noexcept = default;
 
     void put(BytesView key, BytesView value);
     void del(BytesView key);
+    void del_range(BytesView from, BytesView to);  // range delete: [from, to)
 
-    [[nodiscard]] bool empty() const noexcept;
-    [[nodiscard]] std::size_t size() const noexcept;
+    void ensure_present(BytesView key);                         // guard: key must exist
+    void ensure_absent(BytesView key);                          // guard: key must be absent
+    void ensure_unchanged(BytesView key);                       // guard: key unchanged since snapshot
+    void ensure_range_unchanged(BytesView from, BytesView to);  // guard: no key change in [from, to)
+
+    [[nodiscard]] auto has_snapshot() const noexcept -> bool;
+    [[nodiscard]] auto empty() const noexcept -> bool;
 
 private:
-    std::vector<BatchOperation> operations_;
+    // Per-key merged representation.
+    struct KeyAction { ... };
+    std::map<Bytes, KeyAction> actions_;
+
+    struct RangeGuard { Bytes from; Bytes to; };
+    std::vector<RangeGuard> range_guards_;
+
     friend class DB;
 };
 ```
 
-**Rationale:** `std::variant` over an inheritance hierarchy keeps `BatchOperation` a value type (no heap allocation per item, trivially movable). `Batch` is move-only and single-use; `DB::apply_batch` consumes it by move. No size limit is imposed by the engine.
+**Rationale:** `WritePlan` unifies unconditional writes and conditional (guarded) writes into a single type consumed by `apply_batch`. When constructed without a snapshot, it behaves as a simple unconditional batch. When constructed with a snapshot, guards and implicit W-W checks are available. `WritePlan` is move-only and single-use; `DB::apply_batch` consumes it by move. No size limit is imposed by the engine.
 
 ---
 
@@ -316,11 +321,13 @@ public:
 
     // ── Batch ─────────────────────────────────────────────────────────────
 
-    // Atomically applies all operations in batch, wrapped in BulkBegin/BulkEnd.
-    // batch is consumed (move-only). No-op if batch.empty().
+    // Atomically applies all operations in plan, wrapped in BulkBegin/BulkEnd.
+    // plan is consumed (move-only). No-op if plan is empty and has no guards.
+    // When the plan carries a snapshot, guards and implicit W-W checks are
+    // evaluated; returns false on conflict. Returns true if committed.
     // opts.sync controls whether a single fdatasync is issued at the end.
     // Throws std::system_error on I/O failure or DbDegraded if degraded.
-    void apply_batch(const WriteOptions& opts, Batch batch);
+    [[nodiscard]] auto apply_batch(const WriteOptions& opts, WritePlan plan) -> bool;
 
     // ── Range iteration ───────────────────────────────────────────────────
 
@@ -375,11 +382,11 @@ bool found = db.get(kRead, as_bytes("user:1"), out);
 bool existed = db.del(kSync, as_bytes("user:1"));  // false if key was absent
 
 // Atomic batch.
-Batch batch;
-batch.put(as_bytes("user:2"), as_bytes("bob"));
-batch.put(as_bytes("user:3"), as_bytes("carol"));
-batch.del(as_bytes("user:1"));
-db.apply_batch(kSync, std::move(batch));
+WritePlan plan;
+plan.put(as_bytes("user:2"), as_bytes("bob"));
+plan.put(as_bytes("user:3"), as_bytes("carol"));
+plan.del(as_bytes("user:1"));
+db.apply_batch(kSync, std::move(plan));
 
 // Range scan.
 for (auto& [key, value] : db.iter_from(kRead, as_bytes("user:"))) {
@@ -408,8 +415,8 @@ while (!stop_requested) {
 |---|----------|
 | D1 | **Error handling**: Throw (`std::system_error` for I/O, `std::runtime_error` for corruption). These are panic-level events the caller cannot meaningfully recover from inline. `get` uses an output parameter + `bool` return instead of `std::optional` so the caller can reuse an existing buffer across repeated calls. No `std::expected` at this boundary. |
 | D2 | **Config**: `Options` (open-time), `WriteOptions` (per-write durability), `ReadOptions` (per-read freshness and CRC), `VacuumOptions` (fragmentation thresholds). Modelled after LevelDB / RocksDB patterns. |
-| D3 | **Batch ownership**: `Batch` is move-only (copy constructor and copy assignment deleted). Single-use by design; `apply_batch` consumes it. |
-| D4 | **Batch size limit**: None — the caller is responsible. |
+| D3 | **WritePlan ownership**: `WritePlan` is move-only (copy constructor and copy assignment deleted). Single-use by design; `apply_batch` consumes it. |
+| D4 | **WritePlan size limit**: None — the caller is responsible. |
 | D5 | **Iterator strategy**: Lazy — `operator*` reads one value from disk on demand via a single `pread`. Early-termination scans pay no I/O cost for unvisited entries. |
 | D6 | **`KeyIterator` source**: In-memory only — walks the radix-tree key directory without opening any data file. |
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |

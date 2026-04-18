@@ -64,11 +64,11 @@ configurations where it does not hold.
 
 ---
 
-## apply_batch_if
+## apply_batch
 
 The single write path. Every mutation — insert, update, delete — goes
-through `apply_batch_if`. `put`, `del`, and `apply_batch` are
-convenience wrappers that call it with no guards.
+through `apply_batch`. `put` and `del` are convenience wrappers that
+call it with a guardless `WritePlan`.
 
 When called with guards, it is a conditional atomic batch write: apply
 these writes, but only if the caller-specified conditions still hold
@@ -94,8 +94,8 @@ Specifically:
 - **Across calls**: if `put(k, v1)` returns, then `put(k, v2)`
   returns, a subsequent `get(k)` must return `v2`. If `put(k, v1)`
   returns, then `del(k)` returns, `get(k)` must return false.
-- **Within a batch**: operations in a single `Batch` or `WritePlan`
-  are applied in insertion order. If a batch contains `put(k, v1)`
+- **Within a batch**: operations in a single `WritePlan` are applied
+  in insertion order. If a batch contains `put(k, v1)`
   followed by `del(k)`, `get(k)` must return false. If it contains
   `del(k)` followed by `put(k, v2)`, `get(k)` must return `v2`.
 - **Across files**: when a key exists in multiple data files (e.g.
@@ -119,7 +119,7 @@ accepted trade-off chosen by the caller.
 ### Conflict Safety
 
 If any precondition guard, range guard, or implicit W-W check fails,
-`apply_batch_if` must return `false`. The engine must not attempt any
+`apply_batch` must return `false`. The engine must not attempt any
 writes, perform I/O, or change state. The caller's snapshot must not
 be invalidated.
 
@@ -205,7 +205,7 @@ on disk but not reflected in the published counter.
 **Must be true, always:**
 
 - **Monotonicity for new entries.** New entries appended to the active
-  file during `apply_batch_if` must always have a higher sequence
+  file during `apply_batch` must always have a higher sequence
   number than any previous new entry in the same file session. The
   sequence must never go backwards or repeat for new writes.
   `vacuum_absorb` appends old entries with their original LSNs —
@@ -245,7 +245,7 @@ on disk but not reflected in the published counter.
   LSN that gets reused by a data entry in a subsequent write.
 
 - **No caller obligation for LSN safety.** The engine must guarantee
-  that after any failure, a subsequent `apply_batch_if` call with any
+  that after any failure, a subsequent `apply_batch` call with any
   valid `WritePlan` will not produce LSN reuse. The caller must be
   free to retry with any plan, modify the plan, or abandon it
   entirely.
@@ -301,7 +301,7 @@ be deferred until no external references remain.
 
 ### Consistency
 
-Same as `apply_batch_if`: in-memory state must be recovery-equivalent.
+Same as `apply_batch`: in-memory state must be recovery-equivalent.
 If `vacuum_commit` would publish a state where a key references a file
 that does not contain the expected entry, the engine must degrade
 itself.

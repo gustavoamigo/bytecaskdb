@@ -469,12 +469,12 @@ void bytecask_write_plan_free(bytecask_write_plan_t *plan) {
 }
 
 // ---------------------------------------------------------------------------
-// apply_batch_if
+// apply_batch
 // ---------------------------------------------------------------------------
 
-int bytecask_apply_batch_if(bytecask_db_t *db,
-                            bytecask_write_plan_t *plan,
-                            int sync) {
+int bytecask_apply_batch(bytecask_db_t *db,
+                         bytecask_write_plan_t *plan,
+                         int sync) {
   clear_errmsg();
   if (!db || !plan) {
     set_errmsg(!db ? "null db handle" : "null plan handle");
@@ -484,7 +484,7 @@ int bytecask_apply_batch_if(bytecask_db_t *db,
   try {
     bytecask::WriteOptions opts;
     opts.sync = (sync != 0);
-    bool committed = db->db.apply_batch_if(opts, std::move(plan->plan));
+    bool committed = db->db.apply_batch(opts, std::move(plan->plan));
     delete plan;
     return committed ? 1 : 0;
   } catch (const std::exception &e) {

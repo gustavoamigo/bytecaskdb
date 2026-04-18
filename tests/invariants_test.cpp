@@ -86,11 +86,11 @@ TEST_CASE("assert_consistent after overwrites", "[invariants]") {
 TEST_CASE("assert_consistent after batch", "[invariants]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
-  bytecask::Batch batch;
-  batch.put(to_bytes("x"), to_bytes("10"));
-  batch.put(to_bytes("y"), to_bytes("20"));
-  batch.put(to_bytes("z"), to_bytes("30"));
-  db.apply_batch({}, std::move(batch));
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("x"), to_bytes("10"));
+  plan.put(to_bytes("y"), to_bytes("20"));
+  plan.put(to_bytes("z"), to_bytes("30"));
+  (void)db.apply_batch({}, std::move(plan));
   assert_consistent(db);
 }
 
@@ -137,10 +137,10 @@ TEST_CASE("assert_delta on successful batch", "[invariants]") {
   auto db = bytecask::DB::open(td.path / "db");
 
   auto before = capture_baseline(db);
-  bytecask::Batch batch;
-  batch.put(to_bytes("a"), to_bytes("1"));
-  batch.put(to_bytes("b"), to_bytes("2"));
-  db.apply_batch({}, std::move(batch));
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("a"), to_bytes("1"));
+  plan.put(to_bytes("b"), to_bytes("2"));
+  (void)db.apply_batch({}, std::move(plan));
 
   // 2 puts + BulkBegin + BulkEnd = 4 LSN slots
   assert_delta(before, db, ExpectedDelta{
@@ -164,10 +164,10 @@ TEST_CASE("assert_delta detects degraded", "[invariants]") {
   // degrades and next_lsn advances past all consumed LSNs (4 = 2 ops + 2 markers).
   {
     bytecask::testing::ScopedFaultInjector fi{2};
-    bytecask::Batch batch;
-    batch.put(to_bytes("a"), to_bytes("v1"));
-    batch.put(to_bytes("b"), to_bytes("v2"));
-    REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(batch)),
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("a"), to_bytes("v1"));
+    plan.put(to_bytes("b"), to_bytes("v2"));
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(plan)),
                       std::system_error);
   }
 

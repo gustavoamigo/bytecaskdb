@@ -608,7 +608,7 @@ def section_cas(cas_results: dict[int, dict]) -> str:
     L.append("# Optimistic Concurrency — CAS Benchmark\n")
     L.append(
         "> Concurrent read-modify-write (increment) on shared stock counters. "
-        "ByteCaskDB uses `WritePlan` + `apply_batch_if` with snapshot-based "
+        "ByteCaskDB uses `WritePlan` + `apply_batch` with snapshot-based "
         "conflict detection; RocksDB uses `OptimisticTransactionDB`. "
         "Each iteration is one successful CAS — retries on conflict are "
         "included in wall-clock time. Both databases are pre-populated "
@@ -706,7 +706,7 @@ def render_report(
     L.append(
         "- **CAS benchmarks:** concurrent read-modify-write on shared stock counters, "
         "pre-populated with 1M background keys. ByteCaskDB uses "
-        "`WritePlan` + `apply_batch_if`; RocksDB uses `OptimisticTransactionDB`."
+        "`WritePlan` + `apply_batch`; RocksDB uses `OptimisticTransactionDB`."
     )
     L.append("")
 

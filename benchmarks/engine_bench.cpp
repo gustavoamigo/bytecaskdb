@@ -254,12 +254,12 @@ struct BcAdapter {
         const auto n = populate_keys->size();
         for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
           auto end = std::min(i + kPopulateBatchSize, n);
-          bytecask::Batch batch;
+          bytecask::WritePlan plan;
           for (std::size_t j = i; j < end; ++j) {
-            batch.put(bc_key((*populate_keys)[j]), bc_val(*populate_val));
+            plan.put(bc_key((*populate_keys)[j]), bc_val(*populate_val));
           }
           wo.sync = (end == n);
-          engine.apply_batch(wo, std::move(batch));
+          (void)engine.apply_batch(wo, std::move(plan));
         }
       }
     }
@@ -311,18 +311,18 @@ struct BcAdapter {
   static void apply_batch(Db &db, const std::vector<std::string> &keys,
                           const std::vector<std::byte> &val, std::size_t start,
                           int count, bool sync) {
-    bytecask::Batch batch;
+    bytecask::WritePlan plan;
     for (int i = 0; i < count; ++i) {
       const auto &k = keys[(start + i) % keys.size()];
       if (i % 10 == 9) {
-        batch.del(bc_key(k));
+        plan.del(bc_key(k));
       } else {
-        batch.put(bc_key(k), bc_val(val));
+        plan.put(bc_key(k), bc_val(val));
       }
     }
     bytecask::WriteOptions wo;
     wo.sync = sync;
-    db.engine.apply_batch(wo, std::move(batch));
+    (void)db.engine.apply_batch(wo, std::move(plan));
   }
 };
 
@@ -357,19 +357,19 @@ struct BcCasAdapter {
       const auto n = background_keys.size();
       for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
         auto end = std::min(i + kPopulateBatchSize, n);
-        bytecask::Batch batch;
+        bytecask::WritePlan plan;
         for (std::size_t j = i; j < end; ++j) {
-          batch.put(bc_key(background_keys[j]), bc_val(background_val));
+          plan.put(bc_key(background_keys[j]), bc_val(background_val));
         }
-        engine.apply_batch(wo, std::move(batch));
+        (void)engine.apply_batch(wo, std::move(plan));
       }
-      bytecask::Batch stock_batch;
+      bytecask::WritePlan stock_plan;
       auto zero = encode_u64(0);
       for (const auto &k : stock_keys) {
-        stock_batch.put(bc_key(k), bc_val(zero));
+        stock_plan.put(bc_key(k), bc_val(zero));
       }
       wo.sync = true;
-      engine.apply_batch(wo, std::move(stock_batch));
+      (void)engine.apply_batch(wo, std::move(stock_plan));
     }
   };
 
@@ -390,7 +390,7 @@ struct BcCasAdapter {
       plan.ensure_unchanged(bc_key(key));
       plan.put(bc_key(key), bc_val(new_val));
 
-      if (db.engine.apply_batch_if(wo, std::move(plan)))
+      if (db.engine.apply_batch(wo, std::move(plan)))
         return attempts;
     }
   }
@@ -1175,12 +1175,12 @@ struct ParRecoverySetup {
     const auto n = keys.size();
     for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
       auto end = std::min(i + kPopulateBatchSize, n);
-      bytecask::Batch batch;
+      bytecask::WritePlan plan;
       for (std::size_t j = i; j < end; ++j) {
-        batch.put(bc_key(keys[j]), bc_val(tiny_val));
+        plan.put(bc_key(keys[j]), bc_val(tiny_val));
       }
       wo.sync = (end == n);
-      db.apply_batch(wo, std::move(batch));
+      (void)db.apply_batch(wo, std::move(plan));
     }
     // db destructs here — seals active file, writes all hint files.
   }
