@@ -59,6 +59,35 @@ struct PyDB {
 };
 
 // ---------------------------------------------------------------------------
+// PySnapshot — wraps move-only Snapshot with use-after-consume guard.
+//
+// The C++ Snapshot is move-only: WritePlan(Snapshot) consumes it.  Without
+// this wrapper, the Python object would silently become a dangling shell
+// after construction of a WritePlan, causing a segfault on the next call.
+// With the wrapper, every method calls check() and raises RuntimeError
+// instead of touching moved-from memory.
+// ---------------------------------------------------------------------------
+
+struct PySnapshot {
+  std::optional<bytecask::Snapshot> snap;
+
+  explicit PySnapshot(bytecask::Snapshot s) : snap{std::move(s)} {}
+
+  void check() const {
+    if (!snap) {
+      throw std::runtime_error("Snapshot already consumed by WritePlan");
+    }
+  }
+
+  auto take() -> bytecask::Snapshot {
+    check();
+    auto s = std::move(*snap);
+    snap.reset();
+    return s;
+  }
+};
+
+// ---------------------------------------------------------------------------
 // PyWritePlan — wraps move-only WritePlan; single-use, consumed by
 // apply_batch.
 // ---------------------------------------------------------------------------
@@ -307,15 +336,17 @@ NB_MODULE(_bytecaskdb, m) {
   // Snapshot
   // -------------------------------------------------------------------------
 
-  nb::class_<bytecask::Snapshot>(m, "Snapshot",
-      "Frozen, read-only view of the database at a point in time.")
+  nb::class_<PySnapshot>(m, "Snapshot",
+      "Frozen, read-only view of the database at a point in time.\n\n"
+      "Raises RuntimeError if used after being consumed by WritePlan.")
       .def(
           "get",
-          [](bytecask::Snapshot &self, nb::bytes key) -> nb::object {
+          [](PySnapshot &self, nb::bytes key) -> nb::object {
+            self.check();
             bytecask::Bytes out;
             auto k = to_view(key);
             nb::gil_scoped_release release;
-            bool found = self.get(k, out);
+            bool found = self.snap->get(k, out);
             nb::gil_scoped_acquire acquire;
             if (!found) return nb::none();
             return to_pybytes(out);
@@ -324,56 +355,65 @@ NB_MODULE(_bytecaskdb, m) {
           "key"_a)
       .def(
           "contains_key",
-          [](bytecask::Snapshot &self, nb::bytes key) -> bool {
-            return self.contains_key(to_view(key));
+          [](PySnapshot &self, nb::bytes key) -> bool {
+            self.check();
+            return self.snap->contains_key(to_view(key));
           },
           "Return True if key exists. No disk I/O.",
           "key"_a)
       .def(
           "iter_from",
-          [](bytecask::Snapshot &self,
+          [](PySnapshot &self,
              nb::bytes from_key) -> PyEntryIterator {
-            auto range = self.iter_from(to_view(from_key));
+            self.check();
+            auto range = self.snap->iter_from(to_view(from_key));
             return PyEntryIterator{std::move(range.begin())};
           },
           "Iterate (key, value) pairs in ascending order from from_key.",
-          "from_key"_a = nb::bytes("", 0))
+          "from_key"_a = nb::bytes("", 0),
+          nb::keep_alive<0, 1>())
       .def(
           "keys_from",
-          [](bytecask::Snapshot &self,
+          [](PySnapshot &self,
              nb::bytes from_key) -> PyKeyIterator {
-            auto range = self.keys_from(to_view(from_key));
+            self.check();
+            auto range = self.snap->keys_from(to_view(from_key));
             return PyKeyIterator{std::move(range.begin())};
           },
           "Iterate keys in ascending order. No disk I/O.",
-          "from_key"_a = nb::bytes("", 0))
+          "from_key"_a = nb::bytes("", 0),
+          nb::keep_alive<0, 1>())
       .def(
           "riter_from",
-          [](bytecask::Snapshot &self,
+          [](PySnapshot &self,
              nb::bytes from_key) -> PyReverseEntryIterator {
-            auto range = self.riter_from(to_view(from_key));
+            self.check();
+            auto range = self.snap->riter_from(to_view(from_key));
             return PyReverseEntryIterator{std::move(range.begin()),
                                           std::move(range.end())};
           },
           "Iterate (key, value) pairs in descending order from from_key.",
-          "from_key"_a = nb::bytes("", 0))
+          "from_key"_a = nb::bytes("", 0),
+          nb::keep_alive<0, 1>())
       .def(
           "rkeys_from",
-          [](bytecask::Snapshot &self,
+          [](PySnapshot &self,
              nb::bytes from_key) -> PyReverseKeyIterator {
-            auto range = self.rkeys_from(to_view(from_key));
+            self.check();
+            auto range = self.snap->rkeys_from(to_view(from_key));
             return PyReverseKeyIterator{std::move(range.begin()),
                                         std::move(range.end())};
           },
           "Iterate keys in descending order. No disk I/O.",
-          "from_key"_a = nb::bytes("", 0))
+          "from_key"_a = nb::bytes("", 0),
+          nb::keep_alive<0, 1>())
       // Context manager support.
       .def("__enter__",
            [](nb::object self) -> nb::object {
              return self;
            })
       .def("__exit__",
-           [](bytecask::Snapshot &, nb::args) {
+           [](PySnapshot &, nb::args) {
              // Snapshot released when Python GC collects it.
              // __exit__ is a no-op — the destructor handles cleanup.
            });
@@ -389,8 +429,8 @@ NB_MODULE(_bytecaskdb, m) {
       "automatic write-write conflict detection.")
       .def(nb::init<>())
       .def("__init__",
-           [](PyWritePlan *self, bytecask::Snapshot *snap) {
-             new (self) PyWritePlan{std::move(*snap)};
+           [](PyWritePlan *self, PySnapshot *snap) {
+             new (self) PyWritePlan{snap->take()};
            },
            "snapshot"_a)
       .def("put", &PyWritePlan::put, "Stage a key-value write.",
@@ -501,7 +541,7 @@ NB_MODULE(_bytecaskdb, m) {
           "plan"_a, "opts"_a = nb::none())
       .def(
           "snapshot",
-          [](PyDB &self) { return self.db.snapshot(); },
+          [](PyDB &self) { return PySnapshot{self.db.snapshot()}; },
           "Return a frozen, read-only view of the database at this instant.")
       .def(
           "iter_from",
@@ -512,7 +552,8 @@ NB_MODULE(_bytecaskdb, m) {
             return PyEntryIterator{std::move(range.begin())};
           },
           "Iterate (key, value) pairs in ascending order from from_key.",
-          "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none())
+          "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
+          nb::keep_alive<0, 1>())
       .def(
           "keys_from",
           [](PyDB &self, nb::bytes from_key,
@@ -522,7 +563,8 @@ NB_MODULE(_bytecaskdb, m) {
             return PyKeyIterator{std::move(range.begin())};
           },
           "Iterate keys in ascending order. No disk I/O.",
-          "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none())
+          "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
+          nb::keep_alive<0, 1>())
       .def(
           "riter_from",
           [](PyDB &self, nb::bytes from_key,
@@ -534,7 +576,8 @@ NB_MODULE(_bytecaskdb, m) {
                                           std::move(range.end())};
           },
           "Iterate (key, value) pairs in descending order from from_key.",
-          "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none())
+          "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
+          nb::keep_alive<0, 1>())
       .def(
           "rkeys_from",
           [](PyDB &self, nb::bytes from_key,
@@ -546,7 +589,8 @@ NB_MODULE(_bytecaskdb, m) {
                                         std::move(range.end())};
           },
           "Iterate keys in descending order. No disk I/O.",
-          "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none())
+          "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
+          nb::keep_alive<0, 1>())
       .def(
           "vacuum",
           [](PyDB &self, std::optional<bytecask::VacuumOptions> opts)

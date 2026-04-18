@@ -100,14 +100,23 @@ class Snapshot:
 
     Holds open any referenced data files until released. Supports use
     as a context manager (``with db.snapshot() as snap:``).
+
+    After being consumed by ``WritePlan(snapshot)``, all methods raise
+    ``RuntimeError("Snapshot already consumed by WritePlan")``.
     """
 
     def get(self, key: bytes) -> bytes | None:
-        """Return the value for *key*, or ``None`` if not found."""
+        """Return the value for *key*, or ``None`` if not found.
+
+        Raises ``RuntimeError`` if the snapshot has been consumed.
+        """
         ...
 
     def contains_key(self, key: bytes) -> bool:
-        """Return ``True`` if *key* exists. Pure in-memory, no disk I/O."""
+        """Return ``True`` if *key* exists. Pure in-memory, no disk I/O.
+
+        Raises ``RuntimeError`` if the snapshot has been consumed.
+        """
         ...
 
     def iter_from(self, from_key: bytes = b"") -> EntryIterator:
