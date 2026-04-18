@@ -27,7 +27,7 @@ These are non-negotiable constraints the plan is built around.
    `docs/transaction_design.md` is **not** implemented yet and is **not**
    exposed. The plugin ships its own `MariaDBTxn` internal to
    `mariadb/`, built directly on the already-public
-   `DB::snapshot()` + `DB::apply_batch_if(WritePlan)` (Layer 1) via the
+   `DB::snapshot()` + `DB::apply_batch(WritePlan)` (Layer 1) via the
    C API (`bytecask_c.h`). The public Transaction in the main project
    is deferred indefinitely — nothing in the plugin should depend on it.
 3. **`del_range` is planned but not yet in the engine.** The plan
@@ -134,7 +134,7 @@ prefix.
 - One catalog key per counter: `0x01|0x01|counter_id`.
 - Counter-ids: `1 = table_id`, `2 = index_id`, `3 = xid` (for XA prepare).
 - Allocation runs as a conflict-safe CAS using
-  `DB::apply_batch_if(snapshot, WritePlan)` against the counter key
+  `DB::apply_batch(snapshot, WritePlan)` against the counter key
   with `ensure_unchanged`. Two concurrent `CREATE TABLE` statements
   are serialised by MDL at the MariaDB layer, so contention is low,
   but the engine stays correct under any interleaving.
@@ -199,7 +199,7 @@ does not break existing rows.
 - `delete_table()` — **temporary**: best-effort point-delete scan
   because `del_range` is not available yet. Implementation:
   1. Iterate `[0x02|tid, 0x02|tid+1)` using `iter_from`, batch up to
-     ~4k keys, apply `Batch` of `del` operations; repeat until empty.
+     ~4k keys, apply `WritePlan` of `del` operations; repeat until empty.
   2. Delete secondary-index key range the same way.
   3. Remove `TableMeta`.
   This is O(rows) in I/O and not atomic — acceptable until Phase G.
@@ -244,7 +244,7 @@ results, including under moderate concurrency.
 **Scope:** add statement-level and session-level atomicity using a
 custom, MariaDB-specific L2 built on top of the Layer 1 C API
 (`bytecask_snapshot`, `bytecask_write_plan_*`,
-`bytecask_apply_batch_if`). See §4 for the full design.
+`bytecask_apply_batch`). See §4 for the full design.
 
 - New files: `mariadb/bytecaskdb_txn.h`, `.cc`.
 - Per-THD instance stored via `thd_get_ha_data` / `thd_set_ha_data`.
@@ -361,7 +361,7 @@ Serializable is a later milestone (same boundary as in
 `transaction_design.md`).
 
 - Document the contract: reads inside a txn are SI; writes are
-  checked at commit via `apply_batch_if`.
+  checked at commit via `apply_batch`.
 - Map `tx_isolation` to behaviour:
   - `READ COMMITTED` — snapshot is re-acquired at each statement
     start (release + re-begin in `external_lock`).
@@ -385,7 +385,7 @@ appropriate. This phase depends on that engine feature.
    plan.del_range({0x02 | tid}, {0x02 | tid+1});
    plan.del_range({0x03 | tid}, {0x03 | tid+1});
    plan.del(catalog_key);
-   db.apply_batch_if({}, std::move(plan));` — single atomic
+   db.apply_batch({}, std::move(plan));` — single atomic
   operation, O(1) disk writes.
 - `truncate()` — same as `delete_table` but preserves the
   catalog entry.
@@ -609,13 +609,13 @@ for (key, val) in buf_:
 for each read-set key:         bytecask_write_plan_ensure_unchanged(..)
 for each read-set range:       bytecask_write_plan_ensure_range_unchanged(..)
 
-rc = bytecask_apply_batch_if(db_, plan, /*sync=*/1)
+rc = bytecask_apply_batch(db_, plan, /*sync=*/1)
 if rc == 1: return 0
 if rc == 0: return HA_ERR_LOCK_DEADLOCK    // conflict
 return HA_ERR_GENERIC                       // I/O error
 ```
 
-`rc == 0` matters — `apply_batch_if` returning false is the engine's
+`rc == 0` matters — `apply_batch` returning false is the engine's
 "you need to retry" signal. Map to `HA_ERR_LOCK_DEADLOCK` so MariaDB's
 statement retry machinery picks it up (matches MyRocks). Do **not**
 treat it as an internal error.
@@ -712,9 +712,9 @@ there before it.
 | MDL (schema locks)          | MariaDB                            | Untouched.                                                          |
 | Table / row locks           | No one (HTON_NO_LOCK_MANAGER)      | `store_lock()` is a no-op.                                          |
 | Txn isolation               | `MariaDBTxn` + Layer 1 SWMR        | SI by construction.                                                 |
-| W-W conflict detection      | `apply_batch_if` implicit W-W      | Each buffered write key is checked against the snapshot sequence.   |
+| W-W conflict detection      | `apply_batch` implicit W-W      | Each buffered write key is checked against the snapshot sequence.   |
 | R-W conflict (Serializable) | `MariaDBTxn` emits `ensure_*`      | Phase F.2.                                                          |
-| Group commit                | Already done by engine             | Per-THD `apply_batch_if` calls participate in the engine's group.   |
+| Group commit                | Already done by engine             | Per-THD `apply_batch` calls participate in the engine's group.   |
 | Catalog contention          | MariaDB MDL + CAS on counter keys  | DDL is rare; CAS contention is essentially zero.                    |
 
 There is **no new mutex** in the plugin beyond MariaDB's own THR_LOCK

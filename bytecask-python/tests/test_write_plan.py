@@ -8,7 +8,7 @@ def test_write_plan_no_conflict(db):
     snap = db.snapshot()
     plan = bc.WritePlan(snap)
     plan.put(b"stock", b"99")
-    assert db.apply_batch_if(plan) is True
+    assert db.apply_batch(plan) is True
     assert db.get(b"stock") == b"99"
 
 
@@ -21,7 +21,7 @@ def test_write_plan_conflict(db):
 
     plan = bc.WritePlan(snap)
     plan.put(b"stock", b"99")
-    assert db.apply_batch_if(plan) is False
+    assert db.apply_batch(plan) is False
     # Original concurrent write survives
     assert db.get(b"stock") == b"50"
 
@@ -30,7 +30,7 @@ def test_ensure_present(db):
     plan = bc.WritePlan()
     plan.ensure_present(b"missing")
     plan.put(b"other", b"val")
-    assert db.apply_batch_if(plan) is False
+    assert db.apply_batch(plan) is False
 
 
 def test_ensure_absent(db):
@@ -38,14 +38,14 @@ def test_ensure_absent(db):
     plan = bc.WritePlan()
     plan.ensure_absent(b"exists")
     plan.put(b"other", b"val")
-    assert db.apply_batch_if(plan) is False
+    assert db.apply_batch(plan) is False
 
 
 def test_ensure_absent_succeeds(db):
     plan = bc.WritePlan()
     plan.ensure_absent(b"missing")
     plan.put(b"new_key", b"val")
-    assert db.apply_batch_if(plan) is True
+    assert db.apply_batch(plan) is True
     assert db.get(b"new_key") == b"val"
 
 
@@ -59,7 +59,7 @@ def test_ensure_unchanged(db):
     plan = bc.WritePlan(snap)
     plan.ensure_unchanged(b"price")
     plan.put(b"order", b"total_10")
-    assert db.apply_batch_if(plan) is False
+    assert db.apply_batch(plan) is False
 
 
 def test_ensure_unchanged_succeeds(db):
@@ -69,7 +69,7 @@ def test_ensure_unchanged_succeeds(db):
     plan = bc.WritePlan(snap)
     plan.ensure_unchanged(b"price")
     plan.put(b"order", b"total_10")
-    assert db.apply_batch_if(plan) is True
+    assert db.apply_batch(plan) is True
     assert db.get(b"order") == b"total_10"
 
 
@@ -84,7 +84,7 @@ def test_ensure_range_unchanged(db):
     plan = bc.WritePlan(snap)
     plan.ensure_range_unchanged(b"item:", b"item:\xff")
     plan.put(b"summary", b"total")
-    assert db.apply_batch_if(plan) is False
+    assert db.apply_batch(plan) is False
 
 
 def test_ensure_unchanged_without_snapshot_raises(db):
@@ -96,10 +96,10 @@ def test_ensure_unchanged_without_snapshot_raises(db):
 def test_consumed_plan_raises(db):
     plan = bc.WritePlan()
     plan.put(b"k", b"v")
-    db.apply_batch_if(plan)
+    db.apply_batch(plan)
 
     with pytest.raises(RuntimeError, match="already consumed"):
-        db.apply_batch_if(plan)
+        db.apply_batch(plan)
 
 
 def test_has_snapshot_property(db):

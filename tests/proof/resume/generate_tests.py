@@ -54,12 +54,12 @@ def gen_degrade_setup(degrade: DegradeShape) -> str:
             "    auto db = bytecask::DB::open(dir);\n"
             '    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));\n'
             "    {\n"
-            "      bytecask::Batch batch;\n"
-            '      batch.put(to_bytes("p0"), to_bytes("new0"));\n'
-            '      batch.put(to_bytes("p1"), to_bytes("new1"));\n'
+            "      bytecask::WritePlan plan;\n"
+            '      plan.put(to_bytes("p0"), to_bytes("new0"));\n'
+            '      plan.put(to_bytes("p1"), to_bytes("new1"));\n'
             "      bytecask::testing::ScopedFaultInjector fi_degrade{3};\n"
             "      REQUIRE_THROWS_AS(\n"
-            "          db.apply_batch({.sync = true}, std::move(batch)),\n"
+            "          db.apply_batch({.sync = true}, std::move(plan)),\n"
             "          std::system_error);\n"
             "    }\n"
             "    REQUIRE(db.is_degraded());"

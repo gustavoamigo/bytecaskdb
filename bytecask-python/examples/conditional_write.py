@@ -22,7 +22,7 @@ def main():
         plan = bc.WritePlan(snap)
         plan.put(b"stock:widget", new_stock)
 
-        if db.apply_batch_if(plan):
+        if db.apply_batch(plan):
             print(f"  Stock decremented: {stock} -> {stock - 1}")
         else:
             print("  Conflict! Another writer changed stock.")
@@ -41,7 +41,7 @@ def main():
         plan1 = bc.WritePlan(snap1)
         plan1.put(b"stock:widget", str(stock1 - 1).encode())
 
-        committed = db.apply_batch_if(plan1)
+        committed = db.apply_batch(plan1)
         print(f"  Plan committed = {committed}")  # False — conflict
         print(f"  Stock unchanged at: {db.get(b'stock:widget')}")  # b'50'
 
@@ -55,7 +55,7 @@ def main():
         plan2.ensure_unchanged(b"price:widget")  # guard: reject if price changed
         plan2.put(b"order:001", order_total)
 
-        if db.apply_batch_if(plan2):
+        if db.apply_batch(plan2):
             print(f"  Order placed: 3 x ${price} = ${price * 3}")
         else:
             print("  Price changed — re-read and retry")
@@ -72,7 +72,7 @@ def main():
             plan = bc.WritePlan(snap)
             plan.put(b"stock:widget", str(current - 1).encode())
 
-            if db.apply_batch_if(plan):
+            if db.apply_batch(plan):
                 print(f"  Attempt {attempt + 1}: success, stock {current} -> {current - 1}")
                 break
             else:

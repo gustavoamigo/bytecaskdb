@@ -132,40 +132,15 @@ class Snapshot:
     def __exit__(self, *args: object) -> None: ...
 
 # ---------------------------------------------------------------------------
-# Batch
-# ---------------------------------------------------------------------------
-
-class Batch:
-    """Unconditional atomic write batch. Consumed by ``DB.apply_batch()``.
-
-    After apply, all further calls raise ``RuntimeError``.
-    """
-
-    def __init__(self) -> None: ...
-
-    def put(self, key: bytes, value: bytes) -> None:
-        """Stage a key-value write."""
-        ...
-
-    def del_(self, key: bytes) -> None:
-        """Stage a key deletion."""
-        ...
-
-    def del_range(self, from_key: bytes, to_key: bytes) -> None:
-        """Stage a range deletion: all keys in ``[from_key, to_key)``."""
-        ...
-
-# ---------------------------------------------------------------------------
 # WritePlan
 # ---------------------------------------------------------------------------
 
 class WritePlan:
-    """Conditional atomic write plan for ``DB.apply_batch_if()``.
+    """Atomic write plan for ``DB.apply_batch()``.
 
-    Construct without arguments for a snapshot-less plan (only
-    ``ensure_present`` / ``ensure_absent`` guards). Construct with a
-    ``Snapshot`` to enable ``ensure_unchanged`` / ``ensure_range_unchanged``
-    and automatic write-write conflict detection.
+    Construct without arguments for a simple unconditional batch.
+    Construct with a ``Snapshot`` to enable ``ensure_unchanged`` /
+    ``ensure_range_unchanged`` and automatic write-write conflict detection.
 
     After apply, all further calls raise ``RuntimeError``.
     """
@@ -269,15 +244,9 @@ class DB:
         ...
 
     def apply_batch(
-        self, batch: Batch, opts: WriteOptions | None = None
-    ) -> None:
-        """Atomically apply all operations in *batch*. Consumes *batch*."""
-        ...
-
-    def apply_batch_if(
         self, plan: WritePlan, opts: WriteOptions | None = None
     ) -> bool:
-        """Atomically apply *plan* if all guards hold. Consumes *plan*.
+        """Atomically apply *plan*. Consumes *plan*.
 
         Return ``True`` if committed, ``False`` on conflict.
         """

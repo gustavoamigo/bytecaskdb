@@ -135,7 +135,7 @@ entirely by `P` and `F`.
 
 ## Failure Classes
 
-Every I/O failure in `apply_batch_if` falls into exactly one structural
+Every I/O failure in `apply_batch` falls into exactly one structural
 class. The class determines the expected delta — not which specific
 operation failed, not what the key bytes were.
 
@@ -255,8 +255,8 @@ appends.
 
 ### Single write path
 
-All mutations — `put`, `del`, `apply_batch`, `apply_batch_if` — route
-through `apply_batch_if` as the single coordinator under `write_mu_`
+All mutations — `put`, `del`, `apply_batch` — route
+through `apply_batch` as the single coordinator under `write_mu_`
 (one writer at a time). The two-phase discipline is enforced: I/O first
 (`DataFile::append`), then pure in-memory state mutations
 (`TransientEngineState::apply_writes`), then publish
@@ -275,7 +275,7 @@ is never modified.
 ### Behavioral contract
 
 [`CONTRACT.md`](../CONTRACT.md) defines the guarantees for
-`apply_batch_if`, `vacuum_compact`, `vacuum_absorb`, and hint files.
+`apply_batch`, `vacuum_compact`, `vacuum_absorb`, and hint files.
 It is the source of truth for both the implementation and the validation
 model.
 
@@ -335,10 +335,10 @@ to callers. Degrading forces `resume()` before further writes are accepted;
 
 ## Proof Test Generator
 
-### apply_batch_if — 492 tests
+### apply_batch — 492 tests
 
-492 generated Catch2 tests (`[prove_apply_batch_if]` tag) cover every valid
-(StateShape, PlanShape, FailureClass) combination for `apply_batch_if`.
+492 generated Catch2 tests (`[prove_apply_batch]` tag) cover every valid
+(StateShape, PlanShape, FailureClass) combination for `apply_batch`.
 The scenario matrix is 5 state shapes × 17 plan shapes × 9 failure
 classes; 4 elimination rules reduce this to 492 valid tests.
 
@@ -352,7 +352,7 @@ classes; 4 elimination rules reduce this to 492 valid tests.
 | `rotation_threshold` | 1 | 1 | Forces file rotation after the plan's writes — required for classes G and H |
 | `deleted_key` | 1 (deleted) | — | k0 created then deleted — tombstone in write history, no live keys at baseline |
 
-Shapes not currently covered: mid-vacuum (vacuum-in-flight during `apply_batch_if`),
+Shapes not currently covered: mid-vacuum (vacuum-in-flight during `apply_batch`),
 post-resume (DB that has been degraded and resumed), and multiple sealed files with
 cross-file tombstone interactions. These are deferred — the current shapes cover the
 five structurally distinct starting conditions for the write path.
@@ -397,7 +397,7 @@ Shapes not currently covered: guards-without-writes (pure read-dependency check)
 delete-only multi-entry batches, plans exceeding the `256 KiB` solo-writer
 threshold, and causality shapes with `del_range` (covered by manual tests in
 `bytecask_test.cpp`). These are deferred — the current shapes exercise every
-code path branch in `apply_batch_if` (single vs multi entry, with and without
+code path branch in `apply_batch` (single vs multi entry, with and without
 guards, conflict vs success, same-key causality).
 
 #### Elimination rules
@@ -414,7 +414,7 @@ Each test follows the same structure:
 2. Capture baseline
 3. Construct `WritePlan` from `PlanShape`
 4. Inject fault per `FaultConfig`
-5. Execute `apply_batch_if`
+5. Execute `apply_batch`
 6. `assert_delta(before, db, expected)` — validates key membership,
    value correctness (causality), LSN advancement, structural consistency,
    and degraded state.
@@ -518,14 +518,14 @@ secondary source and sees only the data the old file guaranteed.
 
 ### Source files
 
-**apply_batch_if module** (root of `tests/proof/`):
+**apply_batch module** (root of `tests/proof/`):
 
 | File | Role |
 |------|------|
 | [`expected_delta.py`](../tests/proof/expected_delta.py) | The reference model: `expected_delta(plan, failure, ...) → Delta` |
 | [`scenario_matrix.py`](../tests/proof/scenario_matrix.py) | State shapes, plan shapes, failure classes, validity filter |
 | [`fault_point_resolver.py`](../tests/proof/fault_point_resolver.py) | Maps (state, plan, failure) → `ScopedFaultInjector` configuration |
-| [`generate_tests.py`](../tests/proof/generate_tests.py) | Generates `prove_apply_batch_if.cpp` from the matrix |
+| [`generate_tests.py`](../tests/proof/generate_tests.py) | Generates `prove_apply_batch.cpp` from the matrix |
 
 **resume module** (`tests/proof/resume/`):
 
@@ -614,8 +614,8 @@ smoke-test the helpers themselves.
 
 ### Test coverage
 
-All eleven failure classes for `apply_batch_if` are covered by the 172
-`[prove_apply_batch_if]` tests. Each class is exercised across all valid
+All eleven failure classes for `apply_batch` are covered by the 172
+`[prove_apply_batch]` tests. Each class is exercised across all valid
 (StateShape, PlanShape) combinations.
 
 All three resume failure classes (R1–R3) plus DOUBLE and CASCADE across
@@ -635,7 +635,7 @@ Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
 
 - `mid-batch append failure rotates file and discards partial batch`
-  (`[fault_inject]`) — tests `apply_batch` (not `apply_batch_if`)
+  (`[fault_inject]`) — tests `apply_batch` with a `WritePlan`
   recovery by reopening the DB and verifying orphaned batch discard.
 - `reads work on a degraded DB` (`[degraded]`) — tests the full read
   API surface (`get`, `contains_key`, `snapshot`, `iter_from`,
@@ -703,10 +703,10 @@ Run: `scripts/run_fuzz.sh fuzz_data_entry 300` (5-minute run).
 tests/
   proof/
     __init__.py                    ← Python package marker
-    generate_tests.py              ← apply_batch_if generator
-    expected_delta.py              ← apply_batch_if reference model
-    fault_point_resolver.py        ← apply_batch_if fault configs
-    scenario_matrix.py             ← apply_batch_if input matrix
+    generate_tests.py              ← apply_batch generator
+    expected_delta.py              ← apply_batch reference model
+    fault_point_resolver.py        ← apply_batch fault configs
+    scenario_matrix.py             ← apply_batch input matrix
     invariants.h                   ← shared assert helpers for all proof suites
     resume/
       __init__.py
@@ -727,7 +727,7 @@ tests/
       fault_point_resolver.py
       generate_tests.py
     generated/
-      prove_apply_batch_if.cpp     ← generated, never hand-edited
+      prove_apply_batch.cpp     ← generated, never hand-edited
       prove_resume.cpp             ← generated, never hand-edited
       prove_vacuum_absorb.cpp      ← generated, never hand-edited
       prove_vacuum_compact.cpp     ← generated, never hand-edited
@@ -860,7 +860,7 @@ and tractable one. What matters is not which specific operation
 failed or what the key bytes were — it is which phase boundary the
 failure crossed, which determines whether the transition was fully
 persisted or not. Eleven classes cover the entire behavioral space of
-`apply_batch_if` under I/O failure.
+`apply_batch` under I/O failure.
 
 The Python generator makes the model explicit, auditable, and
 evolvable. When a new failure class is identified, it is added to the

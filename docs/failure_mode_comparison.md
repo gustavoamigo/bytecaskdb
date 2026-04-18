@@ -271,7 +271,7 @@ single-document correctness contract.
 
 Three properties distinguish CONTRACT.md from what exists elsewhere:
 
-1. **Per-function failure contracts.** Each write function (`apply_batch_if`,
+1. **Per-function failure contracts.** Each write function (`apply_batch`,
    `vacuum_compact`, `vacuum_absorb`, hint files) gets its own section with
    explicit guarantees for atomicity, durability, IO failure, and consistency.
    Other engines scatter equivalent information across header comments, wiki

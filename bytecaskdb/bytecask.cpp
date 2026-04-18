@@ -578,21 +578,21 @@ auto DB::get(const ReadOptions &opts, BytesView key,
 void DB::put(const WriteOptions &opts, BytesView key, BytesView value) {
   WritePlan plan;
   plan.put(key, value);
-  (void)apply_batch_if(opts, std::move(plan));
+  (void)apply_batch(opts, std::move(plan));
 }
 
 auto DB::del(const WriteOptions &opts, BytesView key) -> bool {
   WritePlan plan;
   plan.ensure_present(key);
   plan.del(key);
-  return apply_batch_if(opts, std::move(plan));
+  return apply_batch(opts, std::move(plan));
 }
 
 void DB::del_range(const WriteOptions &opts, BytesView from, BytesView to) {
   if (Key{from} >= Key{to}) return;
   WritePlan plan;
   plan.del_range(from, to);
-  (void)apply_batch_if(opts, std::move(plan));
+  (void)apply_batch(opts, std::move(plan));
 }
 
 auto DB::contains_key(BytesView key) const -> bool {
@@ -600,31 +600,9 @@ auto DB::contains_key(BytesView key) const -> bool {
   return s->key_dir.contains(key);
 }
 
-void DB::apply_batch(const WriteOptions &opts, Batch batch) {
-  if (batch.empty()) return;
-  WritePlan plan;
-  for (auto &op : batch.operations_) {
-    std::visit(
-        [&](auto &o) {
-          using T = std::decay_t<decltype(o)>;
-          if constexpr (std::is_same_v<T, BatchInsert>) {
-            plan.put(std::span<const std::byte>{o.key},
-                     std::span<const std::byte>{o.value});
-          } else if constexpr (std::is_same_v<T, BatchRemove>) {
-            plan.del(std::span<const std::byte>{o.key});
-          } else if constexpr (std::is_same_v<T, BatchRangeDel>) {
-            plan.del_range(std::span<const std::byte>{o.from},
-                           std::span<const std::byte>{o.to});
-          }
-        },
-        op);
-  }
-  (void)apply_batch_if(opts, std::move(plan));
-}
-
 #pragma endregion
 
-#pragma region Snapshot and apply_batch_if
+#pragma region Snapshot and apply_batch
 
 auto DB::snapshot() const -> Snapshot {
   ReadOptions opts{};
@@ -634,7 +612,7 @@ auto DB::snapshot() const -> Snapshot {
 // The single write path. Routes to either write_group_ (default) or
 // solo_writer_ depending on plan characteristics. put/del/apply_batch are
 // thin wrappers that construct a WritePlan and delegate here.
-auto DB::apply_batch_if(WriteOptions opts,
+auto DB::apply_batch(WriteOptions opts,
                         WritePlan plan) -> bool {
   if (is_degraded()) throw DbDegraded{degraded_reason_};
   if (plan.empty()) return true;
