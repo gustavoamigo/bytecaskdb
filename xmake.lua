@@ -210,17 +210,16 @@ target("bytecaskdb_python")
     -- Resolve Python C API symbols at module load time (provided by the host
     -- interpreter), not at link time -- this is how nanobind and pybind11
     -- build extension modules.
-    --   - Linux: shared objects allow undefined symbols by default; we still
-    --     want --no-undefined to catch any non-Python symbols missed.
-    --     The Python C API itself is intentionally left unresolved.
+    --   - Linux: shared objects allow undefined symbols by default. Do NOT
+    --     pass `-Wl,--no-undefined` here: the Python C API symbols
+    --     (PyBytes_*, _Py_Dealloc, ...) are intentionally unresolved and
+    --     bound by the dynamic loader when the host interpreter loads the
+    --     module.
     --   - macOS: pass `-undefined dynamic_lookup` so the linker tolerates
     --     unresolved Py* symbols; dyld binds them when Python loads the
     --     module. Linking against a framework Python's libpython is
     --     unreliable across runners (the lib dir may not expose a linkable
     --     dylib) and ties the wheel to a specific libpython location.
-    if is_host("linux") then
-        add_shflags("-Wl,--no-undefined", {force = true})
-    end
     if is_host("macosx") then
         add_shflags("-undefined", "dynamic_lookup", {force = true})
     end
