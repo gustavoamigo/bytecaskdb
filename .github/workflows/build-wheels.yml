@@ -16,6 +16,8 @@ name: Build Python wheels
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 # Required for GitHub Pages deployment.
@@ -216,6 +218,8 @@ jobs:
   publish:
     needs: [linux, macos-x86_64, macos-arm64]
     runs-on: ubuntu-latest
+    # Only deploy from pushes to main; PR runs build wheels for verification only.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
