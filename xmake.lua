@@ -196,20 +196,6 @@ target("bytecaskdb_python")
         t:set("prefixname", "")  -- no "lib" prefix
         t:set("extension", ".so")
         t:set("targetdir", path.join(os.projectdir(), "bytecask-python", "bytecaskdb"))
-        -- Resolve Python C API symbols at module load time (they are provided
-        -- by the host interpreter), not at link time. This is how nanobind and
-        -- pybind11 build extension modules.
-        --   - Linux: shared objects allow undefined symbols by default.
-        --   - macOS: pass `-undefined dynamic_lookup` so the linker tolerates
-        --     unresolved Py* symbols; dyld binds them when Python loads us.
-        --     Linking against a framework Python's libpython is unreliable
-        --     across runners (the lib dir may not expose a linkable dylib),
-        --     and is also discouraged because it ties the wheel to a specific
-        --     libpython location.
-        print("[bytecaskdb_python] os.host() = " .. os.host())
-        if os.host() == "macosx" then
-            t:add("ldflags", "-undefined", "dynamic_lookup", {force = true})
-        end
     end)
     -- Suppress warnings from nanobind headers (third-party code).
     add_cxxflags("-Wno-old-style-cast", "-Wno-extra-semi-stmt", "-Wno-shadow",
@@ -221,8 +207,22 @@ target("bytecaskdb_python")
                  "-Wno-gnu-anonymous-struct", "-Wno-unused-function",
                  {force = true})
     add_cxxflags("-fPIC", {force = true})
-    if os.host() == "linux" then
-        add_ldflags("-Wl,--no-undefined", {force = true})
+    -- Resolve Python C API symbols at module load time (provided by the host
+    -- interpreter), not at link time -- this is how nanobind and pybind11
+    -- build extension modules.
+    --   - Linux: shared objects allow undefined symbols by default; we still
+    --     want --no-undefined to catch any non-Python symbols missed.
+    --     The Python C API itself is intentionally left unresolved.
+    --   - macOS: pass `-undefined dynamic_lookup` so the linker tolerates
+    --     unresolved Py* symbols; dyld binds them when Python loads the
+    --     module. Linking against a framework Python's libpython is
+    --     unreliable across runners (the lib dir may not expose a linkable
+    --     dylib) and ties the wheel to a specific libpython location.
+    if is_host("linux") then
+        add_shflags("-Wl,--no-undefined", {force = true})
+    end
+    if is_host("macosx") then
+        add_shflags("-undefined", "dynamic_lookup", {force = true})
     end
     on_config(function(t)
         apply_sanitizer(t)
