@@ -58,6 +58,7 @@ When extending, follow the existing pattern: collect a serial baseline outside t
 
 - Show the user what changed and the test result before offering to commit.
 - Wait for explicit approval before running any commit command.
+- **Never push to the remote without explicit user approval.** Always ask before running `git push`.
 - Use commit messages that describe the actual behavior or architecture change, not generic messages like `update files`.
 
 ## Design philosophy
