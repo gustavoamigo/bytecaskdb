@@ -9,7 +9,8 @@
 #   pip install --index-url https://<user>.github.io/bytecaskdb/python/latest/ bytecaskdb
 #
 # Linux builds run inside the manylinux container with LLVM 20.
-# macOS builds use Homebrew LLVM (latest, currently 20).
+# macOS builds use Homebrew LLVM (latest, currently 20) on Apple Silicon
+# (`macos-14`). GitHub no longer provides x86_64 macOS hosted runners.
 
 name: Build Python wheels
 
@@ -107,60 +108,13 @@ jobs:
           path: dist/final/*.whl
 
   # ---------------------------------------------------------------------------
-  # macOS x86_64
-  # ---------------------------------------------------------------------------
-  macos-x86_64:
-    runs-on: macos-13
-    strategy:
-      matrix:
-        python-version: ["3.12", "3.13"]
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install LLVM and xmake
-        run: |
-          brew install llvm xmake
-
-      - name: Install Python dependencies
-        run: pip install nanobind pytest delocate
-
-      - name: Configure xmake
-        run: |
-          LLVM_PREFIX=$(brew --prefix llvm)
-          xmake f --toolchain=llvm --sdk="$LLVM_PREFIX" -y -v
-
-      - name: Build and test C++ engine
-        run: |
-          xmake build bytecask_tests
-          xmake run bytecask_tests
-
-      - name: Build Python extension
-        run: xmake build bytecaskdb_python
-
-      - name: Run Python tests
-        run: |
-          PYTHONPATH=bytecask-python python3 -m pytest bytecask-python/tests/ -v
-
-      - name: Build wheel
-        run: bash scripts/build_wheel.sh dist/raw
-
-      - name: Repair wheel (delocate)
-        run: |
-          mkdir -p dist/final
-          delocate-wheel -w dist/final dist/raw/*.whl
-
-      - name: Upload wheel
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-macos-x86_64-${{ matrix.python-version }}
-          path: dist/final/*.whl
-
-  # ---------------------------------------------------------------------------
   # macOS arm64 (Apple Silicon)
+  #
+  # GitHub no longer provides x86_64 macOS hosted runners (the `macos-13`
+  # image was retired); jobs requesting the `macos-13` label sit in the queue
+  # forever. Apple Silicon (`macos-14`) is the only supported macOS runner.
+  # If x86_64 wheels become necessary again, build them via cross-compilation
+  # from arm64, or via cibuildwheel using a self-hosted Intel Mac.
   # ---------------------------------------------------------------------------
   macos-arm64:
     runs-on: macos-14
@@ -216,7 +170,7 @@ jobs:
   # Publish wheels to GitHub Pages (PEP 503 simple repository)
   # ---------------------------------------------------------------------------
   publish:
-    needs: [linux, macos-x86_64, macos-arm64]
+    needs: [linux, macos-arm64]
     runs-on: ubuntu-latest
     # Only deploy from pushes to main; PR runs build wheels for verification only.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
