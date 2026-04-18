@@ -1,6 +1,6 @@
 import threading
 import time
-import bytecaskdb as bc
+import bytecaskdb._bytecaskdb as bc
 
 
 def test_concurrent_reads(populated_db):

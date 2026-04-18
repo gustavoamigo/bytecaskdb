@@ -40,6 +40,8 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64
+    env:
+      BYTECASK_MARCH: x86-64-v3
     strategy:
       matrix:
         python: ["cp312-cp312", "cp313-cp313", "cp314-cp314"]

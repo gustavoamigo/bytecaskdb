@@ -13,7 +13,7 @@ Adds:
 
 from __future__ import annotations
 
-import bytecaskdb as _bc
+from bytecaskdb import _bytecaskdb as _bc
 
 __all__ = [
     "DB",
@@ -184,13 +184,22 @@ class _BatchContext:
 
 # ── Transaction context manager (snapshot-backed, raises ConflictError) ──────
 
+# Sentinel for keys deleted within a transaction but not yet committed.
+_TOMBSTONE = object()
+
+
 class _Transaction:
-    """Snapshot-backed write plan.  Reads come from the snapshot; writes are
-    staged and committed atomically.  Guards (ensure_*) can be added.
+    """Snapshot-backed write plan.  Reads see your own staged writes
+    (read-your-own-writes), falling through to the snapshot for keys
+    not touched by the transaction.
 
     Operations are staged in Python lists and replayed into a WritePlan at
     commit time.  This avoids consuming the snapshot (via C++ move) until
     reads are finished.
+
+    Point reads (``get``, ``__getitem__``, ``__contains__``) consult the
+    write buffer first.  Iteration methods (``items``, ``keys``, etc.)
+    read from the snapshot only — they do not reflect uncommitted writes.
 
     Do not construct directly — use ``db.transaction()``.
     """
@@ -203,17 +212,52 @@ class _Transaction:
         self._ops: list[tuple[str, tuple]] = []
         self._guards: list[tuple[str, tuple]] = []
         self._write_opts = write_opts
+        # Write buffer for RYOW point reads. Values are bytes or _TOMBSTONE.
+        # Range deletes are tracked separately.
+        self._pending: dict[bytes, bytes | object] = {}
+        self._range_dels: list[tuple[bytes, bytes]] = []
 
-    # ── Reads from snapshot ───────────────────────────────────────────────────
+    # ── Internal helpers ─────────────────────────────────────────────────────
+
+    def _is_range_deleted(self, key: bytes) -> bool:
+        for lo, hi in self._range_dels:
+            if lo <= key < hi:
+                return True
+        return False
+
+    # ── Reads (RYOW: check write buffer, then snapshot) ──────────────────────
 
     def __getitem__(self, key: bytes) -> bytes:
+        v = self._pending.get(key)
+        if v is _TOMBSTONE:
+            raise KeyError(key)
+        if v is not None:
+            return v  # type: ignore[return-value]
+        if self._is_range_deleted(key):
+            raise KeyError(key)
         return self._snap[key]
 
     def __contains__(self, key: bytes) -> bool:
+        v = self._pending.get(key)
+        if v is _TOMBSTONE:
+            return False
+        if v is not None:
+            return True
+        if self._is_range_deleted(key):
+            return False
         return key in self._snap
 
     def get(self, key: bytes, default: bytes | None = None) -> bytes | None:
+        v = self._pending.get(key)
+        if v is _TOMBSTONE:
+            return default
+        if v is not None:
+            return v  # type: ignore[return-value]
+        if self._is_range_deleted(key):
+            return default
         return self._snap.get(key, default)
+
+    # ── Iteration (snapshot-only; does not reflect uncommitted writes) ────────
 
     def items(self, start: bytes = b""):
         return self._snap.items(start)
@@ -237,18 +281,28 @@ class _Transaction:
 
     def __setitem__(self, key: bytes, value: bytes) -> None:
         self._ops.append(("put", (key, value)))
+        self._pending[key] = value
 
     def __delitem__(self, key: bytes) -> None:
         self._ops.append(("del_", (key,)))
+        self._pending[key] = _TOMBSTONE
 
     def put(self, key: bytes, value: bytes) -> None:
         self._ops.append(("put", (key, value)))
+        self._pending[key] = value
 
     def delete(self, key: bytes) -> None:
         self._ops.append(("del_", (key,)))
+        self._pending[key] = _TOMBSTONE
 
     def delete_range(self, from_key: bytes, to_key: bytes) -> None:
         self._ops.append(("del_range", (from_key, to_key)))
+        self._range_dels.append((from_key, to_key))
+        # Mark individually-known keys in the range as tombstoned so point
+        # reads against already-buffered keys are correct.
+        for k in list(self._pending):
+            if from_key <= k < to_key:
+                self._pending[k] = _TOMBSTONE
 
     # ── Guards ────────────────────────────────────────────────────────────────
 

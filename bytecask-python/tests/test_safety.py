@@ -11,11 +11,10 @@ Covers:
 import gc
 
 import pytest
-import bytecaskdb as bc
+import bytecaskdb._bytecaskdb as bc
 
 import sys
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
-import bytecaskdb_ext as ext
+from bytecaskdb import ext
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -261,8 +260,8 @@ class TestExtTransactionSafety:
             assert txn[b"stock"] == b"10"
             # Stage a write
             txn[b"stock"] = b"9"
-            # Read again — still sees snapshot value
-            assert txn[b"stock"] == b"10"
+            # Read again — sees staged write (RYOW)
+            assert txn[b"stock"] == b"9"
 
         assert db[b"stock"] == b"9"
 
@@ -292,3 +291,65 @@ class TestExtTransactionSafety:
                 # Concurrent write outside the transaction
                 db[b"stock"] = b"0"
                 txn[b"stock"] = str(val - 1).encode()
+
+    def test_ryow_put_then_get(self, tmp_path):
+        """Point read sees a staged put."""
+        db = ext.DB.open(str(tmp_path / "ryow1"))
+        with db.transaction() as txn:
+            txn[b"k"] = b"v1"
+            assert txn[b"k"] == b"v1"
+            assert txn.get(b"k") == b"v1"
+            assert b"k" in txn
+
+    def test_ryow_put_overwrite(self, tmp_path):
+        """Successive puts to the same key — last write wins."""
+        db = ext.DB.open(str(tmp_path / "ryow2"))
+        db[b"k"] = b"old"
+        with db.transaction() as txn:
+            txn[b"k"] = b"v1"
+            txn[b"k"] = b"v2"
+            assert txn[b"k"] == b"v2"
+
+    def test_ryow_delete_then_get(self, tmp_path):
+        """Deleted key raises KeyError / returns default."""
+        db = ext.DB.open(str(tmp_path / "ryow3"))
+        db[b"k"] = b"v"
+        with db.transaction() as txn:
+            txn.delete(b"k")
+            assert txn.get(b"k") is None
+            assert txn.get(b"k", b"fallback") == b"fallback"
+            assert b"k" not in txn
+            with pytest.raises(KeyError):
+                _ = txn[b"k"]
+
+    def test_ryow_delete_then_put(self, tmp_path):
+        """Delete followed by put — key is live again."""
+        db = ext.DB.open(str(tmp_path / "ryow4"))
+        db[b"k"] = b"old"
+        with db.transaction() as txn:
+            txn.delete(b"k")
+            assert b"k" not in txn
+            txn[b"k"] = b"new"
+            assert txn[b"k"] == b"new"
+
+    def test_ryow_delete_range(self, tmp_path):
+        """Range delete hides keys from point reads."""
+        db = ext.DB.open(str(tmp_path / "ryow5"))
+        db[b"a"] = b"1"
+        db[b"b"] = b"2"
+        db[b"c"] = b"3"
+        with db.transaction() as txn:
+            txn.delete_range(b"a", b"c")
+            assert b"a" not in txn
+            assert b"b" not in txn
+            assert txn[b"c"] == b"3"  # c is outside [a, c)
+
+    def test_ryow_put_after_range_delete(self, tmp_path):
+        """Put into a range-deleted region makes the key visible again."""
+        db = ext.DB.open(str(tmp_path / "ryow6"))
+        db[b"b"] = b"old"
+        with db.transaction() as txn:
+            txn.delete_range(b"a", b"d")
+            assert b"b" not in txn
+            txn[b"b"] = b"new"
+            assert txn[b"b"] == b"new"

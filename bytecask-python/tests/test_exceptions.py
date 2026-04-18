@@ -1,5 +1,5 @@
 import pytest
-import bytecaskdb as bc
+import bytecaskdb._bytecaskdb as bc
 
 
 def test_db_degraded_is_runtime_error():

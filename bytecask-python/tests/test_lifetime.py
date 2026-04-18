@@ -1,5 +1,5 @@
 import gc
-import bytecaskdb as bc
+import bytecaskdb._bytecaskdb as bc
 
 
 def test_snapshot_released_after_with(db):

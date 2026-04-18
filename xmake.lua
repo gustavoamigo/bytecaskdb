@@ -99,11 +99,14 @@ if is_mode("release") or is_mode("releasedbg") then
     add_cxflags("-O3", "-fomit-frame-pointer")
 end
 
--- LTO and -march=native applied per-target to avoid polluting dependency package builds.
+-- LTO and target CPU applied per-target to avoid polluting dependency package builds.
+-- Set BYTECASK_MARCH to override (e.g. "x86-64-v3" for portable wheels).
+-- Defaults to "native" for local development.
+local march = os.getenv("BYTECASK_MARCH") or "native"
 local function add_release_opts(t)
     if is_mode("release") or is_mode("releasedbg") then
         t:set("policy", "build.optimization.lto", true)
-        t:add("cxflags", "-march=native", {force = true})
+        t:add("cxflags", "-march=" .. march, {force = true})
     end
 end
 

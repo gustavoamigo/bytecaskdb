@@ -1,5 +1,5 @@
 import pytest
-import bytecaskdb as bc
+import bytecaskdb._bytecaskdb as bc
 
 
 def test_write_plan_no_conflict(db):

@@ -1,4 +1,4 @@
-import bytecaskdb as bc
+import bytecaskdb._bytecaskdb as bc
 
 
 def test_batch_put(db):

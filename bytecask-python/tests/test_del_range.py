@@ -1,4 +1,4 @@
-import bytecaskdb as bc
+import bytecaskdb._bytecaskdb as bc
 
 
 def test_db_del_range(db):

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Demo of the Pythonic bytecaskdb_ext wrapper covering every feature."""
+"""Demo of the Pythonic bytecaskdb wrapper covering every feature."""
 
 import tempfile
-from bytecaskdb_ext import DB, ConflictError
+from bytecaskdb import DB, ConflictError
 
 
 def main():
