@@ -40,20 +40,19 @@ auto current_sequence(std::chrono::milliseconds timeout = 0ms) const -> uint64_t
 - Monitoring: check replication lag (leader sequence vs follower sequence).
 - Health checks: immediate poll with `timeout=0`.
 
-### 2. `Snapshot::sequence()` and file manifest
+### 2. `Snapshot::files()` — file manifest
 
-`Snapshot` exposes the sequence at which it was taken and the set of data/hint files it references. While the snapshot is held, those files are pinned against vacuum.
+`Snapshot` exposes the set of sealed data/hint files it references. While the snapshot is held, those files are pinned against vacuum. The active file is excluded — it may have partial or unsynced writes and is being appended to.
 
 ```cpp
 class Snapshot {
 public:
-    auto sequence() const -> uint64_t;
     auto files() const -> std::vector<FileInfo>;  // file_id, path, min_sequence, max_sequence
     // ... existing methods ...
 };
 ```
 
-**Use case:** Bootstrap a new follower — ship the snapshot's files, open them on the follower, then start tailing from `snapshot.sequence()`.
+**Use case:** Bootstrap a new follower — ship the snapshot's sealed files, open them on the follower, run recovery to rebuild the key directory, then start tailing from `follower.current_sequence()`.
 
 ### 3. `file_stats` with `min_sequence` / `max_sequence`
 
@@ -63,55 +62,50 @@ Vacuum and file rotation are infrequent events. On each, a secondary index (`vec
 
 **Why this matters:** Vacuum rewrites entries into new files, breaking file-level sequence ordering. Without per-file sequence bounds, `changes_since` would need to scan every file.
 
-### 4. `changes_since(from_sequence, out, max_entries)`
+### 4. `changes_since(snap, from_sequence)` — iterator
 
-Fills `out` with raw entries (sequence, entry_type, key, value) for entries with `sequence > from_sequence`, up to `max_entries`. The caller owns the buffer and reuses it across calls — after the first call sizes up, subsequent calls in the replication loop do zero heap allocations for the vector itself.
+Returns an iterator that yields raw entries (sequence, entry_type, key, value) for all committed entries with `sequence > from_sequence`, **in ascending sequence order**.
 
 Implementation:
 
 1. Filter files where `max_sequence > from_sequence` (using file_stats).
-2. Scan those files sequentially, emitting entries where `sequence > from_sequence`.
-3. **Incomplete batch filtering:** within each file, track `BulkBegin`/`BulkEnd` markers. If a `BulkBegin` is seen without a matching `BulkEnd` before end of file, all entries since that `BulkBegin` are discarded — they belong to an uncommitted `apply_batch` (e.g. leader crashed mid-write). This is the same logic recovery already uses. `BulkBegin`/`BulkEnd` markers themselves are stripped from the output — the follower's `ingest` does not need them.
-4. Stop after `max_entries` entries.
+2. Open a cursor per qualifying **hint file**. Hint files contain the entry metadata (sequence, entry_type, key, value_size, file_offset) — no data file reads needed for the scan itself. Within each hint file, skip entries with `sequence <= from_sequence`.
+3. **Merge by sequence:** maintain a min-heap over hint file cursors, yielding the entry with the lowest sequence at each step. This produces a globally ordered stream even when vacuum has rewritten entries into new files in key order rather than sequence order. This is the same fan-in merge pattern that recovery already uses.
+4. **Lazy value fetch:** the actual value bytes are read from the data file via `pread` only when the caller consumes the entry. Deletes and range deletes require no data file read at all.
+5. **Incomplete batch filtering:** within each file, track `BulkBegin`/`BulkEnd` markers. If a `BulkBegin` is seen without a matching `BulkEnd` before end of file, all entries since that `BulkBegin` are discarded — they belong to an uncommitted `apply_batch`. `BulkBegin`/`BulkEnd` markers themselves are stripped from the output.
 
-The scan is performed against an internal snapshot so it sees a consistent view and terminates — it does not tail indefinitely.
+The iterator holds a reference to the `Snapshot`, which pins all data files alive for the duration of the scan — vacuum cannot reclaim them mid-iteration.
 
 ```cpp
-void changes_since(uint64_t from_sequence,
-                   std::vector<RawEntry>& out,
-                   std::size_t max_entries = 1024) const;
+auto changes_since(const Snapshot& snap, uint64_t from_sequence) const -> ChangeIterator;
 ```
 
-Entries include puts, deletes, and range deletes — the full committed changelog. Incomplete batches are excluded. No information is lost to tombstone removal because the data files are the source, not the key directory.
+When the iterator is exhausted, all committed entries up to the snapshot's sequence have been delivered in order.
 
-**Note on ordering:** entries are returned in file-scan order, not sequence order. This is safe because the follower uses two-phase ingest (see below): entries are applied to a working copy with sequence-wins resolution, and state is only published to readers once all entries up to a target sequence have been applied.
+Because entries are sequence-ordered, every prefix of the stream is a valid state. The follower can `ingest()` at any point — not just at iterator exhaustion — and the result is always a consistent, sequence-ordered prefix of the leader's history.
 
-### 5. `ingest(entries)`, `ingest_commit()`, and `current_sequence()` on the follower
+**Failure handling:** on failure mid-iteration, restart Phase 2 with a fresh snapshot and iterator from `follower.current_sequence()`. Since entries are in sequence order, the follower's recovered state after a crash is a valid prefix — `current_sequence()` is trustworthy.
 
-Ingestion on the follower is two-phase:
+### 5. `ingest(entries)` and `current_sequence()` on the follower
 
-**`ingest(entries)`** applies raw entries to a working copy of the key directory using sequence-wins resolution (higher sequence always wins for the same key). The working copy is **not visible to readers** until `ingest_commit()` is called. This allows entries to arrive in any order without exposing intermediate states.
+**`ingest(entries)`** applies raw entries to the key directory and publishes the updated state to readers immediately. Because `changes_since` delivers entries in ascending sequence order, every `ingest` call produces a valid, consistent prefix of the leader's history — no separate commit step is needed.
 
-**`ingest_commit()`** atomically publishes the working copy as the new `EngineState`, making all ingested changes visible to readers in a single state swap.
-
-**`current_sequence()`** returns the last committed sequence — identical semantics on both leader and follower. On the leader it reflects the latest write; on the follower it reflects the last `ingest_commit()`. External code does not need to know which mode it's talking to. The orchestrator compares `leader.current_sequence()` and `follower.current_sequence()` to measure replication lag.
+**`current_sequence()`** returns the last ingested sequence — identical semantics on both leader and follower. On the leader it reflects the latest write; on the follower it reflects the last `ingest`. External code does not need to know which mode it's talking to. The orchestrator compares `leader.current_sequence()` and `follower.current_sequence()` to measure replication lag.
 
 ```cpp
-void ingest(std::span<const RawEntry> entries);  // applies to working copy
-void ingest_commit();                             // publishes to readers
+void ingest(std::span<const RawEntry> entries);  // applies and publishes
 auto current_sequence() const -> uint64_t;        // last committed sequence
 ```
 
-After `ingest_commit()`, `next_sequence` reflects `max(ingested sequences) + 1` so that a promoted follower assigns sequences without gaps.
+After each `ingest`, `next_sequence` reflects `max(ingested sequences) + 1` so that a promoted follower assigns sequences without gaps.
 
 **Constraints:**
-- `ingest` and `ingest_commit` are only callable in `Mode::Follower`.
-- `ingest` appends to data files and updates the key directory, same as the normal write path, but skips guards and sequence assignment.
-- `ingest_commit()` should only be called when all entries up to a known target sequence have been ingested — the orchestrator owns this decision.
+- `ingest` is only callable in `Mode::Follower`.
+- Appends to data files and updates the key directory, same as the normal write path, but skips guards and sequence assignment.
 
 ### 6. `Mode::Follower`
 
-An engine mode that blocks `put`, `del`, `apply_batch` and allows only `ingest`/`ingest_commit` plus all read operations. The mode can be changed online — no restart required.
+An engine mode that blocks `put`, `del`, `apply_batch` and allows only `ingest` plus all read operations. The mode can be changed online — no restart required.
 
 ```cpp
 enum class Mode { Leader, Follower };
@@ -126,36 +120,34 @@ auto mode() const -> Mode;
 
 ## Replication Flow
 
-### Bootstrap
+### Phase 1 — Bootstrap (new follower only)
 
 ```
 1. Follower calls leader: "give me a snapshot"
-2. Leader takes snapshot → returns sequence + file manifest
-3. Leader ships data files + hint files to follower
-   (snapshot pins files against vacuum during transfer)
+2. Leader takes snapshot → returns file manifest
+3. Leader ships sealed data files + hint files to follower
+   (snapshot pins files against vacuum during transfer;
+    active file excluded — only sealed files are shipped)
 4. Follower opens ByteCaskDB with Mode::Follower over received files
 5. Recovery rebuilds key directory from hint files
-6. Follower records bootstrap_seq = snapshot.sequence()
+6. Proceed to Phase 2
 ```
 
-### Steady-State Replication Loop
+### Phase 2 — Replicate (loop forever, restart on any failure)
+
+Because `changes_since` delivers entries in sequence order, every prefix of the stream is a valid state. After a crash, `follower.current_sequence()` reflects a consistent prefix — it is trustworthy and the orchestrator does not need to persist its own `from_seq`.
 
 ```
-std::vector<RawEntry> buf;          // allocated once, reused forever
-my_seq = bootstrap_seq
 loop:
     target_seq = leader.current_sequence(timeout=30s)
-    while my_seq < target_seq:
-        leader.changes_since(my_seq, buf, 4096)
-        if buf.empty(): break
-        follower.ingest(buf)           // applies to working copy, NOT visible to readers
-        my_seq = max sequence in buf
-    follower.commit_state()            // atomic state swap — readers see all changes at once
+    snap = leader.snapshot()
+    it = leader.changes_since(snap, follower.current_sequence())
+    for entry in it:
+        follower.ingest(entry)
+    // on failure at any point: loop restarts from follower.current_sequence()
 ```
 
-Under high write load, `current_sequence` returns immediately and `changes_since` naturally batches entries per round trip. Under low load, the long-poll avoids busy-waiting. When the follower is far behind, the inner loop drains the backlog in bounded chunks without unbounded memory growth.
-
-Entries arrive in file-scan order, not sequence order — this is safe because `ingest` uses sequence-wins resolution and nothing is visible until `commit_state()` at the target sequence. At that point, every entry up to `target_seq` has been applied.
+Under high write load, `current_sequence` returns immediately and the iterator yields many entries per iteration. Under low load, the long-poll avoids busy-waiting.
 
 ### Follower Promotion
 
