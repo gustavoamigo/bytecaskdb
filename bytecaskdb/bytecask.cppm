@@ -732,6 +732,11 @@ private:
   // Declared last so it destructs first, joining the background thread before
   // any other member is destroyed.
   mutable BackgroundWorker worker_;
+
+#ifdef BYTECASK_TESTING
+public:
+  auto& test_write_group() { return write_group_; }
+#endif
 };
 
 // ---------------------------------------------------------------------------

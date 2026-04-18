@@ -10,11 +10,13 @@
 #endif
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <random>
 #include <ranges>
 #include <span>
@@ -3101,6 +3103,140 @@ TEST_CASE("apply_batch single-op writes no markers", "[apply_batch]") {
   });
 
   CHECK(batch_bytes == put_bytes);
+}
+
+TEST_CASE("apply_batch duplicate key in same plan does not conflict",
+          "[apply_batch]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("a"), to_bytes("t0"));
+  plan.put(to_bytes("a"), to_bytes("t1"));
+  REQUIRE(db.apply_batch({}, std::move(plan)));
+
+  auto result = get_val(db, to_bytes("a"));
+  REQUIRE(result.has_value());
+  CHECK(to_string(*result) == "t1");
+}
+
+TEST_CASE("apply_batch group commit: second slot conflicts on existing key",
+          "[apply_batch][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = false}, to_bytes("a"), to_bytes("v0"));
+
+  // Two snapshots at the same point — identical state.
+  auto snapA = db.snapshot();
+  auto snapB = db.snapshot();
+
+  bytecask::WritePlan planA{std::move(snapA)};
+  planA.put(to_bytes("a"), to_bytes("fromA"));
+
+  bytecask::WritePlan planB{std::move(snapB)};
+  planB.put(to_bytes("a"), to_bytes("fromB"));
+
+  // Sync point: force both slots into the same group commit batch.
+  std::mutex mu;
+  std::condition_variable cv;
+  bool leader_ready = false;
+
+  db.test_write_group().on_leader_start_ = [&] {
+    {
+      std::unique_lock<std::mutex> lk{mu};
+      leader_ready = true;
+      cv.notify_all();
+    }
+    // Spin until thread B's slot is also in the queue (2 total).
+    db.test_write_group().wait_for_queue_size(2);
+  };
+
+  bool resultA = false;
+  bool resultB = false;
+
+  // Thread A becomes leader, blocks in hook until thread B enqueues.
+  std::thread tA([&] {
+    resultA = db.apply_batch({.sync = false}, std::move(planA));
+  });
+
+  // Thread B waits for leader, then enqueues via apply_batch.
+  std::thread tB([&] {
+    {
+      std::unique_lock<std::mutex> lk{mu};
+      cv.wait(lk, [&] { return leader_ready; });
+    }
+    resultB = db.apply_batch({.sync = false}, std::move(planB));
+  });
+
+  tA.join();
+  tB.join();
+
+  db.test_write_group().on_leader_start_ = nullptr;
+
+  CHECK(resultA == true);
+  CHECK(resultB == false);
+
+  auto val = get_val(db, to_bytes("a"));
+  REQUIRE(val.has_value());
+  CHECK(to_string(*val) == "fromA");
+}
+
+TEST_CASE("apply_batch group commit: second slot conflicts on new key",
+          "[apply_batch][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // Key "a" does not exist. Both snapshots see absence.
+  auto snapA = db.snapshot();
+  auto snapB = db.snapshot();
+
+  bytecask::WritePlan planA{std::move(snapA)};
+  planA.put(to_bytes("a"), to_bytes("fromA"));
+
+  bytecask::WritePlan planB{std::move(snapB)};
+  planB.put(to_bytes("a"), to_bytes("fromB"));
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool leader_ready = false;
+
+  db.test_write_group().on_leader_start_ = [&] {
+    {
+      std::unique_lock<std::mutex> lk{mu};
+      leader_ready = true;
+      cv.notify_all();
+    }
+    db.test_write_group().wait_for_queue_size(2);
+  };
+
+  bool resultA = false;
+  bool resultB = false;
+
+  std::thread tA([&] {
+    resultA = db.apply_batch({.sync = false}, std::move(planA));
+  });
+
+  std::thread tB([&] {
+    {
+      std::unique_lock<std::mutex> lk{mu};
+      cv.wait(lk, [&] { return leader_ready; });
+    }
+    resultB = db.apply_batch({.sync = false}, std::move(planB));
+  });
+
+  tA.join();
+  tB.join();
+
+  db.test_write_group().on_leader_start_ = nullptr;
+
+  CHECK(resultA == true);
+  CHECK(resultB == false);
+
+  auto val = get_val(db, to_bytes("a"));
+  REQUIRE(val.has_value());
+  CHECK(to_string(*val) == "fromA");
 }
 
 // ---------------------------------------------------------------------------

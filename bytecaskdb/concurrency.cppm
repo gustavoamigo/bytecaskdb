@@ -101,6 +101,24 @@ public:
   WriteGroup(const WriteGroup &) = delete;
   WriteGroup &operator=(const WriteGroup &) = delete;
 
+#ifdef BYTECASK_TESTING
+  // Test-only hook: called after the leader is elected but before
+  // leader_loop() drains the queue. Allows a second thread to enqueue
+  // its slot deterministically into the same batch.
+  std::function<void()> on_leader_start_;
+
+  // Block until the internal queue has at least n entries.
+  void wait_for_queue_size(std::size_t n) {
+    while (true) {
+      {
+        std::lock_guard<std::mutex> lk{queue_mu_};
+        if (queue_.size() >= n) return;
+      }
+      std::this_thread::yield();
+    }
+  }
+#endif
+
   void submit(Slot &slot) {
     std::unique_lock<std::mutex> lk{queue_mu_};
     slot.done = false;
@@ -110,6 +128,9 @@ public:
     if (!leader_active_) {
       leader_active_ = true;
       lk.unlock();
+#ifdef BYTECASK_TESTING
+      if (on_leader_start_) on_leader_start_();
+#endif
       leader_loop();
       lk.lock();
     }
