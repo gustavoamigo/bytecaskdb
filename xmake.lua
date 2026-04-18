@@ -196,18 +196,6 @@ target("bytecaskdb_python")
         t:set("prefixname", "")  -- no "lib" prefix
         t:set("extension", ".so")
         t:set("targetdir", path.join(os.projectdir(), "bytecask-python", "bytecaskdb"))
-        -- On macOS, link against the Python library so Python C API symbols resolve.
-        -- On Linux, shared objects allow undefined symbols by default (resolved at
-        -- load time by the interpreter), so no explicit link is needed.
-        print("[bytecaskdb_python] os.host() = " .. os.host())
-        if os.host() ~= "linux" then
-            local py_libdir = os.iorunv(python, {"-c", "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"}):trim()
-            local py_ldver = os.iorunv(python, {"-c", "import sysconfig; print(sysconfig.get_config_var('LDVERSION'))"}):trim()
-            print("[bytecaskdb_python] Python LIBDIR = " .. py_libdir)
-            print("[bytecaskdb_python] Python LDVERSION = " .. py_ldver)
-            print("[bytecaskdb_python] ldflags: -L" .. py_libdir .. " -lpython" .. py_ldver)
-            t:add("ldflags", "-L" .. py_libdir, "-lpython" .. py_ldver, {force = true})
-        end
     end)
     -- Suppress warnings from nanobind headers (third-party code).
     add_cxxflags("-Wno-old-style-cast", "-Wno-extra-semi-stmt", "-Wno-shadow",
@@ -219,8 +207,21 @@ target("bytecaskdb_python")
                  "-Wno-gnu-anonymous-struct", "-Wno-unused-function",
                  {force = true})
     add_cxxflags("-fPIC", {force = true})
-    if os.host() == "linux" then
-        add_ldflags("-Wl,--no-undefined", {force = true})
+    -- Resolve Python C API symbols at module load time (provided by the host
+    -- interpreter), not at link time -- this is how nanobind and pybind11
+    -- build extension modules.
+    --   - Linux: shared objects allow undefined symbols by default. Do NOT
+    --     pass `-Wl,--no-undefined` here: the Python C API symbols
+    --     (PyBytes_*, _Py_Dealloc, ...) are intentionally unresolved and
+    --     bound by the dynamic loader when the host interpreter loads the
+    --     module.
+    --   - macOS: pass `-undefined dynamic_lookup` so the linker tolerates
+    --     unresolved Py* symbols; dyld binds them when Python loads the
+    --     module. Linking against a framework Python's libpython is
+    --     unreliable across runners (the lib dir may not expose a linkable
+    --     dylib) and ties the wheel to a specific libpython location.
+    if is_host("macosx") then
+        add_shflags("-undefined", "dynamic_lookup", {force = true})
     end
     on_config(function(t)
         apply_sanitizer(t)
