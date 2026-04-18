@@ -56,6 +56,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-192 | Fix macOS wheel build — undefined Python symbols | `bytecaskdb_python` link on macOS failed with undefined `_Py*` symbols. Replaced the unreliable `-L<libdir> -lpython<ver>` link against the framework Python with `-undefined dynamic_lookup`, the canonical approach used by nanobind/pybind11: Python C API symbols are resolved at module load time by the host interpreter, not at link time. Linux path unchanged (shared objects allow undefined symbols by default). |
 | BC-116 | MariaDB Phase C — L2 Transaction + statement atomicity | Per-THD `MariaDBTxn` class with dual-structure write buffer (`ops_` log + `lookup_` map) over snapshot. `hton->commit/rollback/close_connection`. OCC conflict detection via `WritePlan` implicit W-W check → `HA_ERR_LOCK_DEADLOCK`. RYOW via `MergeIterator` (two-pointer merge of snapshot iter + write buffer). BEGIN/COMMIT, BEGIN/ROLLBACK, autocommit, duplicate key detection within txn. 24 smoke tests pass. |
 | BC-114 | Purge table keys on DROP TABLE | `delete_table()` upgraded from paginated point-delete loop to atomic `del_range` + catalog delete in a single `WritePlan`. O(1) disk I/O regardless of table size. |
 | BC-115 | MariaDB Phase 2 — Basic CRUD + PK lookups | `write_row` (with duplicate detection via `ensure_absent`), `update_row` (PK-changed and PK-unchanged), `delete_row`, full table scan (`rnd_init/next/end`), PK index access (`index_read`, `index_next`, `index_first`), `position`/`rnd_pos`. |

@@ -196,17 +196,19 @@ target("bytecaskdb_python")
         t:set("prefixname", "")  -- no "lib" prefix
         t:set("extension", ".so")
         t:set("targetdir", path.join(os.projectdir(), "bytecask-python", "bytecaskdb"))
-        -- On macOS, link against the Python library so Python C API symbols resolve.
-        -- On Linux, shared objects allow undefined symbols by default (resolved at
-        -- load time by the interpreter), so no explicit link is needed.
+        -- Resolve Python C API symbols at module load time (they are provided
+        -- by the host interpreter), not at link time. This is how nanobind and
+        -- pybind11 build extension modules.
+        --   - Linux: shared objects allow undefined symbols by default.
+        --   - macOS: pass `-undefined dynamic_lookup` so the linker tolerates
+        --     unresolved Py* symbols; dyld binds them when Python loads us.
+        --     Linking against a framework Python's libpython is unreliable
+        --     across runners (the lib dir may not expose a linkable dylib),
+        --     and is also discouraged because it ties the wheel to a specific
+        --     libpython location.
         print("[bytecaskdb_python] os.host() = " .. os.host())
-        if os.host() ~= "linux" then
-            local py_libdir = os.iorunv(python, {"-c", "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"}):trim()
-            local py_ldver = os.iorunv(python, {"-c", "import sysconfig; print(sysconfig.get_config_var('LDVERSION'))"}):trim()
-            print("[bytecaskdb_python] Python LIBDIR = " .. py_libdir)
-            print("[bytecaskdb_python] Python LDVERSION = " .. py_ldver)
-            print("[bytecaskdb_python] ldflags: -L" .. py_libdir .. " -lpython" .. py_ldver)
-            t:add("ldflags", "-L" .. py_libdir, "-lpython" .. py_ldver, {force = true})
+        if os.host() == "macosx" then
+            t:add("ldflags", "-undefined", "dynamic_lookup", {force = true})
         end
     end)
     -- Suppress warnings from nanobind headers (third-party code).
