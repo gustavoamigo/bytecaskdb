@@ -353,3 +353,76 @@ class TestExtTransactionSafety:
             assert b"b" not in txn
             txn[b"b"] = b"new"
             assert txn[b"b"] == b"new"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. Reference leak tests — verify context managers release internal state
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestReferenceLeak:
+    """Verify that transaction and batch context managers don't pin
+    internal objects (snapshot, write plan, buffers) after __exit__."""
+
+    def test_transaction_releases_state(self, tmp_path):
+        """Internal references cleared after normal commit."""
+        db = ext.DB.open(str(tmp_path / "leak1"))
+        db[b"k"] = b"v"
+
+        ctx = db.transaction()
+        txn = ctx.__enter__()
+        txn[b"k"] = b"v2"
+        ctx.__exit__(None, None, None)
+
+        # _TransactionContext should have cleared _txn
+        assert ctx._txn is None
+        # _Transaction should have cleared its internals in _commit
+        assert txn._raw_snap is None
+        assert txn._snap is None
+        assert len(txn._ops) == 0
+        assert len(txn._pending) == 0
+        assert len(txn._guards) == 0
+        assert len(txn._range_dels) == 0
+
+    def test_transaction_conflict_releases_state(self, tmp_path):
+        """Internal references cleared even on conflict."""
+        db = ext.DB.open(str(tmp_path / "leak2"))
+        db[b"k"] = b"v"
+
+        ctx = db.transaction()
+        txn = ctx.__enter__()
+        db[b"k"] = b"conflict"
+        txn[b"k"] = b"v2"
+
+        try:
+            ctx.__exit__(None, None, None)
+        except ext.ConflictError:
+            pass
+
+        assert ctx._txn is None
+        assert txn._raw_snap is None
+
+    def test_transaction_exception_releases_state(self, tmp_path):
+        """Internal references cleared when the with-block raises."""
+        db = ext.DB.open(str(tmp_path / "leak3"))
+        db[b"k"] = b"v"
+
+        ctx = db.transaction()
+        txn = ctx.__enter__()
+        txn[b"k"] = b"v2"
+
+        # Simulate an exception in the with-block (commit skipped)
+        ctx.__exit__(ValueError, ValueError("boom"), None)
+
+        assert ctx._txn is None
+
+    def test_batch_releases_state(self, tmp_path):
+        """Internal references cleared after batch exits."""
+        db = ext.DB.open(str(tmp_path / "leak4"))
+
+        ctx = db.batch()
+        batch = ctx.__enter__()
+        batch[b"k"] = b"v"
+        ctx.__exit__(None, None, None)
+
+        assert ctx._batch is None

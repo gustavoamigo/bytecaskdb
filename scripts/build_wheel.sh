@@ -82,6 +82,7 @@ mkdir -p "$DIST_INFO"
 
 # Copy package files
 cp "$PKG_DIR/__init__.py"     "$WHEEL_DIR/bytecaskdb/"
+cp "$PKG_DIR/ext.py"          "$WHEEL_DIR/bytecaskdb/"
 cp "$PKG_DIR/_bytecaskdb.pyi" "$WHEEL_DIR/bytecaskdb/"
 cp "$PKG_DIR/py.typed"        "$WHEEL_DIR/bytecaskdb/"
 cp "$SO_FILE"                 "$WHEEL_DIR/bytecaskdb/"

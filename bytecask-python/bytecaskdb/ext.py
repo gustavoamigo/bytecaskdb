@@ -180,6 +180,7 @@ class _BatchContext:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if exc_type is None and self._batch is not None:
             self._batch._commit()
+        self._batch = None
 
 
 # ── Transaction context manager (snapshot-backed, raises ConflictError) ──────
@@ -328,7 +329,15 @@ class _Transaction:
             getattr(plan, method)(*args)
         for method, args in self._ops:
             getattr(plan, method)(*args)
-        return self._db.apply_batch(plan, self._write_opts)
+        result = self._db.apply_batch(plan, self._write_opts)
+        # Release all references — snapshot is consumed, buffers are stale.
+        self._raw_snap = None  # type: ignore[assignment]
+        self._snap = None  # type: ignore[assignment]
+        self._ops.clear()
+        self._guards.clear()
+        self._pending.clear()
+        self._range_dels.clear()
+        return result
 
 
 class _TransactionContext:
@@ -344,9 +353,11 @@ class _TransactionContext:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if exc_type is None and self._txn is not None:
             if not self._txn._commit():
+                self._txn = None
                 raise ConflictError(
                     "Transaction aborted: concurrent modification detected"
                 )
+        self._txn = None
 
 
 # ── DB ────────────────────────────────────────────────────────────────────────
