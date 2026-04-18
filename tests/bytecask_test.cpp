@@ -671,7 +671,7 @@ TEST_CASE("DB recovery: incomplete batch is discarded",
 // ---------------------------------------------------------------------------
 // Test: recovery produces the same key directory regardless of the order
 // in which data/hint files are iterated. We create two data files manually
-// with crafted names and LSNs so that in one sub-case the tombstone file
+// with crafted names and sequences so that in one sub-case the tombstone file
 // sorts alphabetically first, and in the other it sorts last. Both must
 // yield the same result: "gone" absent, "alive" present.
 // ---------------------------------------------------------------------------
@@ -679,7 +679,7 @@ TEST_CASE("DB recovery: order-independent tombstone",
           "[bytecask][recovery]") {
   // Sub-case A: delete file sorts BEFORE put file (alphabetically).
   // Sub-case B: delete file sorts AFTER put file.
-  // In both, the delete has a higher LSN than the put, so it must win.
+  // In both, the delete has a higher sequence than the put, so it must win.
   auto run = [](std::string_view put_stem, std::string_view del_stem) {
     TempDir td;
     const auto db_path = td.path / "db";
@@ -695,7 +695,7 @@ TEST_CASE("DB recovery: order-independent tombstone",
       df.sync();
     }
 
-    // File with a Delete for "gone" (seq=3) — higher LSN wins.
+    // File with a Delete for "gone" (seq=3) — higher sequence wins.
     {
       bytecask::DataFile df(db_path / std::format("{}.data", del_stem));
       std::ignore = df.append_entry(3, bytecask::EntryType::Delete,
@@ -2278,9 +2278,9 @@ TEST_CASE("vacuum absorb moves entries to active file", "[vacuum]") {
 }
 
 // ---------------------------------------------------------------------------
-// vacuum_absorb_file: LSN preservation across reopen
+// vacuum_absorb_file: sequence preservation across reopen
 // ---------------------------------------------------------------------------
-TEST_CASE("vacuum absorb preserves LSNs across recovery", "[vacuum]") {
+TEST_CASE("vacuum absorb preserves sequences across recovery", "[vacuum]") {
   TempDir td;
   {
     auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
@@ -3622,7 +3622,7 @@ auto make_state(
   auto s = std::make_shared<bytecask::EngineState>();
   s->active_file_id = 1;
   s->next_file_id = 2;
-  s->next_lsn = 100;
+  s->next_seq = 100;
   for (const auto &[k, v] : entries) {
     s->key_dir = s->key_dir.set(to_bytes(k), v);
   }
@@ -3917,7 +3917,7 @@ TEST_CASE("validate_preconditions: no snapshot skips W-W checks",
 // ---------------------------------------------------------------------------
 // These test TransientEngineState::apply_resume in isolation — no DB, no
 // disk I/O. We construct EngineState directly, call .transient(), apply
-// resume entries, and verify key_dir, file_stats, and next_lsn.
+// resume entries, and verify key_dir, file_stats, and next_seq.
 
 namespace {
 
@@ -3959,7 +3959,7 @@ TEST_CASE("apply_resume: put inserts new key into empty key_dir",
   CHECK(kv->value_size == 4);
 }
 
-TEST_CASE("apply_resume: put with higher LSN overwrites existing",
+TEST_CASE("apply_resume: put with higher sequence overwrites existing",
           "[apply_resume]") {
   // file_id=2 holds existing key at seq=10
   auto state = make_state_with_stats(
@@ -3984,7 +3984,7 @@ TEST_CASE("apply_resume: put with higher LSN overwrites existing",
   CHECK(s->file_stats.get(1)->live_bytes == bytecask::entry_size(2, 8));
 }
 
-TEST_CASE("apply_resume: put with lower LSN is ignored",
+TEST_CASE("apply_resume: put with lower sequence is ignored",
           "[apply_resume]") {
   auto state = make_state_with_stats(
       {{"k1", {50, 2, 100, 5}}},
@@ -4005,7 +4005,7 @@ TEST_CASE("apply_resume: put with lower LSN is ignored",
   CHECK(s->file_stats.get(1)->live_bytes == 0);
 }
 
-TEST_CASE("apply_resume: delete removes key when LSN is higher",
+TEST_CASE("apply_resume: delete removes key when sequence is higher",
           "[apply_resume]") {
   auto state = make_state_with_stats(
       {{"k1", {10, 2, 100, 5}}},
@@ -4021,7 +4021,7 @@ TEST_CASE("apply_resume: delete removes key when LSN is higher",
   CHECK(s->file_stats.get(2)->live_bytes == 0);
 }
 
-TEST_CASE("apply_resume: delete is ignored when LSN is lower",
+TEST_CASE("apply_resume: delete is ignored when sequence is lower",
           "[apply_resume]") {
   auto state = make_state_with_stats(
       {{"k1", {50, 2, 100, 5}}},
@@ -4038,10 +4038,10 @@ TEST_CASE("apply_resume: delete is ignored when LSN is lower",
   CHECK(kv->sequence == 50);
 }
 
-TEST_CASE("apply_resume: advances next_lsn past highest seen LSN",
+TEST_CASE("apply_resume: advances next_seq past highest seen sequence",
           "[apply_resume]") {
   auto state = make_state_with_stats({}, {{1, {0, 0}}});
-  state->next_lsn = 10;
+  state->next_seq = 10;
   auto t = state->transient();
 
   std::vector<bytecask::ResumeEntry> entries{
@@ -4049,20 +4049,20 @@ TEST_CASE("apply_resume: advances next_lsn past highest seen LSN",
       make_resume_entry(30, bytecask::EntryType::Put, "b", 100, 4)};
   t.apply_resume(1, entries);
 
-  CHECK(t.next_lsn() == 31);
+  CHECK(t.next_seq() == 31);
 }
 
-TEST_CASE("apply_resume: does not regress next_lsn when entries have lower LSN",
+TEST_CASE("apply_resume: does not regress next_seq when entries have lower sequence",
           "[apply_resume]") {
   auto state = make_state_with_stats({}, {{1, {0, 0}}});
-  state->next_lsn = 100;
+  state->next_seq = 100;
   auto t = state->transient();
 
   std::vector<bytecask::ResumeEntry> entries{
       make_resume_entry(5, bytecask::EntryType::Put, "a", 0, 3)};
   t.apply_resume(1, entries);
 
-  CHECK(t.next_lsn() == 100);
+  CHECK(t.next_seq() == 100);
 }
 
 TEST_CASE("apply_resume: empty entries is a no-op",
@@ -4076,13 +4076,13 @@ TEST_CASE("apply_resume: empty entries is a no-op",
   auto s = std::move(t).persistent();
   CHECK(s->key_dir.get(to_bytes("k1")).has_value());
   CHECK(s->file_stats.get(1)->live_bytes == 42);
-  CHECK(s->next_lsn == 100);
+  CHECK(s->next_seq == 100);
 }
 
 TEST_CASE("apply_resume: multiple entries replayed in order",
           "[apply_resume]") {
   auto state = make_state_with_stats({}, {{1, {0, 0}}});
-  state->next_lsn = 1;
+  state->next_seq = 1;
   auto t = state->transient();
 
   std::vector<bytecask::ResumeEntry> entries{
@@ -4096,7 +4096,7 @@ TEST_CASE("apply_resume: multiple entries replayed in order",
   auto kv2 = s->key_dir.get(to_bytes("k2"));
   REQUIRE(kv2.has_value());
   CHECK(kv2->sequence == 11);
-  CHECK(s->next_lsn == 13);
+  CHECK(s->next_seq == 13);
 }
 
 #endif

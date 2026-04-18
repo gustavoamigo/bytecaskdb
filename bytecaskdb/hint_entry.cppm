@@ -20,7 +20,7 @@ namespace bytecask {
 
 // Hint entry layout (all fields little-endian):
 //
-//   Offset  0: sequence    (u64) — monotonic LSN copied from the data file
+//   Offset  0: sequence    (u64) — monotonic sequence number copied from the data file
 //   Offset  8: entry_type  (u8)  — Put/Delete
 //   Offset  9: file_offset (u64) — byte offset in the companion .data file
 //   Offset 17: value_size  (u32) — value length in bytes

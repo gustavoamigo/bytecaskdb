@@ -46,7 +46,7 @@ inline auto to_string(const Key &key) -> std::string {
 // Uses an owned map (not a Snapshot) to avoid holding file descriptors alive
 // during fault injection tests.
 struct Baseline {
-  std::uint64_t next_lsn;
+  std::uint64_t next_seq;
   std::map<std::string, Bytes> key_values;
 };
 
@@ -55,7 +55,7 @@ struct ExpectedDelta {
   std::vector<std::string> keys_added;
   std::vector<std::string> keys_removed;
   std::map<std::string, std::string> expected_values;  // key -> expected value
-  std::uint64_t lsn_advance;
+  std::uint64_t seq_advance;
   bool degraded;
 };
 
@@ -64,7 +64,7 @@ struct ExpectedDelta {
 // Captures a baseline snapshot of the DB for later delta comparison.
 inline auto capture_baseline(const DB &db) -> Baseline {
   Baseline bl;
-  bl.next_lsn = db.engine_state()->next_lsn;
+  bl.next_seq = db.engine_state()->next_seq;
   for (const auto &[key, value] : db.iter_from({})) {
     bl.key_values[to_string(key)] = value;
   }
@@ -88,7 +88,7 @@ inline void assert_consistent(const DB &db) {
     INFO("key references file_id=" << entry.file_id);
     CHECK(state->files.contains(entry.file_id));
 
-    // 5. Track max sequence for next_lsn check.
+    // 5. Track max sequence for next_seq check.
     if (entry.sequence > max_seq) max_seq = entry.sequence;
   }
 
@@ -108,9 +108,9 @@ inline void assert_consistent(const DB &db) {
     CHECK(state->file_stats.contains(file_id));
   }
 
-  // 5. next_lsn ahead of all sequences.
+  // 5. next_seq ahead of all sequences.
   if (max_seq > 0) {
-    CHECK(state->next_lsn > max_seq);
+    CHECK(state->next_seq > max_seq);
   }
 }
 
@@ -135,9 +135,9 @@ inline void assert_delta(const Baseline &before, const DB &db,
     CHECK(to_string(out) == value);
   }
 
-  // LSN advancement.
+  // Sequence advancement.
   auto after = db.engine_state();
-  CHECK(after->next_lsn == before.next_lsn + expected.lsn_advance);
+  CHECK(after->next_seq == before.next_seq + expected.seq_advance);
 
   // Structural consistency.
   assert_consistent(db);
@@ -246,7 +246,7 @@ struct VacuumBaseline {
   std::map<std::uint32_t, FileStats> file_stats;  // pre-vacuum per-file stats
 };
 
-// Captures key-values, next_lsn, and per-file stats for vacuum tests.
+// Captures key-values, next_seq, and per-file stats for vacuum tests.
 inline auto capture_vacuum_baseline(const DB &db) -> VacuumBaseline {
   VacuumBaseline bl;
   bl.keys = capture_baseline(db);
@@ -278,7 +278,7 @@ inline auto find_vacuum_target(const DB &db) -> std::uint32_t {
 }
 
 // Verifies that vacuum succeeded: vacuumed_file_id removed from state, all
-// pre-vacuum keys readable with correct values, next_lsn unchanged,
+// pre-vacuum keys readable with correct values, next_seq unchanged,
 // total_bytes for the active file matches its actual size (no staleness),
 // assert_consistent passes.
 inline void assert_vacuum_success(const DB &db, const VacuumBaseline &before,
@@ -290,8 +290,8 @@ inline void assert_vacuum_success(const DB &db, const VacuumBaseline &before,
   CHECK_FALSE(state->files.contains(vacuumed_file_id));
   CHECK_FALSE(state->file_stats.contains(vacuumed_file_id));
 
-  // next_lsn unchanged — vacuum does not advance LSN.
-  CHECK(state->next_lsn == before.keys.next_lsn);
+  // next_seq unchanged — vacuum does not advance sequence.
+  CHECK(state->next_seq == before.keys.next_seq);
 
   // All pre-vacuum keys must be present with correct values.
   for (const auto &[key, value] : before.keys.key_values) {
@@ -313,7 +313,7 @@ inline void assert_vacuum_success(const DB &db, const VacuumBaseline &before,
 }
 
 // Verifies that vacuum failed cleanly: vacuumed_file_id still in state, all
-// pre-vacuum keys intact with correct values, next_lsn unchanged,
+// pre-vacuum keys intact with correct values, next_seq unchanged,
 // file_stats unchanged from baseline (no partial stat updates),
 // total_bytes for active file matches its actual size, assert_consistent passes.
 inline void assert_vacuum_no_change(const DB &db, const VacuumBaseline &before,
@@ -325,8 +325,8 @@ inline void assert_vacuum_no_change(const DB &db, const VacuumBaseline &before,
   CHECK(state->files.contains(vacuumed_file_id));
   CHECK(state->file_stats.contains(vacuumed_file_id));
 
-  // next_lsn unchanged.
-  CHECK(state->next_lsn == before.keys.next_lsn);
+  // next_seq unchanged.
+  CHECK(state->next_seq == before.keys.next_seq);
 
   // All pre-vacuum keys must be present with correct values.
   for (const auto &[key, value] : before.keys.key_values) {

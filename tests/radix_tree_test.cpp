@@ -1171,7 +1171,7 @@ TEST_CASE("RadixTree merge model-based", "[radix_tree][merge]") {
     return k;
   };
 
-  // Resolver: higher value wins (analogous to higher-LSN wins).
+  // Resolver: higher value wins (analogous to higher-sequence wins).
   auto resolve = [](int av, int bv) { return bv > av ? bv : av; };
 
   // Run multiple rounds with different tree sizes.

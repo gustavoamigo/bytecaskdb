@@ -110,7 +110,7 @@ TEST_CASE("assert_delta on successful single put", "[invariants]") {
       .keys_added = {"new_key"},
       .keys_removed = {},
       .expected_values = {{"new_key", "value"}},
-      .lsn_advance = 1,
+      .seq_advance = 1,
       .degraded = false,
   });
 }
@@ -127,7 +127,7 @@ TEST_CASE("assert_delta on successful single delete", "[invariants]") {
       .keys_added = {},
       .keys_removed = {"k"},
       .expected_values = {},
-      .lsn_advance = 1,
+      .seq_advance = 1,
       .degraded = false,
   });
 }
@@ -142,12 +142,12 @@ TEST_CASE("assert_delta on successful batch", "[invariants]") {
   plan.put(to_bytes("b"), to_bytes("2"));
   (void)db.apply_batch({}, std::move(plan));
 
-  // 2 puts + BulkBegin + BulkEnd = 4 LSN slots
+  // 2 puts + BulkBegin + BulkEnd = 4 sequence slots
   assert_delta(before, db, ExpectedDelta{
       .keys_added = {"a", "b"},
       .keys_removed = {},
       .expected_values = {{"a", "1"}, {"b", "2"}},
-      .lsn_advance = 4,
+      .seq_advance = 4,
       .degraded = false,
   });
 }
@@ -161,7 +161,7 @@ TEST_CASE("assert_delta detects degraded", "[invariants]") {
 
   // Mid-batch append failure: fi{2} fires on the 3rd checkpoint (op2 in the
   // 2-op batch), after BulkBegin and op1 have already reached disk. The engine
-  // degrades and next_lsn advances past all consumed LSNs (4 = 2 ops + 2 markers).
+  // degrades and next_seq advances past all consumed sequences (4 = 2 ops + 2 markers).
   {
     bytecask::testing::ScopedFaultInjector fi{2};
     bytecask::WritePlan plan;
@@ -175,7 +175,7 @@ TEST_CASE("assert_delta detects degraded", "[invariants]") {
       .keys_added = {},
       .keys_removed = {},
       .expected_values = {},
-      .lsn_advance = 4,
+      .seq_advance = 4,
       .degraded = true,
   });
   assert_resumable(db);
@@ -201,7 +201,7 @@ TEST_CASE("assert_recoverable after successful write", "[invariants]") {
       .keys_added = {"new_key"},
       .keys_removed = {},
       .expected_values = {{"new_key", "value"}},
-      .lsn_advance = 1,
+      .seq_advance = 1,
       .degraded = false,
   });
 }
@@ -230,7 +230,7 @@ TEST_CASE("assert_recoverable when transition not persisted",
       .keys_added = {},
       .keys_removed = {},
       .expected_values = {},
-      .lsn_advance = 0,
+      .seq_advance = 0,
       .degraded = false,
   });
 }
@@ -251,7 +251,7 @@ TEST_CASE("capture_baseline captures correct state", "[invariants]") {
   CHECK(bl.key_values.contains("b"));
   CHECK(bytecask::testing::to_string(bl.key_values.at("a")) == "1");
   CHECK(bytecask::testing::to_string(bl.key_values.at("b")) == "2");
-  CHECK(bl.next_lsn == db.engine_state()->next_lsn);
+  CHECK(bl.next_seq == db.engine_state()->next_seq);
 }
 
 // ---------------------------------------------------------------------------
@@ -267,16 +267,16 @@ TEST_CASE("validate_state_consistency passes on valid state", "[invariants]") {
   REQUIRE_NOTHROW(db.test_validate_state_consistency(*state));
 }
 
-TEST_CASE("validate_state_consistency throws on regressed next_lsn",
+TEST_CASE("validate_state_consistency throws on regressed next_seq",
           "[invariants]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
   db.put({}, to_bytes("a"), to_bytes("1"));
   auto state = db.engine_state();
 
-  // Construct a bad state with next_lsn set to 0.
+  // Construct a bad state with next_seq set to 0.
   auto bad = *state;
-  bad.next_lsn = 0;
+  bad.next_seq = 0;
   REQUIRE_THROWS_AS(db.test_validate_state_consistency(bad),
                     std::runtime_error);
 }

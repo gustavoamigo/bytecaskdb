@@ -17,7 +17,7 @@ class Delta:
     keys_added: List[str]
     keys_removed: List[str]
     expected_values: dict  # key -> value string (for value verification)
-    lsn_advance: int
+    seq_advance: int
     degraded: bool
     threw: bool
 
@@ -35,7 +35,7 @@ def _full_delta(
     key (causality shapes), only the final operation determines the outcome.
     """
     n = plan.write_count
-    lsn_advance = n + (2 if n > 1 else 0)
+    seq_advance = n + (2 if n > 1 else 0)
 
     # Track final state per key: ("put", value_index) or "deleted".
     final_state: dict = {}
@@ -55,7 +55,7 @@ def _full_delta(
         keys_added=keys_added,
         keys_removed=keys_removed,
         expected_values=expected_values,
-        lsn_advance=lsn_advance,
+        seq_advance=seq_advance,
         degraded=degraded,
         threw=threw,
     )
@@ -88,8 +88,8 @@ def expected_delta(
 
     if failure == FailureClass.C:
         # Append failed mid-batch (on BulkEnd). Prior entries (BulkBegin, data
-        # entries) may be on disk. Advance conservatively past all consumed LSNs.
-        # resume() truncates the orphaned batch and sets next_lsn from disk.
+        # entries) may be on disk. Advance conservatively past all consumed sequences.
+        # resume() truncates the orphaned batch and sets next_seq from disk.
         n = plan.write_count
         return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
 
@@ -105,14 +105,14 @@ def expected_delta(
 
     if failure == FailureClass.F:
         # Commit fdatasync failed — bytes in page cache but not confirmed
-        # durable. Key changes are NOT published in-session. LSN advances to
+        # durable. Key changes are NOT published in-session. Sequence advances to
         # prevent reuse. Engine degrades (BC-164); resume() restores writes.
         n = plan.write_count
         return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
 
     if failure == FailureClass.G:
         # Rotation fdatasync failed — same contract as F: bytes in page cache,
-        # key changes unpublished, LSN advances, engine degrades (BC-164).
+        # key changes unpublished, sequence advances, engine degrades (BC-164).
         n = plan.write_count
         return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
 

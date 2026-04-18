@@ -211,7 +211,7 @@ def gen_delta_literal(delta: Delta) -> str:
         f"        .keys_added = {ka},\n"
         f"        .keys_removed = {kr},\n"
         f"        .expected_values = {ev},\n"
-        f"        .lsn_advance = {delta.lsn_advance},\n"
+        f"        .seq_advance = {delta.seq_advance},\n"
         f"        .degraded = {degraded},\n"
         f"    }}"
     )

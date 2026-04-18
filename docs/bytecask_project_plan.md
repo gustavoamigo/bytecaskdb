@@ -32,6 +32,12 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-118 | MariaDB Phase 5 — MVCC + lockless architecture | `HTON_MVCC`, `HTON_NO_LOCK_MANAGER`, `start_consistent_snapshot()`. |
 | BC-120 | MariaDB Phase 6 — Replication + backup hooks | 2PC `prepare`, XA `recover`, `backup_stage` hooks. |
 
+### Replication Primitives
+
+| ID | Title | Note |
+| --- | --- | --- |
+| BC-197 | Replication primitives | Expose `current_lsn(timeout)`, `Snapshot::lsn()` + file manifest, `changes_since(from_lsn)`, `ingest(entries)`, `Mode::Follower`, and `min_lsn`/`max_lsn` on file_stats. See `docs/replication_primitives_design.md`. |
+
 ### Core Engine
 
 | ID | Title | Note |

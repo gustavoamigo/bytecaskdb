@@ -21,7 +21,7 @@ namespace bytecask {
 // Entry layout (all fields little-endian, total = 15 + key_size + value_size +
 // 4):
 //
-//   Offset  0: sequence   (u64) — monotonic LSN
+//   Offset  0: sequence   (u64) — monotonic sequence number
 //   Offset  8: entry_type (u8)  — entry kind; 0 is always corrupt/uninitialized
 //   Offset  9: key_size   (u16) — key length in bytes (0 for BulkBegin/BulkEnd)
 //   Offset 11: value_size (u32) — value length in bytes (0 for Delete/Bulk*)

@@ -320,7 +320,7 @@ export class WritePlan;
 //
 // Created from EngineState via transient(). Owns the mutation logic for all
 // state transitions: writes, rotation, vacuum. The coordinator (DB) does IO
-// and sequencing but never touches key_dir, file_stats, or LSN directly.
+// and sequencing but never touches key_dir, file_stats, or sequence directly.
 //
 // Follows the same transient/persistent discipline as
 // TransientRadixTree/PersistentRadixTree: mutations are batched on a
@@ -345,7 +345,7 @@ public:
       -> bool;
 
   // Prepare IO plan — pure read, no mutations.
-  // Returns the exact append entries to write: LSN-assigned,
+  // Returns the exact append entries to write: sequence-assigned,
   // BulkBegin/BulkEnd included for multi-op batches.
   // Borrows key/value from the WritePlan; the plan must outlive the result.
   [[nodiscard]] auto prepare_write(const WritePlan &plan) const
@@ -366,8 +366,8 @@ public:
                     std::shared_ptr<DataFile> new_sealed_file);
 
   // State transition: replay valid committed entries from a resume() scan.
-  // Uses LSN-wins resolution to update key_dir and file_stats. Advances
-  // next_lsn past the highest LSN in the entries. Cannot fail.
+  // Uses sequence-wins resolution to update key_dir and file_stats. Advances
+  // next_seq past the highest sequence in the entries. Cannot fail.
   void apply_resume(std::uint32_t file_id,
                     const std::vector<ResumeEntry> &entries);
 
@@ -376,14 +376,14 @@ public:
   [[nodiscard]] auto active_file_id() const noexcept -> std::uint32_t;
   [[nodiscard]] auto is_rotation_needed(std::uint64_t threshold) const -> bool;
 
-  // Returns the current next_lsn value — used to capture the post-write LSN
+  // Returns the current next_seq value — used to capture the post-write sequence
   // before consuming the transient on sync failure (F/G).
-  [[nodiscard]] auto next_lsn() const noexcept -> std::uint64_t;
+  [[nodiscard]] auto next_seq() const noexcept -> std::uint64_t;
 
-  // Advances next_lsn_ to new_lsn without applying any key-dir or file-stats
-  // changes. Used on F/G sync failure to prevent LSN reuse for bytes already
+  // Advances next_seq_ to new_seq without applying any key-dir or file-stats
+  // changes. Used on F/G sync failure to prevent sequence reuse for bytes already
   // in the page cache, while keeping key changes unpublished.
-  void advance_next_lsn(std::uint64_t new_lsn) noexcept;
+  void advance_next_seq(std::uint64_t new_seq) noexcept;
 
   // Returns a mutable reference to file_stats_. Used by resume() to update
   // total_bytes for a truncated active file before publishing state.
@@ -402,14 +402,14 @@ private:
                        TransientU32Map<FileStats> file_stats,
                        std::uint32_t active_file_id,
                        std::uint32_t next_file_id,
-                       std::uint64_t next_lsn);
+                       std::uint64_t next_seq);
 
   TransientRadixTree<KeyDirEntry> key_dir_;
   TransientU32Map<std::shared_ptr<DataFile>> files_;
   TransientU32Map<FileStats> file_stats_;
   std::uint32_t active_file_id_;
   std::uint32_t next_file_id_;
-  std::uint64_t next_lsn_;
+  std::uint64_t next_seq_;
 };
 
 // ---------------------------------------------------------------------------
@@ -597,10 +597,10 @@ private:
   void rotate_active_file(TransientEngineState &t,
                           const std::shared_ptr<const EngineState> &current);
 
-  // Publishes an LSN-only state (key_dir unchanged) advanced to target_lsn.
+  // Publishes a sequence-only state (key_dir unchanged) advanced to target_seq.
   // Called on any IO failure where bytes may have reached disk.
-  void publish_lsn_advance(const std::shared_ptr<const EngineState> &current,
-                            std::uint64_t target_lsn);
+  void publish_seq_advance(const std::shared_ptr<const EngineState> &current,
+                            std::uint64_t target_seq);
 
   // Degrade — sets the engine to write-blocked state with a reason.
   void deem_as_degraded(std::string reason);
@@ -673,7 +673,7 @@ private:
   // Builds a RecoveryResult from a set of hint files; no shared mutable state.
   static auto recovery_build_from_hints(std::span<RecoveredFile> files,
                                         bool strict) -> RecoveryResult;
-  // Merges two RecoveryResults with LSN-based conflict resolution.
+  // Merges two RecoveryResults with sequence-based conflict resolution.
   static auto recovery_merge_results(RecoveryResult a, RecoveryResult b)
       -> RecoveryResult;
   // Reconstructs key_dir from hint files using a single thread.

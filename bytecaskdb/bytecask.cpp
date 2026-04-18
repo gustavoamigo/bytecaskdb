@@ -94,15 +94,15 @@ TransientEngineState::TransientEngineState(
     TransientU32Map<std::shared_ptr<DataFile>> files,
     TransientU32Map<FileStats> file_stats,
     std::uint32_t active_file_id, std::uint32_t next_file_id,
-    std::uint64_t next_lsn)
+    std::uint64_t next_seq)
     : key_dir_{std::move(key_dir)}, files_{std::move(files)},
       file_stats_{std::move(file_stats)}, active_file_id_{active_file_id},
-      next_file_id_{next_file_id}, next_lsn_{next_lsn} {}
+      next_file_id_{next_file_id}, next_seq_{next_seq} {}
 
 auto EngineState::transient() const -> TransientEngineState {
   return TransientEngineState{
       key_dir.transient(), files.transient(), file_stats.transient(),
-      active_file_id, next_file_id, next_lsn};
+      active_file_id, next_file_id, next_seq};
 }
 
 auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
@@ -201,28 +201,28 @@ auto TransientEngineState::prepare_write(const WritePlan &plan) const
   const bool multi = wc > 1;
   entries.reserve(multi ? wc + 2 : 1);
 
-  auto lsn = next_lsn_;
+  auto seq = next_seq_;
 
   if (multi) {
-    entries.push_back({lsn++, EntryType::BulkBegin, {}, {}});
+    entries.push_back({seq++, EntryType::BulkBegin, {}, {}});
   }
 
   for (const auto &w : plan.writes_) {
     std::visit(
-        [&entries, &lsn](const auto &op) {
+        [&entries, &seq](const auto &op) {
           using T = std::decay_t<decltype(op)>;
           if constexpr (std::is_same_v<T, WritePlan::PointPut>) {
             entries.push_back(
-                {lsn++, EntryType::Put,
+                {seq++, EntryType::Put,
                  std::span<const std::byte>{op.key},
                  std::span<const std::byte>{op.value}});
           } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
             entries.push_back(
-                {lsn++, EntryType::Delete,
+                {seq++, EntryType::Delete,
                  std::span<const std::byte>{op.key}, {}});
           } else {
             entries.push_back(
-                {lsn++, EntryType::RangeDel,
+                {seq++, EntryType::RangeDel,
                  std::span<const std::byte>{op.from},
                  std::span<const std::byte>{op.to}});
           }
@@ -231,7 +231,7 @@ auto TransientEngineState::prepare_write(const WritePlan &plan) const
   }
 
   if (multi) {
-    entries.push_back({lsn++, EntryType::BulkEnd, {}, {}});
+    entries.push_back({seq++, EntryType::BulkEnd, {}, {}});
   }
 
   return entries;
@@ -248,7 +248,7 @@ void TransientEngineState::apply_writes(
     file_stats_.update(active_file_id_, [](FileStats &fs) {
       fs.total_bytes += kHeaderSize + kCrcSize;
     });
-    ++next_lsn_;
+    ++next_seq_;
     ++io_idx;
   }
 
@@ -272,9 +272,9 @@ void TransientEngineState::apply_writes(
               fs.live_bytes += sz;
               fs.total_bytes += sz;
             });
-            key_dir_.set(key_span, KeyDirEntry{next_lsn_, active_file_id_,
+            key_dir_.set(key_span, KeyDirEntry{next_seq_, active_file_id_,
                                                 offsets[io_idx], val_size});
-            ++next_lsn_;
+            ++next_seq_;
             ++io_idx;
           } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
             const std::span<const std::byte> key_span{op.key};
@@ -291,7 +291,7 @@ void TransientEngineState::apply_writes(
               fs.total_bytes += del_sz;
             });
             key_dir_.erase(key_span);
-            ++next_lsn_;
+            ++next_seq_;
             ++io_idx;
           } else {
             // RangeDel: iterate key_dir in [from, to), decrement live_bytes
@@ -321,7 +321,7 @@ void TransientEngineState::apply_writes(
             file_stats_.update(active_file_id_, [rd_sz](FileStats &fs) {
               fs.total_bytes += rd_sz;
             });
-            ++next_lsn_;
+            ++next_seq_;
             ++io_idx;
           }
         },
@@ -333,7 +333,7 @@ void TransientEngineState::apply_writes(
     file_stats_.update(active_file_id_, [](FileStats &fs) {
       fs.total_bytes += kHeaderSize + kCrcSize;
     });
-    ++next_lsn_;
+    ++next_seq_;
     ++io_idx;
   }
 }
@@ -384,10 +384,10 @@ void TransientEngineState::apply_vacuum(
 
 void TransientEngineState::apply_resume(
     std::uint32_t file_id, const std::vector<ResumeEntry> &entries) {
-  std::uint64_t max_lsn = 0;
+  std::uint64_t max_seq = 0;
   for (const auto &e : entries) {
     const std::span<const std::byte> key_span{e.key};
-    if (e.sequence > max_lsn) max_lsn = e.sequence;
+    if (e.sequence > max_seq) max_seq = e.sequence;
 
     if (e.entry_type == EntryType::Put) {
       const auto existing = key_dir_.get(key_span);
@@ -416,8 +416,8 @@ void TransientEngineState::apply_resume(
     }
   }
 
-  if (max_lsn >= next_lsn_) {
-    next_lsn_ = max_lsn + 1;
+  if (max_seq >= next_seq_) {
+    next_seq_ = max_seq + 1;
   }
 }
 
@@ -434,12 +434,12 @@ auto TransientEngineState::is_rotation_needed(std::uint64_t threshold) const
   return (*files_.get(active_file_id_))->size() >= threshold;
 }
 
-auto TransientEngineState::next_lsn() const noexcept -> std::uint64_t {
-  return next_lsn_;
+auto TransientEngineState::next_seq() const noexcept -> std::uint64_t {
+  return next_seq_;
 }
 
-void TransientEngineState::advance_next_lsn(std::uint64_t new_lsn) noexcept {
-  next_lsn_ = new_lsn;
+void TransientEngineState::advance_next_seq(std::uint64_t new_seq) noexcept {
+  next_seq_ = new_seq;
 }
 
 auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
@@ -449,7 +449,7 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   s->file_stats = std::move(file_stats_).persistent();
   s->active_file_id = active_file_id_;
   s->next_file_id = next_file_id_;
-  s->next_lsn = next_lsn_;
+  s->next_seq = next_seq_;
   return s;
 }
 
@@ -718,7 +718,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   } catch (...) {
     auto ex = std::current_exception();
     try { file.sync(); } catch (...) {}
-    publish_lsn_advance(current, t.next_lsn());
+    publish_seq_advance(current, t.next_seq());
     deem_as_degraded(std::format(
         "append IO error on '{}': call resume() to recover.",
         file.path().string()));
@@ -734,7 +734,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
       file.sync();
     } catch (...) {
       auto ex = std::current_exception();
-      publish_lsn_advance(current, t.next_lsn());
+      publish_seq_advance(current, t.next_seq());
       deem_as_degraded(std::format(
           "rotation fdatasync failed on '{}': bytes in page cache but "
           "durability not confirmed. Call resume() to recover.",
@@ -765,7 +765,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
       file.sync();
     } catch (...) {
       auto ex = std::current_exception();
-      publish_lsn_advance(current, t.next_lsn());
+      publish_seq_advance(current, t.next_seq());
       deem_as_degraded(std::format(
           "commit fdatasync failed on '{}': bytes in page cache but "
           "durability not confirmed. Call resume() to recover.",
@@ -1334,11 +1334,11 @@ void DB::vacuum_absorb_file(std::uint32_t file_id) {
 
 #pragma region State access
 
-void DB::publish_lsn_advance(const std::shared_ptr<const EngineState> &current,
-                              std::uint64_t target_lsn) {
-  auto lsn_only = current->transient();
-  lsn_only.advance_next_lsn(target_lsn);
-  store_state(current, std::move(lsn_only).persistent());
+void DB::publish_seq_advance(const std::shared_ptr<const EngineState> &current,
+                              std::uint64_t target_seq) {
+  auto seq_only = current->transient();
+  seq_only.advance_next_seq(target_seq);
+  store_state(current, std::move(seq_only).persistent());
 }
 
 void DB::deem_as_degraded(std::string reason) {
@@ -1493,10 +1493,10 @@ auto DB::load_state_for_write() const -> std::shared_ptr<EngineState> {
 void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
                      std::shared_ptr<EngineState> new_state) {
   // O(1) invariant checks — always on, even in release.
-  if (new_state->next_lsn < old_state->next_lsn) {
+  if (new_state->next_seq < old_state->next_seq) {
     deem_as_degraded(std::format(
-        "invariant violation: next_lsn regressed from {} to {}",
-        old_state->next_lsn, new_state->next_lsn));
+        "invariant violation: next_seq regressed from {} to {}",
+        old_state->next_seq, new_state->next_seq));
     return;
   }
   if (new_state->active_file_id < old_state->active_file_id) {
@@ -1513,16 +1513,16 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
   }
 
 #ifndef NDEBUG
-  // Debug-only O(n) check: next_lsn > max(all key_dir sequences).
+  // Debug-only O(n) check: next_seq > max(all key_dir sequences).
   std::uint64_t max_seq = 0;
   for (auto it = new_state->key_dir.begin(); it != std::default_sentinel; ++it) {
     auto [key_span, entry] = *it;
     if (entry.sequence > max_seq) max_seq = entry.sequence;
   }
-  if (max_seq > 0 && new_state->next_lsn <= max_seq) {
+  if (max_seq > 0 && new_state->next_seq <= max_seq) {
     deem_as_degraded(std::format(
-        "invariant violation: next_lsn {} <= max key_dir sequence {}",
-        new_state->next_lsn, max_seq));
+        "invariant violation: next_seq {} <= max key_dir sequence {}",
+        new_state->next_seq, max_seq));
     return;
   }
 #endif
@@ -1559,11 +1559,11 @@ void DB::validate_state_consistency(const EngineState &s) const {
     if (entry.sequence > max_seq) max_seq = entry.sequence;
   }
 
-  // 3. next_lsn ahead of all sequences.
-  if (max_seq > 0 && s.next_lsn <= max_seq) {
+  // 3. next_seq ahead of all sequences.
+  if (max_seq > 0 && s.next_seq <= max_seq) {
     throw std::runtime_error{std::format(
-        "state consistency: next_lsn {} <= max key_dir sequence {}",
-        s.next_lsn, max_seq)};
+        "state consistency: next_seq {} <= max key_dir sequence {}",
+        s.next_seq, max_seq)};
   }
 
   // 4. file_stats covers all files.
@@ -1636,7 +1636,7 @@ auto DB::recovery_prepare_files(EngineState &s, bool strict)
 // with a warning instead of throwing.
 auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
     -> RecoveryResult {
-  std::uint64_t max_lsn = 0;
+  std::uint64_t max_seq = 0;
   auto t = PersistentRadixTree<KeyDirEntry>{}.transient();
   std::map<Key, std::uint64_t> tombstones;
   std::vector<RangeTombstone> range_tombstones;
@@ -1649,7 +1649,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
   // live_bytes are NOT tracked per-entry here — Phase 4 in
   // recovery_load_parallel recomputes them in a single pass after the
   // final merge, avoiding redundant O(N) map lookups per worker.
-  auto lsn_wins = [](const KeyDirEntry &existing, const KeyDirEntry &incoming) {
+  auto seq_wins = [](const KeyDirEntry &existing, const KeyDirEntry &incoming) {
     return existing.sequence < incoming.sequence;
   };
 
@@ -1662,7 +1662,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
           const auto k = Key{he->key};
           const auto tomb_it = tombstones.find(k);
           if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
-            if (he->sequence > max_lsn) max_lsn = he->sequence;
+            if (he->sequence > max_seq) max_seq = he->sequence;
             continue;
           }
           // Check range tombstones — O(R) per Put, R expected small.
@@ -1674,13 +1674,13 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
             }
           }
           if (suppressed) {
-            if (he->sequence > max_lsn) max_lsn = he->sequence;
+            if (he->sequence > max_seq) max_seq = he->sequence;
             continue;
           }
           t.upsert(he->key,
                    KeyDirEntry{he->sequence, file_id, he->file_offset,
                                he->value_size},
-                   lsn_wins);
+                   seq_wins);
         } else if (he->entry_type == EntryType::Delete) {
           const auto k = Key{he->key};
           auto &tomb_seq = tombstones[k];
@@ -1707,7 +1707,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
             t.erase(std::span<const std::byte>{ek});
           }
         }
-        if (he->sequence > max_lsn) max_lsn = he->sequence;
+        if (he->sequence > max_seq) max_seq = he->sequence;
       }
     } catch (const std::exception &e) {
       if (strict) throw;
@@ -1718,11 +1718,11 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
   }
 
   return {std::move(t).persistent(), std::move(tombstones),
-          std::move(range_tombstones), max_lsn,
+          std::move(range_tombstones), max_seq,
           std::move(fstats_t).persistent()};
 }
 
-// Merges two RecoveryResults. Tree merge uses LSN-based conflict
+// Merges two RecoveryResults. Tree merge uses sequence-based conflict
 // resolution, then tombstones from both sides are cross-applied to
 // suppress stale PUTs. Tombstone maps and file_stats are unioned.
 // live_bytes are NOT recomputed here — deferred to a single pass
@@ -1735,12 +1735,12 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
   }
   a.file_stats = std::move(merged_stats_t).persistent();
 
-  auto lsn_resolver = [](const KeyDirEntry &x, const KeyDirEntry &y) {
+  auto seq_resolver = [](const KeyDirEntry &x, const KeyDirEntry &y) {
     return (x.sequence >= y.sequence) ? x : y;
   };
 
   auto merged =
-      PersistentRadixTree<KeyDirEntry>::merge(a.key_dir, b.key_dir, lsn_resolver);
+      PersistentRadixTree<KeyDirEntry>::merge(a.key_dir, b.key_dir, seq_resolver);
 
   for (const auto &[key, tomb_seq] : b.tombstones) {
     std::span<const std::byte> key_span{key.begin(), key.size()};
@@ -1795,13 +1795,13 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 
   return {std::move(merged), std::move(merged_tombs),
           std::move(merged_range_tombs),
-          std::max(a.max_lsn, b.max_lsn), std::move(a.file_stats)};
+          std::max(a.max_seq, b.max_seq), std::move(a.file_stats)};
 }
 
 // Reconstructs the key directory from hint files (serial path).
 // Pre-generates missing hint files from raw data scans (batch-aware),
 // then recovers exclusively from hints — single code path.
-// Returns a new EngineState with key_dir populated and next_lsn set to
+// Returns a new EngineState with key_dir populated and next_seq set to
 // max_seen + 1. next_file_id is advanced for each recovered file.
 auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
   auto files = recovery_prepare_files(s, strict);
@@ -1814,7 +1814,7 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
     fstats_scratch.emplace(rf.file_id, FileStats{0, rf.total_bytes});
   }
 
-  std::uint64_t max_lsn = 0;
+  std::uint64_t max_seq = 0;
   auto transient_key_dir = s.key_dir.transient();
   std::map<Key, std::uint64_t> tombstones;
   std::vector<RangeTombstone> range_tombstones;
@@ -1828,7 +1828,7 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
           const auto k = Key{he->key};
           const auto tomb_it = tombstones.find(k);
           if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
-            if (he->sequence > max_lsn) max_lsn = he->sequence;
+            if (he->sequence > max_seq) max_seq = he->sequence;
             continue;
           }
           // Check range tombstones.
@@ -1840,7 +1840,7 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
             }
           }
           if (suppressed) {
-            if (he->sequence > max_lsn) max_lsn = he->sequence;
+            if (he->sequence > max_seq) max_seq = he->sequence;
             continue;
           }
           const auto existing = transient_key_dir.get(he->key);
@@ -1887,7 +1887,7 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
             transient_key_dir.erase(std::span<const std::byte>{ek});
           }
         }
-        if (he->sequence > max_lsn) max_lsn = he->sequence;
+        if (he->sequence > max_seq) max_seq = he->sequence;
       }
     } catch (const std::exception &e) {
       if (strict) throw;
@@ -1901,7 +1901,7 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
   for (const auto &[id, fs] : fstats_scratch) fstats_t.set(id, fs);
   s.key_dir = std::move(transient_key_dir).persistent();
   s.file_stats = std::move(fstats_t).persistent();
-  s.next_lsn = max_lsn + 1;
+  s.next_seq = max_seq + 1;
   return s;
 }
 
@@ -2014,7 +2014,7 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
 
   // Phase 5: assembly.
   s.key_dir = std::move(final_result.key_dir);
-  s.next_lsn = final_result.max_lsn + 1;
+  s.next_seq = final_result.max_seq + 1;
   s.file_stats = std::move(final_result.file_stats);
   return s;
 }

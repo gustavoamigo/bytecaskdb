@@ -87,7 +87,7 @@ export struct EngineState {
   PersistentU32Map<FileStats> file_stats;
   std::uint32_t active_file_id{};
   std::uint32_t next_file_id{};
-  std::uint64_t next_lsn{1};
+  std::uint64_t next_seq{1};
 
   [[nodiscard]] auto active_file() -> DataFile & {
     return **files.get(active_file_id);
@@ -190,7 +190,7 @@ export struct RecoveryResult {
   PersistentRadixTree<KeyDirEntry> key_dir;
   std::map<Key, std::uint64_t> tombstones;
   std::vector<RangeTombstone> range_tombstones;
-  std::uint64_t max_lsn{0};
+  std::uint64_t max_seq{0};
   PersistentU32Map<FileStats> file_stats;
 };
 
