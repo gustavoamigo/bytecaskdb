@@ -207,8 +207,14 @@ target("bytecaskdb_python")
                  "-Wno-gnu-anonymous-struct", "-Wno-unused-function",
                  {force = true})
     add_cxxflags("-fPIC", {force = true})
-    -- Python extension modules must not export all symbols.
-    add_ldflags("-Wl,--no-undefined", {force = true})
+    -- On Linux, reject undefined symbols at link time so missing deps fail early.
+    -- On macOS, Python C API symbols are resolved at runtime when the interpreter
+    -- loads the extension, so use -undefined dynamic_lookup instead.
+    if is_plat("linux") then
+        add_ldflags("-Wl,--no-undefined", {force = true})
+    elseif is_plat("macosx") then
+        add_ldflags("-undefined", "dynamic_lookup", {force = true})
+    end
     on_config(function(t)
         apply_sanitizer(t)
         add_release_opts(t)
