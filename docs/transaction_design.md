@@ -10,14 +10,13 @@ Canonical location: `docs/transaction_design.md`.
 
 ## Background: Where ByteCaskDB stands today
 
-ByteCaskDB already provides atomic multi-operation writes via `apply_batch()`. A `Batch` groups an arbitrary number of `put` and `del` operations wrapped in `BulkBegin`/`BulkEnd` markers that are recovered atomically on restart.
+ByteCaskDB already provides atomic multi-operation writes via `apply_batch()`. A `WritePlan` groups an arbitrary number of `put`, `del`, and `del_range` operations wrapped in `BulkBegin`/`BulkEnd` markers that are recovered atomically on restart. When the plan carries a snapshot, guards and implicit W-W conflict detection are available.
 
-What `apply_batch()` does **not** provide:
+What bare `put`/`del` operations do **not** provide:
 
 - A way to **read before writing** from a consistent view of the database.
-- **Conflict detection**: two concurrent callers building batches can overwrite each other's keys without either knowing.
 - **Read-your-own-writes**: buffered operations are not visible to reads before commit.
-- **Rollback**: a `Batch` that has been applied cannot be undone.
+- **Rollback**: an applied write cannot be undone.
 
 ---
 
@@ -29,28 +28,28 @@ The transaction design is explicitly layered. Each layer is independently usable
 ┌─────────────────────────────────────────────────────────────────┐
 │  Layer 2 — Transaction (optional ergonomics)                    │
 │  Accumulates writes, read-your-own-writes, iter_from/keys_from  │
-│  Calls apply_batch_if() at commit — adds no new mechanism       │
+│  Calls apply_batch() at commit — adds no new mechanism          │
 ├─────────────────────────────────────────────────────────────────┤
-│  Layer 1 — Two new primitives on DB                             │
+│  Layer 1 — Two primitives on DB                                 │
 │  snapshot() → Snapshot          (consistent read-only view)     │
-│  apply_batch_if(snap, plan)     (CAS multi-key write)           │
+│  apply_batch(opts, plan)        (CAS multi-key write)           │
 ├─────────────────────────────────────────────────────────────────┤
 │  Layer 0 — Existing DB                                          │
-│  put, del, apply_batch(Batch)   (no conflict detection — fast)  │
+│  put, del, apply_batch(plan)    (no conflict detection — fast)  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 A developer who wants exactly one capability can use exactly one layer:
 
 - **Consistent read-only view**: call `db.snapshot()` — no `Transaction` needed.
-- **Conflict-safe single-round write**: call `db.snapshot()` then `db.apply_batch_if(snap, plan)` — no `Transaction` needed.
+- **Conflict-safe single-round write**: call `db.snapshot()` then `db.apply_batch(opts, plan)` — no `Transaction` needed.
 - **Full transaction with buffered read/write and rollback**: use `Transaction`.
 
-`DB` is unchanged from the caller's perspective except for two new methods. There is no mandatory wrapper type, no ownership transfer, and no `txn_mu_` — the existing `write_mu_` inside `apply_batch_if()` provides all serialization needed.
+`DB` is unchanged from the caller's perspective except for two new methods. There is no mandatory wrapper type, no ownership transfer, and no `txn_mu_` — the existing `write_mu_` inside `apply_batch()` provides all serialization needed.
 
 ---
 
-## Layer 1: `snapshot()` and `apply_batch_if()`
+## Layer 1: `snapshot()` and `apply_batch(WritePlan)`
 
 These are the only two additions to `DB`'s public interface. Everything in the transaction design is built on top of them.
 
@@ -84,7 +83,7 @@ public:
 private:
   explicit Snapshot(std::shared_ptr<const EngineState> state);
   std::shared_ptr<const EngineState> state_;
-  friend class DB; // DB::snapshot() constructs; apply_batch_if() reads state_
+  friend class DB; // DB::snapshot() constructs; apply_batch() reads state_
 };
 ```
 
@@ -103,30 +102,32 @@ for (auto& [k, v] : snap.iter_from()) { ... }
 
 LevelDB threads snapshots through `ReadOptions` as a raw `const Snapshot*` with manual `ReleaseSnapshot()`. The snapshot is not the object you call — it is a parameter you carry, with manual lifetime. ByteCaskDB's `Snapshot` inverts the model: reads are called directly on it, and lifetime is automatic (value semantics + RAII). It is also composable — `Transaction` is built on top of `Snapshot` rather than reimplementing state capture independently.
 
-### `apply_batch_if(snap, opts, plan)` — compare-and-swap multi-key write
+### `apply_batch(opts, plan)` — compare-and-swap multi-key write
 
-Applies the writes in `plan` atomically, but only if all guards in `plan` pass and no written key was modified since `snap` was taken. Guard checks and the apply all run under `write_mu_`, so they are serialized with all other writers — no external lock needed.
+Applies the writes in `plan` atomically, but only if all guards in `plan` pass and no written key was modified since the plan's snapshot was taken (when the plan carries a snapshot). Guard checks and the apply all run under `write_mu_`, so they are serialized with all other writers — no external lock needed.
 
 ```cpp
 // On DB:
-// Applies plan atomically iff all guards pass and no written key was modified since snap.
+// Applies plan atomically iff all guards pass and no written key was modified since the plan's snapshot.
 // Returns true if committed, false on conflict (W-W or guard violation).
 // Throws std::system_error on I/O failure.
 // Returns true (no-op) if plan has no writes and no guards.
-[[nodiscard]] auto apply_batch_if(const Snapshot& snap, WriteOptions opts, WritePlan plan) -> bool;
+[[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan) -> bool;
 ```
 
-`WritePlan` is the type consumed by `apply_batch_if`. It separates cleanly from `Batch`: `Batch` is the unconditional bulk-write primitive (Layer 0); `WritePlan` is the conditional, snapshot-relative primitive (Layer 1). See the **`WritePlan`** section below for the full type definition.
+`WritePlan` is the type consumed by `apply_batch`. It carries both writes and guards. See the **`WritePlan`** section below for the full type definition.
 
 Conflict detection pseudocode (runs under `write_mu_`):
 
 ```
 lock write_mu_
 
+snap = plan.snapshot  (if plan has no snapshot, skip steps 1–3 W-W checks)
+
 // 1. Evaluate point guards
 for each guard G in plan:
     current_entry = current state_->key_dir.find(G.key)
-    snap_entry    = snap.state_->key_dir.find(G.key)
+    snap_entry    = snap.state_->key_dir.find(G.key)  (only for MustBeUnchanged)
 
     if G.precondition == MustExist and !current_entry:
         → conflict (key must exist but is absent)
@@ -148,7 +149,7 @@ for each range guard R in plan:
     for each key K in snap range:
         if !current key_dir contains K → conflict (key deleted since snapshot)
 
-// 3. Implicit W-W check on all write keys
+// 3. Implicit W-W check on all write keys (when plan has snapshot)
 for each write key K in plan:
     snap_entry    = snap.state_->key_dir.find(K)
     current_entry = current state_->key_dir.find(K)
@@ -179,42 +180,34 @@ Bytes out;
 snap.get(to_bytes("balance"), out);
 auto new_balance = compute(out);
 
-WritePlan plan;
+WritePlan plan{std::move(snap)};
 plan.ensure_unchanged(to_bytes("balance"));
 plan.put(to_bytes("balance"), new_balance);
-auto ok = db.apply_batch_if(snap, {}, std::move(plan));
+auto ok = db.apply_batch({}, std::move(plan));
 // ok == false if "balance" was written concurrently
 ```
 
 ### Single-operation optimization
 
-Both `apply_batch()` and `apply_batch_if()` wrap entries in `BulkBegin`/`BulkEnd` markers for multi-entry atomic recovery. A single-entry write does not need these markers: a single data entry is already atomic on disk — if the write is incomplete, the CRC check on recovery rejects it. When the write set contains exactly one entry, the marker writes are skipped and the entry is written directly, exactly as `put()` and `del()` do today.
+Both `apply_batch()` wraps entries in `BulkBegin`/`BulkEnd` markers for multi-entry atomic recovery. A single-entry write does not need these markers: a single data entry is already atomic on disk — if the write is incomplete, the CRC check on recovery rejects it. When the write set contains exactly one entry, the marker writes are skipped and the entry is written directly, exactly as `put()` and `del()` do today.
 
-This optimization is **purely internal** — no API change. A caller using `apply_batch_if()` for a single CAS write pays no marker overhead.
+This optimization is **purely internal** — no API change. A caller using `apply_batch()` with a guarded `WritePlan` for a single CAS write pays no marker overhead.
 
 | Path | Markers written |
 |---|---|
 | `put` / `del` | Never (single entry by definition) |
-| `apply_batch` with `size() == 1` | No (optimization) |
-| `apply_batch` with `size() > 1` | Yes (BulkBegin + BulkEnd required) |
-| `apply_batch_if` with 1 write | No (same optimization) |
-| `apply_batch_if` with > 1 writes | Yes |
+| `apply_batch` with 1 write | No (optimization) |
+| `apply_batch` with > 1 writes | Yes (BulkBegin + BulkEnd required) |
 
 ---
 
-## `WritePlan` — the `apply_batch_if` vocabulary type
+## `WritePlan` — the `apply_batch` vocabulary type
 
-`WritePlan` is the type consumed exclusively by `apply_batch_if`. It carries both **writes** (`put`, `del`) and **guards** (`ensure_present`, `ensure_absent`, `ensure_unchanged`, `ensure_range_unchanged`). Guards are preconditions checked atomically under `write_mu_` at commit time — if any guard fails, the entire plan is rejected and `apply_batch_if` returns `false`.
+`WritePlan` is the type consumed exclusively by `apply_batch`. It carries both **writes** (`put`, `del`) and **guards** (`ensure_present`, `ensure_absent`, `ensure_unchanged`, `ensure_range_unchanged`). Guards are preconditions checked atomically under `write_mu_` at commit time — if any guard fails, the entire plan is rejected and `apply_batch` returns `false`.
 
-### Why a separate type from `Batch`
+### WritePlan as the unified write type
 
-`Batch` is the unconditional atomic write primitive for `apply_batch` (Layer 0). Its vocabulary is `put` and `del` — nothing else. Mixing conditional guards into `Batch` would create a type that is only half-valid depending on which method consumes it: `apply_batch` would need to reject guards at runtime, and the type system would not prevent the mistake.
-
-`WritePlan` is a distinct type that carries the full conditional vocabulary. Compile-time separation:
-
-- You cannot pass a `WritePlan` to `apply_batch` — wrong type.
-- You cannot pass a `Batch` to `apply_batch_if` — wrong type.
-- `Batch` stays dead simple for the fast unconditional path.
+`WritePlan` serves as the single type for all write operations submitted to `apply_batch`. When constructed without a snapshot (`WritePlan()`), it behaves as a simple unconditional batch — only `ensure_present` and `ensure_absent` guards are available. When constructed with a snapshot (`WritePlan(Snapshot)`), the full guard vocabulary and implicit W-W checks are enabled. This unification eliminates the need for a separate `Batch` class.
 
 ### User-facing API
 
@@ -223,7 +216,9 @@ The API decomposes writes and preconditions into orthogonal primitives. Users co
 ```cpp
 export class WritePlan {
 public:
-  WritePlan() = default;
+  WritePlan();                         // snapshot-less: only ensure_present/ensure_absent available
+  explicit WritePlan(Snapshot snap);   // snapshot embedded; all guards available
+
   WritePlan(const WritePlan&) = delete;
   WritePlan& operator=(const WritePlan&) = delete;
   WritePlan(WritePlan&&) noexcept = default;
@@ -321,7 +316,7 @@ This section verifies that the `WritePlan` vocabulary is sufficient to implement
 
 Writer A: `put(k, v1)` — Writer B: `put(k, v2)`.
 
-`apply_batch_if` performs an implicit W-W check on every write key: it compares the snapshot sequence against the current sequence. Second committer sees mismatch → `false`. No guard needed — built into `apply_batch_if` for all write keys. ✅
+`apply_batch` performs an implicit W-W check on every write key: it compares the snapshot sequence against the current sequence. Second committer sees mismatch → `false`. No guard needed — built into `apply_batch` for all write keys. ✅
 
 **2. Delete-delete conflict**
 
@@ -376,11 +371,11 @@ snap.get(to_bytes("exchange_rate"), rate);
 snap.get(to_bytes("balance_a"), a);
 snap.get(to_bytes("balance_b"), b);
 
-WritePlan plan;
+WritePlan plan{std::move(snap)};
 plan.ensure_unchanged(to_bytes("exchange_rate"));  // guard read dependency
 plan.put(to_bytes("balance_a"), new_a);
 plan.put(to_bytes("balance_b"), new_b);
-db.apply_batch_if(snap, {}, std::move(plan));
+db.apply_batch({}, std::move(plan));
 ```
 
 If `exchange_rate` was modified concurrently → conflict. The written keys (`balance_a`, `balance_b`) are covered by the implicit W-W check. ✅
@@ -390,10 +385,10 @@ If `exchange_rate` was modified concurrently → conflict. The written keys (`ba
 Transaction iterates `[user:100:, user:200:)`, computes aggregate, writes result.
 
 ```cpp
-WritePlan plan;
+WritePlan plan{std::move(snap)};
 plan.ensure_range_unchanged(to_bytes("user:100:"), to_bytes("user:200:"));
 plan.put(to_bytes("aggregate"), result);
-db.apply_batch_if(snap, {}, std::move(plan));
+db.apply_batch({}, std::move(plan));
 ```
 
 Any insert, delete, or modification in the range since snapshot → conflict. ✅
@@ -403,11 +398,11 @@ Any insert, delete, or modification in the range since snapshot → conflict. �
 Insert `user:150:` only if the key prefix range is empty.
 
 ```cpp
-WritePlan plan;
+WritePlan plan{std::move(snap)};
 plan.ensure_range_unchanged(to_bytes("user:150:"), to_bytes("user:151:"));
 plan.ensure_absent(to_bytes("user:150:"));
 plan.put(to_bytes("user:150:"), value);
-db.apply_batch_if(snap, {}, std::move(plan));
+db.apply_batch({}, std::move(plan));
 ```
 
 `ensure_range_unchanged` catches concurrent inserts anywhere in the prefix. `ensure_absent` catches pre-existing key. ✅
@@ -417,11 +412,11 @@ db.apply_batch_if(snap, {}, std::move(plan));
 Verify that multiple keys were from a consistent cut.
 
 ```cpp
-WritePlan plan;
+WritePlan plan{std::move(snap)};
 plan.ensure_unchanged(to_bytes("k1"));
 plan.ensure_unchanged(to_bytes("k2"));
 plan.ensure_unchanged(to_bytes("k3"));
-db.apply_batch_if(snap, {}, std::move(plan));
+db.apply_batch({}, std::move(plan));
 // no writes — guards only. No disk I/O on success.
 ```
 
@@ -443,7 +438,7 @@ db.apply_batch_if(snap, {}, std::move(plan));
 
 | Guarantee | Mechanism | Sufficient? |
 |---|---|---|
-| W-W on written keys | Implicit in `apply_batch_if` (sequence check on all writes) | ✅ |
+| W-W on written keys | Implicit in `apply_batch` (sequence check on all writes) | ✅ |
 | W-W conditional insert | `ensure_absent` + `put` | ✅ |
 | W-W conditional update | `ensure_present` + `put` | ✅ |
 | W-W conditional delete | `ensure_present` + `del` | ✅ |
@@ -458,13 +453,13 @@ The six primitives cover all standard W-W and R-W transactional guarantees for a
 
 ## Layer 2: `Transaction` — optional ergonomics
 
-`Transaction` is an accumulator built entirely on top of `snapshot()` and `apply_batch_if()`. Use it when you need:
+`Transaction` is an accumulator built entirely on top of `snapshot()` and `apply_batch()`. Use it when you need:
 
 - **Read-your-own-writes**: reads within the transaction check the buffered write set first.
 - **Iterators over the merged state**: `iter_from()` and `keys_from()` merge the snapshot and the write set.
 - **Deferred commit with rollback**: the write set is only materialized to disk on `commit()`.
 
-It adds **no new mechanism**. `commit()` builds a `WritePlan` from the write set (and read set for Serializable) and calls `db_.apply_batch_if(snapshot_, opts, std::move(plan))`. Conflict detection, serialization, and durability all come from `apply_batch_if()`.
+It adds **no new mechanism**. `commit()` builds a `WritePlan` from the write set (and read set for Serializable) and calls `db_.apply_batch(opts, std::move(plan))`. Conflict detection, serialization, and durability all come from `apply_batch()`.
 
 `Transaction` holds a non-owning `DB*`. `DB` is not modified to support `Transaction` beyond the two Layer 1 primitives.
 
@@ -508,7 +503,7 @@ public:
   [[nodiscard]] auto keys_from(BytesView from = {}) const
       -> std::ranges::subrange<TxnKeyIterator, std::default_sentinel_t>;
 
-  // Builds a WritePlan from the write set; calls db_.apply_batch_if(snapshot_, plan).
+  // Builds a WritePlan from the write set; calls db_.apply_batch(opts, plan).
   // For Serializable: emits ensure_unchanged / ensure_range_unchanged guards
   // into the WritePlan for read-set keys, checked atomically under write_mu_.
   // Returns true if committed, false on conflict.
@@ -538,7 +533,7 @@ Bytes out;
 txn.get(to_bytes("k"), out);          // reads from snapshot
 txn.put(to_bytes("k"), new_value);    // buffered
 txn.get(to_bytes("k"), out);          // returns new_value (write set wins)
-auto ok = txn.commit();  // calls db.apply_batch_if(snapshot_, {}, plan)
+auto ok = txn.commit();  // calls db.apply_batch({}, plan)
                          // ok == false if "k" was modified concurrently
 ```
 
@@ -564,14 +559,14 @@ auto Transaction::commit() -> bool {
     else     plan.del(key);
   }
 
-  if (!db_->apply_batch_if(snapshot_, WriteOptions{}, std::move(plan)))
+  if (!db_->apply_batch(WriteOptions{}, std::move(plan)))
     return false;
   committed_ = true;
   return true;
 }
 ```
 
-No `txn_mu_`. No wrapper class. `apply_batch_if()` handles all conflict checks atomically under `write_mu_` — both the explicit guards and the implicit W-W check on write keys. Conflicts are signalled by return value (`false`), not exceptions — they are expected outcomes in concurrent workloads, not errors. I/O failures remain exceptions (`std::system_error`).
+No `txn_mu_`. No wrapper class. `apply_batch()` handles all conflict checks atomically under `write_mu_` — both the explicit guards and the implicit W-W check on write keys. Conflicts are signalled by return value (`false`), not exceptions — they are expected outcomes in concurrent workloads, not errors. I/O failures remain exceptions (`std::system_error`).
 
 ---
 
@@ -583,15 +578,15 @@ No `txn_mu_`. No wrapper class. `apply_batch_if()` handles all conflict checks a
 
 ### Snapshot isolation (Layer 1 and Layer 2)
 
-Available directly via `apply_batch_if()` or via `Transaction`. The snapshot is captured once; at commit, each key in the batch is compared against the current key directory by `sequence`. First-committer-wins.
+Available directly via `apply_batch()` or via `Transaction`. The snapshot is captured once; at commit, each key in the batch is compared against the current key directory by `sequence`. First-committer-wins.
 
 Prevents: dirty reads, non-repeatable reads, phantom reads (consistent snapshot). Does **not** prevent: write skew.
 
 ### Serializable isolation (later milestone — Layer 2 only)
 
-Extends Snapshot isolation by tracking the **read set** inside `Transaction::get()` and performing a **read-write conflict check** in `Transaction::commit()` before calling `apply_batch_if()`. Prevents write skew.
+Extends Snapshot isolation by tracking the **read set** inside `Transaction::get()` and performing a **read-write conflict check** in `Transaction::commit()` before calling `apply_batch()`. Prevents write skew.
 
-`apply_batch_if()` does not change for Serializable — the R-W check is purely in `Transaction`, using `sequence` fields already present in `KeyDirEntry`. No new engine mechanism is required.
+`apply_batch()` does not change for Serializable — the R-W check is purely in `Transaction`, using `sequence` fields already present in `KeyDirEntry`. No new engine mechanism is required.
 
 ### ReadUncommitted / ReadCommitted
 
@@ -601,7 +596,7 @@ Not meaningful in ByteCaskDB's SWMR model. Writes are only visible after `state_
 
 ## Conflict signalling
 
-Conflicts are expected outcomes in concurrent workloads — they are not errors. Both `apply_batch_if()` and `Transaction::commit()` return `bool`: `true` if committed, `false` on conflict (W-W or guard violation). The caller's only response is retry or abort.
+Conflicts are expected outcomes in concurrent workloads — they are not errors. Both `apply_batch()` and `Transaction::commit()` return `bool`: `true` if committed, `false` on conflict (W-W or guard violation). The caller's only response is retry or abort.
 
 I/O failures remain exceptions (`std::system_error`) — those are genuinely unexpected.
 
@@ -613,10 +608,10 @@ while (true) {
   auto snap = db.snapshot();
   Bytes out;
   snap.get(to_bytes("counter"), out);
-  WritePlan plan;
+  WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("counter"));
   plan.put(to_bytes("counter"), increment(out));
-  if (db.apply_batch_if(snap, {}, std::move(plan))) break;
+  if (db.apply_batch({}, std::move(plan))) break;
 }
 ```
 
@@ -626,15 +621,15 @@ while (true) {
 
 | Concept | RocksDB | ByteCaskDB |
 |---|---|---|
-| CAS write | Not directly available; requires `TransactionDB` | `db.apply_batch_if(snap, opts, batch)` — on plain `DB` |
+| CAS write | Not directly available; requires `TransactionDB` | `db.apply_batch(opts, plan)` — on plain `DB` |
 | Snapshot | `db->GetSnapshot()` + manual `ReleaseSnapshot()` | `db.snapshot()` → `Snapshot` with RAII lifetime |
 | Begin transaction | `txn_db->BeginTransaction(...)` — via mandatory wrapper | `Transaction{db, level}` — direct construction; no wrapper |
 | Mandatory wrapper | Yes: `TransactionDB::Open()` takes ownership of `DB` | No: `Transaction` holds `DB&`; `DB` is unchanged |
 | Read within txn | `txn->Get(read_opts, key, &value)` | `txn.get(key, out)` |
 | Write within txn | `txn->Put(key, value)` — deferred | `txn.put(key, value)` — deferred |
-| Commit | `txn->Commit()` — conflict check + flush | `txn.commit()` → `db.apply_batch_if()` |
+| Commit | `txn->Commit()` — conflict check + flush | `txn.commit()` → `db.apply_batch()` |
 | Rollback | `txn->Rollback()` | `txn.rollback()` — discard write set, no I/O |
-| Conflict serialization | Separate lock manager or per-key locks | `write_mu_` inside `apply_batch_if()` — no extra infrastructure |
+| Conflict serialization | Separate lock manager or per-key locks | `write_mu_` inside `apply_batch()` — no extra infrastructure |
 | File retention | SST files are immutable + ref-counted | `Snapshot` holds `shared_ptr<EngineState>` → vacuum deferred automatically |
 
 The key structural difference: RocksDB's transaction support requires a mandatory `TransactionDB` wrapper that takes ownership of the underlying `DB`. ByteCaskDB's Layer 1 primitives are available directly on `DB`, so any caller can use conflict-safe writes without adopting a wrapper type or changing how they manage the database object.
@@ -696,7 +691,7 @@ Snapshot isolation prevents dirty reads and phantom reads but allows **write ske
 
 Serializable requires both the R-W check and the apply to be atomic under `write_mu_`. Performing the R-W check outside `write_mu_` — as a naive design would — is **unsound**: another writer can commit between the check and the apply, invalidating the result.
 
-The correct design is for the R-W check to run *inside* `apply_batch_if()`, under `write_mu_`, alongside the existing W-W check. `WritePlan` carries both writes and guards, and `apply_batch_if` processes all of them atomically:
+The correct design is for the R-W check to run *inside* `apply_batch()`, under `write_mu_`, alongside the existing W-W check. `WritePlan` carries both writes and guards, and `apply_batch` processes all of them atomically:
 
 ```
 lock write_mu_
@@ -721,16 +716,16 @@ unlock write_mu_
 // for each key in read_set_points_:    plan.ensure_unchanged(key)
 // for each (from, to) in read_set_ranges_: plan.ensure_range_unchanged(from, to)
 // for each (key, val) in write_set_:   plan.put / plan.del
-db_->apply_batch_if(snapshot_, opts, std::move(plan));
+db_->apply_batch(opts, std::move(plan));
 ```
 
-No separate overload on `DB` is needed. `WritePlan` is the extension point — `apply_batch_if` signature stays `apply_batch_if(snap, opts, plan)` for all isolation levels.
+No separate overload on `DB` is needed. `WritePlan` is the extension point — `apply_batch` signature stays `apply_batch(opts, plan)` for all isolation levels.
 
 ### Range Serializability (later milestone)
 
 Point-read Serializability (above) is straightforward. Range Serializability — detecting phantoms when a transaction iterates a range — requires tracking range predicates in the read set.
 
-`Transaction::iter_from(from)` would record a `RangeRead{from, {}}` into `read_set_ranges_` as it advances; `Transaction::commit()` then emits `plan.ensure_range_unchanged(from, to)` for each tracked range. `apply_batch_if()` performs the bounded scan of the current key directory — O(keys in range), no disk I/O.
+`Transaction::iter_from(from)` would record a `RangeRead{from, {}}` into `read_set_ranges_` as it advances; `Transaction::commit()` then emits `plan.ensure_range_unchanged(from, to)` for each tracked range. `apply_batch()` performs the bounded scan of the current key directory — O(keys in range), no disk I/O.
 
 `PersistentRadixTree` already has `lower_bound()` and DFS iteration, so the scan is feasible. The new piece is plumbing range records through the iterator into `Transaction::read_set_ranges_`. Until implemented, `Transaction::iter_from()` on a `Serializable` transaction throws `std::logic_error`, documenting the limitation rather than silently degrading the isolation guarantee.
 
@@ -751,9 +746,9 @@ Two additions to `DB`'s public interface:
 // Returns a consistent read-only view of the DB at this instant.
 [[nodiscard]] auto snapshot() const -> Snapshot;
 
-// Applies plan atomically iff all guards pass and no written key was modified since snap.
+// Applies plan atomically iff all guards pass and no written key was modified since the plan's snapshot.
 // Returns true if committed, false on conflict. Throws std::system_error on I/O failure.
-[[nodiscard]] auto apply_batch_if(const Snapshot& snap, WriteOptions opts, WritePlan plan) -> bool;
+[[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan) -> bool;
 ```
 
 Everything else — `Transaction`, `TxnEntryIterator`, `TxnKeyIterator`, `IsolationLevel` — lives in `src/transactions.cpp`. `Snapshot` and `WritePlan` are exported from `bytecask.cppm`.
@@ -766,11 +761,11 @@ No `TransactionalDB`. No `txn_mu_`. No `friend` declarations added to `DB`. No i
 
 | Name | Status |
 |---|---|
-| `DB` | Two additions: `snapshot()`, `apply_batch_if()` |
-| `Batch`, `BatchInsert`, `BatchRemove` | Unchanged (Layer 0 only) |
+| `DB` | Two additions: `snapshot()`, `apply_batch()` |
+| `Batch`, `BatchInsert`, `BatchRemove` | **Removed** (unified into `WritePlan`) |
 | `ReadOptions`, `WriteOptions`, `Options`, `VacuumOptions` | Unchanged |
 | `KeyIterator`, `EntryIterator` | Unchanged |
-| `WritePlan` | **New** — conditional write + guard vocabulary for `apply_batch_if` |
+| `WritePlan` | **New** — conditional write + guard vocabulary for `apply_batch` |
 | `Snapshot` | **New** |
 | `Transaction` | **New** |
 | `IsolationLevel` | **New** |
@@ -781,16 +776,15 @@ No `TransactionalDB`. No `txn_mu_`. No `friend` declarations added to `DB`. No i
 
 ---
 
-## Interaction with existing `Batch`
+## Interaction with `put`/`del` convenience methods
 
-`Batch` remains the unconditional atomic write primitive (Layer 0). It carries only `put` and `del` — no guards, no snapshot-relative semantics. `apply_batch(Batch)` is the fast path for callers who do not need conflict detection.
+`put` and `del` remain as convenience methods on `DB` for single-key operations. Internally they build a `WritePlan` and delegate to `apply_batch`. They carry no guards, no snapshot-relative semantics — the fast path for callers who do not need conflict detection.
 
-`WritePlan` is the conditional, snapshot-relative primitive (Layer 1). It carries writes *and* guards. `apply_batch_if(Snapshot, WritePlan)` checks all guards and W-W constraints atomically before applying.
+`WritePlan` is the unified type for all write operations. When constructed without a snapshot, it provides unconditional writes. When constructed with a snapshot, it enables the full guard vocabulary and implicit W-W checks.
 
-The two types are distinct — you cannot pass one where the other is expected. The layers are complementary:
-
-- Use `put` / `del` / `apply_batch(Batch)` when you are the sole writer or do not need conflict safety.
-- Use `db.snapshot()` + `db.apply_batch_if(snap, plan)` when you need conflict-safe conditional writes.
+- Use `put` / `del` for single-key unconditional writes.
+- Use `apply_batch(opts, WritePlan{})` for unconditional multi-key atomic writes.
+- Use `db.snapshot()` + `apply_batch(opts, WritePlan{snap})` when you need conflict-safe conditional writes.
 - Use `Transaction` when you need read-your-own-writes, deferred writes, rollback, or iteration over the merged state.
 
 ---
@@ -803,11 +797,11 @@ The two types are distinct — you cannot pass one where the other is expected. 
 | `DB::snapshot()` | One-liner: `return Snapshot{state_.load()}` |
 | `Snapshot` class | New export; wraps `shared_ptr<const EngineState>`; full read-only API |
 | `WritePlan` class | New export; per-key `KeyAction` map + range guards; build-time validation |
-| `DB::apply_batch_if()` | New method on `DB`: guard check + W-W sequence check under `write_mu_` + existing apply path |
-| Single-op optimization | Skip `BulkBegin`/`BulkEnd` when write count == 1 (both `apply_batch` and `apply_batch_if`) |
-| `Transaction` class | New; holds `DB*` + `Snapshot` + write set; `commit()` builds `WritePlan` and calls `apply_batch_if()` |
-| W-W conflict check | ~15 lines inside `apply_batch_if()` |
-| Guard checks (point + range) | ~25 lines inside `apply_batch_if()`, under `write_mu_` |
+| `DB::apply_batch()` | Unified method on `DB`: guard check + W-W sequence check under `write_mu_` + existing apply path |
+| Single-op optimization | Skip `BulkBegin`/`BulkEnd` when write count == 1 |
+| `Transaction` class | New; holds `DB*` + `Snapshot` + write set; `commit()` builds `WritePlan` and calls `apply_batch()` |
+| W-W conflict check | ~15 lines inside `apply_batch()` |
+| Guard checks (point + range) | ~25 lines inside `apply_batch()`, under `write_mu_` |
 | `TxnKeyIterator` | New: two-pointer merge of snapshot `KeyIterator` + write-set keys |
 | `TxnEntryIterator` | New: same merge; values read lazily from snapshot files |
 | Range R-W tracking for Serializable | Later milestone: iterator records ranges into `Transaction::read_set_ranges_` |
@@ -820,8 +814,8 @@ The two types are distinct — you cannot pass one where the other is expected. 
 
 | File | Change | Content |
 |---|---|---|
-| `src/bytecask.cppm` | Modified | Forward-declare `Snapshot` before `DB`; add `snapshot()` and `apply_batch_if()` to `DB`; append full definitions of `WritePlan`, `Snapshot` after `DB`; `IsolationLevel`, `TxnKeyIterator`, `TxnEntryIterator`, `Transaction` in `src/transactions.cpp` |
-| `src/bytecask.cpp` | Modified | `DB::snapshot()` and `DB::apply_batch_if()` implementations; single-op optimization in both `apply_batch` and `apply_batch_if` |
+| `src/bytecask.cppm` | Modified | Forward-declare `Snapshot` before `DB`; add `snapshot()` and `apply_batch(WritePlan)` to `DB`; append full definitions of `WritePlan`, `Snapshot` after `DB`; `IsolationLevel`, `TxnKeyIterator`, `TxnEntryIterator`, `Transaction` in `src/transactions.cpp` |
+| `src/bytecask.cpp` | Modified | `DB::snapshot()` and `DB::apply_batch()` implementations |
 | `src/transactions.cpp` | **New** | `Snapshot` method bodies; `TxnKeyIterator`; `TxnEntryIterator`; `Transaction` method bodies |
 | `xmake.lua` | Modified | `src/bytecask.cpp` → `src/*.cpp` to pick up the new translation unit (all three targets) |
 | `tests/bytecask_test.cpp` | Modified | New `[transaction]` TEST_CASEs |
@@ -846,23 +840,23 @@ export class DB { ... };
 
 `KeyDirEntry::sequence` is the actual field. The design doc uses "lsn"/"sequence" as interchangeable concept names; the implementation uses `sequence` throughout.
 
-### Access to `Snapshot::state_` in `apply_batch_if`
+### Access to `Snapshot::state_` in `apply_batch`
 
-`apply_batch_if` is a method on `DB`. `Snapshot` declares `friend class DB`, so `DB`'s methods can read `snap.state_` directly. `WritePlan::actions_` and `WritePlan::range_guards_` are accessible to `DB` via `friend class DB` on `WritePlan`.
+`apply_batch` is a method on `DB`. `Snapshot` declares `friend class DB`, so `DB`'s methods can read `snap.state_` directly. `WritePlan::actions_` and `WritePlan::range_guards_` are accessible to `DB` via `friend class DB` on `WritePlan`.
 
 ### Test coverage
 
 | Test | What it proves |
 |---|---|
 | `DB::snapshot()` standalone | Read-only view consistent after concurrent writes |
-| `apply_batch_if` no conflict | Applies when no concurrent write occurred |
-| `apply_batch_if` W-W conflict | Returns `false` when key modified after snapshot |
-| `apply_batch_if` `ensure_present` | Returns `false` when guarded key is absent |
-| `apply_batch_if` `ensure_absent` | Returns `false` when guarded key is present |
-| `apply_batch_if` `ensure_unchanged` | Returns `false` when guarded key was modified since snapshot |
-| `apply_batch_if` `ensure_range_unchanged` | Returns `false` when a key in the guarded range was modified |
+| `apply_batch` no conflict | Applies when no concurrent write occurred |
+| `apply_batch` W-W conflict | Returns `false` when key modified after snapshot |
+| `apply_batch` `ensure_present` | Returns `false` when guarded key is absent |
+| `apply_batch` `ensure_absent` | Returns `false` when guarded key is present |
+| `apply_batch` `ensure_unchanged` | Returns `false` when guarded key was modified since snapshot |
+| `apply_batch` `ensure_range_unchanged` | Returns `false` when a key in the guarded range was modified |
 | `WritePlan` contradictory guards | Throws `std::logic_error` at build time for `ensure_present` + `ensure_absent` on same key |
-| Single-op optimization | `apply_batch` / `apply_batch_if` with 1 write writes no markers (verify via `file_stats` byte counts) |
+| Single-op optimization | `apply_batch` / `apply_batch` with 1 write writes no markers (verify via `file_stats` byte counts) |
 | `Transaction` read-your-own-writes | `txn.put(k, v)` then `txn.get(k)` returns `v` before commit |
 | `Transaction` snapshot read consistency | `txn.get(k)` returns snapshot value, not a later committed write |
 | `Transaction` W-W conflict | Two concurrent transactions write same key; second commit throws |
@@ -876,11 +870,10 @@ export class DB { ... };
 
 The layered design is explicitly closed for modification and open for extension at every seam:
 
-- **`DB`** (`put`, `del`, `apply_batch`) — untouched when transactions are added.
-- **`Batch`** — unchanged. Remains the unconditional Layer 0 primitive. Never absorbs conditional operations.
-- **`apply_batch_if`** — signature never changes. `WritePlan` absorbs new guard types; `apply_batch_if` processes whatever is in the plan.
+- **`DB`** (`put`, `del`, `apply_batch`) — stable public interface.
+- **`apply_batch`** — signature never changes. `WritePlan` absorbs new guard types; `apply_batch` processes whatever is in the plan.
 - **`WritePlan`** is the extension point. New guard types (e.g. `ensure_value_equals` if ever needed) are added to it; nothing upstream changes.
-- **`Transaction`** — when range Serializability arrives, `iter_from()` starts populating `read_set_ranges_` and emitting `ensure_range_unchanged` into the `WritePlan` at commit. No change to `apply_batch_if`, no change to `DB`.
+- **`Transaction`** — when range Serializability arrives, `iter_from()` starts populating `read_set_ranges_` and emitting `ensure_range_unchanged` into the `WritePlan` at commit. No change to `apply_batch`, no change to `DB`.
 
 Each milestone is purely additive. No existing call site needs modification when a higher isolation level is introduced.
 
@@ -894,4 +887,4 @@ Each milestone is purely additive. No existing call site needs modification when
 
 3. **Range Serializability milestone boundary**: `Transaction::iter_from()` on a `Serializable` transaction throws `std::logic_error` until range tracking is implemented. Silently degrading the isolation guarantee without the caller knowing is worse than a clear error.
 
-4. **R-W check scope**: all guard checks (`ensure_present`, `ensure_absent`, `ensure_unchanged`, `ensure_range_unchanged`) run inside `apply_batch_if` under `write_mu_`, alongside the implicit W-W check. This makes `apply_batch_if` a single, unified conflict-checking primitive. Callers who need only W-W protection simply build a `WritePlan` with writes only — no guards. Callers who need R-W protection add guards. `Transaction::commit()` emits guards for its read set automatically.
+4. **R-W check scope**: all guard checks (`ensure_present`, `ensure_absent`, `ensure_unchanged`, `ensure_range_unchanged`) run inside `apply_batch` under `write_mu_`, alongside the implicit W-W check. This makes `apply_batch` a single, unified conflict-checking primitive. Callers who need only W-W protection simply build a `WritePlan` with writes only — no guards. Callers who need R-W protection add guards. `Transaction::commit()` emits guards for its read set automatically.

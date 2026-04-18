@@ -16,7 +16,7 @@
 //   - bytecask_snapshot() returns a heap-allocated opaque snapshot. The caller
 //     owns it and must eventually call bytecask_snapshot_free().
 //   - bytecask_write_plan_new*() return a heap-allocated opaque write plan.
-//     Plans are consumed by bytecask_apply_batch_if(); if not applied, free
+//     Plans are consumed by bytecask_apply_batch(); if not applied, free
 //     with bytecask_write_plan_free().
 //   - Value buffers written by get/iter functions are heap-allocated by the
 //     callee and owned by the caller; free with bytecask_free_buf().
@@ -159,7 +159,7 @@ void bytecask_snapshot_free(bytecask_snapshot_t *snap);
 // Write plans (conditional atomic writes)
 //
 // A WritePlan accumulates put/del operations and optional precondition guards.
-// bytecask_apply_batch_if() applies the plan atomically iff all guards hold.
+// bytecask_apply_batch() applies the plan atomically iff all guards hold.
 // ---------------------------------------------------------------------------
 
 // Creates an empty write plan without a snapshot.
@@ -208,7 +208,7 @@ int bytecask_write_plan_ensure_range_unchanged(bytecask_write_plan_t *plan,
                                                size_t to_len);
 
 // Frees the write plan.  No-op if plan is NULL.
-// Do not call after bytecask_apply_batch_if() — that consumes the plan.
+// Do not call after bytecask_apply_batch() — that consumes the plan.
 void bytecask_write_plan_free(bytecask_write_plan_t *plan);
 
 // Applies the plan atomically iff all guards hold and no written key was
@@ -216,9 +216,9 @@ void bytecask_write_plan_free(bytecask_write_plan_t *plan);
 // Returns 1 if committed, 0 on conflict, -1 on error.
 // The plan is consumed (freed) regardless of outcome — caller must not use
 // it after this call.
-int bytecask_apply_batch_if(bytecask_db_t *db,
-                            bytecask_write_plan_t *plan,
-                            int sync);
+int bytecask_apply_batch(bytecask_db_t *db,
+                         bytecask_write_plan_t *plan,
+                         int sync);
 
 // ---------------------------------------------------------------------------
 // Vacuum

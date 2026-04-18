@@ -191,7 +191,7 @@ int ha_bytecaskdb::delete_table(const char *name) {
                                 upper.data(), upper.size());
   bytecask_write_plan_del(plan, cat_key.data(), cat_key.size());
 
-  int rc = bytecask_apply_batch_if(g_db, plan, /*sync=*/1);
+  int rc = bytecask_apply_batch(g_db, plan, /*sync=*/1);
   if (rc < 0) { return HA_ERR_GENERIC; }
 
   catalog_evict_from_cache(name);
