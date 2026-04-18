@@ -211,9 +211,9 @@ target("bytecaskdb_python")
         -- On Linux, reject undefined symbols at link time so missing deps fail early.
         -- On macOS, Python C API symbols are resolved at runtime when the interpreter
         -- loads the extension, so use -undefined dynamic_lookup instead.
-        if t:is_plat("linux") then
+        if os.host() == "linux" then
             t:add("ldflags", "-Wl,--no-undefined", {force = true})
-        elseif t:is_plat("macosx") then
+        else
             t:add("ldflags", "-undefined", "dynamic_lookup", {force = true})
         end
         apply_sanitizer(t)
