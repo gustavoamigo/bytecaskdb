@@ -44,7 +44,7 @@ jobs:
       BYTECASK_MARCH: x86-64-v3
     strategy:
       matrix:
-        python: ["cp312-cp312", "cp313-cp313", "cp314-cp314"]
+        python: ["cp312-cp312", "cp313-cp313", "cp313-cp313t", "cp314-cp314", "cp314-cp314t"]
     steps:
       - uses: actions/checkout@v4
 
@@ -122,7 +122,7 @@ jobs:
     runs-on: macos-14
     strategy:
       matrix:
-        python-version: ["3.12", "3.13", "3.14"]
+        python-version: ["3.12", "3.13", "3.13t", "3.14", "3.14t"]
     steps:
       - uses: actions/checkout@v4
 

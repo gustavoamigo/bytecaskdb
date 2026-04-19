@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -70,6 +71,7 @@ struct PyDB {
 
 struct PySnapshot {
   std::optional<bytecask::Snapshot> snap;
+  std::unique_ptr<nb::ft_mutex> mu{std::make_unique<nb::ft_mutex>()};
 
   explicit PySnapshot(bytecask::Snapshot s) : snap{std::move(s)} {}
 
@@ -80,6 +82,7 @@ struct PySnapshot {
   }
 
   auto take() -> bytecask::Snapshot {
+    nb::ft_lock_guard lock{*mu};
     check();
     auto s = std::move(*snap);
     snap.reset();
@@ -94,6 +97,7 @@ struct PySnapshot {
 
 struct PyWritePlan {
   std::optional<bytecask::WritePlan> plan;
+  std::unique_ptr<nb::ft_mutex> mu{std::make_unique<nb::ft_mutex>()};
 
   PyWritePlan() : plan{bytecask::WritePlan{}} {}
 
@@ -141,6 +145,7 @@ struct PyWritePlan {
   }
 
   auto take() -> bytecask::WritePlan {
+    nb::ft_lock_guard lock{*mu};
     check();
     auto p = std::move(*plan);
     plan.reset();
@@ -310,27 +315,27 @@ NB_MODULE(_bytecaskdb, m) {
       .def("__iter__", [](PyEntryIterator &self) -> PyEntryIterator & {
         return self;
       })
-      .def("__next__", &PyEntryIterator::next);
+      .def("__next__", &PyEntryIterator::next, nb::lock_self());
 
   nb::class_<PyKeyIterator>(m, "KeyIterator")
       .def("__iter__", [](PyKeyIterator &self) -> PyKeyIterator & {
         return self;
       })
-      .def("__next__", &PyKeyIterator::next);
+      .def("__next__", &PyKeyIterator::next, nb::lock_self());
 
   nb::class_<PyReverseEntryIterator>(m, "ReverseEntryIterator")
       .def("__iter__",
            [](PyReverseEntryIterator &self) -> PyReverseEntryIterator & {
              return self;
            })
-      .def("__next__", &PyReverseEntryIterator::next);
+      .def("__next__", &PyReverseEntryIterator::next, nb::lock_self());
 
   nb::class_<PyReverseKeyIterator>(m, "ReverseKeyIterator")
       .def("__iter__",
            [](PyReverseKeyIterator &self) -> PyReverseKeyIterator & {
              return self;
            })
-      .def("__next__", &PyReverseKeyIterator::next);
+      .def("__next__", &PyReverseKeyIterator::next, nb::lock_self());
 
   // -------------------------------------------------------------------------
   // Snapshot
@@ -434,24 +439,24 @@ NB_MODULE(_bytecaskdb, m) {
            },
            "snapshot"_a)
       .def("put", &PyWritePlan::put, "Stage a key-value write.",
-           "key"_a, "value"_a)
+           "key"_a, "value"_a, nb::lock_self())
       .def("del_", &PyWritePlan::del, "Stage a key deletion.",
-           "key"_a)
+           "key"_a, nb::lock_self())
       .def("del_range", &PyWritePlan::del_range,
            "Stage a range deletion: all keys in [from_key, to_key).",
-           "from_key"_a, "to_key"_a)
+           "from_key"_a, "to_key"_a, nb::lock_self())
       .def("ensure_present", &PyWritePlan::ensure_present,
            "Guard: key must exist at commit time.",
-           "key"_a)
+           "key"_a, nb::lock_self())
       .def("ensure_absent", &PyWritePlan::ensure_absent,
            "Guard: key must be absent at commit time.",
-           "key"_a)
+           "key"_a, nb::lock_self())
       .def("ensure_unchanged", &PyWritePlan::ensure_unchanged,
            "Guard: key must not have changed since the snapshot.",
-           "key"_a)
+           "key"_a, nb::lock_self())
       .def("ensure_range_unchanged", &PyWritePlan::ensure_range_unchanged,
            "Guard: no key in [from_key, to_key) changed since the snapshot.",
-           "from_key"_a, "to_key"_a)
+           "from_key"_a, "to_key"_a, nb::lock_self())
       .def_prop_ro("has_snapshot", &PyWritePlan::has_snapshot,
                    "True if this plan was constructed with a snapshot.");
 

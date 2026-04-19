@@ -42,6 +42,21 @@ ByteCaskDB uses C++23 modules internally, which are not portable across compilat
 
 Any out-of-tree consumer (not just the MariaDB plugin) should use this C API boundary rather than importing the C++23 modules directly.
 
+### Python Bindings
+
+`bytecask-python/` provides Python bindings via [nanobind](https://github.com/wjakob/nanobind), wrapping the C++23 module interface directly (not the C API). The extension exposes DB, Snapshot, WritePlan, all iterator types, and Options. The GIL is released on all I/O paths so multiple Python threads can perform concurrent reads.
+
+**Free-threaded Python (PEP 703)**: the bindings support free-threaded Python 3.13+ (`Py_GIL_DISABLED=1`). The build system auto-detects free-threading via `sysconfig.get_config_var('Py_GIL_DISABLED')` and defines `NB_FREE_THREADED`, which declares `Py_mod_gil = Py_MOD_GIL_NOT_USED` and activates nanobind's locking primitives.
+
+The locking strategy respects the engine's existing thread model:
+
+- **DB reads and snapshot reads are unlocked** — the C++ engine provides lock-free reads via immutable snapshots; adding Python-level locks would destroy read scaling.
+- **`PySnapshot::take()`** is protected by `nb::ft_mutex` — the move-out operation is not atomic and concurrent double-move would be UB.
+- **Iterator `__next__`** uses `nb::lock_self()` — mutable cursor state must be serialized per-instance.
+- **WritePlan mutation methods** use `nb::lock_self()` — the check-then-mutate pattern is not atomic.
+
+Under GIL Python, all nanobind locking primitives (`nb::ft_mutex`, `nb::lock_self()`) are no-ops — zero overhead.
+
 ## Design Principles
 
 The design follows these core tenets in order of priority:
