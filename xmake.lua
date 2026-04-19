@@ -177,7 +177,7 @@ target("bytecaskdb_python")
     add_packages("crc32c")
     -- nanobind requires compiling nb_combined.cpp from the nanobind package.
     on_load(function(t)
-        local python = "python3"
+        local python = os.getenv("BYTECASK_PYTHON") or "python3"
         -- Python include directory
         local py_inc = os.iorunv(python, {"-c", "import sysconfig; print(sysconfig.get_path('include'))"})
         t:add("includedirs", py_inc:trim())
@@ -199,6 +199,12 @@ target("bytecaskdb_python")
         t:set("prefixname", "")  -- no "lib" prefix
         t:set("extension", ".so")
         t:set("targetdir", path.join(os.projectdir(), "bytecask-python", "bytecaskdb"))
+        -- Detect free-threaded Python and enable nanobind free-threading support.
+        local gil_disabled = os.iorunv(python, {"-c",
+            "import sysconfig; print(sysconfig.get_config_var('Py_GIL_DISABLED') or 0)"})
+        if gil_disabled:trim() == "1" then
+            t:add("cxxflags", "-DNB_FREE_THREADED", {force = true})
+        end
     end)
     -- Suppress warnings from nanobind headers (third-party code).
     add_cxxflags("-Wno-old-style-cast", "-Wno-extra-semi-stmt", "-Wno-shadow",

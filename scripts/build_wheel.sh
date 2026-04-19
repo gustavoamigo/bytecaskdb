@@ -34,7 +34,10 @@ PYTHON_TAG=$(python3 -c "
 import sys
 print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
 
-ABI_TAG="$PYTHON_TAG"
+ABI_TAG=$(python3 -c "
+import sys
+flags = getattr(sys, 'abiflags', '')
+print(f'cp{sys.version_info.major}{sys.version_info.minor}{flags}')")
 
 case "$(uname -s)" in
   Linux)

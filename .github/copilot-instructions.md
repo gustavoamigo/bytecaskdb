@@ -5,6 +5,7 @@ These instructions apply to every repository work request in this workspace.
 ## General instruction
 
 - Ignore `docs/old_bytecask_design.md`, it's there just so we I can copy and paste ideas from an older project. 
+- When generating commit messages or pull request descriptions, never include 'Co-authored-by' trailers or metadata attributing the work to an AI.
 
 ## Required workflow for every implementation request
 
