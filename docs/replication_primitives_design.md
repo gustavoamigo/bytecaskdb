@@ -72,7 +72,7 @@ Implementation:
 2. Open a cursor per qualifying **hint file**. Hint files contain the entry metadata (sequence, entry_type, key, value_size, file_offset) — no data file reads needed for the scan itself. Within each hint file, skip entries with `sequence <= from_sequence`.
 3. **Merge by sequence:** maintain a min-heap over hint file cursors, yielding the entry with the lowest sequence at each step. This produces a globally ordered stream even when vacuum has rewritten entries into new files in key order rather than sequence order. This is the same fan-in merge pattern that recovery already uses.
 4. **Lazy value fetch:** the actual value bytes are read from the data file via `pread` only when the caller consumes the entry. Deletes and range deletes require no data file read at all.
-5. **Incomplete batch filtering:** within each file, track `BulkBegin`/`BulkEnd` markers. If a `BulkBegin` is seen without a matching `BulkEnd` before end of file, all entries since that `BulkBegin` are discarded — they belong to an uncommitted `apply_batch`. `BulkBegin`/`BulkEnd` markers themselves are stripped from the output.
+5. **Incomplete batch filtering:** within each file, track `BulkBegin`/`BulkCommit`/`BulkPrepare`/`Bulk2PCCommit` markers. If a `BulkBegin` is seen without a matching `BulkCommit` or `BulkPrepare` before end of file, all entries since that `BulkBegin` are discarded — they belong to an uncommitted batch. Prepared batches (`BulkPrepare` without `Bulk2PCCommit`) are also discarded — the follower only ingests fully committed entries. All batch markers are stripped from the output.
 
 The iterator holds a reference to the `Snapshot`, which pins all data files alive for the duration of the scan — vacuum cannot reclaim them mid-iteration.
 
@@ -163,10 +163,21 @@ No sequence reset, no gap. The promoted follower's sequence space is a strict co
 
 ---
 
+## Other Use Cases
+
+The same primitives that power leader-follower replication also enable:
+
+- **Change Data Capture (CDC)** — tail `changes_since` to transform entries and push to Kafka, Pulsar, or any event bus. The sequence number is an exactly-once cursor.
+- **Outbox pattern** — write the domain event and the state change in a single `apply_batch`, then a separate process tails `changes_since` to publish events. No dual-write problem because both are in the same atomic append.
+
+ByteCaskDB does not care who is consuming or why. It surfaces the ordered stream that already exists in its data files.
+
+---
+
 ## What ByteCaskDB Does NOT Do
 
 - **Leader election** — external coordinator.
 - **Failure detection** — external coordinator.
 - **Network transport** — the replication loop is the user's code; ByteCaskDB provides the data.
 - **Conflict resolution on split-brain** — out of scope for single-leader replication.
-- **Synchronous replication** — `current_sequence` with long-poll gives near-zero lag. True synchronous replication (writer blocks until follower confirms) would require the writer to wait on a follower ack, adding follower-side `fdatasync` latency to every write. This could be added later as an opt-in `WriteOptions` flag without changing the primitive set.
+- **Synchronous replication** — not needed and not planned. The client decides whether to wait for follower convergence by polling `follower.current_sequence()` after a write — same pattern as Kafka's producer acks. The durability-vs-latency tradeoff belongs to the client, not the engine.

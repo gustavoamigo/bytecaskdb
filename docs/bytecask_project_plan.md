@@ -30,18 +30,19 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | --- | --- | --- |
 | BC-117 | MariaDB Phase 4 — Secondary indexes | Key encoding `[index_id][sec_key][pk]`, atomic primary+secondary writes, `index_read/next/prev`. |
 | BC-118 | MariaDB Phase 5 — MVCC + lockless architecture | `HTON_MVCC`, `HTON_NO_LOCK_MANAGER`, `start_consistent_snapshot()`. |
-| BC-120 | MariaDB Phase 6 — Replication + backup hooks | 2PC `prepare`, XA `recover`, `backup_stage` hooks. |
+| BC-120 | MariaDB Phase 6 — Replication + 2PC | `BulkPrepare(value)`/`Bulk2PCCommit(begin_seq)`/`Bulk2PCRollback(begin_seq)` for binlog group commit. `BulkPrepare` carries opaque value (MariaDB stores XID). XA recovery via `ha_recover`/`commit_by_xid`/`rollback_by_xid`. `backup_stage` hooks. See `docs/mariadb_engine_design.md` Phase 6. |
 
 ### Replication Primitives
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-197 | Replication primitives | Expose `current_lsn(timeout)`, `Snapshot::lsn()` + file manifest, `changes_since(from_lsn)`, `ingest(entries)`, `Mode::Follower`, and `min_lsn`/`max_lsn` on file_stats. See `docs/replication_primitives_design.md`. |
+| BC-197 | Replication primitives | Expose `current_sequence(timeout)`, `Snapshot::files()` file manifest, `changes_since(snap, from_sequence)` iterator, `ingest(entries)`, `Mode::Follower`, and `min_sequence`/`max_sequence` on file_stats. Also enables CDC and outbox pattern. See `docs/replication_primitives_design.md`. |
 
 ### Core Engine
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-198 | 2PC entry types: `BulkPrepare` / `Bulk2PCCommit` / `Bulk2PCRollback` | Rename `BulkEnd` → `BulkCommit`. Add `BulkPrepare(value)` (closes batch, triggers W-W conflict, not visible; carries opaque value blob), `Bulk2PCCommit(begin_seq)` (makes prepared batch visible), `Bulk2PCRollback(begin_seq)` (reverts prepared batch). Generic 2PC primitive — not MariaDB-specific. See `docs/mariadb_engine_design.md` Phase 6. |
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-078 | Published library module boundary | Decision: use Path A — keep sub-components (radix_tree, data_file, hint_file, etc.) as top-level modules for isolated testing; enforce public boundary at install time by only shipping the bytecask.engine BMI. Revisit Path B (full-partition restructure) if airtight compiler-enforced encapsulation is needed. |
 | BC-041 | `ReadOptions::verify_checksums` flag | Allow skipping CRC verification on bulk scans for ~5% win. Mirrors LevelDB/RocksDB `verify_checksums` option. |

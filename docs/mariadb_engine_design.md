@@ -160,13 +160,32 @@ Building a thin `MariaDBTxn` directly on `snapshot()` + `apply_batch()` is simpl
 - Write-write conflict detection via `apply_batch()` returning false → `HA_ERR_LOCK_DEADLOCK`.
 - `start_consistent_snapshot()` — for `mysqldump --single-transaction`.
 
-### Phase 6 — Replication + Backup Hooks
+### Phase 6 — Replication + 2PC with Binlog Group Commit
 
 **Scope**:
 - `position()` / `rnd_pos()` — correct stable row references for RBR.
-- 2PC: `hton->prepare` flushes WAL before binlog write.
+- 2PC via `BulkPrepare`/`Bulk2PCCommit` (see below).
 - XA recovery: `hton->recover`, `commit_by_xid`, `rollback_by_xid`.
 - Backup stages: `hton->backup_stage` hooks.
+
+#### 2PC Design — `BulkPrepare` / `Bulk2PCCommit`
+
+See `docs/xa_support_design.md` for the full generic 2PC design including batch marker types, on-disk format, conflict detection, and recovery semantics. This section covers the MariaDB-specific integration.
+
+MariaDB's binlog group commit calls `prepare_ordered()` → binlog write + group fsync → `commit_ordered()` for each transaction in the group, serialized under `LOCK_commit_ordered`. The storage engine is called once per transaction, not once per group. The group commit benefit is the shared binlog `fdatasync`.
+
+**Handler integration:**
+- `prepare_ordered()` — calls `prepare(plan, xid)`: appends `BulkBegin` + entries + `BulkPrepare(xid)` in a single `writev`, `fdatasync`. The batch is durable, triggers W-W conflict detection, but is invisible to readers. Other writes can proceed immediately.
+- `commit_ordered()` — calls `commit_prepared(begin_sequence)` with `sync=false`. Durability is covered by the binlog's group `fdatasync`. Make the batch visible to readers (same pattern as MyRocks: engine trusts the binlog as the single durability point at commit time).
+
+**XA recovery handler integration:**
+- `ha_recover()` — calls `recover()`, returns the list of XIDs from unresolved `BulkPrepare` blocks (extracted from the opaque value).
+- `commit_by_xid(xid)` — maps XID → `begin_sequence`, calls `commit_prepared(begin_seq)`.
+- `rollback_by_xid(xid)` — maps XID → `begin_sequence`, calls `rollback_prepared(begin_seq)`.
+
+**No write blocking between prepare and commit.** `BulkPrepare` closes the block, freeing the data file for other writers. Prepared entries already participate in W-W conflict detection — a concurrent writer touching the same keys gets rejected at prepare time, not after the binlog fsync.
+
+**Client-controlled replication ack (Kafka pattern):** synchronous replication is not built into the engine. After a write, the client decides whether to wait for follower convergence by polling `follower.current_sequence()`. The durability-vs-latency tradeoff belongs to the client, not the engine.
 
 ---
 
@@ -188,7 +207,7 @@ What ByteCaskDB currently has vs. what the MariaDB integration needs:
 | `WritePlan` with guards | ✅ | conflict detection at commit |
 | Forward iterators (`iter_from`, `keys_from`) | ✅ | `rnd_next`, `index_next`, range scans |
 | Reverse iterators (`riter_from`, `rkeys_from`) | ✅ | `index_prev`, descending scans |
-| Atomic batch writes (`BulkBegin`/`BulkEnd`) | ✅ | multi-row statement atomicity |
+| Atomic batch writes (`BulkBegin`/`BulkCommit`) | ✅ | multi-row statement atomicity |
 | Vacuum | ✅ | background maintenance |
 | Parallel recovery | ✅ | fast startup |
 

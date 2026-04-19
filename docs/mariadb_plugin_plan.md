@@ -430,23 +430,58 @@ H.3 — Replication hooks:
   encoded PK in `ref`). Audit for correctness under RBR once we have
   a test harness.
 
-- **Near-term: split-batch 2PC.** Map to ByteCaskDB's existing batch
-  format: `prepare()` writes `BulkBegin + entries` and fdatasyncs;
-  `commit()` writes `BulkEnd` and fdatasyncs. On crash before
-  `commit`, recovery discards the incomplete batch (no BulkEnd) —
-  automatic rollback. To support the crash-after-binlog-write case
-  (`recover()` / `commit_by_xid()`), add an XID marker entry type
-  inside the batch so recovery can identify prepared-but-uncommitted
-  batches and MariaDB can re-drive the commit.
+- **2PC via `BulkPrepare` / `Bulk2PCCommit` / `Bulk2PCRollback`.**
+  Five batch marker types: `BulkBegin`, `BulkCommit` (standalone,
+  atomic `writev`), `BulkPrepare(value)` (2PC prepare, atomic
+  `writev`, carries opaque value — MariaDB stores XID here),
+  `Bulk2PCCommit(begin_seq)` (2PC commit, written separately),
+  `Bulk2PCRollback(begin_seq)` (2PC rollback, written separately).
 
-  Sufficient for non-replicated deployments and for replication when
-  the engine is the only transactional participant.
+  - `prepare_ordered()`: append `BulkBegin` + entries +
+    `BulkPrepare(xid)` in a single `writev`, `fdatasync`. The block
+    is closed (other writes can proceed), triggers W-W conflict
+    detection, but is not visible to readers.
+  - `commit_ordered()`: append `Bulk2PCCommit(begin_sequence)` with
+    `sync=false`. The binlog's group `fdatasync` covers durability.
+    Make the prepared batch visible (same pattern as MyRocks).
+  - Rollback: append `Bulk2PCRollback(begin_sequence)`. Reverts key
+    directory changes; dead entries reclaimable by vacuum.
+  - Crash recovery: scan forward, collect `Bulk2PCCommit` and
+    `Bulk2PCRollback` sequences into resolved/rolled-back sets.
+    Unresolved `BulkPrepare` blocks → report to `ha_recover()`
+    with XID extracted from the opaque value. MariaDB calls
+    `commit_by_xid()` or `rollback_by_xid()`.
 
-- **Long-term: outbox-based replication (dedicated design doc).**
+  `BulkPrepare`'s value is opaque to the engine — the 2PC primitive
+  is generic, not MariaDB-specific. The exact API surface is deferred.
+
+  The existing `BulkBegin`/`BulkCommit` path works for both standalone
+  and 2PC — `BulkPrepare` only activates under MariaDB 2PC.
+
+  See `docs/xa_support_design.md` for the full generic 2PC design
+  (batch markers, on-disk format, recovery semantics) and
+  `docs/mariadb_engine_design.md` Phase 6 for MariaDB-specific
+  handler integration.
+
+- **Client-controlled replication ack (Kafka pattern).**
+  Synchronous replication is not built into the engine. After a write,
+  the client decides whether to wait for follower convergence by
+  polling `follower.current_sequence()`. The durability-vs-latency
+  tradeoff belongs to the client, not the engine. See
+  `docs/replication_primitives_design.md` for the primitive set.
+
+- **CDC / outbox pattern.** The same `changes_since` iterator that
+  powers leader-follower replication can feed external systems
+  (Kafka, binlog, event buses). The sequence number is an
+  exactly-once cursor. Write the domain event and state change in a
+  single `apply_batch`, then tail `changes_since` to publish — no
+  dual-write problem.
+
+- **Long-term: outbox-based binlog (dedicated design doc).**
   The 2PC exists because there are two durable stores (engine data
   files + binlog file) that must agree. The better architecture is
   one source of truth: the engine writes binlog events atomically
-  with the data as outbox entries (e.g., `0x04 | lsn → event`),
+  with the data as outbox entries (e.g., `0x04 | seq → event`),
   and a background drainer produces standard binlog files from them.
   One fdatasync per transaction instead of 2–3. No 2PC, no crash
   gap, consistency by construction.
@@ -769,13 +804,13 @@ to fit the plugin — Layer 1 is already sufficient for Phases A–F.
    bytes raw. That breaks on any ALTER. Phase E will introduce a
    versioned row format; we should do it as part of E.1, not defer
    to Phase H.
-3. **Replication strategy.** Near-term: split-batch 2PC (BulkBegin at
-   prepare, BulkEnd at commit) works for single-engine deployments.
-   Long-term: outbox-based replication eliminates 2PC entirely —
-   binlog events stored atomically with data, drained to standard
-   binlog files by a background thread. The outbox approach is
-   architecturally superior (one source of truth, one fdatasync) but
-   requires significant MariaDB server-side integration work.
+3. **Replication strategy.** 2PC via `BulkPrepare`/`Bulk2PCCommit`/`Bulk2PCRollback`
+   integrates with MariaDB's binlog group commit without blocking
+   writes between prepare and commit. `BulkPrepare` carries an opaque
+   value (MariaDB stores XID; engine doesn't interpret it) — the 2PC
+   primitive is generic. Long-term: outbox-based
+   replication eliminates 2PC entirely — binlog events stored atomically
+   with data, drained to standard binlog files by a background thread.
    Dedicated design doc when the time comes.
 4. **Schema catalog migrations.** Once the catalog schema
    (`ServerMeta` format-version) evolves, we need an upgrade path.
