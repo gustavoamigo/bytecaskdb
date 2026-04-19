@@ -131,16 +131,6 @@ export struct VacuumScanResult {
   std::uint64_t total_bytes{0};
 };
 
-// ---------------------------------------------------------------------------
-// StaleFile — data file removed from the registry by vacuum but potentially
-// still referenced by in-flight readers. Purged when use_count drops to 1.
-// Protected by vacuum_mu_.
-// ---------------------------------------------------------------------------
-export struct StaleFile {
-  std::shared_ptr<DataFile> data_file;
-  std::filesystem::path hint_path;
-};
-
 // RecoveredFile and RecoveryResult are private to bytecask.cpp.
 
 // ---------------------------------------------------------------------------

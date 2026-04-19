@@ -624,14 +624,12 @@ private:
       const std::shared_ptr<const EngineState> &snap,
       const DataFile &source_file, DataFile &dest_file,
       std::uint32_t source_file_id) -> VacuumScanResult;
-  // Purges stale files with no in-flight readers. Called at vacuum() start.
-  void vacuum_purge_stale_files();
   // Remaps key_dir entries, updates file registry, publishes new state. Caller must hold write_mu_.
   void vacuum_commit(std::uint32_t old_file_id, const VacuumScanResult &scan,
                      std::shared_ptr<DataFile> new_sealed_file);
-  // Defers the old data file for removal once no readers hold a reference to it.
-  void vacuum_defer_old_file(const std::shared_ptr<const EngineState> &snap,
-                             std::uint32_t file_id);
+  // Unlinks the old data and hint files. Open fds survive (POSIX).
+  void vacuum_unlink_old_file(const std::shared_ptr<const EngineState> &snap,
+                              std::uint32_t file_id);
   // Rewrites a sealed file into a new sealed file containing only live entries.
   void vacuum_compact_file(std::uint32_t file_id);
   // Appends live entries from a sealed file into the active file, then removes the sealed file.
@@ -721,8 +719,6 @@ private:
   // Serialises vacuum() calls. Separate from write_mu_ so vacuum I/O does
   // not block normal writes.
   std::unique_ptr<std::mutex> vacuum_mu_{std::make_unique<std::mutex>()};
-  // Protected by vacuum_mu_.
-  std::vector<StaleFile> stale_files_;
   // Solo writer — single-slot execution under write_mu_. Same submit()
   // interface as WriteGroup. Used for large batches or opts.solo benchmarking.
   SoloWriter solo_writer_{[this](auto &b) { execute_slots(b); }};

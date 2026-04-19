@@ -528,14 +528,6 @@ DB::~DB() {
   try {
     flush_hints();
   } catch (...) {}
-  for (auto &sf : stale_files_) {
-    try {
-      auto path = sf.data_file->path();
-      sf.data_file.reset();
-      std::filesystem::remove(path);
-      std::filesystem::remove(sf.hint_path);
-    } catch (...) {}
-  }
   if (lock_fd_ != -1) {
     ::close(lock_fd_);
     lock_fd_ = -1;
@@ -905,7 +897,6 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   // Drain in-flight background hint writes so that vacuum's
   // flush_hints_for call cannot race on the same .hint.tmp file.
   worker_.drain();
-  vacuum_purge_stale_files();
 
   // Snapshot file_stats and active-file info.
   PersistentU32Map<FileStats> stats_snap;
@@ -1222,21 +1213,6 @@ auto DB::vacuum_scan_and_copy(
   return result;
 }
 
-// Purge stale files whose DataFile is only held by stale_files_ (no
-// in-flight readers). Called at the start of vacuum() under vacuum_mu_.
-void DB::vacuum_purge_stale_files() {
-  std::erase_if(stale_files_, [](StaleFile &sf) {
-    if (sf.data_file.use_count() == 1) {
-      auto path = sf.data_file->path();
-      sf.data_file.reset();
-      std::filesystem::remove(path);
-      std::filesystem::remove(sf.hint_path);
-      return true;
-    }
-    return false;
-  });
-}
-
 // Remaps key_dir entries from old_file_id to the destination file,
 // updates the files map and file_stats, and publishes the new
 // EngineState. Caller must hold write_mu_.
@@ -1253,14 +1229,15 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
   store_state(current, std::move(t).persistent());
 }
 
-// Stashes the old data file and its hint path for deferred removal
-// once no in-flight readers reference it.
-void DB::vacuum_defer_old_file(
+// Unlinks the old data and hint files from the filesystem. Existing readers
+// continue via their open fds (POSIX: pread succeeds on unlinked files).
+void DB::vacuum_unlink_old_file(
     const std::shared_ptr<const EngineState> &snap, std::uint32_t file_id) {
   auto old_data_file = *snap->files.get(file_id);
   auto old_hint_path =
       dir_ / (old_data_file->path().stem().string() + ".hint");
-  stale_files_.push_back({std::move(old_data_file), std::move(old_hint_path)});
+  std::filesystem::remove(old_data_file->path());
+  std::filesystem::remove(old_hint_path);
 }
 
 // Rewrites a sealed file into a new sealed file containing only live
@@ -1297,7 +1274,7 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
     std::lock_guard<std::mutex> wg{*write_mu_};
     vacuum_commit(file_id, scan, new_file);
   }
-  vacuum_defer_old_file(snap, file_id);
+  vacuum_unlink_old_file(snap, file_id);
 }
 
 // Appends live entries from a sealed file to the active file, then
@@ -1327,7 +1304,7 @@ void DB::vacuum_absorb_file(std::uint32_t file_id) {
       throw;
     }
   }
-  vacuum_defer_old_file(snap, file_id);
+  vacuum_unlink_old_file(snap, file_id);
 }
 
 #pragma endregion

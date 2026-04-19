@@ -2460,41 +2460,52 @@ TEST_CASE("vacuum compact handles batch with mixed put/del", "[vacuum]") {
 }
 
 // ---------------------------------------------------------------------------
-// vacuum: stale file deferred when snapshot holds a reference
+// vacuum unlinks stale files immediately; snapshot reads still work via open fd
 //
-// When a snapshot is alive that references a vacuumed file, the physical
-// file deletion is deferred until the snapshot is dropped.
+// After vacuum compacts a file, its .data file is unlinked from the
+// directory. A snapshot that references the old file can still read via
+// the open fd (POSIX: pread succeeds on unlinked files).
 // ---------------------------------------------------------------------------
-TEST_CASE("vacuum defers stale file purge while snapshot is alive",
+TEST_CASE("vacuum unlinks stale file immediately, snapshot reads via open fd",
           "[vacuum]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+  auto db_path = td.path / "db";
+  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
 
   db.put({}, to_bytes("k"), to_bytes("v1"));
   db.put({}, to_bytes("k"), to_bytes("v2")); // kills v1 → file qualifies
 
+  // Count .data files before vacuum.
+  auto count_data_files = [&]() {
+    int n = 0;
+    for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+      if (e.path().extension() == ".data") ++n;
+    }
+    return n;
+  };
+  const int files_before = count_data_files();
+
   {
-    // Take a snapshot that pins the old file.
+    // Take a snapshot that references the old file.
     auto snap = db.snapshot();
 
-    // Vacuum compacts the dead file, but the snapshot holds a reference.
+    // Vacuum compacts the dead file and unlinks it immediately.
     REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+
+    // The old .data file is gone from the directory.
+    CHECK(count_data_files() < files_before);
 
     // The key is still readable from the live DB.
     auto v = get_val(db, to_bytes("k"));
     REQUIRE(v.has_value());
     CHECK(to_string(*v) == "v2");
 
-    // The snapshot can still read the old value (frozen view).
+    // The snapshot can still read via its open fd (POSIX guarantee).
     bytecask::Bytes snap_out;
     CHECK(snap.get(to_bytes("k"), snap_out));
   }
-  // Snapshot dropped — stale file can now be purged.
 
-  // Another vacuum pass should purge the stale file.
-  (void)db.vacuum({.fragmentation_threshold = 0.0});
-
-  // DB still consistent.
+  // DB still consistent after snapshot is dropped.
   auto v = get_val(db, to_bytes("k"));
   REQUIRE(v.has_value());
   CHECK(to_string(*v) == "v2");

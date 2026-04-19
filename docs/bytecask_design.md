@@ -510,7 +510,7 @@ Used when the file's live data is too large to fit into the active file. Produce
    e. Update `file_stats_`: remove the old file's entry. Insert a new entry for the compacted file using the exact `compacted_live_bytes` tracked during step 2 — for each entry whose key-dir sequence no longer matched in step 4b (concurrent write won), its `entry_size` was subtracted from the running total. `total_bytes` is the physical size of the new file. (Note: `compacted_live_bytes` may be less than `total_bytes` because the new file also contains tombstones that are never counted as live, and entries superseded by concurrent writes during the I/O phase.)
    f. Publish the new `EngineState` via `state_.store()`.
 5. **Release `write_mu_`**.
-6. **Defer file cleanup** — the old file is removed from the registry but may still be referenced by in-flight readers via their `EngineState` snapshot. The old `shared_ptr<DataFile>` is stashed in `stale_files_` (protected by `vacuum_mu_`). At the start of each `vacuum()` call, entries whose `use_count() == 1` (only `stale_files_` holds the reference, no readers) are purged: the fd is closed and the `.data` + `.hint` files are deleted. The destructor also purges all remaining stale files.
+6. **Defer file cleanup** — the old file is removed from the registry and its `.data` and `.hint` files are unlinked from the filesystem at the start of the next `vacuum()` call (under `vacuum_mu_`). Existing readers continue via their open file descriptors — POSIX guarantees that `pread` on an unlinked file succeeds as long as the fd is open. Disk blocks are freed when the last `shared_ptr<DataFile>` is destroyed, closing the fd. The destructor also unlinks any remaining stale files.
 
 ##### `vacuum_absorb_file(file_id)` — fold a sealed file's live entries into the active file
 
@@ -530,7 +530,7 @@ Precondition: `file_stats_[file_id].live_bytes + active_file.size() <= rotation_
    e. Update `file_stats_`: remove the old file's entry. Add the absorbed entries' sizes to `file_stats_[active_file_id]` (both `live_bytes` and `total_bytes` for live Puts; `total_bytes` only for tombstones). Subtract sizes for entries superseded by concurrent writes (same logic as `vacuum_compact_file`).
    f. Publish the new `EngineState`.
 6. **Release `write_mu_`**.
-7. **Defer file cleanup** — same as `vacuum_compact_file`: stash in `stale_files_`, purge when `use_count() == 1`.
+7. **Defer file cleanup** — same as `vacuum_compact_file`: stash in `stale_files_`, unlink at the start of the next `vacuum()` call.
 
 Note: absorbed entries preserve their original LSNs, which are all less than `next_lsn`. This is safe because LSN ordering is only used for recovery conflict resolution across files, and the absorbed entries now live in the active file alongside newer writes. Recovery will see all entries and LSN comparison still picks the correct winner.
 
