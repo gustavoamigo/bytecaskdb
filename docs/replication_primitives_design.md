@@ -157,12 +157,13 @@ The engine maintains a `durable_sequence` alongside `next_seq`:
 - **`next_seq`** — highest allocated sequence. Includes unsync'd entries. Used for sequence assignment.
 - **`durable_sequence`** — highest sequence confirmed by `fdatasync`. Only increases. Each sync point sets `durable_sequence = max(durable_sequence, highest_sequence_in_synced_range)`. This is trivially satisfied because sequences are assigned monotonically and each `fdatasync` covers all entries written to the file so far.
 
-**Sync points that advance `durable_sequence`** (exhaustive — these are the only four `file.sync()` calls in the engine, so they are the only points at which `durable_sequence` can move):
+**Sync points that advance `durable_sequence`** (these are the only points at which `durable_sequence` can move):
 
 1. **Sync write** — `file.sync()` when any writer in the group commit batch requested `sync=true`. Covers all entries in the batch, including those from NoSync writers that rode along.
 2. **Rotation sync** — `file.sync()` before sealing the active file. Covers all entries written to the file, including NoSync entries. This is the mechanism that bounds replication lag on NoSync-only workloads.
-3. **Error-path sync** — `file.sync()` after a failed `append_entries`, to flush whatever was previously written. Not a normal path — the engine degrades after this.
-4. **Resume sync** — after `resume()` truncates garbage bytes and syncs the recovered file.
+3. **Resume sync** — after `resume()` truncates garbage bytes and syncs the recovered file.
+
+The error-path `file.sync()` after a failed `append_entries` does **not** advance `durable_sequence`. That sync is a best-effort flush of bytes previously in the page cache — but `batch_max_seq` includes sequences from the failed append, which may be corrupt. Advancing `durable_sequence` to those sequences would claim durability for garbage. The engine degrades after this path; `resume()` sets `durable_sequence` correctly from the recovered state.
 
 Any future code that adds a new `file.sync()` call must also advance `durable_sequence`, or replication will stall / skip entries depending on direction.
 
