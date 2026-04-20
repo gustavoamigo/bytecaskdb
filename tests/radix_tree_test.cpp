@@ -1398,3 +1398,104 @@ TEST_CASE("RadixTree upper_bound empty tree", "[radix_tree]") {
   const Tree t;
   CHECK(t.upper_bound(to_bytes("anything")) == t.end());
 }
+
+namespace {
+
+// Type with a throwing move constructor, used to exercise SmallVector's
+// exception-safety on move-assignment. Tracks live instances so tests can
+// assert that no destructors run on uninitialised memory (which would cause
+// live_count to go negative or diverge from the true number of objects).
+struct ThrowOnMove {
+  int v{0};
+  static inline int live_count = 0;
+  static inline int moves_done = 0;
+  static inline int throw_at = -1; // throw on the Nth move-construction; -1 = never
+
+  ThrowOnMove() { ++live_count; }
+  explicit ThrowOnMove(int x) : v{x} { ++live_count; }
+  ThrowOnMove(const ThrowOnMove &o) : v{o.v} { ++live_count; }
+  ThrowOnMove(ThrowOnMove &&o) : v{o.v} {
+    if (moves_done == throw_at) {
+      // Do NOT ++live_count — object is not constructed.
+      throw std::runtime_error("throw on move");
+    }
+    ++moves_done;
+    ++live_count;
+  }
+  ~ThrowOnMove() { --live_count; }
+  auto operator=(const ThrowOnMove &) -> ThrowOnMove & = default;
+  auto operator=(ThrowOnMove &&) -> ThrowOnMove & = default;
+};
+
+} // namespace
+
+TEST_CASE("BC-201 SmallVector move-assign exception safety", "[radix_tree][bc201]") {
+  using SV = bytecask::SmallVector<ThrowOnMove, 4>;
+  ThrowOnMove::live_count = 0;
+  ThrowOnMove::moves_done = 0;
+  ThrowOnMove::throw_at = -1;
+
+  {
+    SV dest;
+    dest.push_back(ThrowOnMove{100});
+    dest.push_back(ThrowOnMove{200});
+
+    SV src;
+    src.push_back(ThrowOnMove{1});
+    src.push_back(ThrowOnMove{2});
+    src.push_back(ThrowOnMove{3});
+
+    // Before the move-assign: 2 (dest) + 3 (src) = 5 live.
+    REQUIRE(ThrowOnMove::live_count == 5);
+
+    // Trigger throw on the second element's move-construction inside
+    // dest = std::move(src). With the buggy version, `size_` is set to
+    // other.size_ (=3) up front, so the destructor of `dest` will invoke
+    // ~ThrowOnMove on elements 1 and 2 even though only element 0 was
+    // constructed → live_count goes negative. With the fix, `size_` is
+    // grown incrementally and the destructor only destroys what was built.
+    ThrowOnMove::moves_done = 0;
+    ThrowOnMove::throw_at = 1;
+
+    CHECK_THROWS_AS(dest = std::move(src), std::runtime_error);
+    ThrowOnMove::throw_at = -1;
+  }
+
+  // Both SmallVectors have been destroyed by now. A correct implementation
+  // leaves live_count at exactly 0. The bug produces a negative count.
+  CHECK(ThrowOnMove::live_count == 0);
+}
+
+TEST_CASE("BC-201 ReverseRadixTreeIterator base() past rend equals begin",
+          "[radix_tree][bc201]") {
+  auto t = Tree{}
+               .set(to_bytes("a"), 1)
+               .set(to_bytes("b"), 2)
+               .set(to_bytes("c"), 3);
+  auto rit = t.rbegin();
+  REQUIRE(rit != t.rend());
+  ++rit; // now at "b"
+  ++rit; // now at "a"
+  ++rit; // now past rend
+  REQUIRE(rit == t.rend());
+
+  // Standard reverse_iterator semantics: rend().base() == begin().
+  auto fwd = rit.base();
+  REQUIRE(fwd != t.end());
+  auto [k, v] = *fwd;
+  CHECK(to_string(k) == "a");
+  CHECK(v == 1);
+}
+
+TEST_CASE("BC-201 ReverseRadixTreeIterator ++ past rend stays past rend",
+          "[radix_tree][bc201]") {
+  auto t = Tree{}.set(to_bytes("a"), 1).set(to_bytes("b"), 2);
+  auto rit = t.rbegin();
+  ++rit; // "a"
+  ++rit; // past rend
+  REQUIRE(rit == t.rend());
+
+  // Incrementing past rend must not silently wrap back to the last element.
+  ++rit;
+  CHECK(rit == t.rend());
+}

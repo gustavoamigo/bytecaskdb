@@ -78,14 +78,21 @@ public:
     if (this == &other)
       return *this;
     destroy_all();
-    size_ = other.size_;
+    // Leave size_ at 0 (logically empty, inline mode) until each element has
+    // been successfully constructed. If T's move-construct throws mid-loop,
+    // ~SmallVector will destroy only the already-built prefix rather than
+    // running ~T over uninitialised storage.
+    size_ = 0;
     if (other.on_heap()) {
       new (&heap_) std::vector<T>(std::move(other.heap_));
+      size_ = kSpillSentinel;
       other.heap_.~vector();
       other.size_ = 0;
     } else {
-      for (std::size_t i = 0; i < size_; ++i) {
+      auto n = other.size_;
+      for (std::size_t i = 0; i < n; ++i) {
         std::construct_at(inline_ptr() + i, std::move(other.inline_ptr()[i]));
+        ++size_;
       }
       other.destroy_inline();
       other.size_ = 0;
@@ -282,26 +289,33 @@ public:
   IntrusivePtr(IntrusivePtr &&o) noexcept : ptr_(o.ptr_) { o.ptr_ = nullptr; }
 
   auto operator=(const IntrusivePtr &o) noexcept -> IntrusivePtr & {
-    // Addref before release: if o is a sub-object of *ptr_, releasing
-    // ptr_ first would destroy o (use-after-free).
-    if (o.ptr_)
-      o.ptr_->addref();
+    // Cache RHS pointer before touching *ptr_: if `o` itself lives inside
+    // *ptr_ (e.g. a child slot of this node), releasing ptr_ destroys `o`,
+    // and a later read of `o.ptr_` would be a use-after-free. Reading the
+    // pointer value up front and addref-ing first keeps the target node
+    // alive across the release.
+    auto *new_ptr = o.ptr_;
+    if (new_ptr)
+      new_ptr->addref();
     if (ptr_)
       ptr_->release();
-    ptr_ = o.ptr_;
+    ptr_ = new_ptr;
     return *this;
   }
 
   auto operator=(IntrusivePtr &&o) noexcept -> IntrusivePtr & {
-    if (ptr_ != o.ptr_) {
-      // Detach o before releasing ptr_ to avoid use-after-free when
-      // o is a sub-object of *ptr_.
-      auto *tmp = o.ptr_;
-      o.ptr_ = nullptr;
-      if (ptr_)
-        ptr_->release();
-      ptr_ = tmp;
-    }
+    if (this == &o)
+      return *this;
+    // Extract before releasing: handles both the sub-object case (o lives
+    // inside *ptr_) and the aliased case (ptr_ == o.ptr_ with two distinct
+    // IntrusivePtr objects). Zeroing o.ptr_ first means that if releasing
+    // ptr_ transitively destroys `o`'s IntrusivePtr, its destructor sees a
+    // null and does not double-decrement the target refcount.
+    auto *tmp = o.ptr_;
+    o.ptr_ = nullptr;
+    if (ptr_)
+      ptr_->release();
+    ptr_ = tmp;
     return *this;
   }
 
@@ -1621,6 +1635,7 @@ private:
 
   friend class PersistentRadixTree<V>;
   friend class TransientRadixTree<V>;
+  friend class ReverseRadixTreeIterator<V>;
 };
 
 // Out-of-line: PersistentRadixTree::begin()
@@ -1648,9 +1663,15 @@ public:
   using value_type = std::pair<std::span<const std::byte>, V>;
   using difference_type = std::ptrdiff_t;
 
+  ReverseRadixTreeIterator() = default;
+
   explicit ReverseRadixTreeIterator(RadixTreeIterator<V> past_pos)
       : cur_{std::move(past_pos)} {
     --cur_; // position at the last element (or stay at end if tree is empty)
+    // Empty tree: the forward iterator has no stack to retreat into, so we
+    // are simultaneously rbegin and rend.
+    if (cur_ == std::default_sentinel)
+      past_rend_ = true;
   }
 
   auto operator*() const
@@ -1659,31 +1680,49 @@ public:
   }
 
   auto operator++() -> ReverseRadixTreeIterator & {
-    --cur_; // advance backward; retreat() sets empty stack past begin → end
+    // ++rend() is undefined in the standard; we define it as a no-op to
+    // avoid the alternative where retreat() on an empty stack re-descends
+    // the tree and silently wraps back to the last element.
+    if (past_rend_)
+      return *this;
+    --cur_;
+    if (cur_ == std::default_sentinel)
+      past_rend_ = true;
     return *this;
   }
 
   auto operator++(int) -> ReverseRadixTreeIterator {
     auto tmp = *this;
-    --cur_;
+    ++*this;
     return tmp;
   }
 
   auto operator==(const ReverseRadixTreeIterator &other) const noexcept
       -> bool {
+    if (past_rend_ != other.past_rend_)
+      return false;
+    if (past_rend_)
+      return true;
     return cur_ == other.cur_;
   }
 
   // Compares against the end sentinel. True when the iterator has advanced
-  // past the first element (retreat() emptied the stack — same state as end).
+  // past the first element (explicitly tracked to distinguish from rbegin()
+  // on an empty tree, which also has an empty stack).
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
-    return cur_ == std::default_sentinel;
+    return past_rend_;
   }
 
-  // Returns the underlying forward iterator positioned one past the current
-  // element. Useful for converting a reverse starting point back to a forward
-  // iterator (e.g. passing to ReverseKeyIterator in DB::rkeys_from).
+  // Standard reverse_iterator semantics: *rit == *(base() - 1), and
+  // rend().base() == begin(). Useful for converting a reverse starting
+  // point back to a forward iterator (e.g. passing to ReverseKeyIterator
+  // in DB::rkeys_from).
   [[nodiscard]] auto base() const -> RadixTreeIterator<V> {
+    if (past_rend_) {
+      // rend().base() must equal begin(). Reconstruct from the underlying
+      // iterator's retained root pointer.
+      return RadixTreeIterator<V>{cur_.root_};
+    }
     auto fwd = cur_;
     ++fwd;
     return fwd;
@@ -1691,6 +1730,7 @@ public:
 
 private:
   RadixTreeIterator<V> cur_;
+  bool past_rend_{false};
 };
 
 // Out-of-line: PersistentRadixTree::rbegin()
