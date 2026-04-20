@@ -268,6 +268,13 @@ public:
     // Returns true if a file was vacuumed, false if no file qualified.
     [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
 
+    // Returns the highest sequence confirmed durable by fdatasync.
+    // timeout=0: non-blocking, returns current value.
+    // timeout>0: blocks until durable_seq advances or timeout expires.
+    [[nodiscard]] auto current_sequence(
+        std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
+        -> std::uint64_t;
+
     // True if the engine has entered a degraded state from a write-path failure.
     // Reads remain available; all write operations throw DbDegraded.
     [[nodiscard]] auto is_degraded() const noexcept -> bool;

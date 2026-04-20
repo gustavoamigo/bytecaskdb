@@ -105,15 +105,16 @@ TransientEngineState::TransientEngineState(
     TransientU32Map<std::shared_ptr<DataFile>> files,
     TransientU32Map<FileStats> file_stats,
     std::uint32_t active_file_id, std::uint32_t next_file_id,
-    std::uint64_t next_seq)
+    std::uint64_t next_seq, std::uint64_t durable_seq)
     : key_dir_{std::move(key_dir)}, files_{std::move(files)},
       file_stats_{std::move(file_stats)}, active_file_id_{active_file_id},
-      next_file_id_{next_file_id}, next_seq_{next_seq} {}
+      next_file_id_{next_file_id}, next_seq_{next_seq},
+      durable_seq_{durable_seq} {}
 
 auto EngineState::transient() const -> TransientEngineState {
   return TransientEngineState{
       key_dir.transient(), files.transient(), file_stats.transient(),
-      active_file_id, next_file_id, next_seq};
+      active_file_id, next_file_id, next_seq, durable_seq};
 }
 
 auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
@@ -453,6 +454,16 @@ void TransientEngineState::advance_next_seq(std::uint64_t new_seq) noexcept {
   next_seq_ = new_seq;
 }
 
+void TransientEngineState::apply_sync(std::uint64_t batch_max_seq) {
+  if (batch_max_seq > durable_seq_) {
+    durable_seq_ = batch_max_seq;
+  }
+}
+
+auto TransientEngineState::durable_seq() const noexcept -> std::uint64_t {
+  return durable_seq_;
+}
+
 auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   auto s = std::make_shared<EngineState>();
   s->key_dir = std::move(key_dir_).persistent();
@@ -461,6 +472,7 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   s->active_file_id = active_file_id_;
   s->next_file_id = next_file_id_;
   s->next_seq = next_seq_;
+  s->durable_seq = durable_seq_;
   return s;
 }
 
@@ -511,6 +523,9 @@ DB::DB(std::filesystem::path dir, Options opts)
     fstats_t.set(s.active_file_id, FileStats{});
     s.file_stats = std::move(fstats_t).persistent();
     auto initial = std::make_shared<EngineState>(std::move(s));
+    // All recovered entries were previously synced.
+    initial->durable_seq =
+        initial->next_seq > 0 ? initial->next_seq - 1 : 0;
     validate_state_consistency(*initial);
     store_initial_state(std::move(initial));
   } catch (...) {
@@ -718,6 +733,9 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
 
   if (all_entries.empty()) return;
 
+  // Highest sequence in this batch — used to advance durable_seq after sync.
+  const auto batch_max_seq = t.next_seq() - 1;
+
   // Phase 2: one I/O call for all collected entries.
   std::vector<std::uint64_t> io_offsets(all_entries.size());
   try {
@@ -739,6 +757,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   if (t.is_rotation_needed(rotation_threshold_)) {
     try {
       file.sync();
+      t.apply_sync(batch_max_seq);
     } catch (...) {
       auto ex = std::current_exception();
       publish_seq_advance(current, t.next_seq());
@@ -770,6 +789,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   if (any_sync) {
     try {
       file.sync();
+      t.apply_sync(batch_max_seq);
     } catch (...) {
       auto ex = std::current_exception();
       publish_seq_advance(current, t.next_seq());
@@ -1164,6 +1184,7 @@ auto DB::vacuum_scan_and_copy(
     Offset original_offset;
   };
   bool in_batch = false;
+  std::uint64_t batch_begin_seq = 0;
   std::vector<PendingEntry> pending;
 
   auto emit_entry = [&](const DataEntry &entry, Offset entry_off) {
@@ -1214,14 +1235,39 @@ auto DB::vacuum_scan_and_copy(
     case EntryType::BulkBegin:
       in_batch = true;
       pending.clear();
+      batch_begin_seq = entry.sequence;
       break;
-    case EntryType::BulkEnd:
-      for (auto &pe : pending) {
-        emit_entry(pe.entry, pe.original_offset);
+    case EntryType::BulkEnd: {
+      bool has_live = false;
+      for (const auto &pe : pending) {
+        if (pe.entry.entry_type == EntryType::Delete ||
+            pe.entry.entry_type == EntryType::RangeDel) {
+          has_live = true;
+          break;
+        }
+        if (pe.entry.entry_type == EntryType::Put) {
+          const auto existing = snap->key_dir.get(pe.entry.key);
+          if (existing && existing->file_id == source_file_id &&
+              existing->file_offset == pe.original_offset &&
+              existing->sequence == pe.entry.sequence) {
+            has_live = true;
+            break;
+          }
+        }
+      }
+      if (has_live) {
+        std::ignore = dest_file.append_entry(
+            batch_begin_seq, EntryType::BulkBegin, {}, {});
+        for (auto &pe : pending) {
+          emit_entry(pe.entry, pe.original_offset);
+        }
+        std::ignore = dest_file.append_entry(
+            entry.sequence, EntryType::BulkEnd, {}, {});
       }
       pending.clear();
       in_batch = false;
       break;
+    }
     case EntryType::Put:
     case EntryType::Delete:
     case EntryType::RangeDel:
@@ -1463,12 +1509,26 @@ void DB::resume() {
   });
   t.apply_resume(old_file_id, committed);
   t.apply_rotate_file(std::move(new_file));
+  // All entries recovered from disk were previously synced.
+  t.apply_sync(t.next_seq() > 0 ? t.next_seq() - 1 : 0);
   auto resumed = std::move(t).persistent();
   validate_state_consistency(*resumed);
   store_state(current, std::move(resumed));
 
   // Success: clear degraded flag.
   degraded_.store(false, std::memory_order_release);
+}
+
+auto DB::current_sequence(std::chrono::milliseconds timeout) const
+    -> std::uint64_t {
+  auto baseline = load_state()->durable_seq;
+  if (timeout <= std::chrono::milliseconds{0}) return baseline;
+
+  std::unique_lock<std::mutex> lk{durable_mu_};
+  durable_cv_.wait_for(lk, timeout, [&] {
+    return load_state()->durable_seq > baseline;
+  });
+  return load_state()->durable_seq;
 }
 
 // Returns the engine state from a thread-local cache (read path only).
@@ -1526,6 +1586,15 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
         old_state->next_file_id, new_state->next_file_id));
     return;
   }
+  if (new_state->durable_seq < old_state->durable_seq) {
+    deem_as_degraded(std::format(
+        "invariant violation: durable_seq regressed from {} to {}",
+        old_state->durable_seq, new_state->durable_seq));
+    return;
+  }
+
+  const auto durable_advanced =
+      new_state->durable_seq > old_state->durable_seq;
 
 #ifndef NDEBUG
   // Debug-only O(n) check: next_seq > max(all key_dir sequences).
@@ -1544,6 +1613,11 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
 
   store_state(std::move(new_state));
   state_time_.store(now_ns(), std::memory_order_release);
+
+  if (durable_advanced) {
+    { std::lock_guard<std::mutex> lk{durable_mu_}; }
+    durable_cv_.notify_all();
+  }
 }
 
 void DB::store_initial_state(std::shared_ptr<EngineState> s) {

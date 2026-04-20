@@ -38,7 +38,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-197 | Replication primitives | Expose `current_sequence(timeout)`, `Snapshot::files()` file manifest, `changes_since(snap, from_sequence)` iterator, `ingest(entries)`, `Mode::Follower`, and `min_sequence`/`max_sequence` on file_stats. Also enables CDC and outbox pattern. See `docs/replication_primitives_design.md`. |
+| BC-197 | Replication primitives | Part 1 done: `durable_sequence` tracking (`current_sequence(timeout)` API, `apply_sync` state transition, condvar in `store_state`) and vacuum batch marker preservation (`BulkBegin`/`BulkEnd` emitted for live batches). Remaining: `Snapshot::files()`, `changes_since`, `ingest`, `Mode::Follower`, `min_sequence`/`max_sequence` on file_stats. See `docs/replication_primitives_design.md`. |
 
 ### Core Engine
 

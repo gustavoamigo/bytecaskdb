@@ -4629,3 +4629,230 @@ TEST_CASE("Recovery model-based: workload with range deletes",
     CHECK(collect_stats(db) == serial_stats_vals);
   }
 }
+
+// ---------------------------------------------------------------------------
+// durable_sequence: current_sequence reflects sync writes
+// ---------------------------------------------------------------------------
+TEST_CASE("current_sequence reflects sync writes", "[durable_seq]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // Fresh DB with no writes: durable_seq == 0 (next_seq starts at 1,
+  // no keys recovered, so durable_seq = next_seq - 1 = 0).
+  CHECK(db.current_sequence() == 0);
+
+  // NoSync write — must NOT advance durable_seq.
+  db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+  CHECK(db.current_sequence() == 0);
+
+  // Sync write — must advance durable_seq to cover both keys
+  // (group commit: the sync also confirms the earlier nosync entry).
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+  auto seq_after_sync = db.current_sequence();
+  CHECK(seq_after_sync >= 2);
+}
+
+// ---------------------------------------------------------------------------
+// durable_sequence: nosync-only writes never advance durable_seq
+// ---------------------------------------------------------------------------
+TEST_CASE("current_sequence stays at zero for nosync-only writes",
+          "[durable_seq]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  for (int i = 0; i < 10; ++i) {
+    db.put({.sync = false}, to_bytes(std::format("k{}", i)),
+           to_bytes(std::format("v{}", i)));
+  }
+  CHECK(db.current_sequence() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// durable_sequence: long-poll wakes on sync write
+// ---------------------------------------------------------------------------
+TEST_CASE("current_sequence long-poll wakes on sync write", "[durable_seq]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  std::atomic<std::uint64_t> polled_seq{0};
+  std::thread poller{[&] {
+    polled_seq.store(
+        db.current_sequence(std::chrono::milliseconds{5000}),
+        std::memory_order_release);
+  }};
+
+  // Give poller time to block on the condvar.
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+
+  // Sync write wakes the poller.
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+
+  poller.join();
+  CHECK(polled_seq.load(std::memory_order_acquire) >= 1);
+}
+
+// ---------------------------------------------------------------------------
+// durable_sequence: long-poll times out on idle DB
+// ---------------------------------------------------------------------------
+TEST_CASE("current_sequence long-poll times out on idle DB", "[durable_seq]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto start = std::chrono::steady_clock::now();
+  auto seq = db.current_sequence(std::chrono::milliseconds{50});
+  auto elapsed = std::chrono::steady_clock::now() - start;
+
+  CHECK(seq == 0);
+  CHECK(elapsed >= std::chrono::milliseconds{40});
+}
+
+// ---------------------------------------------------------------------------
+// durable_sequence: correct after recovery
+// ---------------------------------------------------------------------------
+TEST_CASE("current_sequence correct after recovery", "[durable_seq]") {
+  TempDir td;
+  auto db_path = td.path / "db";
+
+  {
+    auto db = bytecask::DB::open(db_path);
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+  }
+
+  // Reopen — all recovered entries were previously synced.
+  auto db = bytecask::DB::open(db_path);
+  auto seq = db.current_sequence();
+  // durable_seq should equal next_seq - 1 after recovery.
+  // We wrote 2 sync entries, so durable_seq >= 2.
+  CHECK(seq >= 2);
+
+  // Verify values survived.
+  CHECK(db.contains_key(to_bytes("k1")));
+  CHECK(db.contains_key(to_bytes("k2")));
+}
+
+// ---------------------------------------------------------------------------
+// durable_sequence: correct after resume
+// ---------------------------------------------------------------------------
+TEST_CASE("current_sequence correct after resume", "[durable_seq][resume]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1'000'000});
+
+  // Committed baseline.
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  auto seq_before = db.current_sequence();
+  CHECK(seq_before >= 1);
+
+  // Degrade via sync failure.
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")),
+                      std::system_error);
+  }
+  REQUIRE(db.is_degraded());
+
+  // Resume — should recover and set durable_seq correctly.
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+
+  auto seq_after = db.current_sequence();
+  // After resume, durable_seq should be >= what it was before the failure.
+  CHECK(seq_after >= seq_before);
+}
+
+// ---------------------------------------------------------------------------
+// vacuum preserves BulkBegin/BulkEnd markers for live batches
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum preserves BulkBegin/BulkEnd markers", "[vacuum][batch]") {
+  TempDir td;
+  auto db_path = td.path / "db";
+  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+
+  // Write individual keys first to create dead entries.
+  db.put({}, to_bytes("a"), to_bytes("old_a"));
+  db.put({}, to_bytes("b"), to_bytes("old_b"));
+
+  // Batch overwrites — these land in one sealed file with BulkBegin/BulkEnd.
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("a"), to_bytes("new_a"));
+  plan.put(to_bytes("b"), to_bytes("new_b"));
+  (void)db.apply_batch({}, std::move(plan));
+
+  // Vacuum — the batch file has live entries, so markers should be preserved.
+  for (int i = 0; i < 10 && db.vacuum({.fragmentation_threshold = 0.0}); ++i) {}
+
+  // Verify data is correct.
+  auto va = get_val(db, to_bytes("a"));
+  auto vb = get_val(db, to_bytes("b"));
+  REQUIRE(va.has_value());
+  REQUIRE(vb.has_value());
+  CHECK(to_string(*va) == "new_a");
+  CHECK(to_string(*vb) == "new_b");
+
+  // Scan vacuumed files for BulkBegin/BulkEnd markers.
+  bool found_begin = false;
+  bool found_end = false;
+  for (const auto &entry : std::filesystem::directory_iterator{db_path}) {
+    if (entry.path().extension() != ".data") continue;
+    bytecask::DataFile df{entry.path()};
+    bytecask::Offset off = 0;
+    while (auto sr = df.scan(off)) {
+      const auto &[de, next] = *sr;
+      if (de.entry_type == bytecask::EntryType::BulkBegin) found_begin = true;
+      if (de.entry_type == bytecask::EntryType::BulkEnd) found_end = true;
+      off = next;
+    }
+  }
+  CHECK(found_begin);
+  CHECK(found_end);
+}
+
+// ---------------------------------------------------------------------------
+// vacuum drops batch when all entries are stale
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum drops batch when all entries are stale",
+          "[vacuum][batch]") {
+  TempDir td;
+  auto db_path = td.path / "db";
+  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+
+  // Write a batch.
+  {
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("a"), to_bytes("batch_a"));
+    plan.put(to_bytes("b"), to_bytes("batch_b"));
+    (void)db.apply_batch({}, std::move(plan));
+  }
+
+  // Overwrite all batch keys individually — makes the batch stale.
+  db.put({}, to_bytes("a"), to_bytes("solo_a"));
+  db.put({}, to_bytes("b"), to_bytes("solo_b"));
+
+  // Vacuum — the stale batch should be dropped entirely (no markers).
+  for (int i = 0; i < 10 && db.vacuum({.fragmentation_threshold = 0.0}); ++i) {}
+
+  // Verify latest values.
+  auto va = get_val(db, to_bytes("a"));
+  auto vb = get_val(db, to_bytes("b"));
+  REQUIRE(va.has_value());
+  REQUIRE(vb.has_value());
+  CHECK(to_string(*va) == "solo_a");
+  CHECK(to_string(*vb) == "solo_b");
+
+  // Scan all data files — no BulkBegin/BulkEnd markers should remain.
+  bool found_marker = false;
+  for (const auto &entry : std::filesystem::directory_iterator{db_path}) {
+    if (entry.path().extension() != ".data") continue;
+    bytecask::DataFile df{entry.path()};
+    bytecask::Offset off = 0;
+    while (auto sr = df.scan(off)) {
+      const auto &[de, next] = *sr;
+      if (de.entry_type == bytecask::EntryType::BulkBegin ||
+          de.entry_type == bytecask::EntryType::BulkEnd) {
+        found_marker = true;
+      }
+      off = next;
+    }
+  }
+  CHECK_FALSE(found_marker);
+}
