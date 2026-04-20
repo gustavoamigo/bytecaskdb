@@ -1,5 +1,7 @@
 # ByteCaskDB XA Support Design
 
+> **Status: very early design.** This document describes a design for generic two-phase commit primitives. Implementation and API surface are subject to change.
+
 ## Purpose
 
 This document describes ByteCaskDB's generic two-phase commit (2PC) primitives. These allow an external coordinator to prepare, commit, or rollback batches in two distinct steps — without embedding any distributed transaction logic inside the engine.

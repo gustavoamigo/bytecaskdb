@@ -125,7 +125,7 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
   │  file_stats      map<uint32_t, FileStats>         │  per-file live/total bytes
   │  active_file_id  uint32_t                         │
   │  next_file_id    uint32_t                         │  writer-only; monotonic file counter
-  │  next_lsn        uint64_t                         │  writer-only; monotonic sequence counter
+  │  next_seq         uint64_t                         │  writer-only; monotonic sequence counter
   └──────────────────────────────────────────────────┘
 ```
 
@@ -152,11 +152,11 @@ Both executors follow a three-phase pattern:
     1. validate_preconditions(plan)
        └─ point guards, range guards, W-W checks — pure reads on transient
     2. prepare_write(plan) → vector<AppendEntry>
-       └─ assigns LSNs, inserts BulkBegin/End markers — pure computation
+       └─ assigns sequences, inserts BulkBegin/End markers — pure computation
     3. pre-compute offsets from running_offset
        └─ entry sizes are deterministic (header + key + value + CRC)
     4. apply_writes(plan, offsets)
-       └─ updates key_dir, file_stats, LSN — pure in-memory mutations
+       └─ updates key_dir, file_stats, sequence — pure in-memory mutations
     5. collect entries into all_entries
 
   Phase 2: one I/O call
@@ -185,11 +185,11 @@ Range deletes are supported on `DB::del_range` and `WritePlan::del_range`. Insid
 
 `TransientEngineState` is the mutable working copy for all write-path state transitions. It follows the same `transient()` / `persistent()` pattern as `PersistentRadixTree` / `TransientRadixTree`.
 
-The coordinator (step 5 above) only performs IO. It never touches `key_dir`, `file_stats`, or LSN directly. The transient owns all state logic:
+The coordinator (step 5 above) only performs IO. It never touches `key_dir`, `file_stats`, or sequence directly. The transient owns all state logic:
 
 - `validate_preconditions(plan)` — reads snapshot + current state, returns bool
-- `prepare_write(plan)` — assigns LSNs, returns `vector<AppendEntry>` for the IO loop
-- `apply_writes(plan, io_result)` — updates key_dir, file_stats, advances LSN
+- `prepare_write(plan)` — assigns sequences, returns `vector<AppendEntry>` for the IO loop
+- `apply_writes(plan, io_result)` — updates key_dir, file_stats, advances sequence
 - `apply_rotate_file(new_file)` — registers new file, updates active_file_id
 - `apply_vacuum(old_file_id, scan, new_file)` — remaps keys, updates registry + stats
 - `persistent() &&` — produces `shared_ptr<EngineState>` for publishing
@@ -213,7 +213,7 @@ When this happens, the engine calls `deem_as_degraded(reason)` with a diagnostic
 - **Recovery via `resume()`**: the degraded flag is in-memory only. The service calls `resume()` to attempt in-process recovery without a restart. `resume()` runs a universal recovery process:
   1. Acquires the write lock.
   2. Scans the active file (batch-aware) to find the last valid committed offset. Orphaned `BulkBegin` batches are excluded — if a `BulkBegin` has no matching `BulkEnd`, `valid_offset` is reset to the batch start.
-  3. Replays valid committed entries into the key directory using LSN-wins resolution: for each Put whose LSN exceeds the current key_dir entry (or the key is absent), update key_dir and file_stats; for each Delete whose LSN exceeds the current entry, erase the key. This recovers entries that were written to the data file but never published to EngineState (e.g. sync-failure paths where only next_lsn was advanced, or degraded-state transitions that occurred between IO and state publication). Also advances `next_lsn` past the highest LSN seen on disk.
+  3. Replays valid committed entries into the key directory using sequence-wins resolution: for each Put whose sequence exceeds the current key_dir entry (or the key is absent), update key_dir and file_stats; for each Delete whose sequence exceeds the current entry, erase the key. This recovers entries that were written to the data file but never published to EngineState (e.g. sync-failure paths where only next_seq was advanced, or degraded-state transitions that occurred between IO and state publication). Also advances `next_seq` past the highest sequence seen on disk.
   4. Calls `ftruncate` to remove garbage bytes and orphaned batch markers up to `valid_offset`.
   5. Calls `fdatasync` to persist the truncation.
   6. Seals the active file and dispatches hint generation (both idempotent).
@@ -225,9 +225,9 @@ Implementation: `degraded_` is an `atomic<bool>` (release on write, acquire on r
 
 ##### Runtime invariant enforcement
 
-The engine validates structural invariants at runtime before publishing state, not just in tests. `store_state` compares old and new `EngineState` on every publication: `next_lsn`, `active_file_id`, and `next_file_id` must never regress. On violation the engine degrades (nothing published, writes blocked, reads remain available). Cost: three integer comparisons per write — unmeasurable against `writev` + `fdatasync`. Debug builds add a full `next_lsn > max(key_dir sequences)` walk.
+The engine validates structural invariants at runtime before publishing state, not just in tests. `store_state` compares old and new `EngineState` on every publication: `next_seq`, `active_file_id`, and `next_file_id` must never regress. On violation the engine degrades (nothing published, writes blocked, reads remain available). Cost: three integer comparisons per write — unmeasurable against `writev` + `fdatasync`. Debug builds add a full `next_seq > max(key_dir sequences)` walk.
 
-On cold paths (`DB::open()`, `resume()`), `validate_state_consistency` runs the full O(n) structural check: active file in registry, no dangling file references, `next_lsn` ahead of all sequences, `file_stats` covers all files, `live_bytes` matches `key_dir`. On violation it throws — the DB does not open or `resume()` fails.
+On cold paths (`DB::open()`, `resume()`), `validate_state_consistency` runs the full O(n) structural check: active file in registry, no dangling file references, `next_seq` ahead of all sequences, `file_stats` covers all files, `live_bytes` matches `key_dir`. On violation it throws — the DB does not open or `resume()` fails.
 
 ##### Partial write detection (tainted file)
 
@@ -239,15 +239,15 @@ For multi-entry batches this is safe: the isolation rotation moves to a new file
 
 After all appends succeed and mutations are applied, the engine may rotate the active file if it exceeds the size threshold. Rotation syncs the file, seals it, and creates a new active file. Two distinct failures can occur:
 
-- **Sync fails before seal**: the file is not sealed. The engine captures the exception, advances `next_lsn` past consumed LSNs, and rethrows without publishing key changes. The DB is not degraded — the next write retries rotation or continues appending.
+- **Sync fails before seal**: the file is not sealed. The engine captures the exception, advances `next_seq` past consumed sequences, and rethrows without publishing key changes. The DB is not degraded — the next write retries rotation or continues appending.
 - **File creation fails after seal**: `rotate_active_file` calls `seal()` before creating the new file. If creation fails, the active file is sealed and cannot accept further appends. The engine degrades the DB and publishes state. `resume()` creates a fresh active file.
 
-##### Sync failure: advance LSN, discard key changes
+##### Sync failure: advance sequence, discard key changes
 
 If `fdatasync` fails (step 8 or the rotation sync at step 7a), the write is not
 confirmed durable. Key-directory changes are not published — the written key is not
-visible to callers. `next_lsn` is advanced past the consumed sequence numbers to
-prevent LSN reuse for bytes now in the page cache. The caller receives the
+visible to callers. `next_seq` is advanced past the consumed sequence numbers to
+prevent sequence reuse for bytes now in the page cache. The caller receives the
 exception and must retry. This matches the contract of every other peer engine.
 
 ##### Durability before visibility
@@ -475,7 +475,7 @@ The active file's `live_bytes` may be non-zero (it holds the current live writes
 The displacement logic mirrors write-path updates:
 
 ```
-for each hint entry h (processed in arbitrary file order, LSN wins):
+for each hint entry h (processed in arbitrary file order, sequence wins):
   if h.type == Put and h wins over existing entry o:
     file_stats[o.file_id].live_bytes -= entry_size(o.key_size, o.value_size)
     file_stats[h.file_id].live_bytes += entry_size(h.key_size, h.value_size)
@@ -485,9 +485,9 @@ for each hint entry h (processed in arbitrary file order, LSN wins):
     // tombstone never enters live_bytes
 ```
 
-Processing order across files does not matter — LSN comparison always picks the correct winner, so `live_bytes` converges to the right values.
+Processing order across files does not matter — sequence comparison always picks the correct winner, so `live_bytes` converges to the right values.
 
-**Parallel recovery**: `RecoveryResult` includes a `file_stats` map alongside `key_dir`, `tombstones`, and `max_lsn`. Each worker builds its own `file_stats` during Phase 2 using the algorithm above. During Phase 3 sequential accumulator merge, `file_stats` maps are unioned (file IDs are disjoint across workers due to round-robin). The merge does **not** recompute `live_bytes` — instead, a single `live_bytes` pass runs once after the final merge in Phase 4 (assembly), iterating the fully-merged tree exactly once.
+**Parallel recovery**: `RecoveryResult` includes a `file_stats` map alongside `key_dir`, `tombstones`, and `max_seq`. Each worker builds its own `file_stats` during Phase 2 using the algorithm above. During Phase 3 sequential accumulator merge, `file_stats` maps are unioned (file IDs are disjoint across workers due to round-robin). The merge does **not** recompute `live_bytes` — instead, a single `live_bytes` pass runs once after the final merge in Phase 4 (assembly), iterating the fully-merged tree exactly once.
 
 #### Vacuum primitives
 
@@ -510,7 +510,7 @@ Used when the file's live data is too large to fit into the active file. Produce
    e. Update `file_stats_`: remove the old file's entry. Insert a new entry for the compacted file using the exact `compacted_live_bytes` tracked during step 2 — for each entry whose key-dir sequence no longer matched in step 4b (concurrent write won), its `entry_size` was subtracted from the running total. `total_bytes` is the physical size of the new file. (Note: `compacted_live_bytes` may be less than `total_bytes` because the new file also contains tombstones that are never counted as live, and entries superseded by concurrent writes during the I/O phase.)
    f. Publish the new `EngineState` via `state_.store()`.
 5. **Release `write_mu_`**.
-6. **Defer file cleanup** — the old file is removed from the registry and its `.data` and `.hint` files are unlinked from the filesystem at the start of the next `vacuum()` call (under `vacuum_mu_`). Existing readers continue via their open file descriptors — POSIX guarantees that `pread` on an unlinked file succeeds as long as the fd is open. Disk blocks are freed when the last `shared_ptr<DataFile>` is destroyed, closing the fd. The destructor also unlinks any remaining stale files.
+6. **Unlink old file** — the old file is removed from the registry and its `.data` and `.hint` files are unlinked from the filesystem immediately after the commit. Existing readers continue via their open file descriptors — POSIX guarantees that `pread` on an unlinked file succeeds as long as the fd is open. Disk blocks are freed when the last `shared_ptr<DataFile>` is destroyed, closing the fd.
 
 ##### `vacuum_absorb_file(file_id)` — fold a sealed file's live entries into the active file
 
@@ -521,8 +521,8 @@ Precondition: `file_stats_[file_id].live_bytes + active_file.size() <= rotation_
 1. **Snapshot the key directory** — call `state_.load()`.
 2. **Acquire `write_mu_`** — the active `DataFile` is NOT thread-safe, so the entire scan-copy-sync-commit sequence must be serialised against concurrent `put`/`del`/`apply_batch` calls that also append to the active file.
 3. **Append live entries to the active file** — scan the old data file entry by entry using **batch-aware scanning** (see below). For each emitted entry:
-   - *Put entry*: if live (same check as `compact_file`), append to the active file at its new offset. The original LSN is preserved verbatim — no new sequence numbers are allocated. Record `(key → active_file_id, new_offset)`.
-   - *Delete entry*: copy verbatim to the active file (same LSN, same key).
+   - *Put entry*: if live (same check as `compact_file`), append to the active file at its new offset. The original sequence is preserved verbatim — no new sequence numbers are allocated. Record `(key → active_file_id, new_offset)`.
+   - *Delete entry*: copy verbatim to the active file (same sequence, same key).
 4. **Durability** — `fdatasync` the active file.
 5. **Commit** (still under `write_mu_`):
    a–c. Same key-directory remapping as `vacuum_compact_file`, but pointing entries to `active_file_id` instead of a new compacted file.
@@ -530,9 +530,9 @@ Precondition: `file_stats_[file_id].live_bytes + active_file.size() <= rotation_
    e. Update `file_stats_`: remove the old file's entry. Add the absorbed entries' sizes to `file_stats_[active_file_id]` (both `live_bytes` and `total_bytes` for live Puts; `total_bytes` only for tombstones). Subtract sizes for entries superseded by concurrent writes (same logic as `vacuum_compact_file`).
    f. Publish the new `EngineState`.
 6. **Release `write_mu_`**.
-7. **Defer file cleanup** — same as `vacuum_compact_file`: stash in `stale_files_`, unlink at the start of the next `vacuum()` call.
+7. **Unlink old file** — same as `vacuum_compact_file`: unlink the `.data` and `.hint` files immediately. Existing readers continue via their open file descriptors — POSIX guarantees `pread` on an unlinked file succeeds as long as the fd is open.
 
-Note: absorbed entries preserve their original LSNs, which are all less than `next_lsn`. This is safe because LSN ordering is only used for recovery conflict resolution across files, and the absorbed entries now live in the active file alongside newer writes. Recovery will see all entries and LSN comparison still picks the correct winner.
+Note: absorbed entries preserve their original sequences, which are all less than `next_seq`. This is safe because sequence ordering is only used for recovery conflict resolution across files, and the absorbed entries now live in the active file alongside newer writes. Recovery will see all entries and sequence comparison still picks the correct winner.
 
 #### Batch-aware scanning
 
@@ -544,21 +544,20 @@ Both vacuum primitives use batch-aware scanning when reading the old data file. 
 
 `vacuum_compact_file` writes the new data file to `.data.tmp` and renames it atomically to `.data` after `fdatasync`. If the engine crashes mid-write, recovery ignores `.data.tmp` files (it only processes `.data` extensions) and cleans them up in `open_and_prepare_files`. The hint file uses the same `.hint.tmp` → `.hint` protocol.
 
-`vacuum_absorb_file` appends to the already-open active file. If the engine crashes mid-absorb, the old file still exists on disk (deferred cleanup). Recovery opens both files and processes all entries. Absorbed entries appear in both the old file and the active file with identical LSNs — recovery's conflict resolution handles duplicates correctly.
+`vacuum_absorb_file` appends to the already-open active file. If the engine crashes mid-absorb, the old file still exists on disk (deferred cleanup). Recovery opens both files and processes all entries. Absorbed entries appear in both the old file and the active file with identical sequences — recovery's conflict resolution handles duplicates correctly.
 
 #### Vacuum caller (`vacuum()`)
 
 The public `vacuum()` method orchestrates file selection and dispatches to exactly one primitive:
 
 1. **Acquire `vacuum_mu_`** — prevents two `vacuum()` calls from running concurrently.
-2. **Purge stale files** — check `stale_files_` for entries whose `shared_ptr<DataFile>` has `use_count() == 1` (no in-flight readers). For those, close the fd and delete the `.data` + `.hint` files.
-3. **Select a target file** — copy `file_stats_` under a brief `write_mu_` acquisition (O(sealed files), then release). Iterate sealed files, compute `fragmentation = 1 − live_bytes / total_bytes` (O(1) per file, no I/O), pick the highest-fragmentation sealed file above `fragmentation_threshold`. If no file qualifies, return immediately.
-4. **Branch**:
+2. **Select a target file** — copy `file_stats_` under a brief `write_mu_` acquisition (O(sealed files), then release). Iterate sealed files, compute `fragmentation = 1 − live_bytes / total_bytes` (O(1) per file, no I/O), pick the highest-fragmentation sealed file above `fragmentation_threshold`. If no file qualifies, return immediately.
+3. **Branch**:
    - If `file_stats_[target].live_bytes <= absorb_threshold` **and** `file_stats_[target].live_bytes + active_file.size() <= rotation_threshold` → call `vacuum_absorb_file(target)`.
    - Otherwise → call `vacuum_compact_file(target)`.
 
    `absorb_threshold` (default 1 MiB) limits absorption to genuinely small files. A file with more live data than `absorb_threshold` is always compacted into a new sealed file, keeping the active file from bloating.
-5. **Release `vacuum_mu_`**.
+4. **Release `vacuum_mu_`**.
 
 #### Tombstone handling
 
@@ -566,7 +565,7 @@ Tombstone (Delete) entries record that a key was explicitly removed. They must b
 
 **Why**: if an older data file (not being compacted in this cycle) contains a Put for the same key, recovery would see that Put and resurrect the key — unless the Delete entry survives in some file to overrule it. Preserving the tombstone prevents this.
 
-A deleted key is not present in the key directory, so no key-directory update is needed for tombstones — they are pure pass-through copies. The original sequence number is preserved verbatim so recovery's LSN comparison still works correctly on the compacted file.
+A deleted key is not present in the key directory, so no key-directory update is needed for tombstones — they are pure pass-through copies. The original sequence number is preserved verbatim so recovery's sequence comparison still works correctly on the compacted file.
 
 The practical consequence is that space reclaimed by partial vacuum comes entirely from superseded Put entries. Tombstones occupy space in the compacted file until a full-vacuum pass eliminates them.
 
@@ -604,7 +603,7 @@ Vacuum never holds `write_mu_` during file I/O. The only time `write_mu_` is hel
 
 | Offset | Size | Field      | Type   | Description                                    |
 |--------|------|------------|--------|------------------------------------------------|
-| 0      | 8    | Sequence   | u64 LE | Monotonic sequence number (LSN)                |
+| 0      | 8    | Sequence   | u64 LE | Monotonic sequence number                      |
 | 8      | 1    | EntryType  | u8     | Entry kind (see EntryType enum)                |
 | 9      | 2    | Key Size   | u16 LE | Key length in bytes (0 for BulkBegin/BulkEnd)  |
 | 11     | 4    | Value Size | u32 LE | Value length in bytes (0 for Delete/Bulk*)     |
@@ -643,13 +642,13 @@ CRC is at the **end** of the entry so both write and read can be done in a singl
 - CRC-32C uses the Castagnoli polynomial `0x1EDC6F41` via the [google/crc32c](https://github.com/google/crc32c) library, which auto-detects hardware acceleration at runtime (SSE4.2 on x86-64, CRC instructions on AArch64) and falls back to a software implementation when neither is available.
 - CRC32 is computed over **all bytes of the entry except the trailing CRC field itself** (i.e., the leading header + key data + value data).
 
-### Log Sequence Number (LSN)
+### Sequence Number
 
-The LSN is a **globally monotonic** counter across all data files and all engine sessions — not a per-file counter. This is a correctness invariant: recovery determines which of two entries for the same key is fresher by comparing LSNs from potentially different files. Any per-file counter reset would silently allow stale data to overwrite live data.
+The sequence is a **globally monotonic** counter across all data files and all engine sessions — not a per-file counter. This is a correctness invariant: recovery determines which of two entries for the same key is fresher by comparing sequences from potentially different files. Any per-file counter reset would silently allow stale data to overwrite live data.
 
-- The engine owns and increments the global LSN. `DataFile` is a passive consumer: the caller passes `sequence` to every `append` call.
+- The engine owns and increments the global sequence. `DataFile` is a passive consumer: the caller passes `sequence` to every `append` call.
 - `DataFile` does not start its own counter; it does not know or care what value the sequence starts at.
-- On startup, the engine scans all hint files and the active data file to find `max_lsn`, then seeds the new active `DataFile` at `max_lsn + 1`.
+- On startup, the engine scans all hint files and the active data file to find `max_seq`, then seeds the new active `DataFile` at `max_seq + 1`.
 
 ### Log-Structured Naming Convention
 
@@ -755,7 +754,7 @@ Total fixed overhead per entry: **24 bytes** (header). The key is stored as `pre
 
 | Offset | Size | Field        | Type   | Description                                    |
 |--------|------|--------------|--------|------------------------------------------------|
-| 0      | 8    | Sequence     | u64 LE | Entry sequence number (LSN)                    |
+| 0      | 8    | Sequence     | u64 LE | Entry sequence number                          |
 | 8      | 1    | EntryType    | u8     | Entry kind: `Put` (0x01) or `Delete` (0x02) only |
 | 9      | 8    | File Offset  | u64 LE | Byte offset of the entry in the data file      |
 | 17     | 4    | Value Size   | u32 LE | Value length in bytes                          |
@@ -796,8 +795,8 @@ On engine startup:
 3. Recover exclusively from hint files. For each hint entry:
    - `Put`: insert `(key → {sequence, file_id, file_offset, value_size})` only if `entry.sequence > dir[key].sequence` (skip if a fresher entry is already present).
    - `Delete`: remove the key from the tree if `entry.sequence > dir[key].sequence`; otherwise skip.
-4. Record `max_lsn` — the largest sequence number seen across all hint entries.
-5. Create a new active data file seeded at `max_lsn + 1`.
+4. Record `max_seq` — the largest sequence number seen across all hint entries.
+5. Create a new active data file seeded at `max_seq + 1`.
 
 This is a single code path: `flush_hints_for()` is the same function used by rotation and background hint writes. No raw-scan recovery logic exists — recovery always goes through hints.
 
@@ -806,9 +805,9 @@ This is a single code path: `flush_hints_for()` is the same function used by rot
 `Bytecask::open(dir, max_file_bytes, recovery_threads)` accepts an optional `recovery_threads` parameter (default 1 = serial). When `recovery_threads > 1`, recovery uses `parallel_recover_existing_files`:
 
 1. **Phase 1 (serial, shared)**: same as above — open files, generate missing hints. Factored into `open_and_prepare_files()`, shared by both paths.
-2. **Phase 2 (parallel build)**: round-robin assign files to W workers. Each builds a `RecoveryResult{key_dir, tombstones, max_lsn, file_stats}` independently.
-3. **Phase 3 (sequential accumulator merge)**: workers push finished `RecoveryResult`s into a thread-safe queue. A single merge thread pops results and merges each into a growing accumulator using `PersistentRadixTree::merge(acc, incoming, lsn_resolver)`, then cross-applies tombstones. Each ~N/W-key tree is merged once; disjoint subtrees are shared O(1) by the persistent tree, so total merge work is proportional to overlap, not N × log₂(W).
-4. **Phase 4 (serial assembly)**: `s.key_dir = final.key_dir; s.next_lsn = final.max_lsn + 1`.
+2. **Phase 2 (parallel build)**: round-robin assign files to W workers. Each builds a `RecoveryResult{key_dir, tombstones, max_seq, file_stats}` independently.
+3. **Phase 3 (sequential accumulator merge)**: workers push finished `RecoveryResult`s into a thread-safe queue. A single merge thread pops results and merges each into a growing accumulator using `PersistentRadixTree::merge(acc, incoming, seq_resolver)`, then cross-applies tombstones. Each ~N/W-key tree is merged once; disjoint subtrees are shared O(1) by the persistent tree, so total merge work is proportional to overlap, not N × log₂(W).
+4. **Phase 4 (serial assembly)**: `s.key_dir = final.key_dir; s.next_seq = final.max_seq + 1`.
 
 See `docs/parallel_recovery_design.md` §11 for the full v1 algorithm.
 
@@ -1284,7 +1283,7 @@ Two primitives added to `DB` in BC-103 providing snapshot isolation without any 
 
 Returns a `Snapshot` — a move-only, read-only value wrapping a `shared_ptr<const EngineState>`. The entire state at that moment is frozen: the key directory, the file registry, and open file descriptors. Reads on `Snapshot` are lock-free; no mutex is ever acquired.
 
-The `shared_ptr` keeps all data files referenced at snapshot time alive. Vacuum's `use_count() == 1` guard defers physical file deletion until all snapshots referencing a file are destroyed — no additional code required.
+The `shared_ptr` keeps all data files referenced at snapshot time alive — their file descriptors remain open. Vacuum unlinks files immediately, but POSIX guarantees that `pread` on an unlinked file succeeds as long as the fd is open. Disk blocks are freed when the last `shared_ptr<DataFile>` is destroyed, closing the fd.
 
 `Snapshot` exposes the same read API as `DB`: `get`, `contains_key`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from`.
 
@@ -1334,7 +1333,7 @@ When the write set contains exactly one operation, `apply_batch` skips the `Bulk
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
 | D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1 and standard C++ practice). |
 | D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. MVCC and snapshot isolation are not provided. |
-| D10 | **Vacuum**: Two independently testable primitives — `vacuum_compact_file` (rewrite sealed file into a new sealed file, dropping dead entries) and `vacuum_absorb_file` (append live entries to the active file, preserving original LSNs, then delete the old file). `vacuum()` selects a target file above `fragmentation_threshold`, then branches: `vacuum_absorb_file` if `live_bytes <= absorb_threshold` and the data fits in the active file, otherwise `vacuum_compact_file`. Returns `true` if a file was processed, `false` if nothing qualified. No compound paths. All vacuum-related identifiers use a `vacuum_` prefix. One sealed file per `vacuum()` call. Engine continues serving reads and writes. For `vacuum_compact_file`, `write_mu_` is held only for the commit step (I/O writes to a private temp file). For `vacuum_absorb_file`, `write_mu_` is held for the entire scan-copy-sync-commit phase because the active `DataFile` is not thread-safe and concurrent `put`/`del`/`apply_batch` also append to it. `vacuum_commit` itself does not acquire `write_mu_` — the caller is responsible for holding it. Tombstones are always copied (never elided) during partial vacuum. File selection uses `fragmentation >= fragmentation_threshold` computed from incrementally maintained `FileStats` — O(1) per file. Stats are reconstructed during recovery as a side-effect of the hint-file pass. |
+| D10 | **Vacuum**: Two independently testable primitives — `vacuum_compact_file` (rewrite sealed file into a new sealed file, dropping dead entries) and `vacuum_absorb_file` (append live entries to the active file, preserving original sequences, then delete the old file). `vacuum()` selects a target file above `fragmentation_threshold`, then branches: `vacuum_absorb_file` if `live_bytes <= absorb_threshold` and the data fits in the active file, otherwise `vacuum_compact_file`. Returns `true` if a file was processed, `false` if nothing qualified. No compound paths. All vacuum-related identifiers use a `vacuum_` prefix. One sealed file per `vacuum()` call. Engine continues serving reads and writes. For `vacuum_compact_file`, `write_mu_` is held only for the commit step (I/O writes to a private temp file). For `vacuum_absorb_file`, `write_mu_` is held for the entire scan-copy-sync-commit phase because the active `DataFile` is not thread-safe and concurrent `put`/`del`/`apply_batch` also append to it. `vacuum_commit` itself does not acquire `write_mu_` — the caller is responsible for holding it. Tombstones are always copied (never elided) during partial vacuum. File selection uses `fragmentation >= fragmentation_threshold` computed from incrementally maintained `FileStats` — O(1) per file. Stats are reconstructed during recovery as a side-effect of the hint-file pass. |
 | D11 | **File naming**: `data_{YYYYMMDDHHmmssUUUUUU}` using microsecond precision. Gives lexicographic == chronological ordering and avoids the false precision of nanosecond timestamps whose sub-microsecond bits are often zero on Linux. |
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be discarded with a logged warning. No partial-batch entries enter the key directory. |
