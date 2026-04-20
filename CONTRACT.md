@@ -255,6 +255,40 @@ contiguity. All operations that depend on LSN comparison must use strict
 `<`, never equality for ordering or arithmetic on gaps. Duplicate
 LSNs are the actual risk.
 
+### Durable Sequence (`durable_seq`)
+
+`durable_seq` tracks the highest sequence number confirmed by `fdatasync`.
+It is a field on `EngineState`, updated through the normal transient →
+persistent → `store_state` path via `TransientEngineState::apply_sync`.
+
+**Must be true, always:**
+
+- **Monotonicity.** `durable_seq` must never regress. Enforced by
+  `store_state` (same check as `next_seq`, `active_file_id`,
+  `next_file_id`).
+
+- **Only advanced after successful fdatasync.** `apply_sync` must only
+  be called after `file.sync()` returns successfully. If sync fails
+  (classes F, G), the transient's `durable_seq` must not be updated.
+
+- **Covers all entries in the batch.** When group commit syncs a batch,
+  `durable_seq` advances to `next_seq - 1` (the highest sequence
+  consumed by Phase 1). All entries in the batch — including earlier
+  nosync entries — are covered by the single `fdatasync`.
+
+- **Recovery sets `durable_seq = next_seq - 1`.** All recovered entries
+  were previously synced. After `DB::open()` and `resume()`,
+  `durable_seq` reflects the full recovered state.
+
+- **NoSync-only writes do not advance `durable_seq`.** If no `fdatasync`
+  occurs in `execute_slots`, the transient carries forward the previous
+  `durable_seq` unchanged.
+
+`current_sequence(timeout)` exposes `durable_seq` to callers.
+`timeout=0` is a non-blocking load. `timeout>0` blocks on `durable_cv_`
+until `durable_seq` advances or timeout expires. The condvar notification
+is centralized in `store_state` — one place, one check.
+
 ---
 
 ## vacuum_compact
@@ -440,6 +474,7 @@ to readers.
 | `next_lsn` must not regress | Prevents LSN reuse (§Sequence Numbers). |
 | `active_file_id` must not regress | File IDs are monotonically assigned; rotation only moves forward. |
 | `next_file_id` must not regress | Same monotonicity as `active_file_id`. |
+| `durable_seq` must not regress | Confirmed-durable sequences cannot un-sync. |
 
 On violation: the engine degrades (publishes nothing, writes blocked,
 reads remain available). Cost: three integer comparisons per write.

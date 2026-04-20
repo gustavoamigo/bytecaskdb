@@ -6,6 +6,7 @@
 module;
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -375,6 +376,11 @@ public:
   void apply_resume(std::uint32_t file_id,
                     const std::vector<ResumeEntry> &entries);
 
+  // State transition: record that all sequences up to batch_max_seq
+  // have been confirmed durable by fdatasync. Monotonic — silently
+  // ignores a value <= current durable_seq. Cannot fail.
+  void apply_sync(std::uint64_t batch_max_seq);
+
   // Pure queries the coordinator needs for IO decisions.
   [[nodiscard]] auto active_file() -> DataFile &;
   [[nodiscard]] auto active_file_id() const noexcept -> std::uint32_t;
@@ -383,6 +389,8 @@ public:
   // Returns the current next_seq value — used to capture the post-write sequence
   // before consuming the transient on sync failure (F/G).
   [[nodiscard]] auto next_seq() const noexcept -> std::uint64_t;
+
+  [[nodiscard]] auto durable_seq() const noexcept -> std::uint64_t;
 
   // Advances next_seq_ to new_seq without applying any key-dir or file-stats
   // changes. Used on F/G sync failure to prevent sequence reuse for bytes already
@@ -406,7 +414,8 @@ private:
                        TransientU32Map<FileStats> file_stats,
                        std::uint32_t active_file_id,
                        std::uint32_t next_file_id,
-                       std::uint64_t next_seq);
+                       std::uint64_t next_seq,
+                       std::uint64_t durable_seq);
 
   TransientRadixTree<KeyDirEntry> key_dir_;
   TransientU32Map<std::shared_ptr<DataFile>> files_;
@@ -414,6 +423,7 @@ private:
   std::uint32_t active_file_id_;
   std::uint32_t next_file_id_;
   std::uint64_t next_seq_;
+  std::uint64_t durable_seq_;
 };
 
 // ---------------------------------------------------------------------------
@@ -593,6 +603,14 @@ public:
   //   }
   [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
 
+  // Returns the highest sequence confirmed durable by fdatasync.
+  // timeout=0: non-blocking, returns current value.
+  // timeout>0: blocks until durable_seq advances past the baseline
+  // captured at entry, or timeout expires.
+  [[nodiscard]] auto current_sequence(
+      std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
+      -> std::uint64_t;
+
 private:
   explicit DB(std::filesystem::path dir, Options opts);
 
@@ -719,6 +737,10 @@ private:
   // Written before degraded_.store(release); read after
   // degraded_.load(acquire) — the atomic bool synchronises access.
   std::string degraded_reason_;
+  // Long-poll condvar for durable_seq advances. Notified by store_state
+  // when new_state->durable_seq > old_state->durable_seq.
+  mutable std::mutex durable_mu_;
+  mutable std::condition_variable durable_cv_;
   // Serialises writers (put, del, apply_batch). Readers never acquire this.
   std::unique_ptr<std::mutex> write_mu_{std::make_unique<std::mutex>()};
   // Serialises vacuum() calls. Separate from write_mu_ so vacuum I/O does

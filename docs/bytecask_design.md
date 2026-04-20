@@ -126,6 +126,7 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
   │  active_file_id  uint32_t                         │
   │  next_file_id    uint32_t                         │  writer-only; monotonic file counter
   │  next_seq         uint64_t                         │  writer-only; monotonic sequence counter
+  │  durable_seq      uint64_t                         │  highest sequence confirmed by fdatasync
   └──────────────────────────────────────────────────┘
 ```
 
@@ -192,6 +193,7 @@ The coordinator (step 5 above) only performs IO. It never touches `key_dir`, `fi
 - `apply_writes(plan, io_result)` — updates key_dir, file_stats, advances sequence
 - `apply_rotate_file(new_file)` — registers new file, updates active_file_id
 - `apply_vacuum(old_file_id, scan, new_file)` — remaps keys, updates registry + stats
+- `apply_sync(batch_max_seq)` — records that fdatasync confirmed durability up to batch_max_seq
 - `persistent() &&` — produces `shared_ptr<EngineState>` for publishing
 
 **Three-phase discipline**: Phase 1 is pure in-memory (validate, prepare, compute offsets, apply_writes). Phase 2 is a single IO call. Phase 3 is sync/rotate/publish. If IO throws, the transient's state mutations are already applied but never published — the transient is discarded and the engine degrades.
@@ -225,7 +227,7 @@ Implementation: `degraded_` is an `atomic<bool>` (release on write, acquire on r
 
 ##### Runtime invariant enforcement
 
-The engine validates structural invariants at runtime before publishing state, not just in tests. `store_state` compares old and new `EngineState` on every publication: `next_seq`, `active_file_id`, and `next_file_id` must never regress. On violation the engine degrades (nothing published, writes blocked, reads remain available). Cost: three integer comparisons per write — unmeasurable against `writev` + `fdatasync`. Debug builds add a full `next_seq > max(key_dir sequences)` walk.
+The engine validates structural invariants at runtime before publishing state, not just in tests. `store_state` compares old and new `EngineState` on every publication: `next_seq`, `active_file_id`, `next_file_id`, and `durable_seq` must never regress. On violation the engine degrades (nothing published, writes blocked, reads remain available). Cost: four integer comparisons per write — unmeasurable against `writev` + `fdatasync`. Debug builds add a full `next_seq > max(key_dir sequences)` walk. When `durable_seq` advances, `store_state` notifies `durable_cv_` — the condvar used by `current_sequence(timeout)` for long-poll.
 
 On cold paths (`DB::open()`, `resume()`), `validate_state_consistency` runs the full O(n) structural check: active file in registry, no dangling file references, `next_seq` ahead of all sequences, `file_stats` covers all files, `live_bytes` matches `key_dir`. On violation it throws — the DB does not open or `resume()` fails.
 
@@ -234,6 +236,16 @@ On cold paths (`DB::open()`, `resume()`), `validate_state_consistency` runs the 
 If `writev` returns a short write (0 < written < total), `DataFile::append()` sets a `tainted_` flag before throwing. A tainted file has bytes on disk that `offset_` does not account for. The file is opened with `O_APPEND`, so the next `writev` would write at the kernel's true EOF (past the partial data), but `offset_` would still point to the old position — the offset returned by subsequent appends would be wrong.
 
 For multi-entry batches this is safe: the isolation rotation moves to a new file, abandoning the tainted one. For single-entry writes, the `apply_batch` catch block checks `file.is_tainted()` and degrades the DB if set. `resume()` then truncates the partial entry and restores a clean state.
+
+##### Durable sequence tracking
+
+`durable_seq` is a field on `EngineState` that tracks the highest sequence number confirmed by `fdatasync`. Updated via `TransientEngineState::apply_sync(batch_max_seq)` — a named state transition, same as `apply_writes`, `apply_rotate_file`, etc.
+
+In `execute_slots`, `batch_max_seq = next_seq - 1` is computed once after Phase 1. At each successful `file.sync()`, the transient calls `apply_sync(batch_max_seq)`. If sync fails, `apply_sync` is never called — the transient carries forward the previous `durable_seq` unchanged. The monotonicity guard in `apply_sync` ensures idempotent calls (rotation sync + commit sync on the same batch).
+
+`current_sequence(timeout)` exposes `durable_seq` to callers. `timeout=0` is a non-blocking load of the current `EngineState`. `timeout>0` blocks on `durable_cv_` (notified by `store_state` when `durable_seq` advances) until the value changes or timeout expires. The condvar notification is centralized in `store_state` — one place, one check.
+
+After recovery (`DB::open`, `resume`), `durable_seq` is set to `next_seq - 1` because all recovered entries were previously synced.
 
 ##### Post-write rotation failure
 

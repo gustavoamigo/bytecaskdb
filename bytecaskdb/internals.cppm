@@ -88,6 +88,7 @@ export struct EngineState {
   std::uint32_t active_file_id{};
   std::uint32_t next_file_id{};
   std::uint64_t next_seq{1};
+  std::uint64_t durable_seq{0};
 
   [[nodiscard]] auto active_file() -> DataFile & {
     return **files.get(active_file_id);
