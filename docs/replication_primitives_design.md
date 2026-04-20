@@ -157,12 +157,14 @@ The engine maintains a `durable_sequence` alongside `next_seq`:
 - **`next_seq`** — highest allocated sequence. Includes unsync'd entries. Used for sequence assignment.
 - **`durable_sequence`** — highest sequence confirmed by `fdatasync`. Only increases. Each sync point sets `durable_sequence = max(durable_sequence, highest_sequence_in_synced_range)`. This is trivially satisfied because sequences are assigned monotonically and each `fdatasync` covers all entries written to the file so far.
 
-**Sync points that advance `durable_sequence`:**
+**Sync points that advance `durable_sequence`** (exhaustive — these are the only four `file.sync()` calls in the engine, so they are the only points at which `durable_sequence` can move):
 
 1. **Sync write** — `file.sync()` when any writer in the group commit batch requested `sync=true`. Covers all entries in the batch, including those from NoSync writers that rode along.
 2. **Rotation sync** — `file.sync()` before sealing the active file. Covers all entries written to the file, including NoSync entries. This is the mechanism that bounds replication lag on NoSync-only workloads.
 3. **Error-path sync** — `file.sync()` after a failed `append_entries`, to flush whatever was previously written. Not a normal path — the engine degrades after this.
 4. **Resume sync** — after `resume()` truncates garbage bytes and syncs the recovered file.
+
+Any future code that adds a new `file.sync()` call must also advance `durable_sequence`, or replication will stall / skip entries depending on direction.
 
 `changes_since(snap, from_sequence)` uses `min(snap.sequence(), durable_sequence)` as its upper bound. Entries with `sequence > durable_sequence` are excluded even if present in the snapshot's key directory.
 
@@ -374,7 +376,8 @@ How entries are delivered to the follower. Each shape exercises a different prop
 | `restart_midstream` | Ingest some entries, close follower, reopen, restart from follower.current_sequence() | Recovery equivalence — reopened follower's current_sequence() is trustworthy and the next changes_since picks up without gaps |
 | `duplicate_delivery` | Re-deliver entries the follower already has | Idempotency — entries with sequence <= current_sequence() are silently skipped, no state change |
 | `planned_promotion` | Replicate NodeA (Leader) → NodeB (Follower) fully, transfer leadership to NodeB, write new entries on NodeB, replicate NodeB → NodeA (backward sync) | Sequence continuity on promoted NodeB; NodeA rejects writes after demotion; NodeA catches up from NodeB and its key_dir matches NodeB's state |
-| `unplanned_promotion` | Replicate NodeA → NodeB partially, crash NodeA, promote NodeB, write new entries, reopen NodeA as Follower, replicate NodeB → NodeA | NodeB's writes start from its current_sequence(); NodeA after catching up has NodeB's full state; sequence space is a strict continuation with no collision |
+
+**Out of scope for the primitive proof:** unplanned promotion (old leader crashes, follower promotes, old leader later rejoins). A crashed leader may have locally-recovered entries past the follower's durable sequence, creating a log fork. Reconciling a fork is a coordinator-level concern, not a primitive-level guarantee. The required recovery protocol is simple: a crashed leader must be re-bootstrapped from the new leader via `create_manifest` before rejoining as a follower — never reopened in place.
 
 ### FailureClasses
 
@@ -396,6 +399,8 @@ class IngestFailureClass(Enum):
 | I_B2 | None | No | Yes (prevent reuse) | Yes |
 | I_F | None visible | No (not published) | Yes (prevent reuse) | Yes |
 | I_C | None from the batch | No — recovery discards incomplete batch | Restored to pre-batch | No (recovery handles) |
+
+**next_seq advance on failure + idempotency — coordinator contract.** On I_B1/I_B2/I_F the follower advances `next_seq` past the failed entries and degrades. A naive re-deliver would hit the idempotency skip (`sequence <= current_sequence()`) and silently drop data. The coordinator must call `resume()` before retrying: `resume()` truncates the post-durable tail and rebuilds `next_seq` from the recovered state ([`bytecask.cpp` `DB::resume`](../bytecaskdb/bytecask.cpp)), restoring the invariant `next_seq == max(applied seq) + 1`. Re-delivery then proceeds normally.
 
 Class C (orphaned `BulkBegin`) is reachable through the replication pipeline — `changes_since` preserves batch markers, so `ingest` writes `BulkBegin`...entries...`BulkEnd` as a `writev`. If the follower crashes mid-`ingest` after writing `BulkBegin` but before `BulkEnd`, recovery discards the incomplete batch (same as the leader's recovery behavior). Classes G and H (rotation failures) apply if `ingest` triggers file rotation on the follower when the active file exceeds the size threshold.
 
@@ -438,6 +443,7 @@ Checked after every test case:
 7. **Idempotency**: re-ingesting entries with `sequence <= current_sequence()` produces no state change — no key_dir delta, no next_seq change.
 8. **Durable boundary**: `changes_since` never yields entries with `sequence > durable_sequence`. Validated by running a mixed sync/nosync workload on the leader, taking a snapshot (which includes unsync'd entries in the key directory), and verifying that `changes_since` excludes entries beyond the durable sequence.
 9. **Batch atomicity through vacuum**: for the `vacuumed_batches` state shape, `changes_since` over vacuumed files yields `BulkBegin`/`BulkEnd` markers framing the batch entries. `ingest` writes the batch as a single `writev` on the follower. After a simulated crash mid-ingest (Class C), recovery discards the incomplete batch — no partial batch is visible.
+9a. **Vacuum preserves original sequences**: for every entry in a vacuumed file, the sequence equals the entry's sequence in the pre-vacuum source file. Vacuum never re-numbers. This is load-bearing for replication (otherwise `changes_since` would yield inconsistent sequences after vacuum) and is currently incidental in [`vacuum_scan_and_copy`](../bytecaskdb/bytecask.cpp) — making it a test invariant prevents a future refactor from silently breaking it.
 10. **Sequence continuity after promotion**: after `set_mode(Leader)`, the first write on the promoted node gets `sequence == current_sequence() + 1`. No gap, no reuse of existing sequences.
 11. **Mode enforcement**: in `Mode::Follower`, `put`/`del`/`apply_batch` are rejected. In `Mode::Leader`, `ingest` is rejected. `set_mode` transitions are immediate — no in-flight writes straddle the boundary (writes are mutex-serialized).
 12. **Backward sync after promotion**: after planned promotion, NodeA (now Follower) replicating from NodeB (now Leader) produces a key_dir identical to NodeB's. The old leader's stale entries are superseded by the new leader's writes through normal sequence ordering.
@@ -480,19 +486,6 @@ promotion tests (planned):
   9. Replicate NodeB → NodeA: NodeB.changes_since → NodeA.ingest
   10. assert NodeA.key_dir == NodeB.key_dir (backward sync converged)
   11. Close both, reopen, assert_recovery_equivalent
-
-promotion tests (unplanned):
-  1. Create NodeA (Leader), apply workload (StateShape)
-  2. Create NodeB (Follower)
-  3. Replicate partially (NodeB ingests subset of changes_since)
-  4. Drop NodeA (simulate crash — no graceful shutdown)
-  5. NodeB.set_mode(Mode::Leader)
-  6. Write new entries on NodeB
-  7. assert NodeB.current_sequence() == last_ingested + N (new writes)
-  8. Reopen NodeA in Mode::Follower
-  9. Replicate NodeB → NodeA from NodeA.current_sequence()
-  10. assert NodeA.key_dir == NodeB.key_dir (NodeA caught up)
-  11. Close both, reopen, assert_recovery_equivalent
 ```
 
 ### Scenario Matrix Size
@@ -505,9 +498,9 @@ Elimination rules:
 - `nosync_only`: rotation triggers fdatasync, so entries are replicable after rotation. All ops shapes and failure classes apply — no elimination.
 - I_C only applies to state shapes with batches (`batches`, `vacuumed_batches`). For state shapes without batch markers, I_C is unreachable → eliminates 36 tests.
 
-Promotion tests are SUCCESS-only for the mode switch (no I/O failure modes — it's a flag flip). The replication phases before and after promotion use the same ingest path tested above. 11 state shapes × 2 promotion shapes = 22 promotion tests.
+Promotion tests are SUCCESS-only for the mode switch (no I/O failure modes — it's a flag flip). The replication phases before and after promotion use the same ingest path tested above. 11 state shapes × 1 promotion shape (planned only) = 11 promotion tests.
 
-Estimated: **~180 ingest tests** + **~33 create_manifest tests** + **~22 promotion tests** = **~235 tests**.
+Estimated: **~180 ingest tests** + **~33 create_manifest tests** + **~11 promotion tests** = **~224 tests**.
 
 ---
 
