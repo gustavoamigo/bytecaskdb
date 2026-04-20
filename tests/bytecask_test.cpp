@@ -24,6 +24,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <vector>
 import bytecask;
 import bytecask.data_entry;
@@ -1070,9 +1071,11 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
   // File IDs may differ, but the multiset of (live_bytes, total_bytes)
   // must match between serial and parallel.
   auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> vals;
+    std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                           std::uint64_t, std::uint64_t>> vals;
     for (const auto &[fid, fs] : db.file_stats()) {
-      vals.emplace_back(fs.live_bytes, fs.total_bytes);
+      vals.emplace_back(fs.live_bytes, fs.total_bytes,
+                        fs.min_sequence, fs.max_sequence);
     }
     std::ranges::sort(vals);
     return vals;
@@ -1088,7 +1091,8 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
 
   // Collect serial file_stats as baseline for parallel comparison.
   // Must use a separate copy since opening mutates the directory.
-  std::vector<std::pair<std::uint64_t, std::uint64_t>> serial_stats_vals;
+  std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                         std::uint64_t, std::uint64_t>> serial_stats_vals;
   {
     const auto serial_path = td.path / "serial_baseline";
     std::filesystem::copy(db_path, serial_path,
@@ -1219,15 +1223,18 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
   };
 
   auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> vals;
+    std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                           std::uint64_t, std::uint64_t>> vals;
     for (const auto &[fid, fs] : db.file_stats()) {
-      vals.emplace_back(fs.live_bytes, fs.total_bytes);
+      vals.emplace_back(fs.live_bytes, fs.total_bytes,
+                        fs.min_sequence, fs.max_sequence);
     }
     std::ranges::sort(vals);
     return vals;
   };
 
-  std::vector<std::pair<std::uint64_t, std::uint64_t>> serial_stats_vals;
+  std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                         std::uint64_t, std::uint64_t>> serial_stats_vals;
   {
     const auto serial_path = td.path / "serial_baseline";
     std::filesystem::copy(db_path, serial_path,
@@ -1319,9 +1326,11 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
   };
 
   auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> vals;
+    std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                           std::uint64_t, std::uint64_t>> vals;
     for (const auto &[fid, fs] : db.file_stats()) {
-      vals.emplace_back(fs.live_bytes, fs.total_bytes);
+      vals.emplace_back(fs.live_bytes, fs.total_bytes,
+                        fs.min_sequence, fs.max_sequence);
     }
     std::ranges::sort(vals);
     return vals;
@@ -1333,7 +1342,8 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
       ++data_file_count;
   }
 
-  std::vector<std::pair<std::uint64_t, std::uint64_t>> serial_stats_vals;
+  std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                         std::uint64_t, std::uint64_t>> serial_stats_vals;
   {
     const auto serial_path = td.path / "serial_baseline";
     std::filesystem::copy(db_path, serial_path,
@@ -3966,7 +3976,7 @@ TEST_CASE("apply_resume: put inserts new key into empty key_dir",
 
   std::vector<bytecask::ResumeEntry> entries{
       make_resume_entry(50, bytecask::EntryType::Put, "k1", 0, 4)};
-  t.apply_resume(1, entries);
+  t.apply_resume(1, entries, 0);
 
   auto s = std::move(t).persistent();
   auto kv = s->key_dir.get(to_bytes("k1"));
@@ -3987,7 +3997,7 @@ TEST_CASE("apply_resume: put with higher sequence overwrites existing",
 
   std::vector<bytecask::ResumeEntry> entries{
       make_resume_entry(50, bytecask::EntryType::Put, "k1", 200, 8)};
-  t.apply_resume(1, entries);
+  t.apply_resume(1, entries, 0);
 
   auto s = std::move(t).persistent();
   auto kv = s->key_dir.get(to_bytes("k1"));
@@ -4011,7 +4021,7 @@ TEST_CASE("apply_resume: put with lower sequence is ignored",
 
   std::vector<bytecask::ResumeEntry> entries{
       make_resume_entry(10, bytecask::EntryType::Put, "k1", 200, 8)};
-  t.apply_resume(1, entries);
+  t.apply_resume(1, entries, 0);
 
   auto s = std::move(t).persistent();
   auto kv = s->key_dir.get(to_bytes("k1"));
@@ -4032,7 +4042,7 @@ TEST_CASE("apply_resume: delete removes key when sequence is higher",
 
   std::vector<bytecask::ResumeEntry> entries{
       make_resume_entry(50, bytecask::EntryType::Delete, "k1")};
-  t.apply_resume(1, entries);
+  t.apply_resume(1, entries, 0);
 
   auto s = std::move(t).persistent();
   CHECK_FALSE(s->key_dir.get(to_bytes("k1")).has_value());
@@ -4048,7 +4058,7 @@ TEST_CASE("apply_resume: delete is ignored when sequence is lower",
 
   std::vector<bytecask::ResumeEntry> entries{
       make_resume_entry(10, bytecask::EntryType::Delete, "k1")};
-  t.apply_resume(1, entries);
+  t.apply_resume(1, entries, 0);
 
   auto s = std::move(t).persistent();
   auto kv = s->key_dir.get(to_bytes("k1"));
@@ -4065,7 +4075,7 @@ TEST_CASE("apply_resume: advances next_seq past highest seen sequence",
   std::vector<bytecask::ResumeEntry> entries{
       make_resume_entry(25, bytecask::EntryType::Put, "a", 0, 3),
       make_resume_entry(30, bytecask::EntryType::Put, "b", 100, 4)};
-  t.apply_resume(1, entries);
+  t.apply_resume(1, entries, 0);
 
   CHECK(t.next_seq() == 31);
 }
@@ -4078,7 +4088,7 @@ TEST_CASE("apply_resume: does not regress next_seq when entries have lower seque
 
   std::vector<bytecask::ResumeEntry> entries{
       make_resume_entry(5, bytecask::EntryType::Put, "a", 0, 3)};
-  t.apply_resume(1, entries);
+  t.apply_resume(1, entries, 0);
 
   CHECK(t.next_seq() == 100);
 }
@@ -4089,7 +4099,7 @@ TEST_CASE("apply_resume: empty entries is a no-op",
   auto t = state->transient();
 
   std::vector<bytecask::ResumeEntry> entries;
-  t.apply_resume(1, entries);
+  t.apply_resume(1, entries, 0);
 
   auto s = std::move(t).persistent();
   CHECK(s->key_dir.get(to_bytes("k1")).has_value());
@@ -4107,7 +4117,7 @@ TEST_CASE("apply_resume: multiple entries replayed in order",
       make_resume_entry(10, bytecask::EntryType::Put, "k1", 0, 5),
       make_resume_entry(11, bytecask::EntryType::Put, "k2", 100, 8),
       make_resume_entry(12, bytecask::EntryType::Delete, "k1")};
-  t.apply_resume(1, entries);
+  t.apply_resume(1, entries, 0);
 
   auto s = std::move(t).persistent();
   CHECK_FALSE(s->key_dir.get(to_bytes("k1")).has_value());
@@ -4575,9 +4585,11 @@ TEST_CASE("Recovery model-based: workload with range deletes",
   };
 
   auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> vals;
+    std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                           std::uint64_t, std::uint64_t>> vals;
     for (const auto &[fid, fs] : db.file_stats()) {
-      vals.emplace_back(fs.live_bytes, fs.total_bytes);
+      vals.emplace_back(fs.live_bytes, fs.total_bytes,
+                        fs.min_sequence, fs.max_sequence);
     }
     std::ranges::sort(vals);
     return vals;
@@ -4590,7 +4602,8 @@ TEST_CASE("Recovery model-based: workload with range deletes",
   }
   REQUIRE(data_file_count > 1);
 
-  std::vector<std::pair<std::uint64_t, std::uint64_t>> serial_stats_vals;
+  std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                         std::uint64_t, std::uint64_t>> serial_stats_vals;
   {
     const auto serial_path = td.path / "serial_baseline";
     std::filesystem::copy(db_path, serial_path,
@@ -4855,4 +4868,293 @@ TEST_CASE("vacuum drops batch when all entries are stale",
     }
   }
   CHECK_FALSE(found_marker);
+}
+
+// ---------------------------------------------------------------------------
+// FileStats min_sequence / max_sequence
+// ---------------------------------------------------------------------------
+
+TEST_CASE("single write sets min_sequence and max_sequence",
+          "[file_stats_seq]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+
+  auto stats = db.file_stats();
+  REQUIRE(stats.size() == 1);
+  const auto &[fid, fs] = *stats.begin();
+  CHECK(fs.min_sequence == 1);
+  CHECK(fs.max_sequence == 1);
+}
+
+TEST_CASE("multiple writes update sequence range", "[file_stats_seq]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+  db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+
+  auto stats = db.file_stats();
+  REQUIRE(stats.size() == 1);
+  const auto &[fid, fs] = *stats.begin();
+  CHECK(fs.min_sequence == 1);
+  CHECK(fs.max_sequence == 3);
+}
+
+TEST_CASE("batch write covers marker sequences", "[file_stats_seq]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  // 3-op batch: BulkBegin(1), Put(2), Put(3), Put(4), BulkEnd(5)
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("k1"), to_bytes("v1"));
+  plan.put(to_bytes("k2"), to_bytes("v2"));
+  plan.put(to_bytes("k3"), to_bytes("v3"));
+  (void)db.apply_batch({.sync = true}, std::move(plan));
+
+  auto stats = db.file_stats();
+  REQUIRE(stats.size() == 1);
+  const auto &[fid, fs] = *stats.begin();
+  CHECK(fs.min_sequence == 1);
+  CHECK(fs.max_sequence == 5);
+}
+
+TEST_CASE("rotation preserves sealed file bounds and resets new",
+          "[file_stats_seq]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path, {.max_file_bytes = 1});
+  // First write goes to file 1; rotation triggered.
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  // Second write goes to a new active file.
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+
+  auto stats = db.file_stats();
+  REQUIRE(stats.size() >= 2);
+  // Find the sealed file (min_sequence == 1) and the new active.
+  bool found_sealed = false;
+  bool found_new = false;
+  for (const auto &[fid, fs] : stats) {
+    if (fs.min_sequence == 1 && fs.max_sequence == 1) {
+      found_sealed = true;
+    }
+    if (fs.min_sequence == 2 && fs.max_sequence == 2) {
+      found_new = true;
+    }
+  }
+  CHECK(found_sealed);
+  CHECK(found_new);
+}
+
+TEST_CASE("vacuum compact tracks sequences", "[file_stats_seq]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path, {.max_file_bytes = 1});
+  // Write 3 keys, each triggers rotation.
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+  db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+
+  // Overwrite k1 to create fragmentation in the first file.
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1b"));
+
+  // Vacuum the fragmented file.
+  (void)db.vacuum({.fragmentation_threshold = 0.0});
+
+  // Verify all files have coherent sequence bounds.
+  for (const auto &[fid, fs] : db.file_stats()) {
+    if (fs.total_bytes > 0) {
+      CHECK(fs.min_sequence > 0);
+      CHECK(fs.max_sequence >= fs.min_sequence);
+    }
+  }
+}
+
+TEST_CASE("recovery reconstructs min_max sequences", "[file_stats_seq]") {
+  TempDir td;
+  std::map<std::uint32_t, bytecask::FileStats> pre_close_stats;
+  {
+    auto db = bytecask::DB::open(td.path, {.max_file_bytes = 1});
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+    pre_close_stats = db.file_stats();
+  }
+
+  // Reopen — recovery rebuilds stats from hint files.
+  auto db = bytecask::DB::open(td.path);
+  auto post_open_stats = db.file_stats();
+
+  // Verify each sealed file from pre-close appears in post-open with
+  // matching sequence bounds. Skip empty active files (min==0, max==0).
+  std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                         std::uint64_t, std::uint64_t>> pre_vals;
+  for (const auto &[fid, fs] : pre_close_stats) {
+    if (fs.min_sequence == 0 && fs.max_sequence == 0) continue;
+    pre_vals.emplace_back(fs.live_bytes, fs.total_bytes,
+                          fs.min_sequence, fs.max_sequence);
+  }
+  std::ranges::sort(pre_vals);
+
+  std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                         std::uint64_t, std::uint64_t>> post_vals;
+  for (const auto &[fid, fs] : post_open_stats) {
+    if (fs.min_sequence == 0 && fs.max_sequence == 0) continue;
+    post_vals.emplace_back(fs.live_bytes, fs.total_bytes,
+                           fs.min_sequence, fs.max_sequence);
+  }
+  std::ranges::sort(post_vals);
+
+  CHECK(pre_vals == post_vals);
+}
+
+TEST_CASE("nosync writes track sequences", "[file_stats_seq]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+
+  auto stats = db.file_stats();
+  REQUIRE(stats.size() == 1);
+  const auto &[fid, fs] = *stats.begin();
+  CHECK(fs.min_sequence == 1);
+  CHECK(fs.max_sequence == 2);
+}
+
+// ---------------------------------------------------------------------------
+// create_manifest tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("basic manifest contains sealed files with hints", "[manifest]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+  db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+
+  auto manifest = db.create_manifest();
+
+  CHECK(manifest.through_sequence > 0);
+  CHECK_FALSE(manifest.files.empty());
+
+  // Every sealed file in the manifest should exist on disk with a .hint companion.
+  for (const auto &fi : manifest.files) {
+    CHECK(std::filesystem::exists(fi.data_path));
+    CHECK(std::filesystem::exists(fi.hint_path));
+  }
+
+  // Snapshot should be readable.
+  bytecask::Bytes out;
+  CHECK(manifest.snap.get(to_bytes("k1"), out));
+  CHECK(manifest.snap.get(to_bytes("k2"), out));
+  CHECK(manifest.snap.get(to_bytes("k3"), out));
+}
+
+TEST_CASE("empty db manifest", "[manifest]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto manifest = db.create_manifest();
+
+  // No writes — through_sequence is 0.
+  CHECK(manifest.through_sequence == 0);
+
+  // Snapshot has no keys.
+  bytecask::Bytes out;
+  CHECK_FALSE(manifest.snap.get(to_bytes("anything"), out));
+}
+
+TEST_CASE("writes continue after manifest", "[manifest]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+
+  auto manifest = db.create_manifest();
+  const auto manifest_seq = manifest.through_sequence;
+  CHECK(manifest_seq > 0);
+
+  // Write more after manifest — not visible in the snapshot.
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+  db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+
+  bytecask::Bytes out;
+  CHECK_FALSE(manifest.snap.get(to_bytes("k2"), out));
+  CHECK_FALSE(manifest.snap.get(to_bytes("k3"), out));
+
+  // current_sequence advances beyond through_sequence.
+  CHECK(db.current_sequence() > manifest_seq);
+}
+
+TEST_CASE("through_sequence includes nosync entries", "[manifest]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // Write without sync — entries are in the active file but not yet durable.
+  db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+
+  // create_manifest syncs before rotation, so these become durable.
+  auto manifest = db.create_manifest();
+  CHECK(manifest.through_sequence >= 2);
+
+  // Both keys visible in snapshot.
+  bytecask::Bytes out;
+  CHECK(manifest.snap.get(to_bytes("k1"), out));
+  CHECK(manifest.snap.get(to_bytes("k2"), out));
+}
+
+TEST_CASE("bootstrap simulation", "[manifest]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+  db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+
+  auto manifest = db.create_manifest();
+
+  // Copy manifest files to a new directory (simulating file transfer).
+  TempDir td2;
+  const auto dest = td2.path / "replica";
+  std::filesystem::create_directories(dest);
+  for (const auto &fi : manifest.files) {
+    std::filesystem::copy(fi.data_path, dest / fi.data_path.filename());
+    std::filesystem::copy(fi.hint_path, dest / fi.hint_path.filename());
+  }
+
+  // Open replica from copied files.
+  auto replica = bytecask::DB::open(dest);
+
+  bytecask::Bytes out;
+  CHECK(replica.get({}, to_bytes("k1"), out));
+  CHECK(replica.get({}, to_bytes("k2"), out));
+  CHECK(replica.get({}, to_bytes("k3"), out));
+}
+
+TEST_CASE("manifest after vacuum", "[manifest]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+  db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+
+  // Overwrite to create fragmentation, then vacuum.
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1_new"));
+  (void)db.vacuum({.fragmentation_threshold = 0.0});
+
+  auto manifest = db.create_manifest();
+
+  CHECK(manifest.through_sequence > 0);
+  CHECK_FALSE(manifest.files.empty());
+
+  // All files exist on disk.
+  for (const auto &fi : manifest.files) {
+    CHECK(std::filesystem::exists(fi.data_path));
+    CHECK(std::filesystem::exists(fi.hint_path));
+  }
+
+  // All keys present in snapshot with correct values.
+  bytecask::Bytes out;
+  CHECK(manifest.snap.get(to_bytes("k1"), out));
+  CHECK(to_string(out) == "v1_new");
+  CHECK(manifest.snap.get(to_bytes("k2"), out));
+  CHECK(to_string(out) == "v2");
+  CHECK(manifest.snap.get(to_bytes("k3"), out));
+  CHECK(to_string(out) == "v3");
 }

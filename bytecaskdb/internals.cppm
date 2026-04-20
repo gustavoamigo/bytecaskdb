@@ -37,11 +37,15 @@ namespace bytecask {
 export struct FileStats {
   std::uint64_t live_bytes{0};
   std::uint64_t total_bytes{0};
+  std::uint64_t min_sequence{0};
+  std::uint64_t max_sequence{0};
 };
 #else
 struct FileStats {
   std::uint64_t live_bytes{0};
   std::uint64_t total_bytes{0};
+  std::uint64_t min_sequence{0};
+  std::uint64_t max_sequence{0};
 };
 #endif
 
@@ -130,6 +134,8 @@ export struct VacuumScanResult {
   std::vector<VacuumMapping> mappings;
   std::uint64_t live_bytes{0};
   std::uint64_t total_bytes{0};
+  std::uint64_t min_sequence{0};
+  std::uint64_t max_sequence{0};
 };
 
 // RecoveredFile and RecoveryResult are private to bytecask.cpp.

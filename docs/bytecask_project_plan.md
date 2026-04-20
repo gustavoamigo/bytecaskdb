@@ -38,13 +38,14 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
-| BC-197 | Replication primitives | Part 1 done: `durable_sequence` tracking (`current_sequence(timeout)` API, `apply_sync` state transition, condvar in `store_state`) and vacuum batch marker preservation (`BulkBegin`/`BulkEnd` emitted for live batches). Remaining: `Snapshot::files()`, `changes_since`, `ingest`, `Mode::Follower`, `min_sequence`/`max_sequence` on file_stats. See `docs/replication_primitives_design.md`. |
+| BC-197 | Replication primitives | Part 1 done: `durable_sequence` tracking (`current_sequence(timeout)` API, `apply_sync` state transition, condvar in `store_state`) and vacuum batch marker preservation (`BulkBegin`/`BulkEnd` emitted for live batches). Part 2 done: `min_sequence`/`max_sequence` on `FileStats` (tracked in all write/vacuum/recovery paths, validated by `validate_state_consistency`) and `create_manifest()` (rotates active file, waits for hints, returns `FileManifest` with sealed files + snapshot). Remaining: `changes_since`, `ingest`, `Mode::Follower`. See `docs/replication_primitives_design.md`. |
 
 ### Core Engine
 
 | ID | Title | Note |
 | --- | --- | --- |
 | BC-198 | 2PC entry types: `BulkPrepare` / `Bulk2PCCommit` / `Bulk2PCRollback` | Rename `BulkEnd` → `BulkCommit`. Add `BulkPrepare(value)` (closes batch, triggers W-W conflict, not visible; carries opaque value blob), `Bulk2PCCommit(begin_seq)` (makes prepared batch visible), `Bulk2PCRollback(begin_seq)` (reverts prepared batch). Generic 2PC primitive — not MariaDB-specific. See `docs/mariadb_engine_design.md` Phase 6. |
+| BC-202 | Bug: `recovery_build_from_hints` error catch skips entire hint file | The `try/catch` in `recovery_build_from_hints` (`bytecask.cpp:1899`) wraps the entire hint file scan loop. A CRC error on one entry skips all remaining valid entries in that file. The catch was meant for data file read errors, not hint file errors. Fix: move error handling to per-entry granularity so valid entries before a corrupt one are still recovered. |
 | BC-002 | Shared engine library target | xmake C++23 module BMI sharing across static-lib targets needs investigation; currently engine sources are compiled per-target. |
 | BC-078 | Published library module boundary | Decision: use Path A — keep sub-components (radix_tree, data_file, hint_file, etc.) as top-level modules for isolated testing; enforce public boundary at install time by only shipping the bytecask.engine BMI. Revisit Path B (full-partition restructure) if airtight compiler-enforced encapsulation is needed. |
 | BC-041 | `ReadOptions::verify_checksums` flag | Allow skipping CRC verification on bulk scans for ~5% win. Mirrors LevelDB/RocksDB `verify_checksums` option. |
