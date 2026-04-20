@@ -390,6 +390,71 @@ Same as `vacuum_compact`.
 
 ---
 
+## `create_manifest`
+
+Rotates the active file, waits for all hint files, and returns a manifest
+of sealed files with a snapshot. Provides a consistent point-in-time view
+for follower bootstrap, backup, or federation.
+
+### Completeness
+
+The manifest includes every sealed data file and its hint companion. The
+`through_sequence` value equals the highest sequence that was durable at
+the time of rotation. The snapshot reflects exactly the state through
+`through_sequence` — no more, no less.
+
+### Rotation atomicity
+
+`create_manifest` syncs the active file before rotation. The sync advances
+`durable_seq` so that `through_sequence` is fully durable. The state is
+captured under `write_mu_` immediately after `store_state`, preventing a
+concurrent write from slipping between state publication and snapshot
+capture.
+
+### File list accuracy
+
+Every file in `FileManifest::files` exists on disk with both `.data` and
+`.hint` paths at the time of return. `worker_.drain()` ensures hint
+generation has completed before building the file list.
+
+### Caller responsibility
+
+Vacuum must not run between `create_manifest()` and file transfer
+completion. Vacuum unlinks files by path; an in-progress file transfer
+(rsync, cp) would get ENOENT. Serializing vacuum with file transfer is
+the caller's responsibility.
+
+---
+
+## `FileStats` sequence bounds
+
+`FileStats::min_sequence` and `max_sequence` track the lowest and highest
+sequence numbers of entries written to each file.
+
+### Invariants
+
+- Both are zero (no entries) or both are non-zero. A state where one is
+  zero and the other is not is a consistency violation.
+- When both are non-zero: `min_sequence <= max_sequence`.
+- These invariants are enforced by `validate_state_consistency` on every
+  state transition.
+
+### Tracking
+
+Sequence bounds are updated in every path that writes entries:
+
+- `apply_writes`: captures the batch's start and end sequence.
+- `vacuum_scan_and_copy`: tracks sequences of all entries copied to the
+  destination file, including `BulkBegin`/`BulkEnd` markers.
+- `apply_vacuum`: propagates scan bounds to the new file's `FileStats`.
+  The absorb path merges bounds with the active file's existing range.
+- `apply_resume`: resets bounds on truncation, then rebuilds from the
+  committed entries.
+- Recovery (serial and parallel): tracks bounds per file during hint
+  replay.
+
+---
+
 ## Hint Files
 
 A hint file is a compact index of a sealed data file. It allows

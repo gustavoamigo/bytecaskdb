@@ -372,9 +372,12 @@ public:
 
   // State transition: replay valid committed entries from a resume() scan.
   // Uses sequence-wins resolution to update key_dir and file_stats. Advances
-  // next_seq past the highest sequence in the entries. Cannot fail.
+  // next_seq past the highest sequence in the entries. Resets file_stats
+  // for file_id (total_bytes = valid_offset, min/max_sequence rebuilt from
+  // entries) so the caller does not need mutable file_stats access.
   void apply_resume(std::uint32_t file_id,
-                    const std::vector<ResumeEntry> &entries);
+                    const std::vector<ResumeEntry> &entries,
+                    std::uint64_t valid_offset);
 
   // State transition: record that all sequences up to batch_max_seq
   // have been confirmed durable by fdatasync. Monotonic — silently
@@ -450,6 +453,8 @@ export inline constexpr std::uint64_t kGroupWriteMaxBytes = 256ULL * 1024;
 
 // Forward declaration — defined after WritePlan.
 export struct EngineSlot;
+export struct FileInfo;
+export struct FileManifest;
 
 // ---------------------------------------------------------------------------
 // DB — the public interface to a ByteCaskDB database.
@@ -610,6 +615,12 @@ public:
   [[nodiscard]] auto current_sequence(
       std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
       -> std::uint64_t;
+
+  // Rotates the active file, waits for all hint files, and returns a
+  // manifest of sealed files with a snapshot. Forces file rotation.
+  // Vacuum must not run between create_manifest() and file transfer
+  // completion (caller responsibility).
+  [[nodiscard]] auto create_manifest() -> FileManifest;
 
 private:
   explicit DB(std::filesystem::path dir, Options opts);
@@ -816,6 +827,22 @@ public:
     return Snapshot{std::move(s)};
   }
 #endif
+};
+
+// ---------------------------------------------------------------------------
+// FileInfo / FileManifest — sealed file inventory for create_manifest().
+// ---------------------------------------------------------------------------
+
+export struct FileInfo {
+  std::uint32_t file_id;
+  std::filesystem::path data_path;
+  std::filesystem::path hint_path;
+};
+
+export struct FileManifest {
+  Snapshot snap;                       // point-in-time read-only view
+  std::vector<FileInfo> files;         // sealed data + hint files
+  std::uint64_t through_sequence{0};   // last sequence covered
 };
 
 // ---------------------------------------------------------------------------

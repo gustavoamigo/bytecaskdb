@@ -243,6 +243,7 @@ void TransientEngineState::apply_writes(
   std::size_t io_idx = 0;
   const auto wc = plan.write_count();
   const bool multi = wc > 1;
+  const auto batch_start_seq = next_seq_;
 
   // Account for BulkBegin marker.
   if (multi) {
@@ -337,6 +338,17 @@ void TransientEngineState::apply_writes(
     ++next_seq_;
     ++io_idx;
   }
+
+  // Track per-file sequence bounds.
+  const auto batch_end_seq = next_seq_ - 1;
+  file_stats_.update(
+      active_file_id_,
+      [batch_start_seq, batch_end_seq](FileStats &fs) {
+        if (fs.min_sequence == 0 || batch_start_seq < fs.min_sequence)
+          fs.min_sequence = batch_start_seq;
+        if (batch_end_seq > fs.max_sequence)
+          fs.max_sequence = batch_end_seq;
+      });
 }
 
 void TransientEngineState::apply_rotate_file(
@@ -373,22 +385,41 @@ void TransientEngineState::apply_vacuum(
   file_stats_.erase(old_file_id);
   if (dest_file_id != active_file_id_) {
     file_stats_.set(dest_file_id,
-                    FileStats{actual_live_bytes, scan.total_bytes});
+                    FileStats{actual_live_bytes, scan.total_bytes,
+                              scan.min_sequence, scan.max_sequence});
   } else {
     file_stats_.update(dest_file_id, [actual_live_bytes,
-                                      total = scan.total_bytes](FileStats &fs) {
+                                      total = scan.total_bytes,
+                                      smin = scan.min_sequence,
+                                      smax = scan.max_sequence](FileStats &fs) {
       fs.live_bytes += actual_live_bytes;
       fs.total_bytes += total;
+      if (smin > 0 && (fs.min_sequence == 0 || smin < fs.min_sequence))
+        fs.min_sequence = smin;
+      if (smax > fs.max_sequence) fs.max_sequence = smax;
     });
   }
 }
 
 void TransientEngineState::apply_resume(
-    std::uint32_t file_id, const std::vector<ResumeEntry> &entries) {
+    std::uint32_t file_id, const std::vector<ResumeEntry> &entries,
+    std::uint64_t valid_offset) {
+  // Reset file stats for the truncated file — apply_resume owns the
+  // full stats lifecycle so callers don't need mutable file_stats access.
+  file_stats_.update(file_id, [valid_offset](FileStats &fs) {
+    fs.total_bytes = valid_offset;
+    fs.min_sequence = 0;
+    fs.max_sequence = 0;
+  });
+
   std::uint64_t max_seq = 0;
+  std::uint64_t seq_min = 0;
+  std::uint64_t seq_max = 0;
   for (const auto &e : entries) {
     const std::span<const std::byte> key_span{e.key};
     if (e.sequence > max_seq) max_seq = e.sequence;
+    if (seq_min == 0 || e.sequence < seq_min) seq_min = e.sequence;
+    if (e.sequence > seq_max) seq_max = e.sequence;
 
     if (e.entry_type == EntryType::Put) {
       const auto existing = key_dir_.get(key_span);
@@ -419,6 +450,13 @@ void TransientEngineState::apply_resume(
 
   if (max_seq >= next_seq_) {
     next_seq_ = max_seq + 1;
+  }
+
+  if (seq_max > 0) {
+    file_stats_.update(file_id, [seq_min, seq_max](FileStats &fs) {
+      fs.min_sequence = seq_min;
+      fs.max_sequence = seq_max;
+    });
   }
 }
 
@@ -1176,6 +1214,12 @@ auto DB::vacuum_scan_and_copy(
   std::uint64_t batch_begin_seq = 0;
   std::vector<PendingEntry> pending;
 
+  auto track_seq = [&](std::uint64_t seq) {
+    if (result.min_sequence == 0 || seq < result.min_sequence)
+      result.min_sequence = seq;
+    if (seq > result.max_sequence) result.max_sequence = seq;
+  };
+
   auto emit_entry = [&](const DataEntry &entry, Offset entry_off) {
     switch (entry.entry_type) {
     case EntryType::Put: {
@@ -1190,6 +1234,7 @@ auto DB::vacuum_scan_and_copy(
         const auto sz = entry_size(entry.key.size(), entry.value.size());
         result.live_bytes += sz;
         result.total_bytes += sz;
+        track_seq(entry.sequence);
         result.mappings.push_back({std::vector<std::byte>{entry.key.begin(),
                                                           entry.key.end()},
                                    new_off, entry.sequence, val_size});
@@ -1200,6 +1245,7 @@ auto DB::vacuum_scan_and_copy(
       std::ignore =
           dest_file.append_entry(entry.sequence, EntryType::Delete, entry.key, {});
       result.total_bytes += entry_size(entry.key.size(), 0);
+      track_seq(entry.sequence);
       break;
     }
     case EntryType::RangeDel: {
@@ -1207,6 +1253,7 @@ auto DB::vacuum_scan_and_copy(
           dest_file.append_entry(entry.sequence, EntryType::RangeDel,
                                  entry.key, entry.value);
       result.total_bytes += entry_size(entry.key.size(), entry.value.size());
+      track_seq(entry.sequence);
       break;
     }
     case EntryType::BulkBegin:
@@ -1247,11 +1294,13 @@ auto DB::vacuum_scan_and_copy(
       if (has_live) {
         std::ignore = dest_file.append_entry(
             batch_begin_seq, EntryType::BulkBegin, {}, {});
+        track_seq(batch_begin_seq);
         for (auto &pe : pending) {
           emit_entry(pe.entry, pe.original_offset);
         }
         std::ignore = dest_file.append_entry(
             entry.sequence, EntryType::BulkEnd, {}, {});
+        track_seq(entry.sequence);
       }
       pending.clear();
       in_batch = false;
@@ -1493,10 +1542,7 @@ void DB::resume() {
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.
   auto t = current->transient();
-  t.file_stats().update(old_file_id, [valid_offset](FileStats &fs) {
-    fs.total_bytes = valid_offset;
-  });
-  t.apply_resume(old_file_id, committed);
+  t.apply_resume(old_file_id, committed, valid_offset);
   t.apply_rotate_file(std::move(new_file));
   // All entries recovered from disk were previously synced.
   t.apply_sync(t.next_seq() > 0 ? t.next_seq() - 1 : 0);
@@ -1518,6 +1564,49 @@ auto DB::current_sequence(std::chrono::milliseconds timeout) const
     return load_state()->durable_seq > baseline;
   });
   return load_state()->durable_seq;
+}
+
+auto DB::create_manifest() -> FileManifest {
+  std::shared_ptr<const EngineState> manifest_state;
+  std::uint64_t through_seq;
+  {
+    std::lock_guard<std::mutex> wg{*write_mu_};
+    if (is_degraded()) throw DbDegraded{degraded_reason_};
+
+    auto current = load_state_for_write();
+    auto t = current->transient();
+
+    // Sync active file to make all entries durable.
+    auto &file = t.active_file();
+    file.sync();
+    const auto max_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
+    t.apply_sync(max_seq);
+
+    // Seal active file, dispatch hint generation, open new active.
+    rotate_active_file(t, current);
+
+    through_seq = max_seq;
+    store_state(current, std::move(t).persistent());
+
+    // Capture state under write_mu_ — a concurrent write after
+    // store_state but before load_state would produce a snapshot
+    // with entries beyond through_sequence, breaking the contract.
+    manifest_state = load_state_for_write();
+  }
+
+  // Wait for all background hint generation to complete.
+  worker_.drain();
+
+  // Build manifest from sealed files.
+  std::vector<FileInfo> files;
+  for (const auto [file_id, file_ptr] : manifest_state->files) {
+    if (file_id == manifest_state->active_file_id) continue;
+    const auto data_path = file_ptr->path();
+    const auto stem = data_path.stem().string();
+    files.push_back({file_id, data_path, dir_ / (stem + ".hint")});
+  }
+
+  return FileManifest{Snapshot{manifest_state}, std::move(files), through_seq};
 }
 
 // Returns the engine state from a thread-local cache (read path only).
@@ -1662,6 +1751,21 @@ void DB::validate_state_consistency(const EngineState &s) const {
           file_id, fs.live_bytes, expected_live)};
     }
   }
+
+  // 6. min_sequence / max_sequence coherence.
+  for (const auto [file_id, fs] : s.file_stats) {
+    if ((fs.min_sequence == 0) != (fs.max_sequence == 0)) {
+      throw std::runtime_error{std::format(
+          "state consistency: file_id {} has min_sequence={} max_sequence={} "
+          "(one is zero, the other is not)",
+          file_id, fs.min_sequence, fs.max_sequence)};
+    }
+    if (fs.min_sequence > 0 && fs.min_sequence > fs.max_sequence) {
+      throw std::runtime_error{std::format(
+          "state consistency: file_id {} min_sequence {} > max_sequence {}",
+          file_id, fs.min_sequence, fs.max_sequence)};
+    }
+  }
 }
 
 #pragma endregion
@@ -1786,6 +1890,11 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
           }
         }
         if (he->sequence > max_seq) max_seq = he->sequence;
+        fstats_t.update(file_id, [seq = he->sequence](FileStats &fs) {
+          if (fs.min_sequence == 0 || seq < fs.min_sequence)
+            fs.min_sequence = seq;
+          if (seq > fs.max_sequence) fs.max_sequence = seq;
+        });
       }
     } catch (const std::exception &e) {
       if (strict) throw;
@@ -1966,6 +2075,11 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
           }
         }
         if (he->sequence > max_seq) max_seq = he->sequence;
+        auto &file_fs = fstats_scratch[file_id];
+        if (file_fs.min_sequence == 0 || he->sequence < file_fs.min_sequence)
+          file_fs.min_sequence = he->sequence;
+        if (he->sequence > file_fs.max_sequence)
+          file_fs.max_sequence = he->sequence;
       }
     } catch (const std::exception &e) {
       if (strict) throw;

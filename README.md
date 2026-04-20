@@ -275,6 +275,12 @@ public:
         std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
         -> std::uint64_t;
 
+    // Rotates the active file, waits for all hint files, and returns a
+    // manifest of sealed files with a snapshot. Forces file rotation.
+    // Vacuum must not run between create_manifest() and file transfer
+    // completion (caller responsibility).
+    [[nodiscard]] auto create_manifest() -> FileManifest;
+
     // True if the engine has entered a degraded state from a write-path failure.
     // Reads remain available; all write operations throw DbDegraded.
     [[nodiscard]] auto is_degraded() const noexcept -> bool;
@@ -302,6 +308,21 @@ public:
         -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
     [[nodiscard]] auto rkeys_from(BytesView from = {}) const
         -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
+};
+
+// Sealed file descriptor returned by create_manifest().
+struct FileInfo {
+    std::uint32_t file_id;
+    std::filesystem::path data_path;
+    std::filesystem::path hint_path;
+};
+
+// Manifest of sealed files with a point-in-time snapshot.
+// Returned by DB::create_manifest().
+struct FileManifest {
+    Snapshot snap;                       // frozen read-only view
+    std::vector<FileInfo> files;         // sealed data + hint files
+    std::uint64_t through_sequence{0};   // last sequence covered
 };
 
 // Write plan for apply_batch. Groups multiple operations into a single atomic write.

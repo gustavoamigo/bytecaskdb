@@ -457,6 +457,8 @@ Rather than computing `live_bytes` at vacuum time (which would require a full ke
 struct FileStats {
   std::uint64_t live_bytes{0};
   std::uint64_t total_bytes{0};
+  std::uint64_t min_sequence{0};  // lowest sequence in this file (0 = no entries)
+  std::uint64_t max_sequence{0};  // highest sequence in this file (0 = no entries)
 };
 ```
 
@@ -499,7 +501,18 @@ for each hint entry h (processed in arbitrary file order, sequence wins):
 
 Processing order across files does not matter — sequence comparison always picks the correct winner, so `live_bytes` converges to the right values.
 
-**Parallel recovery**: `RecoveryResult` includes a `file_stats` map alongside `key_dir`, `tombstones`, and `max_seq`. Each worker builds its own `file_stats` during Phase 2 using the algorithm above. During Phase 3 sequential accumulator merge, `file_stats` maps are unioned (file IDs are disjoint across workers due to round-robin). The merge does **not** recompute `live_bytes` — instead, a single `live_bytes` pass runs once after the final merge in Phase 4 (assembly), iterating the fully-merged tree exactly once.
+##### Sequence bounds
+
+`min_sequence` and `max_sequence` track the range of sequence numbers written to each file. They enable `changes_since` (future) to skip irrelevant files during replication and are maintained alongside `live_bytes`/`total_bytes` in every write path:
+
+- **`apply_writes`**: captures the batch's start and end sequence once per write batch.
+- **Vacuum**: `vacuum_scan_and_copy` tracks sequences of all copied entries (including batch markers). `apply_vacuum` propagates bounds to the destination file; the absorb path merges with existing active file bounds.
+- **`apply_resume`**: resets bounds on truncation, rebuilds from committed entries.
+- **Recovery**: both serial and parallel paths track min/max per file during hint replay.
+
+Invariant: both are zero (no entries yet) or both are non-zero with `min_sequence <= max_sequence`. Enforced by `validate_state_consistency`.
+
+**Parallel recovery**: each worker tracks bounds for its own files. Bounds carry through the Phase 3 merge unchanged (file IDs are disjoint across workers). Phase 4 does not modify sequence bounds.: `RecoveryResult` includes a `file_stats` map alongside `key_dir`, `tombstones`, and `max_seq`. Each worker builds its own `file_stats` during Phase 2 using the algorithm above. During Phase 3 sequential accumulator merge, `file_stats` maps are unioned (file IDs are disjoint across workers due to round-robin). The merge does **not** recompute `live_bytes` — instead, a single `live_bytes` pass runs once after the final merge in Phase 4 (assembly), iterating the fully-merged tree exactly once.
 
 #### Vacuum primitives
 
@@ -1125,6 +1138,14 @@ public:
         -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
     [[nodiscard]] auto rkeys_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
+
+    // ── Manifest ──────────────────────────────────────────────────────────
+
+    // Rotates the active file, waits for all hint files, and returns a
+    // manifest of sealed files with a snapshot. Forces file rotation.
+    // Vacuum must not run between create_manifest() and file transfer
+    // completion (caller responsibility).
+    [[nodiscard]] auto create_manifest() -> FileManifest;
 
 private:
     explicit Bytecask(std::filesystem::path dir);
