@@ -551,6 +551,10 @@ auto DB::get(const ReadOptions &opts, BytesView key,
   if (!kv) {
     return false;
   }
+  if (kv->value_size == 0) {
+    out.clear();
+    return true;
+  }
   // Per-thread I/O scratch buffer — reused across calls to avoid heap churn.
   // Thread-exit destructor is intentional; suppress the Clang diagnostic.
 #pragma clang diagnostic push
@@ -785,6 +789,10 @@ auto Snapshot::contains_key(BytesView key) const -> bool {
 auto Snapshot::get(BytesView key, Bytes &out) const -> bool {
   const auto kv = state_->key_dir.get(key);
   if (!kv) return false;
+  if (kv->value_size == 0) {
+    out.clear();
+    return true;
+  }
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   thread_local Bytes io_buf;
@@ -925,9 +933,16 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 
   if (target_id == 0 && worst_frag == 0.0) return false;
 
+  const auto target_live = stats_snap.get(target_id)->live_bytes;
+
+  // Fast path: file has no live keys — skip scan entirely.
+  if (target_live == 0) {
+    vacuum_remove_file(target_id);
+    return true;
+  }
+
   // Absorb only if the file is small (below absorb_threshold) and its live
   // data fits in the active file without triggering rotation.
-  const auto target_live = stats_snap.get(target_id)->live_bytes;
   if (target_live <= opts.absorb_threshold &&
       target_live + active_size <= rotation_threshold_) {
     vacuum_absorb_file(target_id);
@@ -1273,6 +1288,18 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
   {
     std::lock_guard<std::mutex> wg{*write_mu_};
     vacuum_commit(file_id, scan, new_file);
+  }
+  vacuum_unlink_old_file(snap, file_id);
+}
+
+// Removes a sealed file that has no live keys. No I/O scan needed — just
+// commit the state change and unlink the files. Called under vacuum_mu_.
+void DB::vacuum_remove_file(std::uint32_t file_id) {
+  auto snap = load_state_for_write();
+  {
+    std::lock_guard<std::mutex> wg{*write_mu_};
+    VacuumScanResult empty{};
+    vacuum_commit(file_id, empty, nullptr);
   }
   vacuum_unlink_old_file(snap, file_id);
 }

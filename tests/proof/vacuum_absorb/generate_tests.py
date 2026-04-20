@@ -63,7 +63,8 @@ def gen_vacuum_call(fault_name: str | None, delta: VacuumAbsorbDelta) -> str:
         "{.fragmentation_threshold = 0.0, "
         ".absorb_threshold = std::numeric_limits<std::uint64_t>::max()}"
     )
-    if fault_name is None:
+    if fault_name is None or not delta.threw:
+        # No fault, or fault is unreachable (e.g. all-dead → vacuum_remove path).
         return f"    REQUIRE(db.vacuum({opts}));"
 
     return (

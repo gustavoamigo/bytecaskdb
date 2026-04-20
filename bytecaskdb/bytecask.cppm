@@ -207,11 +207,15 @@ public:
     if (!has_cached_) {
       auto [key_span, dir_entry] = *cur_;
       cached_.first = Key{key_span};
-      (*state_->files.get(dir_entry.file_id))
-          ->read_value(dir_entry.file_offset,
-                      narrow<std::uint16_t>(key_span.size()),
-                      dir_entry.value_size, verify_checksums_,
-                      io_buf_, cached_.second);
+      if (dir_entry.value_size == 0) {
+        cached_.second.clear();
+      } else {
+        (*state_->files.get(dir_entry.file_id))
+            ->read_value(dir_entry.file_offset,
+                        narrow<std::uint16_t>(key_span.size()),
+                        dir_entry.value_size, verify_checksums_,
+                        io_buf_, cached_.second);
+      }
       has_cached_ = true;
     }
     return cached_;
@@ -633,6 +637,7 @@ private:
   // Rewrites a sealed file into a new sealed file containing only live entries.
   void vacuum_compact_file(std::uint32_t file_id);
   // Appends live entries from a sealed file into the active file, then removes the sealed file.
+  void vacuum_remove_file(std::uint32_t file_id);
   void vacuum_absorb_file(std::uint32_t file_id);
 
   // State access helpers — raw state_ / state_time_ access is confined here.

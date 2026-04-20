@@ -124,7 +124,7 @@ TEST_CASE("prove_vacuum_absorb__mostly_dead__success", "[prove_vacuum_absorb]") 
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 160});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -155,7 +155,7 @@ TEST_CASE("prove_vacuum_absorb__mostly_dead__append_fails", "[prove_vacuum_absor
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 160});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -189,7 +189,7 @@ TEST_CASE("prove_vacuum_absorb__mostly_dead__sync_fails", "[prove_vacuum_absorb]
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 160});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -212,6 +212,78 @@ TEST_CASE("prove_vacuum_absorb__mostly_dead__sync_fails", "[prove_vacuum_absorb]
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before);
+}
+
+TEST_CASE("prove_vacuum_absorb__all_dead__success", "[prove_vacuum_absorb]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Delete ['k0', 'k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k0"));
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = std::numeric_limits<std::uint64_t>::max()}));
+
+    assert_vacuum_success(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before);
+}
+
+TEST_CASE("prove_vacuum_absorb__all_dead__append_fails", "[prove_vacuum_absorb]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Delete ['k0', 'k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k0"));
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = std::numeric_limits<std::uint64_t>::max()}));
+
+    assert_vacuum_success(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before);
+}
+
+TEST_CASE("prove_vacuum_absorb__all_dead__sync_fails", "[prove_vacuum_absorb]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Delete ['k0', 'k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k0"));
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = std::numeric_limits<std::uint64_t>::max()}));
+
+    assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
   }
   assert_vacuum_recoverable(dir, before);

@@ -35,8 +35,13 @@ class VacuumAbsorbFailureClass(Enum):
 # k0 written (25B), k1 written (50B), del k1 triggers rotation (50>=50):
 # file_0 sealed with {k0, k1}, file_1 becomes active with k1 tombstone.
 #
-# max_file_bytes=120: fits 5 entries. k0..k4 written (100B), k5 write triggers
-# rotation (125B>=120): file_0 sealed with {k0..k4}, file_1 active.
+# max_file_bytes=160: fits all 6 entries (150B < 160B). k0..k5 written,
+# rotation on first delete (150+21=171>=160): file_0 sealed with {k0..k5},
+# file_1 active with tombstones. Only one sealed file — the vacuum target
+# always has live_bytes > 0 (k0 survives).
+#
+# all_dead: max_file_bytes=50 fits 2 entries. k0, k1 written (50B), both
+# deleted: file_0 sealed with {k0, k1}, live_bytes = 0.
 ABSORB_STATE_SHAPES = [
     AbsorbStateShape(
         "low_fragmentation",
@@ -48,7 +53,13 @@ ABSORB_STATE_SHAPES = [
         "mostly_dead",
         sealed_keys=["k0", "k1", "k2", "k3", "k4", "k5"],
         deleted_keys=["k1", "k2", "k3", "k4", "k5"],
-        max_file_bytes=120,
+        max_file_bytes=160,
+    ),
+    AbsorbStateShape(
+        "all_dead",
+        sealed_keys=["k0", "k1"],
+        deleted_keys=["k0", "k1"],
+        max_file_bytes=50,
     ),
 ]
 
