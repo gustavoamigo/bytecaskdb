@@ -314,6 +314,56 @@ export using ReverseKeyIterator = ReverseIterator<KeyIterator>;
 export using ReverseEntryIterator = ReverseIterator<EntryIterator>;
 
 // ---------------------------------------------------------------------------
+// RawEntry — represents a raw data entry for replication
+// ---------------------------------------------------------------------------
+
+export struct RawEntry {
+  std::uint64_t sequence;
+  EntryType entry_type;
+  BytesView key;
+  BytesView value;  // empty for deletes
+};
+
+// ---------------------------------------------------------------------------
+// ChangeIterator — yields raw entries in ascending sequence order
+//
+// Used by changes_since() for replication. Iterates over multiple data files
+// in sequence-disjoint order, yielding entries with sequence > from_sequence.
+// Holds a snapshot reference to keep file descriptors open during iteration.
+// ---------------------------------------------------------------------------
+
+export class ChangeIterator {
+public:
+  using iterator_category = std::input_iterator_tag;
+  using value_type = RawEntry;
+  using difference_type = std::ptrdiff_t;
+
+  ChangeIterator() = default;
+  ~ChangeIterator(); // Defined in .cpp where Impl is complete
+
+  // Move-only semantics
+  ChangeIterator(const ChangeIterator&) = delete;
+  ChangeIterator& operator=(const ChangeIterator&) = delete;
+  ChangeIterator(ChangeIterator&&) noexcept; // Defined in .cpp where Impl is complete
+  ChangeIterator& operator=(ChangeIterator&&) noexcept; // Defined in .cpp where Impl is complete
+
+  // Constructor for implementation use - not part of public API
+  explicit ChangeIterator(std::shared_ptr<const EngineState> state,
+                          std::uint64_t from_sequence,
+                          std::uint64_t durable_sequence);
+
+  auto operator++() -> ChangeIterator &;
+  void operator++(int);
+  auto operator*() const -> const value_type &;
+  auto operator==(std::default_sentinel_t) const noexcept -> bool;
+
+private:
+  // Implementation details hidden from public interface
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+// ---------------------------------------------------------------------------
 // DB — SWMR key-value store
 //
 // Forward declarations — full definitions after DB.
@@ -622,6 +672,14 @@ public:
   // completion (caller responsibility).
   [[nodiscard]] auto create_manifest() -> FileManifest;
 
+  // Returns an iterator that yields raw entries (sequence, entry_type, key, value)
+  // for all committed, durable entries with sequence > from_sequence, in ascending
+  // sequence order. Used for replication.
+  // The upper bound is min(snap.sequence(), durable_sequence) — entries visible
+  // in the snapshot but not yet fdatasync'd are excluded.
+  [[nodiscard]] auto changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
+      -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t>;
+
 private:
   explicit DB(std::filesystem::path dir, Options opts);
 
@@ -820,6 +878,9 @@ private:
   friend class DB;
   friend class TransientEngineState;
   friend class WritePlan;
+
+  // Private accessor for DB::changes_since
+  auto state() const -> const std::shared_ptr<const EngineState>& { return state_; }
 #ifdef BYTECASK_TESTING
 public:
   static auto from_state(std::shared_ptr<const EngineState> s) -> Snapshot {

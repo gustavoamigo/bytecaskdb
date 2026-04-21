@@ -434,6 +434,7 @@ ByteeCask implements a **conservative online vacuum**: the engine continues to s
 - One file is processed per `vacuum()` call. Callers that want to process multiple files call in a loop.
 - Tombstones (Delete entries) are never dropped during partial compaction (see **Tombstone handling** below).
 - A new compacted file is fully written and `fdatasync`-ed before any old file is removed.
+- **Sequence-disjoint files**: vacuum must preserve the invariant that all data files have non-overlapping sequence ranges. Compacted files maintain disjoint sequence ranges from other files.
 
 #### Fragmentation
 
@@ -1365,6 +1366,7 @@ When the write set contains exactly one operation, `apply_batch` skips the `Bulk
 | D15 | **C ABI / shared-library link constraint**: `libbytecask.a` is compiled with `-fPIC` so it can be linked into a shared object (e.g. `ha_bytecaskdb.so`). Without `-fPIC`, clang emits `R_X86_64_TPOFF32`/`R_X86_64_32S` relocations illegal in a DSO. xmake syntax: `add_cxxflags("-fPIC", {force = true})` on the `bytecask` static target. |
 | D16 | **MariaDB plugin header ordering**: Server-internal headers require `server/my_global.h` before `handler.h`. The client-side stub does not define `MY_GLOBAL_INCLUDED`/`uchar`/`unlikely()`. Fedora layout: base `/usr/include/mysql`, server `/usr/include/mysql/server`, private `/usr/include/mysql/server/private`. CMake include order must be `server/private` → `server` → base. `-DMYSQL_SERVER` is required. `handlerton::state` does not exist in this MariaDB ABI; use `PLUGIN_LICENSE_GPL` (no MIT constant). |
 | D17 | **Directory locking**: One process per directory, enforced by `flock()` on `dir/.lock`. Advisory only — does not protect against uncooperative processes that bypass `DB::open()`. |
+| D18 | **Sequence-disjoint files**: All data files must have non-overlapping sequence ranges — no two files contain entries with the same sequence number. Active file rotation naturally preserves this (sealed files have contiguous sequence ranges). Vacuum compact must ensure compacted files maintain disjoint ranges. This invariant enables efficient replication (linear scan instead of min-heap merge), supports future file merging operations, and allows skipping entire files based on sequence bounds. |
 
 ## Working agreement
 
