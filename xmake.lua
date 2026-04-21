@@ -214,6 +214,7 @@ target("bytecaskdb_python")
                  "-Wno-missing-field-initializers", "-Wno-float-equal",
                  "-Wno-deprecated-declarations", "-Wno-nested-anon-types",
                  "-Wno-gnu-anonymous-struct", "-Wno-unused-function",
+                 "-Wno-disabled-macro-expansion",
                  {force = true})
     add_cxxflags("-fPIC", {force = true})
     -- Resolve Python C API symbols at module load time (provided by the host

@@ -362,7 +362,7 @@ See [`docs/bytecask_design.md`](docs/bytecask_design.md) for the full design ref
 
 ## Building
 
-ByteCaskDB requires **Clang** (with C++23 modules support) and [xmake](https://xmake.io).
+ByteCaskDB requires **Clang** (with C++23 modules support), [xmake](https://xmake.io), and Python tooling (`nanobind`) when building the Python extension target.
 
 ```bash
 # Build and run the test suite.
@@ -373,7 +373,7 @@ xmake run bytecask_tests
 python ./scripts/run_engine_bench.py
 ```
 
-A ready-to-use development environment is provided via the included [Dev Container](.devcontainer) (Fedora 43, Clang, xmake pre-installed).
+A ready-to-use development environment is provided via the included [Dev Container](.devcontainer) (Fedora 43, Clang, xmake, LLVM tooling, and `nanobind` pre-installed).
 
 ## Want to hack on it?
 

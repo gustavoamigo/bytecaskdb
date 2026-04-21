@@ -204,7 +204,9 @@ public:
       iov.resize(chunk_size * kIovecsPerEntry);
 
       std::size_t total_bytes = 0;
+    #ifdef BYTECASK_TESTING
       std::size_t serialized = 0;
+    #endif
       for (std::size_t i = 0; i < chunk_size; ++i) {
         const auto &e = entries[base + i];
 
@@ -226,7 +228,9 @@ public:
         iov[iov_base + 3] = {hdr_crcs[i].data() + kHeaderSize, kCrcSize};
 
         total_bytes += kHeaderSize + e.key.size() + e.value.size() + kCrcSize;
+#ifdef BYTECASK_TESTING
         ++serialized;
+#endif
       }
 
       const auto written =
