@@ -11,7 +11,9 @@ module;
 #include <fcntl.h>
 #include <filesystem>
 #include <format>
+#include <iterator>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <system_error>
@@ -50,9 +52,27 @@ public:
   // Forward-only scanner over a hint file's entry region.
   // Owns a key accumulator for zero-copy prefix decompression:
   //   HintEntry.key is a span into key_buf_ valid until the next next() call.
+  //
+  // Two usage modes:
+  //   next()-style: construct via Scanner(buf), call next() in a while loop.
+  //   iterator-style: construct via Scanner(buf, eager), use in range-for.
+  //                   Zero overhead vs next()-style — no wrapper class.
   class Scanner {
   public:
+    using iterator_concept = std::input_iterator_tag;
+    using value_type = HintEntry;
+    using difference_type = std::ptrdiff_t;
+
+    // next()-style constructor (does not eagerly read).
     explicit Scanner(std::span<const std::byte> buf) : buf_{buf} {}
+
+    // Iterator-style constructor: eagerly reads the first entry so that
+    // operator* is valid immediately after construction.
+    struct eager_t {};
+    static constexpr eager_t eager{};
+    Scanner(std::span<const std::byte> buf, eager_t) : buf_{buf} {
+      cached_ = next();
+    }
 
     // Returns the next entry, or nullopt at end of data.
     // key in the returned HintEntry is valid until the next call.
@@ -67,11 +87,20 @@ public:
       return he;
     }
 
+    // Iterator interface — used only when constructed with eager_t.
+    auto operator*() const -> const value_type& { return *cached_; }
+    auto operator++() -> Scanner& { cached_ = next(); return *this; }
+    void operator++(int) { ++*this; }
+    auto operator==(std::default_sentinel_t) const noexcept -> bool {
+      return !cached_.has_value();
+    }
+
   private:
     std::span<const std::byte> buf_; // non-owning; excludes 4-byte CRC trailer
     std::size_t pos_{};
     std::vector<std::byte> key_buf_;     // backing store for HintEntry.key spans
     std::vector<std::byte> end_key_buf_; // backing store for HintEntry.end_key spans
+    std::optional<HintEntry> cached_;    // populated only in iterator mode
   };
 
   // Creates a write-mode HintFile that buffers entries in memory.
@@ -209,6 +238,18 @@ public:
                               "HintFile::sync: fdatasync failed"};
     }
     ::close(fd);
+  }
+
+  // Returns a Scanner in iterator mode over the entry bytes.
+  // The Scanner holds a non-owning view into this HintFile's buffer; this
+  // HintFile must outlive the Scanner.
+  [[nodiscard]] auto scan_hints() const
+      -> std::ranges::subrange<Scanner, std::default_sentinel_t> {
+    const auto b       = view();
+    const auto entries = (b.size() >= kFileCrcSize)
+                             ? b.subspan(0, b.size() - kFileCrcSize)
+                             : std::span<const std::byte>{};
+    return {Scanner{entries, Scanner::eager}, std::default_sentinel};
   }
 
   // Returns a Scanner over the entry bytes (excluding the 4-byte CRC trailer).
