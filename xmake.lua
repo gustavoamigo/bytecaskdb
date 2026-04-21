@@ -15,8 +15,8 @@ option_end()
 
 if has_config("enable-benchmarks") then
     add_requires("benchmark")
-    add_requires("leveldb")
-    add_requires("rocksdb")
+    -- add_requires("leveldb")
+    add_requires("rocksdb", {system = true})
 end
 
 -- Sanitizer option: `xmake f --sanitizer=address` or `--sanitizer=thread`
@@ -141,7 +141,8 @@ target("engine_bench")
     set_default(false)
     add_files("benchmarks/engine_bench.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
     add_cxflags("-Wno-global-constructors")
-    add_packages("benchmark", "crc32c", "leveldb", "rocksdb")
+    add_packages("benchmark", "crc32c", "rocksdb")
+    add_defines("BENCH_NO_LEVELDB")
     on_config(function(t)
         apply_sanitizer(t)
         add_release_opts(t)

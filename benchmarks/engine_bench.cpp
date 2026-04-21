@@ -227,9 +227,11 @@ struct TmpDir {
   std::filesystem::path path;
 
   explicit TmpDir(std::string_view name) {
-    path = std::filesystem::temp_directory_path() /
-           ("engine_bench_" + std::string{name} + "_" +
-            std::to_string(reinterpret_cast<std::uintptr_t>(this)));
+    const char *base = std::getenv("BC_BENCH_DIR");
+    auto parent = base && *base ? std::filesystem::path{base}
+                                : std::filesystem::temp_directory_path();
+    path = parent / ("engine_bench_" + std::string{name} + "_" +
+                     std::to_string(reinterpret_cast<std::uintptr_t>(this)));
     std::filesystem::create_directories(path);
   }
 

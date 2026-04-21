@@ -26,6 +26,7 @@ RUN dnf install -y \
     mariadb-server \
     mariadb-devel \
     google-crc32c-devel \
+    rocksdb-devel \
     python3-pip \
     python3-devel \
     && dnf clean all
@@ -42,6 +43,15 @@ RUN gcc --version && xmake --version --root
 ENV CC=gcc
 ENV CXX=g++
 ENV BYTECASK_PYTHON=python3
+
+# Install Emscripten SDK for WebAssembly builds
+RUN cd /opt && git clone --depth 1 https://github.com/emscripten-core/emsdk.git \
+    && cd emsdk && ./emsdk install latest && ./emsdk activate latest \
+    && ln -s $(ls -d /opt/emsdk/node/*/bin | head -1)/node /usr/local/bin/node
+
+ENV EMSDK=/opt/emsdk
+ENV EM_CONFIG=/opt/emsdk/.emscripten
+ENV PATH="/opt/emsdk:/opt/emsdk/upstream/emscripten:/opt/emsdk/upstream/bin:${PATH}"
 
 ARG USERNAME=gustavoamigo
 RUN useradd -m $USERNAME || echo "User already exists"
