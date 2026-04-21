@@ -978,12 +978,10 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   // Snapshot file_stats and active-file info.
   PersistentU32Map<FileStats> stats_snap;
   std::uint32_t active_id{};
-  std::uint64_t active_size{};
   {
     auto s = load_state_for_write();
     stats_snap = s->file_stats;
     active_id = s->active_file_id;
-    active_size = s->active_file().size();
   }
 
   // Find the highest-fragmentation sealed file above threshold.
@@ -1010,14 +1008,8 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
     return true;
   }
 
-  // Absorb only if the file is small (below absorb_threshold) and its live
-  // data fits in the active file without triggering rotation.
-  if (target_live <= opts.absorb_threshold &&
-      target_live + active_size <= rotation_threshold_) {
-    vacuum_absorb_file(target_id);
-  } else {
-    vacuum_compact_file(target_id);
-  }
+  // All files with live entries are compacted (sealed→sealed).
+  vacuum_compact_file(target_id);
   return true;
 }
 
@@ -1411,35 +1403,6 @@ void DB::vacuum_remove_file(std::uint32_t file_id) {
 }
 
 // Appends live entries from a sealed file to the active file, then
-// removes the sealed file. Called under vacuum_mu_.
-// The entire I/O + commit phase runs under write_mu_ because
-// scan_and_copy appends to the shared active DataFile, which is
-// NOT thread-safe (requires external synchronization).
-// The old file is deferred for cleanup when no readers reference it.
-void DB::vacuum_absorb_file(std::uint32_t file_id) {
-  auto snap = load_state_for_write();
-  const auto &old_file = **snap->files.get(file_id);
-
-  {
-    std::lock_guard<std::mutex> wg{*write_mu_};
-    auto &active = snap->active_file();
-    const auto pre_vacuum_offset = active.size();
-    try {
-      auto scan = vacuum_scan_and_copy(snap, old_file, active, file_id);
-#ifdef BYTECASK_TESTING
-      FAULT_INJECTION(io_vacuum_absorb_sync);
-#endif
-      active.sync();
-      vacuum_commit(file_id, scan, nullptr);
-    } catch (...) {
-      // Roll back bytes written during copy so file_stats stays consistent.
-      try { active.truncate(pre_vacuum_offset); } catch (...) {}
-      throw;
-    }
-  }
-  vacuum_unlink_old_file(snap, file_id);
-}
-
 #pragma endregion
 
 #pragma region State access

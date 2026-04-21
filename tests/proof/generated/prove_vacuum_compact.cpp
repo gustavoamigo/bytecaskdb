@@ -64,7 +64,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__success", "[prove_vacuum_com
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
 
-    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = 0}));
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
@@ -89,7 +89,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__tmp_create_fails", "[prove_v
 
     {
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_tmp_create"};
-      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = 0}), std::system_error);
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
@@ -115,7 +115,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__append_fails", "[prove_vacuu
 
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
-      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = 0}), std::system_error);
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
@@ -141,7 +141,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__sync_fails", "[prove_vacuum_
 
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
-      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = 0}), std::system_error);
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
@@ -170,7 +170,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__rename_fails", "[prove_vacuu
     // vacuum_commit never ran. Old file remains in state.
     // assert_vacuum_recoverable confirms .data.tmp is not replayed.
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
-      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = 0}), std::system_error);
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
@@ -202,7 +202,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__success", "[prove_vacuum_compact]"
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
 
-    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = 0}));
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
@@ -235,7 +235,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__tmp_create_fails", "[prove_vacuum_
 
     {
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_tmp_create"};
-      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = 0}), std::system_error);
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
@@ -269,7 +269,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__append_fails", "[prove_vacuum_comp
 
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
-      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = 0}), std::system_error);
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
@@ -303,7 +303,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__sync_fails", "[prove_vacuum_compac
 
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
-      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = 0}), std::system_error);
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
@@ -340,7 +340,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__rename_fails", "[prove_vacuum_comp
     // vacuum_commit never ran. Old file remains in state.
     // assert_vacuum_recoverable confirms .data.tmp is not replayed.
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
-      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0, .absorb_threshold = 0}), std::system_error);
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);

@@ -275,7 +275,7 @@ is never modified.
 ### Behavioral contract
 
 [`CONTRACT.md`](../CONTRACT.md) defines the guarantees for
-`apply_batch`, `vacuum_compact`, `vacuum_absorb`, and hint files.
+`apply_batch`, `vacuum_compact`, and hint files.
 It is the source of truth for both the implementation and the validation
 model.
 
@@ -309,10 +309,9 @@ Six additional checkpoints exist in `bytecask.cpp` (compiled under `BYTECASK_TES
 6. `io_resume_sync` — before `file.sync()` in `resume()`
 7. `io_resume_file_creation` — before creating the new active `DataFile`
    in `resume()`
-8. `io_vacuum_absorb_sync` — before `active.sync()` in `vacuum_absorb_file()`
-9. `io_vacuum_compact_tmp_create` — before constructing the temporary
+8. `io_vacuum_compact_tmp_create` — before constructing the temporary
    `DataFile` in `vacuum_compact_file()`
-10. `io_vacuum_compact_rename` — before `std::filesystem::rename()` in
+9. `io_vacuum_compact_rename` — before `std::filesystem::rename()` in
     `vacuum_compact_file()`
 
 ### Orphaned BulkBegin degrade
@@ -475,36 +474,19 @@ fault points.
 
 This directly proves: *resume always eventually recovers once the underlying fault clears.*
 
-### vacuum_absorb — 6 tests
-
-6 generated Catch2 tests (`[prove_vacuum_absorb]` tag) cover two state
-shapes × three failure classes (SUCCESS, VA1, VA2).
-
-State shapes create a DB with exactly one sealed file having fragmentation > 0:
-
-- **low_fragmentation** — sealed file with 2 entries, 1 dead (50% frag)
-- **mostly_dead** — sealed file with 6 entries, 5 dead (~83% frag)
-
-Both use `absorb_threshold=UINT64_MAX` to force the absorb path.
-Failure classes: SUCCESS, VA1 (`io_data_file_append`), VA2 (`io_vacuum_absorb_sync`).
-
-Each test uses `capture_vacuum_baseline` / `find_vacuum_target` before
-the vacuum call, then `assert_vacuum_success` or `assert_vacuum_no_change`
-after. The `assert_vacuum_no_change` helper explicitly checks
-`file_stats[active_id].total_bytes == actual_file_size` — this detects
-the stale-stats invariant violation that would result if `vacuum_absorb_file`
-failed to truncate the active file back after a sync failure. Each test
-ends with `assert_vacuum_recoverable` after the DB scope closes.
-
 ### vacuum_compact — 10 tests
 
 10 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover two state
 shapes × five failure classes (SUCCESS, VC1–VC4).
 
-Same state shapes as absorb but `absorb_threshold=0` forces the compact
-path. `mostly_dead` uses `max_file_bytes=150` to pack all 6 keys into one
-sealed file so `live_bytes > 0` — preventing the edge case where
-`absorb_threshold=0` is still satisfied and absorb is taken.
+State shapes create a DB with exactly one sealed file having fragmentation > 0:
+
+- **low_fragmentation** — sealed file with 2 entries, 1 dead (50% frag)  
+- **mostly_dead** — sealed file with 6 entries, 5 dead (~83% frag)
+
+Files with live entries always use the compact path (sealed→sealed).
+`mostly_dead` uses `max_file_bytes=150` to pack all 6 keys into one
+sealed file.
 
 Failure classes: SUCCESS, VC1 (`io_vacuum_compact_tmp_create`),
 VC2 (`io_data_file_append`), VC3 (`io_data_file_sync`),
@@ -535,15 +517,6 @@ secondary source and sees only the data the old file guaranteed.
 | `fault_point_resolver.py` | Maps failure class → fault checkpoint name |
 | `expected_delta.py` | Reference model: keys present/absent after all resume calls |
 | `generate_tests.py` | Generates `prove_resume.cpp` |
-
-**vacuum_absorb module** (`tests/proof/vacuum_absorb/`):
-
-| File | Role |
-|------|------|
-| `scenario_matrix.py` | AbsorbStateShape (low_fragmentation, mostly_dead), VacuumAbsorbFailureClass |
-| `fault_point_resolver.py` | Maps failure class → fault checkpoint name |
-| `expected_delta.py` | Reference model: threw/file_removed outcome |
-| `generate_tests.py` | Generates `prove_vacuum_absorb.cpp` |
 
 **vacuum_compact module** (`tests/proof/vacuum_compact/`):
 
@@ -604,8 +577,7 @@ I/O checkpoints:
 - `assert_vacuum_no_change(db, before, vacuumed_file_id)` — verifies the
   vacuumed file is still in state, all keys intact, `next_lsn` unchanged,
   `file_stats` unchanged from baseline, the active file's tracked size
-  matches its actual on-disk size (detecting a failed absorb that wrote
-  bytes without rolling them back), `assert_consistent`.
+  matches its actual on-disk size, `assert_consistent`.
 - `assert_vacuum_recoverable(dir, before)` — opens a fresh DB and verifies
   all pre-vacuum keys survive recovery with correct values.
 
@@ -622,9 +594,6 @@ All three resume failure classes (R1–R3) plus DOUBLE and CASCADE across
 all four degrade shapes (H, C, F, G) are covered by the 21
 `[prove_resume]` tests. R1 is correctly excluded for degrade_H, degrade_F,
 and degrade_G (no orphaned bytes to truncate — fault point unreachable).
-
-All three vacuum_absorb failure classes across both state shapes are
-covered by the 6 `[prove_vacuum_absorb]` tests.
 
 All five vacuum_compact failure classes across both state shapes are
 covered by the 10 `[prove_vacuum_compact]` tests.
@@ -714,12 +683,6 @@ tests/
       expected_delta.py
       fault_point_resolver.py
       generate_tests.py
-    vacuum_absorb/
-      __init__.py
-      scenario_matrix.py
-      expected_delta.py
-      fault_point_resolver.py
-      generate_tests.py
     vacuum_compact/
       __init__.py
       scenario_matrix.py
@@ -729,7 +692,6 @@ tests/
     generated/
       prove_apply_batch.cpp     ← generated, never hand-edited
       prove_resume.cpp             ← generated, never hand-edited
-      prove_vacuum_absorb.cpp      ← generated, never hand-edited
       prove_vacuum_compact.cpp     ← generated, never hand-edited
 ```
 

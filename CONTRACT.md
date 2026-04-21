@@ -208,8 +208,6 @@ on disk but not reflected in the published counter.
   file during `apply_batch` must always have a higher sequence
   number than any previous new entry in the same file session. The
   sequence must never go backwards or repeat for new writes.
-  `vacuum_absorb` appends old entries with their original LSNs —
-  these are not new writes and do not follow this ordering.
 
 - **Uniqueness per key.** Two entries for different logical writes
   must not share a sequence number for the same key with different
@@ -342,54 +340,6 @@ itself.
 
 ---
 
-## vacuum_absorb
-
-Appends live entries from a sealed file into the current active file,
-then removes the sealed file from the published state.
-
-### Data Preservation
-
-Same as `vacuum_compact`: every key-value pair readable before must be
-readable after, with the same value.
-
-### Atomicity
-
-The absorbed entries and the removal of the old file must be published
-in a single atomic state publication. The key directory must
-transition all
-absorbed keys from the old file to the active file atomically — no
-reader must see a state where some absorbed keys still resolve from
-the old file while others already resolve from the active file.
-
-### I/O Failure Safety
-
-If any I/O throws during scan, copy, or sync:
-
-- The old file must remain in the published state, unchanged.
-- The active file must be left in the same state it was in before the
-  absorb began. The engine must attempt to truncate any bytes appended
-  during the failed copy; if the truncate also fails, the active file
-  may contain dead bytes that are not referenced by `key_dir`.
-- The DB must remain operational.
-
-### Locking
-
-`vacuum_absorb` must block all other writes for its entire duration
-because it appends to the shared active `DataFile`. Writes are blocked during
-absorb. This is acceptable because absorb only targets small files
-(below `absorb_threshold`).
-
-### Stale File Safety
-
-Same as `vacuum_compact`: the old file must be deferred for deletion
-until no external references remain.
-
-### Consistency
-
-Same as `vacuum_compact`.
-
----
-
 ## `create_manifest`
 
 Rotates the active file, waits for all hint files, and returns a manifest
@@ -446,8 +396,7 @@ Sequence bounds are updated in every path that writes entries:
 - `apply_writes`: captures the batch's start and end sequence.
 - `vacuum_scan_and_copy`: tracks sequences of all entries copied to the
   destination file, including `BulkBegin`/`BulkEnd` markers.
-- `apply_vacuum`: propagates scan bounds to the new file's `FileStats`.
-  The absorb path merges bounds with the active file's existing range.
+- `apply_vacuum`: propagates scan bounds to the compacted file's `FileStats`.
 - `apply_resume`: resets bounds on truncation, then rebuilds from the
   committed entries.
 - Recovery (serial and parallel): tracks bounds per file during hint
