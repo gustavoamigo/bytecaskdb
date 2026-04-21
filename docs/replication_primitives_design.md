@@ -77,9 +77,9 @@ auto create_manifest() -> FileManifest;
 
 Each file's stats track the minimum and maximum sequence of entries it contains. This allows `changes_since` to skip files that have no entries newer than the target sequence.
 
-Vacuum and file rotation are infrequent events. On each, a secondary index (`vector<file_id>` sorted by `min_sequence`) can be rebuilt cheaply for fast range filtering — but this is an optimization for later.
+**Per-file sequence monotonicity invariant:** every data file (active or sealed) contains entries in strictly ascending sequence order. This is naturally true for the active file (sequences are assigned monotonically) and for sealed files produced by rotation. `vacuum_compact_file` preserves it — it scans the source file sequentially, skipping dead entries, so surviving entries retain their original order. `vacuum_remove_file` deletes the file entirely — no ordering concern. `vacuum_absorb_file` is not used — it would interleave old sequences into the active file, violating this invariant.
 
-**Why this matters:** Vacuum rewrites entries into new files, breaking file-level sequence ordering. Without per-file sequence bounds, `changes_since` would need to scan every file.
+This invariant makes `changes_since` efficient: each file is a sorted run, so the min-heap merge is optimal. It also enables **binary search within a file** using hint files (each hint entry carries the sequence), allowing `changes_since` to seek directly to the first entry with `sequence > from_sequence` rather than scanning from byte 0.
 
 ### 4. `changes_since(snap, from_sequence)` — iterator
 
@@ -89,7 +89,7 @@ Implementation:
 
 1. Filter files where `max_sequence > from_sequence` (using file_stats).
 2. Open a cursor per qualifying file. `changes_since` must read from data files (not hint files) to preserve `BulkBegin`/`BulkEnd` batch markers. Hint files strip markers and cannot be used here. Within each file, skip entries with `sequence <= from_sequence`.
-3. **Merge by sequence:** maintain a min-heap over data file cursors, yielding the entry with the lowest sequence at each step. This produces a globally ordered stream even when vacuum has rewritten entries into new files in key order rather than sequence order. This is the same fan-in merge pattern that recovery already uses.
+3. **Merge by sequence:** maintain a min-heap over data file cursors, yielding the entry with the lowest sequence at each step. Each file is a sorted run (guaranteed by the per-file sequence monotonicity invariant), so the merge is optimal — no reordering within any cursor. This is the same fan-in merge pattern that recovery already uses.
 4. **Lazy value fetch:** the actual value bytes are read from the data file via `pread` only when the caller consumes the entry. Deletes and range deletes require no data file read at all.
 5. **Batch-aware scanning:** each per-file cursor does batch-aware scanning, the same pattern used by `flush_hints_for` and `vacuum_scan_and_copy`. Entries between `BulkBegin` and `BulkEnd` are buffered; the buffer is emitted (with markers) only when `BulkEnd` is seen. If the file ends without `BulkEnd`, the buffered entries are discarded — the batch was incomplete (crash during `apply_batch`). All three data file scanners in the engine handle incomplete batches identically.
 
@@ -185,7 +185,9 @@ Between rotations, NoSync entries are in the page cache and not replicable. Once
 
 ## Vacuum: Preserving Batch Markers
 
-`vacuum_scan_and_copy` in `bytecaskdb/bytecask.cpp` rewrites live entries from a sealed source file into a destination file. Currently, its `emit_entry` lambda has a no-op `break` for `BulkBegin`/`BulkEnd` — batch markers are silently dropped from compacted files. Entries that were part of a batch in the source file appear as standalone entries in the destination.
+**Vacuum strategy for replication:** only two vacuum paths exist: `vacuum_compact_file` (sealed→sealed, for files with live entries) and `vacuum_remove_file` (delete, for files with zero live entries). The `vacuum_absorb_file` path (sealed→active) is deprecated because it breaks per-file sequence monotonicity — absorbed entries would interleave old sequences into the active file, defeating file-level filtering and complicating the `changes_since` read fence (the active file's `durable_seq` boundary).
+
+`vacuum_scan_and_copy` in `bytecaskdb/bytecask.cpp` rewrites live entries from a sealed source file into a new sealed destination file. Currently, its `emit_entry` lambda has a no-op `break` for `BulkBegin`/`BulkEnd` — batch markers are silently dropped from compacted files. Entries that were part of a batch in the source file appear as standalone entries in the destination.
 
 This must change. `changes_since` reads from data files (not hint files) and relies on `BulkBegin`/`BulkEnd` markers to frame atomic batches. If vacuum strips these markers, `changes_since` over a vacuumed file yields the entries without batch framing, and `ingest` on the follower writes them as individual entries instead of a single `writev`. A crash mid-ingest would then leave a partial batch visible on the follower — violating the atomicity guarantee that the leader's `apply_batch` provided.
 
@@ -445,6 +447,7 @@ Checked after every test case:
 8. **Durable boundary**: `changes_since` never yields entries with `sequence > durable_sequence`. Validated by running a mixed sync/nosync workload on the leader, taking a snapshot (which includes unsync'd entries in the key directory), and verifying that `changes_since` excludes entries beyond the durable sequence.
 9. **Batch atomicity through vacuum**: for the `vacuumed_batches` state shape, `changes_since` over vacuumed files yields `BulkBegin`/`BulkEnd` markers framing the batch entries. `ingest` writes the batch as a single `writev` on the follower. After a simulated crash mid-ingest (Class C), recovery discards the incomplete batch — no partial batch is visible.
 9a. **Vacuum preserves original sequences**: for every entry in a vacuumed file, the sequence equals the entry's sequence in the pre-vacuum source file. Vacuum never re-numbers. This is load-bearing for replication (otherwise `changes_since` would yield inconsistent sequences after vacuum) and is currently incidental in [`vacuum_scan_and_copy`](../bytecaskdb/bytecask.cpp) — making it a test invariant prevents a future refactor from silently breaking it.
+9b. **Per-file sequence monotonicity**: within every data file (active or sealed, including compacted files), entries appear in strictly ascending sequence order. This holds naturally: the write path assigns sequences monotonically, `vacuum_compact_file` scans sequentially and skips dead entries (preserving order), and `vacuum_remove_file` deletes the file entirely. `vacuum_absorb_file` is not used — it would violate this invariant by interleaving old sequences into the active file.
 10. **Sequence continuity after promotion**: after `set_mode(Leader)`, the first write on the promoted node gets `sequence == current_sequence() + 1`. No gap, no reuse of existing sequences.
 11. **Mode enforcement**: in `Mode::Follower`, `put`/`del`/`apply_batch` are rejected. In `Mode::Leader`, `ingest` is rejected. `set_mode` transitions are immediate — no in-flight writes straddle the boundary (writes are mutex-serialized).
 12. **Backward sync after promotion**: after planned promotion, NodeA (now Follower) replicating from NodeB (now Leader) produces a key_dir identical to NodeB's. The old leader's stale entries are superseded by the new leader's writes through normal sequence ordering.
