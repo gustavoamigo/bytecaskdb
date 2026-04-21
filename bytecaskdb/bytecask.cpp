@@ -1920,8 +1920,13 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
     return s;
   }
 
+#ifdef BYTECASK_SINGLE_THREADED
+  auto W = 1u;
+  (void)recovery_threads;
+#else
   auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
   if (W == 0) W = 1;
+#endif
 
   // Phase 1: round-robin file assignment.
   std::vector<std::vector<RecoveredFile>> worker_files(W);
@@ -1934,6 +1939,24 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
   // each into an accumulator as it arrives. Each ~N/W-key tree is merged
   // once; disjoint subtrees are shared O(1) by the persistent tree, so
   // total merge work is proportional to overlap, not N × log₂(W).
+#ifdef BYTECASK_SINGLE_THREADED
+  // Single-threaded: run recovery serially on the calling thread.
+  std::vector<RecoveryResult> queue;
+  {
+    RecoveryResult acc{};
+    bool acc_initialized = false;
+    for (unsigned i = 0; i < W; ++i) {
+      auto result = recovery_build_from_hints(worker_files[i], strict);
+      if (!acc_initialized) {
+        acc = std::move(result);
+        acc_initialized = true;
+      } else {
+        acc = recovery_merge_results(std::move(acc), std::move(result));
+      }
+    }
+    queue.push_back(std::move(acc));
+  }
+#else
   std::mutex queue_mu;
   std::condition_variable queue_cv;
   std::vector<RecoveryResult> queue;
@@ -1995,6 +2018,7 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
       // lenient: warning already emitted inside recovery_build_from_hints
     }
   }
+#endif
 
   auto &final_result = queue[0];
 
