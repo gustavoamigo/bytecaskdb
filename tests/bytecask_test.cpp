@@ -5085,3 +5085,88 @@ TEST_CASE("manifest after vacuum", "[manifest]") {
   CHECK(manifest.snap.get(to_bytes("k3"), out));
   CHECK(to_string(out) == "v3");
 }
+
+// ===========================================================================
+// changes_since iterator tests
+// ===========================================================================
+
+TEST_CASE("changes_since iterator yields entries in sequence order", "[replication]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // Write some entries
+  db.put({}, to_bytes("key1"), to_bytes("value1"));
+  db.put({}, to_bytes("key2"), to_bytes("value2"));
+  (void)db.del({}, to_bytes("key1"));  // tombstone
+  db.put({}, to_bytes("key3"), to_bytes("value3"));
+
+  // Get current sequence - this is the boundary
+  auto from_seq = db.current_sequence();
+
+  // Write more entries after the baseline (these should be yielded)
+  db.put({}, to_bytes("key4"), to_bytes("value4"));
+  db.put({}, to_bytes("key5"), to_bytes("value5"));
+
+  // Take snapshot after writing the new entries
+  auto snap = db.snapshot();
+
+  // changes_since should yield entries after from_seq in sequence order
+  auto changes = db.changes_since(snap, from_seq);
+
+  std::vector<std::string> collected_keys;
+  std::vector<std::string> collected_values;
+  std::vector<std::uint64_t> collected_sequences;
+
+  for (const auto& entry : changes) {
+    collected_sequences.push_back(entry.sequence);
+    collected_keys.emplace_back(reinterpret_cast<const char*>(entry.key.data()), entry.key.size());
+    collected_values.emplace_back(reinterpret_cast<const char*>(entry.value.data()), entry.value.size());
+  }
+
+  // Debug what we actually got
+  INFO("from_seq: " << from_seq);
+  INFO("snap durable_seq: " << db.current_sequence());
+  INFO("collected " << collected_sequences.size() << " entries");
+  for (size_t i = 0; i < collected_sequences.size(); ++i) {
+    INFO("Entry " << i << " seq=" << collected_sequences[i] << " key='" << collected_keys[i] << "' value='" << collected_values[i] << "'");
+  }
+
+  // Should have 2 entries (sequences 5 and 6) in sequence order
+  REQUIRE(collected_sequences.size() == 2);
+  REQUIRE(collected_sequences[0] < collected_sequences[1]);
+  REQUIRE(collected_sequences[0] == 5);
+  REQUIRE(collected_sequences[1] == 6);
+
+  // Check that we got the expected keys and values
+  REQUIRE(collected_keys[0] == "key4");
+  REQUIRE(collected_values[0] == "value4");
+  REQUIRE(collected_keys[1] == "key5");
+  REQUIRE(collected_values[1] == "value5");
+}
+
+TEST_CASE("changes_since empty iterator when no new entries", "[replication]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // Write some entries
+  db.put({}, to_bytes("key1"), to_bytes("value1"));
+  db.put({}, to_bytes("key2"), to_bytes("value2"));
+
+  auto from_seq = db.current_sequence();
+  auto snap = db.snapshot();
+
+  // changes_since should be empty (no entries after from_seq)
+  auto changes = db.changes_since(snap, from_seq);
+
+  std::vector<bytecask::RawEntry> entries;
+  for (const auto& entry : changes) {
+    entries.push_back({
+      .sequence = entry.sequence,
+      .entry_type = entry.entry_type,
+      .key = bytecask::Bytes{entry.key.begin(), entry.key.end()},
+      .value = bytecask::Bytes{entry.value.begin(), entry.value.end()}
+    });
+  }
+
+  REQUIRE(entries.empty());
+}
