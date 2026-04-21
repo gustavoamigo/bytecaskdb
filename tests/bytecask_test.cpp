@@ -27,6 +27,7 @@
 #include <tuple>
 #include <vector>
 import bytecask;
+import bytecask.batch_iterator;
 import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.types;
@@ -5176,4 +5177,228 @@ TEST_CASE("changes_since empty iterator when no new entries", "[replication]") {
   }
 
   REQUIRE(entries.empty());
+}
+
+// ---------------------------------------------------------------------------
+// DataFileIterator tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("DataFileIterator over empty file yields nothing", "[iterator]") {
+  TempDir td;
+  bytecask::DataFile file{td.path / "empty.data"};
+  file.seal();
+
+  std::vector<bytecask::DataEntry> entries;
+  for (const auto& [entry, off] : bytecask::scan_entries(file)) {
+    entries.push_back(entry);
+  }
+  REQUIRE(entries.empty());
+}
+
+TEST_CASE("DataFileIterator yields all entries in order", "[iterator]") {
+  TempDir td;
+  bytecask::DataFile file{td.path / "test.data"};
+  (void)file.append_entry(1, bytecask::EntryType::Put,
+                          to_bytes("k1"), to_bytes("v1"));
+  (void)file.append_entry(2, bytecask::EntryType::Put,
+                          to_bytes("k2"), to_bytes("v2"));
+  (void)file.append_entry(3, bytecask::EntryType::Delete,
+                          to_bytes("k1"), {});
+  file.seal();
+
+  std::vector<std::pair<std::uint64_t, bytecask::EntryType>> results;
+  for (const auto& [entry, off] : bytecask::scan_entries(file)) {
+    results.emplace_back(entry.sequence, entry.entry_type);
+  }
+
+  REQUIRE(results.size() == 3);
+  CHECK(results[0] == std::pair{std::uint64_t{1}, bytecask::EntryType::Put});
+  CHECK(results[1] == std::pair{std::uint64_t{2}, bytecask::EntryType::Put});
+  CHECK(results[2] == std::pair{std::uint64_t{3}, bytecask::EntryType::Delete});
+}
+
+TEST_CASE("DataFileIterator reports correct offsets", "[iterator]") {
+  TempDir td;
+  bytecask::DataFile file{td.path / "test.data"};
+  auto off1 = file.append_entry(1, bytecask::EntryType::Put,
+                                to_bytes("a"), to_bytes("1"));
+  auto off2 = file.append_entry(2, bytecask::EntryType::Put,
+                                to_bytes("b"), to_bytes("2"));
+  file.seal();
+
+  std::vector<bytecask::Offset> offsets;
+  for (const auto& [entry, off] : bytecask::scan_entries(file)) {
+    offsets.push_back(off);
+  }
+
+  REQUIRE(offsets.size() == 2);
+  CHECK(offsets[0] == off1);
+  CHECK(offsets[1] == off2);
+}
+
+// ---------------------------------------------------------------------------
+// BatchGroupingIterator tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("scan_batches standalone entries yield single-entry batches",
+          "[iterator]") {
+  TempDir td;
+  bytecask::DataFile file{td.path / "test.data"};
+  (void)file.append_entry(1, bytecask::EntryType::Put,
+                          to_bytes("k1"), to_bytes("v1"));
+  (void)file.append_entry(2, bytecask::EntryType::Delete,
+                          to_bytes("k2"), {});
+  file.seal();
+
+  std::vector<bytecask::CommittedBatch> batches;
+  for (const auto& batch : bytecask::scan_batches(file)) {
+    batches.push_back(batch);
+  }
+
+  REQUIRE(batches.size() == 2);
+  CHECK_FALSE(batches[0].is_batch());
+  CHECK(batches[0].entries.size() == 1);
+  CHECK(batches[0].entries[0].first.sequence == 1);
+  CHECK_FALSE(batches[1].is_batch());
+  CHECK(batches[1].entries.size() == 1);
+  CHECK(batches[1].entries[0].first.sequence == 2);
+}
+
+TEST_CASE("scan_batches groups BulkBegin/BulkEnd into a batch", "[iterator]") {
+  TempDir td;
+  bytecask::DataFile file{td.path / "test.data"};
+  (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
+  (void)file.append_entry(11, bytecask::EntryType::Put,
+                          to_bytes("k1"), to_bytes("v1"));
+  (void)file.append_entry(12, bytecask::EntryType::Put,
+                          to_bytes("k2"), to_bytes("v2"));
+  (void)file.append_entry(13, bytecask::EntryType::BulkEnd, {}, {});
+  file.seal();
+
+  std::vector<bytecask::CommittedBatch> batches;
+  for (const auto& batch : bytecask::scan_batches(file)) {
+    batches.push_back(batch);
+  }
+
+  REQUIRE(batches.size() == 1);
+  CHECK(batches[0].is_batch());
+  CHECK(batches[0].bulk_begin_seq == 10);
+  CHECK(batches[0].bulk_end_seq == 13);
+  REQUIRE(batches[0].entries.size() == 4);
+  CHECK(batches[0].entries[0].first.entry_type == bytecask::EntryType::BulkBegin);
+  CHECK(batches[0].entries[0].first.sequence == 10);
+  CHECK(batches[0].entries[1].first.sequence == 11);
+  CHECK(batches[0].entries[2].first.sequence == 12);
+  CHECK(batches[0].entries[3].first.entry_type == bytecask::EntryType::BulkEnd);
+  CHECK(batches[0].entries[3].first.sequence == 13);
+}
+
+TEST_CASE("scan_batches discards incomplete batch at EOF", "[iterator]") {
+  TempDir td;
+  bytecask::DataFile file{td.path / "test.data"};
+  // Standalone entry first, then an incomplete batch.
+  (void)file.append_entry(1, bytecask::EntryType::Put,
+                          to_bytes("k1"), to_bytes("v1"));
+  (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
+  (void)file.append_entry(11, bytecask::EntryType::Put,
+                          to_bytes("k2"), to_bytes("v2"));
+  // No BulkEnd — batch is incomplete.
+  file.seal();
+
+  std::vector<bytecask::CommittedBatch> batches;
+  for (const auto& batch : bytecask::scan_batches(file)) {
+    batches.push_back(batch);
+  }
+
+  // Only the standalone entry should be yielded.
+  REQUIRE(batches.size() == 1);
+  CHECK_FALSE(batches[0].is_batch());
+  CHECK(batches[0].entries[0].first.sequence == 1);
+}
+
+TEST_CASE("scan_batches interleaved standalone and batch entries",
+          "[iterator]") {
+  TempDir td;
+  bytecask::DataFile file{td.path / "test.data"};
+  (void)file.append_entry(1, bytecask::EntryType::Put,
+                          to_bytes("standalone1"), to_bytes("v1"));
+  (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
+  (void)file.append_entry(11, bytecask::EntryType::Put,
+                          to_bytes("batch1"), to_bytes("v2"));
+  (void)file.append_entry(12, bytecask::EntryType::BulkEnd, {}, {});
+  (void)file.append_entry(20, bytecask::EntryType::Delete,
+                          to_bytes("standalone2"), {});
+  file.seal();
+
+  std::vector<bytecask::CommittedBatch> batches;
+  for (const auto& batch : bytecask::scan_batches(file)) {
+    batches.push_back(batch);
+  }
+
+  REQUIRE(batches.size() == 3);
+  CHECK_FALSE(batches[0].is_batch());
+  CHECK(batches[1].is_batch());
+  CHECK_FALSE(batches[2].is_batch());
+}
+
+TEST_CASE("scan_batches next_offset is correct", "[iterator]") {
+  TempDir td;
+  bytecask::DataFile file{td.path / "test.data"};
+  (void)file.append_entry(1, bytecask::EntryType::Put,
+                          to_bytes("k"), to_bytes("v"));
+  (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
+  (void)file.append_entry(11, bytecask::EntryType::Put,
+                          to_bytes("bk"), to_bytes("bv"));
+  (void)file.append_entry(12, bytecask::EntryType::BulkEnd, {}, {});
+  file.seal();
+  auto file_size = file.size();
+
+  std::vector<bytecask::CommittedBatch> batches;
+  for (const auto& batch : bytecask::scan_batches(file)) {
+    batches.push_back(batch);
+  }
+
+  REQUIRE(batches.size() == 2);
+  // Standalone entry's next_offset points past that entry.
+  CHECK(batches[0].next_offset > 0);
+  CHECK(batches[0].next_offset < file_size);
+  // Batch's next_offset points past BulkEnd, which is the file size.
+  CHECK(batches[1].next_offset == file_size);
+}
+
+TEST_CASE("scan_batches over empty file yields nothing", "[iterator]") {
+  TempDir td;
+  bytecask::DataFile file{td.path / "empty.data"};
+  file.seal();
+
+  std::vector<bytecask::CommittedBatch> batches;
+  for (const auto& batch : bytecask::scan_batches(file)) {
+    batches.push_back(batch);
+  }
+  REQUIRE(batches.empty());
+}
+
+TEST_CASE("scan_batches handles RangeDel inside batch", "[iterator]") {
+  TempDir td;
+  bytecask::DataFile file{td.path / "test.data"};
+  (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
+  (void)file.append_entry(11, bytecask::EntryType::Put,
+                          to_bytes("k1"), to_bytes("v1"));
+  (void)file.append_entry(12, bytecask::EntryType::RangeDel,
+                          to_bytes("a"), to_bytes("z"));
+  (void)file.append_entry(13, bytecask::EntryType::BulkEnd, {}, {});
+  file.seal();
+
+  std::vector<bytecask::CommittedBatch> batches;
+  for (const auto& batch : bytecask::scan_batches(file)) {
+    batches.push_back(batch);
+  }
+
+  REQUIRE(batches.size() == 1);
+  CHECK(batches[0].is_batch());
+  REQUIRE(batches[0].entries.size() == 4);
+  CHECK(batches[0].entries[0].first.entry_type == bytecask::EntryType::BulkBegin);
+  CHECK(batches[0].entries[1].first.entry_type == bytecask::EntryType::Put);
+  CHECK(batches[0].entries[2].first.entry_type == bytecask::EntryType::RangeDel);
+  CHECK(batches[0].entries[3].first.entry_type == bytecask::EntryType::BulkEnd);
 }

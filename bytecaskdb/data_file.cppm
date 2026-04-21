@@ -10,12 +10,14 @@ module;
 #include "fault_injector.h"
 #endif
 #include <cerrno>
+#include <concepts>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <fcntl.h>
 #include <filesystem>
 #include <format>
+#include <iterator>
 #include <optional>
 #include <span>
 #include <sys/uio.h>
@@ -23,6 +25,7 @@ module;
 #include <unistd.h>
 #include <utility>
 #include <vector>
+#include <ranges>
 
 // macOS does not provide fdatasync; use F_FULLFSYNC which actually flushes
 // to physical storage (fdatasync on macOS is a no-op shim).
@@ -389,5 +392,63 @@ private:
   }
 #endif
 };
+
+// Forward-only iterator over raw entries in a DataFile.
+// Wraps DataFile::scan(offset) into a standard C++ input iterator.
+// Exceptions from scan() (CRC errors, I/O failures) propagate to the caller.
+export class DataFileIterator {
+public:
+  using iterator_concept = std::input_iterator_tag;
+  using value_type = std::pair<DataEntry, Offset>;
+  using difference_type = std::ptrdiff_t;
+
+  DataFileIterator() = default;
+
+  explicit DataFileIterator(const DataFile& file, Offset start = 0)
+      : file_{&file}, next_offset_{start} {
+    advance();
+  }
+
+  auto operator*() const -> const value_type& { return *cached_; }
+
+  auto operator++() -> DataFileIterator& {
+    advance();
+    return *this;
+  }
+
+  void operator++(int) { ++*this; }
+
+  auto operator==(std::default_sentinel_t) const noexcept -> bool {
+    return !cached_.has_value();
+  }
+
+  // Exposes the byte offset that will be read on the next increment.
+  // After the last successful dereference, this is the offset past the
+  // current entry — useful for callers that need to track file position.
+  [[nodiscard]] auto next_offset() const noexcept -> Offset {
+    return next_offset_;
+  }
+
+private:
+  void advance() {
+    auto result = file_->scan(next_offset_);
+    if (!result) {
+      cached_.reset();
+      return;
+    }
+    auto& [entry, next] = *result;
+    cached_.emplace(std::move(entry), next_offset_);
+    next_offset_ = next;
+  }
+
+  const DataFile* file_{};
+  Offset next_offset_{};
+  std::optional<value_type> cached_;
+};
+
+export inline auto scan_entries(const DataFile& file, Offset start = 0)
+    -> std::ranges::subrange<DataFileIterator, std::default_sentinel_t> {
+  return {DataFileIterator{file, start}, std::default_sentinel};
+}
 
 } // namespace bytecask

@@ -25,6 +25,7 @@ module;
 export module bytecask;
 
 export import :internals;
+import bytecask.batch_iterator;
 import bytecask.concurrency;
 import bytecask.data_file;
 import bytecask.radix_tree;

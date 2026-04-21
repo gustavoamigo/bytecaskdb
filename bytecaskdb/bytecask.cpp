@@ -1066,65 +1066,29 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
   };
 
   auto hint = HintFile::OpenForWrite(tmp_path);
-  bool in_batch = false;
-  std::vector<PendingHint> pending;  // staging buffer for current batch
   std::vector<PendingHint> all_hints; // all confirmed entries across the file
-  Offset off = 0;
 
   try {
-    while (auto result = file->scan(off)) {
-      const auto entry_off = off;
-      const auto &[entry, next] = *result;
-      switch (entry.entry_type) {
-      case EntryType::BulkBegin:
-        in_batch = true;
-        pending.clear();
-        break;
-      case EntryType::BulkEnd:
-        for (auto &pe : pending) {
-          all_hints.push_back(std::move(pe));
+    for (const auto &batch : scan_batches(*file)) {
+      for (const auto &[entry, entry_off] : batch.entries) {
+        if (entry.entry_type == EntryType::BulkBegin ||
+            entry.entry_type == EntryType::BulkEnd) {
+          continue;
         }
-        pending.clear();
-        in_batch = false;
-        break;
-      case EntryType::Put:
-      case EntryType::Delete:
-        if (in_batch) {
-          pending.push_back({entry.sequence, entry.entry_type, entry_off,
-                             narrow<std::uint32_t>(entry.value.size()),
-                             entry.key, {}});
-        } else {
-          all_hints.push_back({entry.sequence, entry.entry_type, entry_off,
-                               narrow<std::uint32_t>(entry.value.size()),
-                               entry.key, {}});
-        }
-        break;
-      case EntryType::RangeDel:
-        if (in_batch) {
-          pending.push_back({entry.sequence, EntryType::RangeDel, entry_off,
-                             narrow<std::uint32_t>(entry.value.size()),
-                             entry.key, entry.value});
-        } else {
-          all_hints.push_back({entry.sequence, EntryType::RangeDel, entry_off,
-                               narrow<std::uint32_t>(entry.value.size()),
-                               entry.key, entry.value});
-        }
-        break;
+        all_hints.push_back(
+            {entry.sequence, entry.entry_type, entry_off,
+             narrow<std::uint32_t>(entry.value.size()), entry.key,
+             entry.entry_type == EntryType::RangeDel
+                 ? std::vector<std::byte>{entry.value.begin(),
+                                          entry.value.end()}
+                 : std::vector<std::byte>{}});
       }
-      off = next;
     }
   } catch (const std::exception &e) {
     if (strict) throw;
     std::cerr << "bytecask: truncated entry in " << file->path()
               << " while generating hint file, recovering up to this point: "
               << e.what() << "\n";
-    // Fall through — write hint file with entries collected so far.
-    in_batch = false;  // discard any pending incomplete batch
-  }
-
-  if (in_batch) {
-    std::cerr << "bytecask: discarding incomplete batch in " << file->path()
-              << " while generating hint file\n";
   }
 
   // Partition: RangeDel entries must not participate in point-entry dedup
@@ -1209,14 +1173,6 @@ auto DB::vacuum_scan_and_copy(
     std::uint32_t source_file_id) -> VacuumScanResult {
   VacuumScanResult result;
 
-  struct PendingEntry {
-    DataEntry entry;
-    Offset original_offset;
-  };
-  bool in_batch = false;
-  std::uint64_t batch_begin_seq = 0;
-  std::vector<PendingEntry> pending;
-
   auto track_seq = [&](std::uint64_t seq) {
     if (result.min_sequence == 0 || seq < result.min_sequence)
       result.min_sequence = seq;
@@ -1261,70 +1217,42 @@ auto DB::vacuum_scan_and_copy(
     }
     case EntryType::BulkBegin:
     case EntryType::BulkEnd:
+      std::ignore =
+          dest_file.append_entry(entry.sequence, entry.entry_type, {}, {});
+      track_seq(entry.sequence);
       break;
     }
   };
 
-  Offset off = 0;
-  while (auto scan_result = source_file.scan(off)) {
-    const auto entry_off = off;
-    const auto &[entry, next] = *scan_result;
-
-    switch (entry.entry_type) {
-    case EntryType::BulkBegin:
-      in_batch = true;
-      pending.clear();
-      batch_begin_seq = entry.sequence;
-      break;
-    case EntryType::BulkEnd: {
+  for (const auto &batch : scan_batches(source_file)) {
+    if (batch.is_batch()) {
+      // Check if any entry in the batch is live.
       bool has_live = false;
-      for (const auto &pe : pending) {
-        if (pe.entry.entry_type == EntryType::Delete ||
-            pe.entry.entry_type == EntryType::RangeDel) {
+      for (const auto &[entry, entry_off] : batch.entries) {
+        if (entry.entry_type == EntryType::Delete ||
+            entry.entry_type == EntryType::RangeDel) {
           has_live = true;
           break;
         }
-        if (pe.entry.entry_type == EntryType::Put) {
-          const auto existing = snap->key_dir.get(pe.entry.key);
+        if (entry.entry_type == EntryType::Put) {
+          const auto existing = snap->key_dir.get(entry.key);
           if (existing && existing->file_id == source_file_id &&
-              existing->file_offset == pe.original_offset &&
-              existing->sequence == pe.entry.sequence) {
+              existing->file_offset == entry_off &&
+              existing->sequence == entry.sequence) {
             has_live = true;
             break;
           }
         }
       }
       if (has_live) {
-        std::ignore = dest_file.append_entry(
-            batch_begin_seq, EntryType::BulkBegin, {}, {});
-        track_seq(batch_begin_seq);
-        for (auto &pe : pending) {
-          emit_entry(pe.entry, pe.original_offset);
+        for (const auto &[entry, entry_off] : batch.entries) {
+          emit_entry(entry, entry_off);
         }
-        std::ignore = dest_file.append_entry(
-            entry.sequence, EntryType::BulkEnd, {}, {});
-        track_seq(entry.sequence);
       }
-      pending.clear();
-      in_batch = false;
-      break;
+    } else {
+      const auto &[entry, entry_off] = batch.entries.front();
+      emit_entry(entry, entry_off);
     }
-    case EntryType::Put:
-    case EntryType::Delete:
-    case EntryType::RangeDel:
-      if (in_batch) {
-        pending.push_back({entry, entry_off});
-      } else {
-        emit_entry(entry, entry_off);
-      }
-      break;
-    }
-    off = next;
-  }
-
-  // Discard incomplete batch at EOF if any
-  if (in_batch) {
-    pending.clear();
   }
 
   return result;
@@ -1439,54 +1367,22 @@ void DB::resume() {
   // transitions between IO and state publication) would otherwise be invisible
   // until cold restart.
   Offset valid_offset = 0;
-  Offset off = 0;
-  bool in_batch = false;
-  Offset batch_start = 0;
   std::vector<ResumeEntry> committed;
-  std::vector<ResumeEntry> pending;  // staging buffer for current batch
   try {
-    while (auto result = file.scan(off)) {
-      const auto entry_off = off;
-      const auto &[entry, next] = *result;
-      switch (entry.entry_type) {
-        case EntryType::BulkBegin:
-          in_batch = true;
-          batch_start = off;
-          pending.clear();
-          break;
-        case EntryType::BulkEnd:
-          in_batch = false;
-          valid_offset = next;
-          for (auto &pe : pending) {
-            committed.push_back(std::move(pe));
-          }
-          pending.clear();
-          break;
-        case EntryType::Put:
-        case EntryType::Delete:
-        case EntryType::RangeDel: {
-          ResumeEntry re{entry.sequence, entry.entry_type, entry_off,
-                         narrow<std::uint32_t>(entry.value.size()),
-                         entry.key};
-          if (in_batch) {
-            pending.push_back(std::move(re));
-          } else {
-            valid_offset = next;
-            committed.push_back(std::move(re));
-          }
-          break;
+    for (const auto &batch : scan_batches(file)) {
+      for (const auto &[entry, entry_off] : batch.entries) {
+        if (entry.entry_type == EntryType::BulkBegin ||
+            entry.entry_type == EntryType::BulkEnd) {
+          continue;
         }
+        committed.push_back({entry.sequence, entry.entry_type, entry_off,
+                             narrow<std::uint32_t>(entry.value.size()),
+                             entry.key});
       }
-      off = next;
+      valid_offset = batch.next_offset;
     }
   } catch (...) {
     // Stop at first CRC error — valid_offset is the last known-good position.
-    // Discard any pending incomplete batch.
-    pending.clear();
-  }
-  if (in_batch) {
-    valid_offset = batch_start;  // discard orphaned batch
-    pending.clear();
   }
 
   // Remove garbage bytes / orphaned batch markers via truncation.
@@ -2270,22 +2166,14 @@ public:
 
 private:
   void scan_file(const DataFile& file) {
-    // Simple batch-aware scanning without template abstraction
-    bool in_batch = false;
-    std::uint64_t batch_begin_seq = 0;
-    std::vector<RawEntry> pending_batch;
-
     auto should_include = [&](std::uint64_t seq) -> bool {
       return seq > from_sequence_ && seq <= durable_sequence_;
     };
 
     auto add_entry = [&](std::uint64_t sequence, EntryType entry_type,
                          std::span<const std::byte> key, std::span<const std::byte> value) {
-      // Store owned copies of key and value data
       key_storage_.emplace_back(key.begin(), key.end());
       value_storage_.emplace_back(value.begin(), value.end());
-
-      // Create stable views pointing to our storage
       entries_.push_back({
         .sequence = sequence,
         .entry_type = entry_type,
@@ -2294,79 +2182,29 @@ private:
       });
     };
 
-    Offset off = 0;
-    while (auto scan_result = file.scan(off)) {
-      const auto& [entry, next] = *scan_result;
-
-      switch (entry.entry_type) {
-      case EntryType::BulkBegin:
-        in_batch = true;
-        pending_batch.clear();
-        batch_begin_seq = entry.sequence;
-        break;
-
-      case EntryType::BulkEnd:
-        if (in_batch) {
-          // Check if any entry in the batch should be included
-          bool has_valid = false;
-          for (const auto& pe : pending_batch) {
-            if (should_include(pe.sequence)) {
-              has_valid = true;
-              break;
-            }
+    for (const auto& batch : scan_batches(file)) {
+      if (batch.is_batch()) {
+        // Check if any entry in the batch should be included.
+        bool has_valid = false;
+        for (const auto& [entry, entry_off] : batch.entries) {
+          if (should_include(entry.sequence)) {
+            has_valid = true;
+            break;
           }
-
-          if (has_valid) {
-            // Add BulkBegin marker if it should be included
-            if (should_include(batch_begin_seq)) {
-              add_entry(batch_begin_seq, EntryType::BulkBegin, {}, {});
-            }
-
-            // Add all valid entries from the batch
-            for (const auto& pe : pending_batch) {
-              if (should_include(pe.sequence)) {
-                add_entry(pe.sequence, pe.entry_type, pe.key, pe.value);
-              }
-            }
-
-            // Add BulkEnd marker if it should be included
-            if (should_include(entry.sequence)) {
-              add_entry(entry.sequence, EntryType::BulkEnd, {}, {});
-            }
-          }
-
-          pending_batch.clear();
-          in_batch = false;
         }
-        break;
-
-      case EntryType::Put:
-      case EntryType::Delete:
-      case EntryType::RangeDel:
-        if (in_batch) {
-          // Buffer in pending batch - store copies to avoid lifetime issues
-          std::vector<std::byte> key_copy(entry.key.begin(), entry.key.end());
-          std::vector<std::byte> value_copy(entry.value.begin(), entry.value.end());
-          pending_batch.push_back({
-            .sequence = entry.sequence,
-            .entry_type = entry.entry_type,
-            .key = BytesView{key_copy.data(), key_copy.size()},
-            .value = BytesView{value_copy.data(), value_copy.size()}
-          });
-          // Keep the copies alive
-          pending_key_storage_.emplace_back(std::move(key_copy));
-          pending_value_storage_.emplace_back(std::move(value_copy));
-        } else if (should_include(entry.sequence)) {
+        if (has_valid) {
+          for (const auto& [entry, entry_off] : batch.entries) {
+            if (should_include(entry.sequence)) {
+              add_entry(entry.sequence, entry.entry_type, entry.key, entry.value);
+            }
+          }
+        }
+      } else {
+        const auto& [entry, entry_off] = batch.entries.front();
+        if (should_include(entry.sequence)) {
           add_entry(entry.sequence, entry.entry_type, entry.key, entry.value);
         }
-        break;
       }
-      off = next;
-    }
-
-    // Discard incomplete batch at EOF if any
-    if (in_batch) {
-      pending_batch.clear();
     }
   }
 
@@ -2378,9 +2216,6 @@ private:
   // Storage for key and value data to keep BytesView stable
   std::vector<Bytes> key_storage_;
   std::vector<Bytes> value_storage_;
-  // Temporary storage for pending batch entries
-  std::vector<Bytes> pending_key_storage_;
-  std::vector<Bytes> pending_value_storage_;
 };
 
 // ChangeIterator methods
