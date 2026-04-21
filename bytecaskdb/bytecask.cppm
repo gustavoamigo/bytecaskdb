@@ -51,10 +51,6 @@ export struct VacuumOptions {
   // Minimum fragmentation ratio (1 − live_bytes / total_bytes) a sealed file
   // must exceed to be eligible for vacuum. Range [0.0, 1.0].
   double fragmentation_threshold{0.5};
-  // Maximum live bytes a sealed file may contain to be absorbed into the
-  // active file instead of being compacted into a new sealed file.
-  // Files above this threshold are always compacted. Default: 1 MiB.
-  std::uint64_t absorb_threshold{1ULL * 1024 * 1024};
 };
 
 
@@ -667,7 +663,6 @@ private:
   void vacuum_compact_file(std::uint32_t file_id);
   // Appends live entries from a sealed file into the active file, then removes the sealed file.
   void vacuum_remove_file(std::uint32_t file_id);
-  void vacuum_absorb_file(std::uint32_t file_id);
 
   // State access helpers — raw state_ / state_time_ access is confined here.
   // Read path: thread-local cached snapshot, may be slightly stale.

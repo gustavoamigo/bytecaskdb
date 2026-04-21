@@ -340,8 +340,7 @@ public:
 
   // Returns true if any writev failure has been detected on this file.
   // A tainted file has bytes on disk that offset_ does not account for —
-  // subsequent writes would land at incorrect offsets. Used by vacuum_absorb
-  // to detect whether truncation is needed after a failed copy.
+  // subsequent writes would land at incorrect offsets.
   [[nodiscard]] auto is_tainted() const noexcept -> bool { return tainted_; }
 
   // Truncates the file to new_size bytes and resets offset_ accordingly.
