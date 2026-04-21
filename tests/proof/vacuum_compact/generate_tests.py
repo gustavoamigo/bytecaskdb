@@ -61,8 +61,8 @@ def gen_vacuum_call(
     fault_name: str | None, failure: VacuumCompactFailureClass
 ) -> str:
     """Generate the vacuum() call, wrapped in fault injector if needed."""
-    # absorb_threshold=0 forces the compact path (live_bytes > 0 always fails absorb).
-    opts = "{.fragmentation_threshold = 0.0, .absorb_threshold = 0}"
+    # fragmentation_threshold=0.0 ensures any sealed file qualifies for vacuum.
+    opts = "{.fragmentation_threshold = 0.0}"
 
     vc4_comment = (
         "\n    // VC4: rename succeeded — synced .data.tmp exists on disk but\n"

@@ -30,10 +30,10 @@ class VacuumCompactFailureClass(Enum):
     VC4 = "rename_fails"      # io_vacuum_compact_rename (synced tmp on disk)
 
 
-# Same state shapes as absorb but VacuumOptions::absorb_threshold=0 forces compact.
+# Compact path is now always used for files with live_bytes > 0.
 # For mostly_dead, max_file_bytes=150 packs all 6 keys into file_0 before
 # rotation (6×25B=150B; del k1 at 150B triggers rotation), ensuring exactly
-# one sealed file with live_bytes>0 so absorb_threshold=0 forces compact.
+# one sealed file with live_bytes>0.
 COMPACT_STATE_SHAPES = [
     CompactStateShape(
         "low_fragmentation",

@@ -2250,70 +2250,6 @@ TEST_CASE("vacuum no-op when nothing exceeds threshold", "[vacuum]") {
 // ---------------------------------------------------------------------------
 // vacuum_absorb_file: basic absorption into active file
 // ---------------------------------------------------------------------------
-TEST_CASE("vacuum absorb moves entries to active file", "[vacuum]") {
-  TempDir td;
-  // Use a large threshold so absorb path is chosen (live data fits in active).
-  {
-    auto db = bytecask::DB::open(td.path / "db");
-    db.put({}, to_bytes("k1"), to_bytes("v1"));
-    db.put({}, to_bytes("k2"), to_bytes("v2"));
-    // Overwrite k1 to create fragmentation.
-    db.put({}, to_bytes("k1"), to_bytes("v1_new"));
-    // db destroyed here — background worker drains, hints written
-  }
-  {
-    auto db2 = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
-    // Writes to force rotation of existing files.
-    db2.put({}, to_bytes("k3"), to_bytes("v3"));
-    // Now we have: sealed files from original writes + sealed file with k3 + active.
-    // Overwrite k2 so one of the old sealed files has dead entries.
-    db2.put({}, to_bytes("k2"), to_bytes("v2_new"));
-    // db2 destroyed here — background worker drains, hints written
-  }
-
-  // Reopen with large threshold so absorb path is used.
-  auto db3 = bytecask::DB::open(td.path / "db");
-  const auto stats_before = db3.file_stats().size();
-
-  (void)db3.vacuum({.fragmentation_threshold = 0.0});
-
-  // One sealed file should have been absorbed → fewer files in registry.
-  const auto stats_after = db3.file_stats().size();
-  CHECK(stats_after < stats_before);
-
-  // All keys still readable.
-  CHECK(to_string(*get_val(db3, to_bytes("k1"))) == "v1_new");
-  CHECK(to_string(*get_val(db3, to_bytes("k2"))) == "v2_new");
-  CHECK(to_string(*get_val(db3, to_bytes("k3"))) == "v3");
-}
-
-// ---------------------------------------------------------------------------
-// vacuum_absorb_file: sequence preservation across reopen
-// ---------------------------------------------------------------------------
-TEST_CASE("vacuum absorb preserves sequences across recovery", "[vacuum]") {
-  TempDir td;
-  {
-    auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
-    db.put({}, to_bytes("a"), to_bytes("alpha"));
-    db.put({}, to_bytes("b"), to_bytes("beta"));
-    // Overwrite a to create fragmentation.
-    db.put({}, to_bytes("a"), to_bytes("alpha2"));
-    // db destroyed here — background worker drains, hints written
-  }
-
-  // Reopen with large threshold so absorb is used.
-  {
-    auto db2 = bytecask::DB::open(td.path / "db");
-    (void)db2.vacuum({.fragmentation_threshold = 0.0});
-    // db2 destroyed here — background worker drains, hints written
-  }
-
-  // Reopen again — recovery should see absorbed entries correctly.
-  auto db3 = bytecask::DB::open(td.path / "db");
-  CHECK(to_string(*get_val(db3, to_bytes("a"))) == "alpha2");
-  CHECK(to_string(*get_val(db3, to_bytes("b"))) == "beta");
-}
-
 // ---------------------------------------------------------------------------
 // vacuum: compact path chosen for large file
 // ---------------------------------------------------------------------------
@@ -2325,10 +2261,8 @@ TEST_CASE("vacuum chooses compact for large file", "[vacuum]") {
     db.put({}, to_bytes("a"), to_bytes("1"));
     db.put({}, to_bytes("a"), to_bytes("2")); // kills first entry.
 
-    // Sealed file with "a"="1" has 100% dead entries.
-    // Active file is tiny (threshold=1 → always rotates).
-    // With threshold=1, absorb path's precondition (live + active <= threshold)
-    // will fail for any file with live data, so compact is always chosen.
+    // Sealed file with "a"="1" has 100% dead entries → vacuum_remove_file.
+    // Any sealed file with live entries → vacuum_compact_file (sealed→sealed).
     // vacuum() drains pending hint writes internally before selecting target.
     REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
@@ -2336,7 +2270,7 @@ TEST_CASE("vacuum chooses compact for large file", "[vacuum]") {
     // db destroyed here — background worker drains, hints written
   }
 
-  // Verify recovery after compact.
+  // Verify recovery after vacuum.
   auto db2 = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
   CHECK(to_string(*get_val(db2, to_bytes("a"))) == "2");
 }

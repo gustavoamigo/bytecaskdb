@@ -184,11 +184,6 @@ struct VacuumOptions {
     // Minimum fragmentation ratio (1 − live_bytes / total_bytes) a sealed
     // file must exceed to be eligible. Range [0.0, 1.0]. Default 0.5.
     double fragmentation_threshold{0.5};
-
-    // Maximum live bytes a sealed file may contain to be absorbed into the
-    // active file rather than compacted into a new sealed file.
-    // Files above this threshold are always compacted. Default: 1 MiB.
-    std::uint64_t absorb_threshold{1ULL * 1024 * 1024};
 };
 ```
 
@@ -349,8 +344,8 @@ public:
     // ── Vacuum ────────────────────────────────────────────────────────────
 
     // Selects the highest-fragmentation sealed file above the threshold and
-    // either absorbs it into the active file (if it is small enough) or
-    // compacts it into a new sealed file.
+    // either removes it (if it has no live entries) or compacts it into a 
+    // new sealed file.
     // Returns true if a file was vacuumed, false if no file qualified.
     // Thread-safe: safe to call from a dedicated background thread without
     // any external synchronisation; only the brief commit step blocks writers.
