@@ -104,9 +104,14 @@ end
 -- Defaults to "native" for local development.
 local march = os.getenv("BYTECASK_MARCH") or "native"
 local function add_release_opts(t)
-    if is_mode("release") or is_mode("releasedbg") then
+    if is_mode("release") then
         t:set("policy", "build.optimization.lto", true)
         t:add("cxflags", "-march=" .. march, {force = true})
+    end
+    if is_mode("releasedbg") then
+        -- No LTO in releasedbg so perf/gdb can resolve symbols.
+        t:add("cxflags", "-march=" .. march, {force = true})
+        t:add("cxflags", "-fno-omit-frame-pointer", {force = true})
     end
 end
 

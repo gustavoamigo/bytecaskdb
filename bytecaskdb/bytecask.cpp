@@ -1585,7 +1585,17 @@ void DB::validate_state_consistency(const EngineState &s) const {
         s.active_file_id)};
   }
 
-  // 2. file_stats covers all files + no dangling file refs + live_bytes.
+  // 4. file_stats covers all files.
+  for (const auto [file_id, _] : s.files) {
+    if (!s.file_stats.contains(file_id)) {
+      throw std::runtime_error{std::format(
+          "state consistency: file_id {} missing from file_stats", file_id)};
+    }
+  }
+
+  // O(n) key_dir walk: verify dangling file refs, live_bytes, and next_seq.
+  // Expensive — only enabled in test builds.
+#ifdef BYTECASK_TESTING
   std::map<std::uint32_t, std::uint64_t> computed_live;
   std::uint64_t max_seq = 0;
   for (auto it = s.key_dir.begin(); it != std::default_sentinel; ++it) {
@@ -1600,22 +1610,12 @@ void DB::validate_state_consistency(const EngineState &s) const {
     if (entry.sequence > max_seq) max_seq = entry.sequence;
   }
 
-  // 3. next_seq ahead of all sequences.
   if (max_seq > 0 && s.next_seq <= max_seq) {
     throw std::runtime_error{std::format(
         "state consistency: next_seq {} <= max key_dir sequence {}",
         s.next_seq, max_seq)};
   }
 
-  // 4. file_stats covers all files.
-  for (const auto [file_id, _] : s.files) {
-    if (!s.file_stats.contains(file_id)) {
-      throw std::runtime_error{std::format(
-          "state consistency: file_id {} missing from file_stats", file_id)};
-    }
-  }
-
-  // 5. live_bytes matches key_dir.
   for (const auto [file_id, fs] : s.file_stats) {
     auto it = computed_live.find(file_id);
     auto expected_live = (it != computed_live.end()) ? it->second : 0ULL;
@@ -1625,6 +1625,7 @@ void DB::validate_state_consistency(const EngineState &s) const {
           file_id, fs.live_bytes, expected_live)};
     }
   }
+#endif
 
   // 6. min_sequence / max_sequence coherence.
   for (const auto [file_id, fs] : s.file_stats) {
@@ -1696,10 +1697,13 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
   auto t = PersistentRadixTree<KeyDirEntry>{}.transient();
   std::map<Key, std::uint64_t> tombstones;
   std::vector<RangeTombstone> range_tombstones;
-  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
 
+  // Use a plain hash map for file_stats accumulation — in-place mutation is
+  // O(1) per entry vs. the copy-out/write-back overhead of TransientU32Map::update().
+  // Converted to PersistentU32Map once at the end.
+  std::unordered_map<std::uint32_t, FileStats> fstats_scratch;
   for (const auto &rf : files) {
-    fstats_t.set(rf.file_id, FileStats{0, rf.total_bytes});
+    fstats_scratch.emplace(rf.file_id, FileStats{0, rf.total_bytes});
   }
 
   // live_bytes are NOT tracked per-entry here — Phase 4 in
@@ -1764,11 +1768,11 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
           }
         }
         if (he->sequence > max_seq) max_seq = he->sequence;
-        fstats_t.update(file_id, [seq = he->sequence](FileStats &fs) {
-          if (fs.min_sequence == 0 || seq < fs.min_sequence)
-            fs.min_sequence = seq;
-          if (seq > fs.max_sequence) fs.max_sequence = seq;
-        });
+        auto &file_fs = fstats_scratch[file_id];
+        if (file_fs.min_sequence == 0 || he->sequence < file_fs.min_sequence)
+          file_fs.min_sequence = he->sequence;
+        if (he->sequence > file_fs.max_sequence)
+          file_fs.max_sequence = he->sequence;
       }
     } catch (const std::exception &e) {
       if (strict) throw;
@@ -1777,6 +1781,9 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
                    hint_path.string().c_str(), e.what());
     }
   }
+
+  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
+  for (const auto &[id, fs] : fstats_scratch) fstats_t.set(id, fs);
 
   return {std::move(t).persistent(), std::move(tombstones),
           std::move(range_tombstones), max_seq,
