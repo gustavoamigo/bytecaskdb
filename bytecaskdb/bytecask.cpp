@@ -1308,8 +1308,12 @@ auto DB::vacuum_scan_and_copy(
       }
       break;
     }
-
     off = next;
+  }
+
+  // Discard incomplete batch at EOF if any
+  if (in_batch) {
+    pending.clear();
   }
 
   return result;
@@ -2175,5 +2179,215 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
 }
 
 #pragma endregion
+
+// ---------------------------------------------------------------------------
+// ChangeIterator implementation
+// ---------------------------------------------------------------------------
+
+// ChangeIterator implementation class
+class ChangeIterator::Impl {
+public:
+  Impl(std::shared_ptr<const EngineState> state,
+       std::uint64_t from_sequence,
+       std::uint64_t durable_sequence)
+    : state_(std::move(state)), from_sequence_(from_sequence),
+      durable_sequence_(durable_sequence), current_entry_idx_(0) {
+
+    // Sort files by min_sequence and filter relevant files
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> file_ranges;
+    for (const auto [file_id, stats] : state_->file_stats) {
+      if (stats.max_sequence > from_sequence && stats.min_sequence <= durable_sequence) {
+        file_ranges.emplace_back(stats.min_sequence, file_id);
+      }
+    }
+
+    // Sort by min_sequence (ascending order)
+    std::sort(file_ranges.begin(), file_ranges.end());
+
+    // Process files in sequence order
+    for (const auto& [min_seq, file_id] : file_ranges) {
+      auto file_ptr = state_->files.get(file_id);
+      if (file_ptr) {
+        scan_file(**file_ptr);
+      }
+    }
+
+    // Sort all collected entries by sequence to handle any gaps properly
+    std::sort(entries_.begin(), entries_.end(),
+              [](const RawEntry& a, const RawEntry& b) {
+                return a.sequence < b.sequence;
+              });
+  }
+
+  auto has_more() const -> bool {
+    return current_entry_idx_ < entries_.size();
+  }
+
+  auto current() const -> const RawEntry& {
+    return entries_[current_entry_idx_];
+  }
+
+  void advance() {
+    if (current_entry_idx_ < entries_.size()) {
+      ++current_entry_idx_;
+    }
+  }
+
+private:
+  void scan_file(const DataFile& file) {
+    // Simple batch-aware scanning without template abstraction
+    bool in_batch = false;
+    std::uint64_t batch_begin_seq = 0;
+    std::vector<RawEntry> pending_batch;
+
+    auto should_include = [&](std::uint64_t seq) -> bool {
+      return seq > from_sequence_ && seq <= durable_sequence_;
+    };
+
+    auto add_entry = [&](std::uint64_t sequence, EntryType entry_type,
+                         std::span<const std::byte> key, std::span<const std::byte> value) {
+      // Store owned copies of key and value data
+      key_storage_.emplace_back(key.begin(), key.end());
+      value_storage_.emplace_back(value.begin(), value.end());
+
+      // Create stable views pointing to our storage
+      entries_.push_back({
+        .sequence = sequence,
+        .entry_type = entry_type,
+        .key = BytesView{key_storage_.back().data(), key_storage_.back().size()},
+        .value = BytesView{value_storage_.back().data(), value_storage_.back().size()}
+      });
+    };
+
+    Offset off = 0;
+    while (auto scan_result = file.scan(off)) {
+      const auto& [entry, next] = *scan_result;
+
+      switch (entry.entry_type) {
+      case EntryType::BulkBegin:
+        in_batch = true;
+        pending_batch.clear();
+        batch_begin_seq = entry.sequence;
+        break;
+
+      case EntryType::BulkEnd:
+        if (in_batch) {
+          // Check if any entry in the batch should be included
+          bool has_valid = false;
+          for (const auto& pe : pending_batch) {
+            if (should_include(pe.sequence)) {
+              has_valid = true;
+              break;
+            }
+          }
+
+          if (has_valid) {
+            // Add BulkBegin marker if it should be included
+            if (should_include(batch_begin_seq)) {
+              add_entry(batch_begin_seq, EntryType::BulkBegin, {}, {});
+            }
+
+            // Add all valid entries from the batch
+            for (const auto& pe : pending_batch) {
+              if (should_include(pe.sequence)) {
+                add_entry(pe.sequence, pe.entry_type, pe.key, pe.value);
+              }
+            }
+
+            // Add BulkEnd marker if it should be included
+            if (should_include(entry.sequence)) {
+              add_entry(entry.sequence, EntryType::BulkEnd, {}, {});
+            }
+          }
+
+          pending_batch.clear();
+          in_batch = false;
+        }
+        break;
+
+      case EntryType::Put:
+      case EntryType::Delete:
+      case EntryType::RangeDel:
+        if (in_batch) {
+          // Buffer in pending batch - store copies to avoid lifetime issues
+          std::vector<std::byte> key_copy(entry.key.begin(), entry.key.end());
+          std::vector<std::byte> value_copy(entry.value.begin(), entry.value.end());
+          pending_batch.push_back({
+            .sequence = entry.sequence,
+            .entry_type = entry.entry_type,
+            .key = BytesView{key_copy.data(), key_copy.size()},
+            .value = BytesView{value_copy.data(), value_copy.size()}
+          });
+          // Keep the copies alive
+          pending_key_storage_.emplace_back(std::move(key_copy));
+          pending_value_storage_.emplace_back(std::move(value_copy));
+        } else if (should_include(entry.sequence)) {
+          add_entry(entry.sequence, entry.entry_type, entry.key, entry.value);
+        }
+        break;
+      }
+      off = next;
+    }
+
+    // Discard incomplete batch at EOF if any
+    if (in_batch) {
+      pending_batch.clear();
+    }
+  }
+
+  std::shared_ptr<const EngineState> state_;
+  std::uint64_t from_sequence_;
+  std::uint64_t durable_sequence_;
+  std::vector<RawEntry> entries_;
+  std::size_t current_entry_idx_;
+  // Storage for key and value data to keep BytesView stable
+  std::vector<Bytes> key_storage_;
+  std::vector<Bytes> value_storage_;
+  // Temporary storage for pending batch entries
+  std::vector<Bytes> pending_key_storage_;
+  std::vector<Bytes> pending_value_storage_;
+};
+
+// ChangeIterator methods
+ChangeIterator::ChangeIterator(std::shared_ptr<const EngineState> state,
+                               std::uint64_t from_sequence,
+                               std::uint64_t durable_sequence)
+  : impl_(std::make_unique<Impl>(std::move(state), from_sequence, durable_sequence)) {}
+
+ChangeIterator::~ChangeIterator() = default;
+
+ChangeIterator::ChangeIterator(ChangeIterator&&) noexcept = default;
+ChangeIterator& ChangeIterator::operator=(ChangeIterator&&) noexcept = default;
+
+auto ChangeIterator::operator++() -> ChangeIterator& {
+  if (impl_) {
+    impl_->advance();
+  }
+  return *this;
+}
+
+void ChangeIterator::operator++(int) {
+  ++(*this);
+}
+
+auto ChangeIterator::operator*() const -> const value_type& {
+  return impl_->current();
+}
+
+auto ChangeIterator::operator==(std::default_sentinel_t) const noexcept -> bool {
+  return !impl_ || !impl_->has_more();
+}
+
+// DB::changes_since implementation
+auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
+    -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t> {
+
+  auto state = snap.state();
+  auto durable_seq = load_state_for_read(ReadOptions{})->durable_seq;
+  auto upper_bound = std::min(state->next_seq - 1, durable_seq);
+
+  auto begin = ChangeIterator{state, from_sequence, upper_bound};
+  return {std::move(begin), std::default_sentinel};
+}
 
 } // namespace bytecask
