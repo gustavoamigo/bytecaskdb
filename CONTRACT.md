@@ -542,3 +542,20 @@ Controls which write paths are available.
 | **Leader mode** | Normal writes allowed; `ingest` throws `std::logic_error`. |
 | **Follower mode** | Normal writes (`put`, `del`, `del_range`, `apply_batch`) throw `DbFollowerMode`; `ingest` allowed. Reads, snapshots, vacuum, and `resume()` work in both modes. |
 | **Initial mode** | Set from `Options::initial_mode` (default `Mode::Leader`) after recovery completes. |
+
+---
+
+## `changes_since`
+
+Returns a lazy iterator over committed, durable entries in ascending
+sequence order. Validated implicitly through the E2E ingest pipeline
+tests, not through standalone `changes_since` proof tests.
+
+| Property | Contract |
+|----------|----------|
+| **Durable boundary** | Only entries confirmed by `fdatasync` are yielded. The upper bound is `min(snap.sequence(), durable_sequence)`. Entries from NoSync writes not yet covered by a subsequent `fdatasync` are excluded, even if visible via snapshots. |
+| **Completeness** | Every committed durable entry with `sequence > from_sequence` at snapshot time is yielded exactly once. |
+| **Ordering** | Entries are yielded in strictly ascending sequence order. |
+| **Batch integrity** | Incomplete batches (orphaned `BulkBegin` without `BulkEnd`) are excluded. `BulkBegin`/`BulkEnd` markers are preserved in the output. |
+| **Vacuum transparency** | After `vacuum_compact_file`, entries retain original sequences and batch markers. `changes_since` over a vacuumed file yields the same logical content as the pre-vacuum file. |
+| **Snapshot safety** | The iterator holds a `Snapshot` reference, keeping file descriptors open. Safe to run concurrently with vacuum (reads via fd, not path). |
