@@ -22,5 +22,5 @@
     }
   },
   "remoteUser": "gustavoamigo",
-  "postCreateCommand": "python3 -c \"import nanobind; print(nanobind.include_dir())\" && RESOURCE_DIR=$(clang --print-resource-dir) && xmake f --toolchain=clang --cxflags=\"-resource-dir=${RESOURCE_DIR}\" -y"
+  "postCreateCommand": "mkdir -p .claude && cp -n .claude.defaults/settings.json .claude/settings.json && python3 -c \"import nanobind; print(nanobind.include_dir())\" && RESOURCE_DIR=$(clang --print-resource-dir) && xmake f --toolchain=clang --cxflags=\"-resource-dir=${RESOURCE_DIR}\" -y"
 }

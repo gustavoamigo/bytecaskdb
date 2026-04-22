@@ -57,9 +57,19 @@ DbDegraded::~DbDegraded() = default;
 
 namespace {
 
-  // Generates a data file stem using a microsecond-precision UTC timestamp.
-// Format: "data_{YYYYMMDDHHmmssUUUUUU}"
+// Generates a unique data file stem using a UTC timestamp + monotonic counter.
+// Format: "data_{YYYYMMDDHHmmssUUUUUU}_{NNNN}"
+// The counter guarantees uniqueness even when the system clock has low
+// resolution (e.g. WASM/Emscripten where system_clock is millisecond-precise,
+// leaving the last 3 microsecond digits as 000).
 auto make_data_file_stem() -> std::string {
+#ifdef BYTECASK_SINGLE_THREADED
+  static unsigned file_counter = 0;
+#else
+  static std::atomic<unsigned> file_counter{0};
+#endif
+  const auto seq = file_counter++;
+
   const auto now = std::chrono::system_clock::now();
   const auto us_total = std::chrono::duration_cast<std::chrono::microseconds>(
                             now.time_since_epoch())
@@ -70,9 +80,10 @@ auto make_data_file_stem() -> std::string {
   std::tm tm_buf{};
   ::gmtime_r(&tt, &tm_buf);
 
-  return std::format("data_{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}{:06d}",
+  return std::format("data_{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}{:06d}_{:04d}",
                      tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
-                     tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, subsec_us);
+                     tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, subsec_us,
+                     seq);
 }
 
 // Nanoseconds since steady_clock epoch. Timestamps state publications;

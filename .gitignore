@@ -42,6 +42,9 @@ tests/fuzz/corpus/
 
 .notes
 
+# Claude Code local state
+.claude/
+
 # Local tools (e.g. nektos/act)
 bin/
 

@@ -397,6 +397,7 @@ If you want to take it in a different direction and fork it into your own thing,
 | [`docs/failure_mode_comparison.md`](docs/failure_mode_comparison.md) | Write-path failure mode comparison: ByteCaskDB vs RocksDB, LevelDB, SQLite WAL, LMDB, WiredTiger |
 | [`docs/replication_primitives_design.md`](docs/replication_primitives_design.md) | Replication primitives: minimal API surface for building leader-follower replication on top of ByteCaskDB |
 | [`docs/xa_support_design.md`](docs/xa_support_design.md) | XA / two-phase commit: generic 2PC primitives (`BulkPrepare`, `Bulk2PCCommit`, `Bulk2PCRollback`) for external coordinators |
+| [`bytecaskdb-node/`](bytecaskdb-node/) | Node.js package: WASM backend (Embind), TypeScript API, and future native N-API binding |
 | [`CONTRACT.md`](CONTRACT.md) | Per-function behavioral contracts: atomicity, durability, I/O failure safety, LSN invariants |
 
 ## License

@@ -1,4 +1,31 @@
-# Emscripten / WebAssembly Build
+# ByteCaskDB for Node.js
+
+ByteCaskDB embedded key-value store for Node.js. Currently ships a WASM backend (Emscripten + Embind); a native N-API backend is planned.
+
+## Install (from source)
+
+```bash
+cd bytecaskdb-node
+npm install
+npm run build
+```
+
+## Usage
+
+```js
+import createByteCask from 'bytecaskdb';
+
+const bc = await createByteCask();
+const db = bc.open('/tmp/mydb');
+
+db.put('hello', 'world');
+const val = db.get('hello');   // Uint8Array | null
+db.close();
+```
+
+See [`wasm/API.md`](wasm/API.md) for the full JavaScript API specification.
+
+## WASM Backend
 
 Cross-compiles ByteCaskDB to WebAssembly and runs under Node.js using NODEFS for real file I/O. Single-threaded only (no pthreads).
 
@@ -10,7 +37,7 @@ Cross-compiles ByteCaskDB to WebAssembly and runs under Node.js using NODEFS for
 ## Build
 
 ```bash
-cd emscripten && bash build.sh
+cd bytecaskdb-node/wasm && bash build.sh
 ```
 
 The build script:
@@ -24,7 +51,7 @@ The build script:
 
 ## JavaScript API
 
-The Embind module exposes ByteCaskDB as a JS-callable API. See [`API.md`](API.md) for the full specification.
+The Embind module exposes ByteCaskDB as a JS-callable API. See [`wasm/API.md`](wasm/API.md) for the full specification.
 
 ```js
 import createByteCask from './build/bytecask.mjs';
@@ -108,19 +135,19 @@ snap.close();
 
 ```bash
 # Default 50k keys
-node build/engine_bench_nodefs.js
+node wasm/build/engine_bench_nodefs.js
 
 # Custom dataset size
-BC_DATASET_SIZE=100000 node build/engine_bench_nodefs.js
+BC_DATASET_SIZE=100000 node wasm/build/engine_bench_nodefs.js
 
 # Filter to a single benchmark
-node build/engine_bench_nodefs.js --benchmark_filter="ByteCaskDB/Get"
+node wasm/build/engine_bench_nodefs.js --benchmark_filter="ByteCaskDB/Get"
 ```
 
 ## Smoke test
 
 ```bash
-node build/bytecask_node.js
+node wasm/build/bytecask_node.js
 ```
 
 ## What's different from the native build
@@ -137,15 +164,18 @@ node build/bytecask_node.js
 
 | File | Description |
 |------|-------------|
-| `build.sh` | Build script — compiles dependencies, modules, and links all targets |
-| `bytecask_embind.cpp` | Embind binding layer — exposes DB, Snapshot, WritePlan, iterators to JS |
-| `test_node.cpp` | Minimal C++ smoke test: write, read, recovery |
-| `pre.js` | Emscripten pre-run hook: env propagation, Symbol.dispose, Symbol.iterator wiring |
-| `run.sh` | Helper to run built binaries with env propagation |
-| `API.md` | Full JavaScript API specification |
+| `wasm/build.sh` | Build script — compiles dependencies, modules, and links all targets |
+| `wasm/bytecask_embind.cpp` | Embind binding layer — exposes DB, Snapshot, WritePlan, iterators to JS |
+| `wasm/test_node.cpp` | Minimal C++ smoke test: write, read, recovery |
+| `wasm/pre.js` | Emscripten pre-run hook: env propagation, Symbol.dispose, Symbol.iterator wiring |
+| `wasm/run.sh` | Helper to run built binaries with env propagation |
+| `wasm/API.md` | Full JavaScript API specification |
+| `src/types.ts` | Shared TypeScript interfaces (ByteCaskDB, Snapshot, WritePlan, iterators) |
+| `src/wasm-backend.ts` | WASM backend factory |
+| `src/index.ts` | Package entry point |
 
 ## Clean rebuild
 
 ```bash
-rm -rf build && bash build.sh
+rm -rf wasm/build && cd wasm && bash build.sh
 ```

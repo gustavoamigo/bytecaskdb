@@ -1,0 +1,23 @@
+{
+  "name": "bytecaskdb",
+  "version": "0.1.0",
+  "description": "ByteCaskDB embedded key-value store for Node.js",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build:wasm": "cd wasm && bash build.sh",
+    "build:ts": "tsc",
+    "build": "npm run build:wasm && npm run build:ts",
+    "test:smoke": "node wasm/build/bytecask_node.js"
+  },
+  "files": [
+    "dist/",
+    "wasm/build/bytecask.mjs",
+    "wasm/build/bytecask.wasm"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.4"
+  }
+}
