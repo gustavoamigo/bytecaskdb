@@ -5159,7 +5159,7 @@ TEST_CASE("changes_since empty iterator when no new entries", "[replication]") {
   // changes_since should be empty (no entries after from_seq)
   auto changes = db.changes_since(snap, from_seq);
 
-  std::vector<bytecask::RawEntry> entries;
+  std::vector<bytecask::DataEntryView> entries;
   for (const auto& entry : changes) {
     entries.push_back({
       .sequence = entry.sequence,
@@ -5170,6 +5170,540 @@ TEST_CASE("changes_since empty iterator when no new entries", "[replication]") {
   }
 
   REQUIRE(entries.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Ingest + Mode::Follower tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("mode enforcement: put/del/apply_batch throw in follower mode",
+          "[replication]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  CHECK(db.mode() == bytecask::Mode::Leader);
+
+  db.set_mode(bytecask::Mode::Follower);
+  CHECK(db.mode() == bytecask::Mode::Follower);
+
+  CHECK_THROWS_AS(db.put({}, to_bytes("k"), to_bytes("v")),
+                  bytecask::DbFollowerMode);
+  CHECK_THROWS_AS((void)db.del({}, to_bytes("k")),
+                  bytecask::DbFollowerMode);
+  CHECK_THROWS_AS(db.del_range({}, to_bytes("a"), to_bytes("z")),
+                  bytecask::DbFollowerMode);
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("k"), to_bytes("v"));
+  CHECK_THROWS_AS((void)db.apply_batch({}, std::move(plan)),
+                  bytecask::DbFollowerMode);
+
+  // Reads still work.
+  bytecask::Bytes out;
+  CHECK_FALSE(db.get({}, to_bytes("k"), out));
+  CHECK_FALSE(db.contains_key(to_bytes("k")));
+}
+
+TEST_CASE("ingest throws in leader mode", "[replication]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  std::vector<bytecask::DataEntryView> entries;
+  CHECK_THROWS_AS(db.ingest(entries), std::logic_error);
+}
+
+TEST_CASE("set_mode transitions: leader -> follower -> leader", "[replication]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  CHECK(db.mode() == bytecask::Mode::Leader);
+  db.set_mode(bytecask::Mode::Follower);
+  CHECK(db.mode() == bytecask::Mode::Follower);
+  db.set_mode(bytecask::Mode::Leader);
+  CHECK(db.mode() == bytecask::Mode::Leader);
+
+  // After returning to leader, writes should work again.
+  db.put({}, to_bytes("k"), to_bytes("v"));
+  bytecask::Bytes out;
+  REQUIRE(db.get({}, to_bytes("k"), out));
+}
+
+TEST_CASE("basic ingest: entries from changes_since are ingested correctly",
+          "[replication]") {
+  TempDir td;
+
+  // Leader writes.
+  auto leader = bytecask::DB::open(td.path / "leader");
+  leader.put({}, to_bytes("user:1"), to_bytes("alice"));
+  leader.put({}, to_bytes("user:2"), to_bytes("bob"));
+  leader.put({}, to_bytes("user:3"), to_bytes("carol"));
+
+  auto snap = leader.snapshot();
+  auto changes = leader.changes_since(snap, 0);
+
+  // Collect entries (must own data since iterator views are transient).
+  struct OwnedEntry {
+    std::uint64_t sequence;
+    bytecask::EntryType entry_type;
+    bytecask::Bytes key;
+    bytecask::Bytes value;
+  };
+  std::vector<OwnedEntry> owned;
+  for (const auto &e : changes) {
+    owned.push_back({e.sequence, e.entry_type,
+                     bytecask::Bytes{e.key.begin(), e.key.end()},
+                     bytecask::Bytes{e.value.begin(), e.value.end()}});
+  }
+
+  // Build DataEntryView span from owned data.
+  std::vector<bytecask::DataEntryView> views;
+  views.reserve(owned.size());
+  for (const auto &o : owned) {
+    views.push_back({o.sequence, o.entry_type, o.key, o.value});
+  }
+
+  // Follower ingests.
+  auto follower = bytecask::DB::open(td.path / "follower",
+                                     {.initial_mode = bytecask::Mode::Follower});
+  follower.ingest(views);
+
+  // Verify all keys match.
+  bytecask::Bytes out;
+  REQUIRE(follower.get({}, to_bytes("user:1"), out));
+  CHECK(to_string(out) == "alice");
+  REQUIRE(follower.get({}, to_bytes("user:2"), out));
+  CHECK(to_string(out) == "bob");
+  REQUIRE(follower.get({}, to_bytes("user:3"), out));
+  CHECK(to_string(out) == "carol");
+}
+
+TEST_CASE("ingest idempotency: re-ingesting is a no-op", "[replication]") {
+  TempDir td;
+
+  auto leader = bytecask::DB::open(td.path / "leader");
+  leader.put({}, to_bytes("k1"), to_bytes("v1"));
+  leader.put({}, to_bytes("k2"), to_bytes("v2"));
+
+  auto snap = leader.snapshot();
+  auto changes = leader.changes_since(snap, 0);
+
+  struct OwnedEntry {
+    std::uint64_t sequence;
+    bytecask::EntryType entry_type;
+    bytecask::Bytes key;
+    bytecask::Bytes value;
+  };
+  std::vector<OwnedEntry> owned;
+  for (const auto &e : changes) {
+    owned.push_back({e.sequence, e.entry_type,
+                     bytecask::Bytes{e.key.begin(), e.key.end()},
+                     bytecask::Bytes{e.value.begin(), e.value.end()}});
+  }
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &o : owned) {
+    views.push_back({o.sequence, o.entry_type, o.key, o.value});
+  }
+
+  auto follower = bytecask::DB::open(td.path / "follower",
+                                     {.initial_mode = bytecask::Mode::Follower});
+  follower.ingest(views);
+  auto seq_after_first = follower.current_sequence();
+
+  // Re-ingest same entries — should be a no-op.
+  follower.ingest(views);
+  CHECK(follower.current_sequence() == seq_after_first);
+}
+
+TEST_CASE("ingest with batches: BulkBegin/BulkEnd preserved", "[replication]") {
+  TempDir td;
+
+  auto leader = bytecask::DB::open(td.path / "leader");
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("batch:1"), to_bytes("val1"));
+  plan.put(to_bytes("batch:2"), to_bytes("val2"));
+  plan.put(to_bytes("batch:3"), to_bytes("val3"));
+  (void)leader.apply_batch({}, std::move(plan));
+
+  auto snap = leader.snapshot();
+  auto changes = leader.changes_since(snap, 0);
+
+  struct OwnedEntry {
+    std::uint64_t sequence;
+    bytecask::EntryType entry_type;
+    bytecask::Bytes key;
+    bytecask::Bytes value;
+  };
+  std::vector<OwnedEntry> owned;
+  for (const auto &e : changes) {
+    owned.push_back({e.sequence, e.entry_type,
+                     bytecask::Bytes{e.key.begin(), e.key.end()},
+                     bytecask::Bytes{e.value.begin(), e.value.end()}});
+  }
+  // Verify BulkBegin and BulkEnd are present.
+  REQUIRE(owned.front().entry_type == bytecask::EntryType::BulkBegin);
+  REQUIRE(owned.back().entry_type == bytecask::EntryType::BulkEnd);
+
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &o : owned) {
+    views.push_back({o.sequence, o.entry_type, o.key, o.value});
+  }
+
+  auto follower = bytecask::DB::open(td.path / "follower",
+                                     {.initial_mode = bytecask::Mode::Follower});
+  follower.ingest(views);
+
+  bytecask::Bytes out;
+  REQUIRE(follower.get({}, to_bytes("batch:1"), out));
+  CHECK(to_string(out) == "val1");
+  REQUIRE(follower.get({}, to_bytes("batch:2"), out));
+  CHECK(to_string(out) == "val2");
+  REQUIRE(follower.get({}, to_bytes("batch:3"), out));
+  CHECK(to_string(out) == "val3");
+}
+
+TEST_CASE("ingest with range delete", "[replication]") {
+  TempDir td;
+
+  auto leader = bytecask::DB::open(td.path / "leader");
+  leader.put({}, to_bytes("a"), to_bytes("1"));
+  leader.put({}, to_bytes("b"), to_bytes("2"));
+  leader.put({}, to_bytes("c"), to_bytes("3"));
+  leader.put({}, to_bytes("d"), to_bytes("4"));
+  leader.del_range({}, to_bytes("b"), to_bytes("d"));
+
+  auto snap = leader.snapshot();
+  auto changes = leader.changes_since(snap, 0);
+
+  struct OwnedEntry {
+    std::uint64_t sequence;
+    bytecask::EntryType entry_type;
+    bytecask::Bytes key;
+    bytecask::Bytes value;
+  };
+  std::vector<OwnedEntry> owned;
+  for (const auto &e : changes) {
+    owned.push_back({e.sequence, e.entry_type,
+                     bytecask::Bytes{e.key.begin(), e.key.end()},
+                     bytecask::Bytes{e.value.begin(), e.value.end()}});
+  }
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &o : owned) {
+    views.push_back({o.sequence, o.entry_type, o.key, o.value});
+  }
+
+  auto follower = bytecask::DB::open(td.path / "follower",
+                                     {.initial_mode = bytecask::Mode::Follower});
+  follower.ingest(views);
+
+  bytecask::Bytes out;
+  CHECK(follower.get({}, to_bytes("a"), out));
+  CHECK_FALSE(follower.get({}, to_bytes("b"), out));
+  CHECK_FALSE(follower.get({}, to_bytes("c"), out));
+  CHECK(follower.get({}, to_bytes("d"), out));
+}
+
+TEST_CASE("ingest sequence continuity: current_sequence matches max ingested",
+          "[replication]") {
+  TempDir td;
+
+  auto leader = bytecask::DB::open(td.path / "leader");
+  leader.put({}, to_bytes("k1"), to_bytes("v1"));
+  leader.put({}, to_bytes("k2"), to_bytes("v2"));
+  auto leader_seq = leader.current_sequence();
+
+  auto snap = leader.snapshot();
+  auto changes = leader.changes_since(snap, 0);
+
+  struct OwnedEntry {
+    std::uint64_t sequence;
+    bytecask::EntryType entry_type;
+    bytecask::Bytes key;
+    bytecask::Bytes value;
+  };
+  std::vector<OwnedEntry> owned;
+  for (const auto &e : changes) {
+    owned.push_back({e.sequence, e.entry_type,
+                     bytecask::Bytes{e.key.begin(), e.key.end()},
+                     bytecask::Bytes{e.value.begin(), e.value.end()}});
+  }
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &o : owned) {
+    views.push_back({o.sequence, o.entry_type, o.key, o.value});
+  }
+
+  auto follower = bytecask::DB::open(td.path / "follower",
+                                     {.initial_mode = bytecask::Mode::Follower});
+  follower.ingest(views);
+
+  CHECK(follower.current_sequence() == leader_seq);
+}
+
+TEST_CASE("ingest recovery equivalence: survives close and reopen",
+          "[replication]") {
+  TempDir td;
+
+  auto leader = bytecask::DB::open(td.path / "leader");
+  leader.put({}, to_bytes("rk1"), to_bytes("rv1"));
+  leader.put({}, to_bytes("rk2"), to_bytes("rv2"));
+
+  auto snap = leader.snapshot();
+  auto changes = leader.changes_since(snap, 0);
+
+  struct OwnedEntry {
+    std::uint64_t sequence;
+    bytecask::EntryType entry_type;
+    bytecask::Bytes key;
+    bytecask::Bytes value;
+  };
+  std::vector<OwnedEntry> owned;
+  for (const auto &e : changes) {
+    owned.push_back({e.sequence, e.entry_type,
+                     bytecask::Bytes{e.key.begin(), e.key.end()},
+                     bytecask::Bytes{e.value.begin(), e.value.end()}});
+  }
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &o : owned) {
+    views.push_back({o.sequence, o.entry_type, o.key, o.value});
+  }
+
+  {
+    auto follower = bytecask::DB::open(td.path / "follower",
+                                       {.initial_mode = bytecask::Mode::Follower});
+    follower.ingest(views);
+  }
+
+  // Reopen and verify state survived recovery.
+  auto follower = bytecask::DB::open(td.path / "follower");
+  bytecask::Bytes out;
+  REQUIRE(follower.get({}, to_bytes("rk1"), out));
+  CHECK(to_string(out) == "rv1");
+  REQUIRE(follower.get({}, to_bytes("rk2"), out));
+  CHECK(to_string(out) == "rv2");
+}
+
+TEST_CASE("promotion continuity: first put after ingest gets next sequence",
+          "[replication]") {
+  TempDir td;
+
+  auto leader = bytecask::DB::open(td.path / "leader");
+  leader.put({}, to_bytes("k1"), to_bytes("v1"));
+
+  auto snap = leader.snapshot();
+  auto changes = leader.changes_since(snap, 0);
+
+  struct OwnedEntry {
+    std::uint64_t sequence;
+    bytecask::EntryType entry_type;
+    bytecask::Bytes key;
+    bytecask::Bytes value;
+  };
+  std::vector<OwnedEntry> owned;
+  for (const auto &e : changes) {
+    owned.push_back({e.sequence, e.entry_type,
+                     bytecask::Bytes{e.key.begin(), e.key.end()},
+                     bytecask::Bytes{e.value.begin(), e.value.end()}});
+  }
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &o : owned) {
+    views.push_back({o.sequence, o.entry_type, o.key, o.value});
+  }
+
+  auto follower = bytecask::DB::open(td.path / "follower",
+                                     {.initial_mode = bytecask::Mode::Follower});
+  follower.ingest(views);
+  auto seq_after_ingest = follower.current_sequence();
+
+  // Promote to leader and write.
+  follower.set_mode(bytecask::Mode::Leader);
+  follower.put({}, to_bytes("k2"), to_bytes("v2"));
+
+  CHECK(follower.current_sequence() == seq_after_ingest + 1);
+}
+
+TEST_CASE("ingest triggers file rotation", "[replication]") {
+  TempDir td;
+
+  // Leader with small rotation threshold to generate multiple files.
+  auto leader = bytecask::DB::open(td.path / "leader", {.max_file_bytes = 256});
+  for (int i = 0; i < 50; ++i) {
+    auto key = std::format("key:{:04d}", i);
+    auto val = std::format("value:{:04d}", i);
+    leader.put({}, to_bytes(key), to_bytes(val));
+  }
+
+  auto snap = leader.snapshot();
+  auto changes = leader.changes_since(snap, 0);
+
+  struct OwnedEntry {
+    std::uint64_t sequence;
+    bytecask::EntryType entry_type;
+    bytecask::Bytes key;
+    bytecask::Bytes value;
+  };
+  std::vector<OwnedEntry> owned;
+  for (const auto &e : changes) {
+    owned.push_back({e.sequence, e.entry_type,
+                     bytecask::Bytes{e.key.begin(), e.key.end()},
+                     bytecask::Bytes{e.value.begin(), e.value.end()}});
+  }
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &o : owned) {
+    views.push_back({o.sequence, o.entry_type, o.key, o.value});
+  }
+
+  // Follower with same small threshold — ingest should trigger rotation.
+  {
+    auto follower = bytecask::DB::open(td.path / "follower",
+                                       {.max_file_bytes = 256,
+                                        .initial_mode = bytecask::Mode::Follower});
+    follower.ingest(views);
+
+    // Verify all data is present.
+    bytecask::Bytes out;
+    for (int i = 0; i < 50; ++i) {
+      auto key = std::format("key:{:04d}", i);
+      auto val = std::format("value:{:04d}", i);
+      REQUIRE(follower.get({}, to_bytes(key), out));
+      CHECK(to_string(out) == val);
+    }
+  }
+
+  // Verify data survives recovery (rotation created valid sealed files).
+  {
+    bytecask::Bytes out;
+    auto reopened = bytecask::DB::open(td.path / "follower");
+    for (int i = 0; i < 50; ++i) {
+      auto key = std::format("key:{:04d}", i);
+      auto val = std::format("value:{:04d}", i);
+      REQUIRE(reopened.get({}, to_bytes(key), out));
+      CHECK(to_string(out) == val);
+    }
+  }
+}
+
+TEST_CASE("batch-safe rotation: batch is not split across files",
+          "[replication]") {
+  TempDir td;
+
+  // Leader writes a batch that should be near the rotation threshold.
+  auto leader = bytecask::DB::open(td.path / "leader", {.max_file_bytes = 256});
+  // First, fill up close to the threshold with individual puts.
+  for (int i = 0; i < 3; ++i) {
+    auto key = std::format("pre:{}", i);
+    leader.put({}, to_bytes(key), to_bytes("padding"));
+  }
+  // Then a batch that must stay together.
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("batch:a"), to_bytes("A"));
+  plan.put(to_bytes("batch:b"), to_bytes("B"));
+  plan.put(to_bytes("batch:c"), to_bytes("C"));
+  (void)leader.apply_batch({}, std::move(plan));
+
+  auto snap = leader.snapshot();
+  auto changes = leader.changes_since(snap, 0);
+
+  struct OwnedEntry {
+    std::uint64_t sequence;
+    bytecask::EntryType entry_type;
+    bytecask::Bytes key;
+    bytecask::Bytes value;
+  };
+  std::vector<OwnedEntry> owned;
+  for (const auto &e : changes) {
+    owned.push_back({e.sequence, e.entry_type,
+                     bytecask::Bytes{e.key.begin(), e.key.end()},
+                     bytecask::Bytes{e.value.begin(), e.value.end()}});
+  }
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &o : owned) {
+    views.push_back({o.sequence, o.entry_type, o.key, o.value});
+  }
+
+  // Follower with small threshold — rotation should not split the batch.
+  {
+    auto follower = bytecask::DB::open(td.path / "follower",
+                                       {.max_file_bytes = 256,
+                                        .initial_mode = bytecask::Mode::Follower});
+    follower.ingest(views);
+
+    bytecask::Bytes out;
+    REQUIRE(follower.get({}, to_bytes("batch:a"), out));
+    CHECK(to_string(out) == "A");
+    REQUIRE(follower.get({}, to_bytes("batch:b"), out));
+    CHECK(to_string(out) == "B");
+    REQUIRE(follower.get({}, to_bytes("batch:c"), out));
+    CHECK(to_string(out) == "C");
+  }
+
+  // Verify recovery works — batch was not split.
+  {
+    bytecask::Bytes out;
+    auto reopened = bytecask::DB::open(td.path / "follower");
+    REQUIRE(reopened.get({}, to_bytes("batch:a"), out));
+    CHECK(to_string(out) == "A");
+    REQUIRE(reopened.get({}, to_bytes("batch:b"), out));
+    CHECK(to_string(out) == "B");
+    REQUIRE(reopened.get({}, to_bytes("batch:c"), out));
+    CHECK(to_string(out) == "C");
+  }
+}
+
+TEST_CASE("leader-to-follower replication round-trip", "[replication]") {
+  TempDir td;
+
+  auto leader = bytecask::DB::open(td.path / "leader");
+
+  // Mixed workload: puts, deletes, batch, range delete.
+  leader.put({}, to_bytes("a"), to_bytes("1"));
+  leader.put({}, to_bytes("b"), to_bytes("2"));
+  leader.put({}, to_bytes("c"), to_bytes("3"));
+  (void)leader.del({}, to_bytes("b"));
+
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("d"), to_bytes("4"));
+  plan.put(to_bytes("e"), to_bytes("5"));
+  (void)leader.apply_batch({}, std::move(plan));
+
+  leader.put({}, to_bytes("f"), to_bytes("6"));
+  leader.put({}, to_bytes("g"), to_bytes("7"));
+  leader.del_range({}, to_bytes("f"), to_bytes("g"));
+
+  auto snap = leader.snapshot();
+  auto changes = leader.changes_since(snap, 0);
+
+  struct OwnedEntry {
+    std::uint64_t sequence;
+    bytecask::EntryType entry_type;
+    bytecask::Bytes key;
+    bytecask::Bytes value;
+  };
+  std::vector<OwnedEntry> owned;
+  for (const auto &e : changes) {
+    owned.push_back({e.sequence, e.entry_type,
+                     bytecask::Bytes{e.key.begin(), e.key.end()},
+                     bytecask::Bytes{e.value.begin(), e.value.end()}});
+  }
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &o : owned) {
+    views.push_back({o.sequence, o.entry_type, o.key, o.value});
+  }
+
+  auto follower = bytecask::DB::open(td.path / "follower",
+                                     {.initial_mode = bytecask::Mode::Follower});
+  follower.ingest(views);
+
+  // Verify key-value equivalence with leader.
+  bytecask::Bytes leader_out, follower_out;
+  for (const auto &key_str : {"a", "b", "c", "d", "e", "f", "g"}) {
+    auto key = to_bytes(key_str);
+    auto leader_found = leader.get({}, key, leader_out);
+    auto follower_found = follower.get({}, key, follower_out);
+    CHECK(leader_found == follower_found);
+    if (leader_found && follower_found) {
+      CHECK(leader_out == follower_out);
+    }
+  }
+
+  CHECK(follower.current_sequence() == leader.current_sequence());
 }
 
 // ---------------------------------------------------------------------------

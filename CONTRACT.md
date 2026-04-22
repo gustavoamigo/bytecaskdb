@@ -515,3 +515,30 @@ published state after `DB::open()` and `resume()`:
 On violation: throws `std::runtime_error`. The DB does not open or
 `resume()` fails. This is intentional — if recovery produces
 inconsistent state, the engine should not run.
+
+## `ingest`
+
+Applies pre-sequenced entries from a leader to a follower's storage.
+
+| Property | Contract |
+|----------|----------|
+| **Mode requirement** | Throws `std::logic_error` if `mode() != Mode::Follower`. |
+| **Degraded check** | Throws `DbDegraded` if the engine is degraded. |
+| **Idempotency** | Entries with `sequence <= durable_seq` are silently skipped. Safe for restart-on-failure semantics. |
+| **Batch-safe rotation** | `BulkBegin`/`BulkEnd` pairs always land in the same data file. File rotation only occurs at boundaries where no batch is open. |
+| **Durability** | Every chunk is `fdatasync`'d before rotation. The final chunk is `fdatasync`'d before `store_state` publishes. |
+| **Sequence advancement** | After ingest, `next_seq = max(next_seq, max(ingested sequences) + 1)`. Monotonically non-decreasing. |
+| **Degraded on I/O failure** | Same pattern as `apply_batch`: on `writev`/`fdatasync` failure, advance sequence to prevent reuse, go degraded, rethrow. |
+| **Atomicity** | If ingest throws, no partial state is published to readers. |
+
+## `set_mode` / `mode`
+
+Controls which write paths are available.
+
+| Property | Contract |
+|----------|----------|
+| **`set_mode(Mode)`** | Acquires `write_mu_` to ensure no in-flight write straddles the transition. Stores mode with release semantics. |
+| **`mode()`** | Lock-free atomic read with acquire semantics. Same pattern as `is_degraded()`. |
+| **Leader mode** | Normal writes allowed; `ingest` throws `std::logic_error`. |
+| **Follower mode** | Normal writes (`put`, `del`, `del_range`, `apply_batch`) throw `DbFollowerMode`; `ingest` allowed. Reads, snapshots, vacuum, and `resume()` work in both modes. |
+| **Initial mode** | Set from `Options::initial_mode` (default `Mode::Leader`) after recovery completes. |

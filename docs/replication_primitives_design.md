@@ -112,7 +112,7 @@ Because entries are sequence-ordered, every prefix of the stream is a valid stat
 **`current_sequence()`** returns the last ingested sequence — identical semantics on both leader and follower. On the leader it reflects the latest write; on the follower it reflects the last `ingest`. External code does not need to know which mode it's talking to. The orchestrator compares `leader.current_sequence()` and `follower.current_sequence()` to measure replication lag.
 
 ```cpp
-void ingest(std::span<const RawEntry> entries);  // applies and publishes
+void ingest(std::span<const DataEntryView> entries);  // applies and publishes
 auto current_sequence() const -> uint64_t;        // last committed sequence
 ```
 

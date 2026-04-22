@@ -202,6 +202,7 @@ struct Options {
     // keys that were successfully recovered. A warning is printed to stderr for
     // each skipped item.
     bool fail_recovery_on_crc_errors{true};
+    Mode initial_mode{Mode::Leader};             // leader allows normal writes; follower allows ingest
 };
 
 struct WriteOptions {
@@ -215,6 +216,8 @@ struct ReadOptions {
     std::chrono::milliseconds staleness_tolerance{0};
     bool verify_checksums{false}; // CRC-verify each value read from disk (default false)
 };
+
+enum class Mode { Leader, Follower };
 
 class DB {
 public:
@@ -280,6 +283,16 @@ public:
     // Vacuum must not run between create_manifest() and file transfer
     // completion (caller responsibility).
     [[nodiscard]] auto create_manifest() -> FileManifest;
+
+    // Returns the current engine mode (Leader or Follower).
+    [[nodiscard]] auto mode() const noexcept -> Mode;
+    // Switches mode under the write mutex. No in-flight write straddles the transition.
+    void set_mode(Mode mode);
+
+    // Applies pre-sequenced entries from a leader. Follower mode only.
+    // Idempotent: entries with sequence <= current_sequence() are skipped.
+    // Throws std::logic_error if not in follower mode, DbDegraded if degraded.
+    void ingest(std::span<const DataEntryView> entries);
 
     // True if the engine has entered a degraded state from a write-path failure.
     // Reads remain available; all write operations throw DbDegraded.
@@ -350,13 +363,25 @@ public:
     [[nodiscard]] auto has_snapshot() const noexcept -> bool;
 };
 
+// Non-owning view of a data entry. Used by changes_since (read path) and
+// ingest (write path). The owning counterpart is DataEntry.
+struct DataEntryView {
+    std::uint64_t sequence;
+    EntryType entry_type;
+    std::span<const std::byte> key;
+    std::span<const std::byte> value;
+};
+
 // Thrown by write operations when the engine is in a degraded state.
 class DbDegraded : public std::runtime_error { /* ... */ };
+
+// Thrown by put/del/del_range/apply_batch when the engine is in follower mode.
+class DbFollowerMode : public std::runtime_error { /* ... */ };
 
 } // namespace bytecask
 ```
 
-Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately). Key-not-found is signalled by `get` returning `false`; `apply_batch` returns `false` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors.
+Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately); normal writes in follower mode throw `DbFollowerMode`. Key-not-found is signalled by `get` returning `false`; `apply_batch` returns `false` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors.
 
 
 ## Architecture

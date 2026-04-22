@@ -80,41 +80,34 @@ def expected_delta(
         return Delta([], [], {}, 0, degraded=False, threw=False)
 
     if failure == FailureClass.B1:
-        # Advance conservatively: the engine cannot determine from userspace
-        # whether bytes reached disk (POSIX does not guarantee writev=-1 means
-        # no bytes written). Gaps are safe; reuse is not.
-        n = plan.write_count
-        return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
+        # Append failed before or after bytes hit disk — engine cannot tell.
+        # next_seq stays at pre-failure value; resume() re-derives from disk.
+        return Delta([], [], {}, 0, degraded=True, threw=True)
 
     if failure == FailureClass.C:
         # Append failed mid-batch (on BulkEnd). Prior entries (BulkBegin, data
-        # entries) may be on disk. Advance conservatively past all consumed sequences.
+        # entries) may be on disk. next_seq stays at pre-failure value;
         # resume() truncates the orphaned batch and sets next_seq from disk.
-        n = plan.write_count
-        return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
+        return Delta([], [], {}, 0, degraded=True, threw=True)
 
     if failure == FailureClass.B2:
-        n = plan.write_count
-        return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
+        return Delta([], [], {}, 0, degraded=True, threw=True)
 
     if failure == FailureClass.B3:
         # Any append error — including a full write that returned an error —
         # degrades unconditionally. resume() replays valid on-disk entries.
-        n = plan.write_count
-        return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
+        return Delta([], [], {}, 0, degraded=True, threw=True)
 
     if failure == FailureClass.F:
         # Commit fdatasync failed — bytes in page cache but not confirmed
-        # durable. Key changes are NOT published in-session. Sequence advances to
-        # prevent reuse. Engine degrades (BC-164); resume() restores writes.
-        n = plan.write_count
-        return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
+        # durable. Key changes are NOT published in-session. next_seq stays
+        # at pre-failure value; resume() re-derives from disk.
+        return Delta([], [], {}, 0, degraded=True, threw=True)
 
     if failure == FailureClass.G:
         # Rotation fdatasync failed — same contract as F: bytes in page cache,
-        # key changes unpublished, sequence advances, engine degrades (BC-164).
-        n = plan.write_count
-        return Delta([], [], {}, n + (2 if n > 1 else 0), degraded=True, threw=True)
+        # key changes unpublished, next_seq stays at pre-failure value.
+        return Delta([], [], {}, 0, degraded=True, threw=True)
 
     if failure == FailureClass.H:
         return _full_delta(

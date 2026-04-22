@@ -152,7 +152,7 @@ Both executors follow a three-phase pattern:
   For each slot:
     1. validate_preconditions(plan)
        └─ point guards, range guards, W-W checks — pure reads on transient
-    2. prepare_write(plan) → vector<AppendEntry>
+    2. prepare_write(plan) → vector<DataEntryView>
        └─ assigns sequences, inserts BulkBegin/End markers — pure computation
     3. pre-compute offsets from running_offset
        └─ entry sizes are deterministic (header + key + value + CRC)
@@ -178,7 +178,7 @@ The sequential per-slot processing in Phase 1 preserves the serial correctness m
 
 `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append. The on-disk entry reuses the standard layout: `entry_type = RangeDel (0x05)`, `key = start_key`, `value = end_key`. No new header fields.
 
-On the write path, `prepare_write` emits one `AppendEntry` per range delete. `apply_writes` iterates the key directory from `lower_bound(from)` to the first key `>= to`, decrements `live_bytes` on each affected file, and erases the keys. The RangeDel entry itself contributes only to `total_bytes` (same as point Delete — tombstones are not live).
+On the write path, `prepare_write` emits one `DataEntryView` per range delete. `apply_writes` iterates the key directory from `lower_bound(from)` to the first key `>= to`, decrements `live_bytes` on each affected file, and erases the keys. The RangeDel entry itself contributes only to `total_bytes` (same as point Delete — tombstones are not live).
 
 Range deletes are supported on `DB::del_range` and `WritePlan::del_range`. Inside a batch, they are framed by `BulkBegin`/`BulkEnd` like other operations. Existing guards (`ensure_unchanged`, `ensure_range_unchanged`, implicit W-W check) detect concurrent range deletes without changes — erased keys produce sequence mismatches.
 
@@ -189,7 +189,7 @@ Range deletes are supported on `DB::del_range` and `WritePlan::del_range`. Insid
 The coordinator (step 5 above) only performs IO. It never touches `key_dir`, `file_stats`, or sequence directly. The transient owns all state logic:
 
 - `validate_preconditions(plan)` — reads snapshot + current state, returns bool
-- `prepare_write(plan)` — assigns sequences, returns `vector<AppendEntry>` for the IO loop
+- `prepare_write(plan)` — assigns sequences, returns `vector<DataEntryView>` for the IO loop
 - `apply_writes(plan, io_result)` — updates key_dir, file_stats, advances sequence
 - `apply_rotate_file(new_file)` — registers new file, updates active_file_id
 - `apply_vacuum(old_file_id, scan, new_file)` — remaps keys, updates registry + stats
@@ -1367,6 +1367,45 @@ When the write set contains exactly one operation, `apply_batch` skips the `Bulk
 | D16 | **MariaDB plugin header ordering**: Server-internal headers require `server/my_global.h` before `handler.h`. The client-side stub does not define `MY_GLOBAL_INCLUDED`/`uchar`/`unlikely()`. Fedora layout: base `/usr/include/mysql`, server `/usr/include/mysql/server`, private `/usr/include/mysql/server/private`. CMake include order must be `server/private` → `server` → base. `-DMYSQL_SERVER` is required. `handlerton::state` does not exist in this MariaDB ABI; use `PLUGIN_LICENSE_GPL` (no MIT constant). |
 | D17 | **Directory locking**: One process per directory, enforced by `flock()` on `dir/.lock`. Advisory only — does not protect against uncooperative processes that bypass `DB::open()`. |
 | D18 | **Sequence-disjoint files**: All data files must have non-overlapping sequence ranges — no two files contain entries with the same sequence number. Active file rotation naturally preserves this (sealed files have contiguous sequence ranges). Vacuum compact must ensure compacted files maintain disjoint ranges. This invariant enables efficient replication (linear scan instead of min-heap merge), supports future file merging operations, and allows skipping entire files based on sequence bounds. |
+
+## Replication Primitives
+
+ByteCaskDB exposes a minimal set of primitives for building leader-follower replication on top of the engine. The design avoids embedding a replication protocol — instead it provides the read and write building blocks that an external coordinator composes.
+
+See [`replication_primitives_design.md`](replication_primitives_design.md) for the full design reference.
+
+### Mode
+
+```cpp
+enum class Mode { Leader, Follower };
+```
+
+`Mode` controls which write paths are available:
+
+- **Leader** (default): normal writes (`put`, `del`, `del_range`, `apply_batch`) are allowed; `ingest` is rejected.
+- **Follower**: normal writes throw `DbFollowerMode`; only `ingest` is allowed. Reads, snapshots, vacuum, and `resume()` work in both modes.
+
+`set_mode(Mode)` acquires the write mutex to ensure no in-flight write straddles the transition. `mode()` is a lock-free atomic read (acquire semantics), same pattern as `is_degraded()`.
+
+### Leader-side: `current_sequence`, `create_manifest`, `changes_since`
+
+- `current_sequence(timeout)` — returns the highest durable sequence number. With timeout > 0, blocks until the sequence advances (useful for polling replicas).
+- `create_manifest()` — rotates the active file, waits for all hint files, and returns a `FileManifest` of sealed files with a snapshot. Used for initial bootstrap.
+- `changes_since(seq, snap)` — returns a lazy `ChangeIterator` that walks sealed files in sequence order, yielding `DataEntryView` entries with `sequence > seq`. Constant memory — scans one entry at a time.
+
+### Follower-side: `ingest`
+
+```cpp
+void ingest(std::span<const DataEntryView> entries);
+```
+
+`ingest` applies pre-sequenced entries from a leader to the follower's storage. Key properties:
+
+- **Idempotent**: entries with `sequence <= durable_seq` are silently skipped.
+- **Batch-safe rotation**: `BulkBegin`/`BulkEnd` pairs always land in the same data file. Rotation only occurs at boundaries where no batch is open.
+- **Chunked I/O**: entries are written in chunks separated by rotation boundaries — one `writev` + one `fdatasync` per chunk, mirroring the leader's group-commit batching.
+- **Durability before visibility**: `store_state` (publishing to readers) happens only after the final `fdatasync`.
+- **Degraded-state on failure**: same pattern as the normal write path — on I/O failure, the engine goes degraded and `resume()` recovers.
 
 ## Working agreement
 

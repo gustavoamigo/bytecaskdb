@@ -161,7 +161,7 @@ TEST_CASE("assert_delta detects degraded", "[invariants]") {
 
   // Mid-batch append failure: fi{2} fires on the 3rd checkpoint (op2 in the
   // 2-op batch), after BulkBegin and op1 have already reached disk. The engine
-  // degrades and next_seq advances past all consumed sequences (4 = 2 ops + 2 markers).
+  // degrades; next_seq stays at the pre-failure value (resume() re-derives it).
   {
     bytecask::testing::ScopedFaultInjector fi{2};
     bytecask::WritePlan plan;
@@ -175,7 +175,7 @@ TEST_CASE("assert_delta detects degraded", "[invariants]") {
       .keys_added = {},
       .keys_removed = {},
       .expected_values = {},
-      .seq_advance = 4,
+      .seq_advance = 0,
       .degraded = true,
   });
   assert_resumable(db);
