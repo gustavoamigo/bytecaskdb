@@ -1411,7 +1411,6 @@ struct ThrowOnMove {
   static inline int moves_done = 0;
   static inline int throw_at = -1; // throw on the Nth move-construction; -1 = never
 
-  ThrowOnMove() { ++live_count; }
   explicit ThrowOnMove(int x) : v{x} { ++live_count; }
   ThrowOnMove(const ThrowOnMove &o) : v{o.v} { ++live_count; }
   ThrowOnMove(ThrowOnMove &&o) : v{o.v} {
@@ -1424,7 +1423,6 @@ struct ThrowOnMove {
   }
   ~ThrowOnMove() { --live_count; }
   auto operator=(const ThrowOnMove &) -> ThrowOnMove & = default;
-  auto operator=(ThrowOnMove &&) -> ThrowOnMove & = default;
 };
 
 } // namespace
