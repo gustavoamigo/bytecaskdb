@@ -374,6 +374,17 @@ completion. Vacuum unlinks files by path; an in-progress file transfer
 (rsync, cp) would get ENOENT. Serializing vacuum with file transfer is
 the caller's responsibility.
 
+### I/O failure safety
+
+If the pre-rotation sync fails, the exception propagates and no manifest
+is produced. The active file is not sealed; the leader continues normally.
+
+If `rotate_active_file` fails (active file sealed but new file creation
+fails), the engine degrades — same pattern as `execute_slots` and
+`ingest`. The sealed active file cannot accept further appends;
+degrading forces `resume()` before the next write. `resume()` creates a
+fresh active file and clears the degraded state.
+
 ---
 
 ## `FileStats` sequence bounds
@@ -530,6 +541,8 @@ Applies pre-sequenced entries from a leader to a follower's storage.
 | **Sequence advancement** | After ingest, `next_seq = max(next_seq, max(ingested sequences) + 1)`. Monotonically non-decreasing. |
 | **Degraded on I/O failure** | Same pattern as `apply_batch`: on `writev`/`fdatasync` failure, advance sequence to prevent reuse, go degraded, rethrow. |
 | **Atomicity** | If ingest throws, no partial state is published to readers. |
+| **Causality** | Entries are applied in the sequence order provided by `changes_since`. If entry A has a lower sequence than entry B, A is applied before B. The follower's state reflects the same causal ordering as the leader's write history. |
+| **I/O failure safety** | If any I/O operation throws, the published key directory reflects zero entries from this call. The engine degrades; `resume()` restores normal operation. After resume, re-delivery from `follower.current_sequence()` proceeds normally. |
 
 ## `set_mode` / `mode`
 
