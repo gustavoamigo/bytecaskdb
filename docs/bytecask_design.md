@@ -808,7 +808,7 @@ while (auto he = scanner.next()) { /* use he->key, he->sequence, … */ }
 On engine startup:
 
 1. Discard any `.hint.tmp` files — incomplete hint files from a crash mid-rotation.
-2. Open all `.data` files and seal them. For any data file without a companion `.hint`, generate one via `flush_hints_for()` (uses `CommittedEntryIterator`: buffers entries between BulkBegin/BulkEnd, discards incomplete batches, logs a warning). Hint entries are sorted by key (for prefix compression) and written to the hint file. Recovery's sequence-aware upsert handles duplicate keys across entries.
+2. Open all `.data` files and seal them. For any data file without a companion `.hint`, generate one via `flush_hints_for()` (uses `CommittedEntryIterator`: buffers entries between BulkBegin/BulkEnd, discards incomplete batches, logs a warning). `BulkBegin`/`BulkEnd` markers are written to hint files with their sequence numbers (for accurate `next_seq` computation). Other hint entries are sorted by key (for prefix compression). Recovery's sequence-aware upsert handles duplicate keys across entries.
 3. Recover exclusively from hint files. For each hint entry:
    - `Put`: insert `(key → {sequence, file_id, file_offset, value_size})` only if `entry.sequence > dir[key].sequence` (skip if a fresher entry is already present).
    - `Delete`: remove the key from the tree if `entry.sequence > dir[key].sequence`; otherwise skip.
@@ -1406,6 +1406,8 @@ void ingest(std::span<const DataEntryView> entries);
 - **Chunked I/O**: entries are written in chunks separated by rotation boundaries — one `writev` + one `fdatasync` per chunk, mirroring the leader's group-commit batching.
 - **Durability before visibility**: `store_state` (publishing to readers) happens only after the final `fdatasync`.
 - **Degraded-state on failure**: same pattern as the normal write path — on I/O failure, the engine goes degraded and `resume()` recovers.
+
+Correctness is validated by 211 generated proof tests (178 ingest + 33 manifest) covering the full (StateShape × OpsShape × FailureClass) matrix. See [`correctness_validation.md`](correctness_validation.md) for the proof framework and [`replication_primitives_design.md`](replication_primitives_design.md) for the invariants.
 
 ## Working agreement
 

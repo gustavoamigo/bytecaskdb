@@ -214,15 +214,15 @@ def gen_fault_injector(config: FaultConfig) -> str:
 # ---------------------------------------------------------------------------
 
 
-def gen_ingest_call(throwing: bool) -> str:
+def gen_ingest_call(throwing: bool, var: str = "views") -> str:
     """Generate the ingest call with or without REQUIRE_THROWS."""
     if throwing:
         return (
             "        REQUIRE_THROWS_AS(\n"
-            "            follower.ingest(views),\n"
+            f"            follower.ingest({var}),\n"
             "            std::system_error);"
         )
-    return "        follower.ingest(views);"
+    return f"        follower.ingest({var});"
 
 
 def gen_assertions_success(state: StateShape) -> str:
@@ -498,15 +498,15 @@ def gen_restart_midstream_test(
 
     fi_code = gen_fault_injector(config)
     if fi_code:
-        # After restart, views2 may contain only stray batch markers
-        # (hints skip BulkBegin/BulkEnd, so recovery underestimates
-        # durable_seq). The fault may not trigger. Use try-catch and
-        # track whether the exception actually fired.
+        # The second pass receives only the remainder after the first pass.
+        # For rotation faults (I_H, I_G), the remainder may be too small to
+        # trigger rotation — the fault never fires. Use try-catch to handle
+        # both outcomes.
         parts.append("      bool threw = false;")
         parts.append("      if (!views2.empty()) {")
         parts.append(fi_code)
         parts.append("        try {")
-        parts.append("          follower.ingest(views);")
+        parts.append(f"          follower.ingest(views2);")
         parts.append("        } catch (const std::system_error&) {")
         parts.append("          threw = true;")
         parts.append("        }")
@@ -519,8 +519,8 @@ def gen_restart_midstream_test(
     if delta.keys_match:
         parts.append(gen_assertions_success(state))
     else:
-        # If the fault didn't fire (views2 empty, or too few entries to
-        # trigger the fault), check success behavior instead.
+        # If the fault didn't fire (views2 empty or too small to trigger
+        # rotation), verify success behavior instead.
         parts.append("      if (!threw) {")
         parts.append("        assert_replication_match(leader_bl, follower);")
         parts.append("        CHECK_FALSE(follower.is_degraded());")
@@ -725,6 +725,26 @@ def gen_manifest_test(state: StateShape, failure: ManifestFailureClass) -> str:
             parts.append(
                 "    REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);"
             )
+
+        # Post-failure assertions.
+        if delta.degraded:
+            parts.append("")
+            parts.append("    // Engine must be degraded — sealed active file is unusable.")
+            parts.append("    CHECK(leader.is_degraded());")
+            parts.append("    assert_consistent(leader);")
+            parts.append("")
+            parts.append("    // resume() must recover.")
+            parts.append("    assert_resumable(leader);")
+            parts.append("")
+            parts.append("    // After resume, writes must succeed.")
+            parts.append('    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));')
+        else:
+            parts.append("")
+            parts.append("    // Engine must NOT be degraded — failure was before seal.")
+            parts.append("    CHECK_FALSE(leader.is_degraded());")
+            parts.append("")
+            parts.append("    // Writes must still succeed.")
+            parts.append('    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));')
 
     parts.append("  }")
     parts.append("}")

@@ -516,7 +516,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__append_fails_nothing_writt
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -588,7 +588,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__append_fails_partial_write
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -659,7 +659,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__sync_fails", "[prove_repl]
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -1257,7 +1257,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__append_fails_nothing_writte
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -1333,7 +1333,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__append_fails_partial_write"
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -1408,7 +1408,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__sync_fails", "[prove_repl]"
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -1984,7 +1984,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__append_fails_nothing_writt
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -2057,7 +2057,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__append_fails_partial_write
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -2129,7 +2129,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__sync_fails", "[prove_repl]
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -2699,7 +2699,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__append_fails_nothing_written"
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -2772,7 +2772,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__append_fails_partial_write", 
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -2844,7 +2844,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__sync_fails", "[prove_repl]") 
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -3454,7 +3454,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__append_fails_nothing_wr
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -3531,7 +3531,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__append_fails_partial_wr
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -3607,7 +3607,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__sync_fails", "[prove_re
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -4346,7 +4346,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__append_fails_nothing_written"
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -4424,7 +4424,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__append_fails_partial_write", 
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -4501,7 +4501,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__sync_fails", "[prove_repl]") 
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -4576,7 +4576,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__crash_mid_batch", "[prove_rep
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{2};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -5398,7 +5398,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__append_fails_nothing_writt
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -5474,7 +5474,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__append_fails_partial_write
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -5549,7 +5549,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__sync_fails", "[prove_repl]
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -5622,7 +5622,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__rotation_sync_fails", "[pr
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -5695,7 +5695,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__rotation_file_creation_fai
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -6293,7 +6293,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__append_fails_nothin
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -6368,7 +6368,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__append_fails_partia
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -6442,7 +6442,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__sync_fails", "[prov
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -7266,7 +7266,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__append_fails_nothing_writ
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -7342,7 +7342,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__append_fails_partial_writ
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -7417,7 +7417,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__sync_fails", "[prove_repl
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -7490,7 +7490,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__rotation_sync_fails", "[p
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -7563,7 +7563,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__rotation_file_creation_fa
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -8171,7 +8171,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__append_fails_nothing
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -8246,7 +8246,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__append_fails_partial
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -8320,7 +8320,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__sync_fails", "[prove
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -9427,7 +9427,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_nothing
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -9514,7 +9514,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_partial
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -9600,7 +9600,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__sync_fails", "[prove
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -9684,7 +9684,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__crash_mid_batch", "[
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{2};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -9770,7 +9770,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_sync_fails"
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -9854,7 +9854,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_file_creati
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         try {
-          follower.ingest(views);
+          follower.ingest(views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -10004,6 +10004,16 @@ TEST_CASE("prove_manifest__single_key__rotation_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must be degraded — sealed active file is unusable.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
+
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10018,6 +10028,12 @@ TEST_CASE("prove_manifest__single_key__hint_gen_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must NOT be degraded — failure was before seal.
+    CHECK_FALSE(leader.is_degraded());
+
+    // Writes must still succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
   }
 }
 
@@ -10059,6 +10075,16 @@ TEST_CASE("prove_manifest__multi_key__rotation_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must be degraded — sealed active file is unusable.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
+
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10077,6 +10103,12 @@ TEST_CASE("prove_manifest__multi_key__hint_gen_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must NOT be degraded — failure was before seal.
+    CHECK_FALSE(leader.is_degraded());
+
+    // Writes must still succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
   }
 }
 
@@ -10112,6 +10144,16 @@ TEST_CASE("prove_manifest__overwrites__rotation_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must be degraded — sealed active file is unusable.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
+
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10127,6 +10169,12 @@ TEST_CASE("prove_manifest__overwrites__hint_gen_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must NOT be degraded — failure was before seal.
+    CHECK_FALSE(leader.is_degraded());
+
+    // Writes must still succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
   }
 }
 
@@ -10162,6 +10210,16 @@ TEST_CASE("prove_manifest__deletes__rotation_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must be degraded — sealed active file is unusable.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
+
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10177,6 +10235,12 @@ TEST_CASE("prove_manifest__deletes__hint_gen_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must NOT be degraded — failure was before seal.
+    CHECK_FALSE(leader.is_degraded());
+
+    // Writes must still succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
   }
 }
 
@@ -10220,6 +10284,16 @@ TEST_CASE("prove_manifest__range_deletes__rotation_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must be degraded — sealed active file is unusable.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
+
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10239,6 +10313,12 @@ TEST_CASE("prove_manifest__range_deletes__hint_gen_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must NOT be degraded — failure was before seal.
+    CHECK_FALSE(leader.is_degraded());
+
+    // Writes must still succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
   }
 }
 
@@ -10284,6 +10364,16 @@ TEST_CASE("prove_manifest__batches__rotation_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must be degraded — sealed active file is unusable.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
+
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10304,6 +10394,12 @@ TEST_CASE("prove_manifest__batches__hint_gen_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must NOT be degraded — failure was before seal.
+    CHECK_FALSE(leader.is_degraded());
+
+    // Writes must still succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
   }
 }
 
@@ -10345,6 +10441,16 @@ TEST_CASE("prove_manifest__multi_file__rotation_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must be degraded — sealed active file is unusable.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
+
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10363,6 +10469,12 @@ TEST_CASE("prove_manifest__multi_file__hint_gen_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must NOT be degraded — failure was before seal.
+    CHECK_FALSE(leader.is_degraded());
+
+    // Writes must still succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
   }
 }
 
@@ -10402,6 +10514,16 @@ TEST_CASE("prove_manifest__mixed_sync_nosync__rotation_fails", "[prove_manifest]
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must be degraded — sealed active file is unusable.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
+
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10419,6 +10541,12 @@ TEST_CASE("prove_manifest__mixed_sync_nosync__hint_gen_fails", "[prove_manifest]
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must NOT be degraded — failure was before seal.
+    CHECK_FALSE(leader.is_degraded());
+
+    // Writes must still succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
   }
 }
 
@@ -10460,6 +10588,16 @@ TEST_CASE("prove_manifest__nosync_only__rotation_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must be degraded — sealed active file is unusable.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
+
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10478,6 +10616,12 @@ TEST_CASE("prove_manifest__nosync_only__hint_gen_fails", "[prove_manifest]") {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must NOT be degraded — failure was before seal.
+    CHECK_FALSE(leader.is_degraded());
+
+    // Writes must still succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
   }
 }
 
@@ -10517,6 +10661,16 @@ TEST_CASE("prove_manifest__nosync_then_sync__rotation_fails", "[prove_manifest]"
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must be degraded — sealed active file is unusable.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
+
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10534,6 +10688,12 @@ TEST_CASE("prove_manifest__nosync_then_sync__hint_gen_fails", "[prove_manifest]"
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must NOT be degraded — failure was before seal.
+    CHECK_FALSE(leader.is_degraded());
+
+    // Writes must still succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
   }
 }
 
@@ -10597,6 +10757,16 @@ TEST_CASE("prove_manifest__vacuumed_batches__rotation_fails", "[prove_manifest]"
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must be degraded — sealed active file is unusable.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
+
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10626,5 +10796,11 @@ TEST_CASE("prove_manifest__vacuumed_batches__hint_gen_fails", "[prove_manifest]"
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
+
+    // Engine must NOT be degraded — failure was before seal.
+    CHECK_FALSE(leader.is_degraded());
+
+    // Writes must still succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
   }
 }

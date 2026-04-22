@@ -102,7 +102,7 @@ On engine startup:
 
 Hint files are written during file rotation (active → immutable). To guarantee a hint file is either complete or absent:
 
-1. Scan the data file and write one hint entry per `Put` or `Delete` record to `data_{timestamp}.hint.tmp`. `BulkBegin`/`BulkEnd` structural markers are skipped — they carry no key/value and are not needed for key directory reconstruction.
+1. Scan the data file and write one hint entry per `Put`, `Delete`, or `RangeDel` record to `data_{timestamp}.hint.tmp`. `BulkBegin`/`BulkEnd` structural markers are written with their sequence numbers (for accurate `next_seq` computation on recovery) but carry no key/value payload.
 2. Call `fdatasync` to flush all bytes to physical storage.
 3. Atomically `rename(2)` to `data_{timestamp}.hint` — POSIX guarantees this is atomic on the same filesystem.
 

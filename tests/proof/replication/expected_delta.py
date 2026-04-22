@@ -29,6 +29,7 @@ class IngestDelta:
 class ManifestDelta:
     manifest_produced: bool
     threw: bool
+    degraded: bool  # engine should be degraded after failure
 
 
 def ingest_expected(
@@ -72,5 +73,9 @@ def ingest_expected(
 def manifest_expected(failure: ManifestFailureClass) -> ManifestDelta:
     """Compute the expected outcome of a create_manifest call."""
     if failure == ManifestFailureClass.SUCCESS:
-        return ManifestDelta(manifest_produced=True, threw=False)
-    return ManifestDelta(manifest_produced=False, threw=True)
+        return ManifestDelta(manifest_produced=True, threw=False, degraded=False)
+    # M_R: rotation file creation fails after seal — engine must degrade.
+    if failure == ManifestFailureClass.M_R:
+        return ManifestDelta(manifest_produced=False, threw=True, degraded=True)
+    # M_H: pre-rotation sync fails — active file not sealed, no degradation.
+    return ManifestDelta(manifest_produced=False, threw=True, degraded=False)
