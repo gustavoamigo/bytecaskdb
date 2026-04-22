@@ -1055,23 +1055,21 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
   };
 
   auto hint = HintFile::OpenForWrite(tmp_path);
-  std::vector<PendingHint> all_hints; // all confirmed entries across the file
+  std::vector<PendingHint> entries;
 
   try {
-    for (const auto &batch : scan_batches(*file)) {
-      for (const auto &[entry, entry_off] : batch.entries) {
-        if (entry.entry_type == EntryType::BulkBegin ||
-            entry.entry_type == EntryType::BulkEnd) {
-          continue;
-        }
-        all_hints.push_back(
-            {entry.sequence, entry.entry_type, entry_off,
-             narrow<std::uint32_t>(entry.value.size()), entry.key,
-             entry.entry_type == EntryType::RangeDel
-                 ? std::vector<std::byte>{entry.value.begin(),
-                                          entry.value.end()}
-                 : std::vector<std::byte>{}});
+    for (const auto &[entry, entry_off] : scan_committed(*file)) {
+      if (entry.entry_type == EntryType::BulkBegin ||
+          entry.entry_type == EntryType::BulkEnd) {
+        continue;
       }
+      entries.push_back(
+          {entry.sequence, entry.entry_type, entry_off,
+           narrow<std::uint32_t>(entry.value.size()), entry.key,
+           entry.entry_type == EntryType::RangeDel
+               ? std::vector<std::byte>{entry.value.begin(),
+                                        entry.value.end()}
+               : std::vector<std::byte>{}});
     }
   } catch (const std::exception &e) {
     if (strict) throw;
@@ -1080,48 +1078,12 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
               << e.what() << "\n";
   }
 
-  // Partition: RangeDel entries must not participate in point-entry dedup
-  // (a RangeDel with start_key "user:" must not dedup with a Put for "user:").
-  auto range_del_begin = std::stable_partition(
-      all_hints.begin(), all_hints.end(),
-      [](const PendingHint &h) { return h.type != EntryType::RangeDel; });
-  std::vector<PendingHint> range_hints(
-      std::make_move_iterator(range_del_begin),
-      std::make_move_iterator(all_hints.end()));
-  all_hints.erase(range_del_begin, all_hints.end());
-
-  // Sort point entries by key asc; within equal keys, seq desc so first = authoritative.
-  std::ranges::sort(all_hints, [](const auto &a, const auto &b) {
-    return a.key < b.key || (a.key == b.key && a.seq > b.seq);
-  });
-  // Erase all but the first (highest-seq) entry per key.
-  auto tail = std::ranges::unique(all_hints, [](const auto &a, const auto &b) {
-    return a.key == b.key;
-  }).begin();
-  all_hints.erase(tail, all_hints.end());
-
-  // Sort range hints by start_key for prefix compression benefit.
-  std::ranges::sort(range_hints, [](const auto &a, const auto &b) {
-    return a.key < b.key || (a.key == b.key && a.seq > b.seq);
+  // Sort by key for prefix compression benefit in the hint file.
+  std::ranges::sort(entries, [](const auto &a, const auto &b) {
+    return a.key < b.key;
   });
 
-  // Merge point and range entries into sorted key order for prefix compression.
-  // Range entries are interleaved by start_key.
-  std::vector<PendingHint> merged;
-  merged.reserve(all_hints.size() + range_hints.size());
-  auto pi = all_hints.begin();
-  auto ri = range_hints.begin();
-  while (pi != all_hints.end() && ri != range_hints.end()) {
-    if (pi->key <= ri->key) {
-      merged.push_back(std::move(*pi++));
-    } else {
-      merged.push_back(std::move(*ri++));
-    }
-  }
-  while (pi != all_hints.end()) merged.push_back(std::move(*pi++));
-  while (ri != range_hints.end()) merged.push_back(std::move(*ri++));
-
-  for (const auto &pe : merged) {
+  for (const auto &pe : entries) {
     if (pe.type == EntryType::RangeDel) {
       hint.append_range_del(pe.seq, pe.file_off, pe.key, pe.end_key);
     } else {
@@ -1152,10 +1114,10 @@ void DB::flush_hints() {
 
 #pragma region Vacuum internals
 
-// Batch-aware scan of source_file: copies live Puts (still current in
-// snap->key_dir for source_file_id) and all tombstones into dest_file.
-// Entries inside BulkBegin..BulkEnd are buffered and emitted only on
-// BulkEnd; incomplete batches at EOF are silently discarded.
+// Scans source_file and copies live entries into dest_file.
+// Live Puts (still current in snap->key_dir for source_file_id),
+// all tombstones, and BulkBegin/BulkEnd markers are emitted.
+// Incomplete batches at EOF are silently discarded by the iterator.
 auto DB::vacuum_scan_and_copy(
     const std::shared_ptr<const EngineState> &snap,
     const DataFile &source_file, DataFile &dest_file,
@@ -1213,35 +1175,8 @@ auto DB::vacuum_scan_and_copy(
     }
   };
 
-  for (const auto &batch : scan_batches(source_file)) {
-    if (batch.is_batch()) {
-      // Check if any entry in the batch is live.
-      bool has_live = false;
-      for (const auto &[entry, entry_off] : batch.entries) {
-        if (entry.entry_type == EntryType::Delete ||
-            entry.entry_type == EntryType::RangeDel) {
-          has_live = true;
-          break;
-        }
-        if (entry.entry_type == EntryType::Put) {
-          const auto existing = snap->key_dir.get(entry.key);
-          if (existing && existing->file_id == source_file_id &&
-              existing->file_offset == entry_off &&
-              existing->sequence == entry.sequence) {
-            has_live = true;
-            break;
-          }
-        }
-      }
-      if (has_live) {
-        for (const auto &[entry, entry_off] : batch.entries) {
-          emit_entry(entry, entry_off);
-        }
-      }
-    } else {
-      const auto &[entry, entry_off] = batch.entries.front();
-      emit_entry(entry, entry_off);
-    }
+  for (const auto &[entry, entry_off] : scan_committed(source_file)) {
+    emit_entry(entry, entry_off);
   }
 
   return result;
@@ -1350,7 +1285,7 @@ void DB::resume() {
   const auto old_file_id = current->active_file_id;
   auto &file = **current->files.get(old_file_id);
 
-  // Scan the active file (batch-aware) to find the last valid committed offset
+  // Scan the active file to find the last valid committed offset
   // and collect valid committed entries for key_dir replay. Entries written to
   // disk but never published to EngineState (sync-failure paths, degraded
   // transitions between IO and state publication) would otherwise be invisible
@@ -1358,18 +1293,18 @@ void DB::resume() {
   Offset valid_offset = 0;
   std::vector<ResumeEntry> committed;
   try {
-    for (const auto &batch : scan_batches(file)) {
-      for (const auto &[entry, entry_off] : batch.entries) {
-        if (entry.entry_type == EntryType::BulkBegin ||
-            entry.entry_type == EntryType::BulkEnd) {
-          continue;
-        }
+    auto iter = CommittedEntryIterator{DataFileIterator{file}};
+    while (!(iter == std::default_sentinel)) {
+      const auto &[entry, entry_off] = *iter;
+      if (entry.entry_type != EntryType::BulkBegin &&
+          entry.entry_type != EntryType::BulkEnd) {
         committed.push_back({entry.sequence, entry.entry_type, entry_off,
                              narrow<std::uint32_t>(entry.value.size()),
                              entry.key});
       }
-      valid_offset = batch.next_offset;
+      ++iter;
     }
+    valid_offset = iter.committed_offset();
   } catch (...) {
     // Stop at first CRC error — valid_offset is the last known-good position.
   }
@@ -1856,7 +1791,7 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 }
 
 // Reconstructs the key directory from hint files (serial path).
-// Pre-generates missing hint files from raw data scans (batch-aware),
+// Pre-generates missing hint files from raw data scans,
 // then recovers exclusively from hints — single code path.
 // Returns a new EngineState with key_dir populated and next_seq set to
 // max_seen + 1. next_file_id is advanced for each recovered file.
@@ -2083,111 +2018,120 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
 
 #pragma endregion
 
+#pragma region Change Since
+
+
 // ---------------------------------------------------------------------------
 // ChangeIterator implementation
 // ---------------------------------------------------------------------------
-
-// ChangeIterator implementation class
+// Lazy ChangeIterator: walks files in min_sequence order, scanning one
+// batch at a time. Only the current batch's entries are held in memory.
+// Files in a single-writer engine have disjoint, monotonically increasing
+// sequence ranges, so iterating files by min_sequence and scanning forward
+// within each file yields globally ascending sequence order.
 class ChangeIterator::Impl {
 public:
   Impl(std::shared_ptr<const EngineState> state,
        std::uint64_t from_sequence,
        std::uint64_t durable_sequence)
     : state_(std::move(state)), from_sequence_(from_sequence),
-      durable_sequence_(durable_sequence), current_entry_idx_(0) {
+      durable_sequence_(durable_sequence) {
 
-    // Sort files by min_sequence and filter relevant files
-    std::vector<std::pair<std::uint64_t, std::uint32_t>> file_ranges;
+    // Build sorted file list — O(num_files), typically tiny.
     for (const auto [file_id, stats] : state_->file_stats) {
       if (stats.max_sequence > from_sequence && stats.min_sequence <= durable_sequence) {
-        file_ranges.emplace_back(stats.min_sequence, file_id);
+        file_queue_.emplace_back(stats.min_sequence, file_id);
       }
     }
+    std::sort(file_queue_.begin(), file_queue_.end());
 
-    // Sort by min_sequence (ascending order)
-    std::sort(file_ranges.begin(), file_ranges.end());
-
-    // Process files in sequence order
-    for (const auto& [min_seq, file_id] : file_ranges) {
-      auto file_ptr = state_->files.get(file_id);
-      if (file_ptr) {
-        scan_file(**file_ptr);
-      }
-    }
-
-    // Sort all collected entries by sequence to handle any gaps properly
-    std::sort(entries_.begin(), entries_.end(),
-              [](const RawEntry& a, const RawEntry& b) {
-                return a.sequence < b.sequence;
-              });
+    // Position at first valid entry.
+    advance_to_next_valid();
   }
 
-  auto has_more() const -> bool {
-    return current_entry_idx_ < entries_.size();
-  }
+  auto has_more() const -> bool { return has_entry_; }
 
-  auto current() const -> const RawEntry& {
-    return entries_[current_entry_idx_];
-  }
+  auto current() const -> const RawEntry& { return cached_entry_; }
 
   void advance() {
-    if (current_entry_idx_ < entries_.size()) {
-      ++current_entry_idx_;
-    }
+    advance_to_next_valid();
   }
 
 private:
-  void scan_file(const DataFile& file) {
-    auto should_include = [&](std::uint64_t seq) -> bool {
-      return seq > from_sequence_ && seq <= durable_sequence_;
-    };
+  auto should_include(std::uint64_t seq) const -> bool {
+    return seq > from_sequence_ && seq <= durable_sequence_;
+  }
 
-    auto add_entry = [&](std::uint64_t sequence, EntryType entry_type,
-                         std::span<const std::byte> key, std::span<const std::byte> value) {
-      key_storage_.emplace_back(key.begin(), key.end());
-      value_storage_.emplace_back(value.begin(), value.end());
-      entries_.push_back({
-        .sequence = sequence,
-        .entry_type = entry_type,
-        .key = BytesView{key_storage_.back().data(), key_storage_.back().size()},
-        .value = BytesView{value_storage_.back().data(), value_storage_.back().size()}
-      });
-    };
+  // Scans forward across entries and files until a valid entry is found
+  // or all files are exhausted. The cached BytesView spans point into
+  // the iterator's current entry, so we must NOT advance the iterator
+  // after caching — that would invalidate the view. Instead, we set
+  // needs_advance_ and increment on the next call.
+  void advance_to_next_valid() {
+    has_entry_ = false;
 
-    for (const auto& batch : scan_batches(file)) {
-      if (batch.is_batch()) {
-        // Check if any entry in the batch should be included.
-        bool has_valid = false;
-        for (const auto& [entry, entry_off] : batch.entries) {
-          if (should_include(entry.sequence)) {
-            has_valid = true;
-            break;
-          }
-        }
-        if (has_valid) {
-          for (const auto& [entry, entry_off] : batch.entries) {
-            if (should_include(entry.sequence)) {
-              add_entry(entry.sequence, entry.entry_type, entry.key, entry.value);
-            }
-          }
-        }
-      } else {
-        const auto& [entry, entry_off] = batch.entries.front();
-        if (should_include(entry.sequence)) {
-          add_entry(entry.sequence, entry.entry_type, entry.key, entry.value);
-        }
-      }
+    // Advance past the previously cached entry (deferred from last call).
+    if (needs_advance_ && entry_iter_) {
+      ++(*entry_iter_);
+      needs_advance_ = false;
     }
+
+    while (true) {
+      // Try next entry in the current file.
+      if (entry_iter_ && !(*entry_iter_ == std::default_sentinel)) {
+        const auto& [entry, entry_off] = **entry_iter_;
+        if (should_include(entry.sequence)) {
+          cache_entry(entry);
+          needs_advance_ = true;
+          return;
+        }
+        ++(*entry_iter_);
+        continue;
+      }
+
+      // Try next file.
+      if (file_idx_ < file_queue_.size()) {
+        auto file_id = file_queue_[file_idx_].second;
+        ++file_idx_;
+        auto file_ptr = state_->files.get(file_id);
+        if (file_ptr) {
+          entry_iter_.emplace(DataFileIterator{**file_ptr});
+        }
+        continue;
+      }
+
+      // All files exhausted.
+      return;
+    }
+  }
+
+  // Caches the current entry. The BytesView spans point into
+  // the iterator's internal buffer which stays alive until advance().
+  void cache_entry(const DataEntry& entry) {
+    cached_entry_ = {
+      .sequence = entry.sequence,
+      .entry_type = entry.entry_type,
+      .key = BytesView{entry.key},
+      .value = BytesView{entry.value}
+    };
+    has_entry_ = true;
   }
 
   std::shared_ptr<const EngineState> state_;
   std::uint64_t from_sequence_;
   std::uint64_t durable_sequence_;
-  std::vector<RawEntry> entries_;
-  std::size_t current_entry_idx_;
-  // Storage for key and value data to keep BytesView stable
-  std::vector<Bytes> key_storage_;
-  std::vector<Bytes> value_storage_;
+
+  // File traversal — sorted by min_sequence.
+  std::vector<std::pair<std::uint64_t, std::uint32_t>> file_queue_;
+  std::size_t file_idx_{0};
+
+  // Current file's committed entry scanner.
+  std::optional<CommittedEntryIterator> entry_iter_;
+  bool needs_advance_{false};
+
+  // Cached current entry — BytesView into entry_iter_'s internal buffer.
+  bool has_entry_{false};
+  RawEntry cached_entry_;
 };
 
 // ChangeIterator methods
@@ -2225,11 +2169,10 @@ auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
     -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t> {
 
   auto state = snap.state();
-  auto durable_seq = load_state_for_read(ReadOptions{})->durable_seq;
-  auto upper_bound = std::min(state->next_seq - 1, durable_seq);
-
-  auto begin = ChangeIterator{state, from_sequence, upper_bound};
+  auto begin = ChangeIterator{state, from_sequence, state->durable_seq};
   return {std::move(begin), std::default_sentinel};
 }
+
+#pragma endregion
 
 } // namespace bytecask
