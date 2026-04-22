@@ -33,6 +33,13 @@ inline auto to_string(const Bytes &bytes) -> std::string {
   return s;
 }
 
+inline auto to_string(BytesView bv) -> std::string {
+  std::string s(bv.size(), '\0');
+  std::ranges::transform(bv, s.begin(),
+                         [](std::byte b) { return static_cast<char>(b); });
+  return s;
+}
+
 inline auto to_string(const Key &key) -> std::string {
   std::string s(key.size(), '\0');
   std::ranges::transform(key, s.begin(),
@@ -370,6 +377,174 @@ inline void assert_vacuum_recoverable(const std::filesystem::path &dir,
     }
   }
   assert_consistent(recovered);
+}
+
+// ---- Replication helpers ----------------------------------------------------
+
+// Owned copies of entries collected from a ChangeIterator. The views
+// returned by the iterator are transient — they point into the
+// iterator's internal buffer and are invalidated on advance.
+struct OwnedEntries {
+  struct Entry {
+    std::uint64_t sequence;
+    EntryType entry_type;
+    Bytes key;
+    Bytes value;
+  };
+  std::vector<Entry> entries;
+
+  // Builds a DataEntryView span referencing the owned data.
+  [[nodiscard]] auto views() const -> std::vector<DataEntryView> {
+    std::vector<DataEntryView> v;
+    v.reserve(entries.size());
+    for (const auto &e : entries) {
+      v.push_back({e.sequence, e.entry_type, e.key, e.value});
+    }
+    return v;
+  }
+};
+
+// Collects all entries from a changes_since range into owned storage.
+template <typename Range>
+inline auto collect_changes(Range &&range) -> OwnedEntries {
+  OwnedEntries result;
+  for (const auto &e : range) {
+    result.entries.push_back({
+        e.sequence,
+        e.entry_type,
+        Bytes{e.key.begin(), e.key.end()},
+        Bytes{e.value.begin(), e.value.end()},
+    });
+  }
+  return result;
+}
+
+// Snapshot of leader's durable state for replication tests.
+// key_values is built by replaying changes_since(snap, 0) — this captures
+// exactly the entries the replication pipeline would deliver to a follower.
+// For nosync workloads, unsync'd entries are excluded (durable_seq boundary).
+struct ReplicationBaseline {
+  std::uint64_t durable_seq;
+  std::uint64_t next_seq;
+  std::map<std::string, Bytes> key_values;
+};
+
+inline auto capture_replication_baseline(const DB &db) -> ReplicationBaseline {
+  ReplicationBaseline bl;
+  auto state = db.engine_state();
+  bl.durable_seq = state->durable_seq;
+  bl.next_seq = state->next_seq;
+  // Replay changes_since to build the exact key-value set that the
+  // replication pipeline would deliver. This respects the durable_seq
+  // boundary — unsync'd entries are excluded.
+  auto snap = db.snapshot();
+  for (const auto &e : db.changes_since(snap, 0)) {
+    auto key_str = to_string(e.key);
+    switch (e.entry_type) {
+      case EntryType::Put:
+        bl.key_values[key_str] = Bytes{e.value.begin(), e.value.end()};
+        break;
+      case EntryType::Delete:
+        bl.key_values.erase(key_str);
+        break;
+      case EntryType::RangeDel: {
+        auto to_str = to_string(e.value);
+        auto it = bl.key_values.lower_bound(key_str);
+        while (it != bl.key_values.end() && it->first < to_str) {
+          it = bl.key_values.erase(it);
+        }
+        break;
+      }
+      case EntryType::BulkBegin:
+      case EntryType::BulkEnd:
+        break;
+    }
+  }
+  return bl;
+}
+
+// Asserts that the follower matches the leader's baseline (SUCCESS case).
+// Invariants 1-5 from the replication design doc.
+inline void assert_replication_match(const ReplicationBaseline &leader,
+                                     const DB &follower) {
+  // 1. Sequence continuity.
+  CHECK(follower.current_sequence() == leader.durable_seq);
+
+  // 2. next_seq monotonicity.
+  auto fstate = follower.engine_state();
+  CHECK(fstate->next_seq > 0);
+
+  // 3. Key-value equivalence.
+  for (const auto &[key, value] : leader.key_values) {
+    INFO("leader key must exist on follower: " << key);
+    Bytes out;
+    REQUIRE(follower.get({}, to_bytes(key), out));
+    CHECK(out == value);
+  }
+
+  // 4. No extra keys.
+  for (const auto &fk : follower.keys_from({})) {
+    auto key_str = to_string(fk);
+    INFO("unexpected key on follower: " << key_str);
+    CHECK(leader.key_values.contains(key_str));
+  }
+
+  // 5. Structural consistency.
+  assert_consistent(follower);
+}
+
+// Asserts that the follower state is unchanged from its own baseline
+// (failure case where no entries were published).
+inline void assert_replication_no_change(const Baseline &before,
+                                         const DB &follower) {
+  auto fstate = follower.engine_state();
+
+  // Key membership unchanged.
+  for (const auto &[key, value] : before.key_values) {
+    INFO("pre-ingest key must survive: " << key);
+    Bytes out;
+    REQUIRE(follower.get({}, to_bytes(key), out));
+    CHECK(out == value);
+  }
+  for (const auto &fk : follower.keys_from({})) {
+    auto key_str = to_string(fk);
+    INFO("unexpected key on follower after failed ingest: " << key_str);
+    CHECK(before.key_values.contains(key_str));
+  }
+
+  assert_consistent(follower);
+}
+
+// Reopens follower from disk and verifies replication survived recovery.
+// Invariant 6 from the design doc.
+inline void assert_replication_recovery(const std::filesystem::path &dir,
+                                        const ReplicationBaseline &leader) {
+  auto recovered = DB::open(dir);
+
+  for (const auto &[key, value] : leader.key_values) {
+    INFO("leader key must survive recovery: " << key);
+    Bytes out;
+    REQUIRE(recovered.get({}, to_bytes(key), out));
+    CHECK(out == value);
+  }
+  for (const auto &rk : recovered.keys_from({})) {
+    auto key_str = to_string(rk);
+    INFO("unexpected key after recovery: " << key_str);
+    CHECK(leader.key_values.contains(key_str));
+  }
+
+  assert_consistent(recovered);
+}
+
+// Asserts that all entries in a changes_since stream respect the durable
+// boundary. Invariant 8 from the design doc.
+template <typename Range>
+inline void assert_durable_boundary(Range &&range,
+                                    std::uint64_t durable_seq) {
+  for (const auto &e : range) {
+    INFO("entry seq=" << e.sequence << " exceeds durable_seq=" << durable_seq);
+    CHECK(e.sequence <= durable_seq);
+  }
 }
 
 }  // namespace bytecask::testing
