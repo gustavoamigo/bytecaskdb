@@ -302,10 +302,7 @@ NB_MODULE(_bytecaskdb, m) {
       .def(nb::init<>())
       .def_rw("fragmentation_threshold",
               &bytecask::VacuumOptions::fragmentation_threshold,
-              "Minimum fragmentation ratio for a file to be eligible.")
-      .def_rw("absorb_threshold",
-              &bytecask::VacuumOptions::absorb_threshold,
-              "Max live bytes for absorption into active file (default 1 MiB).");
+              "Minimum fragmentation ratio for a file to be eligible.");
 
   // -------------------------------------------------------------------------
   // Iterators
