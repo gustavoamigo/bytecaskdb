@@ -24,7 +24,9 @@ export enum class EntryType : std::uint8_t {
   RangeDel = 0x05,  // Range tombstone — key = start_key, value = end_key
 };
 
-export struct AppendEntry {
+export enum class Mode { Leader, Follower };
+
+export struct DataEntryView {
   std::uint64_t sequence;
   EntryType entry_type;
   std::span<const std::byte> key;

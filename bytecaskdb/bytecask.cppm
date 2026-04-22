@@ -29,7 +29,7 @@ import bytecask.batch_iterator;
 import bytecask.concurrency;
 import bytecask.data_file;
 import bytecask.radix_tree;
-import bytecask.types;
+export import bytecask.types;
 import bytecask.u32_map;
 import bytecask.util;
 
@@ -44,6 +44,10 @@ export using Bytes = std::vector<std::byte>;
 
 // Non-owning view — used for all input parameters to avoid copies.
 export using BytesView = std::span<const std::byte>;
+
+// ---------------------------------------------------------------------------
+// Mode — defined in bytecask.types; re-exported via the types import.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // VacuumOptions — controls vacuum file selection.
@@ -116,6 +120,9 @@ export struct Options {
   // skipped; the DB opens with whatever was successfully recovered, and a
   // warning is printed to stderr for each skipped item.
   bool fail_recovery_on_crc_errors{true};
+  // Initial engine mode. Leader (default) allows normal writes; Follower
+  // blocks put/del/apply_batch and allows ingest().
+  Mode initial_mode{Mode::Leader};
 };
 
 // ---------------------------------------------------------------------------
@@ -311,17 +318,6 @@ export using ReverseKeyIterator = ReverseIterator<KeyIterator>;
 export using ReverseEntryIterator = ReverseIterator<EntryIterator>;
 
 // ---------------------------------------------------------------------------
-// RawEntry — represents a raw data entry for replication
-// ---------------------------------------------------------------------------
-
-export struct RawEntry {
-  std::uint64_t sequence;
-  EntryType entry_type;
-  BytesView key;
-  BytesView value;  // empty for deletes
-};
-
-// ---------------------------------------------------------------------------
 // ChangeIterator — yields raw entries in ascending sequence order (lazy)
 //
 // Used by changes_since() for replication. Walks data files lazily in
@@ -333,7 +329,7 @@ export struct RawEntry {
 export class ChangeIterator {
 public:
   using iterator_category = std::input_iterator_tag;
-  using value_type = RawEntry;
+  using value_type = DataEntryView;
   using difference_type = std::ptrdiff_t;
 
   ChangeIterator() = default;
@@ -402,7 +398,7 @@ public:
   // BulkBegin/BulkEnd included for multi-op batches.
   // Borrows key/value from the WritePlan; the plan must outlive the result.
   [[nodiscard]] auto prepare_write(const WritePlan &plan) const
-      -> std::vector<AppendEntry>;
+      -> std::vector<DataEntryView>;
 
   // State transition: apply all writes from a plan using pre-computed offsets.
   // Cannot fail — pure in-memory mutations.
@@ -432,8 +428,30 @@ public:
   // ignores a value <= current durable_seq. Cannot fail.
   void apply_sync(std::uint64_t batch_max_seq);
 
+  // State transition: apply pre-sequenced entries from ingest (replication).
+  // Like apply_writes but operates on DataEntryView span with leader-assigned
+  // sequences. Advances next_seq past the highest ingested sequence.
+  void apply_ingest(std::span<const DataEntryView> entries,
+                    std::span<const std::uint64_t> offsets);
+
+  // State transition: set engine mode (Leader/Follower).
+  void apply_set_mode(Mode mode) { mode_ = mode; }
+
+  // State transition: mark engine as degraded with a reason.
+  void apply_degrade(std::string reason) {
+    degraded_ = true;
+    degraded_reason_ = std::move(reason);
+  }
+
+  // State transition: clear degraded state after successful resume().
+  void apply_clear_degraded() {
+    degraded_ = false;
+    degraded_reason_.clear();
+  }
+
   // Pure queries the coordinator needs for IO decisions.
   [[nodiscard]] auto active_file() -> DataFile &;
+  [[nodiscard]] auto active_file_ptr() const -> std::shared_ptr<DataFile>;
   [[nodiscard]] auto active_file_id() const noexcept -> std::uint32_t;
   [[nodiscard]] auto is_rotation_needed(std::uint64_t threshold) const -> bool;
 
@@ -443,10 +461,11 @@ public:
 
   [[nodiscard]] auto durable_seq() const noexcept -> std::uint64_t;
 
-  // Advances next_seq_ to new_seq without applying any key-dir or file-stats
-  // changes. Used on F/G sync failure to prevent sequence reuse for bytes already
-  // in the page cache, while keeping key changes unpublished.
-  void advance_next_seq(std::uint64_t new_seq) noexcept;
+  [[nodiscard]] auto mode() const noexcept -> Mode { return mode_; }
+  [[nodiscard]] auto is_degraded() const noexcept -> bool { return degraded_; }
+  [[nodiscard]] auto degraded_reason() const noexcept -> const std::string & {
+    return degraded_reason_;
+  }
 
   // Returns a mutable reference to file_stats_. Used by resume() to update
   // total_bytes for a truncated active file before publishing state.
@@ -466,7 +485,10 @@ private:
                        std::uint32_t active_file_id,
                        std::uint32_t next_file_id,
                        std::uint64_t next_seq,
-                       std::uint64_t durable_seq);
+                       std::uint64_t durable_seq,
+                       Mode mode,
+                       bool degraded,
+                       std::string degraded_reason);
 
   TransientRadixTree<KeyDirEntry> key_dir_;
   TransientU32Map<std::shared_ptr<DataFile>> files_;
@@ -475,6 +497,9 @@ private:
   std::uint32_t next_file_id_;
   std::uint64_t next_seq_;
   std::uint64_t durable_seq_;
+  Mode mode_;
+  bool degraded_;
+  std::string degraded_reason_;
 };
 
 // ---------------------------------------------------------------------------
@@ -493,6 +518,17 @@ public:
   DbDegraded(const DbDegraded &) = default;
   auto operator=(const DbDegraded &) -> DbDegraded & = default;
   ~DbDegraded() override;
+};
+
+// ---------------------------------------------------------------------------
+// DbFollowerMode — thrown by write operations (put, del, apply_batch) when
+// the engine is in Follower mode. Separate from DbDegraded because follower
+// mode is intentional, not an error condition.
+// ---------------------------------------------------------------------------
+export class DbFollowerMode : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+  ~DbFollowerMode() override;
 };
 
 // Default group-write byte-size threshold: plans above this size are routed
@@ -556,18 +592,20 @@ public:
   // Returns true if key exists in the index (no disk I/O).
   [[nodiscard]] auto contains_key(BytesView key) const -> bool;
 
+  // Returns the current engine mode. Lock-free (reads published state).
+  [[nodiscard]] auto mode() const noexcept -> Mode;
+
+  // Switches the engine between Leader and Follower mode.
+  // Acquires write_mu_ to ensure no in-flight write straddles the boundary.
+  void set_mode(Mode mode);
+
   // Returns true if the engine has entered a degraded state. A degraded DB
   // refuses all writes but reads remain available. Call resume() to attempt
   // in-process recovery.
-  [[nodiscard]] auto is_degraded() const noexcept -> bool {
-    return degraded_.load(std::memory_order_acquire);
-  }
+  [[nodiscard]] auto is_degraded() const noexcept -> bool;
 
-  // Returns the reason the engine entered degraded state. Safe to call after
-  // is_degraded() returns true — the acquire load synchronises access.
-  [[nodiscard]] auto degraded_reason() const noexcept -> const std::string & {
-    return degraded_reason_;
-  }
+  // Returns the reason the engine entered degraded state.
+  [[nodiscard]] auto degraded_reason() const noexcept -> std::string;
 
   // Attempts to recover from a degraded state. If not degraded, returns
   // immediately. On success, clears the degraded flag and the engine accepts
@@ -678,6 +716,12 @@ public:
   [[nodiscard]] auto changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
       -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t>;
 
+  // Applies pre-sequenced entries from a trusted leader. Only callable in
+  // Follower mode (throws std::logic_error otherwise). Entries with
+  // sequence <= current durable_seq are silently skipped (idempotency).
+  // Always syncs; never splits a BulkBegin..BulkEnd across files.
+  void ingest(std::span<const DataEntryView> entries);
+
 private:
   explicit DB(std::filesystem::path dir, Options opts);
 
@@ -686,12 +730,9 @@ private:
   void rotate_active_file(TransientEngineState &t,
                           const std::shared_ptr<const EngineState> &current);
 
-  // Publishes a sequence-only state (key_dir unchanged) advanced to target_seq.
-  // Called on any IO failure where bytes may have reached disk.
-  void publish_seq_advance(const std::shared_ptr<const EngineState> &current,
-                            std::uint64_t target_seq);
-
   // Degrade — sets the engine to write-blocked state with a reason.
+  // Used by store_state invariant checks; error catch blocks use
+  // apply_degrade() on the transient directly.
   void deem_as_degraded(std::string reason);
 
   // Hint file management
@@ -746,7 +787,7 @@ private:
   // advanced by the total byte size produced. Returns false on validation
   // failure (sets slot.result).
   auto execute_slot(TransientEngineState &t, EngineSlot &slot,
-                    std::vector<AppendEntry> &all_entries,
+                    std::vector<DataEntryView> &all_entries,
                     std::uint64_t &running_offset) -> bool;
   // Executor callback shared by solo_writer_ and write_group_. Three phases:
   // (1) per-slot validate/prepare/apply in-memory, (2) one append_entries,
@@ -797,12 +838,6 @@ private:
   // Stale readers compare this against a thread-local timestamp with a
   // single relaxed load (plain MOV on x86) to decide whether to refresh.
   std::atomic<std::int64_t> state_time_{0};
-  // Set by deem_as_degraded() on write-path failure. Blocks all writes;
-  // reads remain available. Cleared by resume() on successful recovery.
-  std::atomic<bool> degraded_{false};
-  // Written before degraded_.store(release); read after
-  // degraded_.load(acquire) — the atomic bool synchronises access.
-  std::string degraded_reason_;
   // Long-poll condvar for durable_seq advances. Notified by store_state
   // when new_state->durable_seq > old_state->durable_seq.
   mutable std::mutex durable_mu_;
