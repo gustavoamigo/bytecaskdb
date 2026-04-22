@@ -322,10 +322,11 @@ export struct RawEntry {
 };
 
 // ---------------------------------------------------------------------------
-// ChangeIterator — yields raw entries in ascending sequence order
+// ChangeIterator — yields raw entries in ascending sequence order (lazy)
 //
-// Used by changes_since() for replication. Iterates over multiple data files
-// in sequence-disjoint order, yielding entries with sequence > from_sequence.
+// Used by changes_since() for replication. Walks data files lazily in
+// min_sequence order, scanning one entry at a time via CommittedEntryIterator.
+// Yields entries with sequence > from_sequence.
 // Holds a snapshot reference to keep file descriptors open during iteration.
 // ---------------------------------------------------------------------------
 

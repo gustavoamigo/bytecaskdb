@@ -214,7 +214,7 @@ When this happens, the engine calls `deem_as_degraded(reason)` with a diagnostic
 - **Reads available**: `get`, `contains_key`, `snapshot`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from` continue to work. The in-memory state was correctly rolled back (the transient was never persisted), so reads reflect the last successfully committed state.
 - **Recovery via `resume()`**: the degraded flag is in-memory only. The service calls `resume()` to attempt in-process recovery without a restart. `resume()` runs a universal recovery process:
   1. Acquires the write lock.
-  2. Scans the active file (batch-aware) to find the last valid committed offset. Orphaned `BulkBegin` batches are excluded — if a `BulkBegin` has no matching `BulkEnd`, `valid_offset` is reset to the batch start.
+  2. Scans the active file using `CommittedEntryIterator` to find the last valid committed offset. Orphaned `BulkBegin` batches are excluded — if a `BulkBegin` has no matching `BulkEnd`, `committed_offset` is reset to before the batch start.
   3. Replays valid committed entries into the key directory using sequence-wins resolution: for each Put whose sequence exceeds the current key_dir entry (or the key is absent), update key_dir and file_stats; for each Delete whose sequence exceeds the current entry, erase the key. This recovers entries that were written to the data file but never published to EngineState (e.g. sync-failure paths where only next_seq was advanced, or degraded-state transitions that occurred between IO and state publication). Also advances `next_seq` past the highest sequence seen on disk.
   4. Calls `ftruncate` to remove garbage bytes and orphaned batch markers up to `valid_offset`.
   5. Calls `fdatasync` to persist the truncation.
@@ -504,7 +504,7 @@ Processing order across files does not matter — sequence comparison always pic
 
 ##### Sequence bounds
 
-`min_sequence` and `max_sequence` track the range of sequence numbers written to each file. They enable `changes_since` (future) to skip irrelevant files during replication and are maintained alongside `live_bytes`/`total_bytes` in every write path:
+`min_sequence` and `max_sequence` track the range of sequence numbers written to each file. They enable `changes_since` to skip irrelevant files during replication and are maintained alongside `live_bytes`/`total_bytes` in every write path:
 
 - **`apply_writes`**: captures the batch's start and end sequence once per write batch.
 - **Vacuum**: `vacuum_scan_and_copy` tracks sequences of all copied entries (including batch markers). `apply_vacuum` propagates bounds to the compacted file.
@@ -524,7 +524,7 @@ Vacuum uses two self-contained, independently testable paths. The `vacuum()` cal
 Used when the file's live data is too large to fit into the active file. Produces a new, sealed, compacted file.
 
 1. **Snapshot the key directory** — call `state_.load()` to obtain the current `EngineState`. This is the authoritative view of which entries are live.
-2. **Rewrite the target file** — open a new data file at a `.data.tmp` path for writing (new timestamp stem, same directory). Scan the old data file entry by entry using **batch-aware scanning** (see below). For each emitted entry:
+2. **Rewrite the target file** — open a new data file at a `.data.tmp` path for writing (new timestamp stem, same directory). Scan the old data file entry by entry using `CommittedEntryIterator` (see below). For each emitted entry:
    - *Put entry*: check whether the snapshot's key directory entry for that key points to the old file at this offset with the same sequence number. If yes (live), write it to the new file at its new offset, recording `(key → new_file_id, new_offset)`. If no (dead), skip.
    - *Delete entry*: always copy to the new file verbatim (same sequence number, same key). See **Tombstone handling** below.
 3. **Seal and durability** — `fdatasync` the tmp file, close it. Rename `.data.tmp` → `.data` atomically. Open a new `DataFile` at the final path and seal it. Write a hint file by scanning the compacted file (no batches in the output), using the temp-then-rename protocol (`.hint.tmp` → `.hint`).
@@ -551,11 +551,11 @@ Used when `live_bytes == 0` — the file contains only dead entries (tombstones 
 
 This is a pure metadata operation — no scanning, no copying, no syncing. The file contained no live data, so removing it has no effect on readable keys.
 
-#### Batch-aware scanning
+#### Committed entry scanning
 
-`vacuum_compact_file` uses batch-aware scanning when reading the sealed data file. Entries between `BulkBegin` and `BulkEnd` are buffered and only emitted when `BulkEnd` is reached. If the file ends mid-batch (crash during `apply_batch`), the buffered entries are silently discarded — they were never committed.
+`vacuum_compact_file` uses `CommittedEntryIterator` (`scan_committed`) when reading the sealed data file. The iterator yields entries one at a time, including `BulkBegin`/`BulkEnd` markers. Internally, entries between `BulkBegin` and `BulkEnd` are buffered and only yielded when `BulkEnd` is reached. If the file ends mid-batch (crash during `apply_batch`), the buffered entries are silently discarded — they were never committed.
 
-**Why**: without batch-aware scanning, vacuum would copy uncommitted entries (including tombstones from incomplete batches) into the output. Those tombstones could incorrectly shadow live Puts in other files, causing data loss on recovery. This matches `flush_hints_for`'s batch-aware hint generation.
+**Why**: without committed-entry filtering, vacuum would copy uncommitted entries (including tombstones from incomplete batches) into the output. Those tombstones could incorrectly shadow live Puts in other files, causing data loss on recovery. This matches `flush_hints_for`'s hint generation.
 
 (`vacuum_remove_file` performs no scanning — it simply removes file metadata.)
 
@@ -808,7 +808,7 @@ while (auto he = scanner.next()) { /* use he->key, he->sequence, … */ }
 On engine startup:
 
 1. Discard any `.hint.tmp` files — incomplete hint files from a crash mid-rotation.
-2. Open all `.data` files and seal them. For any data file without a companion `.hint`, generate one via `flush_hints_for()` (batch-aware: buffers entries between BulkBegin/BulkEnd, discards incomplete batches, logs a warning). Hint entries are sorted by key and deduplicated — within a data file, only the highest-sequence entry per key is retained — so each key appears at most once per hint file.
+2. Open all `.data` files and seal them. For any data file without a companion `.hint`, generate one via `flush_hints_for()` (uses `CommittedEntryIterator`: buffers entries between BulkBegin/BulkEnd, discards incomplete batches, logs a warning). Hint entries are sorted by key (for prefix compression) and written to the hint file. Recovery's sequence-aware upsert handles duplicate keys across entries.
 3. Recover exclusively from hint files. For each hint entry:
    - `Put`: insert `(key → {sequence, file_id, file_offset, value_size})` only if `entry.sequence > dir[key].sequence` (skip if a fresher entry is already present).
    - `Delete`: remove the key from the tree if `entry.sequence > dir[key].sequence`; otherwise skip.
@@ -855,7 +855,7 @@ If the engine crashes after writing a `BulkBegin` but before the matching `BulkE
 
 One hint file corresponds to exactly one data file (same timestamp stem, different extension).
 
-**Hint files are a correctness-carrying artifact for recovery.** On startup, any data file without a companion `.hint` has one generated via the batch-aware `flush_hints_for()`. Recovery then reads only hint files — there is no separate raw-scan fallback path.
+**Hint files are a correctness-carrying artifact for recovery.** On startup, any data file without a companion `.hint` has one generated via `flush_hints_for()` (using `CommittedEntryIterator`). Recovery then reads only hint files — there is no separate raw-scan fallback path.
 
 Hint files are written **deferred**: never inline on the write path. During normal operation, `rotate_active_file()` dispatches hint writes to the `BackgroundWorker`. At engine close, `~DB()` seals the active file and calls `flush_hints()`, ensuring every data file has a companion `.hint` after a clean shutdown. This keeps write-path latency flat and bounded. The cost is that a crash before shutdown causes recovery to generate missing hint files on startup, which is always correct and only slower.
 
