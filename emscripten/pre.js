@@ -9,17 +9,29 @@ Module.preRun.push(function () {
   }
 });
 
-// Wire up Symbol.dispose on Embind classes so `using db = ...` works
-// (TC39 Explicit Resource Management, Node.js 22+, TypeScript 5.2+).
+// Wire up Symbol.dispose and Symbol.iterator on Embind classes.
 Module.onRuntimeInitialized = Module.onRuntimeInitialized || function () {};
 var origInit = Module.onRuntimeInitialized;
 Module.onRuntimeInitialized = function () {
   origInit.call(this);
-  var classes = ['ByteCaskDB', 'Snapshot', 'WritePlan'];
-  for (var i = 0; i < classes.length; i++) {
-    var cls = Module[classes[i]];
+
+  // Symbol.dispose — explicit resource management (Node.js 22+, TC39)
+  var disposableClasses = ['ByteCaskDB', 'Snapshot', 'WritePlan',
+      'EntryIterator', 'KeyIterator', 'ReverseEntryIterator', 'ReverseKeyIterator'];
+  for (var i = 0; i < disposableClasses.length; i++) {
+    var cls = Module[disposableClasses[i]];
     if (cls && cls.prototype && typeof Symbol !== 'undefined' && Symbol.dispose) {
       cls.prototype[Symbol.dispose] = cls.prototype.close || cls.prototype.delete;
+    }
+  }
+
+  // Symbol.iterator — JS iterator protocol for scan classes
+  var iteratorClasses = ['EntryIterator', 'KeyIterator',
+      'ReverseEntryIterator', 'ReverseKeyIterator'];
+  for (var i = 0; i < iteratorClasses.length; i++) {
+    var cls = Module[iteratorClasses[i]];
+    if (cls && cls.prototype && typeof Symbol !== 'undefined' && Symbol.iterator) {
+      cls.prototype[Symbol.iterator] = function () { return this; };
     }
   }
 };

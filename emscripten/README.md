@@ -24,7 +24,7 @@ The build script:
 
 ## JavaScript API
 
-The Embind module exposes ByteCaskDB as a JS-callable API.
+The Embind module exposes ByteCaskDB as a JS-callable API. See [`API.md`](API.md) for the full specification.
 
 ```js
 import createByteCask from './build/bytecask.mjs';
@@ -34,27 +34,33 @@ const { ByteCaskDB, WritePlan } = Module;
 
 // Open a database (creates the directory if needed)
 const db = ByteCaskDB.open('/tmp/mydb');
+const db2 = ByteCaskDB.open('/tmp/mydb2', { maxFileBytes: 128 * 1024 * 1024 });
 
 // Put / Get / Del — keys and values are strings
-db.put('hello', 'world');          // async write (no fsync)
-db.putSync('hello', 'world');      // durable write (fsync)
+db.put('hello', 'world');                    // durable write (sync=true default)
+db.put('hello', 'world', { sync: false });   // async write (no fsync)
 
-const val = db.get('hello');       // Uint8Array | null
-Buffer.from(val).toString();       // "world"
+const val = db.get('hello');                 // Uint8Array | null
+Buffer.from(val).toString();                 // "world"
 
-db.containsKey('hello');           // true
-db.del('hello');                   // returns true if key existed
+db.containsKey('hello');                     // true
+db.del('hello');                             // returns true if key existed
 
 // Range deletion — all keys in [from, to)
 db.delRange('session:', 'session:~');
 
-// Ordered iteration — returns arrays (materialized, not lazy)
-const entries = db.entries('user:', 100);  // [{key: Uint8Array, value: Uint8Array}, ...]
-const keys = db.keys('user:', 100);       // [Uint8Array, ...]
+// Lazy iteration — JS iterator protocol (for...of, break, spread)
+for (const { key, value } of db.entries('user:')) {
+  console.log(Buffer.from(key).toString(), Buffer.from(value).toString());
+  if (/* enough */) break;  // lazy — stops fetching from WASM
+}
+
+// Key-only iteration
+for (const key of db.keys('user:')) { /* ... */ }
 
 // Reverse iteration
-const last = db.entriesReverse('user:~', 10);
-const lastKeys = db.keysReverse('user:~', 10);
+for (const { key, value } of db.entriesReverse('user:~')) { /* ... */ }
+for (const key of db.keysReverse('user:~')) { /* ... */ }
 
 // Atomic batch
 const plan = new WritePlan();
@@ -67,7 +73,7 @@ db.applyBatch(plan);  // true (committed)
 const snap = db.snapshot();
 snap.get('a');              // Uint8Array
 snap.containsKey('b');      // true
-snap.entries('', 100);      // read from frozen point-in-time view
+for (const { key } of snap.entries('')) { /* frozen view */ }
 
 // Optimistic concurrency (snapshot + guards)
 const snap2 = db.snapshot();
@@ -89,65 +95,14 @@ snap.close();
 } // db[Symbol.dispose]() called automatically
 ```
 
-### API Reference
-
-**ByteCaskDB**
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `ByteCaskDB.open(path)` | `ByteCaskDB` | Open or create a database at `path` |
-| `.get(key)` | `Uint8Array \| null` | Read a value |
-| `.put(key, value)` | `void` | Write (no fsync) |
-| `.putSync(key, value)` | `void` | Write with fsync |
-| `.del(key)` | `boolean` | Delete; returns true if key existed |
-| `.delSync(key)` | `boolean` | Delete with fsync |
-| `.delRange(from, to)` | `void` | Delete all keys in [from, to) |
-| `.containsKey(key)` | `boolean` | Check existence |
-| `.snapshot()` | `Snapshot` | Frozen point-in-time view |
-| `.applyBatch(plan)` | `boolean` | Atomic batch; false on conflict |
-| `.applyBatchNoSync(plan)` | `boolean` | Atomic batch without fsync |
-| `.entries(from, limit)` | `Array<{key, value}>` | Forward scan from key |
-| `.keys(from, limit)` | `Array<Uint8Array>` | Forward key-only scan |
-| `.entriesReverse(from, limit)` | `Array<{key, value}>` | Reverse scan |
-| `.keysReverse(from, limit)` | `Array<Uint8Array>` | Reverse key-only scan |
-| `.vacuum()` | `boolean` | Reclaim space; true if a file was vacuumed |
-| `.isDegraded()` | `boolean` | Check for degraded state |
-| `.degradedReason()` | `string` | Reason for degraded state |
-| `.resume()` | `void` | Recover from degraded state |
-| `.close()` | `void` | Close the database |
-
-**Snapshot** — read-only, frozen view
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `.get(key)` | `Uint8Array \| null` | Read from snapshot |
-| `.containsKey(key)` | `boolean` | Check existence in snapshot |
-| `.entries(from, limit)` | `Array<{key, value}>` | Forward scan |
-| `.keys(from, limit)` | `Array<Uint8Array>` | Key-only scan |
-| `.close()` | `void` | Release the snapshot |
-
-**WritePlan** — atomic batch builder
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `new WritePlan()` | `WritePlan` | Unguarded batch |
-| `WritePlan.withSnapshot(snap)` | `WritePlan` | Guarded batch (consumes snapshot) |
-| `.put(key, value)` | `void` | Add a put operation |
-| `.del(key)` | `void` | Add a delete operation |
-| `.delRange(from, to)` | `void` | Add a range delete |
-| `.ensurePresent(key)` | `void` | Guard: key must exist |
-| `.ensureAbsent(key)` | `void` | Guard: key must not exist |
-| `.ensureUnchanged(key)` | `void` | Guard: key unchanged since snapshot |
-| `.ensureRangeUnchanged(from, to)` | `void` | Guard: no changes in [from, to) |
-| `.close()` | `void` | Release the plan |
-
 ### Notes
 
 - Keys and values are passed as UTF-8 strings. Binary keys are not yet supported.
-- `entries()` / `keys()` materialize results into arrays. Use the `limit` parameter for large datasets.
-- Call `.close()` on DB, Snapshot, and WritePlan when done to free C++ memory. There is no garbage collection integration.
-- All types support `Symbol.dispose` for use with `using` declarations (Node.js 22+).
+- Scan methods (`entries`, `keys`, `entriesReverse`, `keysReverse`) return lazy JS iterators. Use `for...of` and `break` for bounded scans.
+- Iterator objects hold C++ state. Close them when done, or consume to exhaustion, or use `using` declarations. All iterator and resource types support `Symbol.dispose` (Node.js 22+).
+- Call `.close()` on DB, Snapshot, WritePlan, and iterators when done to free C++ memory. There is no garbage collection integration.
 - C++ exceptions (I/O errors, CRC mismatches) are thrown as JS `Error` objects.
+- All write methods default to `sync: true`. Pass `{ sync: false }` for async writes.
 
 ## Benchmarks
 
@@ -183,10 +138,11 @@ node build/bytecask_node.js
 | File | Description |
 |------|-------------|
 | `build.sh` | Build script — compiles dependencies, modules, and links all targets |
-| `bytecask_embind.cpp` | Embind binding layer — exposes DB, Snapshot, WritePlan to JS |
+| `bytecask_embind.cpp` | Embind binding layer — exposes DB, Snapshot, WritePlan, iterators to JS |
 | `test_node.cpp` | Minimal C++ smoke test: write, read, recovery |
-| `pre.js` | Emscripten pre-run hook: env propagation + Symbol.dispose wiring |
+| `pre.js` | Emscripten pre-run hook: env propagation, Symbol.dispose, Symbol.iterator wiring |
 | `run.sh` | Helper to run built binaries with env propagation |
+| `API.md` | Full JavaScript API specification |
 
 ## Clean rebuild
 
