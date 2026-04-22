@@ -58,9 +58,6 @@ class VacuumOptions:
     fragmentation_threshold: float
     """Minimum fragmentation ratio [0.0, 1.0] for a file to be eligible."""
 
-    absorb_threshold: int
-    """Max live bytes for absorption into active file (default 1 MiB)."""
-
     def __init__(self) -> None: ...
 
 # ---------------------------------------------------------------------------
