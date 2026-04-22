@@ -542,7 +542,6 @@ class DB:
         self,
         *,
         fragmentation_threshold: float | None = None,
-        absorb_threshold: int | None = None,
     ) -> bool:
         """Run one vacuum pass. Return True if a file was vacuumed.
 
@@ -554,8 +553,6 @@ class DB:
         opts = _bc.VacuumOptions()
         if fragmentation_threshold is not None:
             opts.fragmentation_threshold = fragmentation_threshold
-        if absorb_threshold is not None:
-            opts.absorb_threshold = absorb_threshold
         return self._db.vacuum(opts)
 
     def resume(self) -> None:
