@@ -6,6 +6,7 @@
 module;
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -52,6 +53,7 @@ import bytecask.util;
 namespace bytecask {
 
 DbDegraded::~DbDegraded() = default;
+DbFollowerMode::~DbFollowerMode() = default;
 
 #pragma region Internal helpers
 
@@ -105,16 +107,19 @@ TransientEngineState::TransientEngineState(
     TransientU32Map<std::shared_ptr<DataFile>> files,
     TransientU32Map<FileStats> file_stats,
     std::uint32_t active_file_id, std::uint32_t next_file_id,
-    std::uint64_t next_seq, std::uint64_t durable_seq)
+    std::uint64_t next_seq, std::uint64_t durable_seq,
+    Mode mode, bool degraded, std::string degraded_reason)
     : key_dir_{std::move(key_dir)}, files_{std::move(files)},
       file_stats_{std::move(file_stats)}, active_file_id_{active_file_id},
       next_file_id_{next_file_id}, next_seq_{next_seq},
-      durable_seq_{durable_seq} {}
+      durable_seq_{durable_seq}, mode_{mode}, degraded_{degraded},
+      degraded_reason_{std::move(degraded_reason)} {}
 
 auto EngineState::transient() const -> TransientEngineState {
   return TransientEngineState{
       key_dir.transient(), files.transient(), file_stats.transient(),
-      active_file_id, next_file_id, next_seq, durable_seq};
+      active_file_id, next_file_id, next_seq, durable_seq,
+      mode, degraded, degraded_reason};
 }
 
 auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
@@ -205,8 +210,8 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
 }
 
 auto TransientEngineState::prepare_write(const WritePlan &plan) const
-    -> std::vector<AppendEntry> {
-  std::vector<AppendEntry> entries;
+    -> std::vector<DataEntryView> {
+  std::vector<DataEntryView> entries;
   const auto wc = plan.write_count();
   if (wc == 0) return entries;
 
@@ -362,6 +367,106 @@ void TransientEngineState::apply_writes(
       });
 }
 
+void TransientEngineState::apply_ingest(
+    std::span<const DataEntryView> entries,
+    std::span<const std::uint64_t> offsets) {
+  assert(entries.size() == offsets.size());
+  if (entries.empty()) return;
+
+  const auto batch_start_seq = entries.front().sequence;
+  std::uint64_t max_seq = 0;
+
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    const auto &e = entries[i];
+    const auto offset = offsets[i];
+    if (e.sequence > max_seq) max_seq = e.sequence;
+
+    switch (e.entry_type) {
+    case EntryType::BulkBegin:
+    case EntryType::BulkEnd:
+      file_stats_.update(active_file_id_, [](FileStats &fs) {
+        fs.total_bytes += kHeaderSize + kCrcSize;
+      });
+      break;
+
+    case EntryType::Put: {
+      const auto existing = key_dir_.get(e.key);
+      if (existing) {
+        const auto dec =
+            entry_size(e.key.size(), existing->value_size);
+        const auto ef = existing->file_id;
+        file_stats_.update(
+            ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+      }
+      const auto val_size = narrow<std::uint32_t>(e.value.size());
+      const auto sz = entry_size(e.key.size(), val_size);
+      file_stats_.update(active_file_id_, [sz](FileStats &fs) {
+        fs.live_bytes += sz;
+        fs.total_bytes += sz;
+      });
+      key_dir_.set(e.key, KeyDirEntry{e.sequence, active_file_id_,
+                                       offset, val_size});
+      break;
+    }
+
+    case EntryType::Delete: {
+      const auto existing = key_dir_.get(e.key);
+      if (existing) {
+        const auto dec =
+            entry_size(e.key.size(), existing->value_size);
+        const auto ef = existing->file_id;
+        file_stats_.update(
+            ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+      }
+      const auto del_sz = entry_size(e.key.size(), 0);
+      file_stats_.update(active_file_id_, [del_sz](FileStats &fs) {
+        fs.total_bytes += del_sz;
+      });
+      key_dir_.erase(e.key);
+      break;
+    }
+
+    case EntryType::RangeDel: {
+      // key = from, value = to
+      std::vector<Key> to_erase;
+      for (auto it = key_dir_.lower_bound(e.key);
+           it != std::default_sentinel; ++it) {
+        auto [key_span, entry] = *it;
+        if (Key{key_span} >= Key{e.value}) break;
+        const auto dec =
+            entry_size(key_span.size(), entry.value_size);
+        const auto ef = entry.file_id;
+        file_stats_.update(
+            ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+        to_erase.emplace_back(key_span);
+      }
+      for (const auto &k : to_erase) {
+        key_dir_.erase(std::span<const std::byte>{k});
+      }
+      const auto rd_sz = entry_size(e.key.size(), e.value.size());
+      file_stats_.update(active_file_id_, [rd_sz](FileStats &fs) {
+        fs.total_bytes += rd_sz;
+      });
+      break;
+    }
+    }
+  }
+
+  // Advance next_seq past the highest ingested sequence.
+  if (max_seq >= next_seq_) next_seq_ = max_seq + 1;
+
+  // Track per-file sequence bounds.
+  const auto batch_end_seq = max_seq;
+  file_stats_.update(
+      active_file_id_,
+      [batch_start_seq, batch_end_seq](FileStats &fs) {
+        if (fs.min_sequence == 0 || batch_start_seq < fs.min_sequence)
+          fs.min_sequence = batch_start_seq;
+        if (batch_end_seq > fs.max_sequence)
+          fs.max_sequence = batch_end_seq;
+      });
+}
+
 void TransientEngineState::apply_rotate_file(
     std::shared_ptr<DataFile> new_file) {
   active_file_id_ = next_file_id_++;
@@ -475,6 +580,10 @@ auto TransientEngineState::active_file() -> DataFile & {
   return **files_.get(active_file_id_);
 }
 
+auto TransientEngineState::active_file_ptr() const -> std::shared_ptr<DataFile> {
+  return *files_.get(active_file_id_);
+}
+
 auto TransientEngineState::active_file_id() const noexcept -> std::uint32_t {
   return active_file_id_;
 }
@@ -486,10 +595,6 @@ auto TransientEngineState::is_rotation_needed(std::uint64_t threshold) const
 
 auto TransientEngineState::next_seq() const noexcept -> std::uint64_t {
   return next_seq_;
-}
-
-void TransientEngineState::advance_next_seq(std::uint64_t new_seq) noexcept {
-  next_seq_ = new_seq;
 }
 
 void TransientEngineState::apply_sync(std::uint64_t batch_max_seq) {
@@ -511,6 +616,9 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   s->next_file_id = next_file_id_;
   s->next_seq = next_seq_;
   s->durable_seq = durable_seq_;
+  s->mode = mode_;
+  s->degraded = degraded_;
+  s->degraded_reason = std::move(degraded_reason_);
   return s;
 }
 
@@ -564,6 +672,7 @@ DB::DB(std::filesystem::path dir, Options opts)
     // All recovered entries were previously synced.
     initial->durable_seq =
         initial->next_seq > 0 ? initial->next_seq - 1 : 0;
+    initial->mode = opts.initial_mode;
     validate_state_consistency(*initial);
     store_initial_state(std::move(initial));
   } catch (...) {
@@ -674,7 +783,10 @@ auto DB::snapshot() const -> Snapshot {
 // thin wrappers that construct a WritePlan and delegate here.
 auto DB::apply_batch(WriteOptions opts,
                         WritePlan plan) -> bool {
-  if (is_degraded()) throw DbDegraded{degraded_reason_};
+  if (auto s = load_state(); !s->is_write_allowed()) {
+    if (s->degraded) throw DbDegraded{s->degraded_reason};
+    throw DbFollowerMode{"write rejected: engine is in follower mode"};
+  }
   if (plan.empty()) return true;
 
   EngineSlot slot;
@@ -703,7 +815,7 @@ auto DB::apply_batch(WriteOptions opts,
 // the total byte size of entries produced. Returns false on validation
 // failure (slot.result set to false).
 auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
-                      std::vector<AppendEntry> &all_entries,
+                      std::vector<DataEntryView> &all_entries,
                       std::uint64_t &running_offset) -> bool {
   if (slot.plan.empty()) {
     slot.result = true;
@@ -747,17 +859,20 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
 void DB::execute_slots(std::vector<Slot *> &batch) {
   std::lock_guard<std::mutex> wg{*write_mu_};
 
-  if (is_degraded()) {
-    auto ex = std::make_exception_ptr(DbDegraded{degraded_reason_});
+  auto current = load_state_for_write();
+  if (!current->is_write_allowed()) {
+    auto ex = current->degraded
+        ? std::make_exception_ptr(DbDegraded{current->degraded_reason})
+        : std::make_exception_ptr(
+              DbFollowerMode{"write rejected: engine is in follower mode"});
     for (auto *s : batch) s->err = ex;
     return;
   }
 
-  auto current = load_state_for_write();
   auto t = current->transient();
   auto &file = t.active_file();
   auto running_offset = static_cast<std::uint64_t>(file.size());
-  std::vector<AppendEntry> all_entries;
+  std::vector<DataEntryView> all_entries;
   auto any_sync = false;
 
   // Phase 1: pure in-memory — validate, prepare, pre-compute offsets,
@@ -781,10 +896,11 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   } catch (...) {
     auto ex = std::current_exception();
     try { file.sync(); } catch (...) {}
-    publish_seq_advance(current, t.next_seq());
-    deem_as_degraded(std::format(
+    auto err_t = current->transient();
+    err_t.apply_degrade(std::format(
         "append IO error on '{}': call resume() to recover.",
         file.path().string()));
+    store_state(std::move(err_t).persistent());
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
@@ -798,11 +914,12 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
       t.apply_sync(batch_max_seq);
     } catch (...) {
       auto ex = std::current_exception();
-      publish_seq_advance(current, t.next_seq());
-      deem_as_degraded(std::format(
+      auto err_t = current->transient();
+      err_t.apply_degrade(std::format(
           "rotation fdatasync failed on '{}': bytes in page cache but "
           "durability not confirmed. Call resume() to recover.",
           file.path().string()));
+      store_state(std::move(err_t).persistent());
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
       }
@@ -812,7 +929,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
       rotate_active_file(t, current);
     } catch (...) {
       auto ex = std::current_exception();
-      deem_as_degraded(std::format(
+      t.apply_degrade(std::format(
           "post-write rotation failed for '{}': active file is sealed "
           "but new file could not be created. Call resume() to recover.",
           file.path().string()));
@@ -830,11 +947,12 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
       t.apply_sync(batch_max_seq);
     } catch (...) {
       auto ex = std::current_exception();
-      publish_seq_advance(current, t.next_seq());
-      deem_as_degraded(std::format(
+      auto err_t = current->transient();
+      err_t.apply_degrade(std::format(
           "commit fdatasync failed on '{}': bytes in page cache but "
           "durability not confirmed. Call resume() to recover.",
           file.path().string()));
+      store_state(std::move(err_t).persistent());
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
       }
@@ -969,7 +1087,7 @@ auto DB::rkeys_from(const ReadOptions &opts, BytesView from) const
 // write_mu_.
 auto DB::vacuum(VacuumOptions opts) -> bool {
   std::lock_guard<std::mutex> vg{*vacuum_mu_};
-  if (is_degraded()) throw DbDegraded{degraded_reason_};
+  if (auto s = load_state(); s->degraded) throw DbDegraded{s->degraded_reason};
 
   // Drain in-flight background hint writes so that vacuum's
   // flush_hints_for call cannot race on the same .hint.tmp file.
@@ -1021,9 +1139,9 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 // background worker, and opens a new active file.
 // Caller must sync the active file before calling if durability is required.
 void DB::rotate_active_file(TransientEngineState &t,
-                            const std::shared_ptr<const EngineState> &current) {
+                            const std::shared_ptr<const EngineState> &) {
   t.active_file().seal();
-  auto sealed_file = *current->files.get(t.active_file_id());
+  auto sealed_file = t.active_file_ptr();
   auto dir = dir_;
   worker_.dispatch([f = std::move(sealed_file), d = std::move(dir)] {
     flush_hints_for(f, d);
@@ -1274,25 +1392,40 @@ void DB::vacuum_remove_file(std::uint32_t file_id) {
 
 #pragma region State access
 
-void DB::publish_seq_advance(const std::shared_ptr<const EngineState> &current,
-                              std::uint64_t target_seq) {
-  auto seq_only = current->transient();
-  seq_only.advance_next_seq(target_seq);
-  store_state(current, std::move(seq_only).persistent());
+auto DB::mode() const noexcept -> Mode {
+  return load_state()->mode;
+}
+
+auto DB::is_degraded() const noexcept -> bool {
+  return load_state()->degraded;
+}
+
+auto DB::degraded_reason() const noexcept -> std::string {
+  return load_state()->degraded_reason;
+}
+
+void DB::set_mode(Mode mode) {
+  std::lock_guard<std::mutex> wg{*write_mu_};
+  auto current = load_state_for_write();
+  auto t = current->transient();
+  t.apply_set_mode(mode);
+  store_state(current, std::move(t).persistent());
 }
 
 void DB::deem_as_degraded(std::string reason) {
-  degraded_reason_ = std::move(reason);
-  degraded_.store(true, std::memory_order_release);
+  auto current = load_state_for_write();
+  auto t = current->transient();
+  t.apply_degrade(std::move(reason));
+  store_state(std::move(t).persistent());
 }
 
 void DB::resume() {
   if (!is_degraded()) return;
 
   auto guard = std::unique_lock<std::mutex>{*write_mu_};
-  if (!is_degraded()) return;  // re-check under lock
-
   auto current = load_state_for_write();
+  if (!current->degraded) return;  // re-check under lock
+
   const auto old_file_id = current->active_file_id;
   auto &file = **current->files.get(old_file_id);
 
@@ -1355,12 +1488,10 @@ void DB::resume() {
   t.apply_rotate_file(std::move(new_file));
   // All entries recovered from disk were previously synced.
   t.apply_sync(t.next_seq() > 0 ? t.next_seq() - 1 : 0);
+  t.apply_clear_degraded();
   auto resumed = std::move(t).persistent();
   validate_state_consistency(*resumed);
   store_state(current, std::move(resumed));
-
-  // Success: clear degraded flag.
-  degraded_.store(false, std::memory_order_release);
 }
 
 auto DB::current_sequence(std::chrono::milliseconds timeout) const
@@ -1380,9 +1511,10 @@ auto DB::create_manifest() -> FileManifest {
   std::uint64_t through_seq;
   {
     std::lock_guard<std::mutex> wg{*write_mu_};
-    if (is_degraded()) throw DbDegraded{degraded_reason_};
 
     auto current = load_state_for_write();
+    if (current->degraded) throw DbDegraded{current->degraded_reason};
+
     auto t = current->transient();
 
     // Sync active file to make all entries durable.
@@ -2086,7 +2218,7 @@ public:
 
   auto has_more() const -> bool { return has_entry_; }
 
-  auto current() const -> const RawEntry& { return cached_entry_; }
+  auto current() const -> const DataEntryView& { return cached_entry_; }
 
   void advance() {
     advance_to_next_valid();
@@ -2166,7 +2298,7 @@ private:
 
   // Cached current entry — BytesView into entry_iter_'s internal buffer.
   bool has_entry_{false};
-  RawEntry cached_entry_;
+  DataEntryView cached_entry_;
 };
 
 // ChangeIterator methods
@@ -2206,6 +2338,126 @@ auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
   auto state = snap.state();
   auto begin = ChangeIterator{state, from_sequence, state->durable_seq};
   return {std::move(begin), std::default_sentinel};
+}
+
+#pragma endregion
+
+#pragma region Ingest (follower replication)
+
+void DB::ingest(std::span<const DataEntryView> entries) {
+  if (auto s = load_state(); !s->is_ingestion_allowed()) {
+    if (s->degraded) throw DbDegraded{s->degraded_reason};
+    throw std::logic_error{"ingest rejected: engine is not in follower mode"};
+  }
+  if (entries.empty()) return;
+
+  std::lock_guard<std::mutex> wg{*write_mu_};
+
+  auto current = load_state_for_write();
+  if (!current->is_ingestion_allowed()) {
+    if (current->degraded) throw DbDegraded{current->degraded_reason};
+    throw std::logic_error{"ingest rejected: engine is not in follower mode"};
+  }
+
+  auto t = current->transient();
+
+  // Filter: skip already-ingested entries (idempotency).
+  auto remaining = entries;
+  while (!remaining.empty() &&
+         remaining.front().sequence <= current->durable_seq) {
+    remaining = remaining.subspan(1);
+  }
+  if (remaining.empty()) return;
+
+  // Chunk-and-rotate loop: write entries in chunks, rotating between chunks
+  // at safe boundaries (never inside BulkBegin..BulkEnd).
+  while (!remaining.empty()) {
+    auto &file = t.active_file();
+
+    // Find chunk end: largest prefix that keeps batches intact.
+    std::size_t chunk_end = remaining.size();
+    bool needs_rotation = false;
+    bool in_batch = false;
+    auto running_bytes = static_cast<std::uint64_t>(file.size());
+    for (std::size_t i = 0; i < remaining.size(); ++i) {
+      running_bytes += entry_size(remaining[i].key.size(),
+                                  remaining[i].value.size());
+      if (remaining[i].entry_type == EntryType::BulkBegin) in_batch = true;
+      else if (remaining[i].entry_type == EntryType::BulkEnd) in_batch = false;
+
+      if (!in_batch && running_bytes >= rotation_threshold_ &&
+          i + 1 < remaining.size()) {
+        chunk_end = i + 1;
+        needs_rotation = true;
+        break;
+      }
+    }
+
+    auto chunk = remaining.subspan(0, chunk_end);
+
+    // Phase 1: compute offsets, apply in-memory state.
+    auto file_offset = static_cast<std::uint64_t>(file.size());
+    std::vector<std::uint64_t> offsets(chunk.size());
+    for (std::size_t i = 0; i < chunk.size(); ++i) {
+      offsets[i] = file_offset;
+      file_offset += entry_size(chunk[i].key.size(), chunk[i].value.size());
+    }
+
+    t.apply_ingest(chunk, offsets);
+    auto chunk_max_seq = chunk.back().sequence;
+
+    // Phase 2: writev chunk to active file.
+    std::vector<std::uint64_t> io_offsets(chunk.size());
+    try {
+      file.append_entries(chunk, io_offsets);
+    } catch (...) {
+      auto ex = std::current_exception();
+      try { file.sync(); } catch (...) {}
+      auto err_t = current->transient();
+      err_t.apply_degrade(
+          "ingest append IO error: call resume() to recover.");
+      store_state(std::move(err_t).persistent());
+      std::rethrow_exception(ex);
+    }
+
+    // Phase 3: if rotation needed, sync before sealing.
+    if (needs_rotation) {
+      try {
+        file.sync();
+        t.apply_sync(chunk_max_seq);
+      } catch (...) {
+        auto err_t = current->transient();
+        err_t.apply_degrade(
+            "ingest rotation fdatasync failed: call resume() to recover.");
+        store_state(std::move(err_t).persistent());
+        throw;
+      }
+      try {
+        rotate_active_file(t, current);
+      } catch (...) {
+        t.apply_degrade(
+            "ingest post-rotation file creation failed: call resume().");
+        store_state(current, std::move(t).persistent());
+        throw;
+      }
+    }
+
+    remaining = remaining.subspan(chunk_end);
+  }
+
+  // Final sync: ensure last chunk is durable before publishing.
+  try {
+    t.active_file().sync();
+    t.apply_sync(t.next_seq() - 1);
+  } catch (...) {
+    auto err_t = current->transient();
+    err_t.apply_degrade(
+        "ingest fdatasync failed: call resume() to recover.");
+    store_state(std::move(err_t).persistent());
+    throw;
+  }
+
+  store_state(current, std::move(t).persistent());
 }
 
 #pragma endregion

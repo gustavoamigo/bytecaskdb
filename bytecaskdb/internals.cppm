@@ -12,6 +12,7 @@ module;
 #include <map>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 export module bytecask:internals;
@@ -93,6 +94,17 @@ export struct EngineState {
   std::uint32_t next_file_id{};
   std::uint64_t next_seq{1};
   std::uint64_t durable_seq{0};
+  Mode mode{Mode::Leader};
+  bool degraded{false};
+  std::string degraded_reason;
+
+  [[nodiscard]] auto is_write_allowed() const noexcept -> bool {
+    return mode == Mode::Leader && !degraded;
+  }
+
+  [[nodiscard]] auto is_ingestion_allowed() const noexcept -> bool {
+    return mode == Mode::Follower && !degraded;
+  }
 
   [[nodiscard]] auto active_file() -> DataFile & {
     return **files.get(active_file_id);

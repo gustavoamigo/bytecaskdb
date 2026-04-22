@@ -174,7 +174,7 @@ public:
   // Each chunk of up to kMaxEntriesPerWritev entries is written with a single
   // writev(). Offsets are written into offsets_out (must be same size as
   // entries). Failure semantics identical to append_entry: tainted + throw.
-  void append_entries(std::span<const AppendEntry> entries,
+  void append_entries(std::span<const DataEntryView> entries,
                       std::span<Offset> offsets_out) {
     assert(entries.size() == offsets_out.size());
     if (entries.empty()) return;

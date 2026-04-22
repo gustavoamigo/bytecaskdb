@@ -87,7 +87,7 @@ TEST_CASE("prove__empty_db__single_put__append_fails_nothing_written", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -120,7 +120,7 @@ TEST_CASE("prove__empty_db__single_put__append_fails_partial_write", "[prove]") 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -154,7 +154,7 @@ TEST_CASE("prove__empty_db__single_put__append_fails_after_full_write", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -188,7 +188,7 @@ TEST_CASE("prove__empty_db__single_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -253,7 +253,7 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_nothing_written", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -286,7 +286,7 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_partial_write", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -320,7 +320,7 @@ TEST_CASE("prove__empty_db__single_delete__append_fails_after_full_write", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -354,7 +354,7 @@ TEST_CASE("prove__empty_db__single_delete__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -420,7 +420,7 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_nothing_written", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -454,7 +454,7 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_partial_write", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -489,7 +489,7 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_after_full_write", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -524,7 +524,7 @@ TEST_CASE("prove__empty_db__multi_put__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -558,7 +558,7 @@ TEST_CASE("prove__empty_db__multi_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -625,7 +625,7 @@ TEST_CASE("prove__empty_db__mixed_batch__append_fails_nothing_written", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -659,7 +659,7 @@ TEST_CASE("prove__empty_db__mixed_batch__append_fails_partial_write", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -694,7 +694,7 @@ TEST_CASE("prove__empty_db__mixed_batch__append_fails_after_full_write", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -729,7 +729,7 @@ TEST_CASE("prove__empty_db__mixed_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -763,7 +763,7 @@ TEST_CASE("prove__empty_db__mixed_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -831,7 +831,7 @@ TEST_CASE("prove__empty_db__large_batch__append_fails_nothing_written", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -866,7 +866,7 @@ TEST_CASE("prove__empty_db__large_batch__append_fails_partial_write", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -902,7 +902,7 @@ TEST_CASE("prove__empty_db__large_batch__append_fails_after_full_write", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -938,7 +938,7 @@ TEST_CASE("prove__empty_db__large_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -973,7 +973,7 @@ TEST_CASE("prove__empty_db__large_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1042,7 +1042,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_nothing_written
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1077,7 +1077,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_partial_write",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1113,7 +1113,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__append_fails_after_full_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1149,7 +1149,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__commit_sync_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1251,7 +1251,7 @@ TEST_CASE("prove__empty_db__causality_overwrite__append_fails_nothing_written", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1285,7 +1285,7 @@ TEST_CASE("prove__empty_db__causality_overwrite__append_fails_partial_write", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1320,7 +1320,7 @@ TEST_CASE("prove__empty_db__causality_overwrite__append_fails_after_full_write",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1355,7 +1355,7 @@ TEST_CASE("prove__empty_db__causality_overwrite__on_bulk_end_append", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1389,7 +1389,7 @@ TEST_CASE("prove__empty_db__causality_overwrite__commit_sync_fails", "[prove]") 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1456,7 +1456,7 @@ TEST_CASE("prove__empty_db__causality_put_del__append_fails_nothing_written", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1490,7 +1490,7 @@ TEST_CASE("prove__empty_db__causality_put_del__append_fails_partial_write", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1525,7 +1525,7 @@ TEST_CASE("prove__empty_db__causality_put_del__append_fails_after_full_write", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1560,7 +1560,7 @@ TEST_CASE("prove__empty_db__causality_put_del__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1594,7 +1594,7 @@ TEST_CASE("prove__empty_db__causality_put_del__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1661,7 +1661,7 @@ TEST_CASE("prove__empty_db__causality_del_put__append_fails_nothing_written", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1695,7 +1695,7 @@ TEST_CASE("prove__empty_db__causality_del_put__append_fails_partial_write", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1730,7 +1730,7 @@ TEST_CASE("prove__empty_db__causality_del_put__append_fails_after_full_write", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1765,7 +1765,7 @@ TEST_CASE("prove__empty_db__causality_del_put__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1799,7 +1799,7 @@ TEST_CASE("prove__empty_db__causality_del_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1867,7 +1867,7 @@ TEST_CASE("prove__empty_db__causality_put_del_put__append_fails_nothing_written"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1902,7 +1902,7 @@ TEST_CASE("prove__empty_db__causality_put_del_put__append_fails_partial_write", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1938,7 +1938,7 @@ TEST_CASE("prove__empty_db__causality_put_del_put__append_fails_after_full_write
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -1974,7 +1974,7 @@ TEST_CASE("prove__empty_db__causality_put_del_put__on_bulk_end_append", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2009,7 +2009,7 @@ TEST_CASE("prove__empty_db__causality_put_del_put__commit_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2077,7 +2077,7 @@ TEST_CASE("prove__empty_db__solo_causality_overwrite__append_fails_nothing_writt
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2111,7 +2111,7 @@ TEST_CASE("prove__empty_db__solo_causality_overwrite__append_fails_partial_write
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2146,7 +2146,7 @@ TEST_CASE("prove__empty_db__solo_causality_overwrite__append_fails_after_full_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2181,7 +2181,7 @@ TEST_CASE("prove__empty_db__solo_causality_overwrite__on_bulk_end_append", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2215,7 +2215,7 @@ TEST_CASE("prove__empty_db__solo_causality_overwrite__commit_sync_fails", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2282,7 +2282,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del__append_fails_nothing_written
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2316,7 +2316,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del__append_fails_partial_write",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2351,7 +2351,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del__append_fails_after_full_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2386,7 +2386,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del__on_bulk_end_append", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2420,7 +2420,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del__commit_sync_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2487,7 +2487,7 @@ TEST_CASE("prove__empty_db__solo_causality_del_put__append_fails_nothing_written
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2521,7 +2521,7 @@ TEST_CASE("prove__empty_db__solo_causality_del_put__append_fails_partial_write",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2556,7 +2556,7 @@ TEST_CASE("prove__empty_db__solo_causality_del_put__append_fails_after_full_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2591,7 +2591,7 @@ TEST_CASE("prove__empty_db__solo_causality_del_put__on_bulk_end_append", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2625,7 +2625,7 @@ TEST_CASE("prove__empty_db__solo_causality_del_put__commit_sync_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2693,7 +2693,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del_put__append_fails_nothing_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2728,7 +2728,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del_put__append_fails_partial_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2764,7 +2764,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del_put__append_fails_after_full_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2800,7 +2800,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del_put__on_bulk_end_append", "[p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2835,7 +2835,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del_put__commit_sync_fails", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2902,7 +2902,7 @@ TEST_CASE("prove__empty_db__sequential_overwrite__append_fails_nothing_written",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2935,7 +2935,7 @@ TEST_CASE("prove__empty_db__sequential_overwrite__append_fails_partial_write", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -2969,7 +2969,7 @@ TEST_CASE("prove__empty_db__sequential_overwrite__append_fails_after_full_write"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3003,7 +3003,7 @@ TEST_CASE("prove__empty_db__sequential_overwrite__commit_sync_fails", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3068,7 +3068,7 @@ TEST_CASE("prove__empty_db__solo_sequential_overwrite__append_fails_nothing_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3101,7 +3101,7 @@ TEST_CASE("prove__empty_db__solo_sequential_overwrite__append_fails_partial_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3135,7 +3135,7 @@ TEST_CASE("prove__empty_db__solo_sequential_overwrite__append_fails_after_full_w
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3169,7 +3169,7 @@ TEST_CASE("prove__empty_db__solo_sequential_overwrite__commit_sync_fails", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3235,7 +3235,7 @@ TEST_CASE("prove__single_key__single_put__append_fails_nothing_written", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3269,7 +3269,7 @@ TEST_CASE("prove__single_key__single_put__append_fails_partial_write", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3304,7 +3304,7 @@ TEST_CASE("prove__single_key__single_put__append_fails_after_full_write", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3339,7 +3339,7 @@ TEST_CASE("prove__single_key__single_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3406,7 +3406,7 @@ TEST_CASE("prove__single_key__single_delete__append_fails_nothing_written", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3440,7 +3440,7 @@ TEST_CASE("prove__single_key__single_delete__append_fails_partial_write", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3475,7 +3475,7 @@ TEST_CASE("prove__single_key__single_delete__append_fails_after_full_write", "[p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3510,7 +3510,7 @@ TEST_CASE("prove__single_key__single_delete__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3578,7 +3578,7 @@ TEST_CASE("prove__single_key__multi_put__append_fails_nothing_written", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3613,7 +3613,7 @@ TEST_CASE("prove__single_key__multi_put__append_fails_partial_write", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3649,7 +3649,7 @@ TEST_CASE("prove__single_key__multi_put__append_fails_after_full_write", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3685,7 +3685,7 @@ TEST_CASE("prove__single_key__multi_put__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3720,7 +3720,7 @@ TEST_CASE("prove__single_key__multi_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3789,7 +3789,7 @@ TEST_CASE("prove__single_key__mixed_batch__append_fails_nothing_written", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3824,7 +3824,7 @@ TEST_CASE("prove__single_key__mixed_batch__append_fails_partial_write", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3860,7 +3860,7 @@ TEST_CASE("prove__single_key__mixed_batch__append_fails_after_full_write", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3896,7 +3896,7 @@ TEST_CASE("prove__single_key__mixed_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -3931,7 +3931,7 @@ TEST_CASE("prove__single_key__mixed_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4001,7 +4001,7 @@ TEST_CASE("prove__single_key__large_batch__append_fails_nothing_written", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4037,7 +4037,7 @@ TEST_CASE("prove__single_key__large_batch__append_fails_partial_write", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4074,7 +4074,7 @@ TEST_CASE("prove__single_key__large_batch__append_fails_after_full_write", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4111,7 +4111,7 @@ TEST_CASE("prove__single_key__large_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4147,7 +4147,7 @@ TEST_CASE("prove__single_key__large_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4219,7 +4219,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_nothing_writt
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4256,7 +4256,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_partial_write
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4294,7 +4294,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__append_fails_after_full_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4332,7 +4332,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__commit_sync_fails", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4438,7 +4438,7 @@ TEST_CASE("prove__single_key__causality_overwrite__append_fails_nothing_written"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4473,7 +4473,7 @@ TEST_CASE("prove__single_key__causality_overwrite__append_fails_partial_write", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4509,7 +4509,7 @@ TEST_CASE("prove__single_key__causality_overwrite__append_fails_after_full_write
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4545,7 +4545,7 @@ TEST_CASE("prove__single_key__causality_overwrite__on_bulk_end_append", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4580,7 +4580,7 @@ TEST_CASE("prove__single_key__causality_overwrite__commit_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4649,7 +4649,7 @@ TEST_CASE("prove__single_key__causality_put_del__append_fails_nothing_written", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4684,7 +4684,7 @@ TEST_CASE("prove__single_key__causality_put_del__append_fails_partial_write", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4720,7 +4720,7 @@ TEST_CASE("prove__single_key__causality_put_del__append_fails_after_full_write",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4756,7 +4756,7 @@ TEST_CASE("prove__single_key__causality_put_del__on_bulk_end_append", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4791,7 +4791,7 @@ TEST_CASE("prove__single_key__causality_put_del__commit_sync_fails", "[prove]") 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4860,7 +4860,7 @@ TEST_CASE("prove__single_key__causality_del_put__append_fails_nothing_written", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4895,7 +4895,7 @@ TEST_CASE("prove__single_key__causality_del_put__append_fails_partial_write", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4931,7 +4931,7 @@ TEST_CASE("prove__single_key__causality_del_put__append_fails_after_full_write",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -4967,7 +4967,7 @@ TEST_CASE("prove__single_key__causality_del_put__on_bulk_end_append", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5002,7 +5002,7 @@ TEST_CASE("prove__single_key__causality_del_put__commit_sync_fails", "[prove]") 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5072,7 +5072,7 @@ TEST_CASE("prove__single_key__causality_put_del_put__append_fails_nothing_writte
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5108,7 +5108,7 @@ TEST_CASE("prove__single_key__causality_put_del_put__append_fails_partial_write"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5145,7 +5145,7 @@ TEST_CASE("prove__single_key__causality_put_del_put__append_fails_after_full_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5182,7 +5182,7 @@ TEST_CASE("prove__single_key__causality_put_del_put__on_bulk_end_append", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5218,7 +5218,7 @@ TEST_CASE("prove__single_key__causality_put_del_put__commit_sync_fails", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5288,7 +5288,7 @@ TEST_CASE("prove__single_key__solo_causality_overwrite__append_fails_nothing_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5323,7 +5323,7 @@ TEST_CASE("prove__single_key__solo_causality_overwrite__append_fails_partial_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5359,7 +5359,7 @@ TEST_CASE("prove__single_key__solo_causality_overwrite__append_fails_after_full_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5395,7 +5395,7 @@ TEST_CASE("prove__single_key__solo_causality_overwrite__on_bulk_end_append", "[p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5430,7 +5430,7 @@ TEST_CASE("prove__single_key__solo_causality_overwrite__commit_sync_fails", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5499,7 +5499,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del__append_fails_nothing_writt
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5534,7 +5534,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del__append_fails_partial_write
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5570,7 +5570,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del__append_fails_after_full_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5606,7 +5606,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del__on_bulk_end_append", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5641,7 +5641,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del__commit_sync_fails", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5710,7 +5710,7 @@ TEST_CASE("prove__single_key__solo_causality_del_put__append_fails_nothing_writt
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5745,7 +5745,7 @@ TEST_CASE("prove__single_key__solo_causality_del_put__append_fails_partial_write
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5781,7 +5781,7 @@ TEST_CASE("prove__single_key__solo_causality_del_put__append_fails_after_full_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5817,7 +5817,7 @@ TEST_CASE("prove__single_key__solo_causality_del_put__on_bulk_end_append", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5852,7 +5852,7 @@ TEST_CASE("prove__single_key__solo_causality_del_put__commit_sync_fails", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5922,7 +5922,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del_put__append_fails_nothing_w
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5958,7 +5958,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del_put__append_fails_partial_w
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -5995,7 +5995,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del_put__append_fails_after_ful
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6032,7 +6032,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del_put__on_bulk_end_append", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6068,7 +6068,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del_put__commit_sync_fails", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6137,7 +6137,7 @@ TEST_CASE("prove__single_key__sequential_overwrite__append_fails_nothing_written
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6171,7 +6171,7 @@ TEST_CASE("prove__single_key__sequential_overwrite__append_fails_partial_write",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6206,7 +6206,7 @@ TEST_CASE("prove__single_key__sequential_overwrite__append_fails_after_full_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6241,7 +6241,7 @@ TEST_CASE("prove__single_key__sequential_overwrite__commit_sync_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6308,7 +6308,7 @@ TEST_CASE("prove__single_key__solo_sequential_overwrite__append_fails_nothing_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6342,7 +6342,7 @@ TEST_CASE("prove__single_key__solo_sequential_overwrite__append_fails_partial_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6377,7 +6377,7 @@ TEST_CASE("prove__single_key__solo_sequential_overwrite__append_fails_after_full
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6412,7 +6412,7 @@ TEST_CASE("prove__single_key__solo_sequential_overwrite__commit_sync_fails", "[p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6488,7 +6488,7 @@ TEST_CASE("prove__populated_db__single_put__append_fails_nothing_written", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6531,7 +6531,7 @@ TEST_CASE("prove__populated_db__single_put__append_fails_partial_write", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6575,7 +6575,7 @@ TEST_CASE("prove__populated_db__single_put__append_fails_after_full_write", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6619,7 +6619,7 @@ TEST_CASE("prove__populated_db__single_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6704,7 +6704,7 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_nothing_written", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6747,7 +6747,7 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_partial_write", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6791,7 +6791,7 @@ TEST_CASE("prove__populated_db__single_delete__append_fails_after_full_write", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6835,7 +6835,7 @@ TEST_CASE("prove__populated_db__single_delete__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6921,7 +6921,7 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_nothing_written", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -6965,7 +6965,7 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_partial_write", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7010,7 +7010,7 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_after_full_write", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7055,7 +7055,7 @@ TEST_CASE("prove__populated_db__multi_put__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7099,7 +7099,7 @@ TEST_CASE("prove__populated_db__multi_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7186,7 +7186,7 @@ TEST_CASE("prove__populated_db__mixed_batch__append_fails_nothing_written", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7230,7 +7230,7 @@ TEST_CASE("prove__populated_db__mixed_batch__append_fails_partial_write", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7275,7 +7275,7 @@ TEST_CASE("prove__populated_db__mixed_batch__append_fails_after_full_write", "[p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7320,7 +7320,7 @@ TEST_CASE("prove__populated_db__mixed_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7364,7 +7364,7 @@ TEST_CASE("prove__populated_db__mixed_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7452,7 +7452,7 @@ TEST_CASE("prove__populated_db__large_batch__append_fails_nothing_written", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7497,7 +7497,7 @@ TEST_CASE("prove__populated_db__large_batch__append_fails_partial_write", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7543,7 +7543,7 @@ TEST_CASE("prove__populated_db__large_batch__append_fails_after_full_write", "[p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7589,7 +7589,7 @@ TEST_CASE("prove__populated_db__large_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7634,7 +7634,7 @@ TEST_CASE("prove__populated_db__large_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7724,7 +7724,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_nothing_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7770,7 +7770,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_partial_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7817,7 +7817,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__append_fails_after_full_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7864,7 +7864,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__commit_sync_fails", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -7997,7 +7997,7 @@ TEST_CASE("prove__populated_db__causality_overwrite__append_fails_nothing_writte
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8041,7 +8041,7 @@ TEST_CASE("prove__populated_db__causality_overwrite__append_fails_partial_write"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8086,7 +8086,7 @@ TEST_CASE("prove__populated_db__causality_overwrite__append_fails_after_full_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8131,7 +8131,7 @@ TEST_CASE("prove__populated_db__causality_overwrite__on_bulk_end_append", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8175,7 +8175,7 @@ TEST_CASE("prove__populated_db__causality_overwrite__commit_sync_fails", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8262,7 +8262,7 @@ TEST_CASE("prove__populated_db__causality_put_del__append_fails_nothing_written"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8306,7 +8306,7 @@ TEST_CASE("prove__populated_db__causality_put_del__append_fails_partial_write", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8351,7 +8351,7 @@ TEST_CASE("prove__populated_db__causality_put_del__append_fails_after_full_write
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8396,7 +8396,7 @@ TEST_CASE("prove__populated_db__causality_put_del__on_bulk_end_append", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8440,7 +8440,7 @@ TEST_CASE("prove__populated_db__causality_put_del__commit_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8527,7 +8527,7 @@ TEST_CASE("prove__populated_db__causality_del_put__append_fails_nothing_written"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8571,7 +8571,7 @@ TEST_CASE("prove__populated_db__causality_del_put__append_fails_partial_write", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8616,7 +8616,7 @@ TEST_CASE("prove__populated_db__causality_del_put__append_fails_after_full_write
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8661,7 +8661,7 @@ TEST_CASE("prove__populated_db__causality_del_put__on_bulk_end_append", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8705,7 +8705,7 @@ TEST_CASE("prove__populated_db__causality_del_put__commit_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8793,7 +8793,7 @@ TEST_CASE("prove__populated_db__causality_put_del_put__append_fails_nothing_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8838,7 +8838,7 @@ TEST_CASE("prove__populated_db__causality_put_del_put__append_fails_partial_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8884,7 +8884,7 @@ TEST_CASE("prove__populated_db__causality_put_del_put__append_fails_after_full_w
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8930,7 +8930,7 @@ TEST_CASE("prove__populated_db__causality_put_del_put__on_bulk_end_append", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -8975,7 +8975,7 @@ TEST_CASE("prove__populated_db__causality_put_del_put__commit_sync_fails", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9063,7 +9063,7 @@ TEST_CASE("prove__populated_db__solo_causality_overwrite__append_fails_nothing_w
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9107,7 +9107,7 @@ TEST_CASE("prove__populated_db__solo_causality_overwrite__append_fails_partial_w
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9152,7 +9152,7 @@ TEST_CASE("prove__populated_db__solo_causality_overwrite__append_fails_after_ful
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9197,7 +9197,7 @@ TEST_CASE("prove__populated_db__solo_causality_overwrite__on_bulk_end_append", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9241,7 +9241,7 @@ TEST_CASE("prove__populated_db__solo_causality_overwrite__commit_sync_fails", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9328,7 +9328,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del__append_fails_nothing_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9372,7 +9372,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del__append_fails_partial_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9417,7 +9417,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del__append_fails_after_full_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9462,7 +9462,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del__on_bulk_end_append", "[p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9506,7 +9506,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del__commit_sync_fails", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9593,7 +9593,7 @@ TEST_CASE("prove__populated_db__solo_causality_del_put__append_fails_nothing_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9637,7 +9637,7 @@ TEST_CASE("prove__populated_db__solo_causality_del_put__append_fails_partial_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9682,7 +9682,7 @@ TEST_CASE("prove__populated_db__solo_causality_del_put__append_fails_after_full_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9727,7 +9727,7 @@ TEST_CASE("prove__populated_db__solo_causality_del_put__on_bulk_end_append", "[p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9771,7 +9771,7 @@ TEST_CASE("prove__populated_db__solo_causality_del_put__commit_sync_fails", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9859,7 +9859,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del_put__append_fails_nothing
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9904,7 +9904,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del_put__append_fails_partial
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9950,7 +9950,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del_put__append_fails_after_f
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -9996,7 +9996,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del_put__on_bulk_end_append",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10041,7 +10041,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del_put__commit_sync_fails", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10128,7 +10128,7 @@ TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_nothing_writt
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10171,7 +10171,7 @@ TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_partial_write
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10215,7 +10215,7 @@ TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_after_full_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10259,7 +10259,7 @@ TEST_CASE("prove__populated_db__sequential_overwrite__commit_sync_fails", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10344,7 +10344,7 @@ TEST_CASE("prove__populated_db__solo_sequential_overwrite__append_fails_nothing_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10387,7 +10387,7 @@ TEST_CASE("prove__populated_db__solo_sequential_overwrite__append_fails_partial_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10431,7 +10431,7 @@ TEST_CASE("prove__populated_db__solo_sequential_overwrite__append_fails_after_fu
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10475,7 +10475,7 @@ TEST_CASE("prove__populated_db__solo_sequential_overwrite__commit_sync_fails", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10551,7 +10551,7 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_nothing_written",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10585,7 +10585,7 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_partial_write", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10620,7 +10620,7 @@ TEST_CASE("prove__rotation_threshold__single_put__append_fails_after_full_write"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10655,7 +10655,7 @@ TEST_CASE("prove__rotation_threshold__single_put__commit_sync_fails", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10691,7 +10691,7 @@ TEST_CASE("prove__rotation_threshold__single_put__rotation_sync_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10792,7 +10792,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_nothing_writte
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10826,7 +10826,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_partial_write"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10861,7 +10861,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__append_fails_after_full_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10896,7 +10896,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__commit_sync_fails", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -10932,7 +10932,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__rotation_sync_fails", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11034,7 +11034,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_nothing_written", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11069,7 +11069,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_partial_write", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11105,7 +11105,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_after_full_write",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11141,7 +11141,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__on_bulk_end_append", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11176,7 +11176,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails", "[prove]") 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11213,7 +11213,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__rotation_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11317,7 +11317,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__append_fails_nothing_written"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11352,7 +11352,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__append_fails_partial_write", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11388,7 +11388,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__append_fails_after_full_write
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11424,7 +11424,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__on_bulk_end_append", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11459,7 +11459,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__commit_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11496,7 +11496,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__rotation_sync_fails", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11601,7 +11601,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__append_fails_nothing_written"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11637,7 +11637,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__append_fails_partial_write", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11674,7 +11674,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__append_fails_after_full_write
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11711,7 +11711,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__on_bulk_end_append", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11747,7 +11747,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__commit_sync_fails", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11785,7 +11785,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__rotation_sync_fails", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11893,7 +11893,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_nothi
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11930,7 +11930,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_parti
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -11968,7 +11968,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__append_fails_after
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12006,7 +12006,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__commit_sync_fails"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12045,7 +12045,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__rotation_sync_fail
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12188,7 +12188,7 @@ TEST_CASE("prove__rotation_threshold__causality_overwrite__append_fails_nothing_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12223,7 +12223,7 @@ TEST_CASE("prove__rotation_threshold__causality_overwrite__append_fails_partial_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12259,7 +12259,7 @@ TEST_CASE("prove__rotation_threshold__causality_overwrite__append_fails_after_fu
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12295,7 +12295,7 @@ TEST_CASE("prove__rotation_threshold__causality_overwrite__on_bulk_end_append", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12330,7 +12330,7 @@ TEST_CASE("prove__rotation_threshold__causality_overwrite__commit_sync_fails", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12367,7 +12367,7 @@ TEST_CASE("prove__rotation_threshold__causality_overwrite__rotation_sync_fails",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12471,7 +12471,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del__append_fails_nothing_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12506,7 +12506,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del__append_fails_partial_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12542,7 +12542,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del__append_fails_after_full
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12578,7 +12578,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del__on_bulk_end_append", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12613,7 +12613,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del__commit_sync_fails", "[p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12650,7 +12650,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del__rotation_sync_fails", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12754,7 +12754,7 @@ TEST_CASE("prove__rotation_threshold__causality_del_put__append_fails_nothing_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12789,7 +12789,7 @@ TEST_CASE("prove__rotation_threshold__causality_del_put__append_fails_partial_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12825,7 +12825,7 @@ TEST_CASE("prove__rotation_threshold__causality_del_put__append_fails_after_full
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12861,7 +12861,7 @@ TEST_CASE("prove__rotation_threshold__causality_del_put__on_bulk_end_append", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12896,7 +12896,7 @@ TEST_CASE("prove__rotation_threshold__causality_del_put__commit_sync_fails", "[p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -12933,7 +12933,7 @@ TEST_CASE("prove__rotation_threshold__causality_del_put__rotation_sync_fails", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13038,7 +13038,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del_put__append_fails_nothin
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13074,7 +13074,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del_put__append_fails_partia
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13111,7 +13111,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del_put__append_fails_after_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13148,7 +13148,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del_put__on_bulk_end_append"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13184,7 +13184,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del_put__commit_sync_fails",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13222,7 +13222,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del_put__rotation_sync_fails
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13328,7 +13328,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_overwrite__append_fails_not
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13363,7 +13363,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_overwrite__append_fails_par
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13399,7 +13399,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_overwrite__append_fails_aft
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13435,7 +13435,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_overwrite__on_bulk_end_appe
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13470,7 +13470,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_overwrite__commit_sync_fail
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13507,7 +13507,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_overwrite__rotation_sync_fa
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13611,7 +13611,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del__append_fails_nothi
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13646,7 +13646,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del__append_fails_parti
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13682,7 +13682,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del__append_fails_after
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13718,7 +13718,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del__on_bulk_end_append
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13753,7 +13753,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del__commit_sync_fails"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13790,7 +13790,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del__rotation_sync_fail
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13894,7 +13894,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_del_put__append_fails_nothi
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13929,7 +13929,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_del_put__append_fails_parti
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -13965,7 +13965,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_del_put__append_fails_after
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14001,7 +14001,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_del_put__on_bulk_end_append
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14036,7 +14036,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_del_put__commit_sync_fails"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14073,7 +14073,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_del_put__rotation_sync_fail
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14178,7 +14178,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del_put__append_fails_n
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14214,7 +14214,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del_put__append_fails_p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14251,7 +14251,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del_put__append_fails_a
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14288,7 +14288,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del_put__on_bulk_end_ap
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14324,7 +14324,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del_put__commit_sync_fa
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14362,7 +14362,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del_put__rotation_sync_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14467,7 +14467,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_nothing
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14501,7 +14501,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_partial
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14536,7 +14536,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_after_f
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14571,7 +14571,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14607,7 +14607,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__rotation_sync_fails"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14708,7 +14708,7 @@ TEST_CASE("prove__rotation_threshold__solo_sequential_overwrite__append_fails_no
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14742,7 +14742,7 @@ TEST_CASE("prove__rotation_threshold__solo_sequential_overwrite__append_fails_pa
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14777,7 +14777,7 @@ TEST_CASE("prove__rotation_threshold__solo_sequential_overwrite__append_fails_af
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14812,7 +14812,7 @@ TEST_CASE("prove__rotation_threshold__solo_sequential_overwrite__commit_sync_fai
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14848,7 +14848,7 @@ TEST_CASE("prove__rotation_threshold__solo_sequential_overwrite__rotation_sync_f
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14950,7 +14950,7 @@ TEST_CASE("prove__deleted_key__single_put__append_fails_nothing_written", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -14985,7 +14985,7 @@ TEST_CASE("prove__deleted_key__single_put__append_fails_partial_write", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15021,7 +15021,7 @@ TEST_CASE("prove__deleted_key__single_put__append_fails_after_full_write", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15057,7 +15057,7 @@ TEST_CASE("prove__deleted_key__single_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15126,7 +15126,7 @@ TEST_CASE("prove__deleted_key__single_delete__append_fails_nothing_written", "[p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15161,7 +15161,7 @@ TEST_CASE("prove__deleted_key__single_delete__append_fails_partial_write", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15197,7 +15197,7 @@ TEST_CASE("prove__deleted_key__single_delete__append_fails_after_full_write", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15233,7 +15233,7 @@ TEST_CASE("prove__deleted_key__single_delete__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15303,7 +15303,7 @@ TEST_CASE("prove__deleted_key__multi_put__append_fails_nothing_written", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15339,7 +15339,7 @@ TEST_CASE("prove__deleted_key__multi_put__append_fails_partial_write", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15376,7 +15376,7 @@ TEST_CASE("prove__deleted_key__multi_put__append_fails_after_full_write", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15413,7 +15413,7 @@ TEST_CASE("prove__deleted_key__multi_put__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15449,7 +15449,7 @@ TEST_CASE("prove__deleted_key__multi_put__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15520,7 +15520,7 @@ TEST_CASE("prove__deleted_key__mixed_batch__append_fails_nothing_written", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15556,7 +15556,7 @@ TEST_CASE("prove__deleted_key__mixed_batch__append_fails_partial_write", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15593,7 +15593,7 @@ TEST_CASE("prove__deleted_key__mixed_batch__append_fails_after_full_write", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15630,7 +15630,7 @@ TEST_CASE("prove__deleted_key__mixed_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15666,7 +15666,7 @@ TEST_CASE("prove__deleted_key__mixed_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15738,7 +15738,7 @@ TEST_CASE("prove__deleted_key__large_batch__append_fails_nothing_written", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15775,7 +15775,7 @@ TEST_CASE("prove__deleted_key__large_batch__append_fails_partial_write", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15813,7 +15813,7 @@ TEST_CASE("prove__deleted_key__large_batch__append_fails_after_full_write", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15851,7 +15851,7 @@ TEST_CASE("prove__deleted_key__large_batch__on_bulk_end_append", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15888,7 +15888,7 @@ TEST_CASE("prove__deleted_key__large_batch__commit_sync_fails", "[prove]") {
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -15962,7 +15962,7 @@ TEST_CASE("prove__deleted_key__single_put_with_guards__append_fails_nothing_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16000,7 +16000,7 @@ TEST_CASE("prove__deleted_key__single_put_with_guards__append_fails_partial_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16039,7 +16039,7 @@ TEST_CASE("prove__deleted_key__single_put_with_guards__append_fails_after_full_w
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16078,7 +16078,7 @@ TEST_CASE("prove__deleted_key__single_put_with_guards__commit_sync_fails", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16187,7 +16187,7 @@ TEST_CASE("prove__deleted_key__causality_overwrite__append_fails_nothing_written
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16223,7 +16223,7 @@ TEST_CASE("prove__deleted_key__causality_overwrite__append_fails_partial_write",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16260,7 +16260,7 @@ TEST_CASE("prove__deleted_key__causality_overwrite__append_fails_after_full_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16297,7 +16297,7 @@ TEST_CASE("prove__deleted_key__causality_overwrite__on_bulk_end_append", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16333,7 +16333,7 @@ TEST_CASE("prove__deleted_key__causality_overwrite__commit_sync_fails", "[prove]
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16404,7 +16404,7 @@ TEST_CASE("prove__deleted_key__causality_put_del__append_fails_nothing_written",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16440,7 +16440,7 @@ TEST_CASE("prove__deleted_key__causality_put_del__append_fails_partial_write", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16477,7 +16477,7 @@ TEST_CASE("prove__deleted_key__causality_put_del__append_fails_after_full_write"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16514,7 +16514,7 @@ TEST_CASE("prove__deleted_key__causality_put_del__on_bulk_end_append", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16550,7 +16550,7 @@ TEST_CASE("prove__deleted_key__causality_put_del__commit_sync_fails", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16621,7 +16621,7 @@ TEST_CASE("prove__deleted_key__causality_del_put__append_fails_nothing_written",
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16657,7 +16657,7 @@ TEST_CASE("prove__deleted_key__causality_del_put__append_fails_partial_write", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16694,7 +16694,7 @@ TEST_CASE("prove__deleted_key__causality_del_put__append_fails_after_full_write"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16731,7 +16731,7 @@ TEST_CASE("prove__deleted_key__causality_del_put__on_bulk_end_append", "[prove]"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16767,7 +16767,7 @@ TEST_CASE("prove__deleted_key__causality_del_put__commit_sync_fails", "[prove]")
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16839,7 +16839,7 @@ TEST_CASE("prove__deleted_key__causality_put_del_put__append_fails_nothing_writt
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16876,7 +16876,7 @@ TEST_CASE("prove__deleted_key__causality_put_del_put__append_fails_partial_write
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16914,7 +16914,7 @@ TEST_CASE("prove__deleted_key__causality_put_del_put__append_fails_after_full_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16952,7 +16952,7 @@ TEST_CASE("prove__deleted_key__causality_put_del_put__on_bulk_end_append", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -16989,7 +16989,7 @@ TEST_CASE("prove__deleted_key__causality_put_del_put__commit_sync_fails", "[prov
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17061,7 +17061,7 @@ TEST_CASE("prove__deleted_key__solo_causality_overwrite__append_fails_nothing_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17097,7 +17097,7 @@ TEST_CASE("prove__deleted_key__solo_causality_overwrite__append_fails_partial_wr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17134,7 +17134,7 @@ TEST_CASE("prove__deleted_key__solo_causality_overwrite__append_fails_after_full
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17171,7 +17171,7 @@ TEST_CASE("prove__deleted_key__solo_causality_overwrite__on_bulk_end_append", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17207,7 +17207,7 @@ TEST_CASE("prove__deleted_key__solo_causality_overwrite__commit_sync_fails", "[p
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17278,7 +17278,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del__append_fails_nothing_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17314,7 +17314,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del__append_fails_partial_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17351,7 +17351,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del__append_fails_after_full_w
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17388,7 +17388,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del__on_bulk_end_append", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17424,7 +17424,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del__commit_sync_fails", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17495,7 +17495,7 @@ TEST_CASE("prove__deleted_key__solo_causality_del_put__append_fails_nothing_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17531,7 +17531,7 @@ TEST_CASE("prove__deleted_key__solo_causality_del_put__append_fails_partial_writ
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17568,7 +17568,7 @@ TEST_CASE("prove__deleted_key__solo_causality_del_put__append_fails_after_full_w
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17605,7 +17605,7 @@ TEST_CASE("prove__deleted_key__solo_causality_del_put__on_bulk_end_append", "[pr
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17641,7 +17641,7 @@ TEST_CASE("prove__deleted_key__solo_causality_del_put__commit_sync_fails", "[pro
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 4,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17713,7 +17713,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del_put__append_fails_nothing_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17750,7 +17750,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del_put__append_fails_partial_
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17788,7 +17788,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del_put__append_fails_after_fu
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17826,7 +17826,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del_put__on_bulk_end_append", 
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17863,7 +17863,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del_put__commit_sync_fails", "
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 5,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17934,7 +17934,7 @@ TEST_CASE("prove__deleted_key__sequential_overwrite__append_fails_nothing_writte
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -17969,7 +17969,7 @@ TEST_CASE("prove__deleted_key__sequential_overwrite__append_fails_partial_write"
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -18005,7 +18005,7 @@ TEST_CASE("prove__deleted_key__sequential_overwrite__append_fails_after_full_wri
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -18041,7 +18041,7 @@ TEST_CASE("prove__deleted_key__sequential_overwrite__commit_sync_fails", "[prove
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -18110,7 +18110,7 @@ TEST_CASE("prove__deleted_key__solo_sequential_overwrite__append_fails_nothing_w
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -18145,7 +18145,7 @@ TEST_CASE("prove__deleted_key__solo_sequential_overwrite__append_fails_partial_w
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -18181,7 +18181,7 @@ TEST_CASE("prove__deleted_key__solo_sequential_overwrite__append_fails_after_ful
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;
@@ -18217,7 +18217,7 @@ TEST_CASE("prove__deleted_key__solo_sequential_overwrite__commit_sync_fails", "[
         .keys_added = {},
         .keys_removed = {},
         .expected_values = {},
-        .seq_advance = 1,
+        .seq_advance = 0,
         .degraded = true,
     };
   Baseline before;

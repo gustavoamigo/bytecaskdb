@@ -93,7 +93,7 @@ TEST_CASE("DataFile::append_entries batches multiple entries into one writev",
   const auto v1 = to_bytes("val1");
   const auto k2 = to_bytes("k2");
 
-  const std::array<bytecask::AppendEntry, 3> entries{{
+  const std::array<bytecask::DataEntryView, 3> entries{{
       {1, bytecask::EntryType::Put, k0, v0},
       {2, bytecask::EntryType::Put, k1, v1},
       {3, bytecask::EntryType::Delete, k2, {}},
