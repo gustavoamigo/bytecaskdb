@@ -1064,15 +1064,47 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
   // Helper: collect per-file stats as a sorted vector for comparison.
   // File IDs may differ, but the multiset of (live_bytes, total_bytes)
   // must match between serial and parallel.
+  using StatsTuple = std::tuple<std::uint64_t, std::uint64_t,
+                                std::uint64_t, std::uint64_t>;
+
   auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                           std::uint64_t, std::uint64_t>> vals;
+    std::vector<StatsTuple> vals;
     for (const auto &[fid, fs] : db.file_stats()) {
       vals.emplace_back(fs.live_bytes, fs.total_bytes,
                         fs.min_sequence, fs.max_sequence);
     }
     std::ranges::sort(vals);
     return vals;
+  };
+
+  auto check_stats = [](const std::vector<StatsTuple> &actual,
+                         const std::vector<StatsTuple> &expected) {
+    if (actual == expected) return;
+    // Diagnostic: print first 5 differences.
+    std::fprintf(stderr, "file_stats mismatch: actual.size=%zu expected.size=%zu\n",
+                 actual.size(), expected.size());
+    auto n = std::min(actual.size(), expected.size());
+    int printed = 0;
+    for (std::size_t i = 0; i < n && printed < 5; ++i) {
+      if (actual[i] != expected[i]) {
+        auto [al, at, amn, amx] = actual[i];
+        auto [el, et, emn, emx] = expected[i];
+        std::fprintf(stderr, "  [%zu] actual=(%lu,%lu,%lu,%lu) expected=(%lu,%lu,%lu,%lu)\n",
+                     i, al, at, amn, amx, el, et, emn, emx);
+        ++printed;
+      }
+    }
+    for (std::size_t i = n; i < actual.size() && printed < 5; ++i, ++printed) {
+      auto [al, at, amn, amx] = actual[i];
+      std::fprintf(stderr, "  [%zu] actual=(%lu,%lu,%lu,%lu) expected=<missing>\n",
+                   i, al, at, amn, amx);
+    }
+    for (std::size_t i = n; i < expected.size() && printed < 5; ++i, ++printed) {
+      auto [el, et, emn, emx] = expected[i];
+      std::fprintf(stderr, "  [%zu] actual=<missing> expected=(%lu,%lu,%lu,%lu)\n",
+                   i, el, et, emn, emx);
+    }
+    CHECK(actual == expected);
   };
 
   // Count data files for the max-parallelism test.
@@ -1085,8 +1117,7 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
 
   // Collect serial file_stats as baseline for parallel comparison.
   // Must use a separate copy since opening mutates the directory.
-  std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                         std::uint64_t, std::uint64_t>> serial_stats_vals;
+  std::vector<StatsTuple> serial_stats_vals;
   {
     const auto serial_path = td.path / "serial_baseline";
     std::filesystem::copy(db_path, serial_path,
@@ -1102,7 +1133,7 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    check_stats(collect_stats(db), serial_stats_vals);
   }
 
   SECTION("parallel recovery (2 workers)") {
@@ -1111,7 +1142,7 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 2});
     verify("parallel/2", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    check_stats(collect_stats(db), serial_stats_vals);
   }
 
   SECTION("parallel recovery (W = file count)") {
@@ -1122,7 +1153,7 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
         p, {.max_file_bytes = 1,
             .recovery_threads = static_cast<unsigned>(data_file_count)});
     verify("parallel/max", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    check_stats(collect_stats(db), serial_stats_vals);
   }
 }
 
@@ -1216,9 +1247,11 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
     }
   };
 
+  using StatsTuple2 = std::tuple<std::uint64_t, std::uint64_t,
+                                  std::uint64_t, std::uint64_t>;
+
   auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                           std::uint64_t, std::uint64_t>> vals;
+    std::vector<StatsTuple2> vals;
     for (const auto &[fid, fs] : db.file_stats()) {
       vals.emplace_back(fs.live_bytes, fs.total_bytes,
                         fs.min_sequence, fs.max_sequence);
@@ -1227,8 +1260,36 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
     return vals;
   };
 
-  std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                         std::uint64_t, std::uint64_t>> serial_stats_vals;
+  auto check_stats = [](const std::vector<StatsTuple2> &actual,
+                         const std::vector<StatsTuple2> &expected) {
+    if (actual == expected) return;
+    std::fprintf(stderr, "file_stats mismatch: actual.size=%zu expected.size=%zu\n",
+                 actual.size(), expected.size());
+    auto n = std::min(actual.size(), expected.size());
+    int printed = 0;
+    for (std::size_t i = 0; i < n && printed < 5; ++i) {
+      if (actual[i] != expected[i]) {
+        auto [al, at, amn, amx] = actual[i];
+        auto [el, et, emn, emx] = expected[i];
+        std::fprintf(stderr, "  [%zu] actual=(%lu,%lu,%lu,%lu) expected=(%lu,%lu,%lu,%lu)\n",
+                     i, al, at, amn, amx, el, et, emn, emx);
+        ++printed;
+      }
+    }
+    for (std::size_t i = n; i < actual.size() && printed < 5; ++i, ++printed) {
+      auto [al, at, amn, amx] = actual[i];
+      std::fprintf(stderr, "  [%zu] actual=(%lu,%lu,%lu,%lu) expected=<missing>\n",
+                   i, al, at, amn, amx);
+    }
+    for (std::size_t i = n; i < expected.size() && printed < 5; ++i, ++printed) {
+      auto [el, et, emn, emx] = expected[i];
+      std::fprintf(stderr, "  [%zu] actual=<missing> expected=(%lu,%lu,%lu,%lu)\n",
+                   i, el, et, emn, emx);
+    }
+    CHECK(actual == expected);
+  };
+
+  std::vector<StatsTuple2> serial_stats_vals;
   {
     const auto serial_path = td.path / "serial_baseline";
     std::filesystem::copy(db_path, serial_path,
@@ -1244,7 +1305,7 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    check_stats(collect_stats(db), serial_stats_vals);
   }
 
   SECTION("parallel (4 workers)") {
@@ -1253,7 +1314,7 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 4});
     verify("parallel/4", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    check_stats(collect_stats(db), serial_stats_vals);
   }
 }
 
@@ -1319,9 +1380,11 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
     }
   };
 
+  using StatsTuple3 = std::tuple<std::uint64_t, std::uint64_t,
+                                  std::uint64_t, std::uint64_t>;
+
   auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                           std::uint64_t, std::uint64_t>> vals;
+    std::vector<StatsTuple3> vals;
     for (const auto &[fid, fs] : db.file_stats()) {
       vals.emplace_back(fs.live_bytes, fs.total_bytes,
                         fs.min_sequence, fs.max_sequence);
@@ -1330,14 +1393,42 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
     return vals;
   };
 
+  auto check_stats = [](const std::vector<StatsTuple3> &actual,
+                         const std::vector<StatsTuple3> &expected) {
+    if (actual == expected) return;
+    std::fprintf(stderr, "file_stats mismatch: actual.size=%zu expected.size=%zu\n",
+                 actual.size(), expected.size());
+    auto n = std::min(actual.size(), expected.size());
+    int printed = 0;
+    for (std::size_t i = 0; i < n && printed < 5; ++i) {
+      if (actual[i] != expected[i]) {
+        auto [al, at, amn, amx] = actual[i];
+        auto [el, et, emn, emx] = expected[i];
+        std::fprintf(stderr, "  [%zu] actual=(%lu,%lu,%lu,%lu) expected=(%lu,%lu,%lu,%lu)\n",
+                     i, al, at, amn, amx, el, et, emn, emx);
+        ++printed;
+      }
+    }
+    for (std::size_t i = n; i < actual.size() && printed < 5; ++i, ++printed) {
+      auto [al, at, amn, amx] = actual[i];
+      std::fprintf(stderr, "  [%zu] actual=(%lu,%lu,%lu,%lu) expected=<missing>\n",
+                   i, al, at, amn, amx);
+    }
+    for (std::size_t i = n; i < expected.size() && printed < 5; ++i, ++printed) {
+      auto [el, et, emn, emx] = expected[i];
+      std::fprintf(stderr, "  [%zu] actual=<missing> expected=(%lu,%lu,%lu,%lu)\n",
+                   i, el, et, emn, emx);
+    }
+    CHECK(actual == expected);
+  };
+
   int data_file_count = 0;
   for (const auto &e : std::filesystem::directory_iterator{db_path}) {
     if (e.path().extension() == ".data")
       ++data_file_count;
   }
 
-  std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                         std::uint64_t, std::uint64_t>> serial_stats_vals;
+  std::vector<StatsTuple3> serial_stats_vals;
   {
     const auto serial_path = td.path / "serial_baseline";
     std::filesystem::copy(db_path, serial_path,
@@ -1353,7 +1444,7 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    check_stats(collect_stats(db), serial_stats_vals);
   }
 
   SECTION("parallel (3 workers)") {
@@ -1362,7 +1453,7 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 3});
     verify("parallel/3", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    check_stats(collect_stats(db), serial_stats_vals);
   }
 
   SECTION("parallel (W = file count)") {
@@ -1373,7 +1464,7 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
         p, {.max_file_bytes = 1,
             .recovery_threads = static_cast<unsigned>(data_file_count)});
     verify("parallel/max", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    check_stats(collect_stats(db), serial_stats_vals);
   }
 }
 
@@ -4512,15 +4603,46 @@ TEST_CASE("Recovery model-based: workload with range deletes",
     }
   };
 
+  using StatsTuple4 = std::tuple<std::uint64_t, std::uint64_t,
+                                  std::uint64_t, std::uint64_t>;
+
   auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                           std::uint64_t, std::uint64_t>> vals;
+    std::vector<StatsTuple4> vals;
     for (const auto &[fid, fs] : db.file_stats()) {
       vals.emplace_back(fs.live_bytes, fs.total_bytes,
                         fs.min_sequence, fs.max_sequence);
     }
     std::ranges::sort(vals);
     return vals;
+  };
+
+  auto check_stats = [](const std::vector<StatsTuple4> &actual,
+                         const std::vector<StatsTuple4> &expected) {
+    if (actual == expected) return;
+    std::fprintf(stderr, "file_stats mismatch: actual.size=%zu expected.size=%zu\n",
+                 actual.size(), expected.size());
+    auto n = std::min(actual.size(), expected.size());
+    int printed = 0;
+    for (std::size_t i = 0; i < n && printed < 5; ++i) {
+      if (actual[i] != expected[i]) {
+        auto [al, at, amn, amx] = actual[i];
+        auto [el, et, emn, emx] = expected[i];
+        std::fprintf(stderr, "  [%zu] actual=(%lu,%lu,%lu,%lu) expected=(%lu,%lu,%lu,%lu)\n",
+                     i, al, at, amn, amx, el, et, emn, emx);
+        ++printed;
+      }
+    }
+    for (std::size_t i = n; i < actual.size() && printed < 5; ++i, ++printed) {
+      auto [al, at, amn, amx] = actual[i];
+      std::fprintf(stderr, "  [%zu] actual=(%lu,%lu,%lu,%lu) expected=<missing>\n",
+                   i, al, at, amn, amx);
+    }
+    for (std::size_t i = n; i < expected.size() && printed < 5; ++i, ++printed) {
+      auto [el, et, emn, emx] = expected[i];
+      std::fprintf(stderr, "  [%zu] actual=<missing> expected=(%lu,%lu,%lu,%lu)\n",
+                   i, el, et, emn, emx);
+    }
+    CHECK(actual == expected);
   };
 
   int data_file_count = 0;
@@ -4530,8 +4652,7 @@ TEST_CASE("Recovery model-based: workload with range deletes",
   }
   REQUIRE(data_file_count > 1);
 
-  std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                         std::uint64_t, std::uint64_t>> serial_stats_vals;
+  std::vector<StatsTuple4> serial_stats_vals;
   {
     const auto serial_path = td.path / "serial_baseline";
     std::filesystem::copy(db_path, serial_path,
@@ -4547,7 +4668,7 @@ TEST_CASE("Recovery model-based: workload with range deletes",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    check_stats(collect_stats(db), serial_stats_vals);
   }
 
   SECTION("parallel recovery (2 workers)") {
@@ -4556,7 +4677,7 @@ TEST_CASE("Recovery model-based: workload with range deletes",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 2});
     verify("parallel/2", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    check_stats(collect_stats(db), serial_stats_vals);
   }
 
   SECTION("parallel recovery (W = file count)") {
@@ -4567,7 +4688,7 @@ TEST_CASE("Recovery model-based: workload with range deletes",
         p, {.max_file_bytes = 1,
             .recovery_threads = static_cast<unsigned>(data_file_count)});
     verify("parallel/max", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    check_stats(collect_stats(db), serial_stats_vals);
   }
 }
 
