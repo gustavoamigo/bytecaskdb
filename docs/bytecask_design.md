@@ -500,7 +500,11 @@ for each hint entry h (processed in arbitrary file order, sequence wins):
     // tombstone never enters live_bytes
 ```
 
-Processing order across files does not matter — sequence comparison always picks the correct winner, so `live_bytes` converges to the right values.
+Processing order across files does not matter — the canonical key-ownership comparator always picks the same winner regardless of merge order, so `live_bytes` converges to the right values.
+
+##### Canonical key-ownership comparator
+
+Sequence numbers are unique per logical write. When two `KeyDirEntry` values claim the same key, the one with the higher sequence wins. If two entries share the same sequence number, they must point to the same physical record (`file_id`, `file_offset`); if they don't, the database is corrupt and recovery throws `std::runtime_error`. This comparator is commutative, so merge results are independent of worker count, completion order, or file iteration order. Both serial and parallel recovery use this comparator.
 
 ##### Sequence bounds
 

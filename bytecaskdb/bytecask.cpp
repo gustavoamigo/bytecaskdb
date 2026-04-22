@@ -1792,7 +1792,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
   // recovery_load_parallel recomputes them in a single pass after the
   // final merge, avoiding redundant O(N) map lookups per worker.
   auto seq_wins = [](const KeyDirEntry &existing, const KeyDirEntry &incoming) {
-    return existing.sequence < incoming.sequence;
+    return kde_newer(incoming, existing);
   };
 
   for (auto &[file_id, data_file, hint_path, tb] : files) {
@@ -1800,11 +1800,20 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
       auto hint = HintFile::OpenForRead(hint_path);
       auto scanner = hint.make_scanner();
       while (auto he = scanner.next()) {
+        // Track per-file sequence bounds for ALL entries, including those
+        // suppressed by tombstones. Bounds represent the range of sequences
+        // physically present in the file, not just live ones.
+        if (he->sequence > max_seq) max_seq = he->sequence;
+        auto &file_fs = fstats_scratch[file_id];
+        if (file_fs.min_sequence == 0 || he->sequence < file_fs.min_sequence)
+          file_fs.min_sequence = he->sequence;
+        if (he->sequence > file_fs.max_sequence)
+          file_fs.max_sequence = he->sequence;
+
         if (he->entry_type == EntryType::Put) {
           const auto k = Key{he->key};
           const auto tomb_it = tombstones.find(k);
           if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
-            if (he->sequence > max_seq) max_seq = he->sequence;
             continue;
           }
           // Check range tombstones — O(R) per Put, R expected small.
@@ -1816,7 +1825,6 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
             }
           }
           if (suppressed) {
-            if (he->sequence > max_seq) max_seq = he->sequence;
             continue;
           }
           t.upsert(he->key,
@@ -1849,12 +1857,6 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
             t.erase(std::span<const std::byte>{ek});
           }
         }
-        if (he->sequence > max_seq) max_seq = he->sequence;
-        auto &file_fs = fstats_scratch[file_id];
-        if (file_fs.min_sequence == 0 || he->sequence < file_fs.min_sequence)
-          file_fs.min_sequence = he->sequence;
-        if (he->sequence > file_fs.max_sequence)
-          file_fs.max_sequence = he->sequence;
       }
     } catch (const std::exception &e) {
       if (strict) throw;
@@ -1886,7 +1888,7 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
   a.file_stats = std::move(merged_stats_t).persistent();
 
   auto seq_resolver = [](const KeyDirEntry &x, const KeyDirEntry &y) {
-    return (x.sequence >= y.sequence) ? x : y;
+    return kde_newer(x, y) ? x : y;
   };
 
   auto merged =
@@ -1974,11 +1976,20 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
       auto hint = HintFile::OpenForRead(hint_path);
       auto scanner = hint.make_scanner();
       while (auto he = scanner.next()) {
+        // Track per-file sequence bounds for ALL entries, including those
+        // suppressed by tombstones. Bounds represent the range of sequences
+        // physically present in the file, not just live ones.
+        if (he->sequence > max_seq) max_seq = he->sequence;
+        auto &file_fs = fstats_scratch[file_id];
+        if (file_fs.min_sequence == 0 || he->sequence < file_fs.min_sequence)
+          file_fs.min_sequence = he->sequence;
+        if (he->sequence > file_fs.max_sequence)
+          file_fs.max_sequence = he->sequence;
+
         if (he->entry_type == EntryType::Put) {
           const auto k = Key{he->key};
           const auto tomb_it = tombstones.find(k);
           if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
-            if (he->sequence > max_seq) max_seq = he->sequence;
             continue;
           }
           // Check range tombstones.
@@ -1990,11 +2001,12 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
             }
           }
           if (suppressed) {
-            if (he->sequence > max_seq) max_seq = he->sequence;
             continue;
           }
           const auto existing = transient_key_dir.get(he->key);
-          if (!existing || existing->sequence < he->sequence) {
+          auto incoming = KeyDirEntry{he->sequence, file_id,
+                                      he->file_offset, he->value_size};
+          if (!existing || kde_newer(incoming, *existing)) {
             if (existing) {
               const auto dec =
                   entry_size(he->key.size(), existing->value_size);
@@ -2002,9 +2014,7 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
             }
             const auto inc = entry_size(he->key.size(), he->value_size);
             fstats_scratch[file_id].live_bytes += inc;
-            transient_key_dir.set(he->key,
-                                  KeyDirEntry{he->sequence, file_id,
-                                              he->file_offset, he->value_size});
+            transient_key_dir.set(he->key, incoming);
           }
         } else if (he->entry_type == EntryType::Delete) {
           const auto k = Key{he->key};
@@ -2037,12 +2047,6 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
             transient_key_dir.erase(std::span<const std::byte>{ek});
           }
         }
-        if (he->sequence > max_seq) max_seq = he->sequence;
-        auto &file_fs = fstats_scratch[file_id];
-        if (file_fs.min_sequence == 0 || he->sequence < file_fs.min_sequence)
-          file_fs.min_sequence = he->sequence;
-        if (he->sequence > file_fs.max_sequence)
-          file_fs.max_sequence = he->sequence;
       }
     } catch (const std::exception &e) {
       if (strict) throw;
@@ -2055,6 +2059,22 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
   auto fstats_t = PersistentU32Map<FileStats>{}.transient();
   for (const auto &[id, fs] : fstats_scratch) fstats_t.set(id, fs);
   s.key_dir = std::move(transient_key_dir).persistent();
+
+  // Recompute live_bytes canonically from the final key_dir, matching
+  // the parallel path's Phase 4. The incremental tracking above may diverge
+  // from parallel due to non-deterministic directory iteration order
+  // affecting which file_id wins when entries share the same sequence.
+  std::unordered_map<std::uint32_t, std::uint64_t> live_accum;
+  for (auto it = s.key_dir.begin(); it != std::default_sentinel; ++it) {
+    const auto &[key_span, kde] = *it;
+    live_accum[kde.file_id] += entry_size(key_span.size(), kde.value_size);
+  }
+  for (const auto &[id, _] : fstats_scratch) {
+    const auto acc_it = live_accum.find(id);
+    const auto live = (acc_it != live_accum.end()) ? acc_it->second : 0ULL;
+    fstats_t.update(id, [live](FileStats &fs) { fs.live_bytes = live; });
+  }
+
   s.file_stats = std::move(fstats_t).persistent();
   s.next_seq = max_seq + 1;
   return s;
