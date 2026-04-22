@@ -27,6 +27,7 @@ RUN dnf install -y \
     mariadb-devel \
     google-crc32c-devel \
     rocksdb-devel \
+    sudo \
     python3-pip \
     python3-devel \
     && dnf clean all
@@ -55,3 +56,5 @@ ENV PATH="/opt/emsdk:/opt/emsdk/upstream/emscripten:/opt/emsdk/upstream/bin:${PA
 
 ARG USERNAME=gustavoamigo
 RUN useradd -m $USERNAME || echo "User already exists"
+RUN echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
+    && chmod 0440 /etc/sudoers.d/$USERNAME
