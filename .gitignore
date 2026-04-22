@@ -7,6 +7,7 @@ build/
 
 # Editor / LSP caches
 .cache/
+.claude/
 .vscode/
 compile_commands.json
 
