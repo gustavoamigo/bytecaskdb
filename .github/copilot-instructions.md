@@ -104,6 +104,16 @@ These four principles govern every design decision in the codebase, in priority 
 - Use `std::ssize` (C++20) instead of casting `.size()` to a signed type.
 - Prefer `std::filesystem` utilities over manual file-handle tricks (e.g. `std::filesystem::file_size`).
 
+### Iterator laziness — correctness requirement
+
+Iterators must fetch and process data lazily unless explicitly documented otherwise. An iterator that eagerly materializes all results into memory is a correctness bug: the result set may exceed available memory (e.g. a `changes_since` scan over millions of entries). The correct pattern is to hold at most one unit of work in memory at a time (one batch, one entry) and advance on demand.
+
+When implementing an iterator over data files:
+- Build the file/partition list eagerly (it is O(num_files), small).
+- Scan one batch at a time within each file.
+- Cache only the current entry; release previous data on advance.
+- If global ordering is required across files, exploit the engine's sequence-disjoint file property (files sorted by min_sequence yield globally ascending order) rather than collecting and sorting all entries.
+
 ### Lifetime and view safety — spans, iterators, and non-owning views
 
 The hardest class of bugs in this codebase involves returning non-owning views (`std::span`, `std::string_view`, raw pointers) into an object's own internal buffer. These are correct as long as the owning object stays alive, but silently become dangling references — confirmed by ASan as heap-use-after-free — if:
@@ -157,6 +167,10 @@ private:
 - **Sign-conversion on array indexing** (`-Wsign-conversion`): When indexing an array/string with the result of a signed distribution or function, wrap the index in `static_cast<std::size_t>(...)`.
 - **Missing `[[noreturn]]` on lambdas** (`-Wmissing-noreturn`): Add `[[noreturn]]` to lambdas that unconditionally throw: `[][[noreturn]] { throw ...; }`.
 - **Unused functions/variables** (`-Wunused-function`, `-Wunused-variable`): Remove helper functions and variables that are no longer referenced after a refactor rather than leaving them in place.
+
+### Batch marker invariants
+
+BulkBegin/BulkEnd markers must NOT be skipped by vacuum or ChangeIterator — they are structural markers that preserve batch atomicity on disk. Only hint generation skips them (hints do not have the concept).
 
 ## Documentation writing guidelines
 
