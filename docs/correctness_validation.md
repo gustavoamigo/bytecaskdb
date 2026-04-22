@@ -498,6 +498,106 @@ the old file is still in the published state. `assert_vacuum_recoverable`
 confirms that recovery does not replay the orphaned new file as a
 secondary source and sees only the data the old file guaranteed.
 
+### prove_replication — 211 tests
+
+211 generated Catch2 tests (`[prove_repl]` + `[prove_manifest]` tags) cover
+the replication pipeline: 178 ingest tests covering (StateShape × OpsShape ×
+IngestFailureClass) and 33 manifest tests covering (StateShape ×
+ManifestFailureClass). The scenario matrix is defined in
+`tests/proof/replication/scenario_matrix.py`.
+
+#### State shapes
+
+11 leader workloads that produce the state to replicate:
+
+| Shape | max_file_bytes | has_batches | has_nosync | What it tests |
+|-------|---------------|-------------|------------|---------------|
+| `single_key` | — | No | No | Minimal replication payload — single entry through the full pipeline |
+| `multi_key` | — | No | No | Multi-entry ingest; changes_since yields multiple entries in sequence order |
+| `overwrites` | — | No | No | changes_since yields both entries; ingest applies in sequence order so the overwrite wins |
+| `deletes` | — | No | No | Tombstone replicates correctly — follower does not have the key after ingest |
+| `range_deletes` | — | No | No | RangeDel entry walks the follower's key directory over [from, to) |
+| `batches` | — | Yes | No | Batch markers preserved through changes_since; ingest uses them to write atomically |
+| `multi_file` | 256 | No | No | changes_since merges entries across multiple sealed files in ascending sequence order |
+| `mixed_sync_nosync` | — | No | Yes | changes_since yields only entries up to durable_sequence; unsync'd entries excluded |
+| `nosync_only` | 256 | No | Yes | Entries replicable only after rotation triggers fdatasync; replication lag bounded by max_file_bytes |
+| `nosync_then_sync` | — | No | Yes | The sync's fdatasync covers all prior nosync entries; durable_sequence catches up |
+| `vacuumed_batches` | 256 | Yes | No | changes_since over vacuumed file yields BulkBegin/BulkEnd markers; ingest writes atomically |
+
+#### Ops shapes
+
+How entries are delivered to the follower:
+
+| Shape | What it tests |
+|-------|---------------|
+| `full_stream` | Baseline — full replication in a single ingest call |
+| `incremental` | Each chunk produces a valid prefix; follower.current_sequence() advances monotonically |
+| `restart_midstream` | Recovery equivalence — reopened follower's current_sequence() is trustworthy, next changes_since picks up without gaps |
+| `duplicate_delivery` | Idempotency — entries with sequence <= current_sequence() are silently skipped |
+| `planned_promotion` | Sequence continuity on promoted node; backward sync after leadership transfer converges |
+
+#### Ingest failure classes
+
+| Class | Entries applied | key_dir changes | Degraded |
+|-------|----------------|-----------------|----------|
+| SUCCESS | All | Yes — full delta | No |
+| I_B1 (`append_fails_nothing_written`) | None | No | Yes |
+| I_B2 (`append_fails_partial_write`) | None | No | Yes |
+| I_F (`sync_fails`) | None visible | No (not published) | Yes |
+| I_C (`crash_mid_batch`) | None from the batch | No — recovery discards incomplete batch | No (recovery handles) |
+| I_G (`rotation_sync_fails`) | None visible | No (not published) | Yes |
+| I_H (`rotation_file_creation_fails`) | Chunk that triggered rotation | Yes — partial delta | Yes |
+
+I_H is notable: the sync succeeded before file creation failed, so the
+chunk that triggered rotation is fully durable. The follower's key_dir
+reflects a partial delta — the entries from that chunk are committed.
+
+#### Manifest failure classes
+
+| Class | Manifest produced | Leader state |
+|-------|-------------------|-------------|
+| SUCCESS | Yes | Continues accepting writes |
+| M_R (`rotation_fails`) | No — exception thrown | Unchanged |
+| M_H (`hint_generation_fails`) | No — exception or timeout | Active file was rotated (sealed) |
+
+#### Elimination rules
+
+Four rules filter invalid (state, ops, failure) combinations:
+
+1. **duplicate_delivery × non-SUCCESS** — duplicates are skipped before
+   I/O, so all failure classes except SUCCESS are unreachable.
+2. **planned_promotion × non-SUCCESS** — a flag flip, only SUCCESS applies.
+3. **I_C requires batch markers** — only valid for `batches` and
+   `vacuumed_batches` state shapes.
+4. **I_G / I_H require file rotation** — only valid for state shapes
+   with `max_file_bytes` set (`multi_file`, `nosync_only`,
+   `vacuumed_batches`).
+
+#### Test structure
+
+Each ingest test follows: setup leader workload → capture replication
+baseline → create follower in Mode::Follower → inject fault → ingest per
+ops shape → assert_replication_match or assert_replication_no_change →
+assert_replication_recovery. For degraded cases, `resume()` is called
+before re-ingesting remaining entries. `planned_promotion` tests run
+the full leadership transfer protocol (demote leader → promote follower →
+write on new leader → backward sync → verify convergence).
+
+#### Edge cases
+
+- **Nosync baseline**: `capture_replication_baseline` builds the expected
+  key-value map by replaying `changes_since` output (not snapshot
+  iteration), respecting the `durable_seq` boundary.
+- **Batch boundary chunk splitting**: for small batch states, all entries
+  may land in chunk 1 during incremental tests. Runtime guard handles
+  empty chunk 2.
+- **Hint-file batch marker gap (fixed)**: hint files now include
+  BulkBegin/BulkEnd markers, so recovery correctly computes `durable_seq`
+  for batch states. In `restart_midstream` tests, the second pass after
+  recovery may still be too small to trigger rotation-class faults (I_H,
+  I_G). The test framework uses try-catch with `bool threw` tracking to
+  handle both outcomes.
+
 ### Source files
 
 **apply_batch module** (root of `tests/proof/`):
@@ -527,11 +627,20 @@ secondary source and sees only the data the old file guaranteed.
 | `expected_delta.py` | Reference model: threw/file_removed outcome |
 | `generate_tests.py` | Generates `prove_vacuum_compact.cpp` |
 
+**replication module** (`tests/proof/replication/`):
+
+| File | Role |
+|------|------|
+| `scenario_matrix.py` | StateShape, OpsShape, IngestFailureClass, ManifestFailureClass, validity filter |
+| `expected_delta.py` | Reference model: `IngestDelta` and `ManifestDelta` per (state, ops, failure) |
+| `fault_point_resolver.py` | Maps failure class → `ScopedFaultInjector` configuration |
+| `generate_tests.py` | Generates `prove_replication.cpp` |
+
 **Shared invariants** (`tests/proof/`):
 
 | File | Role |
 |------|------|
-| [`invariants.h`](../tests/proof/invariants.h) | `capture_baseline`, `assert_consistent`, `assert_delta`, `assert_recoverable`, `assert_resumable`, `assert_keys_recoverable`, `VacuumBaseline`, `capture_vacuum_baseline`, `find_vacuum_target`, `assert_vacuum_success`, `assert_vacuum_no_change`, `assert_vacuum_recoverable` |
+| [`invariants.h`](../tests/proof/invariants.h) | `capture_baseline`, `assert_consistent`, `assert_delta`, `assert_recoverable`, `assert_resumable`, `assert_keys_recoverable`, `VacuumBaseline`, `capture_vacuum_baseline`, `find_vacuum_target`, `assert_vacuum_success`, `assert_vacuum_no_change`, `assert_vacuum_recoverable`, `OwnedEntries`, `collect_changes`, `ReplicationBaseline`, `capture_replication_baseline`, `assert_replication_match`, `assert_replication_no_change`, `assert_replication_recovery`, `assert_durable_boundary` |
 
 ### Fault injection modes
 
@@ -580,6 +689,21 @@ I/O checkpoints:
   matches its actual on-disk size, `assert_consistent`.
 - `assert_vacuum_recoverable(dir, before)` — opens a fresh DB and verifies
   all pre-vacuum keys survive recovery with correct values.
+- `OwnedEntries` / `collect_changes(range)` — collects transient
+  `ChangeIterator` entries into owned storage. The views returned by the
+  iterator are invalidated on advance; `OwnedEntries` preserves them.
+- `ReplicationBaseline` / `capture_replication_baseline(db)` — snapshots
+  the leader's durable state by replaying `changes_since(snap, 0)` to
+  build a key-value map that respects the `durable_seq` boundary.
+- `assert_replication_match(leader_bl, follower)` — verifies sequence
+  continuity, key-value equivalence, no extra keys, and structural
+  consistency between leader baseline and follower state (SUCCESS case).
+- `assert_replication_no_change(before, follower)` — verifies follower
+  state is unchanged from its own baseline (failure case).
+- `assert_replication_recovery(dir, leader_bl)` — reopens follower from
+  disk and verifies replication survived recovery.
+- `assert_durable_boundary(range, durable_seq)` — verifies no entry in
+  a `changes_since` stream has `sequence > durable_seq`.
 
 12 test cases (`[invariants]` tag) in `tests/invariants_test.cpp`
 smoke-test the helpers themselves.
@@ -598,7 +722,12 @@ and degrade_G (no orphaned bytes to truncate — fault point unreachable).
 All five vacuum_compact failure classes across both state shapes are
 covered by the 10 `[prove_vacuum_compact]` tests.
 
-Total generated proof tests: **209**.
+All seven ingest failure classes across 11 state shapes and 5 ops shapes
+are covered by the 178 `[prove_repl]` tests. All three manifest failure
+classes across 11 state shapes are covered by the 33 `[prove_manifest]`
+tests. Four elimination rules reduce the full matrix to 211 valid tests.
+
+Total generated proof tests: **734**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
@@ -689,10 +818,17 @@ tests/
       expected_delta.py
       fault_point_resolver.py
       generate_tests.py
+    replication/
+      __init__.py
+      scenario_matrix.py
+      expected_delta.py
+      fault_point_resolver.py
+      generate_tests.py
     generated/
       prove_apply_batch.cpp     ← generated, never hand-edited
       prove_resume.cpp             ← generated, never hand-edited
       prove_vacuum_compact.cpp     ← generated, never hand-edited
+      prove_replication.cpp        ← generated, never hand-edited
 ```
 
 The fault injection infrastructure (`fault_injector.h`) lives in

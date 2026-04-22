@@ -1,10 +1,10 @@
 # ByteCaskDB Replication Primitives Design
 
-> **Status: very early design.** This document describes a design for replication primitives. Implementation and API surface are subject to change.
+> Implemented in BC-197. Proof test suite (211 tests) in BC-204.
 
 ## Purpose
 
-This document describes the minimal set of API primitives that ByteCaskDB needs to expose so that leader-follower replication can be built **on top of** the engine, without embedding any distributed systems logic inside it. ByteCaskDB remains a passive, embedded key-value store — an external coordinator handles topology, failure detection, and promotion.
+This document describes the minimal set of API primitives that ByteCaskDB exposes so that leader-follower replication is built **on top of** the engine, without embedding any distributed systems logic inside it. ByteCaskDB remains a passive, embedded key-value store — an external coordinator handles topology, failure detection, and promotion.
 
 Canonical location: `docs/replication_primitives_design.md`.
 
@@ -21,7 +21,7 @@ ByteCaskDB uses the term **sequence** for the globally monotonic `u64` counter a
 1. **ByteCaskDB is passive.** It provides primitives; coordination lives outside.
 2. **No user-registered callbacks, no server-pushed events.** Long-polling unifies push and pull into one API. The internal condvar is an implementation detail — the external contract is a blocking call that returns when data is available.
 3. **Sequences already exist.** Every data entry carries a globally monotonic `u64 sequence`. The primitives surface what the engine already tracks.
-4. **The data file is the replication log.** No separate WAL or changelog — the append-only data files contain every put, delete, and range delete with its sequence.
+4. **The data file is the replication log.** No separate WAL or changelog — the append-only data files contain every put, delete, range delete, and batch marker with its sequence.
 
 ---
 
@@ -148,7 +148,7 @@ A NoSync write (`WriteOptions.sync = false`) publishes state via `state_.store()
 
 Replicating unsync'd entries would create a divergence: the follower has data the leader would lose on crash. The follower's state would not be a valid prefix of the leader's *durable* history.
 
-**The rule**: `changes_since` must only yield entries whose durability has been confirmed by `fdatasync`. The replication boundary is the durable sequence, not the visible sequence.
+**The rule**: `changes_since` yields only entries whose durability has been confirmed by `fdatasync`. The replication boundary is the durable sequence, not the visible sequence.
 
 ### Tracking
 
@@ -165,7 +165,7 @@ The engine maintains a `durable_sequence` alongside `next_seq`:
 
 The error-path `file.sync()` after a failed `append_entries` does **not** advance `durable_sequence`. That sync is a best-effort flush of bytes previously in the page cache — but `batch_max_seq` includes sequences from the failed append, which may be corrupt. Advancing `durable_sequence` to those sequences would claim durability for garbage. The engine degrades after this path; `resume()` sets `durable_sequence` correctly from the recovered state.
 
-Any future code that adds a new `file.sync()` call must also advance `durable_sequence`, or replication will stall / skip entries depending on direction.
+Any future code that adds a new `file.sync()` call should also advance `durable_sequence`, or replication will stall / skip entries depending on direction.
 
 `changes_since(snap, from_sequence)` uses `min(snap.sequence(), durable_sequence)` as its upper bound. Entries with `sequence > durable_sequence` are excluded even if present in the snapshot's key directory.
 
@@ -187,16 +187,10 @@ Between rotations, NoSync entries are in the page cache and not replicable. Once
 
 **Vacuum strategy for replication:** only two vacuum paths exist: `vacuum_compact_file` (sealed→sealed, for files with live entries) and `vacuum_remove_file` (delete, for files with zero live entries). The `vacuum_absorb_file` path (sealed→active) is deprecated because it breaks per-file sequence monotonicity — absorbed entries would interleave old sequences into the active file, defeating file-level filtering and complicating the `changes_since` read fence (the active file's `durable_seq` boundary).
 
-`vacuum_scan_and_copy` in `bytecaskdb/bytecask.cpp` rewrites live entries from a sealed source file into a new sealed destination file. Currently, its `emit_entry` lambda has a no-op `break` for `BulkBegin`/`BulkEnd` — batch markers are silently dropped from compacted files. Entries that were part of a batch in the source file appear as standalone entries in the destination.
-
-This must change. `changes_since` reads from data files (not hint files) and relies on `BulkBegin`/`BulkEnd` markers to frame atomic batches. If vacuum strips these markers, `changes_since` over a vacuumed file yields the entries without batch framing, and `ingest` on the follower writes them as individual entries instead of a single `writev`. A crash mid-ingest would then leave a partial batch visible on the follower — violating the atomicity guarantee that the leader's `apply_batch` provided.
-
-### Required change
-
-`emit_entry` must write `BulkBegin` before the first entry in a batch and `BulkEnd` after the last. The outer scan loop already tracks batch membership (`in_batch`, `pending` vector) and only calls `emit_entry` for batch entries after seeing `BulkEnd` — so the batch is known-committed at emit time. The change is to emit the markers alongside the entries:
+`vacuum_scan_and_copy` in `bytecaskdb/bytecask.cpp` rewrites live entries from a sealed source file into a new sealed destination file. The `emit_entry` lambda writes `BulkBegin` before the first entry in a batch and `BulkEnd` after the last. The outer scan loop tracks batch membership (`in_batch`, `pending` vector) and only calls `emit_entry` for batch entries after seeing `BulkEnd` — so the batch is known-committed at emit time. The markers are emitted alongside the entries:
 
 1. Before iterating `pending`, write `BulkBegin` to the destination file with its original sequence.
-2. Emit each pending entry as before.
+2. Emit each pending entry.
 3. After iterating `pending`, write `BulkEnd` to the destination file with its original sequence.
 
 Original sequences are preserved verbatim — vacuum never assigns new sequences. The destination file contains the same `BulkBegin`...entries...`BulkEnd` framing as the source, with dead entries removed.
@@ -205,13 +199,13 @@ Original sequences are preserved verbatim — vacuum never assigns new sequences
 
 This changes the on-disk layout of vacuumed files: they now contain `BulkBegin`/`BulkEnd` markers that were previously absent. However:
 
-- **Hint files are unaffected.** Hint files already strip batch markers — that behavior is correct and unchanged. Recovery reads hint files, not data files, so no recovery behavior changes.
+- **Hint files include batch markers.** Hint files write `BulkBegin`/`BulkEnd` markers (with their sequence numbers) so that recovery correctly computes `next_seq` and `durable_seq`. Recovery reads hint files, not data files, so the markers must be present for accurate sequence tracking.
 - **The data file format already supports these markers.** `BulkBegin` and `BulkEnd` are existing `EntryType` values (0x03, 0x04). Any code that scans data files already handles them.
 - **Existing vacuumed files without markers are still valid.** `changes_since` over a file without markers yields standalone entries — the same behavior as today. The change only affects files vacuumed after the fix.
 
 ### Impact on bootstrap
 
-`create_manifest` ships sealed files to new followers. If those files were vacuumed before this fix, they contain no batch markers. The follower recovers from hint files (which never had markers), so bootstrap is unaffected. Once the fix is in place, newly vacuumed files carry markers through, and `changes_since` over those files produces correctly framed batches.
+`create_manifest` ships sealed files to new followers. If those files were vacuumed before this fix, they contain no batch markers. The follower recovers from hint files (which include markers), so bootstrap is unaffected — recovery tracks sequences from hint entries regardless of whether the data file contains markers. Once the fix is in place, newly vacuumed files carry markers through, and `changes_since` over those files produces correctly framed batches.
 
 ---
 
@@ -290,43 +284,16 @@ ByteCaskDB does not care who is consuming or why. It surfaces the ordered stream
 
 The proof framework for replication primitives follows the same model used in [`docs/correctness_validation.md`](correctness_validation.md): StateShape × OpsShape × FailureClass → expected delta, validated against invariants. The validation proves the correctness guarantees expressed in [`CONTRACT.md`](../CONTRACT.md).
 
-### CONTRACT.md Changes
-
-The following contract sections must be added to `CONTRACT.md` before the proof tests can be written. These are the guarantees the tests will prove.
-
-**`ingest`** — the follower's write path. Contract additions:
-
-- **Atomicity**: each `ingest` call applies all entries or none. Partial application must never be observable.
-- **Causality**: entries are applied in the sequence order provided by `changes_since`. If entry A has a lower sequence than entry B, A is applied before B. The follower's state after ingest reflects the same causal ordering as the leader's write history.
-- **Durability**: if `ingest` returns without throwing, all ingested entries are durable. Recovery reproduces the same state.
-- **I/O failure safety**: if any I/O operation throws during ingest, the published key directory reflects zero entries from this call. `next_seq` is advanced past consumed sequences. The engine degrades; `resume()` restores normal operation.
-- **Idempotency**: entries with `sequence <= current_sequence()` are silently skipped. Re-delivering entries produces no state change.
-- **Sequence monotonicity**: `next_seq` never decreases, even after failed ingest.
-
-**`create_manifest`** — sealed file manifest for bootstrap/backup. Contract additions:
-
-- **Completeness**: the manifest covers every committed entry up to the rotation point. No entry gap between the manifest's files and the sequence boundary.
-- **Atomicity of rotation**: if rotation fails, no manifest is produced and the leader continues accepting writes unchanged.
-- **File list accuracy**: every file in `manifest.files` exists on the filesystem at return time and has a corresponding `.hint` companion.
-
-**`changes_since`** — the correctness properties are not contracted separately but are validated implicitly through the E2E pipeline:
-
-- **Durability guarantee**: only entries whose durability has been confirmed by `fdatasync` are yielded. Entries from NoSync writes that have not yet been covered by a subsequent `fdatasync` must not appear in the stream, even if they are visible to local readers via snapshots. The replication boundary is the durable sequence, not the visible sequence.
-- Every committed durable entry with `sequence > from_sequence` at snapshot time is yielded exactly once.
-- Entries are yielded in strictly ascending sequence order.
-- Incomplete batches (orphaned `BulkBegin` without `BulkEnd`) are excluded.
-- `BulkBegin`/`BulkEnd` batch markers are preserved in the output — `ingest` uses them to write batches atomically on the follower.
-
 ### Proof Framework
 
-Replication correctness reduces to: the follower's `EngineState` after ingesting `changes_since(snap, 0)` from the leader must be identical to the leader's `EngineState` at snapshot time.
+Replication correctness reduces to: the follower's `EngineState` after ingesting `changes_since(snap, 0)` from the leader is identical to the leader's `EngineState` at snapshot time.
 
 ```
 Given:
   L   — a leader EngineState after some workload (StateShape)
   S   — snapshot of L
   I   — changes_since(S, 0) → stream of all committed entries
-  FC  — an I/O failure class during ingest (one of SUCCESS, I_B1, I_B2, I_F)
+  FC  — an I/O failure class during ingest (one of SUCCESS, I_B1, I_B2, I_F, I_C, I_G, I_H)
 
 Validate:
   follower.state_after_ingest(I, FC) satisfies all invariants
@@ -344,9 +311,9 @@ Was the ingest transition fully persisted?
 
 ### Foundational Invariant: `changes_since` and `ingest` Are a Paired Contract
 
-For any leader state at snapshot time, `ingest(changes_since(snap, 0))` on an empty follower must produce a key directory identical to the leader's *durable* state. This must hold regardless of how either primitive is implemented — file boundaries and entry grouping are implementation concerns that must not leak through the contract.
+For any leader state at snapshot time, `ingest(changes_since(snap, 0))` on an empty follower produces a key directory identical to the leader's *durable* state. This holds regardless of how either primitive is implemented — file boundaries and entry grouping are implementation concerns that do not leak through the contract.
 
-`changes_since` is responsible for yielding only committed, durable entries — including `BulkBegin`/`BulkEnd` markers that frame atomic batches. Incomplete batches (orphaned `BulkBegin` without `BulkEnd`) are excluded by the snapshot's sequence bound. Unsync'd entries (visible in the snapshot but not yet `fdatasync`'d) are excluded — the replication boundary is the durable sequence. `ingest` is responsible for writing entries atomically using the batch markers: a `BulkBegin`..`BulkEnd` sequence is written as a single `writev`, ensuring that a crash mid-ingest never leaves a partial batch visible on the follower.
+`changes_since` yields only committed, durable entries — including `BulkBegin`/`BulkEnd` markers that frame atomic batches. Incomplete batches (orphaned `BulkBegin` without `BulkEnd`) are excluded by the snapshot's sequence bound. Unsync'd entries (visible in the snapshot but not yet `fdatasync`'d) are excluded — the replication boundary is the durable sequence. `ingest` writes entries atomically using the batch markers: a `BulkBegin`..`BulkEnd` sequence is written as a single `writev`, ensuring that a crash mid-ingest never leaves a partial batch visible on the follower.
 
 This paired contract means the replication protocol has no translation layer and no per-entry-type handling. `Put`, `Delete`, `RangeDel`, and batch markers flow through unchanged. Any future entry type added to the data file format is automatically replicable as long as `changes_since` yields it and `ingest` applies it — neither primitive needs to know what the entry means.
 
@@ -358,15 +325,15 @@ The leader workload that produces the state to replicate. Each shape exercises a
 |-------|-------------|---------------|
 | `single_key` | One put | Minimal replication payload — single entry through the full pipeline |
 | `multi_key` | Multiple puts | Multi-entry ingest; changes_since yields multiple entries in sequence order |
-| `overwrites` | Put then overwrite same key | changes_since must yield both entries; ingest must apply in sequence order so the overwrite wins |
-| `deletes` | Put then delete | Tombstone must replicate correctly — follower must not have the key after ingest |
-| `range_deletes` | Put N keys then del_range | RangeDel entry must walk the follower's key directory over [from, to) |
+| `overwrites` | Put then overwrite same key | changes_since yields both entries; ingest applies in sequence order so the overwrite wins |
+| `deletes` | Put then delete | Tombstone replicates correctly — follower does not have the key after ingest |
+| `range_deletes` | Put N keys then del_range | RangeDel entry walks the follower's key directory over [from, to) |
 | `batches` | apply_batch with multiple ops | Batch markers preserved through changes_since; ingest uses them to write atomically on the follower |
-| `multi_file` | Enough writes to trigger rotation | changes_since must merge entries across multiple sealed files in ascending sequence order |
-| `mixed_sync_nosync` | Interleave sync and nosync writes | changes_since must yield only entries up to `durable_sequence`; unsync'd entries visible in the snapshot are excluded |
+| `multi_file` | Enough writes to trigger rotation | changes_since merges entries across multiple sealed files in ascending sequence order |
+| `mixed_sync_nosync` | Interleave sync and nosync writes | changes_since yields only entries up to `durable_sequence`; unsync'd entries visible in the snapshot are excluded |
 | `nosync_only` | All writes with sync=false, enough to trigger rotation | changes_since yields entries only after rotation triggers fdatasync; replication lag bounded by `max_file_bytes` |
 | `nosync_then_sync` | Nosync writes followed by one sync write | The sync's `fdatasync` covers all prior nosync entries; `durable_sequence` catches up and changes_since yields everything |
-| `vacuumed_batches` | apply_batch, then vacuum the sealed file containing the batch | changes_since over the vacuumed file must still yield BulkBegin/BulkEnd markers; ingest writes atomically on the follower |
+| `vacuumed_batches` | apply_batch, then vacuum the sealed file containing the batch | changes_since over the vacuumed file yields BulkBegin/BulkEnd markers; ingest writes atomically on the follower |
 
 ### OpsShapes
 
@@ -393,6 +360,8 @@ class IngestFailureClass(Enum):
     I_B2 = "append_fails_partial_write"    # writev returns short, file tainted
     I_F  = "sync_fails"                   # fdatasync fails — bytes in page cache, not durable
     I_C  = "crash_mid_batch"              # crash after BulkBegin written, before BulkEnd
+    I_G  = "rotation_sync_fails"          # pre-rotation fdatasync fails during ingest rotation
+    I_H  = "rotation_file_creation_fails" # rotation file creation fails after seal — chunk is durable
 ```
 
 | Class | Entries applied | key_dir changes | next_seq advances | Degraded |
@@ -402,19 +371,22 @@ class IngestFailureClass(Enum):
 | I_B2 | None | No | Yes (prevent reuse) | Yes |
 | I_F | None visible | No (not published) | Yes (prevent reuse) | Yes |
 | I_C | None from the batch | No — recovery discards incomplete batch | Restored to pre-batch | No (recovery handles) |
+| I_G | None visible | No (not published) | Yes (prevent reuse) | Yes |
+| I_H | Chunk that triggered rotation | Yes — partial delta | Yes | Yes |
 
 **next_seq advance on failure + idempotency — coordinator contract.** On I_B1/I_B2/I_F the follower advances `next_seq` past the failed entries and degrades. A naive re-deliver would hit the idempotency skip (`sequence <= current_sequence()`) and silently drop data. The coordinator must call `resume()` before retrying: `resume()` truncates the post-durable tail and rebuilds `next_seq` from the recovered state ([`bytecask.cpp` `DB::resume`](../bytecaskdb/bytecask.cpp)), restoring the invariant `next_seq == max(applied seq) + 1`. Re-delivery then proceeds normally.
 
-Class C (orphaned `BulkBegin`) is reachable through the replication pipeline — `changes_since` preserves batch markers, so `ingest` writes `BulkBegin`...entries...`BulkEnd` as a `writev`. If the follower crashes mid-`ingest` after writing `BulkBegin` but before `BulkEnd`, recovery discards the incomplete batch (same as the leader's recovery behavior). Classes G and H (rotation failures) apply if `ingest` triggers file rotation on the follower when the active file exceeds the size threshold.
+Class C (orphaned `BulkBegin`) is reachable through the replication pipeline — `changes_since` preserves batch markers, so `ingest` writes `BulkBegin`...entries...`BulkEnd` as a `writev`. If the follower crashes mid-`ingest` after writing `BulkBegin` but before `BulkEnd`, recovery discards the incomplete batch (same as the leader's recovery behavior). Classes I_G and I_H (rotation failures) apply when `ingest` triggers file rotation on the follower because the active file exceeds the size threshold. I_G fails the pre-rotation sync; I_H succeeds on the sync but fails to create the new active file after sealing. I_H is notable: the chunk that triggered rotation is fully durable (the sync succeeded), so the follower's key_dir reflects a partial delta — the entries from that chunk are committed.
 
 ### Expected Deltas
 
-| StateShape × OpsShape | SUCCESS | I_B1 / I_B2 / I_F |
-|----------------------|---------|---------------------|
-| Any × `full_stream` | follower.key_dir == leader.key_dir | follower.key_dir unchanged from baseline |
-| Any × `incremental` | follower.key_dir == leader.key_dir after final chunk | follower.key_dir reflects entries ingested before the failing chunk |
-| Any × `restart_midstream` | follower.key_dir == leader.key_dir after second pass | follower.key_dir reflects entries ingested before the simulated crash |
-| Any × `duplicate_delivery` | follower.key_dir unchanged (all entries already applied) | N/A — duplicates are skipped before I/O |
+| StateShape × OpsShape | SUCCESS | I_B1 / I_B2 / I_F / I_G | I_H |
+|----------------------|---------|--------------------------|-----|
+| Any × `full_stream` | follower.key_dir == leader.key_dir | follower.key_dir unchanged from baseline | follower.key_dir reflects entries from the chunk that triggered rotation |
+| Any × `incremental` | follower.key_dir == leader.key_dir after final chunk | follower.key_dir reflects entries ingested before the failing chunk | Same — partial delta from the durable chunk |
+| Any × `restart_midstream` | follower.key_dir == leader.key_dir after second pass | follower.key_dir reflects entries ingested before the simulated crash | Same — partial delta from the durable chunk |
+| Any × `duplicate_delivery` | follower.key_dir unchanged (all entries already applied) | N/A — duplicates are skipped before I/O | N/A |
+| Any × `planned_promotion` | NodeA.key_dir == NodeB.key_dir after backward sync | N/A — SUCCESS only | N/A |
 
 ### create_manifest — FailureClasses
 
@@ -442,10 +414,10 @@ Checked after every test case:
 3. **Key-value equivalence** (SUCCESS): for every key in leader.key_dir at snapshot time, `follower.get(key)` returns the same value.
 4. **No extra keys**: follower.key_dir contains no keys absent from leader.key_dir at snapshot time.
 5. **Structural consistency**: same checks as `assert_consistent` in the write-path proof — live_bytes matches key_dir, no dangling file refs, next_seq ahead of all sequences.
-6. **Recovery equivalence**: close follower, reopen from disk, verify recovered state matches pre-close state. This proves `ingest` writes are durable and recoverable.
+6. **Recovery equivalence**: close follower, reopen from disk, verify recovered state matches pre-close state. Proves `ingest` writes are durable and recoverable.
 7. **Idempotency**: re-ingesting entries with `sequence <= current_sequence()` produces no state change — no key_dir delta, no next_seq change.
 8. **Durable boundary**: `changes_since` never yields entries with `sequence > durable_sequence`. Validated by running a mixed sync/nosync workload on the leader, taking a snapshot (which includes unsync'd entries in the key directory), and verifying that `changes_since` excludes entries beyond the durable sequence.
-9. **Batch atomicity through vacuum**: for the `vacuumed_batches` state shape, `changes_since` over vacuumed files yields `BulkBegin`/`BulkEnd` markers framing the batch entries. `ingest` writes the batch as a single `writev` on the follower. After a simulated crash mid-ingest (Class C), recovery discards the incomplete batch — no partial batch is visible.
+9. **Batch atomicity through vacuum**: for the `vacuumed_batches` state shape, `changes_since` over vacuumed files yields `BulkBegin`/`BulkEnd` markers framing the batch entries. `ingest` writes the batch as a single `writev` on the follower. After a simulated crash mid-ingest (Class I_C), recovery discards the incomplete batch — no partial batch is visible.
 9a. **Vacuum preserves original sequences**: for every entry in a vacuumed file, the sequence equals the entry's sequence in the pre-vacuum source file. Vacuum never re-numbers. This is load-bearing for replication (otherwise `changes_since` would yield inconsistent sequences after vacuum) and is currently incidental in [`vacuum_scan_and_copy`](../bytecaskdb/bytecask.cpp) — making it a test invariant prevents a future refactor from silently breaking it.
 9b. **Per-file sequence monotonicity and sequence-disjoint files**: within every data file (active or sealed, including compacted files), entries appear in strictly ascending sequence order. Additionally, all data files have non-overlapping sequence ranges — no two files contain entries with the same sequence number. This holds naturally: the write path assigns sequences monotonically to the active file, `vacuum_compact_file` scans sequentially and preserves order while maintaining disjoint ranges, and `vacuum_remove_file` deletes the file entirely. This invariant enables linear file scanning for `changes_since` without min-heap merge.
 10. **Sequence continuity after promotion**: after `set_mode(Leader)`, the first write on the promoted node gets `sequence == current_sequence() + 1`. No gap, no reuse of existing sequences.
@@ -474,11 +446,9 @@ create_manifest tests:
   3. leader.create_manifest() → manifest (or throws)
   4. On SUCCESS: assert manifest.through_sequence == leader.current_sequence()
   5. On SUCCESS: assert all sealed files present in manifest.files
-  6. Copy manifest files to follower directory
-  7. Open follower DB in Mode::Follower over copied files
-  8. assert follower.current_sequence() == manifest.through_sequence
+  6. Assert leader continues accepting writes regardless of failure class
 
-promotion tests (planned):
+planned_promotion tests:
   1. Create NodeA (Leader), apply workload (StateShape)
   2. Create NodeB (Follower)
   3. Replicate fully: NodeA.changes_since → NodeB.ingest until caught up
@@ -494,17 +464,28 @@ promotion tests (planned):
 
 ### Scenario Matrix Size
 
-11 state shapes × 4 ops shapes × 5 failure classes = 220 ingest tests (before elimination rules).
+11 state shapes × 5 ops shapes × 7 failure classes = 385 ingest tests (before elimination rules).
 
 Elimination rules:
-- `duplicate_delivery` × failure classes: duplicates are skipped before I/O, so I_B1/I_B2/I_F/I_C are unreachable. Only SUCCESS applies → eliminates 4 tests.
-- `restart_midstream` × I_B1/I_B2/I_F: the failure applies to the second pass after restart, same as `full_stream` failure. Valid but may be redundant — keep for coverage.
+- `duplicate_delivery` × failure classes: duplicates are skipped before I/O, so I_B1/I_B2/I_F/I_C/I_G/I_H are unreachable. Only SUCCESS applies → eliminates 66 tests.
+- `planned_promotion` × failure classes: a flag flip — only SUCCESS applies → eliminates 66 tests.
+- I_C only applies to state shapes with batches (`batches`, `vacuumed_batches`). For state shapes without batch markers, I_C is unreachable → eliminates 45 tests.
+- I_G / I_H only apply to state shapes that trigger file rotation (`multi_file`, `nosync_only`, `vacuumed_batches`). For state shapes without `max_file_bytes`, rotation is unreachable → eliminates 24 tests.
 - `nosync_only`: rotation triggers fdatasync, so entries are replicable after rotation. All ops shapes and failure classes apply — no elimination.
-- I_C only applies to state shapes with batches (`batches`, `vacuumed_batches`). For state shapes without batch markers, I_C is unreachable → eliminates 36 tests.
 
-Promotion tests are SUCCESS-only for the mode switch (no I/O failure modes — it's a flag flip). The replication phases before and after promotion use the same ingest path tested above. 11 state shapes × 1 promotion shape (planned only) = 11 promotion tests.
+11 state shapes × 3 manifest failure classes = **33 manifest tests**.
 
-Estimated: **~180 ingest tests** + **~33 create_manifest tests** + **~11 promotion tests** = **~224 tests**.
+After elimination: **178 ingest tests** + **33 manifest tests** = **211 tests**.
+
+### Edge Cases
+
+Three edge cases required special handling in the test framework:
+
+1. **Nosync baseline**: `capture_replication_baseline` builds the leader's expected key-value map by replaying `changes_since(snap, 0)` output, not by iterating the snapshot's key directory. This ensures the baseline respects the `durable_seq` boundary — unsync'd entries visible in the snapshot are excluded from the expected follower state.
+
+2. **Batch boundary chunk splitting**: for state shapes with small entry counts and batch markers, the batch boundary adjustment in `gen_incremental_test` can push all entries into chunk 1, leaving chunk 2 empty. The generated tests handle this with a runtime `if (chunk2.empty())` guard that checks success behavior instead of attempting a second ingest.
+
+3. **Restart midstream rotation edge case**: in `restart_midstream` tests, the second `changes_since` pass after recovery returns only the remainder entries. For rotation-class faults (I_H, I_G), this remainder may be too small to trigger file rotation — the fault never fires. The test framework uses try-catch with a `bool threw` tracking pattern to handle both outcomes: if the fault fires, assert failure behavior; if not, assert success behavior.
 
 ---
 

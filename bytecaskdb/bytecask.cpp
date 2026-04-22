@@ -1190,6 +1190,13 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
     for (const auto &[entry, entry_off] : scan_committed(*file)) {
       if (entry.entry_type == EntryType::BulkBegin ||
           entry.entry_type == EntryType::BulkEnd) {
+        // Batch markers carry sequences that must be visible to recovery
+        // so that next_seq (and therefore durable_seq) is computed past
+        // the marker's sequence. Without them, recovery underestimates
+        // next_seq and the next write reuses a marker's sequence number.
+        // BulkBegin also ensures file_stats.min_sequence is accurate.
+        entries.push_back({entry.sequence, entry.entry_type, entry_off,
+                           0, {}, {}});
         continue;
       }
       entries.push_back(
@@ -1524,7 +1531,15 @@ auto DB::create_manifest() -> FileManifest {
     t.apply_sync(max_seq);
 
     // Seal active file, dispatch hint generation, open new active.
-    rotate_active_file(t, current);
+    try {
+      rotate_active_file(t, current);
+    } catch (...) {
+      t.apply_degrade(
+          "create_manifest rotation failed: active file is sealed "
+          "but new file could not be created. Call resume() to recover.");
+      store_state(current, std::move(t).persistent());
+      throw;
+    }
 
     through_seq = max_seq;
     store_state(current, std::move(t).persistent());
