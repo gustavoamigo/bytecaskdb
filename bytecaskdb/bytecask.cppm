@@ -528,6 +528,8 @@ public:
 export class DbFollowerMode : public std::runtime_error {
 public:
   using std::runtime_error::runtime_error;
+  DbFollowerMode(const DbFollowerMode &) = default;
+  auto operator=(const DbFollowerMode &) -> DbFollowerMode & = default;
   ~DbFollowerMode() override;
 };
 
