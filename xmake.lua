@@ -153,6 +153,16 @@ target("engine_bench")
         add_release_opts(t)
     end)
 
+target("memory_profile")
+    set_kind("binary")
+    set_default(false)
+    add_files("benchmarks/memory_profile.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
+    add_packages("crc32c")
+    on_config(function(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+
 -- Static library target for out-of-tree consumers (e.g. the MariaDB plugin).
 -- Compiles all C++23 module sources and exposes them via libbytecask.a.
 -- Note: C++23 module BMIs are not portable across translation units that
