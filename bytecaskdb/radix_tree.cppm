@@ -24,235 +24,171 @@ export module bytecask.radix_tree;
 namespace bytecask {
 
 // ---------------------------------------------------------------------------
-// SmallVector<T, N>
+// CompactPrefix
 //
-// Stores up to N elements inline (no heap allocation), spilling to an
-// std::vector<T> beyond that. Provides a minimal subset of the vector
-// interface sufficient for the radix tree's node layout.
+// Fixed 16-byte container for node prefix bytes. Stores up to 15 bytes
+// inline (no heap allocation). Prefixes longer than 15 bytes spill to a
+// heap-allocated buffer.
+//
+// Inline layout (size_ <= 15):
+//   size_ : length (0-15)
+//   data_[0..14] : prefix bytes
+//
+// Heap layout (size_ == kHeapFlag):
+//   data_[0..7]  : byte* pointer via memcpy
+//   data_[8..11] : uint32_t heap length via memcpy
+//
+// sizeof(CompactPrefix) == 16, alignof(CompactPrefix) == 1.
 // ---------------------------------------------------------------------------
-export template <typename T, std::size_t N> class SmallVector {
+class CompactPrefix {
 public:
-  SmallVector() : size_{0} {
-    // Intentionally leave inline_storage_ uninitialized — no elements
-    // constructed yet. The union's heap_ member is not active.
-  }
+  static constexpr std::size_t kInlineCap = 15;
 
-  ~SmallVector() { destroy_all(); }
+  CompactPrefix() noexcept = default;
 
-  SmallVector(const SmallVector &other) : size_{other.size_} {
+  ~CompactPrefix() { free_heap(); }
+
+  CompactPrefix(const CompactPrefix &other) : size_{other.size_} {
     if (other.on_heap()) {
-      new (&heap_) std::vector<T>(other.heap_);
+      auto n = other.heap_size();
+      auto *buf = new std::byte[n];
+      std::memcpy(buf, other.heap_ptr(), n);
+      store_heap_ptr(buf);
+      store_heap_size(n);
     } else {
-      for (std::size_t i = 0; i < size_; ++i) {
-        std::construct_at(inline_ptr() + i, other.inline_ptr()[i]);
-      }
+      std::memcpy(data_, other.data_, other.inline_size());
     }
   }
 
-  SmallVector(SmallVector &&other) noexcept(
-      std::is_nothrow_move_constructible_v<T>)
-      : size_{other.size_} {
-    if (other.on_heap()) {
-      new (&heap_) std::vector<T>(std::move(other.heap_));
-      other.heap_.~vector();
-      other.size_ = 0;
-    } else {
-      for (std::size_t i = 0; i < size_; ++i) {
-        std::construct_at(inline_ptr() + i, std::move(other.inline_ptr()[i]));
-      }
-      other.destroy_inline();
-      other.size_ = 0;
-    }
+  CompactPrefix(CompactPrefix &&other) noexcept : size_{other.size_} {
+    std::memcpy(data_, other.data_, sizeof(data_));
+    other.size_ = 0;
   }
 
-  auto operator=(const SmallVector &other) -> SmallVector & {
+  auto operator=(const CompactPrefix &other) -> CompactPrefix & {
     if (this != &other) {
-      auto tmp{other};          // copy first — if this throws, *this is untouched
-      *this = std::move(tmp);   // move-assign is noexcept for our element types
+      auto tmp{other};
+      *this = std::move(tmp);
     }
     return *this;
   }
 
-  auto operator=(SmallVector &&other) noexcept(
-      std::is_nothrow_move_constructible_v<T>) -> SmallVector & {
+  auto operator=(CompactPrefix &&other) noexcept -> CompactPrefix & {
     if (this == &other)
       return *this;
-    destroy_all();
-    // Leave size_ at 0 (logically empty, inline mode) until each element has
-    // been successfully constructed. If T's move-construct throws mid-loop,
-    // ~SmallVector will destroy only the already-built prefix rather than
-    // running ~T over uninitialised storage.
-    size_ = 0;
-    if (other.on_heap()) {
-      new (&heap_) std::vector<T>(std::move(other.heap_));
-      size_ = kSpillSentinel;
-      other.heap_.~vector();
-      other.size_ = 0;
-    } else {
-      auto n = other.size_;
-      for (std::size_t i = 0; i < n; ++i) {
-        std::construct_at(inline_ptr() + i, std::move(other.inline_ptr()[i]));
-        ++size_;
-      }
-      other.destroy_inline();
-      other.size_ = 0;
-    }
+    free_heap();
+    size_ = other.size_;
+    std::memcpy(data_, other.data_, sizeof(data_));
+    other.size_ = 0;
     return *this;
   }
 
   [[nodiscard]] auto size() const noexcept -> std::size_t {
-    return on_heap() ? heap_.size() : size_;
+    return on_heap() ? heap_size() : inline_size();
   }
 
-  [[nodiscard]] auto empty() const noexcept -> bool { return size() == 0; }
+  [[nodiscard]] auto empty() const noexcept -> bool { return size_ == 0; }
 
-  [[nodiscard]] auto data() noexcept -> T * {
-    return on_heap() ? heap_.data() : inline_ptr();
+  [[nodiscard]] auto data() noexcept -> std::byte * {
+    return on_heap() ? heap_ptr() : data_;
   }
 
-  [[nodiscard]] auto data() const noexcept -> const T * {
-    return on_heap() ? heap_.data() : inline_ptr();
+  [[nodiscard]] auto data() const noexcept -> const std::byte * {
+    return on_heap() ? heap_ptr() : data_;
   }
 
-  [[nodiscard]] auto operator[](std::size_t i) noexcept -> T & {
+  [[nodiscard]] auto operator[](std::size_t i) noexcept -> std::byte & {
     return data()[i];
   }
 
-  [[nodiscard]] auto operator[](std::size_t i) const noexcept -> const T & {
+  [[nodiscard]] auto operator[](std::size_t i) const noexcept
+      -> const std::byte & {
     return data()[i];
   }
 
-  [[nodiscard]] auto begin() noexcept -> T * { return data(); }
-  [[nodiscard]] auto end() noexcept -> T * { return data() + size(); }
-  [[nodiscard]] auto begin() const noexcept -> const T * { return data(); }
-  [[nodiscard]] auto end() const noexcept -> const T * {
+  [[nodiscard]] auto begin() noexcept -> std::byte * { return data(); }
+  [[nodiscard]] auto end() noexcept -> std::byte * { return data() + size(); }
+  [[nodiscard]] auto begin() const noexcept -> const std::byte * {
+    return data();
+  }
+  [[nodiscard]] auto end() const noexcept -> const std::byte * {
     return data() + size();
   }
 
-  void push_back(const T &val) {
+  void push_back(std::byte b) {
     if (on_heap()) {
-      heap_.push_back(val);
-    } else if (size_ < N) {
-      std::construct_at(inline_ptr() + size_, val);
-      ++size_;
-    } else {
-      spill_to_heap();
-      heap_.push_back(val);
-    }
-  }
-
-  void push_back(T &&val) {
-    if (on_heap()) {
-      heap_.push_back(std::move(val));
-    } else if (size_ < N) {
-      std::construct_at(inline_ptr() + size_, std::move(val));
-      ++size_;
-    } else {
-      spill_to_heap();
-      heap_.push_back(std::move(val));
-    }
-  }
-
-  // Insert at position. Returns pointer to inserted element.
-  auto insert(T *pos, T val) -> T * {
-    auto idx = static_cast<std::size_t>(pos - data());
-    if (on_heap()) {
-      auto it = heap_.insert(heap_.begin() + static_cast<std::ptrdiff_t>(idx),
-                             std::move(val));
-      return &*it;
-    }
-    if (size_ < N) {
-      if (idx < size_) {
-        // Shift elements [idx, size_) right by one.
-        std::construct_at(inline_ptr() + size_,
-                          std::move(inline_ptr()[size_ - 1]));
-        for (auto i = size_ - 1; i > idx; --i) {
-          inline_ptr()[i] = std::move(inline_ptr()[i - 1]);
-        }
-        inline_ptr()[idx] = std::move(val);
-      } else {
-        // Inserting at the end — no shift needed.
-        std::construct_at(inline_ptr() + idx, std::move(val));
-      }
-      ++size_;
-      return inline_ptr() + idx;
-    }
-    spill_to_heap();
-    auto it = heap_.insert(heap_.begin() + static_cast<std::ptrdiff_t>(idx),
-                           std::move(val));
-    return &*it;
-  }
-
-  void erase(T *pos) {
-    auto idx = static_cast<std::size_t>(pos - data());
-    if (on_heap()) {
-      heap_.erase(heap_.begin() + static_cast<std::ptrdiff_t>(idx));
+      auto old_n = heap_size();
+      auto *old_buf = heap_ptr();
+      auto *new_buf = new std::byte[old_n + 1];
+      std::memcpy(new_buf, old_buf, old_n);
+      new_buf[old_n] = b;
+      delete[] old_buf;
+      store_heap_ptr(new_buf);
+      store_heap_size(old_n + 1);
       return;
     }
-    for (auto i = idx; i + 1 < size_; ++i) {
-      inline_ptr()[i] = std::move(inline_ptr()[i + 1]);
+    auto n = inline_size();
+    if (n < kInlineCap) {
+      data_[n] = b;
+      ++size_;
+      return;
     }
-    std::destroy_at(inline_ptr() + size_ - 1);
-    --size_;
+    // Spill: copy inline bytes + new byte to heap.
+    auto *buf = new std::byte[kInlineCap + 1];
+    std::memcpy(buf, data_, kInlineCap);
+    buf[kInlineCap] = b;
+    store_heap_ptr(buf);
+    store_heap_size(kInlineCap + 1);
+    size_ = kHeapFlag;
   }
 
   void clear() {
-    destroy_all();
-    // After destroy_all() the union has no active member. Setting size_ = 0
-    // switches back to inline mode; subsequent push_back will construct_at
-    // into inline_storage_. This is valid under C++20 implicit-lifetime rules
-    // (std::byte is an implicit-lifetime type and the union provides storage).
+    free_heap();
     size_ = 0;
   }
 
 private:
-  static constexpr std::size_t kSpillSentinel = N + 1;
+  static constexpr std::uint8_t kHeapFlag = 0xFF;
 
   [[nodiscard]] auto on_heap() const noexcept -> bool {
-    return size_ == kSpillSentinel;
+    return size_ == kHeapFlag;
   }
 
-  auto inline_ptr() noexcept -> T * {
-    return std::launder(reinterpret_cast<T *>(&inline_storage_));
+  [[nodiscard]] auto inline_size() const noexcept -> std::size_t {
+    return size_;
   }
 
-  auto inline_ptr() const noexcept -> const T * {
-    return std::launder(reinterpret_cast<const T *>(&inline_storage_));
+  [[nodiscard]] auto heap_size() const noexcept -> std::size_t {
+    std::uint32_t n;
+    std::memcpy(&n, data_ + 8, sizeof(n));
+    return n;
   }
 
-  void destroy_inline() {
-    if (!on_heap()) {
-      for (std::size_t i = 0; i < size_; ++i) {
-        std::destroy_at(inline_ptr() + i);
-      }
-    }
+  void store_heap_size(std::size_t n) noexcept {
+    auto n32 = static_cast<std::uint32_t>(n);
+    std::memcpy(data_ + 8, &n32, sizeof(n32));
   }
 
-  void destroy_all() {
-    if (on_heap()) {
-      heap_.~vector();
-    } else {
-      destroy_inline();
-    }
+  [[nodiscard]] auto heap_ptr() const noexcept -> std::byte * {
+    std::byte *p;
+    std::memcpy(&p, data_, sizeof(p));
+    return p;
   }
 
-  void spill_to_heap() {
-    std::vector<T> tmp;
-    tmp.reserve(N + 1);
-    for (std::size_t i = 0; i < size_; ++i) {
-      tmp.push_back(std::move(inline_ptr()[i]));
-    }
-    destroy_inline();
-    new (&heap_) std::vector<T>(std::move(tmp));
-    size_ = kSpillSentinel;
+  void store_heap_ptr(std::byte *p) noexcept {
+    std::memcpy(data_, &p, sizeof(p));
   }
 
-  std::size_t size_{0};
-  union {
-    alignas(T) std::byte inline_storage_[sizeof(T) * N];
-    std::vector<T> heap_;
-  };
+  void free_heap() noexcept {
+    if (on_heap())
+      delete[] heap_ptr();
+  }
+
+  std::uint8_t size_{0};
+  std::byte data_[kInlineCap]{};
 };
+static_assert(sizeof(CompactPrefix) == 16);
+static_assert(alignof(CompactPrefix) == 1);
 
 // ---------------------------------------------------------------------------
 // IntrusivePtr<T>
@@ -377,12 +313,12 @@ template <typename V> struct Node {
   std::uint32_t packed_tag_{0};
   V value_{};
 
-  using Prefix = SmallVector<std::byte, 24>;
+  using Prefix = CompactPrefix;
   Prefix prefix;
 
   // Children: null for leaf nodes, heap-allocated for internal nodes.
   // 94% of nodes are leaves — they pay only 8 B (null pointer) instead
-  // of 32 B for an empty SmallVector.
+  // of embedding an empty vector in the node.
   using ChildSlot = std::pair<std::byte, IntrusivePtr<Node>>;
   using ChildVec = std::vector<ChildSlot>;
   std::unique_ptr<ChildVec> children_;

@@ -28,8 +28,8 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BENCH_TARGET = "bytecask_bench"
-BENCH_BINARY = REPO_ROOT / "build/linux/x86_64/release/bytecask_bench"
+BENCH_TARGET = "map_bench"
+BENCH_BINARY = REPO_ROOT / "build/linux/x86_64/release/map_bench"
 CSV_PATH = REPO_ROOT / "benchmarks/map_bench_results.csv"
 
 CSV_COLUMNS = [

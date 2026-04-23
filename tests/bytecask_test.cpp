@@ -3604,7 +3604,7 @@ auto make_snapshot(
 
 TEST_CASE("validate_preconditions: MustExist passes when key present",
           "[validate_preconditions]") {
-  auto state = make_state({{"k", {10, 1, 0, 5}}});
+  auto state = make_state({{"k", {10, 0, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan;
   plan.ensure_present(to_bytes("k"));
@@ -3634,7 +3634,7 @@ TEST_CASE("validate_preconditions: MustBeAbsent passes when key absent",
 
 TEST_CASE("validate_preconditions: MustBeAbsent fails when key present",
           "[validate_preconditions]") {
-  auto state = make_state({{"k", {10, 1, 0, 5}}});
+  auto state = make_state({{"k", {10, 0, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan;
   plan.ensure_absent(to_bytes("k"));
@@ -3644,7 +3644,7 @@ TEST_CASE("validate_preconditions: MustBeAbsent fails when key present",
 
 TEST_CASE("validate_preconditions: None precondition always passes",
           "[validate_preconditions]") {
-  auto state = make_state({{"k", {10, 1, 0, 5}}});
+  auto state = make_state({{"k", {10, 0, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan;
   plan.put(to_bytes("k"), to_bytes("v1"));
@@ -3655,8 +3655,8 @@ TEST_CASE("validate_preconditions: None precondition always passes",
 
 TEST_CASE("validate_preconditions: MustBeUnchanged passes when key unchanged",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
-  auto state = make_state({{"k", {10, 1, 0, 5}}});
+  auto snap = make_snapshot({{"k", {10, 0, 1, 5}}});
+  auto state = make_state({{"k", {10, 0, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("k"));
@@ -3666,8 +3666,8 @@ TEST_CASE("validate_preconditions: MustBeUnchanged passes when key unchanged",
 
 TEST_CASE("validate_preconditions: MustBeUnchanged fails when key modified",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
-  auto state = make_state({{"k", {20, 1, 100, 5}}});
+  auto snap = make_snapshot({{"k", {10, 0, 1, 5}}});
+  auto state = make_state({{"k", {20, 100, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("k"));
@@ -3677,7 +3677,7 @@ TEST_CASE("validate_preconditions: MustBeUnchanged fails when key modified",
 
 TEST_CASE("validate_preconditions: MustBeUnchanged fails when key deleted",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
+  auto snap = make_snapshot({{"k", {10, 0, 1, 5}}});
   auto state = make_state({});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
@@ -3700,7 +3700,7 @@ TEST_CASE("validate_preconditions: MustBeUnchanged passes when key absent in bot
 TEST_CASE("validate_preconditions: MustBeUnchanged fails when key appeared",
           "[validate_preconditions]") {
   auto snap = make_snapshot({});
-  auto state = make_state({{"k", {15, 1, 0, 5}}});
+  auto state = make_state({{"k", {15, 0, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("k"));
@@ -3712,8 +3712,8 @@ TEST_CASE("validate_preconditions: MustBeUnchanged fails when key appeared",
 
 TEST_CASE("validate_preconditions: range guard passes when range unchanged",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"a", {5, 1, 0, 3}}, {"b", {10, 1, 0, 5}}, {"d", {15, 1, 0, 4}}});
-  auto state = make_state({{"a", {5, 1, 0, 3}}, {"b", {10, 1, 0, 5}}, {"d", {15, 1, 0, 4}}});
+  auto snap = make_snapshot({{"a", {5, 0, 1, 3}}, {"b", {10, 0, 1, 5}}, {"d", {15, 0, 1, 4}}});
+  auto state = make_state({{"a", {5, 0, 1, 3}}, {"b", {10, 0, 1, 5}}, {"d", {15, 0, 1, 4}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
@@ -3723,8 +3723,8 @@ TEST_CASE("validate_preconditions: range guard passes when range unchanged",
 
 TEST_CASE("validate_preconditions: range guard fails when key modified in range",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"b", {10, 1, 0, 5}}});
-  auto state = make_state({{"b", {20, 1, 100, 5}}});
+  auto snap = make_snapshot({{"b", {10, 0, 1, 5}}});
+  auto state = make_state({{"b", {20, 100, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
@@ -3735,7 +3735,7 @@ TEST_CASE("validate_preconditions: range guard fails when key modified in range"
 TEST_CASE("validate_preconditions: range guard fails when key inserted in range",
           "[validate_preconditions]") {
   auto snap = make_snapshot({});
-  auto state = make_state({{"c", {20, 1, 0, 5}}});
+  auto state = make_state({{"c", {20, 0, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
@@ -3745,7 +3745,7 @@ TEST_CASE("validate_preconditions: range guard fails when key inserted in range"
 
 TEST_CASE("validate_preconditions: range guard fails when key deleted in range",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"c", {10, 1, 0, 5}}});
+  auto snap = make_snapshot({{"c", {10, 0, 1, 5}}});
   auto state = make_state({});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
@@ -3756,8 +3756,8 @@ TEST_CASE("validate_preconditions: range guard fails when key deleted in range",
 
 TEST_CASE("validate_preconditions: range guard ignores keys outside range",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"a", {5, 1, 0, 3}}, {"b", {10, 1, 0, 5}}});
-  auto state = make_state({{"a", {50, 1, 0, 3}}, {"b", {10, 1, 0, 5}}});
+  auto snap = make_snapshot({{"a", {5, 0, 1, 3}}, {"b", {10, 0, 1, 5}}});
+  auto state = make_state({{"a", {50, 0, 1, 3}}, {"b", {10, 0, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
@@ -3769,8 +3769,8 @@ TEST_CASE("validate_preconditions: range guard ignores keys outside range",
 
 TEST_CASE("validate_preconditions: W-W passes when write key unchanged",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
-  auto state = make_state({{"k", {10, 1, 0, 5}}});
+  auto snap = make_snapshot({{"k", {10, 0, 1, 5}}});
+  auto state = make_state({{"k", {10, 0, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("k"), to_bytes("v1"));
@@ -3779,8 +3779,8 @@ TEST_CASE("validate_preconditions: W-W passes when write key unchanged",
 
 TEST_CASE("validate_preconditions: W-W fails when write key modified",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
-  auto state = make_state({{"k", {20, 1, 100, 5}}});
+  auto snap = make_snapshot({{"k", {10, 0, 1, 5}}});
+  auto state = make_state({{"k", {20, 100, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("k"), to_bytes("v1"));
@@ -3790,7 +3790,7 @@ TEST_CASE("validate_preconditions: W-W fails when write key modified",
 TEST_CASE("validate_preconditions: W-W fails when write key appeared",
           "[validate_preconditions]") {
   auto snap = make_snapshot({});
-  auto state = make_state({{"k", {15, 1, 0, 5}}});
+  auto state = make_state({{"k", {15, 0, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("k"), to_bytes("v1"));
@@ -3799,7 +3799,7 @@ TEST_CASE("validate_preconditions: W-W fails when write key appeared",
 
 TEST_CASE("validate_preconditions: W-W fails when write key deleted",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
+  auto snap = make_snapshot({{"k", {10, 0, 1, 5}}});
   auto state = make_state({});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
@@ -3821,8 +3821,8 @@ TEST_CASE("validate_preconditions: W-W skips guard-only keys",
           "[validate_preconditions]") {
   // Key "g" is guard-only (ensure_present), "k" is the write.
   // "g" was modified concurrently but W-W only checks write keys.
-  auto snap = make_snapshot({{"g", {10, 1, 0, 5}}, {"k", {10, 1, 0, 5}}});
-  auto state = make_state({{"g", {20, 1, 100, 3}}, {"k", {10, 1, 0, 5}}});
+  auto snap = make_snapshot({{"g", {10, 0, 1, 5}}, {"k", {10, 0, 1, 5}}});
+  auto state = make_state({{"g", {20, 100, 1, 3}}, {"k", {10, 0, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_present(to_bytes("g"));
@@ -3834,8 +3834,8 @@ TEST_CASE("validate_preconditions: W-W skips guard-only keys",
 
 TEST_CASE("validate_preconditions: multiple guards all pass",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"a", {5, 1, 0, 3}}, {"b", {10, 1, 0, 5}}});
-  auto state = make_state({{"a", {5, 1, 0, 3}}, {"b", {10, 1, 0, 5}}});
+  auto snap = make_snapshot({{"a", {5, 0, 1, 3}}, {"b", {10, 0, 1, 5}}});
+  auto state = make_state({{"a", {5, 0, 1, 3}}, {"b", {10, 0, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_present(to_bytes("a"));
@@ -3846,8 +3846,8 @@ TEST_CASE("validate_preconditions: multiple guards all pass",
 
 TEST_CASE("validate_preconditions: one failing guard rejects plan",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"a", {5, 1, 0, 3}}, {"b", {10, 1, 0, 5}}});
-  auto state = make_state({{"a", {5, 1, 0, 3}}, {"b", {20, 1, 100, 5}}});
+  auto snap = make_snapshot({{"a", {5, 0, 1, 3}}, {"b", {10, 0, 1, 5}}});
+  auto state = make_state({{"a", {5, 0, 1, 3}}, {"b", {20, 100, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_present(to_bytes("a"));
@@ -3858,8 +3858,8 @@ TEST_CASE("validate_preconditions: one failing guard rejects plan",
 
 TEST_CASE("validate_preconditions: del with snapshot triggers W-W check",
           "[validate_preconditions]") {
-  auto snap = make_snapshot({{"k", {10, 1, 0, 5}}});
-  auto state = make_state({{"k", {20, 1, 100, 5}}});
+  auto snap = make_snapshot({{"k", {10, 0, 1, 5}}});
+  auto state = make_state({{"k", {20, 100, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan{std::move(snap)};
   plan.del(to_bytes("k"));
@@ -3868,7 +3868,7 @@ TEST_CASE("validate_preconditions: del with snapshot triggers W-W check",
 
 TEST_CASE("validate_preconditions: no snapshot skips W-W checks",
           "[validate_preconditions]") {
-  auto state = make_state({{"k", {20, 1, 0, 5}}});
+  auto state = make_state({{"k", {20, 0, 1, 5}}});
   auto t = state->transient();
   bytecask::WritePlan plan;
   plan.put(to_bytes("k"), to_bytes("v1"));
@@ -3926,7 +3926,7 @@ TEST_CASE("apply_resume: put with higher sequence overwrites existing",
           "[apply_resume]") {
   // file_id=2 holds existing key at seq=10
   auto state = make_state_with_stats(
-      {{"k1", {10, 2, 100, 5}}},
+      {{"k1", {10, 100, 2, 5}}},
       {{1, {0, 0}}, {2, {bytecask::entry_size(2, 5), 0}}});
   auto t = state->transient();
 
@@ -3950,7 +3950,7 @@ TEST_CASE("apply_resume: put with higher sequence overwrites existing",
 TEST_CASE("apply_resume: put with lower sequence is ignored",
           "[apply_resume]") {
   auto state = make_state_with_stats(
-      {{"k1", {50, 2, 100, 5}}},
+      {{"k1", {50, 100, 2, 5}}},
       {{1, {0, 0}}, {2, {bytecask::entry_size(2, 5), 0}}});
   auto t = state->transient();
 
@@ -3971,7 +3971,7 @@ TEST_CASE("apply_resume: put with lower sequence is ignored",
 TEST_CASE("apply_resume: delete removes key when sequence is higher",
           "[apply_resume]") {
   auto state = make_state_with_stats(
-      {{"k1", {10, 2, 100, 5}}},
+      {{"k1", {10, 100, 2, 5}}},
       {{1, {0, 0}}, {2, {bytecask::entry_size(2, 5), 0}}});
   auto t = state->transient();
 
@@ -3987,7 +3987,7 @@ TEST_CASE("apply_resume: delete removes key when sequence is higher",
 TEST_CASE("apply_resume: delete is ignored when sequence is lower",
           "[apply_resume]") {
   auto state = make_state_with_stats(
-      {{"k1", {50, 2, 100, 5}}},
+      {{"k1", {50, 100, 2, 5}}},
       {{1, {0, 0}}, {2, {bytecask::entry_size(2, 5), 0}}});
   auto t = state->transient();
 
@@ -4030,7 +4030,7 @@ TEST_CASE("apply_resume: does not regress next_seq when entries have lower seque
 
 TEST_CASE("apply_resume: empty entries is a no-op",
           "[apply_resume]") {
-  auto state = make_state_with_stats({{"k1", {10, 1, 0, 5}}}, {{1, {42, 100}}});
+  auto state = make_state_with_stats({{"k1", {10, 0, 1, 5}}}, {{1, {42, 100}}});
   auto t = state->transient();
 
   std::vector<bytecask::ResumeEntry> entries;

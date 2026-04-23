@@ -193,13 +193,13 @@ struct Node {
 
     V value;
 
-    // Short-prefix optimization: most prefixes after a split are 1–20 bytes.
-    // Inline storage up to 24 bytes avoids a heap allocation per node.
-    SmallVector<std::byte, 24> prefix;
+    // Short-prefix optimization: most prefixes after a split are 1–15 bytes.
+    // Inline storage up to 15 bytes avoids a heap allocation per node.
+    CompactPrefix prefix;
 
     // Heap-allocated children vector. nullptr for leaf nodes (94% of nodes).
-    // Leaves pay only 8 bytes (the null pointer) instead of 32 bytes for
-    // an empty SmallVector.
+    // Leaves pay only 8 bytes (the null pointer) instead of embedding an
+    // empty vector in the node.
     using ChildVec = std::vector<std::pair<std::byte, IntrusivePtr<Node>>>;
     std::unique_ptr<ChildVec> children_;
 };
@@ -211,9 +211,9 @@ struct Node {
 
 `PersistentRadixTree` and `TransientRadixTree` use explicit move constructors/assignments that reset the source's `size_` (and `tag_` for transient) to zero via `std::exchange`. This ensures a moved-from tree is in a valid empty state (`size() == 0`, `empty() == true`) rather than carrying stale metadata while the root pointer has been transferred.
 
-Children are stored behind a `unique_ptr` so leaf nodes (94% of all nodes) carry only the 8-byte null pointer instead of a 32-byte empty `SmallVector`. Internal nodes allocate the vector on first `insert_child()` call. Access is via `child_count()`, `child_at()`, and `has_children()` helpers.
+Children are stored behind a `unique_ptr` so leaf nodes (94% of all nodes) carry only the 8-byte null pointer instead of embedding an empty vector. Internal nodes allocate the vector on first `insert_child()` call. Access is via `child_count()`, `child_at()`, and `has_children()` helpers.
 
-`SmallVector<T, N>` stores up to N elements inline (no heap allocation), spilling to the heap above N. This serves design principle #3 (predictable latency): node splits on the write path are zero-allocation in the common case. Copy assignment uses the copy-and-move idiom: construct a temporary copy first (may throw), then move-assign from it (noexcept for our element types). This guarantees strong exception safety — if the copy throws, `*this` is untouched.
+`CompactPrefix` is a fixed 16-byte container (1-byte size + 15 inline bytes, `alignof == 1`). Prefixes up to 15 bytes are stored inline with no heap allocation. Prefixes longer than 15 bytes spill to a heap buffer: the pointer is stored in the first 8 bytes of the inline array via `memcpy` and the heap size in bytes 8–11 — well-defined C++ with no strict aliasing violation. In practice, radix tree splits produce prefixes that are overwhelmingly shorter than 15 bytes (the 16-byte UUIDv7 binary segments are the longest common case), so the heap path is rarely taken.
 
 ### 3.2. Transient Copy-on-Write (COW) Model
 The `transient()` / `persistent()` API pattern — a mutable builder that freezes into an immutable snapshot — was popularised by [Rich Hickey's Clojure transients](https://clojure.org/reference/transients) (Clojure 1.1, ~2009).
@@ -416,7 +416,7 @@ Hint files are assigned to workers round-robin. Each worker builds a `TransientR
 2.  **Prefix Reuse:** Memory profiling or node-inspection tests proving that inserting "prefix_A" and "prefix_B" creates exactly one shared node for "prefix_".
 3.  **Transient Efficiency:** Google Benchmark suite (`benchmarks/map_bench.cpp`, target `bytecask_bench`) comparing `PersistentRadixTree` against `PersistentOrderedMap` across persistent set, transient set, get, iteration, and lower_bound at 1k/10k/100k keys. Transient bulk insert must be significantly faster than chained persistent `set()` for the same container.
 4.  **Ordered Iteration:** `std::is_sorted` returns true when iterating from `begin()` to `end()` comparing `iterator.key()`.
-5.  **SmallVector inline storage:** Inserting keys that produce splits with prefixes ≤ 24 bytes and nodes with ≤ 8 children does not trigger heap allocations for those containers (verified via allocator instrumentation or node inspection).
+5.  **CompactPrefix inline storage:** Inserting keys that produce splits with prefixes ≤ 15 bytes does not trigger heap allocations for prefix storage (verified via allocator instrumentation or node inspection).
 6.  **Erase Compaction:** Erasing all keys from a tree results in a completely empty root, with no dangling routing nodes.
 7.  **Model-based property tests:** A deterministic PRNG-driven test generates 10,000 random `set`/`erase` operations over short byte-array keys (alphabet of 6, length 1–8 for high prefix overlap) and applies them to the radix tree and a `std::map<std::string, int>` oracle. After every operation the following invariants are checked:
     - `size()` equals `oracle.size()`.
@@ -443,10 +443,8 @@ Each `Node<V>` is allocated via `new` and managed by `IntrusivePtr<Node>`, which
 |---|---|---|
 | `refcount_` | `atomic<uint32_t>` | 4 |
 | `packed_tag_` | `uint32_t` | 4 |
-| `value_` | `V` (e.g. `int`) | 4 |
-| *(padding)* | | 4 |
-| `prefix` size word | `size_t` | 8 |
-| `prefix` union (inline 24 B or `std::vector`) | `union` | 24 |
+| `value_` | `V` (e.g. `KeyDirEntry`, 24 B) | 24 |
+| `prefix` | `CompactPrefix` (15 inline bytes, alignof 1) | 16 |
 | `children_` | `unique_ptr<ChildVec>` | 8 |
 | **Node struct total** | | **56 bytes** |
 
@@ -477,11 +475,8 @@ Values from `BM_MemoryFootprint` at 100k keys (measured with the global allocato
 
 | Container | Key type | B/key (generic) | B/key (prefixed UUIDv7) | Key-length sensitivity |
 |---|---|---|---|---|
-| `PersistentRadixTree` | `span<byte>` (not stored) | **86 B** | **92 B** | Low — prefix compression absorbs shared bytes |
+| `PersistentRadixTree` | `span<byte>` (not stored) | **70 B** | **74 B** | Low — prefix compression absorbs shared bytes |
 | `std::map` | `std::string` | 72 B | 117 B | High — full key copied into every node |
-| `PersistentOrderedMap` | `immer::flex_vector` entry | ~40 B\* | ~75 B\* | High — full key copied per entry |
-
-\* `PersistentOrderedMap` figures reflect structural sharing at the `immer::flex_vector` chunk level, not raw per-key key storage. A single live snapshot in isolation carries roughly the same key storage cost as `std::map`.
 
 ### 7.4. Prefix compression in practice
 
@@ -494,19 +489,14 @@ For short, dissimilar keys (e.g. the generic `"key_N"` benchmark, 6–10 bytes e
 
 ### 7.5. 100M key projections
 
-The primary concern for ByteCaskDB is the key directory at production scale. The table below uses 1.07 nodes/key and the measured 86 B/key at 100k as the per-node baseline.
+The primary concern for ByteCaskDB is the key directory at production scale. The table below uses 1.07 nodes/key and the measured 70 B/key at 100k as the per-node baseline.
 
 | Configuration | B/key | 100M keys |
 |---|---|---|
-| Current (`IntrusivePtr`, `unique_ptr<ChildVec>`, packed tag) | **86** | **~8.6 GB** |
-| + pool allocator (batch node allocations, eliminate malloc overhead) | ~70 | ~7.0 GB |
+| Current (`IntrusivePtr`, `unique_ptr<ChildVec>`, `CompactPrefix`, packed tag) | **70** | **~7.0 GB** |
 | `std::map` (no persistence, no prefix compression) | 72 | ~7.2 GB |
 
-The original `shared_ptr`-based design measured 129 B/key (generic) and 139 B/key (prefixed). Intrusive refcounting reduced this to 108/116 B/key (−17%). The leaf node optimization (null `unique_ptr` instead of empty SmallVector) further reduced to 86/92 B/key (−20% from intrusive, −33% from original).
-
-### 7.6. What the `OrderedMap` memory benchmark actually measures
-
-`PersistentOrderedMap` is backed by `immer::flex_vector`, a Radix Balanced Tree of 32-element chunks. Because consecutive `set()` calls produce a chain of versions that share chunks, the allocation tracker reports only **net new bytes in the final snapshot** — bytes from discarded intermediate versions are allocated and immediately freed. The reported ~40 B/key for generic keys and ~75 B/key for prefixed keys do not represent the RAM cost of holding a single live copy of that map. A snapshot in isolation occupies approximately the same RAM as a comparable `std::map`.
+The original `shared_ptr`-based design measured 129 B/key (generic) and 139 B/key (prefixed). Intrusive refcounting reduced this to 108/116 B/key (−17%). The leaf node optimization (null `unique_ptr` instead of empty SmallVector) reduced to 86/92 B/key (−20% from intrusive, −33% from original). Replacing `SmallVector<byte,24>` (32 B) with `CompactPrefix` (16 B) and reordering `KeyDirEntry` fields to eliminate alignment padding further reduced to 70/74 B/key (−19% from leaf optimization, −46% from original).
 
 ---
 

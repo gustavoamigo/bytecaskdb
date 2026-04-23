@@ -290,8 +290,8 @@ void TransientEngineState::apply_writes(
               fs.live_bytes += sz;
               fs.total_bytes += sz;
             });
-            key_dir_.set(key_span, KeyDirEntry{next_seq_, active_file_id_,
-                                                offsets[io_idx], val_size});
+            key_dir_.set(key_span, KeyDirEntry{next_seq_, offsets[io_idx],
+                                                active_file_id_, val_size});
             ++next_seq_;
             ++io_idx;
           } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
@@ -404,8 +404,8 @@ void TransientEngineState::apply_ingest(
         fs.live_bytes += sz;
         fs.total_bytes += sz;
       });
-      key_dir_.set(e.key, KeyDirEntry{e.sequence, active_file_id_,
-                                       offset, val_size});
+      key_dir_.set(e.key, KeyDirEntry{e.sequence, offset,
+                                       active_file_id_, val_size});
       break;
     }
 
@@ -486,7 +486,7 @@ void TransientEngineState::apply_vacuum(
     const auto cur = key_dir_.get(key_span);
     if (cur && cur->sequence == m.sequence) {
       key_dir_.set(key_span,
-                   KeyDirEntry{m.sequence, dest_file_id, m.new_offset,
+                   KeyDirEntry{m.sequence, m.new_offset, dest_file_id,
                                m.value_size});
     } else {
       actual_live_bytes -= entry_size(m.key.size(), m.value_size);
@@ -550,7 +550,7 @@ void TransientEngineState::apply_resume(
         file_stats_.update(file_id,
                            [inc](FileStats &fs) { fs.live_bytes += inc; });
         key_dir_.set(key_span,
-                     KeyDirEntry{e.sequence, file_id, e.file_offset,
+                     KeyDirEntry{e.sequence, e.file_offset, file_id,
                                  e.value_size});
       }
     } else if (e.entry_type == EntryType::Delete) {
@@ -1828,7 +1828,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
             continue;
           }
           t.upsert(he->key,
-                   KeyDirEntry{he->sequence, file_id, he->file_offset,
+                   KeyDirEntry{he->sequence, he->file_offset, file_id,
                                he->value_size},
                    seq_wins);
         } else if (he->entry_type == EntryType::Delete) {
@@ -2004,8 +2004,8 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
             continue;
           }
           const auto existing = transient_key_dir.get(he->key);
-          auto incoming = KeyDirEntry{he->sequence, file_id,
-                                      he->file_offset, he->value_size};
+          auto incoming = KeyDirEntry{he->sequence, he->file_offset,
+                                      file_id, he->value_size};
           if (!existing || kde_newer(incoming, *existing)) {
             if (existing) {
               const auto dec =
