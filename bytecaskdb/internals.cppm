@@ -87,21 +87,6 @@ export inline auto kde_newer(const KeyDirEntry &a, const KeyDirEntry &b) -> bool
   return false; // identical record
 }
 
-// Canonical key-ownership comparator. Returns true if `a` is strictly newer
-// than `b`. Sequence numbers are unique per logical write, so equal sequences
-// must point to the same physical record. If they don't, the database is
-// corrupt and recovery is aborted.
-export inline auto kde_newer(const KeyDirEntry &a, const KeyDirEntry &b) -> bool {
-  if (a.sequence != b.sequence) return a.sequence > b.sequence;
-  // Same sequence — must be the same physical record.
-  if (a.file_id != b.file_id || a.file_offset != b.file_offset) {
-    throw std::runtime_error(
-        "bytecask: corrupt database — two entries share the same sequence "
-        "number but differ in physical location");
-  }
-  return false; // identical record
-}
-
 // Returns the on-disk size of a data file entry given key and value sizes.
 export inline constexpr auto entry_size(std::size_t key_size,
                                         std::size_t value_size)
