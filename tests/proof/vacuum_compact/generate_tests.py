@@ -176,7 +176,6 @@ struct TempDir {
     return counter++;
   }
 };
-};
 
 } // namespace
 
