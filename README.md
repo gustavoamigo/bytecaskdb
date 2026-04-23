@@ -6,7 +6,7 @@
 
 **ByteCaskDB** is a fast, predictable embedded key-value store written in C++. Reads and writes have flat, predictable latency from thousands of keys to hundreds of millions.
 
-All keys in memory at all times — a deliberate design choice that removes an entire class of complexity that exists solely to minimise disk access and makes every point lookup O(1) with flat, predictable latency. At ~100 bytes per key, 128 GB of RAM holds roughly a billion keys. Very few moving parts — an in-memory key directory and an append-only data file — is what keeps that latency flat whether you have 1,000 records or 100 million. 
+All keys in memory at all times — a deliberate design choice that removes an entire class of complexity that exists solely to minimise disk access and makes every point lookup O(1) with flat, predictable latency. At ~70 bytes per key, 128 GB of RAM holds close to two billion keys. Very few moving parts — an in-memory key directory and an append-only data file — is what keeps that latency flat whether you have 1,000 records or 100 million. 
 
 Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCaskDB replaces the original hash-table key directory with a **[persistent radix tree](docs/persistent_radix_tree_design.md)** — enabling ordered range queries, prefix scans, and prefix compaction, while keeping the simplicity that makes Bitcask fast. Snapshots are O(1) — just a root pointer copy. Full MVCC and serializable conflict detection are supported with no separate transaction type required.
 
@@ -415,7 +415,7 @@ See [`docs/bytecask_design.md`](docs/bytecask_design.md) for the full design ref
 
 ## Building
 
-ByteCaskDB requires **Clang** (with C++23 modules support) and [xmake](https://xmake.io).
+ByteCaskDB requires **Clang** (with C++23 modules support), [xmake](https://xmake.io), and Python tooling (`nanobind`) when building the Python extension target.
 
 ```bash
 # Build and run the test suite.
@@ -426,7 +426,7 @@ xmake run bytecask_tests
 python ./scripts/run_engine_bench.py
 ```
 
-A ready-to-use development environment is provided via the included [Dev Container](.devcontainer) (Fedora 43, Clang, xmake pre-installed).
+A ready-to-use development environment is provided via the included [Dev Container](.devcontainer) (Fedora 43, Clang, xmake, LLVM tooling, and `nanobind` pre-installed).
 
 ## Want to hack on it?
 
@@ -450,6 +450,7 @@ If you want to take it in a different direction and fork it into your own thing,
 | [`docs/failure_mode_comparison.md`](docs/failure_mode_comparison.md) | Write-path failure mode comparison: ByteCaskDB vs RocksDB, LevelDB, SQLite WAL, LMDB, WiredTiger |
 | [`docs/replication_primitives_design.md`](docs/replication_primitives_design.md) | Replication primitives: minimal API surface for building leader-follower replication on top of ByteCaskDB |
 | [`docs/xa_support_design.md`](docs/xa_support_design.md) | XA / two-phase commit: generic 2PC primitives (`BulkPrepare`, `Bulk2PCCommit`, `Bulk2PCRollback`) for external coordinators |
+| [`bytecaskdb-node/`](bytecaskdb-node/) | Node.js package: WASM backend (Embind), TypeScript API, and future native N-API binding |
 | [`CONTRACT.md`](CONTRACT.md) | Per-function behavioral contracts: atomicity, durability, I/O failure safety, LSN invariants |
 
 ## License

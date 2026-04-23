@@ -59,9 +59,19 @@ DbFollowerMode::~DbFollowerMode() = default;
 
 namespace {
 
-  // Generates a data file stem using a microsecond-precision UTC timestamp.
-// Format: "data_{YYYYMMDDHHmmssUUUUUU}"
+// Generates a unique data file stem using a UTC timestamp + monotonic counter.
+// Format: "data_{YYYYMMDDHHmmssUUUUUU}_{NNNN}"
+// The counter guarantees uniqueness even when the system clock has low
+// resolution (e.g. WASM/Emscripten where system_clock is millisecond-precise,
+// leaving the last 3 microsecond digits as 000).
 auto make_data_file_stem() -> std::string {
+#ifdef BYTECASK_SINGLE_THREADED
+  static unsigned file_counter = 0;
+#else
+  static std::atomic<unsigned> file_counter{0};
+#endif
+  const auto seq = file_counter++;
+
   const auto now = std::chrono::system_clock::now();
   const auto us_total = std::chrono::duration_cast<std::chrono::microseconds>(
                             now.time_since_epoch())
@@ -72,9 +82,10 @@ auto make_data_file_stem() -> std::string {
   std::tm tm_buf{};
   ::gmtime_r(&tt, &tm_buf);
 
-  return std::format("data_{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}{:06d}",
+  return std::format("data_{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}{:06d}_{:04d}",
                      tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
-                     tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, subsec_us);
+                     tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, subsec_us,
+                     seq);
 }
 
 // Nanoseconds since steady_clock epoch. Timestamps state publications;
@@ -279,8 +290,8 @@ void TransientEngineState::apply_writes(
               fs.live_bytes += sz;
               fs.total_bytes += sz;
             });
-            key_dir_.set(key_span, KeyDirEntry{next_seq_, active_file_id_,
-                                                offsets[io_idx], val_size});
+            key_dir_.set(key_span, KeyDirEntry{next_seq_, offsets[io_idx],
+                                                active_file_id_, val_size});
             ++next_seq_;
             ++io_idx;
           } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
@@ -393,8 +404,8 @@ void TransientEngineState::apply_ingest(
         fs.live_bytes += sz;
         fs.total_bytes += sz;
       });
-      key_dir_.set(e.key, KeyDirEntry{e.sequence, active_file_id_,
-                                       offset, val_size});
+      key_dir_.set(e.key, KeyDirEntry{e.sequence, offset,
+                                       active_file_id_, val_size});
       break;
     }
 
@@ -475,7 +486,7 @@ void TransientEngineState::apply_vacuum(
     const auto cur = key_dir_.get(key_span);
     if (cur && cur->sequence == m.sequence) {
       key_dir_.set(key_span,
-                   KeyDirEntry{m.sequence, dest_file_id, m.new_offset,
+                   KeyDirEntry{m.sequence, m.new_offset, dest_file_id,
                                m.value_size});
     } else {
       actual_live_bytes -= entry_size(m.key.size(), m.value_size);
@@ -539,7 +550,7 @@ void TransientEngineState::apply_resume(
         file_stats_.update(file_id,
                            [inc](FileStats &fs) { fs.live_bytes += inc; });
         key_dir_.set(key_span,
-                     KeyDirEntry{e.sequence, file_id, e.file_offset,
+                     KeyDirEntry{e.sequence, e.file_offset, file_id,
                                  e.value_size});
       }
     } else if (e.entry_type == EntryType::Delete) {
@@ -1817,7 +1828,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
             continue;
           }
           t.upsert(he->key,
-                   KeyDirEntry{he->sequence, file_id, he->file_offset,
+                   KeyDirEntry{he->sequence, he->file_offset, file_id,
                                he->value_size},
                    seq_wins);
         } else if (he->entry_type == EntryType::Delete) {
@@ -1993,8 +2004,8 @@ auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
             continue;
           }
           const auto existing = transient_key_dir.get(he->key);
-          auto incoming = KeyDirEntry{he->sequence, file_id,
-                                      he->file_offset, he->value_size};
+          auto incoming = KeyDirEntry{he->sequence, he->file_offset,
+                                      file_id, he->value_size};
           if (!existing || kde_newer(incoming, *existing)) {
             if (existing) {
               const auto dec =
@@ -2080,8 +2091,13 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
     return s;
   }
 
+#ifdef BYTECASK_SINGLE_THREADED
+  auto W = 1u;
+  (void)recovery_threads;
+#else
   auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
   if (W == 0) W = 1;
+#endif
 
   // Phase 1: round-robin file assignment.
   std::vector<std::vector<RecoveredFile>> worker_files(W);
@@ -2094,6 +2110,24 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
   // each into an accumulator as it arrives. Each ~N/W-key tree is merged
   // once; disjoint subtrees are shared O(1) by the persistent tree, so
   // total merge work is proportional to overlap, not N × log₂(W).
+#ifdef BYTECASK_SINGLE_THREADED
+  // Single-threaded: run recovery serially on the calling thread.
+  std::vector<RecoveryResult> queue;
+  {
+    RecoveryResult acc{};
+    bool acc_initialized = false;
+    for (unsigned i = 0; i < W; ++i) {
+      auto result = recovery_build_from_hints(worker_files[i], strict);
+      if (!acc_initialized) {
+        acc = std::move(result);
+        acc_initialized = true;
+      } else {
+        acc = recovery_merge_results(std::move(acc), std::move(result));
+      }
+    }
+    queue.push_back(std::move(acc));
+  }
+#else
   std::mutex queue_mu;
   std::condition_variable queue_cv;
   std::vector<RecoveryResult> queue;
@@ -2155,6 +2189,7 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
       // lenient: warning already emitted inside recovery_build_from_hints
     }
   }
+#endif
 
   auto &final_result = queue[0];
 

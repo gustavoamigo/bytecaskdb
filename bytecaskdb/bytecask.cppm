@@ -114,7 +114,11 @@ export struct Options {
   std::uint64_t max_file_bytes{kDefaultRotationThreshold};
   // Number of threads used to rebuild the key directory at open time.
   // 1 selects the serial path; >1 uses file-level fan-in parallelism.
+#ifdef BYTECASK_SINGLE_THREADED
+  unsigned recovery_threads{1};
+#else
   unsigned recovery_threads{4};
+#endif
   // When true (default): any CRC error during recovery causes DB::open to
   // throw std::runtime_error. When false: corrupt entries and hint files are
   // skipped; the DB opens with whatever was successfully recovered, and a

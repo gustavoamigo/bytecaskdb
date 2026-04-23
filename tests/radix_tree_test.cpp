@@ -785,9 +785,14 @@ TEST_CASE("RadixTree erase empty key", "[radix_tree]") {
 }
 
 // ---------------------------------------------------------------------------
-// Long keys: prefix > 24 bytes triggers SmallVector<std::byte, 24> spill
+// Long keys: prefix > 15 bytes triggers CompactPrefix heap spill
 // ---------------------------------------------------------------------------
-TEST_CASE("RadixTree long keys spill SmallVector prefix", "[radix_tree]") {
+TEST_CASE("RadixTree long keys spill CompactPrefix", "[radix_tree]") {
+  // Key at the inline boundary (15 bytes as prefix after split).
+  std::string boundary(16, 'b');
+  auto t0 = Tree{}.set(to_bytes(boundary), 42);
+  CHECK(*t0.get(to_bytes(boundary)) == 42);
+
   std::string long_a(50, 'x');
   std::string long_b(50, 'x');
   long_b += "suffix";
@@ -873,9 +878,9 @@ TEST_CASE("RadixTree lower_bound at or before first key", "[radix_tree]") {
 }
 
 // ---------------------------------------------------------------------------
-// Wide fanout: > 8 children at one node triggers SmallVector children spill
+// Wide fanout: > 8 children at one node
 // ---------------------------------------------------------------------------
-TEST_CASE("RadixTree wide fanout spills SmallVector children", "[radix_tree]") {
+TEST_CASE("RadixTree wide fanout", "[radix_tree]") {
   auto t = Tree{};
   // Create 26 children from a single root by inserting single-char keys a-z.
   for (int i = 0; i < 26; ++i) {
@@ -1397,71 +1402,6 @@ TEST_CASE("RadixTree reverse from upper_bound", "[radix_tree]") {
 TEST_CASE("RadixTree upper_bound empty tree", "[radix_tree]") {
   const Tree t;
   CHECK(t.upper_bound(to_bytes("anything")) == t.end());
-}
-
-namespace {
-
-// Type with a throwing move constructor, used to exercise SmallVector's
-// exception-safety on move-assignment. Tracks live instances so tests can
-// assert that no destructors run on uninitialised memory (which would cause
-// live_count to go negative or diverge from the true number of objects).
-struct ThrowOnMove {
-  int v{0};
-  static inline int live_count = 0;
-  static inline int moves_done = 0;
-  static inline int throw_at = -1; // throw on the Nth move-construction; -1 = never
-
-  explicit ThrowOnMove(int x) : v{x} { ++live_count; }
-  ThrowOnMove(const ThrowOnMove &o) : v{o.v} { ++live_count; }
-  ThrowOnMove(ThrowOnMove &&o) : v{o.v} {
-    if (moves_done == throw_at) {
-      // Do NOT ++live_count — object is not constructed.
-      throw std::runtime_error("throw on move");
-    }
-    ++moves_done;
-    ++live_count;
-  }
-  ~ThrowOnMove() { --live_count; }
-  auto operator=(const ThrowOnMove &) -> ThrowOnMove & = default;
-};
-
-} // namespace
-
-TEST_CASE("BC-201 SmallVector move-assign exception safety", "[radix_tree][bc201]") {
-  using SV = bytecask::SmallVector<ThrowOnMove, 4>;
-  ThrowOnMove::live_count = 0;
-  ThrowOnMove::moves_done = 0;
-  ThrowOnMove::throw_at = -1;
-
-  {
-    SV dest;
-    dest.push_back(ThrowOnMove{100});
-    dest.push_back(ThrowOnMove{200});
-
-    SV src;
-    src.push_back(ThrowOnMove{1});
-    src.push_back(ThrowOnMove{2});
-    src.push_back(ThrowOnMove{3});
-
-    // Before the move-assign: 2 (dest) + 3 (src) = 5 live.
-    REQUIRE(ThrowOnMove::live_count == 5);
-
-    // Trigger throw on the second element's move-construction inside
-    // dest = std::move(src). With the buggy version, `size_` is set to
-    // other.size_ (=3) up front, so the destructor of `dest` will invoke
-    // ~ThrowOnMove on elements 1 and 2 even though only element 0 was
-    // constructed → live_count goes negative. With the fix, `size_` is
-    // grown incrementally and the destructor only destroys what was built.
-    ThrowOnMove::moves_done = 0;
-    ThrowOnMove::throw_at = 1;
-
-    CHECK_THROWS_AS(dest = std::move(src), std::runtime_error);
-    ThrowOnMove::throw_at = -1;
-  }
-
-  // Both SmallVectors have been destroyed by now. A correct implementation
-  // leaves live_count at exactly 0. The bug produces a negative count.
-  CHECK(ThrowOnMove::live_count == 0);
 }
 
 TEST_CASE("BC-201 ReverseRadixTreeIterator base() past rend equals begin",

@@ -66,10 +66,11 @@ struct FileStats {
 // ---------------------------------------------------------------------------
 export struct KeyDirEntry {
   std::uint64_t sequence{};
-  std::uint32_t file_id{};
   std::uint64_t file_offset{};
+  std::uint32_t file_id{};
   std::uint32_t value_size{};
 };
+static_assert(sizeof(KeyDirEntry) == 24);
 
 // Canonical key-ownership comparator. Returns true if `a` is strictly newer
 // than `b`. Sequence numbers are unique per logical write, so equal sequences

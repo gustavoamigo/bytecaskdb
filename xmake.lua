@@ -15,8 +15,8 @@ option_end()
 
 if has_config("enable-benchmarks") then
     add_requires("benchmark")
-    add_requires("leveldb")
-    add_requires("rocksdb")
+    -- add_requires("leveldb")
+    add_requires("rocksdb", {system = true})
 end
 
 -- Sanitizer option: `xmake f --sanitizer=address` or `--sanitizer=thread`
@@ -146,7 +146,18 @@ target("engine_bench")
     set_default(false)
     add_files("benchmarks/engine_bench.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
     add_cxflags("-Wno-global-constructors")
-    add_packages("benchmark", "crc32c", "leveldb", "rocksdb")
+    add_packages("benchmark", "crc32c", "rocksdb")
+    add_defines("BENCH_NO_LEVELDB")
+    on_config(function(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+
+target("memory_profile")
+    set_kind("binary")
+    set_default(false)
+    add_files("benchmarks/memory_profile.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
+    add_packages("crc32c")
     on_config(function(t)
         apply_sanitizer(t)
         add_release_opts(t)
@@ -219,6 +230,7 @@ target("bytecaskdb_python")
                  "-Wno-missing-field-initializers", "-Wno-float-equal",
                  "-Wno-deprecated-declarations", "-Wno-nested-anon-types",
                  "-Wno-gnu-anonymous-struct", "-Wno-unused-function",
+                 "-Wno-disabled-macro-expansion",
                  {force = true})
     add_cxxflags("-fPIC", {force = true})
     -- Resolve Python C API symbols at module load time (provided by the host

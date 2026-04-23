@@ -38,6 +38,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -47,15 +48,19 @@
 #include <vector>
 
 // LevelDB
+#ifndef BENCH_NO_LEVELDB
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
+#endif
 
 // RocksDB
+#ifndef BENCH_NO_ROCKSDB
 #include <rocksdb/db.h>
 #include <rocksdb/table.h>
 #include <rocksdb/utilities/optimistic_transaction_db.h>
 #include <rocksdb/utilities/transaction.h>
 #include <rocksdb/write_batch.h>
+#endif
 
 // ByteCaskDB (C++20 modules)
 import bytecask;
@@ -131,9 +136,11 @@ auto bc_val(const std::vector<std::byte> &v) -> bytecask::BytesView {
   return std::span<const std::byte>{v.data(), v.size()};
 }
 
+#ifndef BENCH_NO_LEVELDB
 auto ldb_slice(const std::string &s) -> leveldb::Slice {
   return {s.data(), s.size()};
 }
+#endif
 
 // Wraps the reinterpret_cast needed to view a byte vector as a C char array.
 // Both LevelDB and RocksDB accept their respective Slice via const char*.
@@ -141,10 +148,13 @@ auto bytes_to_chars(const std::vector<std::byte> &v) -> const char * {
   return reinterpret_cast<const char *>(v.data());
 }
 
+#ifndef BENCH_NO_LEVELDB
 auto ldb_val_slice(const std::vector<std::byte> &v) -> leveldb::Slice {
   return {bytes_to_chars(v), v.size()};
 }
+#endif
 
+#ifndef BENCH_NO_ROCKSDB
 auto rdb_slice(const std::string &s) -> rocksdb::Slice {
   return {s.data(), s.size()};
 }
@@ -152,6 +162,7 @@ auto rdb_slice(const std::string &s) -> rocksdb::Slice {
 auto rdb_val_slice(const std::vector<std::byte> &v) -> rocksdb::Slice {
   return {bytes_to_chars(v), v.size()};
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // CAS benchmark helpers
@@ -216,9 +227,11 @@ struct TmpDir {
   std::filesystem::path path;
 
   explicit TmpDir(std::string_view name) {
-    path = std::filesystem::temp_directory_path() /
-           ("engine_bench_" + std::string{name} + "_" +
-            std::to_string(reinterpret_cast<std::uintptr_t>(this)));
+    const char *base = std::getenv("BC_BENCH_DIR");
+    auto parent = base && *base ? std::filesystem::path{base}
+                                : std::filesystem::temp_directory_path();
+    path = parent / ("engine_bench_" + std::string{name} + "_" +
+                     std::to_string(reinterpret_cast<std::uintptr_t>(this)));
     std::filesystem::create_directories(path);
   }
 
@@ -396,6 +409,7 @@ struct BcCasAdapter {
   }
 };
 
+#ifndef BENCH_NO_LEVELDB
 template <bool UseCache = true> struct LdbAdapter {
   struct Db {
     TmpDir dir;
@@ -493,7 +507,9 @@ template <bool UseCache = true> struct LdbAdapter {
     benchmark::DoNotOptimize(s);
   }
 };
+#endif // BENCH_NO_LEVELDB
 
+#ifndef BENCH_NO_ROCKSDB
 template <bool UseCache = true> struct RdbAdapter {
   struct Db {
     TmpDir dir;
@@ -689,6 +705,7 @@ struct RdbCasAdapter {
     }
   }
 };
+#endif // BENCH_NO_ROCKSDB
 
 // ===========================================================================
 // Generic benchmark templates
@@ -1228,10 +1245,14 @@ void BM_RecoveryParallel(benchmark::State &state) {
 #define BENCH(...) BENCHMARK(__VA_ARGS__)->UseRealTime()
 
 using Bc  = BcAdapter;
+#ifndef BENCH_NO_LEVELDB
 using Ldb = LdbAdapter<true>;
 using LdbNC = LdbAdapter<false>;
+#endif
+#ifndef BENCH_NO_ROCKSDB
 using Rdb = RdbAdapter<true>;
 using RdbNC = RdbAdapter<false>;
+#endif
 
 // -- Single Threaded Tests ---
 // --- ByteCaskDB ---
@@ -1247,26 +1268,31 @@ BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCaskDB/MixedBatch/Sync");
 
 
 // --- LevelDB ---
+#ifndef BENCH_NO_LEVELDB
 // BENCH(BM_Put<Ldb, false>)          ->Name("LevelDB/Put/NoSync");
 // BENCH(BM_Put<Ldb, true>)           ->Name("LevelDB/Put/Sync");
 // BENCH(BM_Del<Ldb, true>)           ->Name("LevelDB/Del/Sync");
 // BENCH(BM_Get<Ldb>)                 ->Name("LevelDB/Get");
 // BENCH(BM_Range<Ldb, kRangeLen>)    ->Name("LevelDB/Range50");
 // BENCH(BM_MixedBatch<Ldb, true>)    ->Name("LevelDB/MixedBatch/Sync");
+#endif
 
 
 // --- RocksDB ---
+#ifndef BENCH_NO_ROCKSDB
 BENCH(BM_Put<Rdb, false>)          ->Name("RocksDB/Put/NoSync");
 BENCH(BM_Put<Rdb, true>)           ->Name("RocksDB/Put/Sync");
 BENCH(BM_Del<Rdb, true>)           ->Name("RocksDB/Del/Sync");
 BENCH(BM_Get<Rdb>)                 ->Name("RocksDB/Get");
 BENCH(BM_Range<Rdb, kRangeLen>)    ->Name("RocksDB/Range50");
 BENCH(BM_MixedBatch<Rdb, true>)    ->Name("RocksDB/MixedBatch/Sync");
+#endif
 
 
 
 // --- Recovery from 1 thread to 16 ---
 BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg(1) ->Unit(benchmark::kSecond);
+#ifndef BENCH_NO_MT
 BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg(2) ->Unit(benchmark::kSecond);
 BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg(4) ->Unit(benchmark::kSecond);
 BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg(8) ->Unit(benchmark::kSecond);
@@ -1279,11 +1305,13 @@ BENCH(BM_GetMT<Bc>)                ->Name("ByteCaskDB/GetMT")           ->Thread
 BENCH(BM_GetMT<Bc>)                ->Name("ByteCaskDB/GetMT")           ->Threads(8);
 BENCH(BM_GetMT<Bc>)                ->Name("ByteCaskDB/GetMT")           ->Threads(16);
 BENCH(BM_GetMT<Bc>)                ->Name("ByteCaskDB/GetMT")           ->Threads(32);
+#ifndef BENCH_NO_ROCKSDB
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(2);
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(4);
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(8);
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(16);
 BENCH(BM_GetMT<Rdb>)                ->Name("RocksDB/GetMT")           ->Threads(32);
+#endif
 
 // --- ReadAndWriteLoad (read throughput with 1 background writer) ---
 BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCaskDB/ReadAndWriteLoad/Sync")            ->Threads(2);
@@ -1296,11 +1324,13 @@ BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCaskDB/ReadAndWriteL
 BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(8);
 BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(16);
 BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(32);
+#ifndef BENCH_NO_ROCKSDB
 BENCH(BM_ReadWhileWriting<Rdb, true>)            ->Name("RocksDB/ReadAndWriteLoad/Sync")            ->Threads(2);
 BENCH(BM_ReadWhileWriting<Rdb, true>)            ->Name("RocksDB/ReadAndWriteLoad/Sync")            ->Threads(4);
 BENCH(BM_ReadWhileWriting<Rdb, true>)            ->Name("RocksDB/ReadAndWriteLoad/Sync")            ->Threads(8);
 BENCH(BM_ReadWhileWriting<Rdb, true>)            ->Name("RocksDB/ReadAndWriteLoad/Sync")            ->Threads(16);
 BENCH(BM_ReadWhileWriting<Rdb, true>)            ->Name("RocksDB/ReadAndWriteLoad/Sync")            ->Threads(32);
+#endif
 // BENCH(BM_ReadWhileWriting<RdbNC, true>)          ->Name("RocksDB/ReadAndWriteLoad/Sync/NoCache")    ->Threads(2);
 // BENCH(BM_ReadWhileWriting<RdbNC, true>)          ->Name("RocksDB/ReadAndWriteLoad/Sync/NoCache")    ->Threads(4);
 // BENCH(BM_ReadWhileWriting<RdbNC, true>)          ->Name("RocksDB/ReadAndWriteLoad/Sync/NoCache")    ->Threads(8);
@@ -1313,12 +1343,14 @@ BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads
 BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads(16); 
 BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads(32);
 BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads(64);
-BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(2) ; 
-BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(4) ; 
-BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(8) ; 
-BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(16); 
+#ifndef BENCH_NO_ROCKSDB
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(2) ;
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(4) ;
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(8) ;
+BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(16);
 BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(32);
 BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(64);
+#endif
 
 // --- Multithreaded Put with periodic sync (50 ms interval) ---
 BENCH(BM_PutMT_PeriodicSync<Bc>)   ->Name("ByteCaskDB/PutMT/PeriodicSync") ->Threads(2) ;
@@ -1327,16 +1359,20 @@ BENCH(BM_PutMT_PeriodicSync<Bc>)   ->Name("ByteCaskDB/PutMT/PeriodicSync") ->Thr
 BENCH(BM_PutMT_PeriodicSync<Bc>)   ->Name("ByteCaskDB/PutMT/PeriodicSync") ->Threads(16);
 BENCH(BM_PutMT_PeriodicSync<Bc>)   ->Name("ByteCaskDB/PutMT/PeriodicSync") ->Threads(32);
 BENCH(BM_PutMT_PeriodicSync<Bc>)   ->Name("ByteCaskDB/PutMT/PeriodicSync") ->Threads(64);
+#ifndef BENCH_NO_ROCKSDB
 BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(2) ;
 BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(4) ;
 BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(8) ;
 BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(16);
 BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(32);
 BENCH(BM_PutMT_PeriodicSync<Rdb>)  ->Name("RocksDB/PutMT/PeriodicSync")  ->Threads(64);
+#endif
 
 // --- Multithreaded CAS (optimistic concurrency: read-modify-write with conflict retry) ---
 using BcCas  = BcCasAdapter;
+#ifndef BENCH_NO_ROCKSDB
 using RdbCas = RdbCasAdapter;
+#endif
 
 BENCH(BM_CasMT<BcCas, false>)  ->Name("ByteCaskDB/CasMT/NoSync") ->Threads(2);
 BENCH(BM_CasMT<BcCas, false>)  ->Name("ByteCaskDB/CasMT/NoSync") ->Threads(4);
@@ -1348,6 +1384,7 @@ BENCH(BM_CasMT<BcCas, true>)   ->Name("ByteCaskDB/CasMT/Sync")   ->Threads(4);
 BENCH(BM_CasMT<BcCas, true>)   ->Name("ByteCaskDB/CasMT/Sync")   ->Threads(8);
 BENCH(BM_CasMT<BcCas, true>)   ->Name("ByteCaskDB/CasMT/Sync")   ->Threads(16);
 BENCH(BM_CasMT<BcCas, true>)   ->Name("ByteCaskDB/CasMT/Sync")   ->Threads(32);
+#ifndef BENCH_NO_ROCKSDB
 BENCH(BM_CasMT<RdbCas, false>) ->Name("RocksDB/CasMT/NoSync")    ->Threads(2);
 BENCH(BM_CasMT<RdbCas, false>) ->Name("RocksDB/CasMT/NoSync")    ->Threads(4);
 BENCH(BM_CasMT<RdbCas, false>) ->Name("RocksDB/CasMT/NoSync")    ->Threads(8);
@@ -1358,6 +1395,8 @@ BENCH(BM_CasMT<RdbCas, true>)  ->Name("RocksDB/CasMT/Sync")      ->Threads(4);
 BENCH(BM_CasMT<RdbCas, true>)  ->Name("RocksDB/CasMT/Sync")      ->Threads(8);
 BENCH(BM_CasMT<RdbCas, true>)  ->Name("RocksDB/CasMT/Sync")      ->Threads(16);
 BENCH(BM_CasMT<RdbCas, true>)  ->Name("RocksDB/CasMT/Sync")      ->Threads(32);
+#endif
+#endif // BENCH_NO_MT
 
 
 // clang-format on

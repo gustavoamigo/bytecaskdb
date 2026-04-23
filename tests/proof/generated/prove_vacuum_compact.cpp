@@ -34,11 +34,17 @@ struct TempDir {
   TempDir()
       : path{std::filesystem::temp_directory_path() /
              std::format(
-                 "prove_vac_compact_{}",
-                 std::chrono::system_clock::now().time_since_epoch().count())} {
+                 "prove_vac_compact_{}_{}",
+                 std::chrono::system_clock::now().time_since_epoch().count(),
+                 next_id())} {
     std::filesystem::create_directories(path);
   }
   ~TempDir() { std::filesystem::remove_all(path); }
+ private:
+  static auto next_id() -> unsigned {
+    static unsigned counter = 0;
+    return counter++;
+  }
 };
 
 } // namespace

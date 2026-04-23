@@ -4,7 +4,7 @@
 
 ByteCaskDB is a [Bitcask](https://riak.com/assets/bitcask-intro.pdf) implementation with a key architectural difference: it uses an immutable **persistent radix tree** for the Key Directory instead of a Hash Table. This design choice enables efficient **range queries** and **prefix searches** while maintaining Bitcask's core strengths of fast writes and simple recovery. The name "ByteCaskDB" reflects this hybrid approach: **Bitcask algorithm** + **tree index** = **ByteCaskDB**.
 
-**Core design choice**: all keys live in memory at all times. This eliminates disk-bound index lookups entirely — every point read is O(1) from the radix tree, every range scan is a pure in-memory walk. Database size is bounded by available RAM: at ~100 bytes per unique key (key data + metadata + tree structure overhead), 10 million keys require around 1 GB.
+**Core design choice**: all keys live in memory at all times. This eliminates disk-bound index lookups entirely — every point read is O(1) from the radix tree, every range scan is a pure in-memory walk. Database size is bounded by available RAM: at ~70 bytes per unique key (key data + metadata + tree structure overhead), 10 million keys require around 700 MB.
 
 This document is the living design reference for the repository. It should track the current implementation state, the intended architecture, and important constraints.
 

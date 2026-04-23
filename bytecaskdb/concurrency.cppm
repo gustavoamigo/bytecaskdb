@@ -188,10 +188,41 @@ private:
 // Lifecycle: the thread starts at construction and joins at destruction.
 // drain() blocks until the queue is empty and the last task has finished.
 //
+// When BYTECASK_SINGLE_THREADED is defined, no thread is spawned. dispatch()
+// runs tasks immediately on the calling thread. Intended for environments
+// without thread support (e.g. WebAssembly without pthreads).
+//
 // Declare BackgroundWorker as the LAST member of any owning class so that
 // it destructs first, ensuring the background thread joins before any other
 // member is destroyed.
 // ---------------------------------------------------------------------------
+
+#ifdef BYTECASK_SINGLE_THREADED
+
+export class BackgroundWorker {
+public:
+  BackgroundWorker() = default;
+  ~BackgroundWorker() = default;
+
+  BackgroundWorker(const BackgroundWorker &) = delete;
+  BackgroundWorker &operator=(const BackgroundWorker &) = delete;
+
+  void dispatch(std::function<void()> task) {
+    try {
+      task();
+    } catch (const std::exception &e) {
+      std::cerr << "bytecask: background worker exception: " << e.what()
+                << "\n";
+    } catch (...) {
+      std::cerr << "bytecask: background worker: unknown exception\n";
+    }
+  }
+
+  void drain() {}
+};
+
+#else
+
 export class BackgroundWorker {
 public:
   BackgroundWorker() : thread_{[this] { run(); }} {}
@@ -260,5 +291,7 @@ private:
   bool stop_{false};
   std::thread thread_;
 };
+
+#endif
 
 } // namespace bytecask
