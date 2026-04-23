@@ -10,6 +10,21 @@ Module.preRun.push(function () {
 });
 
 // Wire up Symbol.dispose and Symbol.iterator on Embind classes.
+// Print memory usage after the program exits.
+Module.postRun = Module.postRun || [];
+Module.postRun.push(function () {
+  if (typeof process !== 'undefined' && process.memoryUsage) {
+    var mem = process.memoryUsage();
+    var MB = function (b) { return (b / 1048576).toFixed(1) + ' MiB'; };
+    console.log('\n=== Memory Usage ===');
+    console.log('  RSS:          ' + MB(mem.rss));
+    console.log('  Heap total:   ' + MB(mem.heapTotal));
+    console.log('  Heap used:    ' + MB(mem.heapUsed));
+    console.log('  WASM memory:  ' + MB(HEAP8.byteLength));
+    console.log('  External:     ' + MB(mem.external));
+  }
+});
+
 Module.onRuntimeInitialized = Module.onRuntimeInitialized || function () {};
 var origInit = Module.onRuntimeInitialized;
 Module.onRuntimeInitialized = function () {

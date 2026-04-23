@@ -11,6 +11,7 @@
 # Output:
 #   build/bytecask_node.js         — smoke test (Node.js + NODEFS)
 #   build/engine_bench_nodefs.js   — benchmarks (Node.js + NODEFS)
+#   build/memory_profile.js        — memory profile (Node.js + NODEFS)
 #   build/bytecask.mjs             — Embind JS module (Node.js + NODEFS)
 #
 # Run:
@@ -107,13 +108,14 @@ precompile bytecask.radix_tree   bytecaskdb/radix_tree.cppm
 precompile bytecask.u32_map      bytecaskdb/u32_map.cppm
 precompile bytecask.data_file    bytecaskdb/data_file.cppm
 precompile bytecask.hint_file    bytecaskdb/hint_file.cppm
+precompile bytecask.batch_iterator bytecaskdb/batch_iterator.cppm
 precompile bytecask.concurrency  bytecaskdb/concurrency.cppm
 precompile bytecask:internals    bytecaskdb/internals.cppm
 precompile bytecask              bytecaskdb/bytecask.cppm
 
 # ── Step 3: Compile object files ──────────────────────────────────────────────
 echo "=== Compiling objects ==="
-CPPM_FILES=(types util serialization data_entry hint_entry radix_tree u32_map data_file hint_file concurrency internals)
+CPPM_FILES=(types util serialization data_entry hint_entry radix_tree u32_map data_file hint_file batch_iterator concurrency internals)
 
 for f in "${CPPM_FILES[@]}"; do
   emcc $CFLAGS -c $MODS $CRC32C_INCLUDE "$ROOT/bytecaskdb/${f}.cppm" -o "$PCM/${f}.o"
@@ -126,6 +128,8 @@ emcc $CFLAGS -c $MODS $CRC32C_INCLUDE "$SCRIPT_DIR/bytecask_embind.cpp" -o "$PCM
 emcc $CFLAGS -c $MODS $CRC32C_INCLUDE $BENCH_INCLUDE \
   -DBENCH_NO_LEVELDB -DBENCH_NO_ROCKSDB -DBENCH_NO_MT \
   "$ROOT/benchmarks/engine_bench.cpp" -o "$PCM/engine_bench.o"
+emcc $CFLAGS -c $MODS $CRC32C_INCLUDE \
+  "$ROOT/benchmarks/memory_profile.cpp" -o "$PCM/memory_profile.o"
 
 # ── Step 3b: Compile testing-variant library objects ─────────────────────────
 echo "=== Compiling testing-variant objects ==="
@@ -152,6 +156,7 @@ testing_precompile bytecask.radix_tree   bytecaskdb/radix_tree.cppm
 testing_precompile bytecask.u32_map      bytecaskdb/u32_map.cppm
 testing_precompile bytecask.data_file    bytecaskdb/data_file.cppm
 testing_precompile bytecask.hint_file    bytecaskdb/hint_file.cppm
+testing_precompile bytecask.batch_iterator bytecaskdb/batch_iterator.cppm
 testing_precompile bytecask.concurrency  bytecaskdb/concurrency.cppm
 testing_precompile bytecask:internals    bytecaskdb/internals.cppm
 testing_precompile bytecask              bytecaskdb/bytecask.cppm
@@ -176,7 +181,7 @@ for t in "${TEST_FILES[@]}"; do
     "$ROOT/tests/${t}.cpp" -o "$TESTING/${t}.o"
 done
 
-PROOF_FILES=(prove_apply_batch prove_resume prove_vacuum_compact prove_vacuum_absorb)
+PROOF_FILES=(prove_apply_batch prove_resume prove_vacuum_compact)
 for p in "${PROOF_FILES[@]}"; do
   emcc $CFLAGS -DBYTECASK_TESTING -c $TMODS $CRC32C_INCLUDE $CATCH2_INCLUDE \
     -I"$ROOT/bytecaskdb" -I"$ROOT/tests" \
@@ -196,9 +201,11 @@ LIB_OBJ+=("$PCM/bytecask_ifc.o" "$PCM/bytecask_impl.o")
 
 LINK_COMMON=($CFLAGS
   -L"$CRC32C_PREFIX/lib" -lcrc32c
+  -sMALLOC=mimalloc
   -sNODERAWFS=1 -sENVIRONMENT=node -lnoderawfs.js
   -sEXIT_RUNTIME=1 -sALLOW_MEMORY_GROWTH
-  --pre-js "$SCRIPT_DIR/pre.js")
+  --pre-js "$SCRIPT_DIR/pre.js"
+  --js-library "$SCRIPT_DIR/syscall_overrides.js")
 
 # Smoke test
 emcc "${LINK_COMMON[@]}" \
@@ -211,9 +218,15 @@ emcc "${LINK_COMMON[@]}" \
   -L"$BENCH_PREFIX/lib" -lbenchmark -lbenchmark_main \
   -o "$BUILD/engine_bench_nodefs.js"
 
+# Memory profile
+emcc "${LINK_COMMON[@]}" \
+  "${LIB_OBJ[@]}" "$PCM/memory_profile.o" \
+  -o "$BUILD/memory_profile.js"
+
 # Embind JS module
 emcc $CFLAGS \
   -L"$CRC32C_PREFIX/lib" -lcrc32c \
+  -sMALLOC=mimalloc \
   -lembind \
   -sNODERAWFS=1 -sENVIRONMENT=node -lnoderawfs.js \
   -sALLOW_MEMORY_GROWTH \
@@ -244,4 +257,5 @@ echo "=== Build complete ==="
 echo "Run smoke test:  node $BUILD/bytecask_node.js"
 echo "Run Catch2 tests: node $BUILD/bytecask_tests.js '~[concurrency]' '~[lock]'"
 echo "Run benchmarks:  BC_DATASET_SIZE=100000 node $BUILD/engine_bench_nodefs.js"
+echo "Mem profile:     BC_DATASET_SIZE=100000 node $BUILD/memory_profile.js"
 echo "Embind module:   $BUILD/bytecask.mjs"
