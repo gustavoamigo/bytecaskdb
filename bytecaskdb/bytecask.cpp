@@ -625,6 +625,8 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
 // Throws std::system_error if the directory cannot be prepared.
 DB::DB(std::filesystem::path dir, Options opts)
     : dir_{std::move(dir)}, rotation_threshold_{opts.max_file_bytes},
+      size_limits_{std::min(opts.max_key_bytes, kMaxKeySize),
+                   std::min(opts.max_value_bytes, kMaxValueSize)},
       state_{std::make_shared<EngineState>()} {
   std::filesystem::create_directories(dir_);
 
@@ -740,21 +742,23 @@ auto DB::get(const ReadOptions &opts, BytesView key,
 // opts.sync controls whether fdatasync is called after the write.
 // Throws std::system_error on I/O failure or lock contention (try_lock).
 void DB::put(const WriteOptions &opts, BytesView key, BytesView value) {
-  WritePlan plan;
+  WritePlan plan{size_limits_};
   plan.put(key, value);
   (void)apply_batch(opts, std::move(plan));
 }
 
 auto DB::del(const WriteOptions &opts, BytesView key) -> bool {
-  WritePlan plan;
+  WritePlan plan{size_limits_};
   plan.ensure_present(key);
   plan.del(key);
   return apply_batch(opts, std::move(plan));
 }
 
 void DB::del_range(const WriteOptions &opts, BytesView from, BytesView to) {
+  check_key_size(from.size(), size_limits_.max_key_bytes);
+  check_key_size(to.size(), size_limits_.max_key_bytes);
   if (Key{from} >= Key{to}) return;
-  WritePlan plan;
+  WritePlan plan{size_limits_};
   plan.del_range(from, to);
   (void)apply_batch(opts, std::move(plan));
 }
@@ -770,7 +774,7 @@ auto DB::contains_key(const ReadOptions& opts, BytesView key) const -> bool {
 
 auto DB::snapshot() const -> Snapshot {
   ReadOptions opts{};
-  return Snapshot{load_state_for_read(opts)};
+  return Snapshot{load_state_for_read(opts), size_limits_};
 }
 
 // The single write path. Routes to either write_group_ (default) or
@@ -1559,7 +1563,7 @@ auto DB::create_manifest() -> FileManifest {
     files.push_back({file_id, data_path, dir_ / (stem + ".hint")});
   }
 
-  return FileManifest{Snapshot{manifest_state}, std::move(files), through_seq};
+  return FileManifest{Snapshot{manifest_state, size_limits_}, std::move(files), through_seq};
 }
 
 // Returns the engine state from a thread-local cache (read path only).
@@ -2382,6 +2386,13 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     throw std::logic_error{"ingest rejected: engine is not in follower mode"};
   }
   if (entries.empty()) return;
+
+  for (const auto &e : entries) {
+    check_key_size(e.key.size(), size_limits_.max_key_bytes);
+    if (e.entry_type == EntryType::Put) {
+      check_value_size(e.value.size(), size_limits_.max_value_bytes);
+    }
+  }
 
   std::lock_guard<std::mutex> wg{*write_mu_};
 

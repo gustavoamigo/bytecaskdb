@@ -31,6 +31,12 @@ class Options:
     """If True (default), any CRC error during recovery raises.
     If False, corrupt entries are skipped and a warning is printed."""
 
+    max_key_bytes: int
+    """Max key size in bytes (default 4096; hard ceiling 65535)."""
+
+    max_value_bytes: int
+    """Max value size in bytes (default 4 MiB; hard ceiling ~4 GiB)."""
+
     def __init__(self) -> None: ...
 
 class WriteOptions:

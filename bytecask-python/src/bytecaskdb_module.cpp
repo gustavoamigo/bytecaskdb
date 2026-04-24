@@ -281,7 +281,11 @@ NB_MODULE(_bytecaskdb, m) {
               "Number of threads for parallel hint-file replay (default 4).")
       .def_rw("fail_recovery_on_crc_errors",
               &bytecask::Options::fail_recovery_on_crc_errors,
-              "If True (default), CRC errors during recovery raise.");
+              "If True (default), CRC errors during recovery raise.")
+      .def_rw("max_key_bytes", &bytecask::Options::max_key_bytes,
+              "Max key size in bytes (default 4096; hard ceiling 65535).")
+      .def_rw("max_value_bytes", &bytecask::Options::max_value_bytes,
+              "Max value size in bytes (default 4 MiB; hard ceiling ~4 GiB).");
 
   nb::class_<bytecask::WriteOptions>(m, "WriteOptions",
       "Per-write options for put, del_, apply_batch, etc.")

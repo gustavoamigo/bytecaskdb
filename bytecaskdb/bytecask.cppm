@@ -63,6 +63,39 @@ export struct VacuumOptions {
 export inline constexpr std::uint64_t kDefaultRotationThreshold =
     64ULL * 1024 * 1024;
 
+// Hard limits imposed by the on-disk entry header format.
+// key_size is u16 (2 bytes), value_size is u32 (4 bytes).
+export inline constexpr std::uint32_t kMaxKeySize = 65535;
+export inline constexpr std::uint32_t kMaxValueSize =
+    std::numeric_limits<std::uint32_t>::max();
+
+// Sensible defaults — keys live in RAM (radix tree), values go to disk.
+export inline constexpr std::uint32_t kDefaultMaxKeyBytes = 4096;
+export inline constexpr std::uint32_t kDefaultMaxValueBytes =
+    4U * 1024 * 1024; // 4 MiB
+
+// Carried by Snapshot and WritePlan so size checks happen at the API boundary.
+export struct SizeLimits {
+  std::uint32_t max_key_bytes{kDefaultMaxKeyBytes};
+  std::uint32_t max_value_bytes{kDefaultMaxValueBytes};
+};
+
+inline void check_key_size(std::size_t size, std::uint32_t limit) {
+  if (size > limit) {
+    throw std::invalid_argument{
+        "key size " + std::to_string(size) +
+        " exceeds limit " + std::to_string(limit)};
+  }
+}
+
+inline void check_value_size(std::size_t size, std::uint32_t limit) {
+  if (size > limit) {
+    throw std::invalid_argument{
+        "value size " + std::to_string(size) +
+        " exceeds limit " + std::to_string(limit)};
+  }
+}
+
 // ---------------------------------------------------------------------------
 // WriteOptions / ReadOptions — modelled after LevelDB / RocksDB.
 // ---------------------------------------------------------------------------
@@ -127,6 +160,12 @@ export struct Options {
   // Initial engine mode. Leader (default) allows normal writes; Follower
   // blocks put/del/apply_batch and allows ingest().
   Mode initial_mode{Mode::Leader};
+  // Maximum key size in bytes. Keys exceeding this limit are rejected with
+  // std::invalid_argument. Hard ceiling: 65,535 (u16 wire format).
+  std::uint32_t max_key_bytes{kDefaultMaxKeyBytes};
+  // Maximum value size in bytes. Values exceeding this limit are rejected with
+  // std::invalid_argument. Hard ceiling: 4,294,967,295 (u32 wire format).
+  std::uint32_t max_value_bytes{kDefaultMaxValueBytes};
 };
 
 // ---------------------------------------------------------------------------
@@ -835,6 +874,7 @@ private:
   std::filesystem::path dir_;
   int lock_fd_{-1};  // flock() on dir_/.lock; released by close() in ~DB()
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
+  SizeLimits size_limits_;
   // All mutable state — SWMR. Writers publish via atomic_store()
   // under write_mu_; readers call atomic_load() (never acquiring write_mu_).
   // Note: std::atomic<std::shared_ptr<T>> (C++20 P0718R2) is not yet
@@ -918,9 +958,11 @@ public:
       -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 
 private:
-  explicit Snapshot(std::shared_ptr<const EngineState> state)
-      : state_{std::move(state)} {}
+  explicit Snapshot(std::shared_ptr<const EngineState> state,
+                    SizeLimits limits = {})
+      : state_{std::move(state)}, limits_{limits} {}
   std::shared_ptr<const EngineState> state_;
+  SizeLimits limits_;
   friend class DB;
   friend class TransientEngineState;
   friend class WritePlan;
@@ -1000,7 +1042,9 @@ public:
   using WriteOp = std::variant<PointPut, PointDel, RangeDel>;
 
   WritePlan() = default;
-  explicit WritePlan(Snapshot snap) : snap_{std::move(snap)} {}
+  explicit WritePlan(SizeLimits limits) : limits_{limits} {}
+  explicit WritePlan(Snapshot snap)
+      : snap_{std::move(snap)}, limits_{snap_ ? snap_->limits_ : SizeLimits{}} {}
   WritePlan(const WritePlan &) = delete;
   WritePlan &operator=(const WritePlan &) = delete;
   WritePlan(WritePlan &&) noexcept = default;
@@ -1009,18 +1053,23 @@ public:
   // --- Writes (unconditional) ---
 
   void put(BytesView key, BytesView value) {
+    check_key_size(key.size(), limits_.max_key_bytes);
+    check_value_size(value.size(), limits_.max_value_bytes);
     writes_.emplace_back(
         PointPut{Bytes{key.begin(), key.end()},
                  Bytes{value.begin(), value.end()}});
   }
 
   void del(BytesView key) {
+    check_key_size(key.size(), limits_.max_key_bytes);
     writes_.emplace_back(PointDel{Bytes{key.begin(), key.end()}});
   }
 
   // --- Range writes ---
 
   void del_range(BytesView from, BytesView to) {
+    check_key_size(from.size(), limits_.max_key_bytes);
+    check_key_size(to.size(), limits_.max_key_bytes);
     writes_.emplace_back(
         RangeDel{Bytes{from.begin(), from.end()},
                  Bytes{to.begin(), to.end()}});
@@ -1029,15 +1078,18 @@ public:
   // --- Point guards ---
 
   void ensure_present(BytesView key) {
+    check_key_size(key.size(), limits_.max_key_bytes);
     set_precondition(key, Precondition::MustExist);
   }
 
   void ensure_absent(BytesView key) {
+    check_key_size(key.size(), limits_.max_key_bytes);
     set_precondition(key, Precondition::MustBeAbsent);
   }
 
   // Requires a snapshot — throws std::logic_error if constructed without one.
   void ensure_unchanged(BytesView key) {
+    check_key_size(key.size(), limits_.max_key_bytes);
     if (!snap_) {
       throw std::logic_error{
           "WritePlan::ensure_unchanged requires a snapshot"};
@@ -1052,6 +1104,8 @@ public:
   // from is inclusive, to is exclusive.
   // Requires a snapshot — throws std::logic_error if constructed without one.
   void ensure_range_unchanged(BytesView from, BytesView to) {
+    check_key_size(from.size(), limits_.max_key_bytes);
+    check_key_size(to.size(), limits_.max_key_bytes);
     if (!snap_) {
       throw std::logic_error{
           "WritePlan::ensure_range_unchanged requires a snapshot"};
@@ -1109,6 +1163,7 @@ private:
   }
 
   std::optional<Snapshot> snap_;
+  SizeLimits limits_;
   std::vector<WriteOp> writes_;
   std::map<Bytes, KeyGuard> guards_;
   std::vector<RangeGuard> range_guards_;

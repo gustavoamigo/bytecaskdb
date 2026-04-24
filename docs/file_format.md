@@ -107,6 +107,8 @@ Total entry size: `15 + key_size + value_size + 4` bytes.
 | 9      | 2    | `key_size`   | u16 LE | 0 for `BulkBegin`/`BulkEnd`; 1–65535 otherwise | Key length in bytes |
 | 11     | 4    | `value_size` | u32 LE | 0 for `Delete`/`BulkBegin`/`BulkEnd`; for `RangeDel`, holds `end_key` length | Value length in bytes |
 
+**Hard limits**: The wire format imposes absolute ceilings of 65,535 bytes for keys (u16) and 4,294,967,295 bytes for values (u32). The engine enforces configurable limits via `Options::max_key_bytes` (default 4 KiB) and `Options::max_value_bytes` (default 4 MiB), validated at the API boundary before any data is written to disk.
+
 ### Trailing CRC
 
 | Offset from entry start              | Size | Type   | Description |

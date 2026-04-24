@@ -203,6 +203,8 @@ struct Options {
     // each skipped item.
     bool fail_recovery_on_crc_errors{true};
     Mode initial_mode{Mode::Leader};             // leader allows normal writes; follower allows ingest
+    uint32_t max_key_bytes{4096};                // max key size (hard ceiling: 65,535 — u16 wire format)
+    uint32_t max_value_bytes{4 * 1024 * 1024};   // max value size (hard ceiling: ~4 GiB — u32 wire format)
 };
 
 struct WriteOptions {

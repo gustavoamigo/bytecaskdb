@@ -235,6 +235,10 @@ static auto jsdb_open(const std::string &path, val opts) -> JsDB * {
     o.max_file_bytes = opts["maxFileBytes"].as<uint64_t>();
   if (has_prop(opts, "failOnCrcErrors"))
     o.fail_recovery_on_crc_errors = opts["failOnCrcErrors"].as<bool>();
+  if (has_prop(opts, "maxKeyBytes"))
+    o.max_key_bytes = opts["maxKeyBytes"].as<uint32_t>();
+  if (has_prop(opts, "maxValueBytes"))
+    o.max_value_bytes = opts["maxValueBytes"].as<uint32_t>();
   return new JsDB{std::filesystem::path{path}, std::move(o)};
 }
 

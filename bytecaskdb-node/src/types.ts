@@ -4,6 +4,10 @@
 export interface OpenOptions {
   maxFileBytes?: number;
   failOnCrcErrors?: boolean;
+  /** Max key size in bytes (default 4096; hard ceiling 65535). */
+  maxKeyBytes?: number;
+  /** Max value size in bytes (default 4 MiB; hard ceiling ~4 GiB). */
+  maxValueBytes?: number;
 }
 
 export interface WriteOptions {

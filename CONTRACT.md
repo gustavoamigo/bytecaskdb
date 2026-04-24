@@ -76,6 +76,16 @@ at commit time. Returns `false` with no side effects if they don't.
 This is the primitive that makes read-modify-write sequences safe
 without external locking.
 
+### Size preconditions
+
+All keys and values in the `WritePlan` must satisfy the size limits
+configured in `Options` (default: 4 KiB keys, 4 MiB values; hard
+ceiling: 65,535 bytes keys, ~4 GiB values). Size validation happens
+at the `WritePlan` API boundary (`put`, `del`, `del_range`, guard
+methods) before any data is copied. `DB::put`, `DB::del`, and
+`DB::del_range` also validate before creating their internal
+`WritePlan`. Violations throw `std::invalid_argument`.
+
 ### Atomicity
 
 The engine must apply all writes in the plan and make them visible

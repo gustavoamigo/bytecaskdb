@@ -5932,3 +5932,95 @@ TEST_CASE("scan_committed handles RangeDel inside batch", "[iterator]") {
   CHECK(entries[2].first.entry_type == bytecask::EntryType::RangeDel);
   CHECK(entries[3].first.entry_type == bytecask::EntryType::BulkEnd);
 }
+
+// ---------------------------------------------------------------------------
+// Size limits
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Size limits: put rejects oversized key", "[bytecask][limits]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path, {.max_key_bytes = 8});
+  CHECK_NOTHROW(db.put({.sync = false}, to_bytes("12345678"), to_bytes("v")));
+  CHECK_THROWS_AS(
+      db.put({.sync = false}, to_bytes("123456789"), to_bytes("v")),
+      std::invalid_argument);
+}
+
+TEST_CASE("Size limits: put rejects oversized value", "[bytecask][limits]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path, {.max_value_bytes = 4});
+  CHECK_NOTHROW(db.put({.sync = false}, to_bytes("k"), to_bytes("1234")));
+  CHECK_THROWS_AS(
+      db.put({.sync = false}, to_bytes("k"), to_bytes("12345")),
+      std::invalid_argument);
+}
+
+TEST_CASE("Size limits: del rejects oversized key", "[bytecask][limits]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path, {.max_key_bytes = 4});
+  CHECK_THROWS_AS(db.del({.sync = false}, to_bytes("12345")),
+                  std::invalid_argument);
+}
+
+TEST_CASE("Size limits: del_range rejects oversized boundary",
+          "[bytecask][limits]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path, {.max_key_bytes = 4});
+  CHECK_THROWS_AS(
+      db.del_range({.sync = false}, to_bytes("12345"), to_bytes("z")),
+      std::invalid_argument);
+  CHECK_THROWS_AS(
+      db.del_range({.sync = false}, to_bytes("a"), to_bytes("12345")),
+      std::invalid_argument);
+}
+
+TEST_CASE("Size limits: WritePlan validates from snapshot limits",
+          "[bytecask][limits]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path, {.max_key_bytes = 8});
+  auto snap = db.snapshot();
+  bytecask::WritePlan plan{std::move(snap)};
+  CHECK_NOTHROW(plan.put(to_bytes("12345678"), to_bytes("v")));
+  CHECK_THROWS_AS(plan.put(to_bytes("123456789"), to_bytes("v")),
+                  std::invalid_argument);
+}
+
+TEST_CASE("Size limits: WritePlan default uses default limits",
+          "[bytecask][limits]") {
+  // Default WritePlan (no DB) uses kDefaultMaxKeyBytes = 4096.
+  bytecask::WritePlan plan;
+  std::string key_at_limit(4096, 'k');
+  std::string key_over_limit(4097, 'k');
+  CHECK_NOTHROW(plan.put(to_bytes(key_at_limit), to_bytes("v")));
+  CHECK_THROWS_AS(plan.put(to_bytes(key_over_limit), to_bytes("v")),
+                  std::invalid_argument);
+}
+
+TEST_CASE("Size limits: guard methods validate key size",
+          "[bytecask][limits]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path, {.max_key_bytes = 4});
+  auto snap = db.snapshot();
+  bytecask::WritePlan plan{std::move(snap)};
+  CHECK_THROWS_AS(plan.ensure_present(to_bytes("12345")),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(plan.ensure_absent(to_bytes("12345")),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(plan.ensure_unchanged(to_bytes("12345")),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(
+      plan.ensure_range_unchanged(to_bytes("12345"), to_bytes("z")),
+      std::invalid_argument);
+}
+
+TEST_CASE("Size limits: hard ceiling clamps user value",
+          "[bytecask][limits]") {
+  TempDir td;
+  // User passes a value larger than the wire format ceiling.
+  // DB::open clamps it to kMaxKeySize.
+  auto db = bytecask::DB::open(td.path, {.max_key_bytes = 100000});
+  // A 65535-byte key should be accepted (at wire format ceiling).
+  std::string key_at_hard_limit(65535, 'k');
+  CHECK_NOTHROW(
+      db.put({.sync = false}, to_bytes(key_at_hard_limit), to_bytes("v")));
+}

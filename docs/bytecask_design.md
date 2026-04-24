@@ -82,6 +82,19 @@ Keys are stored as byte sequences within the radix tree's prefix-compressed node
 
 **Historical note**: the original key directory used `PersistentOrderedMap<Key, KeyDirEntry>`, backed by `immer::flex_vector<Entry>`. The radix tree replacement (BC-030) delivers O(k) lookups vs O(n log n) binary search, lower memory overhead via prefix compression and intrusive refcounting, and faster batch mutations via the transient API's in-place path copying. `PersistentOrderedMap` is retained in the codebase for benchmarking purposes (`benchmarks/map_bench.cpp`).
 
+### Size Limits
+
+The on-disk entry header imposes hard ceilings: keys are limited to 65,535 bytes (u16 `key_size` field) and values to 4,294,967,295 bytes (u32 `value_size` field). These cannot be raised without a format change.
+
+Configurable limits are enforced at the API boundary — before any data is copied into a `WritePlan` or written to disk:
+
+| Limit | Default | Hard ceiling | Rationale |
+|-------|---------|-------------|-----------|
+| `Options::max_key_bytes` | 4,096 (4 KiB) | 65,535 | Keys live in memory (radix tree). Large keys bloat RAM and slow traversal. |
+| `Options::max_value_bytes` | 4,194,304 (4 MiB) | 4,294,967,295 | Values go to disk. Oversized values cause pathological file rotation. |
+
+Violations throw `std::invalid_argument`. `WritePlan` carries the limits from `Snapshot` (which inherits them from `DB`) or uses the defaults when constructed without a snapshot. `DB::put`, `DB::del`, `DB::del_range`, and `DB::ingest` all validate before proceeding.
+
 ### Concurrency Model
 
 ByteCaskDB follows a **single-writer / multiple-reader (SWMR)** model:
