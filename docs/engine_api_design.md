@@ -170,9 +170,9 @@ struct ReadOptions {
     std::chrono::milliseconds staleness_tolerance{0};
 
     // When true, CRC32 is verified for every value read from disk.
-    // Default false for higher throughput; enable when silent corruption
-    // detection is required.
-    bool verify_checksums{false};
+    // Default true for data integrity; disable for higher throughput when
+    // silent corruption detection is not required.
+    bool verify_checksums{true};
 };
 ```
 

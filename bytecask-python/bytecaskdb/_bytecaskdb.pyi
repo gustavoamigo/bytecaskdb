@@ -83,7 +83,7 @@ class ReadOptions:
     """Per-read options passed to ``get``, ``iter_from``, etc."""
 
     verify_checksums: bool
-    """If True, CRC-verify each value read from disk (default False)."""
+    """If True (default), CRC-verify each value read from disk."""
 
     def __init__(self) -> None: ...
 

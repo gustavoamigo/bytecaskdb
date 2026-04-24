@@ -216,7 +216,7 @@ struct ReadOptions {
     // staleness_tolerance == 0 (default): refresh thread-local snapshot on every write.
     // staleness_tolerance  > 0: refresh only when the last write is older than this window.
     std::chrono::milliseconds staleness_tolerance{0};
-    bool verify_checksums{false}; // CRC-verify each value read from disk (default false)
+    bool verify_checksums{true}; // CRC-verify each value read from disk (default true)
 };
 
 enum class Mode { Leader, Follower };

@@ -134,10 +134,10 @@ export struct ReadOptions {
   // instructions, no clock read on the reader side.
   std::chrono::milliseconds staleness_tolerance{0};
 
-  // When true, all data read from underlying storage is verified
-  // against its CRC32 checksum. When set to false (default) for higher read throughput at
+  // When true (default), all data read from underlying storage is verified
+  // against its CRC32 checksum. Set to false for higher read throughput at
   // the cost of silent corruption detection.
-  bool verify_checksums{false};
+  bool verify_checksums{true};
 };
 
 // Options passed to DB::open().

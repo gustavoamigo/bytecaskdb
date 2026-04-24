@@ -385,7 +385,7 @@ NB_MODULE(_bytecaskdb, m) {
       "Per-read options for get, iter_from, etc.")
       .def(nb::init<>())
       .def_rw("verify_checksums", &bytecask::ReadOptions::verify_checksums,
-              "If True, CRC-verify each value read from disk (default False).");
+              "If True (default), CRC-verify each value read from disk.");
 
   nb::class_<bytecask::VacuumOptions>(m, "VacuumOptions",
       "Options for DB.vacuum().")
