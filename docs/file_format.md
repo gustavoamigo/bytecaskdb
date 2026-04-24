@@ -1,21 +1,21 @@
-# ByteCaskDB File Format Reference
+# ByteCaskDB File Format Reference — V01
 
-This document specifies the on-disk format for ByteCaskDB databases. It is the
-authoritative reference for anyone who needs to read, write, or validate
+This document specifies the V01 on-disk format for ByteCaskDB databases. It is
+the authoritative reference for anyone who needs to read, write, or validate
 ByteCaskDB files outside the engine itself.
 
 ## Database Directory Layout
 
 A ByteCaskDB database is a directory containing pairs of files sharing the same
-timestamp stem:
+stem:
 
 ```
 my_db/
-├── data_20260407123456000001.data   ← active data file (append-only)
-├── data_20260407123455000001.data   ← sealed data file (read-only)
-├── data_20260407123455000001.hint   ← companion hint file (read-only)
-├── data_20260407123454000001.data
-├── data_20260407123454000001.hint
+├── data_20260407123456_a7f2b31e_V01.data   ← active data file (append-only)
+├── data_20260407123455_3b1e04c9_V01.data   ← sealed data file (read-only)
+├── data_20260407123455_3b1e04c9_V01.hint   ← companion hint file (read-only)
+├── data_20260407123454_c904f182_V01.data
+├── data_20260407123454_c904f182_V01.hint
 └── ...
 ```
 
@@ -28,20 +28,24 @@ my_db/
 
 ### File Naming
 
-Files are named with a timestamp stem:
-
 ```
-data_{YYYYMMDDHHmmssUUUUUU}
+data_{YYYYMMDDHHmmss}_{RRRR}_V{XX}
 ```
 
-where `UUUUUU` is the microsecond sub-second component (zero-padded, 6 digits).
+| Field              | Description |
+|--------------------|-------------|
+| `YYYYMMDDHHmmss`   | UTC timestamp at second precision. Records when the file was created on disk — **not** the age of its content. After compaction, a file may contain entries much older than its timestamp. |
+| `RRRRRRRR`           | 4-byte random hex salt (8 characters, `00000000`–`ffffffff`). Prevents collisions when multiple files are created within the same second. |
+| `V{XX}`            | File format version. `V01` is the initial version. The engine uses this to select the correct parser at open time. |
+
+The timestamp is a human-readable debug hint. Filename ordering carries no
+semantic meaning for content ordering — entry sequence numbers inside the files
+are the authoritative ordering mechanism. Each data file has at most one
+companion hint file with the same stem.
 
 Examples:
-- `data_20260407123456000001.data`
-- `data_20260407123456000001.hint`
-
-Lexicographic sort equals chronological order. Each data file has at most one
-companion hint file with the same stem.
+- `data_20260407123456_a7f2b31e_V01.data`
+- `data_20260407123456_a7f2b31e_V01.hint`
 
 ---
 

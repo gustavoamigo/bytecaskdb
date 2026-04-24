@@ -97,7 +97,7 @@ void corrupt_file_middle(const std::filesystem::path &path) {
   f.put(c);
 }
 
-// Returns .hint files in dir sorted by name (ascending timestamp order).
+// Returns .hint files in dir sorted by name (ascending creation-time order).
 auto list_hint_files(const std::filesystem::path &dir)
     -> std::vector<std::filesystem::path> {
   std::vector<std::filesystem::path> paths;
@@ -647,7 +647,7 @@ TEST_CASE("DB recovery: incomplete batch is discarded",
 
   {
     // Manually write a data file simulating a crash mid-batch.
-    bytecask::DataFile df(db_path / "data_00000000000000000000000001.data");
+    bytecask::DataFile df(db_path / "data_00000000000000_00000000_V01.data");
     // Standalone entry — should survive.
     std::ignore = df.append_entry(1, bytecask::EntryType::Put, to_bytes("good"),
                             to_bytes("value1"));
@@ -907,6 +907,8 @@ TEST_CASE("DB recovery: lenient mode opens with partial recovery on corrupt hint
 
   const auto hints = list_hint_files(db_path);
   REQUIRE(hints.size() >= 2);
+  // Filenames contain random salts so name-sort order is non-deterministic.
+  // Corrupt the middle hint file by index — we don't know which key it holds.
   corrupt_file_middle(hints[1]);
 
   // Lenient recovery must succeed even with a corrupt hint file.
@@ -914,10 +916,12 @@ TEST_CASE("DB recovery: lenient mode opens with partial recovery on corrupt hint
       bytecask::DB::open(db_path, {.max_file_bytes = 1,
                                    .fail_recovery_on_crc_errors = false});
   CHECK_FALSE(db.is_degraded());
-  CHECK(get_val(db, to_bytes("key_first")).has_value());
-  CHECK(get_val(db, to_bytes("key_third")).has_value());
-  // Key from the corrupt file must be absent.
-  CHECK_FALSE(get_val(db, to_bytes("key_second")).has_value());
+  // Exactly one key should be missing (the one from the corrupt hint file).
+  int found = 0;
+  if (get_val(db, to_bytes("key_first")).has_value()) ++found;
+  if (get_val(db, to_bytes("key_second")).has_value()) ++found;
+  if (get_val(db, to_bytes("key_third")).has_value()) ++found;
+  CHECK(found == 2);
 }
 
 // ---------------------------------------------------------------------------

@@ -25,6 +25,7 @@ module;
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <ranges>
 #include <span>
 #include <string>
@@ -59,33 +60,27 @@ DbFollowerMode::~DbFollowerMode() = default;
 
 namespace {
 
-// Generates a unique data file stem using a UTC timestamp + monotonic counter.
-// Format: "data_{YYYYMMDDHHmmssUUUUUU}_{NNNN}"
-// The counter guarantees uniqueness even when the system clock has low
-// resolution (e.g. WASM/Emscripten where system_clock is millisecond-precise,
-// leaving the last 3 microsecond digits as 000).
+// Generates a unique data file stem.
+// Format: "data_{YYYYMMDDHHmmss}_{RRRRRRRR}_V01"
+//   - Timestamp: UTC second precision, human-readable creation time (debug hint
+//     only — does not reflect content age after compaction).
+//   - RRRRRRRR: 4-byte random hex salt for collision avoidance.
+//   - V01: file format version.
 auto make_data_file_stem() -> std::string {
-#ifdef BYTECASK_SINGLE_THREADED
-  static unsigned file_counter = 0;
-#else
-  static std::atomic<unsigned> file_counter{0};
-#endif
-  const auto seq = file_counter++;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  static thread_local std::mt19937 rng{std::random_device{}()};
+#pragma clang diagnostic pop
+  const auto salt = std::uniform_int_distribution<std::uint32_t>{0, 0xFFFF'FFFF}(rng);
 
   const auto now = std::chrono::system_clock::now();
-  const auto us_total = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now.time_since_epoch())
-                            .count();
-  const auto subsec_us = us_total % 1'000'000;
-
   const auto tt = std::chrono::system_clock::to_time_t(now);
   std::tm tm_buf{};
   ::gmtime_r(&tt, &tm_buf);
 
-  return std::format("data_{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}{:06d}_{:04d}",
+  return std::format("data_{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}_{:08x}_V01",
                      tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
-                     tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, subsec_us,
-                     seq);
+                     tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, salt);
 }
 
 // Nanoseconds since steady_clock epoch. Timestamps state publications;
