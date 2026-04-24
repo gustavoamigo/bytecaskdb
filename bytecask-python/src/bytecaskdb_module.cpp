@@ -8,7 +8,9 @@
 // the bytecask module. NB_MODULE must live outside any module partition
 // because it declares extern "C" symbols in the global module.
 
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -17,11 +19,13 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 import bytecask;
 
@@ -245,6 +249,68 @@ struct PyReverseKeyIterator {
   }
 };
 
+// ---------------------------------------------------------------------------
+// PyDataEntry — owning wrapper for DataEntryView. The view's span members
+// don't outlive iteration, so we copy key/value into Python bytes.
+// ---------------------------------------------------------------------------
+
+struct PyDataEntry {
+  std::uint64_t sequence;
+  bytecask::EntryType entry_type;
+  nb::bytes key;
+  nb::bytes value;
+
+  PyDataEntry(const bytecask::DataEntryView &v)
+      : sequence{v.sequence},
+        entry_type{v.entry_type},
+        key{reinterpret_cast<const char *>(v.key.data()), v.key.size()},
+        value{reinterpret_cast<const char *>(v.value.data()), v.value.size()} {}
+};
+
+// ---------------------------------------------------------------------------
+// PyChangeIterator — wraps ChangeIterator with __iter__/__next__.
+// ---------------------------------------------------------------------------
+
+struct PyChangeIterator {
+  bytecask::ChangeIterator cur;
+  bool exhausted;
+
+  explicit PyChangeIterator(bytecask::ChangeIterator c)
+      : cur{std::move(c)},
+        exhausted{cur == std::default_sentinel} {}
+
+  auto next() -> PyDataEntry {
+    if (exhausted) {
+      throw nb::stop_iteration();
+    }
+    auto entry = PyDataEntry{*cur};
+    ++cur;
+    exhausted = (cur == std::default_sentinel);
+    return entry;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// PyFileInfo / PyFileManifest — wraps FileManifest from create_manifest().
+// ---------------------------------------------------------------------------
+
+struct PyFileInfo {
+  std::uint32_t file_id;
+  std::string data_path;
+  std::string hint_path;
+
+  explicit PyFileInfo(const bytecask::FileInfo &fi)
+      : file_id{fi.file_id},
+        data_path{fi.data_path.string()},
+        hint_path{fi.hint_path.string()} {}
+};
+
+struct PyFileManifest {
+  PySnapshot *snapshot;
+  std::vector<PyFileInfo> files;
+  std::uint64_t through_sequence;
+};
+
 } // namespace
 
 NB_MODULE(_bytecaskdb, m) {
@@ -253,13 +319,16 @@ NB_MODULE(_bytecaskdb, m) {
   // -------------------------------------------------------------------------
 
   nb::exception<bytecask::DbDegraded>(m, "DbDegraded", PyExc_RuntimeError);
+  nb::exception<bytecask::DbFollowerMode>(m, "DbFollowerMode",
+                                          PyExc_RuntimeError);
 
   nb::register_exception_translator(
       [](const std::exception_ptr &p, void *) {
         try {
           std::rethrow_exception(p);
         } catch (const bytecask::DbDegraded &) {
-          // Registered above — let nanobind handle it.
+          throw;
+        } catch (const bytecask::DbFollowerMode &) {
           throw;
         } catch (const std::system_error &e) {
           PyErr_SetString(PyExc_OSError, e.what());
@@ -267,6 +336,21 @@ NB_MODULE(_bytecaskdb, m) {
           PyErr_SetString(PyExc_ValueError, e.what());
         }
       });
+
+  // -------------------------------------------------------------------------
+  // Enums
+  // -------------------------------------------------------------------------
+
+  nb::enum_<bytecask::Mode>(m, "Mode")
+      .value("Leader", bytecask::Mode::Leader)
+      .value("Follower", bytecask::Mode::Follower);
+
+  nb::enum_<bytecask::EntryType>(m, "EntryType")
+      .value("Put", bytecask::EntryType::Put)
+      .value("Delete", bytecask::EntryType::Delete)
+      .value("BulkBegin", bytecask::EntryType::BulkBegin)
+      .value("BulkEnd", bytecask::EntryType::BulkEnd)
+      .value("RangeDel", bytecask::EntryType::RangeDel);
 
   // -------------------------------------------------------------------------
   // Options
@@ -285,7 +369,9 @@ NB_MODULE(_bytecaskdb, m) {
       .def_rw("max_key_bytes", &bytecask::Options::max_key_bytes,
               "Max key size in bytes (default 4096; hard ceiling 65535).")
       .def_rw("max_value_bytes", &bytecask::Options::max_value_bytes,
-              "Max value size in bytes (default 4 MiB; hard ceiling ~4 GiB).");
+              "Max value size in bytes (default 4 MiB; hard ceiling ~4 GiB).")
+      .def_rw("initial_mode", &bytecask::Options::initial_mode,
+              "Initial engine mode (default Mode.Leader).");
 
   nb::class_<bytecask::WriteOptions>(m, "WriteOptions",
       "Per-write options for put, del_, apply_batch, etc.")
@@ -337,6 +423,37 @@ NB_MODULE(_bytecaskdb, m) {
              return self;
            })
       .def("__next__", &PyReverseKeyIterator::next, nb::lock_self());
+
+  nb::class_<PyDataEntry>(m, "DataEntry",
+      "A replication data entry with sequence, entry_type, key, and value.")
+      .def_ro("sequence", &PyDataEntry::sequence)
+      .def_ro("entry_type", &PyDataEntry::entry_type)
+      .def_ro("key", &PyDataEntry::key)
+      .def_ro("value", &PyDataEntry::value);
+
+  nb::class_<PyChangeIterator>(m, "ChangeIterator")
+      .def("__iter__", [](nb::object self) -> nb::object {
+        return self;
+      })
+      .def("__next__", &PyChangeIterator::next, nb::lock_self());
+
+  nb::class_<PyFileInfo>(m, "FileInfo",
+      "Sealed file descriptor: file_id, data_path, hint_path.")
+      .def_ro("file_id", &PyFileInfo::file_id)
+      .def_ro("data_path", &PyFileInfo::data_path)
+      .def_ro("hint_path", &PyFileInfo::hint_path);
+
+  nb::class_<PyFileManifest>(m, "FileManifest",
+      "Manifest of sealed files with a point-in-time snapshot.")
+      .def_prop_ro("snapshot",
+                   [](PyFileManifest &self) -> PySnapshot * {
+                     return self.snapshot;
+                   }, nb::rv_policy::reference_internal)
+      .def_prop_ro("files",
+                   [](PyFileManifest &self) -> const std::vector<PyFileInfo> & {
+                     return self.files;
+                   })
+      .def_ro("through_sequence", &PyFileManifest::through_sequence);
 
   // -------------------------------------------------------------------------
   // Snapshot
@@ -632,5 +749,81 @@ NB_MODULE(_bytecaskdb, m) {
              nb::gil_scoped_release release;
              self.db.resume();
            },
-           "Attempt recovery from a degraded state.");
+           "Attempt recovery from a degraded state.")
+      .def_prop_ro(
+          "mode",
+          [](PyDB &self) { return self.db.mode(); },
+          "Current engine mode (Mode.Leader or Mode.Follower).")
+      .def(
+          "set_mode",
+          [](PyDB &self, bytecask::Mode mode) {
+            self.db.set_mode(mode);
+          },
+          "Switch engine mode.", "mode"_a)
+      .def(
+          "current_sequence",
+          [](PyDB &self, std::uint64_t timeout_ms) -> std::uint64_t {
+            nb::gil_scoped_release release;
+            return self.db.current_sequence(
+                std::chrono::milliseconds{timeout_ms});
+          },
+          "Return the highest durable sequence number.",
+          "timeout_ms"_a = 0)
+      .def(
+          "create_manifest",
+          [](PyDB &self) -> PyFileManifest * {
+            auto manifest = self.db.create_manifest();
+            auto *snap = new PySnapshot{std::move(manifest.snap)};
+            std::vector<PyFileInfo> files;
+            files.reserve(manifest.files.size());
+            for (const auto &fi : manifest.files) {
+              files.emplace_back(fi);
+            }
+            auto *result = new PyFileManifest{
+                snap, std::move(files), manifest.through_sequence};
+            return result;
+          },
+          "Return a manifest of sealed files with a snapshot.",
+          nb::rv_policy::take_ownership)
+      .def(
+          "changes_since",
+          [](PyDB &self, PySnapshot &snap,
+             std::uint64_t from_sequence) -> PyChangeIterator * {
+            snap.check();
+            auto range = self.db.changes_since(*snap.snap, from_sequence);
+            return new PyChangeIterator{std::move(range.begin())};
+          },
+          "Iterate data entries with sequence > from_sequence.",
+          "snapshot"_a, "from_sequence"_a,
+          nb::keep_alive<0, 2>(),
+          nb::rv_policy::take_ownership)
+      .def(
+          "ingest",
+          [](PyDB &self, nb::list entries) {
+            // Build owning buffers for keys/values, then construct views.
+            auto n = nb::len(entries);
+            std::vector<bytecask::DataEntryView> views;
+            views.reserve(n);
+            // Keep references alive during ingest.
+            std::vector<nb::bytes> key_refs;
+            std::vector<nb::bytes> val_refs;
+            key_refs.reserve(n);
+            val_refs.reserve(n);
+
+            for (std::size_t i = 0; i < n; ++i) {
+              auto entry = nb::cast<PyDataEntry &>(entries[i]);
+              key_refs.push_back(entry.key);
+              val_refs.push_back(entry.value);
+              views.push_back(bytecask::DataEntryView{
+                  .sequence = entry.sequence,
+                  .entry_type = entry.entry_type,
+                  .key = to_view(key_refs.back()),
+                  .value = to_view(val_refs.back()),
+              });
+            }
+            nb::gil_scoped_release release;
+            self.db.ingest(views);
+          },
+          "Ingest pre-sequenced entries from a leader (follower mode only).",
+          "entries"_a);
 }

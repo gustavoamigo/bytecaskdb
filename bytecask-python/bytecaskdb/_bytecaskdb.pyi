@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import enum
 import os
 from typing import Iterator, overload
 
@@ -13,6 +14,31 @@ class DbDegraded(RuntimeError):
 
     Reads remain available. Call ``DB.resume()`` to attempt recovery.
     """
+
+class DbFollowerMode(RuntimeError):
+    """Raised by normal write operations when the engine is in follower mode.
+
+    Use ``DB.ingest()`` for replication writes in follower mode.
+    """
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+class Mode(enum.Enum):
+    """Engine replication mode."""
+
+    Leader = ...
+    Follower = ...
+
+class EntryType(enum.Enum):
+    """Data entry type tag."""
+
+    Put = ...
+    Delete = ...
+    BulkBegin = ...
+    BulkEnd = ...
+    RangeDel = ...
 
 # ---------------------------------------------------------------------------
 # Options
@@ -36,6 +62,9 @@ class Options:
 
     max_value_bytes: int
     """Max value size in bytes (default 4 MiB; hard ceiling ~4 GiB)."""
+
+    initial_mode: Mode
+    """Initial engine mode (default Mode.Leader)."""
 
     def __init__(self) -> None: ...
 
@@ -93,6 +122,48 @@ class ReverseKeyIterator:
 
     def __iter__(self) -> ReverseKeyIterator: ...
     def __next__(self) -> bytes: ...
+
+class ChangeIterator:
+    """Forward iterator yielding ``DataEntry`` objects in sequence order."""
+
+    def __iter__(self) -> ChangeIterator: ...
+    def __next__(self) -> DataEntry: ...
+
+# ---------------------------------------------------------------------------
+# DataEntry / FileInfo / FileManifest
+# ---------------------------------------------------------------------------
+
+class DataEntry:
+    """A replication data entry."""
+
+    @property
+    def sequence(self) -> int: ...
+    @property
+    def entry_type(self) -> EntryType: ...
+    @property
+    def key(self) -> bytes: ...
+    @property
+    def value(self) -> bytes: ...
+
+class FileInfo:
+    """Sealed file descriptor."""
+
+    @property
+    def file_id(self) -> int: ...
+    @property
+    def data_path(self) -> str: ...
+    @property
+    def hint_path(self) -> str: ...
+
+class FileManifest:
+    """Manifest of sealed files with a point-in-time snapshot."""
+
+    @property
+    def snapshot(self) -> Snapshot: ...
+    @property
+    def files(self) -> list[FileInfo]: ...
+    @property
+    def through_sequence(self) -> int: ...
 
 # ---------------------------------------------------------------------------
 # Snapshot
@@ -249,7 +320,7 @@ class DB:
         value: bytes,
         opts: WriteOptions | None = None,
     ) -> None:
-        """Write *key* → *value*. Overwrites any existing value."""
+        """Write *key* -> *value*. Overwrites any existing value."""
         ...
 
     def del_(
@@ -321,11 +392,7 @@ class DB:
         ...
 
     def resume(self) -> None:
-        """Attempt recovery from a degraded state.
-
-        Scans the active file, truncates garbage, replays valid entries,
-        and opens a fresh active file. No-op if not degraded.
-        """
+        """Attempt recovery from a degraded state."""
         ...
 
     @property
@@ -336,4 +403,31 @@ class DB:
     @property
     def degraded_reason(self) -> str:
         """Diagnostic string describing why the engine degraded, or empty."""
+        ...
+
+    @property
+    def mode(self) -> Mode:
+        """Current engine mode."""
+        ...
+
+    def set_mode(self, mode: Mode) -> None:
+        """Switch engine mode."""
+        ...
+
+    def current_sequence(self, timeout_ms: int = 0) -> int:
+        """Return the highest durable sequence number."""
+        ...
+
+    def create_manifest(self) -> FileManifest:
+        """Return a manifest of sealed files with a snapshot."""
+        ...
+
+    def changes_since(
+        self, snapshot: Snapshot, from_sequence: int
+    ) -> ChangeIterator:
+        """Iterate data entries with sequence > from_sequence."""
+        ...
+
+    def ingest(self, entries: list[DataEntry]) -> None:
+        """Ingest pre-sequenced entries from a leader (follower mode only)."""
         ...

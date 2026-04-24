@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 
+export type Mode = 'leader' | 'follower';
+
+export type EntryType = 'put' | 'delete' | 'bulkBegin' | 'bulkEnd' | 'rangeDel';
+
 export interface OpenOptions {
   maxFileBytes?: number;
   failOnCrcErrors?: boolean;
@@ -8,6 +12,8 @@ export interface OpenOptions {
   maxKeyBytes?: number;
   /** Max value size in bytes (default 4 MiB; hard ceiling ~4 GiB). */
   maxValueBytes?: number;
+  /** Initial engine mode (default 'leader'). */
+  initialMode?: Mode;
 }
 
 export interface WriteOptions {
@@ -21,6 +27,26 @@ export interface ReadOptions {
 export interface Entry {
   key: Uint8Array;
   value: Uint8Array;
+}
+
+export interface DataEntry {
+  sequence: number;
+  entryType: EntryType;
+  key: Uint8Array;
+  value: Uint8Array;
+}
+
+export interface FileInfo {
+  fileId: number;
+  dataPath: string;
+  hintPath: string;
+}
+
+export interface FileManifest extends Disposable {
+  getSnapshot(): Snapshot;
+  getFiles(): FileInfo[];
+  getThroughSequence(): number;
+  close(): void;
 }
 
 export interface CloseableIterator<T> extends Disposable {
@@ -66,6 +92,12 @@ export interface ByteCaskDB extends Disposable {
   isDegraded(): boolean;
   degradedReason(): string;
   resume(): void;
+  mode(): Mode;
+  setMode(mode: Mode): void;
+  currentSequence(timeoutMs?: number): number;
+  createManifest(): FileManifest;
+  changesSince(snap: Snapshot, fromSeq: number): CloseableIterator<DataEntry>;
+  ingest(entries: DataEntry[]): void;
   close(): void;
 }
 

@@ -11,6 +11,7 @@
 // optional JS options object as the last parameter. No behavioral options
 // are baked into method names. See emscripten/API.md for the full spec.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -226,6 +227,74 @@ struct JsReverseKeyIterator {
 };
 
 // ---------------------------------------------------------------------------
+// JsChangeIterator — wraps ChangeIterator for replication
+// ---------------------------------------------------------------------------
+
+static auto entry_type_to_string(bytecask::EntryType et) -> const char * {
+  switch (et) {
+    case bytecask::EntryType::Put: return "put";
+    case bytecask::EntryType::Delete: return "delete";
+    case bytecask::EntryType::BulkBegin: return "bulkBegin";
+    case bytecask::EntryType::BulkEnd: return "bulkEnd";
+    case bytecask::EntryType::RangeDel: return "rangeDel";
+  }
+}
+
+static auto string_to_mode(const std::string &s) -> bytecask::Mode {
+  if (s == "leader") return bytecask::Mode::Leader;
+  if (s == "follower") return bytecask::Mode::Follower;
+  throw std::invalid_argument("Invalid mode: " + s + " (expected 'leader' or 'follower')");
+}
+
+static auto mode_to_string(bytecask::Mode m) -> const char * {
+  switch (m) {
+    case bytecask::Mode::Leader: return "leader";
+    case bytecask::Mode::Follower: return "follower";
+  }
+}
+
+static auto span_to_js(std::span<const std::byte> s) -> val {
+  return to_js_uint8array(s.data(), s.size());
+}
+
+struct JsChangeIterator {
+  std::ranges::subrange<bytecask::ChangeIterator, std::default_sentinel_t> range;
+  bytecask::ChangeIterator it;
+
+  explicit JsChangeIterator(
+      std::ranges::subrange<bytecask::ChangeIterator, std::default_sentinel_t> r)
+      : range{std::move(r)}, it{range.begin()} {}
+
+  auto next() -> val {
+    auto result = val::object();
+    if (it == std::default_sentinel) {
+      result.set("done", true);
+      return result;
+    }
+    auto view = *it;
+    auto entry = val::object();
+    entry.set("sequence", static_cast<double>(view.sequence));
+    entry.set("entryType", std::string{entry_type_to_string(view.entry_type)});
+    entry.set("key", span_to_js(view.key));
+    entry.set("value", span_to_js(view.value));
+    result.set("value", entry);
+    result.set("done", false);
+    ++it;
+    return result;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// JsFileManifest — wraps FileManifest from create_manifest()
+// ---------------------------------------------------------------------------
+
+struct JsFileManifest {
+  JsSnapshot *snapshot;
+  val files;
+  double through_sequence;
+};
+
+// ---------------------------------------------------------------------------
 // JsDB bound methods
 // ---------------------------------------------------------------------------
 
@@ -239,6 +308,8 @@ static auto jsdb_open(const std::string &path, val opts) -> JsDB * {
     o.max_key_bytes = opts["maxKeyBytes"].as<uint32_t>();
   if (has_prop(opts, "maxValueBytes"))
     o.max_value_bytes = opts["maxValueBytes"].as<uint32_t>();
+  if (has_prop(opts, "initialMode"))
+    o.initial_mode = string_to_mode(opts["initialMode"].as<std::string>());
   return new JsDB{std::filesystem::path{path}, std::move(o)};
 }
 
@@ -321,6 +392,87 @@ static auto jsdb_degraded_reason(JsDB &self) -> std::string {
 }
 
 static void jsdb_resume(JsDB &self) { self.db.resume(); }
+
+static auto jsdb_mode(JsDB &self) -> std::string {
+  return mode_to_string(self.db.mode());
+}
+
+static void jsdb_set_mode(JsDB &self, const std::string &mode) {
+  self.db.set_mode(string_to_mode(mode));
+}
+
+static auto jsdb_current_sequence(JsDB &self, val timeout_ms_val) -> double {
+  std::uint64_t timeout_ms = 0;
+  if (!timeout_ms_val.isUndefined() && !timeout_ms_val.isNull()) {
+    timeout_ms = timeout_ms_val.as<std::uint64_t>();
+  }
+  return static_cast<double>(
+      self.db.current_sequence(std::chrono::milliseconds{timeout_ms}));
+}
+
+static auto jsdb_create_manifest(JsDB &self) -> JsFileManifest * {
+  auto manifest = self.db.create_manifest();
+  auto *snap = new JsSnapshot{std::move(manifest.snap)};
+
+  auto js_files = val::array();
+  for (std::size_t i = 0; i < manifest.files.size(); ++i) {
+    auto &fi = manifest.files[i];
+    auto obj = val::object();
+    obj.set("fileId", fi.file_id);
+    obj.set("dataPath", fi.data_path.string());
+    obj.set("hintPath", fi.hint_path.string());
+    js_files.call<void>("push", obj);
+  }
+
+  return new JsFileManifest{
+      snap, std::move(js_files),
+      static_cast<double>(manifest.through_sequence)};
+}
+
+static auto jsdb_changes_since(JsDB &self, JsSnapshot &snap,
+                               double from_seq) -> JsChangeIterator * {
+  snap.check();
+  auto range = self.db.changes_since(*snap.snap,
+                                     static_cast<std::uint64_t>(from_seq));
+  return new JsChangeIterator{std::move(range)};
+}
+
+static void jsdb_ingest(JsDB &self, val entries) {
+  auto len = entries["length"].as<std::size_t>();
+  std::vector<bytecask::DataEntryView> views;
+  views.reserve(len);
+
+  // Keep owned string buffers alive for the duration of ingest.
+  std::vector<std::string> key_bufs;
+  std::vector<std::string> val_bufs;
+  key_bufs.reserve(len);
+  val_bufs.reserve(len);
+
+  for (std::size_t i = 0; i < len; ++i) {
+    auto e = entries[i];
+    auto seq = static_cast<std::uint64_t>(e["sequence"].as<double>());
+    auto et_str = e["entryType"].as<std::string>();
+
+    bytecask::EntryType et;
+    if (et_str == "put") et = bytecask::EntryType::Put;
+    else if (et_str == "delete") et = bytecask::EntryType::Delete;
+    else if (et_str == "bulkBegin") et = bytecask::EntryType::BulkBegin;
+    else if (et_str == "bulkEnd") et = bytecask::EntryType::BulkEnd;
+    else if (et_str == "rangeDel") et = bytecask::EntryType::RangeDel;
+    else throw std::invalid_argument("Invalid entryType: " + et_str);
+
+    key_bufs.push_back(e["key"].as<std::string>());
+    val_bufs.push_back(e["value"].as<std::string>());
+
+    views.push_back(bytecask::DataEntryView{
+        .sequence = seq,
+        .entry_type = et,
+        .key = to_view(key_bufs.back()),
+        .value = to_view(val_bufs.back()),
+    });
+  }
+  self.db.ingest(views);
+}
 
 static void jsdb_close(JsDB &self) { delete &self; }
 
@@ -433,6 +585,11 @@ static void js_entry_iter_close(JsEntryIterator &self) { delete &self; }
 static void js_key_iter_close(JsKeyIterator &self) { delete &self; }
 static void js_rev_entry_iter_close(JsReverseEntryIterator &self) { delete &self; }
 static void js_rev_key_iter_close(JsReverseKeyIterator &self) { delete &self; }
+static void js_change_iter_close(JsChangeIterator &self) { delete &self; }
+static void js_file_manifest_close(JsFileManifest &self) {
+  // snapshot is owned separately, caller must close it.
+  delete &self;
+}
 
 // ---------------------------------------------------------------------------
 // Embind registration
@@ -456,6 +613,12 @@ EMSCRIPTEN_BINDINGS(bytecask) {
       .function("isDegraded", &jsdb_is_degraded)
       .function("degradedReason", &jsdb_degraded_reason)
       .function("resume", &jsdb_resume)
+      .function("mode", &jsdb_mode)
+      .function("setMode", &jsdb_set_mode)
+      .function("currentSequence", &jsdb_current_sequence)
+      .function("createManifest", &jsdb_create_manifest, allow_raw_pointers())
+      .function("changesSince", &jsdb_changes_since, allow_raw_pointers())
+      .function("ingest", &jsdb_ingest)
       .function("close", &jsdb_close);
 
   class_<JsSnapshot>("Snapshot")
@@ -495,4 +658,20 @@ EMSCRIPTEN_BINDINGS(bytecask) {
   class_<JsReverseKeyIterator>("ReverseKeyIterator")
       .function("next", &JsReverseKeyIterator::next)
       .function("close", &js_rev_key_iter_close);
+
+  class_<JsChangeIterator>("ChangeIterator")
+      .function("next", &JsChangeIterator::next)
+      .function("close", &js_change_iter_close);
+
+  class_<JsFileManifest>("FileManifest")
+      .function("getSnapshot", [](JsFileManifest &self) -> JsSnapshot * {
+        return self.snapshot;
+      }, allow_raw_pointers())
+      .function("getFiles", [](JsFileManifest &self) -> val {
+        return self.files;
+      })
+      .function("getThroughSequence", [](JsFileManifest &self) -> double {
+        return self.through_sequence;
+      })
+      .function("close", &js_file_manifest_close);
 }
