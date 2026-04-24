@@ -264,8 +264,10 @@ static void jsdb_del_range(JsDB &self, const std::string &from,
   self.db.del_range(wo, to_view(from), to_view(to));
 }
 
-static auto jsdb_contains_key(JsDB &self, const std::string &key) -> bool {
-  return self.db.contains_key(to_view(key));
+static auto jsdb_contains_key(JsDB &self, const std::string &key, val opts)
+    -> bool {
+  auto ro = extract_read_options(opts);
+  return self.db.contains_key(ro, to_view(key));
 }
 
 static auto jsdb_snapshot(JsDB &self) -> JsSnapshot * {
@@ -327,40 +329,45 @@ static auto jssnap_get(JsSnapshot &self, const std::string &key, val opts)
   self.check();
   auto ro = extract_read_options(opts);
   Bytes out;
-  if (self.snap->get(to_view(key), out)) {
+  if (self.snap->get(ro, to_view(key), out)) {
     return bytes_to_js(out);
   }
   return val::null();
 }
 
-static auto jssnap_contains_key(JsSnapshot &self, const std::string &key)
-    -> bool {
+static auto jssnap_contains_key(JsSnapshot &self, const std::string &key,
+                                val opts) -> bool {
   self.check();
-  return self.snap->contains_key(to_view(key));
+  auto ro = extract_read_options(opts);
+  return self.snap->contains_key(ro, to_view(key));
 }
 
 static auto jssnap_entries(JsSnapshot &self, const std::string &from, val opts)
     -> JsEntryIterator * {
   self.check();
-  return new JsEntryIterator{self.snap->iter_from(to_view(from))};
+  auto ro = extract_read_options(opts);
+  return new JsEntryIterator{self.snap->iter_from(ro, to_view(from))};
 }
 
 static auto jssnap_keys(JsSnapshot &self, const std::string &from, val opts)
     -> JsKeyIterator * {
   self.check();
-  return new JsKeyIterator{self.snap->keys_from(to_view(from))};
+  auto ro = extract_read_options(opts);
+  return new JsKeyIterator{self.snap->keys_from(ro, to_view(from))};
 }
 
 static auto jssnap_entries_reverse(JsSnapshot &self, const std::string &from,
                                    val opts) -> JsReverseEntryIterator * {
   self.check();
-  return new JsReverseEntryIterator{self.snap->riter_from(to_view(from))};
+  auto ro = extract_read_options(opts);
+  return new JsReverseEntryIterator{self.snap->riter_from(ro, to_view(from))};
 }
 
 static auto jssnap_keys_reverse(JsSnapshot &self, const std::string &from,
                                 val opts) -> JsReverseKeyIterator * {
   self.check();
-  return new JsReverseKeyIterator{self.snap->rkeys_from(to_view(from))};
+  auto ro = extract_read_options(opts);
+  return new JsReverseKeyIterator{self.snap->rkeys_from(ro, to_view(from))};
 }
 
 static void jssnap_close(JsSnapshot &self) { delete &self; }

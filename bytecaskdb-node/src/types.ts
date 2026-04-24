@@ -27,7 +27,7 @@ export interface CloseableIterator<T> extends Disposable {
 
 export interface Snapshot extends Disposable {
   get(key: string, opts?: ReadOptions): Uint8Array | null;
-  containsKey(key: string): boolean;
+  containsKey(key: string, opts?: ReadOptions): boolean;
   entries(from: string, opts?: ReadOptions): CloseableIterator<Entry>;
   keys(from: string, opts?: ReadOptions): CloseableIterator<Uint8Array>;
   entriesReverse(from: string, opts?: ReadOptions): CloseableIterator<Entry>;
@@ -51,7 +51,7 @@ export interface ByteCaskDB extends Disposable {
   put(key: string, value: string, opts?: WriteOptions): void;
   del(key: string, opts?: WriteOptions): boolean;
   delRange(from: string, to: string, opts?: WriteOptions): void;
-  containsKey(key: string): boolean;
+  containsKey(key: string, opts?: ReadOptions): boolean;
   snapshot(): Snapshot;
   applyBatch(plan: WritePlan, opts?: WriteOptions): boolean;
   entries(from: string, opts?: ReadOptions): CloseableIterator<Entry>;

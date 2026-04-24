@@ -759,8 +759,8 @@ void DB::del_range(const WriteOptions &opts, BytesView from, BytesView to) {
   (void)apply_batch(opts, std::move(plan));
 }
 
-auto DB::contains_key(BytesView key) const -> bool {
-  auto s = load_state_for_read(ReadOptions{});
+auto DB::contains_key(const ReadOptions& opts, BytesView key) const -> bool {
+  auto s = load_state_for_read(opts);
   return s->key_dir.contains(key);
 }
 
@@ -962,13 +962,15 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
 
 #pragma region Snapshot read methods
 
-auto Snapshot::contains_key(BytesView key) const -> bool {
+auto Snapshot::contains_key(const ReadOptions& /*opts*/,
+                            BytesView key) const -> bool {
   return state_->key_dir.contains(key);
 }
 
 // Reads the value for key from the frozen snapshot state into out.
 // Thread-local I/O buffer reused across calls to amortize allocation.
-auto Snapshot::get(BytesView key, Bytes &out) const -> bool {
+auto Snapshot::get(const ReadOptions& opts, BytesView key,
+                   Bytes &out) const -> bool {
   const auto kv = state_->key_dir.get(key);
   if (!kv) return false;
   if (kv->value_size == 0) {
@@ -981,20 +983,20 @@ auto Snapshot::get(BytesView key, Bytes &out) const -> bool {
 #pragma clang diagnostic pop
   (*state_->files.get(kv->file_id))
       ->read_value(kv->file_offset, narrow<std::uint16_t>(key.size()),
-                   kv->value_size, /*verify_checksums=*/true, io_buf, out);
+                   kv->value_size, opts.verify_checksums, io_buf, out);
   return true;
 }
 
-auto Snapshot::iter_from(BytesView from) const
+auto Snapshot::iter_from(const ReadOptions& opts, BytesView from) const
     -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
   auto it =
       from.empty() ? state_->key_dir.begin() : state_->key_dir.lower_bound(from);
   return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
-      EntryIterator{state_, std::move(it), /*verify_checksums=*/true},
+      EntryIterator{state_, std::move(it), opts.verify_checksums},
       std::default_sentinel};
 }
 
-auto Snapshot::keys_from(BytesView from) const
+auto Snapshot::keys_from(const ReadOptions& /*opts*/, BytesView from) const
     -> std::ranges::subrange<KeyIterator, std::default_sentinel_t> {
   auto it =
       from.empty() ? state_->key_dir.begin() : state_->key_dir.lower_bound(from);
@@ -1002,17 +1004,17 @@ auto Snapshot::keys_from(BytesView from) const
       KeyIterator{std::move(it)}, std::default_sentinel};
 }
 
-auto Snapshot::riter_from(BytesView from) const
+auto Snapshot::riter_from(const ReadOptions& opts, BytesView from) const
     -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator> {
   auto begin_it = from.empty()
       ? state_->key_dir.rbegin().base()
       : state_->key_dir.upper_bound(from);
   auto end_it = state_->key_dir.begin();
-  return {ReverseEntryIterator{EntryIterator{state_, std::move(begin_it), /*verify_checksums=*/true}},
-          ReverseEntryIterator{EntryIterator{state_, std::move(end_it), /*verify_checksums=*/true}}};
+  return {ReverseEntryIterator{EntryIterator{state_, std::move(begin_it), opts.verify_checksums}},
+          ReverseEntryIterator{EntryIterator{state_, std::move(end_it), opts.verify_checksums}}};
 }
 
-auto Snapshot::rkeys_from(BytesView from) const
+auto Snapshot::rkeys_from(const ReadOptions& /*opts*/, BytesView from) const
     -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator> {
   auto begin_it = from.empty()
       ? state_->key_dir.rbegin().base()

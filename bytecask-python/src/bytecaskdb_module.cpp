@@ -343,71 +343,79 @@ NB_MODULE(_bytecaskdb, m) {
       "Raises RuntimeError if used after being consumed by WritePlan.")
       .def(
           "get",
-          [](PySnapshot &self, nb::bytes key) -> nb::object {
+          [](PySnapshot &self, nb::bytes key,
+             std::optional<bytecask::ReadOptions> opts) -> nb::object {
             self.check();
             bytecask::Bytes out;
             auto k = to_view(key);
+            auto ropts = opts.value_or(bytecask::ReadOptions{});
             nb::gil_scoped_release release;
-            bool found = self.snap->get(k, out);
+            bool found = self.snap->get(ropts, k, out);
             nb::gil_scoped_acquire acquire;
             if (!found) return nb::none();
             return to_pybytes(out);
           },
           "Return the value for key, or None if not found.",
-          "key"_a)
+          "key"_a, "opts"_a = nb::none())
       .def(
           "contains_key",
-          [](PySnapshot &self, nb::bytes key) -> bool {
+          [](PySnapshot &self, nb::bytes key,
+             std::optional<bytecask::ReadOptions> opts) -> bool {
             self.check();
-            return self.snap->contains_key(to_view(key));
+            auto ropts = opts.value_or(bytecask::ReadOptions{});
+            return self.snap->contains_key(ropts, to_view(key));
           },
           "Return True if key exists. No disk I/O.",
-          "key"_a)
+          "key"_a, "opts"_a = nb::none())
       .def(
           "iter_from",
-          [](PySnapshot &self,
-             nb::bytes from_key) -> PyEntryIterator {
+          [](PySnapshot &self, nb::bytes from_key,
+             std::optional<bytecask::ReadOptions> opts) -> PyEntryIterator {
             self.check();
-            auto range = self.snap->iter_from(to_view(from_key));
+            auto ropts = opts.value_or(bytecask::ReadOptions{});
+            auto range = self.snap->iter_from(ropts, to_view(from_key));
             return PyEntryIterator{std::move(range.begin())};
           },
           "Iterate (key, value) pairs in ascending order from from_key.",
-          "from_key"_a = nb::bytes("", 0),
+          "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
           nb::keep_alive<0, 1>())
       .def(
           "keys_from",
-          [](PySnapshot &self,
-             nb::bytes from_key) -> PyKeyIterator {
+          [](PySnapshot &self, nb::bytes from_key,
+             std::optional<bytecask::ReadOptions> opts) -> PyKeyIterator {
             self.check();
-            auto range = self.snap->keys_from(to_view(from_key));
+            auto ropts = opts.value_or(bytecask::ReadOptions{});
+            auto range = self.snap->keys_from(ropts, to_view(from_key));
             return PyKeyIterator{std::move(range.begin())};
           },
           "Iterate keys in ascending order. No disk I/O.",
-          "from_key"_a = nb::bytes("", 0),
+          "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
           nb::keep_alive<0, 1>())
       .def(
           "riter_from",
-          [](PySnapshot &self,
-             nb::bytes from_key) -> PyReverseEntryIterator {
+          [](PySnapshot &self, nb::bytes from_key,
+             std::optional<bytecask::ReadOptions> opts) -> PyReverseEntryIterator {
             self.check();
-            auto range = self.snap->riter_from(to_view(from_key));
+            auto ropts = opts.value_or(bytecask::ReadOptions{});
+            auto range = self.snap->riter_from(ropts, to_view(from_key));
             return PyReverseEntryIterator{std::move(range.begin()),
                                           std::move(range.end())};
           },
           "Iterate (key, value) pairs in descending order from from_key.",
-          "from_key"_a = nb::bytes("", 0),
+          "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
           nb::keep_alive<0, 1>())
       .def(
           "rkeys_from",
-          [](PySnapshot &self,
-             nb::bytes from_key) -> PyReverseKeyIterator {
+          [](PySnapshot &self, nb::bytes from_key,
+             std::optional<bytecask::ReadOptions> opts) -> PyReverseKeyIterator {
             self.check();
-            auto range = self.snap->rkeys_from(to_view(from_key));
+            auto ropts = opts.value_or(bytecask::ReadOptions{});
+            auto range = self.snap->rkeys_from(ropts, to_view(from_key));
             return PyReverseKeyIterator{std::move(range.begin()),
                                         std::move(range.end())};
           },
           "Iterate keys in descending order. No disk I/O.",
-          "from_key"_a = nb::bytes("", 0),
+          "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
           nb::keep_alive<0, 1>())
       // Context manager support.
       .def("__enter__",
@@ -525,11 +533,13 @@ NB_MODULE(_bytecaskdb, m) {
           "from_key"_a, "to_key"_a, "opts"_a = nb::none())
       .def(
           "contains_key",
-          [](PyDB &self, nb::bytes key) -> bool {
-            return self.db.contains_key(to_view(key));
+          [](PyDB &self, nb::bytes key,
+             std::optional<bytecask::ReadOptions> opts) -> bool {
+            auto ropts = opts.value_or(bytecask::ReadOptions{});
+            return self.db.contains_key(ropts, to_view(key));
           },
           "Return True if key exists. No disk I/O.",
-          "key"_a)
+          "key"_a, "opts"_a = nb::none())
       .def(
           "apply_batch",
           [](PyDB &self, PyWritePlan &plan,

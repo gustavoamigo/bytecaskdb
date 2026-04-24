@@ -596,7 +596,8 @@ public:
   void del_range(const WriteOptions &opts, BytesView from, BytesView to);
 
   // Returns true if key exists in the index (no disk I/O).
-  [[nodiscard]] auto contains_key(BytesView key) const -> bool;
+  [[nodiscard]] auto contains_key(const ReadOptions& opts,
+                                  BytesView key) const -> bool;
 
   // Returns the current engine mode. Lock-free (reads published state).
   [[nodiscard]] auto mode() const noexcept -> Mode;
@@ -885,29 +886,35 @@ public:
   Snapshot &operator=(Snapshot &&) noexcept = default;
 
   // Returns true if key exists in this snapshot. No disk I/O.
-  [[nodiscard]] auto contains_key(BytesView key) const -> bool;
+  [[nodiscard]] auto contains_key(const ReadOptions& opts,
+                                  BytesView key) const -> bool;
 
   // Writes the value for key into out. Returns true if found, false if absent.
   // Throws std::system_error on I/O failure or std::runtime_error on CRC mismatch.
-  [[nodiscard]] auto get(BytesView key, Bytes &out) const -> bool;
+  [[nodiscard]] auto get(const ReadOptions& opts, BytesView key,
+                         Bytes &out) const -> bool;
 
   // Returns an input range of (key, value) pairs with keys >= from.
   // Results are in ascending key order. Each dereference reads from disk (lazy).
-  [[nodiscard]] auto iter_from(BytesView from = {}) const
+  [[nodiscard]] auto iter_from(const ReadOptions& opts,
+                               BytesView from = {}) const
       -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
 
   // Returns an input range of keys >= from. Pure in-memory — no disk I/O.
-  [[nodiscard]] auto keys_from(BytesView from = {}) const
+  [[nodiscard]] auto keys_from(const ReadOptions& opts,
+                               BytesView from = {}) const
       -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
 
   // Returns a range of (key, value) pairs in descending key order.
   // When from is non-empty, starts at the last key <= from.
   // When from is empty, starts at the last key in the DB.
-  [[nodiscard]] auto riter_from(BytesView from = {}) const
+  [[nodiscard]] auto riter_from(const ReadOptions& opts,
+                                BytesView from = {}) const
       -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
 
   // Returns a range of keys in descending order. Pure in-memory — no disk I/O.
-  [[nodiscard]] auto rkeys_from(BytesView from = {}) const
+  [[nodiscard]] auto rkeys_from(const ReadOptions& opts,
+                                BytesView from = {}) const
       -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 
 private:

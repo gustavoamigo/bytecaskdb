@@ -312,7 +312,8 @@ public:
     [[nodiscard]] auto del(const WriteOptions& opts, BytesView key) -> bool;
 
     // Returns true if key exists in the index (no disk I/O).
-    [[nodiscard]] auto contains_key(BytesView key) const -> bool;
+    [[nodiscard]] auto contains_key(const ReadOptions& opts,
+                                    BytesView key) const -> bool;
 
     // ── Batch ─────────────────────────────────────────────────────────────
 

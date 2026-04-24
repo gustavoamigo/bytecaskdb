@@ -206,11 +206,11 @@ TEST_CASE("DB contains_key tracks mutations", "[bytecask]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
 
-  CHECK_FALSE(db.contains_key(to_bytes("k")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("k")));
   db.put({}, to_bytes("k"), to_bytes("v"));
-  CHECK(db.contains_key(to_bytes("k")));
+  CHECK(db.contains_key({}, to_bytes("k")));
   CHECK(db.del({}, to_bytes("k")));
-  CHECK_FALSE(db.contains_key(to_bytes("k")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("k")));
 }
 
 // ---------------------------------------------------------------------------
@@ -627,7 +627,7 @@ TEST_CASE("DB recovery: cross-file tombstone suppresses stale put",
   }
 
   auto db2 = bytecask::DB::open(db_path, {.max_file_bytes = 1});
-  CHECK_FALSE(db2.contains_key(to_bytes("gone")));
+  CHECK_FALSE(db2.contains_key({}, to_bytes("gone")));
   CHECK_FALSE(get_val(db2, to_bytes("gone")).has_value());
   REQUIRE(get_val(db2, to_bytes("keep")).has_value());
   CHECK(to_string(*get_val(db2, to_bytes("keep"))) == "v2");
@@ -2209,12 +2209,12 @@ TEST_CASE("vacuum compact preserves tombstones", "[vacuum]") {
     REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
     // The key should still be absent.
-    CHECK_FALSE(db.contains_key(to_bytes("gone")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("gone")));
   }
 
   // Reopen to verify tombstone survives recovery.
   auto db2 = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1});
-  CHECK_FALSE(db2.contains_key(to_bytes("gone")));
+  CHECK_FALSE(db2.contains_key({}, to_bytes("gone")));
 }
 
 // ---------------------------------------------------------------------------
@@ -2412,7 +2412,7 @@ TEST_CASE("vacuum compact handles batch with mixed put/del", "[vacuum]") {
   auto vk = get_val(db, to_bytes("keep"));
   REQUIRE(vk.has_value());
   CHECK(to_string(*vk) == "updated");
-  CHECK_FALSE(db.contains_key(to_bytes("gone")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("gone")));
 }
 
 // ---------------------------------------------------------------------------
@@ -2458,7 +2458,7 @@ TEST_CASE("vacuum unlinks stale file immediately, snapshot reads via open fd",
 
     // The snapshot can still read via its open fd (POSIX guarantee).
     bytecask::Bytes snap_out;
-    CHECK(snap.get(to_bytes("k"), snap_out));
+    CHECK(snap.get({}, to_bytes("k"), snap_out));
   }
 
   // DB still consistent after snapshot is dropped.
@@ -2482,7 +2482,7 @@ TEST_CASE("Snapshot get is frozen at snapshot time", "[snapshot]") {
   db.put({}, to_bytes("k"), to_bytes("v2"));
 
   bytecask::Bytes out;
-  REQUIRE(snap.get(to_bytes("k"), out));
+  REQUIRE(snap.get({}, to_bytes("k"), out));
   CHECK(to_string(out) == "v1");
 
   REQUIRE(db.get({}, to_bytes("k"), out));
@@ -2499,8 +2499,8 @@ TEST_CASE("Snapshot contains_key is frozen at snapshot time", "[snapshot]") {
 
   (void)db.del({}, to_bytes("k"));
 
-  CHECK(snap.contains_key(to_bytes("k")));
-  CHECK_FALSE(db.contains_key(to_bytes("k")));
+  CHECK(snap.contains_key({}, to_bytes("k")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("k")));
 }
 
 // Snapshot::get returns false for a key absent at snapshot time.
@@ -2511,7 +2511,7 @@ TEST_CASE("Snapshot get returns false for absent key", "[snapshot]") {
   db.put({}, to_bytes("k"), to_bytes("v"));
 
   bytecask::Bytes out;
-  CHECK_FALSE(snap.get(to_bytes("k"), out));
+  CHECK_FALSE(snap.get({}, to_bytes("k"), out));
 }
 
 // Snapshot::iter_from yields entries frozen at snapshot time.
@@ -2527,7 +2527,7 @@ TEST_CASE("Snapshot iter_from is frozen at snapshot time", "[snapshot]") {
   db.put({}, to_bytes("c"), to_bytes("3"));
 
   std::vector<std::string> keys;
-  for (const auto &[k, v] : snap.iter_from()) {
+  for (const auto &[k, v] : snap.iter_from({})) {
     keys.push_back(to_string(k));
   }
   CHECK(keys == std::vector<std::string>{"a", "b"});
@@ -2546,7 +2546,7 @@ TEST_CASE("Snapshot keys_from is frozen at snapshot time", "[snapshot]") {
   (void)db.del({}, to_bytes("a"));
 
   std::vector<std::string> keys;
-  for (const auto &k : snap.keys_from()) {
+  for (const auto &k : snap.keys_from({})) {
     keys.push_back(to_string(k));
   }
   CHECK(keys == std::vector<std::string>{"a", "b"});
@@ -2662,7 +2662,7 @@ TEST_CASE("Snapshot riter_from is frozen at snapshot time", "[snapshot]") {
   db.put({}, to_bytes("c"), to_bytes("3"));
 
   std::vector<std::string> keys;
-  for (const auto &[k, v] : snap.riter_from()) {
+  for (const auto &[k, v] : snap.riter_from({})) {
     keys.push_back(to_string(k));
   }
   CHECK(keys == std::vector<std::string>{"b", "a"});
@@ -2680,7 +2680,7 @@ TEST_CASE("Snapshot rkeys_from is frozen at snapshot time", "[snapshot]") {
   (void)db.del({}, to_bytes("a"));
 
   std::vector<std::string> keys;
-  for (const auto &k : snap.rkeys_from()) {
+  for (const auto &k : snap.rkeys_from({})) {
     keys.push_back(to_string(k));
   }
   CHECK(keys == std::vector<std::string>{"b", "a"});
@@ -3277,13 +3277,13 @@ TEST_CASE("reads work on a degraded DB", "[degraded]") {
   CHECK(to_string(*val) == "val_x");
 
   // contains_key — pure in-memory.
-  CHECK(db.contains_key(to_bytes("x")));
-  CHECK_FALSE(db.contains_key(to_bytes("a")));
+  CHECK(db.contains_key({}, to_bytes("x")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("a")));
 
   // snapshot — frozen read-only view.
   auto snap = db.snapshot();
   bytecask::Bytes snap_out;
-  CHECK(snap.get(to_bytes("x"), snap_out));
+  CHECK(snap.get({}, to_bytes("x"), snap_out));
 
   // iter_from — lazy value fetch.
   auto range = db.iter_from({}, to_bytes("x"));
@@ -3317,7 +3317,7 @@ TEST_CASE("class F: key not visible after commit sync failure", "[f_visibility]"
   }
 
   // Key must not be visible — write was not confirmed durable.
-  CHECK_FALSE(db.contains_key(to_bytes("new_key")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("new_key")));
   // Engine must be degraded — bytes in page cache, key_dir diverges.
   CHECK(db.is_degraded());
   // resume() clears the degraded state.
@@ -3345,16 +3345,16 @@ TEST_CASE("class G: key not visible after rotation sync failure", "[g_visibility
   }
 
   // Key must not be visible — write was not confirmed durable.
-  CHECK_FALSE(db.contains_key(to_bytes("new_key")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("new_key")));
   // Engine must be degraded — bytes in page cache, key_dir diverges.
   CHECK(db.is_degraded());
   // Pre-existing key must still be visible.
-  CHECK(db.contains_key(to_bytes("seed")));
+  CHECK(db.contains_key({}, to_bytes("seed")));
   // resume() clears the degraded state.
   REQUIRE_NOTHROW(db.resume());
   CHECK_FALSE(db.is_degraded());
   // Pre-existing key still visible after resume.
-  CHECK(db.contains_key(to_bytes("seed")));
+  CHECK(db.contains_key({}, to_bytes("seed")));
 }
 
 TEST_CASE("resume() recovers from degraded state", "[degraded][resume]") {
@@ -3379,12 +3379,12 @@ TEST_CASE("resume() recovers from degraded state", "[degraded][resume]") {
   CHECK_FALSE(db.is_degraded());
 
   // Both k1 and k2 were committed before/during the fault — must still be visible.
-  CHECK(db.contains_key(to_bytes("k1")));
-  CHECK(db.contains_key(to_bytes("k2")));
+  CHECK(db.contains_key({}, to_bytes("k1")));
+  CHECK(db.contains_key({}, to_bytes("k2")));
 
   // Subsequent writes succeed after resume().
   REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
-  CHECK(db.contains_key(to_bytes("k3")));
+  CHECK(db.contains_key({}, to_bytes("k3")));
 }
 
 TEST_CASE("resume() replays unpublished entries from active file",
@@ -3396,7 +3396,7 @@ TEST_CASE("resume() replays unpublished entries from active file",
 
   // k1 committed normally — baseline.
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
-  CHECK(db.contains_key(to_bytes("k1")));
+  CHECK(db.contains_key({}, to_bytes("k1")));
 
   // k2 written to page cache but key changes NOT published (class F sync
   // failure). fdatasync fails → engine degrades; k2 bytes in page cache.
@@ -3405,7 +3405,7 @@ TEST_CASE("resume() replays unpublished entries from active file",
     REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")),
                       std::system_error);
   }
-  CHECK_FALSE(db.contains_key(to_bytes("k2")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
   // F degrades the engine immediately.
   REQUIRE(db.is_degraded());
 
@@ -3416,9 +3416,9 @@ TEST_CASE("resume() replays unpublished entries from active file",
   CHECK_FALSE(db.is_degraded());
 
   // k1 was always committed and must still be visible.
-  CHECK(db.contains_key(to_bytes("k1")));
+  CHECK(db.contains_key({}, to_bytes("k1")));
   // k2 was replayed by resume() from the page-cache bytes.
-  CHECK(db.contains_key(to_bytes("k2")));
+  CHECK(db.contains_key({}, to_bytes("k2")));
 
   // Verify actual values.
   auto v = get_val(db, to_bytes("k2"));
@@ -3427,7 +3427,7 @@ TEST_CASE("resume() replays unpublished entries from active file",
 
   // Subsequent writes work.
   REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
-  CHECK(db.contains_key(to_bytes("k3")));
+  CHECK(db.contains_key({}, to_bytes("k3")));
 }
 
 TEST_CASE("writes throw DbDegraded on a degraded engine", "[degraded]") {
@@ -3473,7 +3473,7 @@ TEST_CASE("writes throw DbDegraded on a degraded engine", "[degraded]") {
   REQUIRE_NOTHROW(db.resume());
   CHECK_FALSE(db.is_degraded());
   REQUIRE_NOTHROW(db.put({.sync = false}, to_bytes("k5"), to_bytes("v5")));
-  CHECK(db.contains_key(to_bytes("k5")));
+  CHECK(db.contains_key({}, to_bytes("k5")));
 }
 
 TEST_CASE("resume() discards pending batch on CRC error in active file",
@@ -3521,12 +3521,12 @@ TEST_CASE("resume() discards pending batch on CRC error in active file",
   CHECK_FALSE(db.is_degraded());
 
   // Committed entries before the batch must survive.
-  CHECK(db.contains_key(to_bytes("k1")));
-  CHECK(db.contains_key(to_bytes("k2")));
+  CHECK(db.contains_key({}, to_bytes("k1")));
+  CHECK(db.contains_key({}, to_bytes("k2")));
 
   // Writes succeed after resume.
   REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
-  CHECK(db.contains_key(to_bytes("k3")));
+  CHECK(db.contains_key({}, to_bytes("k3")));
 }
 
 TEST_CASE("resume() with live snapshot on degraded DB",
@@ -3552,25 +3552,25 @@ TEST_CASE("resume() with live snapshot on degraded DB",
   // Take snapshot while degraded — pins data files.
   auto snap = db.snapshot();
   bytecask::Bytes out;
-  CHECK(snap.get(to_bytes("k1"), out));
-  CHECK(snap.get(to_bytes("k2"), out));
-  CHECK_FALSE(snap.contains_key(to_bytes("a")));
+  CHECK(snap.get({}, to_bytes("k1"), out));
+  CHECK(snap.get({}, to_bytes("k2"), out));
+  CHECK_FALSE(snap.contains_key({}, to_bytes("a")));
 
   // resume() with snapshot still alive.
   REQUIRE_NOTHROW(db.resume());
   CHECK_FALSE(db.is_degraded());
 
   // Snapshot still readable — pinned files not deleted.
-  CHECK(snap.get(to_bytes("k1"), out));
-  CHECK(snap.get(to_bytes("k2"), out));
+  CHECK(snap.get({}, to_bytes("k1"), out));
+  CHECK(snap.get({}, to_bytes("k2"), out));
 
   // Post-resume writes succeed.
   REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
-  CHECK(db.contains_key(to_bytes("k3")));
+  CHECK(db.contains_key({}, to_bytes("k3")));
 
   // DB reads still correct.
-  CHECK(db.contains_key(to_bytes("k1")));
-  CHECK(db.contains_key(to_bytes("k2")));
+  CHECK(db.contains_key({}, to_bytes("k1")));
+  CHECK(db.contains_key({}, to_bytes("k2")));
 }
 
 // ---------------------------------------------------------------------------
@@ -4325,7 +4325,7 @@ TEST_CASE("WritePlan: put then del_range — put is killed",
   plan.del_range(to_bytes("a"), to_bytes("z"));
   (void)db.apply_batch({}, std::move(plan));
 
-  CHECK_FALSE(db.contains_key(to_bytes("key")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("key")));
 }
 
 TEST_CASE("WritePlan: del_range then put — put survives",
@@ -4357,7 +4357,7 @@ TEST_CASE("WritePlan: interleaved puts and del_range — correct causality",
   plan.put(to_bytes("b"), to_bytes("2"));
   (void)db.apply_batch({}, std::move(plan));
 
-  CHECK_FALSE(db.contains_key(to_bytes("a"))); // killed by del_range
+  CHECK_FALSE(db.contains_key({}, to_bytes("a"))); // killed by del_range
   bytecask::Bytes out;
   REQUIRE(db.get({}, to_bytes("b"), out));      // survives — after del_range
   CHECK(to_string(out) == "2");
@@ -4389,7 +4389,7 @@ TEST_CASE("Causality survives recovery",
     bytecask::Bytes out;
     REQUIRE(db.get({}, to_bytes("key:surv"), out));
     CHECK(to_string(out) == "alive");
-    CHECK_FALSE(db.contains_key(to_bytes("key:dead")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("key:dead")));
   }
 
   SECTION("parallel recovery") {
@@ -4397,7 +4397,7 @@ TEST_CASE("Causality survives recovery",
     bytecask::Bytes out;
     REQUIRE(db.get({}, to_bytes("key:surv"), out));
     CHECK(to_string(out) == "alive");
-    CHECK_FALSE(db.contains_key(to_bytes("key:dead")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("key:dead")));
   }
 }
 
@@ -4679,8 +4679,8 @@ TEST_CASE("current_sequence correct after recovery", "[durable_seq]") {
   CHECK(seq >= 2);
 
   // Verify values survived.
-  CHECK(db.contains_key(to_bytes("k1")));
-  CHECK(db.contains_key(to_bytes("k2")));
+  CHECK(db.contains_key({}, to_bytes("k1")));
+  CHECK(db.contains_key({}, to_bytes("k2")));
 }
 
 // ---------------------------------------------------------------------------
@@ -4981,9 +4981,9 @@ TEST_CASE("basic manifest contains sealed files with hints", "[manifest]") {
 
   // Snapshot should be readable.
   bytecask::Bytes out;
-  CHECK(manifest.snap.get(to_bytes("k1"), out));
-  CHECK(manifest.snap.get(to_bytes("k2"), out));
-  CHECK(manifest.snap.get(to_bytes("k3"), out));
+  CHECK(manifest.snap.get({}, to_bytes("k1"), out));
+  CHECK(manifest.snap.get({}, to_bytes("k2"), out));
+  CHECK(manifest.snap.get({}, to_bytes("k3"), out));
 }
 
 TEST_CASE("empty db manifest", "[manifest]") {
@@ -4997,7 +4997,7 @@ TEST_CASE("empty db manifest", "[manifest]") {
 
   // Snapshot has no keys.
   bytecask::Bytes out;
-  CHECK_FALSE(manifest.snap.get(to_bytes("anything"), out));
+  CHECK_FALSE(manifest.snap.get({}, to_bytes("anything"), out));
 }
 
 TEST_CASE("writes continue after manifest", "[manifest]") {
@@ -5014,8 +5014,8 @@ TEST_CASE("writes continue after manifest", "[manifest]") {
   db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
 
   bytecask::Bytes out;
-  CHECK_FALSE(manifest.snap.get(to_bytes("k2"), out));
-  CHECK_FALSE(manifest.snap.get(to_bytes("k3"), out));
+  CHECK_FALSE(manifest.snap.get({}, to_bytes("k2"), out));
+  CHECK_FALSE(manifest.snap.get({}, to_bytes("k3"), out));
 
   // current_sequence advances beyond through_sequence.
   CHECK(db.current_sequence() > manifest_seq);
@@ -5035,8 +5035,8 @@ TEST_CASE("through_sequence includes nosync entries", "[manifest]") {
 
   // Both keys visible in snapshot.
   bytecask::Bytes out;
-  CHECK(manifest.snap.get(to_bytes("k1"), out));
-  CHECK(manifest.snap.get(to_bytes("k2"), out));
+  CHECK(manifest.snap.get({}, to_bytes("k1"), out));
+  CHECK(manifest.snap.get({}, to_bytes("k2"), out));
 }
 
 TEST_CASE("bootstrap simulation", "[manifest]") {
@@ -5090,11 +5090,11 @@ TEST_CASE("manifest after vacuum", "[manifest]") {
 
   // All keys present in snapshot with correct values.
   bytecask::Bytes out;
-  CHECK(manifest.snap.get(to_bytes("k1"), out));
+  CHECK(manifest.snap.get({}, to_bytes("k1"), out));
   CHECK(to_string(out) == "v1_new");
-  CHECK(manifest.snap.get(to_bytes("k2"), out));
+  CHECK(manifest.snap.get({}, to_bytes("k2"), out));
   CHECK(to_string(out) == "v2");
-  CHECK(manifest.snap.get(to_bytes("k3"), out));
+  CHECK(manifest.snap.get({}, to_bytes("k3"), out));
   CHECK(to_string(out) == "v3");
 }
 
@@ -5211,7 +5211,7 @@ TEST_CASE("mode enforcement: put/del/apply_batch throw in follower mode",
   // Reads still work.
   bytecask::Bytes out;
   CHECK_FALSE(db.get({}, to_bytes("k"), out));
-  CHECK_FALSE(db.contains_key(to_bytes("k")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("k")));
 }
 
 TEST_CASE("ingest throws in leader mode", "[replication]") {

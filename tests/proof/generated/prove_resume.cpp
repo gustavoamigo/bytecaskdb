@@ -62,8 +62,8 @@ TEST_CASE("prove_resume__degrade_H__success", "[prove_resume]") {
     // resume() succeeds on first attempt.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -94,8 +94,8 @@ TEST_CASE("prove_resume__degrade_H__sync_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -126,8 +126,8 @@ TEST_CASE("prove_resume__degrade_H__file_creation_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -151,15 +151,15 @@ TEST_CASE("prove_resume__degrade_H__double_resume", "[prove_resume]") {
     // First resume() succeeds.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
 
     // Second resume() is a no-op — engine already healthy.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -197,8 +197,8 @@ TEST_CASE("prove_resume__degrade_H__cascade_r2_r3", "[prove_resume]") {
     // Phase 4: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -227,9 +227,9 @@ TEST_CASE("prove_resume__degrade_C__success", "[prove_resume]") {
     // resume() succeeds on first attempt.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p1")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"});
@@ -265,9 +265,9 @@ TEST_CASE("prove_resume__degrade_C__truncate_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p1")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"});
@@ -303,9 +303,9 @@ TEST_CASE("prove_resume__degrade_C__sync_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p1")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"});
@@ -341,9 +341,9 @@ TEST_CASE("prove_resume__degrade_C__file_creation_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p1")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"});
@@ -372,17 +372,17 @@ TEST_CASE("prove_resume__degrade_C__double_resume", "[prove_resume]") {
     // First resume() succeeds.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p1")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
 
     // Second resume() is a no-op — engine already healthy.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p1")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"});
@@ -425,9 +425,9 @@ TEST_CASE("prove_resume__degrade_C__cascade_r2_r3", "[prove_resume]") {
     // Phase 4: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p0")));
-    CHECK_FALSE(db.contains_key(to_bytes("p1")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"});
@@ -452,8 +452,8 @@ TEST_CASE("prove_resume__degrade_F__success", "[prove_resume]") {
     // resume() succeeds on first attempt.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -485,8 +485,8 @@ TEST_CASE("prove_resume__degrade_F__sync_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -518,8 +518,8 @@ TEST_CASE("prove_resume__degrade_F__file_creation_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -544,15 +544,15 @@ TEST_CASE("prove_resume__degrade_F__double_resume", "[prove_resume]") {
     // First resume() succeeds.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
 
     // Second resume() is a no-op — engine already healthy.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -591,8 +591,8 @@ TEST_CASE("prove_resume__degrade_F__cascade_r2_r3", "[prove_resume]") {
     // Phase 4: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -617,8 +617,8 @@ TEST_CASE("prove_resume__degrade_G__success", "[prove_resume]") {
     // resume() succeeds on first attempt.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -650,8 +650,8 @@ TEST_CASE("prove_resume__degrade_G__sync_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -683,8 +683,8 @@ TEST_CASE("prove_resume__degrade_G__file_creation_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -709,15 +709,15 @@ TEST_CASE("prove_resume__degrade_G__double_resume", "[prove_resume]") {
     // First resume() succeeds.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
 
     // Second resume() is a no-op — engine already healthy.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
@@ -756,8 +756,8 @@ TEST_CASE("prove_resume__degrade_G__cascade_r2_r3", "[prove_resume]") {
     // Phase 4: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key(to_bytes("k0")));
-    CHECK(db.contains_key(to_bytes("p0")));
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {});

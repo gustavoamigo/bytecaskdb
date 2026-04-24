@@ -221,7 +221,7 @@ int bytecask_get(bytecask_db_t *db,
 int bytecask_contains_key(bytecask_db_t *db,
                           const uint8_t *key, std::size_t key_len) {
   if (!db) { return 0; }
-  return db->db.contains_key(to_view(key, key_len)) ? 1 : 0;
+  return db->db.contains_key({}, to_view(key, key_len)) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +335,7 @@ int bytecask_snapshot_get(const bytecask_snapshot_t *snap,
   *out_val_len = 0;
   try {
     bytecask::Bytes buf;
-    bool found = snap->snap.get(to_view(key, key_len), buf);
+    bool found = snap->snap.get({}, to_view(key, key_len), buf);
     if (!found) { return 0; }
     auto *copy = dup_bytes(buf.data(), buf.size());
     if (!copy && !buf.empty()) {
@@ -354,7 +354,7 @@ int bytecask_snapshot_get(const bytecask_snapshot_t *snap,
 int bytecask_snapshot_contains_key(const bytecask_snapshot_t *snap,
                                    const uint8_t *key, std::size_t key_len) {
   if (!snap) { return 0; }
-  return snap->snap.contains_key(to_view(key, key_len)) ? 1 : 0;
+  return snap->snap.contains_key({}, to_view(key, key_len)) ? 1 : 0;
 }
 
 bytecask_iter_t *bytecask_snapshot_iter_open(bytecask_snapshot_t *snap,
@@ -367,7 +367,7 @@ bytecask_iter_t *bytecask_snapshot_iter_open(bytecask_snapshot_t *snap,
     if (from && from_len > 0) {
       from_view = to_view(from, from_len);
     }
-    auto range = snap->snap.iter_from(from_view);
+    auto range = snap->snap.iter_from({}, from_view);
     return new bytecask_iter{range.begin()};
   } catch (const std::exception &e) {
     set_errmsg(e.what());

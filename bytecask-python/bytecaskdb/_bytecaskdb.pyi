@@ -102,35 +102,51 @@ class Snapshot:
     ``RuntimeError("Snapshot already consumed by WritePlan")``.
     """
 
-    def get(self, key: bytes) -> bytes | None:
+    def get(self, key: bytes, opts: ReadOptions | None = None) -> bytes | None:
         """Return the value for *key*, or ``None`` if not found.
 
         Raises ``RuntimeError`` if the snapshot has been consumed.
         """
         ...
 
-    def contains_key(self, key: bytes) -> bool:
+    def contains_key(self, key: bytes, opts: ReadOptions | None = None) -> bool:
         """Return ``True`` if *key* exists. Pure in-memory, no disk I/O.
 
         Raises ``RuntimeError`` if the snapshot has been consumed.
         """
         ...
 
-    def iter_from(self, from_key: bytes = b"") -> EntryIterator:
+    def iter_from(
+        self,
+        from_key: bytes = b"",
+        opts: ReadOptions | None = None,
+    ) -> EntryIterator:
         """Return an iterator over ``(key, value)`` pairs in ascending order,
         starting at the first key >= *from_key*."""
         ...
 
-    def keys_from(self, from_key: bytes = b"") -> KeyIterator:
+    def keys_from(
+        self,
+        from_key: bytes = b"",
+        opts: ReadOptions | None = None,
+    ) -> KeyIterator:
         """Return an iterator over keys in ascending order. No disk I/O."""
         ...
 
-    def riter_from(self, from_key: bytes = b"") -> ReverseEntryIterator:
+    def riter_from(
+        self,
+        from_key: bytes = b"",
+        opts: ReadOptions | None = None,
+    ) -> ReverseEntryIterator:
         """Return an iterator over ``(key, value)`` pairs in descending order,
         starting at the last key <= *from_key*."""
         ...
 
-    def rkeys_from(self, from_key: bytes = b"") -> ReverseKeyIterator:
+    def rkeys_from(
+        self,
+        from_key: bytes = b"",
+        opts: ReadOptions | None = None,
+    ) -> ReverseKeyIterator:
         """Return an iterator over keys in descending order. No disk I/O."""
         ...
 
@@ -245,7 +261,7 @@ class DB:
         """Delete all keys in ``[from_key, to_key)`` with a single disk append."""
         ...
 
-    def contains_key(self, key: bytes) -> bool:
+    def contains_key(self, key: bytes, opts: ReadOptions | None = None) -> bool:
         """Return ``True`` if *key* exists. Pure in-memory, no disk I/O."""
         ...
 

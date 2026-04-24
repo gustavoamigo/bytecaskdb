@@ -127,11 +127,11 @@ inline void assert_delta(const Baseline &before, const DB &db,
   // Key membership.
   for (const auto &key : expected.keys_added) {
     INFO("expected key added: " << key);
-    CHECK(db.contains_key(to_bytes(key)));
+    CHECK(db.contains_key({}, to_bytes(key)));
   }
   for (const auto &key : expected.keys_removed) {
     INFO("expected key removed: " << key);
-    CHECK_FALSE(db.contains_key(to_bytes(key)));
+    CHECK_FALSE(db.contains_key({}, to_bytes(key)));
   }
 
   // Value verification (causality: last write determines value).
@@ -180,7 +180,7 @@ inline void assert_recoverable(const std::filesystem::path &dir,
     bool has_new_value = expected.expected_values.contains(key);
     if (!was_removed && !has_new_value) {
       INFO("pre-existing key must survive recovery: " << key);
-      CHECK(recovered.contains_key(to_bytes(key)));
+      CHECK(recovered.contains_key({}, to_bytes(key)));
       Bytes out;
       if (recovered.get({}, to_bytes(key), out)) {
         CHECK(out == value);
@@ -191,13 +191,13 @@ inline void assert_recoverable(const std::filesystem::path &dir,
   // Added keys must be present.
   for (const auto &key : expected.keys_added) {
     INFO("added key must survive recovery: " << key);
-    CHECK(recovered.contains_key(to_bytes(key)));
+    CHECK(recovered.contains_key({}, to_bytes(key)));
   }
 
   // Removed keys must be absent.
   for (const auto &key : expected.keys_removed) {
     INFO("removed key must be absent after recovery: " << key);
-    CHECK_FALSE(recovered.contains_key(to_bytes(key)));
+    CHECK_FALSE(recovered.contains_key({}, to_bytes(key)));
   }
 
   // Value verification (causality: last write determines value after recovery).
@@ -236,11 +236,11 @@ inline void assert_keys_recoverable(
   auto recovered = DB::open(dir);
   for (const auto &key : keys_present) {
     INFO("key must be present after recovery: " << key);
-    CHECK(recovered.contains_key(to_bytes(key)));
+    CHECK(recovered.contains_key({}, to_bytes(key)));
   }
   for (const auto &key : keys_absent) {
     INFO("key must be absent after recovery: " << key);
-    CHECK_FALSE(recovered.contains_key(to_bytes(key)));
+    CHECK_FALSE(recovered.contains_key({}, to_bytes(key)));
   }
   assert_consistent(recovered);
 }
@@ -303,7 +303,7 @@ inline void assert_vacuum_success(const DB &db, const VacuumBaseline &before,
   // All pre-vacuum keys must be present with correct values.
   for (const auto &[key, value] : before.keys.key_values) {
     INFO("pre-vacuum key must survive vacuum: " << key);
-    CHECK(db.contains_key(to_bytes(key)));
+    CHECK(db.contains_key({}, to_bytes(key)));
     Bytes out;
     if (db.get({}, to_bytes(key), out)) {
       CHECK(out == value);
@@ -338,7 +338,7 @@ inline void assert_vacuum_no_change(const DB &db, const VacuumBaseline &before,
   // All pre-vacuum keys must be present with correct values.
   for (const auto &[key, value] : before.keys.key_values) {
     INFO("pre-vacuum key must survive failed vacuum: " << key);
-    CHECK(db.contains_key(to_bytes(key)));
+    CHECK(db.contains_key({}, to_bytes(key)));
     Bytes out;
     if (db.get({}, to_bytes(key), out)) {
       CHECK(out == value);
@@ -370,7 +370,7 @@ inline void assert_vacuum_recoverable(const std::filesystem::path &dir,
   auto recovered = DB::open(dir);
   for (const auto &[key, value] : before.keys.key_values) {
     INFO("key must survive vacuum and recovery: " << key);
-    CHECK(recovered.contains_key(to_bytes(key)));
+    CHECK(recovered.contains_key({}, to_bytes(key)));
     Bytes out;
     if (recovered.get({}, to_bytes(key), out)) {
       CHECK(out == value);

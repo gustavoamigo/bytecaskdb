@@ -128,18 +128,18 @@ def gen_double_resume(delta: ResumeDelta) -> str:
     lines.append("    REQUIRE_NOTHROW(db.resume());")
     lines.append("    REQUIRE_FALSE(db.is_degraded());")
     for key in delta.keys_present:
-        lines.append(f'    CHECK(db.contains_key(to_bytes("{key}")));')
+        lines.append(f'    CHECK(db.contains_key({{}}, to_bytes("{key}")));')
     for key in delta.keys_absent:
-        lines.append(f'    CHECK_FALSE(db.contains_key(to_bytes("{key}")));')
+        lines.append(f'    CHECK_FALSE(db.contains_key({{}}, to_bytes("{key}")));')
     lines.append("    assert_consistent(db);")
     lines.append("")
     lines.append("    // Second resume() is a no-op — engine already healthy.")
     lines.append("    REQUIRE_NOTHROW(db.resume());")
     lines.append("    REQUIRE_FALSE(db.is_degraded());")
     for key in delta.keys_present:
-        lines.append(f'    CHECK(db.contains_key(to_bytes("{key}")));')
+        lines.append(f'    CHECK(db.contains_key({{}}, to_bytes("{key}")));')
     for key in delta.keys_absent:
-        lines.append(f'    CHECK_FALSE(db.contains_key(to_bytes("{key}")));')
+        lines.append(f'    CHECK_FALSE(db.contains_key({{}}, to_bytes("{key}")));')
     lines.append("    assert_consistent(db);")
     return "\n".join(lines)
 
@@ -155,9 +155,9 @@ def gen_clean_resume_and_checks(delta: ResumeDelta, phase_num: int = 3) -> str:
     lines.append("    REQUIRE_NOTHROW(db.resume());")
     lines.append("    REQUIRE_FALSE(db.is_degraded());")
     for key in delta.keys_present:
-        lines.append(f'    CHECK(db.contains_key(to_bytes("{key}")));')
+        lines.append(f'    CHECK(db.contains_key({{}}, to_bytes("{key}")));')
     for key in delta.keys_absent:
-        lines.append(f'    CHECK_FALSE(db.contains_key(to_bytes("{key}")));')
+        lines.append(f'    CHECK_FALSE(db.contains_key({{}}, to_bytes("{key}")));')
     lines.append("    assert_consistent(db);")
     return "\n".join(lines)
 

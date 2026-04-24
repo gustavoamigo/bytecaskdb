@@ -146,7 +146,7 @@ plan.del(to_bytes("user:1"));
 // Decrement stock — write keys are checked for conflicts automatically.
 auto snap = db.snapshot();
 Bytes stock_out;
-snap.get(to_bytes("stock:widget"), stock_out);
+snap.get({}, to_bytes("stock:widget"), stock_out);
 // ... decrement stock count ...
 WritePlan plan2{std::move(snap)};
 plan2.put(to_bytes("stock:widget"), new_stock);
@@ -158,7 +158,7 @@ if (!db.apply_batch({}, std::move(plan2))) {
 // but don't write. Write keys are checked automatically.
 auto snap2 = db.snapshot();
 Bytes price_out;
-snap2.get(to_bytes("price:widget"), price_out);
+snap2.get({}, to_bytes("price:widget"), price_out);
 // ... compute order_total from price ...
 WritePlan order{std::move(snap2)};
 order.ensure_unchanged(to_bytes("price:widget"));  // reject if price changed
@@ -243,7 +243,8 @@ public:
     // No-op if from >= to. Throws std::system_error on I/O failure or DbDegraded.
     void del_range(const WriteOptions& opts, BytesView from, BytesView to);
 
-    [[nodiscard]] auto contains_key(BytesView key) const -> bool;
+    [[nodiscard]] auto contains_key(const ReadOptions& opts,
+                                    BytesView key) const -> bool;
 
     // Atomically applies all operations in plan. When the plan has a snapshot
     // or explicit guards, returns false on conflict. A guardless, snapshot-less
@@ -311,15 +312,21 @@ public:
 // Holds open any referenced data files until destroyed.
 class Snapshot {
 public:
-    [[nodiscard]] auto get(BytesView key, Bytes& out) const -> bool;
-    [[nodiscard]] auto contains_key(BytesView key) const -> bool;
-    [[nodiscard]] auto iter_from(BytesView from = {}) const
+    [[nodiscard]] auto get(const ReadOptions& opts,
+                           BytesView key, Bytes& out) const -> bool;
+    [[nodiscard]] auto contains_key(const ReadOptions& opts,
+                                    BytesView key) const -> bool;
+    [[nodiscard]] auto iter_from(const ReadOptions& opts,
+                                 BytesView from = {}) const
         -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
-    [[nodiscard]] auto keys_from(BytesView from = {}) const
+    [[nodiscard]] auto keys_from(const ReadOptions& opts,
+                                 BytesView from = {}) const
         -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
-    [[nodiscard]] auto riter_from(BytesView from = {}) const
+    [[nodiscard]] auto riter_from(const ReadOptions& opts,
+                                  BytesView from = {}) const
         -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
-    [[nodiscard]] auto rkeys_from(BytesView from = {}) const
+    [[nodiscard]] auto rkeys_from(const ReadOptions& opts,
+                                  BytesView from = {}) const
         -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 };
 
