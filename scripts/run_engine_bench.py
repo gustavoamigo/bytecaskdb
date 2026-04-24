@@ -127,8 +127,8 @@ def run_benchmark(extra_flags: list[str], dataset_size: int, tmpdir: str) -> dic
         ] + extra_flags
         env = os.environ.copy()
         env["BC_DATASET_SIZE"] = str(dataset_size)
-        env["TMPDIR"] = tmpdir
-        print(f"Running: TMPDIR={tmpdir} BC_DATASET_SIZE={dataset_size} {' '.join(cmd)}")
+        env["BC_BENCH_DIR"] = tmpdir
+        print(f"Running: BC_BENCH_DIR={tmpdir} BC_DATASET_SIZE={dataset_size} {' '.join(cmd)}")
         subprocess.run(cmd, check=True, cwd=REPO_ROOT, env=env)
         with open(out_path, encoding="utf-8") as f:
             return json.load(f)

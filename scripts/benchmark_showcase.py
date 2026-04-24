@@ -107,7 +107,7 @@ def _run(dataset_size: int, extra_flags: list[str]) -> dict:
     try:
         env = os.environ.copy()
         env["BC_DATASET_SIZE"] = str(dataset_size)
-        env["TMPDIR"] = str(run_tmp)
+        env["BC_BENCH_DIR"] = str(run_tmp)
         cmd = [
             str(BENCH_BINARY),
             f"--benchmark_out={out_path}",
@@ -146,7 +146,7 @@ def run_cas(stock_items: int) -> dict:
         env = os.environ.copy()
         env["BC_CAS_STOCK_ITEMS"] = str(stock_items)
         env["BC_DATASET_SIZE"] = str(1_000_000)
-        env["TMPDIR"] = str(run_tmp)
+        env["BC_BENCH_DIR"] = str(run_tmp)
         cmd = [
             str(BENCH_BINARY),
             f"--benchmark_out={out_path}",

@@ -132,6 +132,16 @@ auto bc_key(const std::string &s) -> bytecask::BytesView {
   return std::as_bytes(std::span{s.data(), s.size()});
 }
 
+// Formats a prefixed key into buf and returns a BytesView over the written bytes.
+// Key format matches generate_prefixed_keys(): "{prefix}018f6e2c-{hi}-7000-8000-{lo}".
+auto make_key(char *buf, std::size_t buf_size,
+              const char *prefix, std::size_t idx) -> bytecask::BytesView {
+  auto len = static_cast<std::size_t>(
+      std::snprintf(buf, buf_size, "%s018f6e2c-%04zx-7000-8000-%012zx",
+                    prefix, idx >> 16, idx & std::size_t{0xFFFFFFFF}));
+  return std::as_bytes(std::span{buf, len});
+}
+
 auto bc_val(const std::vector<std::byte> &v) -> bytecask::BytesView {
   return std::span<const std::byte>{v.data(), v.size()};
 }
@@ -261,18 +271,27 @@ struct BcAdapter {
        const std::vector<std::byte> *populate_val)
         : dir{tag}, engine{bytecask::DB::open(dir.path)} {
       if (populate_keys) {
-        constexpr std::size_t kPopulateBatchSize = 100;
+        static constexpr std::size_t kPopulateBatchSize = 100;
+        static constexpr std::array prefixes = {
+            "user::", "order::", "session::", "invoice::", "product::"};
         bytecask::WriteOptions wo;
         wo.sync = false;
         const auto n = populate_keys->size();
-        for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
-          auto end = std::min(i + kPopulateBatchSize, n);
-          bytecask::WritePlan plan;
-          for (std::size_t j = i; j < end; ++j) {
-            plan.put(bc_key((*populate_keys)[j]), bc_val(*populate_val));
+        const auto per_prefix = n / prefixes.size();
+        std::size_t written = 0;
+        for (const auto *pfx : prefixes) {
+          for (std::size_t i = 0; i < per_prefix; i += kPopulateBatchSize) {
+            auto end = std::min(i + kPopulateBatchSize, per_prefix);
+            bytecask::WritePlan plan;
+            for (std::size_t j = i; j < end; ++j) {
+              char buf[64];
+              plan.put(make_key(buf, sizeof(buf), pfx, j),
+                       bc_val(*populate_val));
+            }
+            written += end - i;
+            wo.sync = (written == n);
+            (void)engine.apply_batch(wo, std::move(plan));
           }
-          wo.sync = (end == n);
-          (void)engine.apply_batch(wo, std::move(plan));
         }
       }
     }
@@ -297,6 +316,7 @@ struct BcAdapter {
 
   static void get(Db &db, const std::string &k) {
     bytecask::ReadOptions ro;
+    ro.verify_checksums = false;
     bytecask::Bytes value;
     auto found = db.engine.get(ro, bc_key(k), value);
     benchmark::DoNotOptimize(found);
@@ -311,6 +331,7 @@ struct BcAdapter {
 
   static void range(Db &db, const std::string &k, int limit) {
     bytecask::ReadOptions ro;
+    ro.verify_checksums = false;
     auto range = db.engine.iter_from(ro, bc_key(k));
     int count = 0;
     for (auto it = range.begin(); it != range.end() && count < limit;
@@ -345,6 +366,7 @@ struct BcAdapter {
 struct BcAdapterStale : BcAdapter {
   static void get(Db &db, const std::string &k) {
     bytecask::ReadOptions ro;
+    ro.verify_checksums = false;
     ro.staleness_tolerance = std::chrono::milliseconds{100};
     bytecask::Bytes value;
     auto found = db.engine.get(ro, bc_key(k), value);
@@ -396,7 +418,7 @@ struct BcCasAdapter {
       ++attempts;
       auto snap = db.engine.snapshot();
       bytecask::Bytes out;
-      (void)snap.get(bc_key(key), out);
+      (void)snap.get({.verify_checksums = false}, bc_key(key), out);
       auto new_val = encode_u64(decode_u64_bytes(out) + 1);
 
       bytecask::WritePlan plan{std::move(snap)};
@@ -1181,23 +1203,30 @@ static constexpr std::uint64_t kParRecoveryThreshold = 4ULL * 1024 * 1024;
 namespace {
 struct ParRecoverySetup {
   TmpDir dir{"par_recovery"};
-  std::vector<std::string> keys;
 
-  ParRecoverySetup() : keys{generate_prefixed_keys(kDatasetSize)} {
+  ParRecoverySetup() {
     auto db = bytecask::DB::open(dir.path, {.max_file_bytes = kParRecoveryThreshold});
-    constexpr std::size_t kPopulateBatchSize = 100;
+    static constexpr std::size_t kPopulateBatchSize = 100;
+    static constexpr std::array prefixes = {
+        "user::", "order::", "session::", "invoice::", "product::"};
+    static const std::vector<std::byte> tiny_val{std::byte{0x42}};
     bytecask::WriteOptions wo;
     wo.sync = false;
-    static const std::vector<std::byte> tiny_val{std::byte{0x42}};
-    const auto n = keys.size();
-    for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
-      auto end = std::min(i + kPopulateBatchSize, n);
-      bytecask::WritePlan plan;
-      for (std::size_t j = i; j < end; ++j) {
-        plan.put(bc_key(keys[j]), bc_val(tiny_val));
+
+    std::size_t written = 0;
+    for (const auto *pfx : prefixes) {
+      const auto per_prefix = kDatasetSize / prefixes.size();
+      for (std::size_t i = 0; i < per_prefix; i += kPopulateBatchSize) {
+        auto end = std::min(i + kPopulateBatchSize, per_prefix);
+        bytecask::WritePlan plan;
+        for (std::size_t j = i; j < end; ++j) {
+          char buf[64];
+          plan.put(make_key(buf, sizeof(buf), pfx, j), bc_val(tiny_val));
+        }
+        written += end - i;
+        wo.sync = (written == kDatasetSize);
+        (void)db.apply_batch(wo, std::move(plan));
       }
-      wo.sync = (end == n);
-      (void)db.apply_batch(wo, std::move(plan));
     }
     // db destructs here — seals active file, writes all hint files.
   }
