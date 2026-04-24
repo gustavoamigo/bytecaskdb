@@ -17,7 +17,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append. In-memory cleanup walks the radix tree; disk cost is O(1) regardless of how many keys fall in the range. Available on `DB` and `WritePlan`.
 - **Atomic writes** — every `put`, `del`, and `del_range` is atomic. `apply_batch` makes multiple puts, deletes, and range deletes atomic as a group.
 - **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
-- **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 600 ms on a SATA SSD.
+- **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 510 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex with group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost. On the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
 - **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a degraded state: reads remain available, all writes throw `DbDegraded`, and the service calls `resume()` to recover without a restart.
@@ -26,12 +26,12 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 
 Benchmarked at 1 M keys with [RocksDB](https://rocksdb.org/) as a reference point. The tables below include both engines for context.
 
-- **Point reads** reach 1.34 Mops/s at 1 M keys with flat, sub-microsecond latency (p50 702 ns, p99 920 ns). Latency stays flat as the dataset grows because every lookup is an in-memory radix tree traversal followed by a single `pread` at a known offset.
-- **Concurrent reads scale linearly** — lock-free snapshots with no shared mutex. 15.3 Mops/s at 32 threads.
-- **Sequential writes** sustain 149 Kops/s (NoSync) and 498 ops/s (Sync), limited by `fdatasync` round-trip latency. No write amplification from compaction.
-- **Concurrent sync writes scale via group commit** — writers share a single `fdatasync` call. 16.6 Kops/s at 64 threads.
+- **Point reads** reach 1.29 Mops/s at 1 M keys with flat, sub-microsecond latency (p50 728 ns, p99 1.01 µs). Latency stays flat as the dataset grows because every lookup is an in-memory radix tree traversal followed by a single `pread` at a known offset.
+- **Concurrent reads scale linearly** — lock-free snapshots with no shared mutex. 14.0 Mops/s at 32 threads.
+- **Sequential writes** sustain 134 Kops/s (NoSync) and 139 ops/s (Sync), limited by `fdatasync` round-trip latency. No write amplification from compaction.
+- **Concurrent sync writes scale via group commit** — writers share a single `fdatasync` call. 4.9 Kops/s at 64 threads.
 - **Range scans over values** fetch each value individually from disk. LSM-based engines pack values contiguously in sorted runs and perform better here. Key-only iteration (`keys_from`) is a pure in-memory tree walk with no disk I/O.
-- **Recovery is fast and parallel** — hint files replayed across all cores with full CRC verification. 1 M keys in ~57 ms, 10 M in ~528 ms at 16 threads.
+- **Recovery is fast and parallel** — hint files replayed across all cores with full CRC verification. 1 M keys in ~58 ms, 10 M in ~506 ms at 16 threads.
 
 See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md) for the full benchmark report with all thread counts, dataset sizes, and hardware details.
 
@@ -43,12 +43,12 @@ See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md)
 
 | Operation | ByteCaskDB | RocksDB | Notes |
 |-----------|----------|---------|-------|
-| Put (NoSync) | 149 Kops/s | 179 Kops/s | Sequential append on both sides |
-| Put (Sync) | 498 ops/s | 463 ops/s | Disk-bound — limited by `fdatasync` round-trip latency |
-| Get | 1.34 Mops/s | 566 Kops/s | In-memory radix tree lookup; flat latency regardless of dataset size |
-| Del (Sync) | 678 ops/s | 273 ops/s | Single tombstone append; no compaction write amplification |
-| Range-50 | 30 K scans/s | 82 K scans/s | LSM sorted runs favour sequential value scans |
-| MixedBatch (Sync) | 42 Kops/s | 35 Kops/s | Atomic batch with single `writev` + `fdatasync` |
+| Put (NoSync) | 134 Kops/s | 163 Kops/s | Sequential append on both sides |
+| Put (Sync) | 139 ops/s | 148 ops/s | Disk-bound — limited by `fdatasync` round-trip latency |
+| Get | 1.29 Mops/s | 431 Kops/s | In-memory radix tree lookup; flat latency regardless of dataset size |
+| Del (Sync) | 184 ops/s | 2 ops/s | Single tombstone append; no compaction write amplification |
+| Range-50 | 28 K scans/s | 68 K scans/s | LSM sorted runs favour sequential value scans |
+| MixedBatch (Sync) | 14 Kops/s | 13 Kops/s | Atomic batch with single `writev` + `fdatasync` |
 
 At small dataset sizes (50 k keys), all keys fit in RocksDB's block cache and reads are fast on both engines. From 500 k keys onward, block cache misses begin to dominate and the in-memory key directory approach shows its advantage.
 
@@ -56,8 +56,8 @@ At small dataset sizes (50 k keys), all keys fit in RocksDB's block cache and re
 
 | Percentile | ByteCaskDB | RocksDB |
 |-----------|---------|----------|
-| p50 | 702 ns | 1.53 µs |
-| p99 | 920 ns | 4.18 µs |
+| p50 | 728 ns | 2.10 µs |
+| p99 | 1.01 µs | 5.37 µs |
 
 Latency stays flat as the dataset grows: every read resolves to a known file offset via the in-memory key directory, so there is no metadata amplification from multiple levels or bloom filter checks.
 
@@ -67,11 +67,11 @@ Latency stays flat as the dataset grows: every read resolves to a known file off
 
 | Threads | ByteCaskDB | RocksDB |
 |---:|---:|---:|
-| 2 | 2.45 Mops/s | 816 Kops/s |
-| 4 | 4.49 Mops/s | 1.96 Mops/s |
-| 8 | 7.42 Mops/s | 4.19 Mops/s |
-| 16 | 10.33 Mops/s | 6.70 Mops/s |
-| 32 | 15.32 Mops/s | 9.70 Mops/s |
+| 2 | 2.34 Mops/s | 749 Kops/s |
+| 4 | 4.18 Mops/s | 1.49 Mops/s |
+| 8 | 6.25 Mops/s | 3.24 Mops/s |
+| 16 | 8.76 Mops/s | 4.79 Mops/s |
+| 32 | 14.01 Mops/s | 7.33 Mops/s |
 
 ### Concurrent Sync Writes — `PutMT/Sync` (1M keys)
 
@@ -79,12 +79,12 @@ Latency stays flat as the dataset grows: every read resolves to a known file off
 
 | Threads | ByteCaskDB | RocksDB |
 |---:|---:|---:|
-| 2 | 496 ops/s | 751 ops/s |
-| 4 | 986 ops/s | 1.0 Kops/s |
-| 8 | 1.8 Kops/s | 1.9 Kops/s |
-| 16 | 4.6 Kops/s | 1.3 Kops/s |
-| 32 | 8.9 Kops/s | 2.3 Kops/s |
-| 64 | 16.6 Kops/s | 5.4 Kops/s |
+| 2 | 145 ops/s | 257 ops/s |
+| 4 | 314 ops/s | 439 ops/s |
+| 8 | 617 ops/s | 741 ops/s |
+| 16 | 1.3 Kops/s | 816 ops/s |
+| 32 | 2.9 Kops/s | 1.7 Kops/s |
+| 64 | 4.9 Kops/s | 3.3 Kops/s |
 
 ### Read-While-Writing (1M keys, 1 writer + N readers, Sync, CRC disabled)
 
@@ -92,11 +92,11 @@ Latency stays flat as the dataset grows: every read resolves to a known file off
 
 | Readers | ByteCaskDB | RocksDB |
 |---:|---:|---:|
-| 2 | 2.44 Mops/s | 761 Kops/s |
-| 4 | 4.36 Mops/s | 1.88 Mops/s |
-| 8 | 6.55 Mops/s | 4.07 Mops/s |
-| 16 | 9.43 Mops/s | 6.50 Mops/s |
-| 32 | 15.86 Mops/s | 10.03 Mops/s |
+| 2 | 2.43 Mops/s | 720 Kops/s |
+| 4 | 4.39 Mops/s | 1.32 Mops/s |
+| 8 | 6.52 Mops/s | 2.91 Mops/s |
+| 16 | 9.40 Mops/s | 4.48 Mops/s |
+| 32 | 14.93 Mops/s | 7.20 Mops/s |
 
 ### Recovery
 
@@ -104,18 +104,18 @@ Recovery runs when ByteCaskDB opens an existing database: it rebuilds the in-mem
 
 | Keys | Threads | Recovery Time | Speedup vs 1T |
 |---:|---:|---:|---:|
-| 1M | 1 | 239 ms | — |
-| 1M | 4 | 85 ms | 2.8× |
-| 1M | 8 | 65 ms | 3.7× |
-| 1M | 16 | 57 ms | 4.2× |
-| 10M | 1 | 2.42 s | — |
-| 10M | 4 | 0.91 s | 2.7× |
-| 10M | 8 | 0.62 s | 3.9× |
-| 10M | 16 | 0.53 s | 4.6× |
+| 1M | 1 | 297 ms | — |
+| 1M | 4 | 93 ms | 3.2× |
+| 1M | 8 | 64 ms | 4.6× |
+| 1M | 16 | 58 ms | 5.1× |
+| 10M | 1 | 3.00 s | — |
+| 10M | 4 | 0.91 s | 3.3× |
+| 10M | 8 | 0.58 s | 5.2× |
+| 10M | 16 | 0.51 s | 5.9× |
 
 ---
 
-_Tested on AMD Ryzen 7 3700X (8C/16T), Samsung SSD 860 EVO SATA (485 MiB/s read), 31 GiB RAM. Each result is the mean of 5 runs. Benchmark source: [`benchmarks/engine_bench.cpp`](benchmarks/engine_bench.cpp)._
+_Tested on AMD Ryzen 7 3700X (8C/16T), Samsung SSD 860 EVO SATA (463 MiB/s read), 31 GiB RAM. Each result is the mean of 5 runs. Benchmark source: [`benchmarks/engine_bench.cpp`](benchmarks/engine_bench.cpp)._
 
 ## Quick Start
 
