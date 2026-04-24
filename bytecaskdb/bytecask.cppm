@@ -18,6 +18,7 @@ module;
 #include <ranges>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -27,6 +28,7 @@ export module bytecask;
 export import :internals;
 import bytecask.batch_iterator;
 import bytecask.concurrency;
+export import bytecask.counters;
 import bytecask.data_file;
 import bytecask.radix_tree;
 export import bytecask.types;
@@ -768,6 +770,11 @@ public:
   // Always syncs; never splits a BulkBegin..BulkEnd across files.
   void ingest(std::span<const DataEntryView> entries);
 
+  // Returns all operational counters and gauges as a flat map.
+  // Copies atomic counters (relaxed load) and reads current gauges from
+  // EngineState. Designed for pull-based scraping (Prometheus, logging).
+  [[nodiscard]] auto stats() const -> std::map<std::string, std::int64_t>;
+
 private:
   explicit DB(std::filesystem::path dir, Options opts);
 
@@ -875,6 +882,7 @@ private:
   int lock_fd_{-1};  // flock() on dir_/.lock; released by close() in ~DB()
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
   SizeLimits size_limits_;
+  mutable Counters counters_;
   // All mutable state — SWMR. Writers publish via atomic_store()
   // under write_mu_; readers call atomic_load() (never acquiring write_mu_).
   // Note: std::atomic<std::shared_ptr<T>> (C++20 P0718R2) is not yet

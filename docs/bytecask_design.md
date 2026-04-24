@@ -1363,6 +1363,47 @@ When the write set contains exactly one operation, `apply_batch` skips the `Bulk
 - Design notes in `docs/old_bytecask_design.md` are historical reference material, not the current source of truth.
 - The living design and project tracker live under `docs/`.
 
+## Operational Counters
+
+`DB::stats()` returns a `std::map<std::string, std::int64_t>` containing all operational counters and gauges. Designed for pull-based metrics integration (Prometheus, logging, debugging).
+
+**Monotonic counters** (increment only, reset on restart):
+
+| Counter | Path | Description |
+|---------|------|-------------|
+| `bytecask.bytes_written` | Write | On-disk bytes appended (header + key + value + CRC) |
+| `bytecask.group_writer_batches` | Write | `execute_slots()` calls (one per batch) |
+| `bytecask.group_writer_coalesced` | Write | Total writers coalesced across all batches |
+| `bytecask.file_rotations` | Write | Active file rotations |
+| `bytecask.fsyncs` | Write | `fdatasync` calls |
+| `bytecask.disk_reads` | Read | `pread` calls from `get()` |
+| `bytecask.disk_read_bytes` | Read | Bytes read from disk |
+| `bytecask.vacuum_bytes_reclaimed` | Vacuum | Bytes freed by vacuum |
+| `bytecask.vacuum_files_unlinked` | Vacuum | Data files physically removed |
+| `bytecask.files_opened` | Lifecycle | `DataFile` opens (recovery, rotation, vacuum) |
+| `bytecask.crc_failures` | Error | CRC mismatches on the read path |
+| `bytecask.io_errors` | Error | `std::system_error` from I/O operations |
+| `bytecask.degraded_transitions` | Error | Times the engine entered degraded state |
+
+**Recovery counters** (set once at open, immutable for DB lifetime):
+
+| Counter | Description |
+|---------|-------------|
+| `bytecask.recovery_files` | Data files replayed during recovery |
+| `bytecask.recovery_keys` | Keys recovered into the key directory |
+| `bytecask.recovery_duration_us` | Wall-clock recovery time in microseconds |
+
+**Gauges** (current state, read from `EngineState` at call time):
+
+| Gauge | Description |
+|-------|-------------|
+| `bytecask.degraded` | 1 if degraded, 0 otherwise |
+| `bytecask.open_files` | Number of data files in the file registry |
+
+All atomic counters use `std::memory_order_relaxed` — sufficient for monotonic counters where cross-counter consistency is not required. Write-path counters are incremented under the existing `write_mu_` (zero contention). Read-path counters use relaxed `fetch_add` (~8 ns on x86), negligible next to the `pread` syscall.
+
+Counters are per-DB instance (`Counters` struct owned by `DB`). Two open databases have independent counter sets.
+
 ## Design Decisions
 
 | # | Decision |

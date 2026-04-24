@@ -6024,3 +6024,138 @@ TEST_CASE("Size limits: hard ceiling clamps user value",
   CHECK_NOTHROW(
       db.put({.sync = false}, to_bytes(key_at_hard_limit), to_bytes("v")));
 }
+
+// ---------------------------------------------------------------------------
+// stats() — operational counters
+// ---------------------------------------------------------------------------
+
+TEST_CASE("stats: fresh DB has zero counters and one open file",
+          "[bytecask][stats]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  auto s = db.stats();
+  CHECK(s.at("bytecask.bytes_written") == 0);
+  CHECK(s.at("bytecask.group_writer_batches") == 0);
+  CHECK(s.at("bytecask.group_writer_coalesced") == 0);
+  CHECK(s.at("bytecask.fsyncs") == 0);
+  CHECK(s.at("bytecask.disk_reads") == 0);
+  CHECK(s.at("bytecask.disk_read_bytes") == 0);
+  CHECK(s.at("bytecask.crc_failures") == 0);
+  CHECK(s.at("bytecask.io_errors") == 0);
+  CHECK(s.at("bytecask.degraded_transitions") == 0);
+  CHECK(s.at("bytecask.degraded") == 0);
+  // Fresh DB: recovery found no files, but we opened one active file.
+  CHECK(s.at("bytecask.recovery_files") == 0);
+  CHECK(s.at("bytecask.recovery_keys") == 0);
+  CHECK(s.at("bytecask.files_opened") == 1);
+  CHECK(s.at("bytecask.open_files") == 1);
+}
+
+TEST_CASE("stats: write counters increment on put",
+          "[bytecask][stats]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+  auto s = db.stats();
+  CHECK(s.at("bytecask.bytes_written") > 0);
+  CHECK(s.at("bytecask.group_writer_batches") >= 2);
+  CHECK(s.at("bytecask.group_writer_coalesced") >= 2);
+  CHECK(s.at("bytecask.fsyncs") >= 2);
+}
+
+TEST_CASE("stats: disk_reads and disk_read_bytes increment on get",
+          "[bytecask][stats]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  db.put({.sync = false}, to_bytes("k1"), to_bytes("hello"));
+  db.put({.sync = false}, to_bytes("k2"), to_bytes("world"));
+
+  bytecask::Bytes out;
+  (void)db.get({}, to_bytes("k1"), out);
+  (void)db.get({}, to_bytes("k2"), out);
+
+  auto s = db.stats();
+  CHECK(s.at("bytecask.disk_reads") == 2);
+  CHECK(s.at("bytecask.disk_read_bytes") == 10);  // "hello" + "world"
+}
+
+TEST_CASE("stats: recovery counters after reopen", "[bytecask][stats]") {
+  TempDir td;
+  {
+    auto db = bytecask::DB::open(td.path);
+    for (int i = 0; i < 100; ++i) {
+      auto key = std::format("k{:04d}", i);
+      db.put({.sync = false}, to_bytes(key), to_bytes("v"));
+    }
+  }
+  auto db = bytecask::DB::open(td.path);
+  auto s = db.stats();
+  CHECK(s.at("bytecask.recovery_files") >= 1);
+  CHECK(s.at("bytecask.recovery_keys") == 100);
+  CHECK(s.at("bytecask.recovery_duration_us") > 0);
+}
+
+TEST_CASE("stats: vacuum counters", "[bytecask][stats]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path, {.max_file_bytes = 256});
+  // Write enough keys to rotate at least one file, then overwrite them all.
+  for (int i = 0; i < 50; ++i) {
+    auto key = std::format("k{:04d}", i);
+    db.put({.sync = false}, to_bytes(key), to_bytes("original"));
+  }
+  // Overwrite all keys so the old files are fully dead.
+  for (int i = 0; i < 50; ++i) {
+    auto key = std::format("k{:04d}", i);
+    db.put({.sync = false}, to_bytes(key), to_bytes("updated"));
+  }
+  // Run vacuum until nothing qualifies.
+  while (db.vacuum({.fragmentation_threshold = 0.0})) {}
+  auto s = db.stats();
+  CHECK(s.at("bytecask.vacuum_files_unlinked") > 0);
+  CHECK(s.at("bytecask.vacuum_bytes_reclaimed") > 0);
+}
+
+TEST_CASE("stats: file_rotations increments", "[bytecask][stats]") {
+  TempDir td;
+  // Very small rotation threshold to force rotations.
+  auto db = bytecask::DB::open(td.path, {.max_file_bytes = 64});
+  for (int i = 0; i < 20; ++i) {
+    auto key = std::format("k{:04d}", i);
+    db.put({.sync = false}, to_bytes(key), to_bytes("value"));
+  }
+  auto s = db.stats();
+  CHECK(s.at("bytecask.file_rotations") > 0);
+  CHECK(s.at("bytecask.files_opened") > 1);
+}
+
+TEST_CASE("stats: all expected keys are present in dump",
+          "[bytecask][stats]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  auto s = db.stats();
+  std::vector<std::string> expected = {
+      "bytecask.bytes_written",
+      "bytecask.group_writer_batches",
+      "bytecask.group_writer_coalesced",
+      "bytecask.file_rotations",
+      "bytecask.fsyncs",
+      "bytecask.disk_reads",
+      "bytecask.disk_read_bytes",
+      "bytecask.vacuum_bytes_reclaimed",
+      "bytecask.vacuum_files_unlinked",
+      "bytecask.recovery_files",
+      "bytecask.recovery_keys",
+      "bytecask.recovery_duration_us",
+      "bytecask.files_opened",
+      "bytecask.crc_failures",
+      "bytecask.io_errors",
+      "bytecask.degraded_transitions",
+      "bytecask.degraded",
+      "bytecask.open_files",
+  };
+  for (const auto &name : expected) {
+    CHECK(s.contains(name));
+  }
+  CHECK(s.size() == expected.size());
+}

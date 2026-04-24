@@ -650,15 +650,32 @@ DB::DB(std::filesystem::path dir, Options opts)
 
   try {
     EngineState s;
+    const auto recovery_start = std::chrono::steady_clock::now();
     if (opts.recovery_threads <= 1) {
       s = recovery_load_serial(std::move(s), opts.fail_recovery_on_crc_errors);
     } else {
       s = recovery_load_parallel(std::move(s), opts.recovery_threads,
                                  opts.fail_recovery_on_crc_errors);
     }
+    const auto recovery_end = std::chrono::steady_clock::now();
+    counters_.recovery_duration_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            recovery_end - recovery_start)
+            .count();
+    // Count recovered files and keys.
+    std::int64_t file_count = 0;
+    for (auto it = s.files.begin(); it != std::default_sentinel; ++it)
+      ++file_count;
+    counters_.recovery_files = file_count;
+    counters_.recovery_keys =
+        static_cast<std::int64_t>(s.key_dir.size());
+    // Count files opened during recovery.
+    counters_.files_opened.store(file_count, std::memory_order_relaxed);
     s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
     auto new_active = std::make_shared<DataFile>(dir_ / (stem + ".data"));
+    // +1 for the new active file.
+    counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
     auto files_t = s.files.transient();
     files_t.set(s.active_file_id, new_active);
     s.files = std::move(files_t).persistent();
@@ -734,6 +751,9 @@ auto DB::get(const ReadOptions &opts, BytesView key,
   (*s->files.get(kv->file_id))
       ->read_value(kv->file_offset, narrow<std::uint16_t>(key.size()),
                    kv->value_size, opts.verify_checksums, io_buf, out);
+  counters_.disk_reads.fetch_add(1, std::memory_order_relaxed);
+  counters_.disk_read_bytes.fetch_add(
+      static_cast<std::int64_t>(kv->value_size), std::memory_order_relaxed);
   return true;
 }
 
@@ -868,9 +888,14 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     return;
   }
 
+  counters_.group_writer_batches.fetch_add(1, std::memory_order_relaxed);
+  counters_.group_writer_coalesced.fetch_add(
+      static_cast<std::int64_t>(batch.size()), std::memory_order_relaxed);
+
   auto t = current->transient();
   auto &file = t.active_file();
-  auto running_offset = static_cast<std::uint64_t>(file.size());
+  auto initial_offset = static_cast<std::uint64_t>(file.size());
+  auto running_offset = initial_offset;
   std::vector<DataEntryView> all_entries;
   auto any_sync = false;
 
@@ -899,6 +924,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     err_t.apply_degrade(std::format(
         "append IO error on '{}': call resume() to recover.",
         file.path().string()));
+    counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
     store_state(std::move(err_t).persistent());
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
@@ -906,10 +932,15 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     return;
   }
 
+  counters_.bytes_written.fetch_add(
+      static_cast<std::int64_t>(running_offset - initial_offset),
+      std::memory_order_relaxed);
+
   // Phase 3: sync/rotate/publish.
   if (t.is_rotation_needed(rotation_threshold_)) {
     try {
       file.sync();
+      counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
       t.apply_sync(batch_max_seq);
     } catch (...) {
       auto ex = std::current_exception();
@@ -918,6 +949,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
           "rotation fdatasync failed on '{}': bytes in page cache but "
           "durability not confirmed. Call resume() to recover.",
           file.path().string()));
+      counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
       store_state(std::move(err_t).persistent());
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
@@ -926,12 +958,15 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     }
     try {
       rotate_active_file(t, current);
+      counters_.file_rotations.fetch_add(1, std::memory_order_relaxed);
+      counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
     } catch (...) {
       auto ex = std::current_exception();
       t.apply_degrade(std::format(
           "post-write rotation failed for '{}': active file is sealed "
           "but new file could not be created. Call resume() to recover.",
           file.path().string()));
+      counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
       store_state(current, std::move(t).persistent());
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
@@ -943,6 +978,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   if (any_sync) {
     try {
       file.sync();
+      counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
       t.apply_sync(batch_max_seq);
     } catch (...) {
       auto ex = std::current_exception();
@@ -951,6 +987,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
           "commit fdatasync failed on '{}': bytes in page cache but "
           "durability not confirmed. Call resume() to recover.",
           file.path().string()));
+      counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
       store_state(std::move(err_t).persistent());
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
@@ -1344,6 +1381,7 @@ void DB::vacuum_unlink_old_file(
       dir_ / (old_data_file->path().stem().string() + ".hint");
   std::filesystem::remove(old_data_file->path());
   std::filesystem::remove(old_hint_path);
+  counters_.vacuum_files_unlinked.fetch_add(1, std::memory_order_relaxed);
 }
 
 // Rewrites a sealed file into a new sealed file containing only live
@@ -1380,6 +1418,12 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
     std::lock_guard<std::mutex> wg{*write_mu_};
     vacuum_commit(file_id, scan, new_file);
   }
+  // Bytes reclaimed = old total - new live (compacted file is smaller).
+  auto old_total = snap->file_stats.get(file_id)->total_bytes;
+  counters_.vacuum_bytes_reclaimed.fetch_add(
+      static_cast<std::int64_t>(old_total - scan.live_bytes),
+      std::memory_order_relaxed);
+  counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
   vacuum_unlink_old_file(snap, file_id);
 }
 
@@ -1387,11 +1431,14 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
 // commit the state change and unlink the files. Called under vacuum_mu_.
 void DB::vacuum_remove_file(std::uint32_t file_id) {
   auto snap = load_state_for_write();
+  auto old_total = snap->file_stats.get(file_id)->total_bytes;
   {
     std::lock_guard<std::mutex> wg{*write_mu_};
     VacuumScanResult empty{};
     vacuum_commit(file_id, empty, nullptr);
   }
+  counters_.vacuum_bytes_reclaimed.fetch_add(
+      static_cast<std::int64_t>(old_total), std::memory_order_relaxed);
   vacuum_unlink_old_file(snap, file_id);
 }
 
@@ -1410,6 +1457,47 @@ auto DB::is_degraded() const noexcept -> bool {
 
 auto DB::degraded_reason() const noexcept -> std::string {
   return load_state()->degraded_reason;
+}
+
+auto DB::stats() const -> std::map<std::string, std::int64_t> {
+  auto s = load_state();
+  std::int64_t open_files = 0;
+  for (auto it = s->files.begin(); it != std::default_sentinel; ++it)
+    ++open_files;
+  return {
+      {"bytecask.bytes_written",
+       counters_.bytes_written.load(std::memory_order_relaxed)},
+      {"bytecask.group_writer_batches",
+       counters_.group_writer_batches.load(std::memory_order_relaxed)},
+      {"bytecask.group_writer_coalesced",
+       counters_.group_writer_coalesced.load(std::memory_order_relaxed)},
+      {"bytecask.file_rotations",
+       counters_.file_rotations.load(std::memory_order_relaxed)},
+      {"bytecask.fsyncs",
+       counters_.fsyncs.load(std::memory_order_relaxed)},
+      {"bytecask.disk_reads",
+       counters_.disk_reads.load(std::memory_order_relaxed)},
+      {"bytecask.disk_read_bytes",
+       counters_.disk_read_bytes.load(std::memory_order_relaxed)},
+      {"bytecask.vacuum_bytes_reclaimed",
+       counters_.vacuum_bytes_reclaimed.load(std::memory_order_relaxed)},
+      {"bytecask.vacuum_files_unlinked",
+       counters_.vacuum_files_unlinked.load(std::memory_order_relaxed)},
+      {"bytecask.recovery_files", counters_.recovery_files},
+      {"bytecask.recovery_keys", counters_.recovery_keys},
+      {"bytecask.recovery_duration_us", counters_.recovery_duration_us},
+      {"bytecask.files_opened",
+       counters_.files_opened.load(std::memory_order_relaxed)},
+      {"bytecask.crc_failures",
+       counters_.crc_failures.load(std::memory_order_relaxed)},
+      {"bytecask.io_errors",
+       counters_.io_errors.load(std::memory_order_relaxed)},
+      {"bytecask.degraded_transitions",
+       counters_.degraded_transitions.load(std::memory_order_relaxed)},
+      // Gauges — current state, not monotonic.
+      {"bytecask.degraded", s->degraded ? 1 : 0},
+      {"bytecask.open_files", open_files},
+  };
 }
 
 void DB::set_mode(Mode mode) {
@@ -1630,6 +1718,8 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
 
   const auto durable_advanced =
       new_state->durable_seq > old_state->durable_seq;
+  const auto became_degraded =
+      new_state->degraded && !old_state->degraded;
 
 #ifndef NDEBUG
   // Debug-only O(n) check: next_seq > max(all key_dir sequences).
@@ -1649,6 +1739,9 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
   store_state(std::move(new_state));
   state_time_.store(now_ns(), std::memory_order_release);
 
+  if (became_degraded) {
+    counters_.degraded_transitions.fetch_add(1, std::memory_order_relaxed);
+  }
   if (durable_advanced) {
     { std::lock_guard<std::mutex> lk{durable_mu_}; }
     durable_cv_.notify_all();
