@@ -704,6 +704,7 @@ Not yet implemented — callers currently provide the full file path.
 - **`fdatasync` over `fflush`/`flush()`**: `fdatasync` syncs data to physical media while skipping inode metadata updates (access time etc.), making it faster than `fsync` for a pure append-only log.
 - **Group Commit pattern**: Separating `append()` (writes to page cache) from `sync()` (forces to disk) lets future code batch hundreds of writes before a single expensive `fdatasync`, which is the primary lever for high write throughput on NVMe hardware (see `io_uring` paper reference).
 - **Zero-copy write path**: `append()` builds only the 15-byte header and 4-byte CRC in a fixed member buffer, then calls `::writev()` with four iovecs — `[header(15), key, value, crc(4)]`. The kernel gathers the scattered buffers into one atomic write without any intermediate heap allocation or memcpy of key/value data. For 1 KiB values this eliminates ~250 MB/s of unnecessary copying at 244k puts/s.
+- **Block preallocation**: On Linux, `DataFile` preallocates disk blocks in 4 MiB chunks using `fallocate(FALLOC_FL_KEEP_SIZE)` before each `writev()`. This eliminates per-write filesystem extent-allocation overhead without changing the file's logical size — `O_APPEND`, `offset_`, scanning, and recovery are all unaffected. The call is a no-op on filesystems that do not support it (tmpfs, NFS). On non-Linux platforms (macOS) the feature is compiled out.
 
 ### Source Code Module Architecture
 

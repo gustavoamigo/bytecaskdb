@@ -72,6 +72,7 @@ public:
     ::posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
 #endif
     offset_ = std::filesystem::file_size(path_);
+    preallocated_end_ = offset_;
   }
 
   ~DataFile() {
@@ -97,6 +98,7 @@ public:
   //   DataFile b = std::move(a);     // b: fd=5, a: fd=-1 (harmless destructor)
   DataFile(DataFile &&other) noexcept
       : path_{std::move(other.path_)}, fd_{other.fd_}, offset_{other.offset_},
+        preallocated_end_{other.preallocated_end_},
         sealed_{other.sealed_}, tainted_{other.tainted_} {
     other.fd_ = -1;
   }
@@ -117,6 +119,7 @@ public:
       offset_ = other.offset_;
       sealed_ = other.sealed_;
       tainted_ = other.tainted_;
+      preallocated_end_ = other.preallocated_end_;
       other.fd_ = -1;
     }
     return *this;
@@ -145,6 +148,7 @@ public:
         {hdr_crc_buf_.data() + kHeaderSize, kCrcSize},
     }};
     const auto total = kHeaderSize + key.size() + value.size() + kCrcSize;
+    ensure_preallocated(offset_ + static_cast<Offset>(total));
     const auto written = ::writev(fd_, iov.data(), std::ssize(iov));
 #ifdef BYTECASK_TESTING
     // Post-write injection simulates partial or full writes followed by
@@ -236,6 +240,7 @@ public:
 #endif
       }
 
+      ensure_preallocated(offset_ + static_cast<Offset>(total_bytes));
       const auto written =
           ::writev(fd_, iov.data(), narrow<int>(chunk_size * kIovecsPerEntry));
 
@@ -358,6 +363,7 @@ public:
                               "DataFile::truncate"};
     }
     offset_ = new_size;
+    preallocated_end_ = new_size;
     tainted_ = false;
   }
 
@@ -365,11 +371,30 @@ private:
   std::filesystem::path path_;
   int fd_{-1};
   Offset offset_{0};
+  Offset preallocated_end_{0};
   bool sealed_{false};
   bool tainted_{false};
   // Fixed buffer holding the 15-byte header and 4-byte CRC for each append.
   // Avoids heap allocation on the hot write path.
   std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};
+
+  // Preallocates disk blocks up to write_end without changing the file's
+  // logical size. Reduces filesystem extent-allocation overhead on the write
+  // path. Failure is silently ignored — preallocation is a pure optimization.
+  void ensure_preallocated(Offset write_end) {
+#ifdef __linux__
+    if (write_end <= preallocated_end_) return;
+    static constexpr Offset kPreallocChunk = 4 * 1024 * 1024;  // 4 MiB
+    auto alloc_end =
+        ((write_end + kPreallocChunk - 1) / kPreallocChunk) * kPreallocChunk;
+    if (::fallocate(fd_, FALLOC_FL_KEEP_SIZE, narrow<off_t>(preallocated_end_),
+                    narrow<off_t>(alloc_end - preallocated_end_)) == 0) {
+      preallocated_end_ = alloc_end;
+    }
+#else
+    (void)write_end;
+#endif
+  }
 
 #ifdef BYTECASK_TESTING
   void testing_fault_injection_append(std::span<const ::iovec> iov_buf,
