@@ -110,12 +110,13 @@ precompile bytecask.data_file    bytecaskdb/data_file.cppm
 precompile bytecask.hint_file    bytecaskdb/hint_file.cppm
 precompile bytecask.batch_iterator bytecaskdb/batch_iterator.cppm
 precompile bytecask.concurrency  bytecaskdb/concurrency.cppm
+precompile bytecask.counters     bytecaskdb/counters.cppm
 precompile bytecask:internals    bytecaskdb/internals.cppm
 precompile bytecask              bytecaskdb/bytecask.cppm
 
 # ── Step 3: Compile object files ──────────────────────────────────────────────
 echo "=== Compiling objects ==="
-CPPM_FILES=(types util serialization data_entry hint_entry radix_tree u32_map data_file hint_file batch_iterator concurrency internals)
+CPPM_FILES=(types util serialization data_entry hint_entry radix_tree u32_map data_file hint_file batch_iterator concurrency counters internals)
 
 for f in "${CPPM_FILES[@]}"; do
   emcc $CFLAGS -c $MODS $CRC32C_INCLUDE "$ROOT/bytecaskdb/${f}.cppm" -o "$PCM/${f}.o"
@@ -158,6 +159,7 @@ testing_precompile bytecask.data_file    bytecaskdb/data_file.cppm
 testing_precompile bytecask.hint_file    bytecaskdb/hint_file.cppm
 testing_precompile bytecask.batch_iterator bytecaskdb/batch_iterator.cppm
 testing_precompile bytecask.concurrency  bytecaskdb/concurrency.cppm
+testing_precompile bytecask.counters     bytecaskdb/counters.cppm
 testing_precompile bytecask:internals    bytecaskdb/internals.cppm
 testing_precompile bytecask              bytecaskdb/bytecask.cppm
 
