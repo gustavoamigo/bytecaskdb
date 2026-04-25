@@ -785,11 +785,11 @@ TEST_CASE("RadixTree erase empty key", "[radix_tree]") {
 }
 
 // ---------------------------------------------------------------------------
-// Long keys: prefix > 15 bytes triggers CompactPrefix heap spill
+// Long keys: prefix > 7 bytes triggers chain-split routing nodes
 // ---------------------------------------------------------------------------
-TEST_CASE("RadixTree long keys spill CompactPrefix", "[radix_tree]") {
-  // Key at the inline boundary (15 bytes as prefix after split).
-  std::string boundary(16, 'b');
+TEST_CASE("RadixTree long keys chain-split", "[radix_tree]") {
+  // Key at the inline boundary (7 bytes as prefix after split).
+  std::string boundary(8, 'b');
   auto t0 = Tree{}.set(to_bytes(boundary), 42);
   CHECK(*t0.get(to_bytes(boundary)) == 42);
 
@@ -927,6 +927,47 @@ TEST_CASE("RadixTree transient overwrite", "[radix_tree]") {
   auto t = std::move(tr).persistent();
   CHECK(t.size() == 1U);
   CHECK(*t.get(to_bytes("key")) == 3);
+}
+
+// ---------------------------------------------------------------------------
+// Transient: consumed builders fail fast in release builds
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree consumed transient rejects reuse", "[radix_tree]") {
+  auto tr = Tree{}.transient();
+  tr.set(to_bytes("key"), 1);
+
+  auto t = std::move(tr).persistent();
+  REQUIRE(t.size() == 1U);
+  REQUIRE(*t.get(to_bytes("key")) == 1);
+
+  auto greater = [](int existing, int incoming) {
+    return incoming > existing;
+  };
+
+  CHECK_THROWS_AS(tr.get(to_bytes("key")), std::logic_error);
+  CHECK_THROWS_AS(tr.get_ptr(to_bytes("key")), std::logic_error);
+  CHECK_THROWS_AS(tr.contains(to_bytes("key")), std::logic_error);
+  CHECK_THROWS_AS(tr.lower_bound(to_bytes("key")), std::logic_error);
+  CHECK_THROWS_AS(tr.set(to_bytes("other"), 2), std::logic_error);
+  CHECK_THROWS_AS(tr.upsert(to_bytes("key"), 2, greater), std::logic_error);
+  CHECK_THROWS_AS(tr.erase(to_bytes("key")), std::logic_error);
+  CHECK_THROWS_AS(std::move(tr).persistent(), std::logic_error);
+}
+
+TEST_CASE("RadixTree moved-from transient rejects reuse", "[radix_tree]") {
+  auto original = Tree{}.transient();
+  original.set(to_bytes("key"), 1);
+
+  auto moved = std::move(original);
+  moved.set(to_bytes("other"), 2);
+
+  CHECK_THROWS_AS(original.get(to_bytes("key")), std::logic_error);
+  CHECK_THROWS_AS(original.set(to_bytes("x"), 3), std::logic_error);
+
+  auto t = std::move(moved).persistent();
+  CHECK(t.size() == 2U);
+  CHECK(*t.get(to_bytes("key")) == 1);
+  CHECK(*t.get(to_bytes("other")) == 2);
 }
 
 // ---------------------------------------------------------------------------

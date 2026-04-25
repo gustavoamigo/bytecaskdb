@@ -211,7 +211,7 @@ struct Node {
 
 `PersistentRadixTree` and `TransientRadixTree` use explicit move constructors/assignments that reset the source's `size_` (and `tag_` for transient) to zero via `std::exchange`. This ensures a moved-from tree is in a valid empty state (`size() == 0`, `empty() == true`) rather than carrying stale metadata while the root pointer has been transferred.
 
-Children are stored behind a `unique_ptr` so leaf nodes (94% of all nodes) carry only the 8-byte null pointer instead of embedding an empty vector. Internal nodes allocate the vector on first `insert_child()` call. Access is via `child_count()`, `child_at()`, and `has_children()` helpers.
+Children are stored behind a `unique_ptr` so leaf nodes (94% of all nodes) carry only the 8-byte null pointer instead of embedding an empty vector. Internal nodes allocate the vector on first `insert_child()` call. Access is via `child_count()`, `child_at()`, `find_child()`, and the related mutation helpers, which centralize the `Node` / `InternalNode` split and return safe defaults for leaves.
 
 `CompactPrefix` is a fixed 16-byte container (1-byte size + 15 inline bytes, `alignof == 1`). Prefixes up to 15 bytes are stored inline with no heap allocation. Prefixes longer than 15 bytes spill to a heap buffer: the pointer is stored in the first 8 bytes of the inline array via `memcpy` and the heap size in bytes 8–11 — well-defined C++ with no strict aliasing violation. In practice, radix tree splits produce prefixes that are overwhelmingly shorter than 15 bytes (the 16-byte UUIDv7 binary segments are the longest common case), so the heap path is rarely taken.
 
@@ -221,6 +221,7 @@ The `transient()` / `persistent()` API pattern — a mutable builder that freeze
 *   During a transient mutation, if the traversed node's `edit_tag` matches the session's tag **and** the node's reference count is 1 (uniquely owned), the node is mutated **in-place**.
 *   If the tag differs (e.g., `0` or an older session) or the node is shared (refcount > 1), the node is **copied**, the copy is tagged with the current session ID, and the mutation applies to the copy.
 *   The refcount guard defends against edit-tag wraparound: after 2^31 `transient()` calls the 31-bit tag space can repeat, but a shared node will never be mutated in place regardless of its tag.
+*   A transient is single-use. `persistent() &&` retires the session tag, and any later operation on a consumed or moved-from builder throws `std::logic_error` in release builds instead of depending on debug-only assertions.
 
 ---
 
@@ -241,14 +242,14 @@ All operations leave the original tree unchanged and return a new instance.
 
 
 ### 4.2. Transient API (`TransientRadixTree<V>`)
-Operations mutate the tree in-place utilizing the COW epoch logic.
+Operations mutate the tree in-place utilizing the COW epoch logic. A consumed or moved-from transient is invalid for further use; every public entrypoint fails fast with `std::logic_error`.
 
 *   `std::optional<V> get(std::span<const std::byte> key) const` *(Reads the current state of the transient tree)*
 *   `bool contains(std::span<const std::byte> key) const`
 *   `void set(std::span<const std::byte> key, V val)`
 *   `template <typename Pred> std::optional<V> upsert(std::span<const std::byte> key, V val, Pred&& should_replace)` — Single-traversal insert-or-conditional-replace. If the key is absent, inserts `val` and returns `nullopt`. If the key is present, calls `should_replace(existing, val)`; if true, replaces the value and returns the displaced old value; if false, leaves the value unchanged and returns `nullopt`.
 *   `bool erase(std::span<const std::byte> key)`
-*   `PersistentRadixTree<V> persistent() &&` *(Consumes the builder; the transient must not be used after this call)*
+*   `PersistentRadixTree<V> persistent() &&` *(Consumes the builder; subsequent use throws `std::logic_error`)*
 
 
 ### 4.3. Iterator API (`Iterator`)

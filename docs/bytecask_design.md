@@ -18,7 +18,7 @@ Canonical location: `docs/bytecask_design.md`.
 
 - Provide a clean, minimal API surface for key-value operations.
 - Support atomic multi-operation batches.
-- Support ordered range iteration (enabled by the B-Tree key directory).
+- Support ordered range iteration (enabled by the radix-tree key directory).
 - Be idiomatic C++23: no raw pointers, no stringly-typed errors, move-only ownership.
 
 ## Non-Goals (for now)
@@ -72,11 +72,15 @@ The design follows these core tenets in order of priority:
 
 ByteCaskDB uses `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times.
 
-The key directory is a persistent (immutable) radix tree with path-compressed nodes, intrusive reference counting, and structural sharing across versions. It provides O(k) get/set/erase (where k = key length), bidirectional ordered iteration via DFS, `lower_bound()` / `upper_bound()` for range queries, `rbegin()` / `rend()` for safe reverse iteration via `ReverseRadixTreeIterator`, and a `transient()` / `persistent()` API for batch mutations. `RadixTreeIterator` satisfies `std::bidirectional_iterator` — `operator--` walks the tree in reverse with O(1) amortized cost per step. `ReverseRadixTreeIterator` wraps `RadixTreeIterator` with pre-decrement at construction so `operator*` always returns a span into a live iterator buffer — no dangling references. It also tracks a `past_rend_` flag so `++rend()` is a no-op (never wraps back to the last element) and `rend().base() == begin()` holds (standard reverse_iterator semantics). Implemented in `bytecask.radix_tree` (`src/engine/radix_tree.cppm`).
+The key directory is a persistent (immutable) radix tree with path-compressed nodes, intrusive reference counting, and structural sharing across versions. It provides O(k) get/set/erase (where k = key length), bidirectional ordered iteration via DFS, `lower_bound()` / `upper_bound()` for range queries, `rbegin()` / `rend()` for safe reverse iteration via `ReverseRadixTreeIterator`, and a `transient()` / `persistent()` API for batch mutations. `RadixTreeIterator` satisfies `std::bidirectional_iterator` — `operator--` walks the tree in reverse with O(1) amortized cost per step. `ReverseRadixTreeIterator` wraps `RadixTreeIterator` with pre-decrement at construction so `operator*` always returns a span into a live iterator buffer — no dangling references. It also tracks a `past_rend_` flag so `++rend()` is a no-op (never wraps back to the last element) and `rend().base() == begin()` holds (standard reverse_iterator semantics). Implemented in `bytecask.radix_tree` (`bytecaskdb/radix_tree.cppm`).
+
+`TransientRadixTree` is intentionally single-use. `persistent() &&` retires the builder, and any later read or write on a consumed or moved-from transient throws `std::logic_error` in release builds instead of relying on debug-only assertions.
 
 `Node::release()` uses iterative tail-release: when the last child's refcount drops to zero, the loop continues with that child instead of recursing through `~IntrusivePtr`. This avoids O(depth) recursive destructor frames for chains of single-child nodes — the dominant pattern in compressed radix trees. Profiling (perf, MergeOverlapping/100K) measured the recursive `~IntrusivePtr` cascade at 29% of total merge time; the iterative version reduces MergeOverlapping by ~6% and parallel recovery at 16T by ~13%.
 
 `TransientRadixTree::upsert(key, val, should_replace)` performs a single-traversal conditional insert-or-replace: it walks from root to leaf once, inserting if the key is absent, or replacing if `should_replace(existing, incoming)` returns true. Returns the displaced old value when a replacement occurs, enabling callers to track side-effects (e.g. file_stats adjustment). Used by parallel recovery's `recovery_build_from_hints` to eliminate the separate `get()` + `set()` dual traversal that profiling (perf, Recovery/Parallel/16) showed consuming ~49% of recovery time.
+
+Child storage remains behind the `Node` / `InternalNode` split. `child_count`, `child_at`, `find_child`, and the mutation helpers now funnel through checked accessors that return safe defaults for leaf nodes instead of repeating flag checks plus open-coded downcasts at each call site.
 
 Keys are stored as byte sequences within the radix tree's prefix-compressed nodes. The radix tree API accepts `std::span<const std::byte>` for all key parameters — no intermediate `Key` wrapper is needed for internal operations. The public `Key` class (backed by `std::vector<std::byte>`) is retained for the external iterator API (`KeyIterator`, `EntryIterator`) and for the recovery tombstone tracking map. `Key` provides `operator<=>` (lexicographic over raw byte values) and `begin()`/`end()`/`size()` accessors. Keys have a hard upper bound of 65 535 bytes (the `u16 key_size` field in the data file header).
 

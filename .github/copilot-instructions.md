@@ -104,6 +104,17 @@ These four principles govern every design decision in the codebase, in priority 
 - Use `std::ssize` (C++20) instead of casting `.size()` to a signed type.
 - Prefer `std::filesystem` utilities over manual file-handle tricks (e.g. `std::filesystem::file_size`).
 
+### Safety through abstraction — compile-time first, runtime second
+
+Prefer designs where incorrect usage is impossible over designs where incorrect usage is merely caught. In priority order:
+
+1. **Compile-time safety**: Use the type system to make invalid states unrepresentable. If a capability or field is absent for a subset of instances, encode that in the types so that invalid access is a compiler error, not a runtime bug.
+2. **Runtime safety**: When compile-time enforcement is not possible (e.g. base-pointer dispatch), use assertions, tag checks, or safe defaults so that bugs produce crashes or wrong-but-safe behavior — never silent memory corruption or UB.
+
+Avoid designs where correctness depends on programmer discipline alone (e.g. "never touch field X on this variant"). A future contributor will forget. The abstraction should make forgetting either impossible (compile error) or immediately visible (assertion failure).
+
+**Example — the P4 Node/InternalNode split**: Rather than allocating leaf nodes at a smaller size and relying on discipline to never access the `children_` field (heap buffer overflow if violated), we split into `Node` (base, no `children_` field) and `InternalNode : Node` (derived, has `children_`). Accessing `children_` through a `Node*` is a compile error. Child accessor methods on `Node` check a tag bit before downcasting and return safe defaults ("no children") when the tag is absent.
+
 ### Iterator laziness — correctness requirement
 
 Iterators must fetch and process data lazily unless explicitly documented otherwise. An iterator that eagerly materializes all results into memory is a correctness bug: the result set may exceed available memory (e.g. a `changes_since` scan over millions of entries). The correct pattern is to hold at most one unit of work in memory at a time (one batch, one entry) and advance on demand.

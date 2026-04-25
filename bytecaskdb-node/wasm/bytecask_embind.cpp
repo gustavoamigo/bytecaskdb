@@ -590,6 +590,15 @@ static void js_file_manifest_close(JsFileManifest &self) {
   // snapshot is owned separately, caller must close it.
   delete &self;
 }
+static auto js_file_manifest_get_snapshot(JsFileManifest &self) -> JsSnapshot * {
+  return self.snapshot;
+}
+static auto js_file_manifest_get_files(JsFileManifest &self) -> val {
+  return self.files;
+}
+static auto js_file_manifest_get_through_sequence(JsFileManifest &self) -> double {
+  return self.through_sequence;
+}
 
 // ---------------------------------------------------------------------------
 // Embind registration
@@ -664,14 +673,8 @@ EMSCRIPTEN_BINDINGS(bytecask) {
       .function("close", &js_change_iter_close);
 
   class_<JsFileManifest>("FileManifest")
-      .function("getSnapshot", [](JsFileManifest &self) -> JsSnapshot * {
-        return self.snapshot;
-      }, allow_raw_pointers())
-      .function("getFiles", [](JsFileManifest &self) -> val {
-        return self.files;
-      })
-      .function("getThroughSequence", [](JsFileManifest &self) -> double {
-        return self.through_sequence;
-      })
+      .function("getSnapshot", &js_file_manifest_get_snapshot, allow_raw_pointers())
+      .function("getFiles", &js_file_manifest_get_files)
+      .function("getThroughSequence", &js_file_manifest_get_through_sequence)
       .function("close", &js_file_manifest_close);
 }

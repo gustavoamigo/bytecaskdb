@@ -52,6 +52,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 | BC-092 | UUIDv4 test | Test and protections if customers use UUIDv4 as key (Maybe we will need a Adaptive Radix Tree extension) |
 | BC-188 | Tombstone GC during vacuum | Point and range tombstones are currently preserved forever. Vacuum should elide tombstones that are older than all live data files, since no recovery can need them. |
 | BC-189 | Radix tree `erase_range(from, to)` | Current `del_range` erases keys one-by-one after collecting them. A native `erase_range` on PersistentRadixTree could delete entire subtrees in O(subtree) instead of O(N) individual erases. |
+| BC-215 | Refresh stale coverage artifact | The checked-in `lcov.info` no longer matches the current radix-tree symbols/tests and should not be treated as current coverage evidence. Either regenerate it from the current coverage workflow or remove it from review flows. |
 | BC-093 | Vacuum benchmarks | Add benchmark tests for the vacuum (with performance and data file reclaim tests) |
 | BC-094 | Profile memory | Profile memory usage (maybe benchmark tests that capture that) |
 | BC-125 | ~~`WriteOptions::sync_before_visible`~~ | Obsolete. Durability-before-visibility is now the default. `state_.store()` happens after `fdatasync`. |
@@ -65,6 +66,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-214 | Radix tree safety hardening | `TransientRadixTree` now throws `std::logic_error` on consumed or moved-from reuse in release builds. Child access is centralized through checked `Node`/`InternalNode` helpers instead of repeated flag-plus-cast patterns. Added 2 regression tests; `[radix_tree]` passes with 57 cases and 1,059,164 assertions. |
 | BC-206 | Radix tree node memory optimization (80B→56B) | Two changes: (1) reorder `KeyDirEntry` fields to eliminate 8B alignment padding (sequence, file_offset, file_id, value_size — both uint64_t fields adjacent). (2) Replace `SmallVector<byte,24>` (32B) with `CompactPrefix` (16B): 1-byte size + 15 inline bytes, heap spill via memcpy pointer storage for prefixes >15 bytes. Node struct stays 56B but with `KeyDirEntry` (24B) as value type instead of `int` (4B+padding). Measured: 70 B/key generic (−19% from 86), 74 B/key prefixed (−19% from 92). 1045 tests pass (1.28M assertions). |
 | BC-207 | File naming format change | New format: `data_{YYYYMMDDHHmmss}_{RRRRRRRR}_V{XX}`. Dropped false microsecond precision and monotonic counter. Timestamp is now second-precision UTC creation-time hint (not content age). Random 4-byte hex salt replaces counter for collision avoidance. Added file format version tag (`V01`). Updated D11 in design docs, file_format.md naming section. |
 | BC-208 | Add ReadOptions to Snapshot methods and DB::contains_key | All read methods on Snapshot and DB now take `const ReadOptions&` for symmetry. Snapshot `get`/`iter_from`/`riter_from` no longer hardcode `verify_checksums=true` — caller controls CRC verification. Updated C API, Python bindings, Node/WASM bindings, type stubs. Fixed WASM bug where snapshot methods accepted but ignored ReadOptions. |
