@@ -6,7 +6,7 @@
 
 **ByteCaskDB** is a fast, predictable embedded key-value store written in C++. Reads and writes have flat, predictable latency from thousands of keys to hundreds of millions.
 
-All keys in memory at all times — a deliberate design choice that removes an entire class of complexity that exists solely to minimise disk access and makes every point lookup O(1) with flat, predictable latency. At ~70 bytes per key, 128 GB of RAM holds close to two billion keys. Very few moving parts — an in-memory key directory and an append-only data file — is what keeps that latency flat whether you have 1,000 records or 100 million. 
+All keys in memory at all times — a deliberate design choice that removes an entire class of complexity that exists solely to minimise disk access and makes every point lookup O(1) with flat, predictable latency. At ~50 bytes per key, 128 GB of RAM holds close to 2.7 billion keys. Very few moving parts — an in-memory key directory and an append-only data file — is what keeps that latency flat whether you have 1,000 records or 100 million. 
 
 Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCaskDB replaces the original hash-table key directory with a **[persistent radix tree](docs/persistent_radix_tree_design.md)** — enabling ordered range queries, prefix scans, and prefix compaction, while keeping the simplicity that makes Bitcask fast. Snapshots are O(1) — just a root pointer copy. Full MVCC and serializable conflict detection are supported with no separate transaction type required.
 
@@ -32,7 +32,7 @@ Benchmarked at 1 M keys with [RocksDB](https://rocksdb.org/) as a reference poin
 - **Sequential writes** sustain 134 Kops/s (NoSync) and 139 ops/s (Sync), limited by `fdatasync` round-trip latency. No write amplification from compaction.
 - **Concurrent sync writes scale via group commit** — writers share a single `fdatasync` call. 4.9 Kops/s at 64 threads.
 - **Range scans over values** fetch each value individually from disk. LSM-based engines pack values contiguously in sorted runs and perform better here. Key-only iteration (`keys_from`) is a pure in-memory tree walk with no disk I/O.
-- **Recovery is fast and parallel** — hint files replayed across all cores with full CRC verification. 1 M keys in ~58 ms, 10 M in ~506 ms at 16 threads.
+- **Recovery is fast and parallel** — hint files replayed across all cores with per-file CRC verification. 1 M keys in ~58 ms, 10 M in ~506 ms at 16 threads.
 
 See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md) for the full benchmark report with all thread counts, dataset sizes, and hardware details.
 
@@ -40,7 +40,7 @@ See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md)
 
 ### Single-Threaded Throughput (1M keys)
 
-> CRC verification is disabled for read operations; enabled for recovery.
+> Per-value CRC verification is disabled for read benchmarks; hint file CRC is always verified during recovery.
 
 | Operation | ByteCaskDB | RocksDB | Notes |
 |-----------|----------|---------|-------|
@@ -101,7 +101,7 @@ Latency stays flat as the dataset grows: every read resolves to a known file off
 
 ### Recovery
 
-Recovery runs when ByteCaskDB opens an existing database: it rebuilds the in-memory key directory by reading compact hint files from disk, then verifies every entry with CRC-32. This is parallelised across all available CPU cores — each core processes a disjoint set of data files independently, and the results are merged before the database becomes available.
+Recovery runs when ByteCaskDB opens an existing database: it rebuilds the in-memory key directory by reading compact hint files from disk. Each hint file is verified by a file-level CRC-32C trailer before parsing. This is parallelised across all available CPU cores — each core processes a disjoint set of hint files independently, and the results are merged before the database becomes available.
 
 | Keys | Threads | Recovery Time | Speedup vs 1T |
 |---:|---:|---:|---:|
@@ -196,7 +196,7 @@ for (auto& key : db.rkeys_from({}, to_bytes("user:~"))) { ... }
 namespace bytecask {
 
 struct Options {
-    uint64_t max_file_bytes{64 * 1024 * 1024};  // active file rotation threshold (default 64 MiB)
+    uint64_t max_file_bytes{64 * 1024 * 1024};  // active file rotation threshold (default 64 MiB, hard ceiling: 4 GiB)
     unsigned recovery_threads{4};                // parallelism for hint-file replay at open
     // When true (default): any CRC error during recovery causes DB::open to throw.
     // When false: corrupt entries and hint files are skipped; DB opens with the
@@ -205,7 +205,7 @@ struct Options {
     bool fail_recovery_on_crc_errors{true};
     Mode initial_mode{Mode::Leader};             // leader allows normal writes; follower allows ingest
     uint32_t max_key_bytes{4096};                // max key size (hard ceiling: 65,535 — u16 wire format)
-    uint32_t max_value_bytes{4 * 1024 * 1024};   // max value size (hard ceiling: ~4 GiB — u32 wire format)
+    uint32_t max_value_bytes{4 * 1024 * 1024};   // max value size (hard ceiling: 256 MiB — packed KeyDirEntry)
 };
 
 struct WriteOptions {

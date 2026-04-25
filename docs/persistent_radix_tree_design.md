@@ -187,33 +187,44 @@ This component inherits the ByteCaskDB design tenets in order of priority:
 
 ### 3.1. Node Layout
 ```cpp
+// Base node — 94% of all nodes are leaves and use only this struct.
 struct Node {
     mutable std::atomic<uint32_t> refcount; // intrusive reference count
-    uint32_t packed_tag; // high bit = has_value, low 31 bits = edit tag (0 = immutable)
+    uint32_t packed_tag; // high bit = has_value, bit 30 = has_children, low 30 bits = edit tag
 
     V value;
 
-    // Short-prefix optimization: most prefixes after a split are 1–15 bytes.
-    // Inline storage up to 15 bytes avoids a heap allocation per node.
-    CompactPrefix prefix;
+    // Short-prefix optimization: most prefixes after a split are 1–7 bytes.
+    // Inline storage up to 7 bytes avoids a heap allocation per node.
+    // Key segments longer than 7 bytes are split into a chain of routing
+    // nodes (7 prefix bytes + 1 transition byte per hop).
+    CompactPrefix prefix;  // 8 bytes (1-byte size + 7 inline bytes)
+};
 
-    // Heap-allocated children vector. nullptr for leaf nodes (94% of nodes).
-    // Leaves pay only 8 bytes (the null pointer) instead of embedding an
-    // empty vector in the node.
-    using ChildVec = std::vector<std::pair<std::byte, IntrusivePtr<Node>>>;
-    std::unique_ptr<ChildVec> children_;
+// Derived node for the ~6% of nodes that have children.
+struct InternalNode : Node {
+    // Struct-of-arrays layout: parallel vectors of transition bytes and
+    // node pointers. Eliminates the 7 bytes of alignment padding that
+    // pair<byte, IntrusivePtr> would waste per child slot (16 → 9 B/slot).
+    struct ChildStore {
+        std::vector<std::byte> transition_bytes;
+        std::vector<IntrusivePtr<Node>> ptrs;
+    };
+    std::unique_ptr<ChildStore> children_;
 };
 ```
 
 `IntrusivePtr<T>` is a lightweight single-pointer (8 bytes) smart pointer. It calls `addref()` on copy and `release()` on destruction; when the count reaches zero, the node is deleted. Copy assignment uses addref-before-release sequencing to prevent use-after-free when the source is a sub-object of the destination (e.g., reassigning a root to one of its own children). Move assignment detaches the source pointer before releasing the old destination for the same reason. This eliminates the ~32-byte `make_shared` control block per node and halves the pointer size in every child slot from 16 bytes (`shared_ptr`) to 8 bytes (`IntrusivePtr`).
 
-`Node::release()` uses an **iterative tail-release** to avoid the O(depth) recursive destructor chain that would otherwise result from `~IntrusivePtr → release → delete → ~Node → ~ChildVec → ~IntrusivePtr → …`. When the last reference to a node is dropped, the implementation detaches all children from their `IntrusivePtr`s before calling `delete`, then loops over those children releasing each one in turn — converting the last-child release into a loop. For chains of single-child nodes (the dominant pattern in prefix-compressed trees), this eliminates the recursive call overhead entirely. Profiling showed the naive recursive approach consuming 29% of total merge time at 100k keys.
+`Node::release()` uses an **iterative tail-release** to avoid the O(depth) recursive destructor chain that would otherwise result from `~IntrusivePtr → release → delete → ~Node → ~ChildStore → ~IntrusivePtr → …`. When the last reference to a node is dropped, the implementation detaches all children from their `IntrusivePtr`s before calling `delete`, then loops over those children releasing each one in turn — converting the last-child release into a loop. For chains of single-child nodes (the dominant pattern in prefix-compressed trees), this eliminates the recursive call overhead entirely. Profiling showed the naive recursive approach consuming 29% of total merge time at 100k keys.
 
 `PersistentRadixTree` and `TransientRadixTree` use explicit move constructors/assignments that reset the source's `size_` (and `tag_` for transient) to zero via `std::exchange`. This ensures a moved-from tree is in a valid empty state (`size() == 0`, `empty() == true`) rather than carrying stale metadata while the root pointer has been transferred.
 
-Children are stored behind a `unique_ptr` so leaf nodes (94% of all nodes) carry only the 8-byte null pointer instead of embedding an empty vector. Internal nodes allocate the vector on first `insert_child()` call. Access is via `child_count()`, `child_at()`, `find_child()`, and the related mutation helpers, which centralize the `Node` / `InternalNode` split and return safe defaults for leaves.
+Leaf nodes use `Node` directly (no `children_` field — accessing it through a `Node*` is a compile error). Internal nodes use `InternalNode`, which adds a `unique_ptr<ChildStore>`. Child accessors on `Node` check a tag bit (`kHasChildrenBit`) before downcasting and return safe defaults ("no children") when the flag is absent. This makes incorrect access a compile-time error for leaves and a safe no-op for base-pointer dispatch.
 
-`CompactPrefix` is a fixed 16-byte container (1-byte size + 15 inline bytes, `alignof == 1`). Prefixes up to 15 bytes are stored inline with no heap allocation. Prefixes longer than 15 bytes spill to a heap buffer: the pointer is stored in the first 8 bytes of the inline array via `memcpy` and the heap size in bytes 8–11 — well-defined C++ with no strict aliasing violation. In practice, radix tree splits produce prefixes that are overwhelmingly shorter than 15 bytes (the 16-byte UUIDv7 binary segments are the longest common case), so the heap path is rarely taken.
+Children use a struct-of-arrays layout (`ChildStore`): parallel vectors of transition bytes and node pointers. This eliminates the 7 bytes of alignment padding per child slot that `pair<byte, IntrusivePtr>` would waste (16 → 9 bytes per slot).
+
+`CompactPrefix` is a fixed 8-byte container (1-byte size + 7 inline bytes, `alignof == 1`). Prefixes up to 7 bytes are stored inline with no heap allocation. Key segments longer than 7 bytes are split into a chain of routing nodes: each hop stores 7 prefix bytes plus 1 transition byte to the next node. This eliminates the heap spill path entirely — no heap allocation is ever needed for prefixes.
 
 ### 3.2. Transient Copy-on-Write (COW) Model
 The `transient()` / `persistent()` API pattern — a mutable builder that freezes into an immutable snapshot — was popularised by [Rich Hickey's Clojure transients](https://clojure.org/reference/transients) (Clojure 1.1, ~2009).
@@ -438,28 +449,35 @@ Hint files are assigned to workers round-robin. Each worker builds a `TransientR
 
 ### 7.1. Node layout breakdown
 
-Each `Node<V>` is allocated via `new` and managed by `IntrusivePtr<Node>`, which embeds the reference count inside the node itself. No separate control block is allocated.
+Nodes are allocated via `new` and managed by `IntrusivePtr<Node>`, which embeds the reference count inside the node itself. No separate control block is allocated. Leaf nodes (94% of all nodes) use the base `Node<V>` struct; the remaining ~6% use `InternalNode<V>` which adds a `children_` pointer.
+
+**`Node<V>` (base — used for leaves):**
 
 | Field | Type | Bytes |
 |---|---|---|
 | `refcount_` | `atomic<uint32_t>` | 4 |
 | `packed_tag_` | `uint32_t` | 4 |
 | `value_` | `V` (e.g. `KeyDirEntry`, 24 B) | 24 |
-| `prefix` | `CompactPrefix` (15 inline bytes, alignof 1) | 16 |
-| `children_` | `unique_ptr<ChildVec>` | 8 |
-| **Node struct total** | | **56 bytes** |
+| `prefix` | `CompactPrefix` (7 inline bytes, alignof 1) | 8 |
+| **Node struct total** | | **40 bytes** |
 
-Leaf nodes (94% of all nodes): 56 B, `children_` is null, no heap allocation for children.
+**`InternalNode<V>` (derived — used for routing nodes with children):**
 
-Internal nodes (6%): 56 B + heap `std::vector` (~24 B header + N × 16 B per child slot). One child slot is `pair<byte, IntrusivePtr<Node>>` = 1 byte + 7 bytes padding + 8 bytes (`IntrusivePtr` = raw ptr) = **16 bytes**.
+| Field | Type | Bytes |
+|---|---|---|
+| (inherits `Node<V>`) | | 40 |
+| `children_` | `unique_ptr<ChildStore>` | 8 |
+| **InternalNode struct total** | | **48 bytes** |
+
+Internal nodes heap-allocate a `ChildStore` (struct-of-arrays: two `std::vector`s, ~48 B header + N × 9 B per child slot). One child slot is 1 byte (transition) + 8 bytes (`IntrusivePtr`) = **9 bytes** — no alignment padding thanks to the struct-of-arrays split.
 
 | Node type | Fraction | Struct | Heap children | Total |
 |---|---|---|---|---|
-| Leaf (0 children) | ~94% | 56 B | 0 | **56 B** |
-| Internal (2 children avg) | ~6% | 56 B | ~56 B | ~112 B |
-| **Weighted average** | | | | **~59 B** |
+| Leaf (0 children) | ~94% | 40 B | 0 | **40 B** |
+| Internal (2 children avg) | ~6% | 48 B | ~66 B | ~114 B |
+| **Weighted average** | | | | **~44 B** |
 
-The previous design used `SmallVector<pair<byte, IntrusivePtr<Node>>, 1>` for children (32 bytes inline regardless of child count). Every node — including leaves — paid the full 32 bytes. Switching to `unique_ptr<ChildVec>` saves 24 bytes per leaf node (32 → 8).
+The ~44 B weighted average is the per-node cost. Measured per-key overhead is higher (~61–69 B/key) because prefix chain-splitting for long keys creates additional routing nodes, pushing the nodes-per-key ratio above 1.07.
 
 ### 7.2. Node distribution
 
@@ -468,15 +486,15 @@ For a typical key set with reasonable prefix compression the tree has approximat
 | Node type | Fraction | Children storage |
 |---|---|---|
 | Leaf (0 children) | ~94% | `nullptr` (0 B) |
-| Internal (2+ children) | ~6% | heap `std::vector` (~24 B header + N × 16 B) |
+| Internal (2+ children) | ~6% | heap `ChildStore` (~48 B header + N × 9 B) |
 
 ### 7.3. Measured footprint
 
-Values from `BM_MemoryFootprint` at 100k keys (measured with the global allocator tracker):
+Values from `BM_MemoryFootprint` at 100k keys with `KeyDirEntry` value type (measured with the global allocator tracker):
 
 | Container | Key type | B/key (generic) | B/key (prefixed UUIDv7) | Key-length sensitivity |
 |---|---|---|---|---|
-| `PersistentRadixTree` | `span<byte>` (not stored) | **70 B** | **74 B** | Low — prefix compression absorbs shared bytes |
+| `PersistentRadixTree` | `span<byte>` (not stored) | **61 B** | **63 B** | Low — prefix compression absorbs shared bytes |
 | `std::map` | `std::string` | 72 B | 117 B | High — full key copied into every node |
 
 ### 7.4. Prefix compression in practice
@@ -484,20 +502,50 @@ Values from `BM_MemoryFootprint` at 100k keys (measured with the global allocato
 Prefix compression is not free: it replaces raw key bytes with tree structure. The trade-off is:
 
 - **What gets compressed**: bytes shared between keys with a common prefix are stored once in a routing node rather than repeated in every leaf.
-- **What gets paid**: each leaf node carries ~56 bytes of struct overhead; internal nodes carry ~56 B struct + a heap-allocated children vector. The weighted average is ~59 B/node.
+- **What gets paid**: each leaf node carries 40 bytes of struct overhead; internal nodes carry 48 B struct + a heap-allocated `ChildStore`. The weighted average is ~44 B/node, but prefix chain-splitting for long keys adds routing nodes that push the effective per-key cost higher.
 
 For short, dissimilar keys (e.g. the generic `"key_N"` benchmark, 6–10 bytes each), compression is minimal and the per-node overhead dominates. For long, highly-redundant keys (e.g. `"user::018f6e2c-XXXX-7000-8000-XXXXXXXXXXXX"`, 45 bytes, 5 prefixes × 20k keys), RadixTree absorbs the extra key length at a modest per-key cost while `std::map` pays the full key storage, confirming that prefix compression is working correctly.
 
 ### 7.5. 100M key projections
 
-The primary concern for ByteCaskDB is the key directory at production scale. The table below uses 1.07 nodes/key and the measured 70 B/key at 100k as the per-node baseline.
+The primary concern for ByteCaskDB is the key directory at production scale. The table below uses the measured ~69 B/key at 1M text keys as the per-key baseline.
 
 | Configuration | B/key | 100M keys |
 |---|---|---|
-| Current (`IntrusivePtr`, `unique_ptr<ChildVec>`, `CompactPrefix`, packed tag) | **70** | **~7.0 GB** |
+| Current (`Node`/`InternalNode` split, struct-of-arrays children, `CompactPrefix` 8 B, packed tag) | **~69** | **~6.9 GB** |
 | `std::map` (no persistence, no prefix compression) | 72 | ~7.2 GB |
 
-The original `shared_ptr`-based design measured 129 B/key (generic) and 139 B/key (prefixed). Intrusive refcounting reduced this to 108/116 B/key (−17%). The leaf node optimization (null `unique_ptr` instead of empty SmallVector) reduced to 86/92 B/key (−20% from intrusive, −33% from original). Replacing `SmallVector<byte,24>` (32 B) with `CompactPrefix` (16 B) and reordering `KeyDirEntry` fields to eliminate alignment padding further reduced to 70/74 B/key (−19% from leaf optimization, −46% from original).
+The original `shared_ptr`-based design measured 129 B/key (generic) and 139 B/key (prefixed). Intrusive refcounting reduced this to 108/116 B/key (−17%). The leaf node optimization (null `unique_ptr` instead of empty SmallVector) reduced to 86/92 B/key (−20% from intrusive, −33% from original). Replacing `SmallVector<byte,24>` (32 B) with `CompactPrefix` (16 B) and reordering `KeyDirEntry` fields to eliminate alignment padding further reduced to 70/74 B/key (−19% from leaf optimization, −46% from original). Shrinking `CompactPrefix` from 16 B to 8 B with chain-splitting for long prefixes, replacing child slot `pair<byte, IntrusivePtr>` with struct-of-arrays (`ChildStore`), and splitting `Node`/`InternalNode` so leaves allocate 40 B instead of 56 B brought the footprint to ~61/63 B/key at 100k and ~69 B/key at 1M (−47% from original).
+
+### 7.6. Memory footprint by key shape
+
+Measured at 1M keys using RSS-based profiling (`memory_profile.cpp`) with 245-byte values and `KeyDirEntry` (16 B). **B/key** is total DB RSS overhead divided by key count. **Overhead** subtracts the average key length — the structural cost the tree adds beyond the raw key bytes.
+
+| Key shape | Avg key size | B/key | Overhead | Description |
+|---|---|---|---|---|
+| prefixed | 44 B | 50 | 6 | Type-prefixed UUIDv7 (`user::018f6e2c-...`). 5 prefix groups share a long common stem — best case for prefix compression. |
+| uuidv7_binary | 16 B | 51 | 35 | Raw 16-byte UUIDv7. Binary encoding of time-ordered UUIDs — compact on disk and in the tree. |
+| incremental | 4 B | 54 | 50 | Auto-increment integers (`"1"` .. `"1000000"`). Short keys with a growing common prefix per decimal digit. |
+| uniform | 8 B | 54 | 46 | Sequential `"key_0"` .. `"key_N"`. Shared `"key_"` prefix, then digit fanout. |
+| hash_prefixed | 24 B | 60 | 36 | Cassandra/DynamoDB pattern: 8-char hash partition + `::item::` + ordered sort key. 8 partitions, good compression within each. |
+| uuidv7 | 36 B | 60 | 24 | RFC 9562 time-ordered UUIDs (text). 48-bit timestamp prefix shared across ~50 keys/ms — good compression. |
+| zipfian | 27 B | 60 | 33 | Skewed hot/cold: 5% short hot keys, 95% longer cold keys with partition prefixes. |
+| binary | 8 B | 65 | 57 | Non-ASCII keys with embedded `0x00`, `0x80`, `0xFF` bytes. Tests byte-level prefix comparison edge cases. |
+| clustered | 16 B | 83 | 67 | Few large partitions (`users/`, `orders/`, `events/`) with 10-digit counters. Wide fanout at counter digit positions. |
+| many_partitions | 13 B | 105 | 92 | 500k distinct 6-digit partition prefixes, ~2 keys each. Wide top-level fanout, minimal prefix sharing. |
+| uuidv4_binary | 16 B | 181 | 165 | Raw 16-byte random UUIDv4. No prefix structure — every byte diverges early. |
+| sha256_bin | 32 B | 409 | 377 | Raw 32-byte SHA-256 hashes. Fully random content, no shared prefix. Worst case for binary keys. |
+| uuidv4_text | 36 B | 434 | 398 | Random UUIDv4 text (`550e8400-e29b-...`). Only the dashes at fixed positions are shared. |
+| uuidv4_prefixed | 44 B | 464 | 420 | Type-prefixed random UUIDv4 (`user::550e8400-...`). Prefix saves ~6 B/key vs bare UUIDv4, but the random suffix dominates. |
+| sha256_hex | 64 B | 881 | 817 | 64-char hex SHA-256 hashes. Fully random, 4 bits of entropy per character — worst case overall. |
+
+Three tiers emerge:
+
+1. **~50–65 B/key** — keys with strong prefix structure (time-ordered UUIDs, type prefixes, sequential integers, hash-partitioned sort keys). Structural overhead is 6–57 B above key size. This is the target range for most database workloads.
+2. **~80–105 B/key** — keys with moderate structure but wide fanout (clustered counters, many small partitions). Still practical at scale.
+3. **~180–880 B/key** — random keys (UUIDv4, SHA-256). The radix tree cannot compress what has no structure. Each key byte that diverges from its neighbours creates a separate routing node. At 1M SHA-256 hex keys the tree uses ~840 MB of RSS.
+
+For production workloads, prefer time-ordered (UUIDv7) or prefix-structured keys. If keys are inherently random (content-addressed hashes), store the binary form (32-byte SHA-256 binary = 409 B/key) rather than hex (64-byte SHA-256 hex = 881 B/key) — the 2× key length reduction yields a 2× memory reduction.
 
 ---
 

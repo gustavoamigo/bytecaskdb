@@ -65,11 +65,10 @@ export struct VacuumOptions {
 export inline constexpr std::uint64_t kDefaultRotationThreshold =
     64ULL * 1024 * 1024;
 
-// Hard limits imposed by the on-disk entry header format.
-// key_size is u16 (2 bytes), value_size is u32 (4 bytes).
+// Hard limits imposed by the on-disk entry header format and in-memory packing.
+// key_size is u16 (2 bytes), value_size is u24 in packed KeyDirEntry (16 MiB).
 export inline constexpr std::uint32_t kMaxKeySize = 65535;
-export inline constexpr std::uint32_t kMaxValueSize =
-    std::numeric_limits<std::uint32_t>::max();
+export inline constexpr std::uint32_t kMaxValueSize = KeyDirEntry::kMaxValueSize;
 
 // Sensible defaults — keys live in RAM (radix tree), values go to disk.
 export inline constexpr std::uint32_t kDefaultMaxKeyBytes = 4096;
@@ -166,7 +165,7 @@ export struct Options {
   // std::invalid_argument. Hard ceiling: 65,535 (u16 wire format).
   std::uint32_t max_key_bytes{kDefaultMaxKeyBytes};
   // Maximum value size in bytes. Values exceeding this limit are rejected with
-  // std::invalid_argument. Hard ceiling: 4,294,967,295 (u32 wire format).
+  // std::invalid_argument. Hard ceiling: 16,777,215 (24-bit packed KeyDirEntry).
   std::uint32_t max_value_bytes{kDefaultMaxValueBytes};
 };
 
@@ -257,13 +256,13 @@ public:
     if (!has_cached_) {
       auto [key_span, dir_entry] = *cur_;
       cached_.first = Key{key_span};
-      if (dir_entry.value_size == 0) {
+      if (dir_entry.value_size() == 0) {
         cached_.second.clear();
       } else {
-        (*state_->files.get(dir_entry.file_id))
-            ->read_value(dir_entry.file_offset,
+        (*state_->files.get(dir_entry.file_id()))
+            ->read_value(dir_entry.file_offset(),
                         narrow<std::uint16_t>(key_span.size()),
-                        dir_entry.value_size, verify_checksums_,
+                        dir_entry.value_size(), verify_checksums_,
                         io_buf_, cached_.second);
       }
       has_cached_ = true;
@@ -857,9 +856,8 @@ private:
   // Merges two RecoveryResults with sequence-based conflict resolution.
   static auto recovery_merge_results(RecoveryResult a, RecoveryResult b)
       -> RecoveryResult;
-  // Reconstructs key_dir from hint files using a single thread.
-  auto recovery_load_serial(EngineState s, bool strict) -> EngineState;
-  // Reconstructs key_dir using file-level fan-in parallelism.
+  // Reconstructs key_dir from hint files. Uses file-level fan-in parallelism
+  // when recovery_threads > 1; single-threaded otherwise.
   auto recovery_load_parallel(EngineState s, unsigned recovery_threads,
                                bool strict) -> EngineState;
 

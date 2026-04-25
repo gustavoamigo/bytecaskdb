@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Date** | April 24, 2026  10:23:41 |
+| **Date** | April 25, 2026  19:43:33 |
 | **Host** | `linuxpc` |
 | **CPUs** | 16 × 4427 MHz |
-| **Git commit** | `8c16b77` |
+| **Git commit** | `a1c28f4` |
 | **Mode** | Full |
 
 ## Hardware
@@ -27,8 +27,8 @@ Installed RAM: 31.3 GiB
 NAME MODEL                       SIZE FSTYPE TRAN
 sda  Samsung SSD 860 EVO 500GB 465.8G        sata
 
-Sequential read speed : 463MiB/s
-Sequential write speed: 476MiB/s
+Sequential read speed : 469MiB/s
+Sequential write speed: 450MiB/s
 
 ==========================================
 ```
@@ -57,50 +57,50 @@ Sequential write speed: 476MiB/s
 
 | Benchmark | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---|---:|---:|:---:|
-| Put (NoSync) | 135.3 Kops/s | **153.6 Kops/s** | **0.88×** |
-| Put (Sync) | **465.5 ops/s** | 457.0 ops/s | **1.02×** |
-| Get | 1.28 Mops/s | **1.29 Mops/s** | **0.99×** |
-| Del (Sync) | **670.3 ops/s** | 462.2 ops/s | **1.45×** |
-| Range-50 | 28.9 K scans/s | **122.7 K scans/s** | **0.24×** |
-| MixedBatch/Sync | **43.5 Kops/s** | 37.6 Kops/s | **1.16×** |
+| Put (NoSync) | 137.7 Kops/s | **154.5 Kops/s** | **0.89×** |
+| Put (Sync) | **454.3 ops/s** | 445.2 ops/s | **1.02×** |
+| Get | 1.15 Mops/s | **1.30 Mops/s** | **0.88×** |
+| Del (Sync) | **656.9 ops/s** | 431.4 ops/s | **1.52×** |
+| Range-50 | 27.8 K scans/s | **116.4 K scans/s** | **0.24×** |
+| MixedBatch/Sync | **40.8 Kops/s** | 39.4 Kops/s | **1.03×** |
 
 ### Get Latency _(CRC disabled)_
 
 | Percentile | ByteCaskDB | RocksDB |
 |---|---:|---:|
-| p50 | 734 ns | 732 ns |
-| p99 | 1.02 µs | 1.13 µs |
+| p50 | 816 ns | 720 ns |
+| p99 | 1.15 µs | 1.14 µs |
 
 ### Concurrent Reads — GetMT _(CRC disabled)_
 
 | Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
-| 2 | 2.32 Mops/s | **2.54 Mops/s** | **0.91×** |
-| 4 | 4.31 Mops/s | **4.68 Mops/s** | **0.92×** |
-| 8 | 5.38 Mops/s | **8.96 Mops/s** | **0.60×** |
-| 16 | 8.00 Mops/s | **11.46 Mops/s** | **0.70×** |
-| 32 | 12.72 Mops/s | **16.56 Mops/s** | **0.77×** |
+| 2 | 2.25 Mops/s | **2.73 Mops/s** | **0.82×** |
+| 4 | 3.95 Mops/s | **4.91 Mops/s** | **0.80×** |
+| 8 | 5.16 Mops/s | **8.91 Mops/s** | **0.58×** |
+| 16 | 7.65 Mops/s | **11.27 Mops/s** | **0.68×** |
+| 32 | 11.27 Mops/s | **15.27 Mops/s** | **0.74×** |
 
 ### Concurrent Writes — PutMT/Sync
 
 | Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
-| 2 | 153.5 ops/s | **245.7 ops/s** | **0.62×** |
-| 4 | 309.8 ops/s | **425.3 ops/s** | **0.73×** |
-| 8 | 613.3 ops/s | **696.4 ops/s** | **0.88×** |
-| 16 | **1.4 Kops/s** | 1.1 Kops/s | **1.30×** |
-| 32 | **3.0 Kops/s** | 1.7 Kops/s | **1.71×** |
-| 64 | **5.1 Kops/s** | 3.5 Kops/s | **1.48×** |
+| 2 | 161.0 ops/s | **250.8 ops/s** | **0.64×** |
+| 4 | 306.8 ops/s | **459.7 ops/s** | **0.67×** |
+| 8 | **653.8 ops/s** | 538.6 ops/s | **1.21×** |
+| 16 | **1.4 Kops/s** | 863.6 ops/s | **1.64×** |
+| 32 | **2.7 Kops/s** | 1.8 Kops/s | **1.51×** |
+| 64 | **4.7 Kops/s** | 3.5 Kops/s | **1.34×** |
 
 ### Read-While-Writing — 1 writer + N readers, Sync _(CRC disabled)_
 
 | Readers | ByteCaskDB | RocksDB |
 |---:|---:|---:|
-| 2 | 2.40 Mops/s | **2.58 Mops/s** |
-| 4 | 4.26 Mops/s | **4.68 Mops/s** |
-| 8 | 5.62 Mops/s | **8.96 Mops/s** |
-| 16 | 8.39 Mops/s | **11.59 Mops/s** |
-| 32 | 13.81 Mops/s | **18.72 Mops/s** |
+| 2 | 2.28 Mops/s | **2.45 Mops/s** |
+| 4 | 4.04 Mops/s | **4.65 Mops/s** |
+| 8 | 5.44 Mops/s | **8.78 Mops/s** |
+| 16 | 8.26 Mops/s | **11.41 Mops/s** |
+| 32 | 12.23 Mops/s | **17.39 Mops/s** |
 
 ---
 ## 500k Keys (500,000)
@@ -111,50 +111,50 @@ Sequential write speed: 476MiB/s
 
 | Benchmark | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---|---:|---:|:---:|
-| Put (NoSync) | 138.2 Kops/s | **158.9 Kops/s** | **0.87×** |
-| Put (Sync) | **163.2 ops/s** | 158.2 ops/s | **1.03×** |
-| Get | **1.27 Mops/s** | 363.8 Kops/s | **3.48×** |
-| Del (Sync) | **172.0 ops/s** | 132.9 ops/s | **1.29×** |
-| Range-50 | 28.2 K scans/s | **65.1 K scans/s** | **0.43×** |
-| MixedBatch/Sync | **15.0 Kops/s** | 14.4 Kops/s | **1.05×** |
+| Put (NoSync) | 131.4 Kops/s | **159.8 Kops/s** | **0.82×** |
+| Put (Sync) | **162.9 ops/s** | 159.5 ops/s | **1.02×** |
+| Get | **1.16 Mops/s** | 351.6 Kops/s | **3.29×** |
+| Del (Sync) | **177.2 ops/s** | 136.3 ops/s | **1.30×** |
+| Range-50 | 27.4 K scans/s | **61.5 K scans/s** | **0.44×** |
+| MixedBatch/Sync | **14.9 Kops/s** | 14.7 Kops/s | **1.01×** |
 
 ### Get Latency _(CRC disabled)_
 
 | Percentile | ByteCaskDB | RocksDB |
 |---|---:|---:|
-| p50 | 742 ns | 2.50 µs |
-| p99 | 1.01 µs | 5.86 µs |
+| p50 | 820 ns | 2.67 µs |
+| p99 | 1.09 µs | 5.77 µs |
 
 ### Concurrent Reads — GetMT _(CRC disabled)_
 
 | Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
-| 2 | **2.26 Mops/s** | 642.7 Kops/s | **3.52×** |
-| 4 | **4.14 Mops/s** | 1.21 Mops/s | **3.41×** |
-| 8 | **6.04 Mops/s** | 2.81 Mops/s | **2.15×** |
-| 16 | **8.41 Mops/s** | 3.90 Mops/s | **2.16×** |
-| 32 | **13.38 Mops/s** | 6.40 Mops/s | **2.09×** |
+| 2 | **2.21 Mops/s** | 677.9 Kops/s | **3.26×** |
+| 4 | **3.88 Mops/s** | 1.28 Mops/s | **3.03×** |
+| 8 | **5.71 Mops/s** | 2.84 Mops/s | **2.01×** |
+| 16 | **8.24 Mops/s** | 4.28 Mops/s | **1.93×** |
+| 32 | **13.08 Mops/s** | 6.30 Mops/s | **2.08×** |
 
 ### Concurrent Writes — PutMT/Sync
 
 | Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
-| 2 | 151.7 ops/s | **259.3 ops/s** | **0.58×** |
-| 4 | 307.6 ops/s | **341.6 ops/s** | **0.90×** |
-| 8 | 664.8 ops/s | **703.3 ops/s** | **0.95×** |
-| 16 | **1.4 Kops/s** | 777.7 ops/s | **1.83×** |
-| 32 | **2.5 Kops/s** | 1.6 Kops/s | **1.55×** |
-| 64 | **4.8 Kops/s** | 3.4 Kops/s | **1.41×** |
+| 2 | 160.7 ops/s | **253.5 ops/s** | **0.63×** |
+| 4 | 333.4 ops/s | **464.5 ops/s** | **0.72×** |
+| 8 | **625.3 ops/s** | 596.0 ops/s | **1.05×** |
+| 16 | **1.4 Kops/s** | 886.2 ops/s | **1.52×** |
+| 32 | **2.8 Kops/s** | 1.9 Kops/s | **1.43×** |
+| 64 | **4.8 Kops/s** | 3.6 Kops/s | **1.34×** |
 
 ### Read-While-Writing — 1 writer + N readers, Sync _(CRC disabled)_
 
 | Readers | ByteCaskDB | RocksDB |
 |---:|---:|---:|
-| 2 | **2.31 Mops/s** | 619.5 Kops/s |
-| 4 | **4.26 Mops/s** | 1.17 Mops/s |
-| 8 | **6.43 Mops/s** | 2.72 Mops/s |
-| 16 | **8.95 Mops/s** | 4.16 Mops/s |
-| 32 | **14.50 Mops/s** | 6.39 Mops/s |
+| 2 | **2.21 Mops/s** | 632.1 Kops/s |
+| 4 | **3.99 Mops/s** | 1.21 Mops/s |
+| 8 | **6.18 Mops/s** | 2.74 Mops/s |
+| 16 | **8.65 Mops/s** | 4.09 Mops/s |
+| 32 | **13.25 Mops/s** | 5.77 Mops/s |
 
 ---
 ## 1M Keys (1,000,000)
@@ -165,50 +165,50 @@ Sequential write speed: 476MiB/s
 
 | Benchmark | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---|---:|---:|:---:|
-| Put (NoSync) | 133.8 Kops/s | **162.8 Kops/s** | **0.82×** |
-| Put (Sync) | 138.5 ops/s | **148.0 ops/s** | **0.94×** |
-| Get | **1.29 Mops/s** | 430.7 Kops/s | **3.00×** |
-| Del (Sync) | **183.9 ops/s** | 1.9 ops/s | **96.92×** |
-| Range-50 | 27.6 K scans/s | **67.6 K scans/s** | **0.41×** |
-| MixedBatch/Sync | **14.2 Kops/s** | 12.8 Kops/s | **1.11×** |
+| Put (NoSync) | 134.2 Kops/s | **160.7 Kops/s** | **0.84×** |
+| Put (Sync) | **157.2 ops/s** | 153.2 ops/s | **1.03×** |
+| Get | **1.14 Mops/s** | 437.3 Kops/s | **2.60×** |
+| Del (Sync) | **165.3 ops/s** | 134.0 ops/s | **1.23×** |
+| Range-50 | 28.0 K scans/s | **69.2 K scans/s** | **0.40×** |
+| MixedBatch/Sync | **14.9 Kops/s** | 14.4 Kops/s | **1.04×** |
 
 ### Get Latency _(CRC disabled)_
 
 | Percentile | ByteCaskDB | RocksDB |
 |---|---:|---:|
-| p50 | 728 ns | 2.10 µs |
-| p99 | 1.01 µs | 5.37 µs |
+| p50 | 834 ns | 2.09 µs |
+| p99 | 1.10 µs | 5.09 µs |
 
 ### Concurrent Reads — GetMT _(CRC disabled)_
 
 | Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
-| 2 | **2.34 Mops/s** | 748.7 Kops/s | **3.12×** |
-| 4 | **4.18 Mops/s** | 1.49 Mops/s | **2.80×** |
-| 8 | **6.25 Mops/s** | 3.24 Mops/s | **1.93×** |
-| 16 | **8.76 Mops/s** | 4.79 Mops/s | **1.83×** |
-| 32 | **14.01 Mops/s** | 7.33 Mops/s | **1.91×** |
+| 2 | **2.25 Mops/s** | 797.7 Kops/s | **2.82×** |
+| 4 | **4.11 Mops/s** | 1.54 Mops/s | **2.67×** |
+| 8 | **6.73 Mops/s** | 3.16 Mops/s | **2.13×** |
+| 16 | **9.49 Mops/s** | 4.88 Mops/s | **1.94×** |
+| 32 | **14.17 Mops/s** | 6.99 Mops/s | **2.03×** |
 
 ### Concurrent Writes — PutMT/Sync
 
 | Threads | ByteCaskDB | RocksDB | ByteCaskDB / RocksDB |
 |---:|---:|---:|:---:|
-| 2 | 145.0 ops/s | **256.7 ops/s** | **0.56×** |
-| 4 | 314.4 ops/s | **439.3 ops/s** | **0.72×** |
-| 8 | 616.9 ops/s | **741.3 ops/s** | **0.83×** |
-| 16 | **1.3 Kops/s** | 815.5 ops/s | **1.65×** |
-| 32 | **2.9 Kops/s** | 1.7 Kops/s | **1.71×** |
-| 64 | **4.9 Kops/s** | 3.3 Kops/s | **1.50×** |
+| 2 | 161.0 ops/s | **268.7 ops/s** | **0.60×** |
+| 4 | 307.4 ops/s | **456.7 ops/s** | **0.67×** |
+| 8 | 652.8 ops/s | **771.5 ops/s** | **0.85×** |
+| 16 | **1.6 Kops/s** | 862.7 ops/s | **1.81×** |
+| 32 | **3.0 Kops/s** | 1.8 Kops/s | **1.66×** |
+| 64 | **4.7 Kops/s** | 3.5 Kops/s | **1.35×** |
 
 ### Read-While-Writing — 1 writer + N readers, Sync _(CRC disabled)_
 
 | Readers | ByteCaskDB | RocksDB |
 |---:|---:|---:|
-| 2 | **2.43 Mops/s** | 720.3 Kops/s |
-| 4 | **4.39 Mops/s** | 1.32 Mops/s |
-| 8 | **6.52 Mops/s** | 2.91 Mops/s |
-| 16 | **9.40 Mops/s** | 4.48 Mops/s |
-| 32 | **14.93 Mops/s** | 7.20 Mops/s |
+| 2 | **2.28 Mops/s** | 759.3 Kops/s |
+| 4 | **4.17 Mops/s** | 1.50 Mops/s |
+| 8 | **6.33 Mops/s** | 3.06 Mops/s |
+| 16 | **9.19 Mops/s** | 4.82 Mops/s |
+| 32 | **14.05 Mops/s** | 6.85 Mops/s |
 
 ---
 
@@ -222,21 +222,21 @@ Sequential write speed: 476MiB/s
 
 | Threads | BCDB 50k | RDB 50k | BCDB 500k | RDB 500k | BCDB 1M | RDB 1M |
 |---:| ---: | ---: | ---: | ---: | ---: | ---: |
-| 2 | 2.32 Mops/s | **2.54 Mops/s** | **2.26 Mops/s** | 642.7 Kops/s | **2.34 Mops/s** | 748.7 Kops/s |
-| 4 | 4.31 Mops/s | **4.68 Mops/s** | **4.14 Mops/s** | 1.21 Mops/s | **4.18 Mops/s** | 1.49 Mops/s |
-| 8 | 5.38 Mops/s | **8.96 Mops/s** | **6.04 Mops/s** | 2.81 Mops/s | **6.25 Mops/s** | 3.24 Mops/s |
-| 16 | 8.00 Mops/s | **11.46 Mops/s** | **8.41 Mops/s** | 3.90 Mops/s | **8.76 Mops/s** | 4.79 Mops/s |
-| 32 | 12.72 Mops/s | **16.56 Mops/s** | **13.38 Mops/s** | 6.40 Mops/s | **14.01 Mops/s** | 7.33 Mops/s |
+| 2 | 2.25 Mops/s | **2.73 Mops/s** | **2.21 Mops/s** | 677.9 Kops/s | **2.25 Mops/s** | 797.7 Kops/s |
+| 4 | 3.95 Mops/s | **4.91 Mops/s** | **3.88 Mops/s** | 1.28 Mops/s | **4.11 Mops/s** | 1.54 Mops/s |
+| 8 | 5.16 Mops/s | **8.91 Mops/s** | **5.71 Mops/s** | 2.84 Mops/s | **6.73 Mops/s** | 3.16 Mops/s |
+| 16 | 7.65 Mops/s | **11.27 Mops/s** | **8.24 Mops/s** | 4.28 Mops/s | **9.49 Mops/s** | 4.88 Mops/s |
+| 32 | 11.27 Mops/s | **15.27 Mops/s** | **13.08 Mops/s** | 6.30 Mops/s | **14.17 Mops/s** | 6.99 Mops/s |
 
 ### p99 Read Latency
 
 | Threads | BCDB 50k | RDB 50k | BCDB 500k | RDB 500k | BCDB 1M | RDB 1M |
 |---:| ---: | ---: | ---: | ---: | ---: | ---: |
-| 2 | **2.26 µs** | 2.36 µs | **2.43 µs** | 13.71 µs | **2.49 µs** | 12.59 µs |
-| 4 | 5.48 µs | **5.27 µs** | **5.99 µs** | 28.74 µs | **5.80 µs** | 26.10 µs |
-| 8 | 17.89 µs | **11.63 µs** | **15.61 µs** | 56.40 µs | **15.05 µs** | 51.23 µs |
-| 16 | 41.71 µs | **31.53 µs** | **39.75 µs** | 100.06 µs | **39.57 µs** | 78.38 µs |
-| 32 | 79.73 µs | **63.31 µs** | **76.55 µs** | 213.81 µs | **69.22 µs** | 140.62 µs |
+| 2 | 2.27 µs | **2.13 µs** | **2.43 µs** | 12.79 µs | **2.40 µs** | 11.58 µs |
+| 4 | 6.21 µs | **4.72 µs** | **6.26 µs** | 28.66 µs | **5.41 µs** | 26.17 µs |
+| 8 | 18.33 µs | **11.35 µs** | **16.45 µs** | 59.46 µs | **13.54 µs** | 54.36 µs |
+| 16 | 43.41 µs | **29.00 µs** | **40.95 µs** | 99.46 µs | **33.09 µs** | 78.61 µs |
+| 32 | 90.51 µs | **58.77 µs** | **77.54 µs** | 172.16 µs | **63.64 µs** | 142.34 µs |
 
 
 # Recovery
@@ -249,31 +249,31 @@ Sequential write speed: 476MiB/s
 
 | Threads | Recovery Time (mean) |
 |---:|---:|
-| 1 | 0.023 s |
-| 2 | 0.023 s |
-| 4 | 0.025 s |
-| 8 | 0.027 s |
-| 16 | 0.029 s |
+| 1 | 0.024 s |
+| 2 | 0.026 s |
+| 4 | 0.028 s |
+| 8 | 0.030 s |
+| 16 | 0.032 s |
 
 ### 1M Keys (1,000,000)
 
 | Threads | Recovery Time (mean) |
 |---:|---:|
-| 1 | 0.297 s |
-| 2 | 0.149 s |
-| 4 | 0.093 s |
-| 8 | 0.064 s |
-| 16 | 0.058 s |
+| 1 | 0.335 s |
+| 2 | 0.192 s |
+| 4 | 0.118 s |
+| 8 | 0.074 s |
+| 16 | 0.066 s |
 
 ### 10M Keys (10,000,000)
 
 | Threads | Recovery Time (mean) |
 |---:|---:|
-| 1 | 3.003 s |
-| 2 | 1.583 s |
-| 4 | 0.914 s |
-| 8 | 0.578 s |
-| 16 | 0.506 s |
+| 1 | 3.411 s |
+| 2 | 1.934 s |
+| 4 | 1.159 s |
+| 8 | 0.708 s |
+| 16 | 0.568 s |
 
 
 # Optimistic Concurrency — CAS Benchmark
@@ -286,21 +286,21 @@ Sequential write speed: 476MiB/s
 
 | Threads | ByteCaskDB | RocksDB | BCDB p50 | RDB p50 | BCDB p99 | RDB p99 | BCDB avg attempts | RDB avg attempts |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2 | 101.0 Kops/s | **154.0 Kops/s** | 38.05 µs | 24.68 µs | 60.85 µs | 47.81 µs | 1.00 | 1.01 |
-| 4 | 153.5 Kops/s | **229.6 Kops/s** | 94.34 µs | 65.62 µs | 213.29 µs | 148.27 µs | 1.02 | 1.02 |
-| 8 | 205.8 Kops/s | **293.3 Kops/s** | 263.39 µs | 204.63 µs | 584.55 µs | 480.63 µs | 1.04 | 1.05 |
-| 16 | **231.4 Kops/s** | 183.4 Kops/s | 975.49 µs | 1.26 ms | 2.76 ms | 4.17 ms | 1.09 | 1.11 |
-| 32 | **283.6 Kops/s** | 187.3 Kops/s | 2.69 ms | 4.76 ms | 11.62 ms | 13.12 ms | 1.16 | 1.21 |
+| 2 | 101.3 Kops/s | **153.8 Kops/s** | 38.02 µs | 24.54 µs | 60.57 µs | 47.07 µs | 1.00 | 1.01 |
+| 4 | 153.2 Kops/s | **221.2 Kops/s** | 95.37 µs | 68.87 µs | 197.66 µs | 148.77 µs | 1.02 | 1.02 |
+| 8 | 207.6 Kops/s | **299.6 Kops/s** | 259.28 µs | 197.60 µs | 583.91 µs | 475.66 µs | 1.04 | 1.05 |
+| 16 | 235.5 Kops/s | **255.3 Kops/s** | 958.11 µs | 946.98 µs | 2.73 ms | 2.50 ms | 1.09 | 1.11 |
+| 32 | **292.3 Kops/s** | 205.8 Kops/s | 2.61 ms | 4.41 ms | 11.31 ms | 11.87 ms | 1.16 | 1.21 |
 
 #### Sync
 
 | Threads | ByteCaskDB | RocksDB | BCDB p50 | RDB p50 | BCDB p99 | RDB p99 | BCDB avg attempts | RDB avg attempts |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2 | **153.0 ops/s** | 137.7 ops/s | 25.95 ms | 26.81 ms | 32.69 ms | 66.68 ms | 1.00 | 1.03 |
-| 4 | 262.8 ops/s | **272.3 ops/s** | 50.50 ms | 62.09 ms | 64.74 ms | 84.48 ms | 1.00 | 1.01 |
-| 8 | **482.4 ops/s** | 449.7 ops/s | 109.83 ms | 147.80 ms | 164.71 ms | 153.98 ms | 1.00 | 1.00 |
-| 16 | 476.3 ops/s | **728.8 ops/s** | 537.75 ms | 294.43 ms | 537.75 ms | 294.43 ms | 1.12 | 1.12 |
-| 32 | 889.7 ops/s | **1.2 Kops/s** | 1151.10 ms | 837.99 ms | 1151.10 ms | 837.99 ms | 1.34 | 1.33 |
+| 2 | 157.8 ops/s | **177.3 ops/s** | 25.27 ms | 23.24 ms | 26.58 ms | 40.87 ms | 1.00 | 1.01 |
+| 4 | **327.2 ops/s** | 264.2 ops/s | 49.29 ms | 49.92 ms | 50.85 ms | 89.98 ms | 1.00 | 1.00 |
+| 8 | **576.5 ops/s** | 514.8 ops/s | 101.09 ms | 131.14 ms | 108.17 ms | 141.86 ms | 1.00 | 1.01 |
+| 16 | **1.4 Kops/s** | 803.9 ops/s | 161.54 ms | 307.41 ms | 161.54 ms | 307.41 ms | 1.08 | 1.08 |
+| 32 | **2.1 Kops/s** | 1.3 Kops/s | 481.77 ms | 797.36 ms | 481.77 ms | 797.36 ms | 1.34 | 1.33 |
 
 ## 10,000 stock items (low contention)
 
@@ -308,21 +308,21 @@ Sequential write speed: 476MiB/s
 
 | Threads | ByteCaskDB | RocksDB | BCDB p50 | RDB p50 | BCDB p99 | RDB p99 | BCDB avg attempts | RDB avg attempts |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2 | 97.2 Kops/s | **153.6 Kops/s** | 40.05 µs | 25.02 µs | 65.61 µs | 39.71 µs | 1.00 | 1.00 |
-| 4 | 114.8 Kops/s | **217.1 Kops/s** | 108.76 µs | 72.20 µs | 485.01 µs | 108.16 µs | 1.00 | 1.00 |
-| 8 | 167.1 Kops/s | **302.7 Kops/s** | 326.75 µs | 203.92 µs | 536.64 µs | 347.80 µs | 1.00 | 1.00 |
-| 16 | 194.9 Kops/s | **264.2 Kops/s** | 1.22 ms | 957.64 µs | 2.17 ms | 1.91 ms | 1.00 | 1.00 |
-| 32 | **226.2 Kops/s** | 217.8 Kops/s | 3.94 ms | 4.51 ms | 9.03 ms | 7.56 ms | 1.00 | 1.00 |
+| 2 | 90.7 Kops/s | **166.5 Kops/s** | 42.42 µs | 23.18 µs | 65.33 µs | 36.93 µs | 1.00 | 1.00 |
+| 4 | 113.9 Kops/s | **219.0 Kops/s** | 108.61 µs | 71.70 µs | 235.06 µs | 106.19 µs | 1.00 | 1.00 |
+| 8 | 159.0 Kops/s | **310.4 Kops/s** | 354.61 µs | 195.88 µs | 458.71 µs | 349.05 µs | 1.00 | 1.00 |
+| 16 | 204.9 Kops/s | **256.8 Kops/s** | 1.13 ms | 974.70 µs | 2.21 ms | 2.21 ms | 1.00 | 1.00 |
+| 32 | **238.3 Kops/s** | 224.3 Kops/s | 3.72 ms | 4.48 ms | 8.35 ms | 6.72 ms | 1.00 | 1.00 |
 
 #### Sync
 
 | Threads | ByteCaskDB | RocksDB | BCDB p50 | RDB p50 | BCDB p99 | RDB p99 | BCDB avg attempts | RDB avg attempts |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2 | 150.2 ops/s | **161.4 ops/s** | 25.84 ms | 22.76 ms | 38.33 ms | 69.21 ms | 1.00 | 1.00 |
-| 4 | 252.4 ops/s | **291.6 ops/s** | 54.43 ms | 48.30 ms | 70.88 ms | 85.57 ms | 1.00 | 1.00 |
-| 8 | 340.2 ops/s | **506.9 ops/s** | 199.11 ms | 114.72 ms | 199.11 ms | 150.00 ms | 1.00 | 1.00 |
-| 16 | 499.4 ops/s | **827.9 ops/s** | 512.67 ms | 276.43 ms | 512.67 ms | 276.43 ms | 1.00 | 1.00 |
-| 32 | 987.2 ops/s | **1.7 Kops/s** | 1037.50 ms | 586.36 ms | 1037.50 ms | 586.36 ms | 1.03 | 1.03 |
+| 2 | 144.0 ops/s | **144.3 ops/s** | 26.47 ms | 23.32 ms | 37.85 ms | 76.21 ms | 1.00 | 1.00 |
+| 4 | **316.6 ops/s** | 250.0 ops/s | 46.66 ms | 64.83 ms | 48.76 ms | 98.62 ms | 1.00 | 1.00 |
+| 8 | **649.9 ops/s** | 544.9 ops/s | 87.01 ms | 122.75 ms | 97.52 ms | 135.95 ms | 1.00 | 1.00 |
+| 16 | **1.3 Kops/s** | 903.1 ops/s | 181.28 ms | 286.11 ms | 188.75 ms | 286.11 ms | 1.00 | 1.00 |
+| 32 | **3.1 Kops/s** | 1.8 Kops/s | 255.86 ms | 575.86 ms | 255.86 ms | 575.86 ms | 1.02 | 1.03 |
 
 ---
-_Generated by `scripts/benchmark_showcase.py` · 2026-04-24_
+_Generated by `scripts/benchmark_showcase.py` · 2026-04-25_

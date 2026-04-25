@@ -1,23 +1,16 @@
 add_rules("mode.debug", "mode.release", "mode.releasedbg")
 
 add_requires("crc32c")
+add_requires("jemalloc", {optional = true})
 -- Test dependency — optional so `xmake build` (default targets)
 -- doesn't download/build it unless the consuming target is explicitly built.
 add_requires("catch2 3.x", {optional = true})
 
--- Benchmark option: `xmake f --enable-benchmarks=true`
--- Downloads benchmark, leveldb, and rocksdb only when enabled.
-option("enable-benchmarks")
-    set_default(false)
-    set_showmenu(true)
-    set_description("Download and build benchmark dependencies (benchmark, leveldb, rocksdb)")
-option_end()
-
-if has_config("enable-benchmarks") then
-    add_requires("benchmark")
-    -- add_requires("leveldb")
-    add_requires("rocksdb", {system = true})
-end
+-- Benchmark dependencies — optional so `xmake build` (default targets)
+-- doesn't download/build them unless a consuming target is explicitly built.
+add_requires("benchmark", {optional = true})
+-- add_requires("leveldb", {optional = true})
+add_requires("rocksdb", {system = true, optional = true})
 
 -- Sanitizer option: `xmake f --sanitizer=address` or `--sanitizer=thread`
 option("sanitizer")
@@ -120,7 +113,22 @@ target("bytecask_tests")
     set_default(false)
     -- For VS Code / clangd support, run: scripts/gen_compile_commands.sh
     add_files("tests/*.cpp", "tests/proof/generated/*.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
+    remove_files("tests/radix_tree_memory_test.cpp")
     add_includedirs("bytecaskdb", "tests")
+    add_packages("catch2", "crc32c")
+    add_defines("BYTECASK_TESTING")
+    on_config(function(t)
+        apply_sanitizer(t)
+        apply_coverage(t)
+        add_release_opts(t)
+    end)
+
+target("radix_tree_memory_tests")
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/radix_tree_memory_test.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
+    add_includedirs("bytecaskdb", "tests")
+    add_cxflags("-Wno-global-constructors")
     add_packages("catch2", "crc32c")
     add_defines("BYTECASK_TESTING")
     on_config(function(t)
@@ -157,7 +165,7 @@ target("memory_profile")
     set_kind("binary")
     set_default(false)
     add_files("benchmarks/memory_profile.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
-    add_packages("crc32c")
+    add_packages("crc32c", "jemalloc")
     on_config(function(t)
         apply_sanitizer(t)
         add_release_opts(t)

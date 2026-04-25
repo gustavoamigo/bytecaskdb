@@ -14,6 +14,10 @@ compile_commands.json
 # Benchmark temp data
 .tmp/
 
+# Benchmark results (local, causes merge conflicts)
+benchmarks/engine_bench_results.csv
+benchmarks/map_bench_results.csv
+
 # Benchmark showcase output
 bytecask_benchmark_showcase_*.md
 bench_data/

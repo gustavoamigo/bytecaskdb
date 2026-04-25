@@ -4,6 +4,7 @@ summary table of peak RSS and per-key overhead.
 
 Usage:
     python3 scripts/run_memory_profile.py [--skip-build] [--sizes 50000,100000,500000]
+    python3 scripts/run_memory_profile.py --key-formats=uuidv7,uuidv4_text,sha256_hex
 """
 
 import argparse
@@ -16,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TARGET = "memory_profile"
 BINARY = REPO_ROOT / "build/linux/x86_64/release/memory_profile"
 DEFAULT_SIZES = [50_000, 100_000, 500_000, 1_000_000, 10_000_000]
+DEFAULT_FORMATS = ["prefixed", "binary"]
 VALUE_SIZE = 245  # must match kValueSize in memory_profile.cpp
 
 
@@ -39,8 +41,8 @@ def parse_output(text: str) -> dict[str, int]:
     results: dict[str, int] = {}
     phase = None
     for line in text.splitlines():
-        # Header: === Memory Profile (N keys, K-byte [text|binary] keys, V-byte values) ===
-        m = re.search(r"(\d+)-byte (?:text|binary) keys", line)
+        # Header: === Memory Profile (N keys, K-byte <format> keys, V-byte values) ===
+        m = re.search(r"(\d+)-byte \S+ keys", line)
         if m:
             results["meta/key_size"] = int(m.group(1))
         m = re.search(r"(\d+)-byte values", line)
@@ -57,7 +59,7 @@ def parse_output(text: str) -> dict[str, int]:
     return results
 
 
-def run_profile(n: int, key_format: str = "text") -> dict[str, int]:
+def run_profile(n: int, key_format: str = "prefixed") -> dict[str, int]:
     bend_dir = str(REPO_ROOT / ".tmp")
     env = {"BC_DATASET_SIZE": str(n), "BC_BENCH_DIR": bend_dir, "BC_KEY_FORMAT": key_format}
     # Inherit PATH and other essentials
@@ -120,7 +122,16 @@ def main() -> None:
         "--sizes",
         type=str,
         default=None,
-        help="Comma-separated dataset sizes (default: 50k,100k,500k,1M)",
+        help="Comma-separated dataset sizes (default: 50k,100k,500k,1M,10M)",
+    )
+    parser.add_argument(
+        "--key-formats",
+        type=str,
+        default=None,
+        help="Comma-separated key formats to profile (default: prefixed,binary). "
+             "Available: uniform, prefixed, short, incremental, uuidv7, uuidv7_binary, "
+             "sha256_hex, sha256_bin, uuidv4_text, uuidv4_prefixed, uuidv4_binary, "
+             "hash_prefixed, binary, zipfian, clustered, many_partitions, mixed",
     )
     args = parser.parse_args()
 
@@ -128,24 +139,23 @@ def main() -> None:
     if args.sizes:
         sizes = [int(s.replace("_", "")) for s in args.sizes.split(",")]
 
+    formats = DEFAULT_FORMATS
+    if args.key_formats:
+        formats = [f.strip() for f in args.key_formats.split(",")]
+
     build(args.skip_build)
 
-    # Run with text keys (string UUIDv7)
-    print("\n" + "=" * 60)
-    print("  TEXT KEYS (string UUIDv7)")
-    print("=" * 60)
-    text_rows, text_key_size, text_value_size = run_format(sizes, "text")
+    all_results: list[tuple[str, list[tuple[int, int, int, float]], int, int]] = []
 
-    # Run with binary keys (16-byte UUIDv7)
-    print("\n" + "=" * 60)
-    print("  BINARY KEYS (16-byte UUIDv7)")
-    print("=" * 60)
-    binary_rows, binary_key_size, binary_value_size = run_format(sizes, "binary")
+    for fmt in formats:
+        print("\n" + "=" * 60)
+        print(f"  {fmt.upper()} KEYS")
+        print("=" * 60)
+        rows, key_size, value_size = run_format(sizes, fmt)
+        all_results.append((fmt, rows, key_size, value_size))
 
-    # Print both summaries
-    # Overhead = B/key - key_size (structural overhead beyond key bytes)
-    print_summary("Text keys", text_rows, text_key_size, text_value_size)
-    print_summary("Binary keys", binary_rows, binary_key_size, binary_value_size)
+    for fmt, rows, key_size, value_size in all_results:
+        print_summary(f"{fmt} keys", rows, key_size, value_size)
 
 
 if __name__ == "__main__":
