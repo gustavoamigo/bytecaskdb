@@ -785,11 +785,11 @@ TEST_CASE("RadixTree erase empty key", "[radix_tree]") {
 }
 
 // ---------------------------------------------------------------------------
-// Long keys: prefix > 15 bytes triggers CompactPrefix heap spill
+// Long keys: prefix > 7 bytes triggers chain-split routing nodes
 // ---------------------------------------------------------------------------
-TEST_CASE("RadixTree long keys spill CompactPrefix", "[radix_tree]") {
-  // Key at the inline boundary (15 bytes as prefix after split).
-  std::string boundary(16, 'b');
+TEST_CASE("RadixTree long keys chain-split", "[radix_tree]") {
+  // Key at the inline boundary (7 bytes as prefix after split).
+  std::string boundary(8, 'b');
   auto t0 = Tree{}.set(to_bytes(boundary), 42);
   CHECK(*t0.get(to_bytes(boundary)) == 42);
 

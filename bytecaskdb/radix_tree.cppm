@@ -26,168 +26,52 @@ namespace bytecask {
 // ---------------------------------------------------------------------------
 // CompactPrefix
 //
-// Fixed 16-byte container for node prefix bytes. Stores up to 15 bytes
-// inline (no heap allocation). Prefixes longer than 15 bytes spill to a
-// heap-allocated buffer.
+// Fixed 8-byte container for node prefix bytes. Stores up to 7 bytes inline.
+// No heap allocation — prefixes longer than 7 bytes are split across a chain
+// of routing nodes (each carrying up to 7 prefix bytes + 1 transition byte).
 //
-// Inline layout (size_ <= 15):
-//   size_ : length (0-15)
-//   data_[0..14] : prefix bytes
-//
-// Heap layout (size_ == kHeapFlag):
-//   data_[0..7]  : byte* pointer via memcpy
-//   data_[8..11] : uint32_t heap length via memcpy
-//
-// sizeof(CompactPrefix) == 16, alignof(CompactPrefix) == 1.
+// sizeof(CompactPrefix) == 8, alignof(CompactPrefix) == 1.
 // ---------------------------------------------------------------------------
 class CompactPrefix {
 public:
-  static constexpr std::size_t kInlineCap = 15;
+  static constexpr std::size_t kInlineCap = 7;
 
   CompactPrefix() noexcept = default;
 
-  ~CompactPrefix() { free_heap(); }
-
-  CompactPrefix(const CompactPrefix &other) : size_{other.size_} {
-    if (other.on_heap()) {
-      auto n = other.heap_size();
-      auto *buf = new std::byte[n];
-      std::memcpy(buf, other.heap_ptr(), n);
-      store_heap_ptr(buf);
-      store_heap_size(n);
-    } else {
-      std::memcpy(data_, other.data_, other.inline_size());
-    }
-  }
-
-  CompactPrefix(CompactPrefix &&other) noexcept : size_{other.size_} {
-    std::memcpy(data_, other.data_, sizeof(data_));
-    other.size_ = 0;
-  }
-
-  auto operator=(const CompactPrefix &other) -> CompactPrefix & {
-    if (this != &other) {
-      auto tmp{other};
-      *this = std::move(tmp);
-    }
-    return *this;
-  }
-
-  auto operator=(CompactPrefix &&other) noexcept -> CompactPrefix & {
-    if (this == &other)
-      return *this;
-    free_heap();
-    size_ = other.size_;
-    std::memcpy(data_, other.data_, sizeof(data_));
-    other.size_ = 0;
-    return *this;
-  }
-
-  [[nodiscard]] auto size() const noexcept -> std::size_t {
-    return on_heap() ? heap_size() : inline_size();
-  }
-
+  [[nodiscard]] auto size() const noexcept -> std::size_t { return size_; }
   [[nodiscard]] auto empty() const noexcept -> bool { return size_ == 0; }
-
-  [[nodiscard]] auto data() noexcept -> std::byte * {
-    return on_heap() ? heap_ptr() : data_;
-  }
-
+  [[nodiscard]] auto data() noexcept -> std::byte * { return data_; }
   [[nodiscard]] auto data() const noexcept -> const std::byte * {
-    return on_heap() ? heap_ptr() : data_;
+    return data_;
   }
-
   [[nodiscard]] auto operator[](std::size_t i) noexcept -> std::byte & {
-    return data()[i];
+    return data_[i];
   }
-
   [[nodiscard]] auto operator[](std::size_t i) const noexcept
       -> const std::byte & {
-    return data()[i];
+    return data_[i];
   }
-
-  [[nodiscard]] auto begin() noexcept -> std::byte * { return data(); }
-  [[nodiscard]] auto end() noexcept -> std::byte * { return data() + size(); }
+  [[nodiscard]] auto begin() noexcept -> std::byte * { return data_; }
+  [[nodiscard]] auto end() noexcept -> std::byte * { return data_ + size_; }
   [[nodiscard]] auto begin() const noexcept -> const std::byte * {
-    return data();
+    return data_;
   }
   [[nodiscard]] auto end() const noexcept -> const std::byte * {
-    return data() + size();
+    return data_ + size_;
   }
 
   void push_back(std::byte b) {
-    if (on_heap()) {
-      auto old_n = heap_size();
-      auto *old_buf = heap_ptr();
-      auto *new_buf = new std::byte[old_n + 1];
-      std::memcpy(new_buf, old_buf, old_n);
-      new_buf[old_n] = b;
-      delete[] old_buf;
-      store_heap_ptr(new_buf);
-      store_heap_size(old_n + 1);
-      return;
-    }
-    auto n = inline_size();
-    if (n < kInlineCap) {
-      data_[n] = b;
-      ++size_;
-      return;
-    }
-    // Spill: copy inline bytes + new byte to heap.
-    auto *buf = new std::byte[kInlineCap + 1];
-    std::memcpy(buf, data_, kInlineCap);
-    buf[kInlineCap] = b;
-    store_heap_ptr(buf);
-    store_heap_size(kInlineCap + 1);
-    size_ = kHeapFlag;
+    assert(size_ < kInlineCap);
+    data_[size_++] = b;
   }
 
-  void clear() {
-    free_heap();
-    size_ = 0;
-  }
+  void clear() { size_ = 0; }
 
 private:
-  static constexpr std::uint8_t kHeapFlag = 0xFF;
-
-  [[nodiscard]] auto on_heap() const noexcept -> bool {
-    return size_ == kHeapFlag;
-  }
-
-  [[nodiscard]] auto inline_size() const noexcept -> std::size_t {
-    return size_;
-  }
-
-  [[nodiscard]] auto heap_size() const noexcept -> std::size_t {
-    std::uint32_t n;
-    std::memcpy(&n, data_ + 8, sizeof(n));
-    return n;
-  }
-
-  void store_heap_size(std::size_t n) noexcept {
-    auto n32 = static_cast<std::uint32_t>(n);
-    std::memcpy(data_ + 8, &n32, sizeof(n32));
-  }
-
-  [[nodiscard]] auto heap_ptr() const noexcept -> std::byte * {
-    std::byte *p;
-    std::memcpy(&p, data_, sizeof(p));
-    return p;
-  }
-
-  void store_heap_ptr(std::byte *p) noexcept {
-    std::memcpy(data_, &p, sizeof(p));
-  }
-
-  void free_heap() noexcept {
-    if (on_heap())
-      delete[] heap_ptr();
-  }
-
   std::uint8_t size_{0};
   std::byte data_[kInlineCap]{};
 };
-static_assert(sizeof(CompactPrefix) == 16);
+static_assert(sizeof(CompactPrefix) == 8);
 static_assert(alignof(CompactPrefix) == 1);
 
 // ---------------------------------------------------------------------------
@@ -495,6 +379,10 @@ template <typename V> struct Node {
   }
 };
 
+// Check Node size after CompactPrefix shrink (16B → 8B).
+// Node<uint64_t>: 4+4+8+8+8 = 32.
+static_assert(sizeof(Node<std::uint64_t>) == 32);
+
 // ---------------------------------------------------------------------------
 // Helper: compute the common prefix length between a node's prefix and a key
 // slice.
@@ -644,18 +532,115 @@ private:
     return nullptr;
   }
 
+  // -- chain builders --
+  // Build a chain of routing nodes ending in a value-bearing leaf.
+  // Chunks key left-to-right: each intermediate node gets 7 prefix bytes +
+  // 1 transition byte (8 bytes of key material per hop). The final leaf
+  // gets the remaining 0–7 bytes as prefix.
+  static auto build_leaf_chain(std::span<const std::byte> key, V val,
+                               std::uint32_t tag = 0)
+      -> IntrusivePtr<Node<V>> {
+    // Fast path: key fits in a single node's prefix.
+    if (key.size() <= CompactPrefix::kInlineCap) {
+      auto leaf = make_intrusive<Node<V>>();
+      if (tag)
+        leaf->set_edit_tag(tag);
+      for (auto b : key)
+        leaf->prefix.push_back(b);
+      leaf->set_value(std::move(val));
+      return leaf;
+    }
+
+    // Partition key into chunks of 7 prefix + 1 transition byte.
+    // Collect chunk boundaries first, then build bottom-up.
+    struct Chunk {
+      std::size_t prefix_start;
+      std::size_t prefix_len;
+      std::size_t transition_idx; // index of transition byte (unused for last)
+    };
+    std::vector<Chunk> chunks;
+    std::size_t pos = 0;
+    while (key.size() - pos > CompactPrefix::kInlineCap) {
+      chunks.push_back({pos, CompactPrefix::kInlineCap, pos + CompactPrefix::kInlineCap});
+      pos += CompactPrefix::kInlineCap + 1; // 7 prefix + 1 transition
+    }
+    // Last chunk: remaining 0–7 bytes become the leaf's prefix.
+    auto leaf_prefix = key.subspan(pos);
+
+    // Build bottom-up: leaf first, then wrap in routing nodes.
+    auto cur = make_intrusive<Node<V>>();
+    if (tag)
+      cur->set_edit_tag(tag);
+    for (auto b : leaf_prefix)
+      cur->prefix.push_back(b);
+    cur->set_value(std::move(val));
+
+    for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
+      auto routing = make_intrusive<Node<V>>();
+      if (tag)
+        routing->set_edit_tag(tag);
+      for (std::size_t i = 0; i < it->prefix_len; ++i)
+        routing->prefix.push_back(key[it->prefix_start + i]);
+      routing->insert_child(key[it->transition_idx], std::move(cur));
+      cur = std::move(routing);
+    }
+    return cur;
+  }
+
+  // Build a chain of routing nodes with an existing terminal node at the end.
+  // Overwrites terminal->prefix with the last chunk. Leaves terminal's
+  // children and value intact.
+  static auto build_routing_chain(std::span<const std::byte> merged,
+                                  IntrusivePtr<Node<V>> terminal,
+                                  std::uint32_t tag = 0)
+      -> IntrusivePtr<Node<V>> {
+    // Fast path: fits in a single prefix.
+    if (merged.size() <= CompactPrefix::kInlineCap) {
+      terminal->prefix.clear();
+      for (auto b : merged)
+        terminal->prefix.push_back(b);
+      return terminal;
+    }
+
+    // Partition into chunks.
+    struct Chunk {
+      std::size_t prefix_start;
+      std::size_t prefix_len;
+      std::size_t transition_idx;
+    };
+    std::vector<Chunk> chunks;
+    std::size_t pos = 0;
+    while (merged.size() - pos > CompactPrefix::kInlineCap) {
+      chunks.push_back({pos, CompactPrefix::kInlineCap, pos + CompactPrefix::kInlineCap});
+      pos += CompactPrefix::kInlineCap + 1;
+    }
+
+    // Set terminal's prefix to the last chunk.
+    terminal->prefix.clear();
+    for (auto b : merged.subspan(pos))
+      terminal->prefix.push_back(b);
+
+    // Build bottom-up: terminal is the innermost node.
+    auto cur = std::move(terminal);
+    for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
+      auto routing = make_intrusive<Node<V>>();
+      if (tag)
+        routing->set_edit_tag(tag);
+      for (std::size_t i = 0; i < it->prefix_len; ++i)
+        routing->prefix.push_back(merged[it->prefix_start + i]);
+      routing->insert_child(merged[it->transition_idx], std::move(cur));
+      cur = std::move(routing);
+    }
+    return cur;
+  }
+
   // -- set (returns new root + whether a new key was inserted) --
   static auto set_impl(const IntrusivePtr<Node<V>> &node,
                        std::span<const std::byte> key, V val)
       -> std::pair<IntrusivePtr<Node<V>>, bool> {
     if (!node) {
-      // Create a leaf.
-      auto leaf = make_intrusive<Node<V>>();
-      leaf->prefix = typename Node<V>::Prefix{};
-      for (auto b : key)
-        leaf->prefix.push_back(b);
-      leaf->set_value(std::move(val));
-      return {std::move(leaf), true};
+      // Create a leaf (chain-split if key > 7 bytes).
+      return {build_leaf_chain(key, std::move(val)), true};
     }
 
     auto new_node = node->clone();
@@ -687,11 +672,8 @@ private:
         split->set_value(std::move(val));
       } else {
         auto new_transition = remaining[0];
-        auto new_leaf = make_intrusive<Node<V>>();
-        for (auto b : remaining.subspan(1))
-          new_leaf->prefix.push_back(b);
-        new_leaf->set_value(std::move(val));
-        split->insert_child(new_transition, std::move(new_leaf));
+        auto chain = build_leaf_chain(remaining.subspan(1), std::move(val));
+        split->insert_child(new_transition, std::move(chain));
       }
       return {std::move(split), true};
     }
@@ -716,11 +698,8 @@ private:
       return {std::move(new_node), inserted};
     }
     // No child for this transition — create a leaf.
-    auto leaf = make_intrusive<Node<V>>();
-    for (auto b : child_key)
-      leaf->prefix.push_back(b);
-    leaf->set_value(std::move(val));
-    new_node->insert_child(transition, std::move(leaf));
+    auto chain = build_leaf_chain(child_key, std::move(val));
+    new_node->insert_child(transition, std::move(chain));
     return {std::move(new_node), true};
   }
 
@@ -797,6 +776,7 @@ private:
 
   // Merge a routing node (no value) with its single child.
   // New prefix = node.prefix + transition_byte + child.prefix
+  // If combined prefix > 7 bytes, builds a chain of routing nodes.
   static auto merge_with_child(IntrusivePtr<Node<V>> node)
       -> IntrusivePtr<Node<V>> {
     assert(!node->has_value() && node->child_count() == 1);
@@ -804,14 +784,28 @@ private:
     auto transition = slot0.transition;
     auto child = slot0.ptr->clone();
 
-    typename Node<V>::Prefix merged_prefix;
+    auto total = node->prefix.size() + 1 + child->prefix.size();
+    if (total <= CompactPrefix::kInlineCap) {
+      // Fast path: fits in a single prefix.
+      typename Node<V>::Prefix merged_prefix;
+      for (auto b : node->prefix)
+        merged_prefix.push_back(b);
+      merged_prefix.push_back(transition);
+      for (std::size_t i = 0; i < child->prefix.size(); ++i)
+        merged_prefix.push_back(child->prefix[i]);
+      child->prefix = std::move(merged_prefix);
+      return std::move(child);
+    }
+    // Overflow: collect merged bytes, build a routing chain.
+    std::vector<std::byte> merged;
+    merged.reserve(total);
     for (auto b : node->prefix)
-      merged_prefix.push_back(b);
-    merged_prefix.push_back(transition);
+      merged.push_back(b);
+    merged.push_back(transition);
     for (std::size_t i = 0; i < child->prefix.size(); ++i)
-      merged_prefix.push_back(child->prefix[i]);
-    child->prefix = std::move(merged_prefix);
-    return child;
+      merged.push_back(child->prefix[i]);
+    return build_routing_chain(std::span<const std::byte>{merged},
+                               std::move(child));
   }
 
   // -- merge_impl --
@@ -1041,6 +1035,8 @@ private:
   // to allow in-place mutation. The refcount check defends against tag
   // wraparound after 2^31 transient sessions: even if an old node
   // happens to carry the same 31-bit tag, it will be cloned if shared.
+  using Ops = PersistentRadixTree<V>;
+
   static auto ensure_mutable(const IntrusivePtr<Node<V>> &node,
                              std::uint32_t tag) -> IntrusivePtr<Node<V>> {
     if (node && node->edit_tag() == tag &&
@@ -1060,12 +1056,7 @@ private:
                             std::uint32_t tag)
       -> std::pair<IntrusivePtr<Node<V>>, bool> {
     if (!node) {
-      auto leaf = make_intrusive<Node<V>>();
-      leaf->set_edit_tag(tag);
-      for (auto b : key)
-        leaf->prefix.push_back(b);
-      leaf->set_value(std::move(val));
-      return {std::move(leaf), true};
+      return {Ops::build_leaf_chain(key, std::move(val), tag), true};
     }
 
     auto mutable_node = ensure_mutable(node, tag);
@@ -1092,12 +1083,8 @@ private:
         split->set_value(std::move(val));
       } else {
         auto new_transition = remaining[0];
-        auto new_leaf = make_intrusive<Node<V>>();
-        new_leaf->set_edit_tag(tag);
-        for (auto b : remaining.subspan(1))
-          new_leaf->prefix.push_back(b);
-        new_leaf->set_value(std::move(val));
-        split->insert_child(new_transition, std::move(new_leaf));
+        auto chain = Ops::build_leaf_chain(remaining.subspan(1), std::move(val), tag);
+        split->insert_child(new_transition, std::move(chain));
       }
       return {std::move(split), true};
     }
@@ -1118,12 +1105,8 @@ private:
       existing_child->ptr = std::move(new_child);
       return {std::move(mutable_node), inserted};
     }
-    auto leaf = make_intrusive<Node<V>>();
-    leaf->set_edit_tag(tag);
-    for (auto b : child_key)
-      leaf->prefix.push_back(b);
-    leaf->set_value(std::move(val));
-    mutable_node->insert_child(transition, std::move(leaf));
+    auto chain = Ops::build_leaf_chain(child_key, std::move(val), tag);
+    mutable_node->insert_child(transition, std::move(chain));
     return {std::move(mutable_node), true};
   }
 
@@ -1137,12 +1120,7 @@ private:
                                std::uint32_t tag, Pred &&should_replace)
       -> std::tuple<IntrusivePtr<Node<V>>, std::optional<V>, bool> {
     if (!node) {
-      auto leaf = make_intrusive<Node<V>>();
-      leaf->set_edit_tag(tag);
-      for (auto b : key)
-        leaf->prefix.push_back(b);
-      leaf->set_value(std::move(val));
-      return {std::move(leaf), std::nullopt, true};
+      return {Ops::build_leaf_chain(key, std::move(val), tag), std::nullopt, true};
     }
 
     auto mutable_node = ensure_mutable(node, tag);
@@ -1169,12 +1147,8 @@ private:
         split->set_value(std::move(val));
       } else {
         auto new_transition = remaining[0];
-        auto new_leaf = make_intrusive<Node<V>>();
-        new_leaf->set_edit_tag(tag);
-        for (auto b : remaining.subspan(1))
-          new_leaf->prefix.push_back(b);
-        new_leaf->set_value(std::move(val));
-        split->insert_child(new_transition, std::move(new_leaf));
+        auto chain = Ops::build_leaf_chain(remaining.subspan(1), std::move(val), tag);
+        split->insert_child(new_transition, std::move(chain));
       }
       return {std::move(split), std::nullopt, true};
     }
@@ -1203,12 +1177,8 @@ private:
       existing_child->ptr = std::move(new_child);
       return {std::move(mutable_node), std::move(displaced), inserted};
     }
-    auto leaf = make_intrusive<Node<V>>();
-    leaf->set_edit_tag(tag);
-    for (auto b : child_key)
-      leaf->prefix.push_back(b);
-    leaf->set_value(std::move(val));
-    mutable_node->insert_child(transition, std::move(leaf));
+    auto chain = Ops::build_leaf_chain(child_key, std::move(val), tag);
+    mutable_node->insert_child(transition, std::move(chain));
     return {std::move(mutable_node), std::nullopt, true};
   }
 
@@ -1277,14 +1247,25 @@ private:
     auto transition = slot.transition;
     auto child = ensure_mutable(slot.ptr, tag);
 
-    typename Node<V>::Prefix merged_prefix;
+    auto total = node->prefix.size() + 1 + child->prefix.size();
+    if (total <= CompactPrefix::kInlineCap) {
+      typename Node<V>::Prefix merged_prefix;
+      for (std::size_t i = 0; i < node->prefix.size(); ++i)
+        merged_prefix.push_back(node->prefix[i]);
+      merged_prefix.push_back(transition);
+      for (std::size_t i = 0; i < child->prefix.size(); ++i)
+        merged_prefix.push_back(child->prefix[i]);
+      child->prefix = std::move(merged_prefix);
+      return std::move(child);
+    }    std::vector<std::byte> merged;
+    merged.reserve(total);
     for (std::size_t i = 0; i < node->prefix.size(); ++i)
-      merged_prefix.push_back(node->prefix[i]);
-    merged_prefix.push_back(transition);
+      merged.push_back(node->prefix[i]);
+    merged.push_back(transition);
     for (std::size_t i = 0; i < child->prefix.size(); ++i)
-      merged_prefix.push_back(child->prefix[i]);
-    child->prefix = std::move(merged_prefix);
-    return child;
+      merged.push_back(child->prefix[i]);
+    return Ops::build_routing_chain(std::span<const std::byte>{merged},
+                               std::move(child), tag);
   }
 
   friend class PersistentRadixTree<V>;
