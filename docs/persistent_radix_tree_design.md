@@ -517,6 +517,36 @@ The primary concern for ByteCaskDB is the key directory at production scale. The
 
 The original `shared_ptr`-based design measured 129 B/key (generic) and 139 B/key (prefixed). Intrusive refcounting reduced this to 108/116 B/key (−17%). The leaf node optimization (null `unique_ptr` instead of empty SmallVector) reduced to 86/92 B/key (−20% from intrusive, −33% from original). Replacing `SmallVector<byte,24>` (32 B) with `CompactPrefix` (16 B) and reordering `KeyDirEntry` fields to eliminate alignment padding further reduced to 70/74 B/key (−19% from leaf optimization, −46% from original). Shrinking `CompactPrefix` from 16 B to 8 B with chain-splitting for long prefixes, replacing child slot `pair<byte, IntrusivePtr>` with struct-of-arrays (`ChildStore`), and splitting `Node`/`InternalNode` so leaves allocate 40 B instead of 56 B brought the footprint to ~61/63 B/key at 100k and ~69 B/key at 1M (−47% from original).
 
+### 7.6. Memory footprint by key shape
+
+Measured at 1M keys using RSS-based profiling (`memory_profile.cpp`) with 245-byte values and `KeyDirEntry` (16 B). **B/key** is total DB RSS overhead divided by key count. **Overhead** subtracts the average key length — the structural cost the tree adds beyond the raw key bytes.
+
+| Key shape | Avg key size | B/key | Overhead | Description |
+|---|---|---|---|---|
+| prefixed | 44 B | 50 | 6 | Type-prefixed UUIDv7 (`user::018f6e2c-...`). 5 prefix groups share a long common stem — best case for prefix compression. |
+| uuidv7_binary | 16 B | 51 | 35 | Raw 16-byte UUIDv7. Binary encoding of time-ordered UUIDs — compact on disk and in the tree. |
+| incremental | 4 B | 54 | 50 | Auto-increment integers (`"1"` .. `"1000000"`). Short keys with a growing common prefix per decimal digit. |
+| uniform | 8 B | 54 | 46 | Sequential `"key_0"` .. `"key_N"`. Shared `"key_"` prefix, then digit fanout. |
+| hash_prefixed | 24 B | 60 | 36 | Cassandra/DynamoDB pattern: 8-char hash partition + `::item::` + ordered sort key. 8 partitions, good compression within each. |
+| uuidv7 | 36 B | 60 | 24 | RFC 9562 time-ordered UUIDs (text). 48-bit timestamp prefix shared across ~50 keys/ms — good compression. |
+| zipfian | 27 B | 60 | 33 | Skewed hot/cold: 5% short hot keys, 95% longer cold keys with partition prefixes. |
+| binary | 8 B | 65 | 57 | Non-ASCII keys with embedded `0x00`, `0x80`, `0xFF` bytes. Tests byte-level prefix comparison edge cases. |
+| clustered | 16 B | 83 | 67 | Few large partitions (`users/`, `orders/`, `events/`) with 10-digit counters. Wide fanout at counter digit positions. |
+| many_partitions | 13 B | 105 | 92 | 500k distinct 6-digit partition prefixes, ~2 keys each. Wide top-level fanout, minimal prefix sharing. |
+| uuidv4_binary | 16 B | 181 | 165 | Raw 16-byte random UUIDv4. No prefix structure — every byte diverges early. |
+| sha256_bin | 32 B | 409 | 377 | Raw 32-byte SHA-256 hashes. Fully random content, no shared prefix. Worst case for binary keys. |
+| uuidv4_text | 36 B | 434 | 398 | Random UUIDv4 text (`550e8400-e29b-...`). Only the dashes at fixed positions are shared. |
+| uuidv4_prefixed | 44 B | 464 | 420 | Type-prefixed random UUIDv4 (`user::550e8400-...`). Prefix saves ~6 B/key vs bare UUIDv4, but the random suffix dominates. |
+| sha256_hex | 64 B | 881 | 817 | 64-char hex SHA-256 hashes. Fully random, 4 bits of entropy per character — worst case overall. |
+
+Three tiers emerge:
+
+1. **~50–65 B/key** — keys with strong prefix structure (time-ordered UUIDs, type prefixes, sequential integers, hash-partitioned sort keys). Structural overhead is 6–57 B above key size. This is the target range for most database workloads.
+2. **~80–105 B/key** — keys with moderate structure but wide fanout (clustered counters, many small partitions). Still practical at scale.
+3. **~180–880 B/key** — random keys (UUIDv4, SHA-256). The radix tree cannot compress what has no structure. Each key byte that diverges from its neighbours creates a separate routing node. At 1M SHA-256 hex keys the tree uses ~840 MB of RSS.
+
+For production workloads, prefer time-ordered (UUIDv7) or prefix-structured keys. If keys are inherently random (content-addressed hashes), store the binary form (32-byte SHA-256 binary = 409 B/key) rather than hex (64-byte SHA-256 hex = 881 B/key) — the 2× key length reduction yields a 2× memory reduction.
+
 ---
 
 ## 8. Benchmark Results
