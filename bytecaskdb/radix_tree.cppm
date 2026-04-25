@@ -183,30 +183,38 @@ inline std::atomic<std::uint64_t> next_edit_tag{1};
 } // namespace detail
 
 // ---------------------------------------------------------------------------
-// Node<V>
+// Node<V> — base type for all radix tree nodes (leaf and internal).
+//
+// packed_tag_ bit layout:
+//   [31: has_value] [30: has_children] [29:0: edit_tag]
+//
+// 94% of nodes are leaves that never acquire children. By splitting the
+// children_ field into a derived InternalNode<V>, leaf nodes are allocated
+// at sizeof(Node) = 40 bytes (glibc usable=40) instead of 48 bytes
+// (glibc usable=56), saving 16 bytes per leaf.
+//
+// Safety: children_ does not exist on Node — accessing it through a Node*
+// is a compile error. Child accessor methods check has_children_flag()
+// before downcasting to InternalNode; a missing flag returns a safe default
+// ("no children"), never memory corruption.
 // ---------------------------------------------------------------------------
+template <typename V> struct InternalNode; // forward declaration
+
 template <typename V> struct Node {
-  // Intrusive reference count. mutable so addref/release work through const
-  // paths (same semantics as shared_ptr's control block).
-  // Starts at 1: make_intrusive + IntrusivePtr::adopt() take ownership
-  // without incrementing.
   mutable std::atomic<std::uint32_t> refcount_{1};
 
-  // High bit of packed_tag_ = 1 means this node holds a value.
-  // Low 31 bits = transient edit tag (0 = immutable).
+  static constexpr std::uint32_t kHasValueBit = 0x8000'0000u;
+  static constexpr std::uint32_t kHasChildrenBit = 0x4000'0000u;
+  static constexpr std::uint32_t kFlagBits = kHasValueBit | kHasChildrenBit;
+  static constexpr std::uint32_t kTagMask = 0x3FFF'FFFFu;
+
   std::uint32_t packed_tag_{0};
   V value_{};
 
   using Prefix = CompactPrefix;
   Prefix prefix;
 
-  // Children: null for leaf nodes, heap-allocated for internal nodes.
-  // 94% of nodes are leaves — they pay only 8 B (null pointer) instead
-  // of embedding an empty vector in the node.
-  //
-  // SoA layout: parallel vectors of transition bytes and child pointers.
-  // Eliminates 7 bytes of alignment padding per slot that
-  // pair<byte, IntrusivePtr<Node>> would waste (1 + 7 pad + 8 = 16 → 1 + 8 = 9).
+  // -- Child nested types (used by InternalNode, exposed here for callers) --
   struct ChildRef {
     std::byte &transition;
     IntrusivePtr<Node> &ptr;
@@ -225,7 +233,6 @@ template <typename V> struct Node {
       return transition_bytes.empty();
     }
   };
-  std::unique_ptr<ChildStore> children_;
 
   void addref() const noexcept {
     refcount_.fetch_add(1, std::memory_order_relaxed);
@@ -240,22 +247,22 @@ template <typename V> struct Node {
   // the dominant pattern in compressed radix trees.
   void release() const noexcept {
     const Node* cur = this;
-    // acq_rel on every fetch_sub: ensures all prior writes to the
-    // node are visible before the deleting thread runs the destructor.
     while (cur->refcount_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      // Sole owner — safe to const_cast and detach children before
-      // deleting, so ~Node doesn't trigger recursive releases.
       auto* mut = const_cast<Node*>(cur);
-      auto kids = std::move(mut->children_);
-      delete mut;
+      bool has_kids = mut->has_children_flag();
+
+      std::unique_ptr<ChildStore> kids;
+      if (has_kids) {
+        auto* internal = static_cast<InternalNode<V>*>(mut);
+        kids = std::move(internal->children_);
+        delete internal;
+      } else {
+        delete mut;
+      }
 
       if (!kids || kids->empty())
         return;
 
-      // Detach every child from its IntrusivePtr (no refcount change)
-      // and release all but the last one recursively. The last child
-      // becomes the next iteration's cur, converting tail recursion
-      // into a loop.
       const Node* tail = nullptr;
       for (std::size_t i = 0; i < kids->size(); ++i) {
         auto* raw = kids->ptrs[i].detach();
@@ -268,91 +275,107 @@ template <typename V> struct Node {
       if (!tail)
         return;
       cur = tail;
-      // Loop restarts: fetch_sub on tail's refcount acts as release.
     }
   }
 
   [[nodiscard]] auto has_value() const noexcept -> bool {
-    return (packed_tag_ >> 31) != 0;
+    return (packed_tag_ & kHasValueBit) != 0;
+  }
+  [[nodiscard]] auto has_children_flag() const noexcept -> bool {
+    return (packed_tag_ & kHasChildrenBit) != 0;
   }
   [[nodiscard]] auto edit_tag() const noexcept -> std::uint32_t {
-    return packed_tag_ & 0x7FFF'FFFFu;
+    return packed_tag_ & kTagMask;
   }
   void set_edit_tag(std::uint32_t tag) noexcept {
-    packed_tag_ = (packed_tag_ & 0x8000'0000u) | (tag & 0x7FFF'FFFFu);
+    packed_tag_ = (packed_tag_ & kFlagBits) | (tag & kTagMask);
   }
   void set_value(V v) {
     value_ = std::move(v);
-    packed_tag_ |= 0x8000'0000u;
+    packed_tag_ |= kHasValueBit;
   }
-  void clear_value() noexcept { packed_tag_ &= 0x7FFF'FFFFu; }
+  void clear_value() noexcept { packed_tag_ &= ~kHasValueBit; }
 
-  // -- Children accessors ---------------------------------------------------
+  // -- Children accessors (delegate to InternalNode via checked cast) -------
   [[nodiscard]] auto child_count() const noexcept -> std::size_t {
-    return children_ ? children_->size() : 0;
+    if (!has_children_flag()) return 0;
+    auto& kids = static_cast<const InternalNode<V>*>(this)->children_;
+    return kids ? kids->size() : 0;
   }
   [[nodiscard]] auto has_children() const noexcept -> bool {
-    return children_ && !children_->empty();
+    if (!has_children_flag()) return false;
+    auto& kids = static_cast<const InternalNode<V>*>(this)->children_;
+    return kids && !kids->empty();
   }
   [[nodiscard]] auto child_at(std::size_t i) const -> ConstChildRef {
-    return {children_->transition_bytes[i], children_->ptrs[i]};
+    assert(has_children_flag());
+    auto& kids = static_cast<const InternalNode<V>*>(this)->children_;
+    return {kids->transition_bytes[i], kids->ptrs[i]};
   }
   [[nodiscard]] auto child_at(std::size_t i) -> ChildRef {
-    return {children_->transition_bytes[i], children_->ptrs[i]};
+    assert(has_children_flag());
+    auto& kids = static_cast<InternalNode<V>*>(this)->children_;
+    return {kids->transition_bytes[i], kids->ptrs[i]};
   }
 
-  // Find child by transition byte. Children are sorted by transition byte.
-  // Linear scan is used because prefix compression keeps child counts small
-  // (typically 1–4), where it outperforms binary search.
   [[nodiscard]] auto find_child(std::byte b) const
       -> std::optional<ConstChildRef> {
-    if (!children_)
+    if (!has_children_flag())
       return std::nullopt;
-    for (std::size_t i = 0; i < children_->size(); ++i) {
-      if (children_->transition_bytes[i] == b)
-        return ConstChildRef{children_->transition_bytes[i],
-                             children_->ptrs[i]};
+    auto& kids = static_cast<const InternalNode<V>*>(this)->children_;
+    if (!kids)
+      return std::nullopt;
+    for (std::size_t i = 0; i < kids->size(); ++i) {
+      if (kids->transition_bytes[i] == b)
+        return ConstChildRef{kids->transition_bytes[i], kids->ptrs[i]};
     }
     return std::nullopt;
   }
 
   [[nodiscard]] auto find_child_mut(std::byte b) -> std::optional<ChildRef> {
-    if (!children_)
+    if (!has_children_flag())
       return std::nullopt;
-    for (std::size_t i = 0; i < children_->size(); ++i) {
-      if (children_->transition_bytes[i] == b)
-        return ChildRef{children_->transition_bytes[i], children_->ptrs[i]};
+    auto& kids = static_cast<InternalNode<V>*>(this)->children_;
+    if (!kids)
+      return std::nullopt;
+    for (std::size_t i = 0; i < kids->size(); ++i) {
+      if (kids->transition_bytes[i] == b)
+        return ChildRef{kids->transition_bytes[i], kids->ptrs[i]};
     }
     return std::nullopt;
   }
 
-  // Insert child in sorted order by transition byte.
   void insert_child(std::byte b, IntrusivePtr<Node> child) {
-    if (!children_)
-      children_ = std::make_unique<ChildStore>();
+    assert(has_children_flag());
+    auto& kids = static_cast<InternalNode<V>*>(this)->children_;
+    if (!kids)
+      kids = std::make_unique<ChildStore>();
     std::size_t pos = 0;
-    while (pos < children_->size() && children_->transition_bytes[pos] < b)
+    while (pos < kids->size() && kids->transition_bytes[pos] < b)
       ++pos;
-    assert((pos == children_->size() || children_->transition_bytes[pos] != b) &&
+    assert((pos == kids->size() || kids->transition_bytes[pos] != b) &&
            "duplicate transition byte");
-    children_->transition_bytes.insert(
-        children_->transition_bytes.begin() +
+    kids->transition_bytes.insert(
+        kids->transition_bytes.begin() +
             static_cast<std::ptrdiff_t>(pos),
         b);
-    children_->ptrs.insert(
-        children_->ptrs.begin() + static_cast<std::ptrdiff_t>(pos),
+    kids->ptrs.insert(
+        kids->ptrs.begin() + static_cast<std::ptrdiff_t>(pos),
         std::move(child));
   }
 
   void remove_child(std::byte b) {
-    if (!children_)
+    if (!has_children_flag())
       return;
-    for (std::size_t i = 0; i < children_->size(); ++i) {
-      if (children_->transition_bytes[i] == b) {
-        children_->transition_bytes.erase(
-            children_->transition_bytes.begin() +
+    auto& kids = static_cast<InternalNode<V>*>(this)->children_;
+    if (!kids)
+      return;
+    for (std::size_t i = 0; i < kids->size(); ++i) {
+      if (kids->transition_bytes[i] == b) {
+        kids->transition_bytes.erase(
+            kids->transition_bytes.begin() +
                 static_cast<std::ptrdiff_t>(i));
-        children_->ptrs.erase(children_->ptrs.begin() +
+        kids->ptrs.erase(kids->ptrs.begin() +
                               static_cast<std::ptrdiff_t>(i));
         return;
       }
@@ -361,14 +384,21 @@ template <typename V> struct Node {
 
   // Deep clone of this node (not recursive — children are shared).
   [[nodiscard]] auto clone() const -> IntrusivePtr<Node> {
-    auto n = make_intrusive<Node>();
-    // Clear edit_tag in the clone; preserve has_value bit.
-    n->packed_tag_ = packed_tag_ & 0x8000'0000u;
+    if (has_children_flag()) {
+      auto* self = static_cast<const InternalNode<V>*>(this);
+      auto* n = new InternalNode<V>();
+      n->packed_tag_ = packed_tag_ & kFlagBits;
+      n->value_ = value_;
+      n->prefix = prefix;
+      if (self->children_)
+        n->children_ = std::make_unique<ChildStore>(*self->children_);
+      return IntrusivePtr<Node>::adopt(n);
+    }
+    auto* n = new Node();
+    n->packed_tag_ = packed_tag_ & kHasValueBit;
     n->value_ = value_;
     n->prefix = prefix;
-    if (children_)
-      n->children_ = std::make_unique<ChildStore>(*children_);
-    return n;
+    return IntrusivePtr<Node>::adopt(n);
   }
 
   // Clone and stamp with edit tag for transient ownership.
@@ -377,11 +407,69 @@ template <typename V> struct Node {
     n->set_edit_tag(tag);
     return n;
   }
+
+  // Clone, promoting to InternalNode if this is a leaf.
+  // Used when the caller will insert children into the clone.
+  [[nodiscard]] auto clone_as_internal() const -> IntrusivePtr<Node> {
+    auto* n = new InternalNode<V>();
+    n->packed_tag_ = (packed_tag_ & kHasValueBit) | kHasChildrenBit;
+    n->value_ = value_;
+    n->prefix = prefix;
+    if (has_children_flag()) {
+      auto& src = static_cast<const InternalNode<V>*>(this)->children_;
+      if (src)
+        n->children_ = std::make_unique<ChildStore>(*src);
+    }
+    return IntrusivePtr<Node>::adopt(n);
+  }
 };
 
-// Check Node size after CompactPrefix shrink (16B → 8B).
-// Node<uint64_t>: 4+4+8+8+8 = 32.
-static_assert(sizeof(Node<std::uint64_t>) == 32);
+// ---------------------------------------------------------------------------
+// InternalNode<V> — extends Node with children storage.
+//
+// Allocated only for nodes that will have children (routing/split nodes).
+// sizeof(InternalNode<KeyDirEntry>) == 48, glibc usable=56.
+// ---------------------------------------------------------------------------
+template <typename V> struct InternalNode : Node<V> {
+  std::unique_ptr<typename Node<V>::ChildStore> children_;
+};
+
+// Node<uint64_t>: 4+4+8+8 = 24 (no children_ field).
+static_assert(sizeof(Node<std::uint64_t>) == 24);
+// InternalNode<uint64_t>: 24+8 = 32.
+static_assert(sizeof(InternalNode<std::uint64_t>) == 32);
+
+// Factory functions for node allocation.
+// make_leaf: allocates Node (40B for KeyDirEntry), no children.
+// make_internal: allocates InternalNode (48B for KeyDirEntry), with
+// has_children flag set.
+template <typename V>
+auto make_leaf() -> IntrusivePtr<Node<V>> {
+  return IntrusivePtr<Node<V>>::adopt(new Node<V>());
+}
+
+template <typename V>
+auto make_internal() -> IntrusivePtr<Node<V>> {
+  auto* n = new InternalNode<V>();
+  n->packed_tag_ |= Node<V>::kHasChildrenBit;
+  return IntrusivePtr<Node<V>>::adopt(n);
+}
+
+// Promote a leaf node to internal. Returns a new InternalNode with the
+// same fields (value, prefix, edit_tag) plus has_children set.
+// The original node is not modified — callers replace their pointer.
+template <typename V>
+auto promote_to_internal(const IntrusivePtr<Node<V>> &node)
+    -> IntrusivePtr<Node<V>> {
+  assert(!node->has_children_flag());
+  auto* n = new InternalNode<V>();
+  n->packed_tag_ = (node->packed_tag_ & ~Node<V>::kFlagBits) |
+                   (node->packed_tag_ & Node<V>::kHasValueBit) |
+                   Node<V>::kHasChildrenBit;
+  n->value_ = node->value_;
+  n->prefix = node->prefix;
+  return IntrusivePtr<Node<V>>::adopt(n);
+}
 
 // ---------------------------------------------------------------------------
 // Helper: compute the common prefix length between a node's prefix and a key
@@ -542,7 +630,7 @@ private:
       -> IntrusivePtr<Node<V>> {
     // Fast path: key fits in a single node's prefix.
     if (key.size() <= CompactPrefix::kInlineCap) {
-      auto leaf = make_intrusive<Node<V>>();
+      auto leaf = make_leaf<V>();
       if (tag)
         leaf->set_edit_tag(tag);
       for (auto b : key)
@@ -568,7 +656,7 @@ private:
     auto leaf_prefix = key.subspan(pos);
 
     // Build bottom-up: leaf first, then wrap in routing nodes.
-    auto cur = make_intrusive<Node<V>>();
+    auto cur = make_leaf<V>();
     if (tag)
       cur->set_edit_tag(tag);
     for (auto b : leaf_prefix)
@@ -576,7 +664,7 @@ private:
     cur->set_value(std::move(val));
 
     for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
-      auto routing = make_intrusive<Node<V>>();
+      auto routing = make_internal<V>();
       if (tag)
         routing->set_edit_tag(tag);
       for (std::size_t i = 0; i < it->prefix_len; ++i)
@@ -623,7 +711,7 @@ private:
     // Build bottom-up: terminal is the innermost node.
     auto cur = std::move(terminal);
     for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
-      auto routing = make_intrusive<Node<V>>();
+      auto routing = make_internal<V>();
       if (tag)
         routing->set_edit_tag(tag);
       for (std::size_t i = 0; i < it->prefix_len; ++i)
@@ -650,8 +738,7 @@ private:
 
     if (cpl < prefix_span.size()) {
       // Split: divergence within this node's prefix.
-      auto split = make_intrusive<Node<V>>();
-      // Split node gets the common prefix.
+      auto split = make_internal<V>();
       for (std::size_t i = 0; i < cpl; ++i)
         split->prefix.push_back(prefix_span[i]);
 
@@ -698,7 +785,11 @@ private:
       return {std::move(new_node), inserted};
     }
     // No child for this transition — create a leaf.
+    // Promote to internal if the clone is a leaf (the node previously
+    // had no children but now needs one).
     auto chain = build_leaf_chain(child_key, std::move(val));
+    if (!new_node->has_children_flag())
+      new_node = promote_to_internal(new_node);
     new_node->insert_child(transition, std::move(chain));
     return {std::move(new_node), true};
   }
@@ -831,7 +922,7 @@ private:
     if (cpl < pa.size() && cpl < pb.size()) {
       // The two prefixes diverge — build a split node with the common prefix,
       // then place trimmed a and trimmed b as its two children.
-      auto split = make_intrusive<Node<V>>();
+      auto split = make_internal<V>();
       for (std::size_t i = 0; i < cpl; ++i)
         split->prefix.push_back(pa[i]);
 
@@ -855,7 +946,7 @@ private:
     if (cpl < pa.size()) {
       // b's prefix is fully consumed — b's node sits *above* a in the trie.
       // Build result based on b; insert a under b at transition pa[cpl].
-      auto new_b = b->clone();
+      auto new_b = b->clone_as_internal();
       auto a_trimmed = a->clone();
       typename Node<V>::Prefix a_suffix;
       for (std::size_t i = cpl + 1; i < pa.size(); ++i)
@@ -878,7 +969,7 @@ private:
     if (cpl < pb.size()) {
       // a's prefix is fully consumed — a's node sits *above* b in the trie.
       // Build result based on a; insert b under a at transition pb[cpl].
-      auto new_a = a->clone();
+      auto new_a = a->clone_as_internal();
       auto b_trimmed = b->clone();
       typename Node<V>::Prefix b_suffix;
       for (std::size_t i = cpl + 1; i < pb.size(); ++i)
@@ -899,8 +990,8 @@ private:
     }
 
     // Full prefix match — both nodes share the same compressed key prefix.
-    // Clone a and fold b's value + children into it.
-    auto merged = a->clone();
+    // Clone a as internal — b's children may need to be folded in.
+    auto merged = a->clone_as_internal();
     std::size_t overlaps = 0;
 
     if (b->has_value()) {
@@ -1043,7 +1134,7 @@ private:
         node->refcount_.load(std::memory_order_acquire) == 1)
       return node;
     if (!node) {
-      auto n = make_intrusive<Node<V>>();
+      auto n = make_leaf<V>();
       n->set_edit_tag(tag);
       return n;
     }
@@ -1066,7 +1157,7 @@ private:
 
     if (cpl < prefix_span.size()) {
       // Split.
-      auto split = make_intrusive<Node<V>>();
+      auto split = make_internal<V>();
       split->set_edit_tag(tag);
       for (std::size_t i = 0; i < cpl; ++i)
         split->prefix.push_back(prefix_span[i]);
@@ -1106,6 +1197,8 @@ private:
       return {std::move(mutable_node), inserted};
     }
     auto chain = Ops::build_leaf_chain(child_key, std::move(val), tag);
+    if (!mutable_node->has_children_flag())
+      mutable_node = promote_to_internal(mutable_node);
     mutable_node->insert_child(transition, std::move(chain));
     return {std::move(mutable_node), true};
   }
@@ -1130,7 +1223,7 @@ private:
 
     if (cpl < prefix_span.size()) {
       // Split — key diverges from prefix, so this is always a new insert.
-      auto split = make_intrusive<Node<V>>();
+      auto split = make_internal<V>();
       split->set_edit_tag(tag);
       for (std::size_t i = 0; i < cpl; ++i)
         split->prefix.push_back(prefix_span[i]);
@@ -1178,6 +1271,8 @@ private:
       return {std::move(mutable_node), std::move(displaced), inserted};
     }
     auto chain = Ops::build_leaf_chain(child_key, std::move(val), tag);
+    if (!mutable_node->has_children_flag())
+      mutable_node = promote_to_internal(mutable_node);
     mutable_node->insert_child(transition, std::move(chain));
     return {std::move(mutable_node), std::nullopt, true};
   }
@@ -1293,13 +1388,14 @@ template <typename V>
 auto PersistentRadixTree<V>::transient() const -> TransientRadixTree<V> {
   // Relaxed ordering: only uniqueness is required, not inter-thread visibility
   // ordering. Each transient session gets a distinct tag via fetch_add.
-  // Truncate to 31 bits — tag 0 is reserved for "immutable" sentinel.
+  // Truncate to 30 bits — tag 0 is reserved for "immutable" sentinel.
+  // Bit 31 = has_value, bit 30 = has_children, bits 29:0 = edit_tag.
   auto raw = detail::next_edit_tag.fetch_add(1, std::memory_order_relaxed);
-  auto tag = static_cast<std::uint32_t>(raw & 0x7FFF'FFFFu);
+  auto tag = static_cast<std::uint32_t>(raw & Node<V>::kTagMask);
   if (tag == 0) [[unlikely]]
     tag = static_cast<std::uint32_t>(
         detail::next_edit_tag.fetch_add(1, std::memory_order_relaxed) &
-        0x7FFF'FFFFu);
+        Node<V>::kTagMask);
   return TransientRadixTree<V>{root_, size_, tag};
 }
 
