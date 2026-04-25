@@ -32,7 +32,7 @@ Benchmarked at 1 M keys with [RocksDB](https://rocksdb.org/) as a reference poin
 - **Sequential writes** sustain 134 Kops/s (NoSync) and 139 ops/s (Sync), limited by `fdatasync` round-trip latency. No write amplification from compaction.
 - **Concurrent sync writes scale via group commit** — writers share a single `fdatasync` call. 4.9 Kops/s at 64 threads.
 - **Range scans over values** fetch each value individually from disk. LSM-based engines pack values contiguously in sorted runs and perform better here. Key-only iteration (`keys_from`) is a pure in-memory tree walk with no disk I/O.
-- **Recovery is fast and parallel** — hint files replayed across all cores with full CRC verification. 1 M keys in ~58 ms, 10 M in ~506 ms at 16 threads.
+- **Recovery is fast and parallel** — hint files replayed across all cores with per-file CRC verification. 1 M keys in ~58 ms, 10 M in ~506 ms at 16 threads.
 
 See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md) for the full benchmark report with all thread counts, dataset sizes, and hardware details.
 
@@ -40,7 +40,7 @@ See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md)
 
 ### Single-Threaded Throughput (1M keys)
 
-> CRC verification is disabled for read operations; enabled for recovery.
+> Per-value CRC verification is disabled for read benchmarks; hint file CRC is always verified during recovery.
 
 | Operation | ByteCaskDB | RocksDB | Notes |
 |-----------|----------|---------|-------|
@@ -101,7 +101,7 @@ Latency stays flat as the dataset grows: every read resolves to a known file off
 
 ### Recovery
 
-Recovery runs when ByteCaskDB opens an existing database: it rebuilds the in-memory key directory by reading compact hint files from disk, then verifies every entry with CRC-32. This is parallelised across all available CPU cores — each core processes a disjoint set of data files independently, and the results are merged before the database becomes available.
+Recovery runs when ByteCaskDB opens an existing database: it rebuilds the in-memory key directory by reading compact hint files from disk. Each hint file is verified by a file-level CRC-32C trailer before parsing. This is parallelised across all available CPU cores — each core processes a disjoint set of hint files independently, and the results are merged before the database becomes available.
 
 | Keys | Threads | Recovery Time | Speedup vs 1T |
 |---:|---:|---:|---:|
