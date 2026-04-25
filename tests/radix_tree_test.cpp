@@ -930,6 +930,47 @@ TEST_CASE("RadixTree transient overwrite", "[radix_tree]") {
 }
 
 // ---------------------------------------------------------------------------
+// Transient: consumed builders fail fast in release builds
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree consumed transient rejects reuse", "[radix_tree]") {
+  auto tr = Tree{}.transient();
+  tr.set(to_bytes("key"), 1);
+
+  auto t = std::move(tr).persistent();
+  REQUIRE(t.size() == 1U);
+  REQUIRE(*t.get(to_bytes("key")) == 1);
+
+  auto greater = [](int existing, int incoming) {
+    return incoming > existing;
+  };
+
+  CHECK_THROWS_AS(tr.get(to_bytes("key")), std::logic_error);
+  CHECK_THROWS_AS(tr.get_ptr(to_bytes("key")), std::logic_error);
+  CHECK_THROWS_AS(tr.contains(to_bytes("key")), std::logic_error);
+  CHECK_THROWS_AS(tr.lower_bound(to_bytes("key")), std::logic_error);
+  CHECK_THROWS_AS(tr.set(to_bytes("other"), 2), std::logic_error);
+  CHECK_THROWS_AS(tr.upsert(to_bytes("key"), 2, greater), std::logic_error);
+  CHECK_THROWS_AS(tr.erase(to_bytes("key")), std::logic_error);
+  CHECK_THROWS_AS(std::move(tr).persistent(), std::logic_error);
+}
+
+TEST_CASE("RadixTree moved-from transient rejects reuse", "[radix_tree]") {
+  auto original = Tree{}.transient();
+  original.set(to_bytes("key"), 1);
+
+  auto moved = std::move(original);
+  moved.set(to_bytes("other"), 2);
+
+  CHECK_THROWS_AS(original.get(to_bytes("key")), std::logic_error);
+  CHECK_THROWS_AS(original.set(to_bytes("x"), 3), std::logic_error);
+
+  auto t = std::move(moved).persistent();
+  CHECK(t.size() == 2U);
+  CHECK(*t.get(to_bytes("key")) == 1);
+  CHECK(*t.get(to_bytes("other")) == 2);
+}
+
+// ---------------------------------------------------------------------------
 // Transient: erase triggers path compression
 // ---------------------------------------------------------------------------
 TEST_CASE("RadixTree transient erase path compression", "[radix_tree]") {

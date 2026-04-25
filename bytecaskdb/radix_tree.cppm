@@ -15,6 +15,7 @@ module;
 #include <new>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -296,33 +297,56 @@ template <typename V> struct Node {
   }
   void clear_value() noexcept { packed_tag_ &= ~kHasValueBit; }
 
+  [[nodiscard]] auto internal_node() noexcept -> InternalNode<V> * {
+    if (!has_children_flag())
+      return nullptr;
+    return static_cast<InternalNode<V> *>(this);
+  }
+  [[nodiscard]] auto internal_node() const noexcept
+      -> const InternalNode<V> * {
+    if (!has_children_flag())
+      return nullptr;
+    return static_cast<const InternalNode<V> *>(this);
+  }
+  [[nodiscard]] auto child_store_or_null() noexcept -> ChildStore * {
+    auto *internal = internal_node();
+    if (!internal)
+      return nullptr;
+    return internal->children_.get();
+  }
+  [[nodiscard]] auto child_store_or_null() const noexcept
+      -> const ChildStore * {
+    auto *internal = internal_node();
+    if (!internal)
+      return nullptr;
+    return internal->children_.get();
+  }
+
   // -- Children accessors (delegate to InternalNode via checked cast) -------
   [[nodiscard]] auto child_count() const noexcept -> std::size_t {
-    if (!has_children_flag()) return 0;
-    auto& kids = static_cast<const InternalNode<V>*>(this)->children_;
+    auto *kids = child_store_or_null();
     return kids ? kids->size() : 0;
   }
   [[nodiscard]] auto has_children() const noexcept -> bool {
-    if (!has_children_flag()) return false;
-    auto& kids = static_cast<const InternalNode<V>*>(this)->children_;
+    auto *kids = child_store_or_null();
     return kids && !kids->empty();
   }
   [[nodiscard]] auto child_at(std::size_t i) const -> ConstChildRef {
-    assert(has_children_flag());
-    auto& kids = static_cast<const InternalNode<V>*>(this)->children_;
+    auto *kids = child_store_or_null();
+    assert(kids != nullptr);
+    assert(i < kids->size());
     return {kids->transition_bytes[i], kids->ptrs[i]};
   }
   [[nodiscard]] auto child_at(std::size_t i) -> ChildRef {
-    assert(has_children_flag());
-    auto& kids = static_cast<InternalNode<V>*>(this)->children_;
+    auto *kids = child_store_or_null();
+    assert(kids != nullptr);
+    assert(i < kids->size());
     return {kids->transition_bytes[i], kids->ptrs[i]};
   }
 
   [[nodiscard]] auto find_child(std::byte b) const
       -> std::optional<ConstChildRef> {
-    if (!has_children_flag())
-      return std::nullopt;
-    auto& kids = static_cast<const InternalNode<V>*>(this)->children_;
+    auto *kids = child_store_or_null();
     if (!kids)
       return std::nullopt;
     for (std::size_t i = 0; i < kids->size(); ++i) {
@@ -333,9 +357,7 @@ template <typename V> struct Node {
   }
 
   [[nodiscard]] auto find_child_mut(std::byte b) -> std::optional<ChildRef> {
-    if (!has_children_flag())
-      return std::nullopt;
-    auto& kids = static_cast<InternalNode<V>*>(this)->children_;
+    auto *kids = child_store_or_null();
     if (!kids)
       return std::nullopt;
     for (std::size_t i = 0; i < kids->size(); ++i) {
@@ -346,28 +368,27 @@ template <typename V> struct Node {
   }
 
   void insert_child(std::byte b, IntrusivePtr<Node> child) {
-    assert(has_children_flag());
-    auto& kids = static_cast<InternalNode<V>*>(this)->children_;
-    if (!kids)
-      kids = std::make_unique<ChildStore>();
+    auto *internal = internal_node();
+    assert(internal != nullptr);
+    if (!internal->children_)
+      internal->children_ = std::make_unique<ChildStore>();
+    auto &kids = *internal->children_;
     std::size_t pos = 0;
-    while (pos < kids->size() && kids->transition_bytes[pos] < b)
+    while (pos < kids.size() && kids.transition_bytes[pos] < b)
       ++pos;
-    assert((pos == kids->size() || kids->transition_bytes[pos] != b) &&
+    assert((pos == kids.size() || kids.transition_bytes[pos] != b) &&
            "duplicate transition byte");
-    kids->transition_bytes.insert(
-        kids->transition_bytes.begin() +
+    kids.transition_bytes.insert(
+      kids.transition_bytes.begin() +
             static_cast<std::ptrdiff_t>(pos),
         b);
-    kids->ptrs.insert(
-        kids->ptrs.begin() + static_cast<std::ptrdiff_t>(pos),
+    kids.ptrs.insert(
+      kids.ptrs.begin() + static_cast<std::ptrdiff_t>(pos),
         std::move(child));
   }
 
   void remove_child(std::byte b) {
-    if (!has_children_flag())
-      return;
-    auto& kids = static_cast<InternalNode<V>*>(this)->children_;
+    auto *kids = child_store_or_null();
     if (!kids)
       return;
     for (std::size_t i = 0; i < kids->size(); ++i) {
@@ -385,7 +406,8 @@ template <typename V> struct Node {
   // Deep clone of this node (not recursive — children are shared).
   [[nodiscard]] auto clone() const -> IntrusivePtr<Node> {
     if (has_children_flag()) {
-      auto* self = static_cast<const InternalNode<V>*>(this);
+      auto *self = internal_node();
+      assert(self != nullptr);
       auto* n = new InternalNode<V>();
       n->packed_tag_ = packed_tag_ & kFlagBits;
       n->value_ = value_;
@@ -416,7 +438,7 @@ template <typename V> struct Node {
     n->value_ = value_;
     n->prefix = prefix;
     if (has_children_flag()) {
-      auto& src = static_cast<const InternalNode<V>*>(this)->children_;
+      auto *src = child_store_or_null();
       if (src)
         n->children_ = std::make_unique<ChildStore>(*src);
     }
@@ -1047,13 +1069,15 @@ public:
 
   [[nodiscard]] auto get(std::span<const std::byte> key) const
       -> std::optional<V> {
+    ensure_active();
     if (!root_)
       return std::nullopt;
     return PersistentRadixTree<V>::get_impl(root_, key);
   }
 
-  [[nodiscard]] auto get_ptr(std::span<const std::byte> key) const noexcept
+  [[nodiscard]] auto get_ptr(std::span<const std::byte> key) const
       -> const V * {
+    ensure_active();
     if (!root_)
       return nullptr;
     return PersistentRadixTree<V>::get_ptr_impl(root_, key);
@@ -1064,7 +1088,7 @@ public:
   }
 
   void set(std::span<const std::byte> key, V val) {
-    assert(tag_ != 0 && "transient already consumed");
+    ensure_active();
     auto [new_root, inserted] = set_transient(root_, key, std::move(val), tag_);
     root_ = std::move(new_root);
     if (inserted)
@@ -1079,7 +1103,7 @@ public:
   template <typename Pred>
   auto upsert(std::span<const std::byte> key, V val, Pred &&should_replace)
       -> std::optional<V> {
-    assert(tag_ != 0 && "transient already consumed");
+    ensure_active();
     auto [new_root, displaced, inserted] = upsert_transient(
         root_, key, std::move(val), tag_,
         std::forward<Pred>(should_replace));
@@ -1090,7 +1114,7 @@ public:
   }
 
   auto erase(std::span<const std::byte> key) -> bool {
-    assert(tag_ != 0 && "transient already consumed");
+    ensure_active();
     if (!root_)
       return false;
     auto [new_root, removed] = erase_transient(root_, key, tag_);
@@ -1101,14 +1125,17 @@ public:
   }
 
   [[nodiscard]] auto persistent() && -> PersistentRadixTree<V> {
+    ensure_active();
+    auto live_size = std::exchange(size_, 0);
     tag_ = 0; // Retire the tag — nodes become immutable.
-    return PersistentRadixTree<V>{std::move(root_), size_};
+    return PersistentRadixTree<V>{std::move(root_), live_size};
   }
 
   // Iteration support for range scans on the transient tree.
   // Shares the same internal structure as PersistentRadixTree.
   [[nodiscard]] auto lower_bound(std::span<const std::byte> key) const
       -> RadixTreeIterator<V> {
+    ensure_active();
     return RadixTreeIterator<V>{root_, key};
   }
 
@@ -1120,6 +1147,12 @@ private:
   TransientRadixTree(IntrusivePtr<Node<V>> root, std::size_t sz,
                      std::uint32_t tag)
       : root_{std::move(root)}, size_{sz}, tag_{tag} {}
+
+  void ensure_active() const {
+    if (tag_ == 0) [[unlikely]] {
+      throw std::logic_error{"TransientRadixTree already consumed"};
+    }
+  }
 
   // Ensure a node is owned by this transient session.
   // Requires both matching edit tag AND unique ownership (refcount == 1)

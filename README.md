@@ -420,7 +420,7 @@ ByteCaskDB is designed around four core tenets, in priority order:
   └── Sealed Files   read-only .data + .hint files      (older segments)
 ```
 
-**Write path**: all writes route through a single coordinator (`apply_batch`). Concurrent sync writers are batched via group commit — the first writer becomes leader, drains the queue, and executes all pending writes under one lock hold with a single `fdatasync`. Each write appends CRC-32-verified, length-prefixed records to the active data file, then applies pure in-memory state transitions via `TransientEngineState`. Durability before visibility: `state_.store()` happens after `fdatasync`.
+**Write path**: all writes route through a single coordinator (`apply_batch`). Concurrent sync writers are batched via group commit — the first writer becomes leader, drains the queue, and executes all pending writes under one lock hold with a single `fdatasync`. Each write appends CRC-32-verified, length-prefixed records to the active data file, then applies pure in-memory state transitions via `TransientEngineState`. The radix-tree builder used for those transitions is single-use: it freezes into the published immutable snapshot and fails fast on accidental reuse. Durability before visibility: `state_.store()` happens after `fdatasync`.
 
 **Read path**: readers obtain an immutable snapshot of the engine state, look up the key in the radix tree to find its file and offset, then read the value directly. Reads are lock-free and scale linearly across cores.
 
