@@ -73,6 +73,7 @@ export interface WritePlan extends Disposable {
   ensureAbsent(key: string): void;
   ensureUnchanged(key: string): void;
   ensureRangeUnchanged(from: string, to: string): void;
+  hasSnapshot(): boolean;
   close(): void;
 }
 
@@ -98,12 +99,14 @@ export interface ByteCaskDB extends Disposable {
   createManifest(): FileManifest;
   changesSince(snap: Snapshot, fromSeq: number): CloseableIterator<DataEntry>;
   ingest(entries: DataEntry[]): void;
+  stats(): Record<string, number>;
   close(): void;
 }
 
 export interface WritePlanConstructor {
   new(): WritePlan;
   withSnapshot(snap: Snapshot): WritePlan;
+  withLimits(opts: { maxKeyBytes?: number; maxValueBytes?: number }): WritePlan;
 }
 
 export interface ByteCaskFactory {

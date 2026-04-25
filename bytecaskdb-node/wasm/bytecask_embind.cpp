@@ -536,6 +536,17 @@ static auto jswp_with_snapshot(JsSnapshot &snap) -> JsWritePlan * {
   return new JsWritePlan{snap};
 }
 
+static auto jswp_with_limits(val opts) -> JsWritePlan * {
+  bytecask::SizeLimits limits;
+  if (has_prop(opts, "maxKeyBytes"))
+    limits.max_key_bytes = opts["maxKeyBytes"].as<uint32_t>();
+  if (has_prop(opts, "maxValueBytes"))
+    limits.max_value_bytes = opts["maxValueBytes"].as<uint32_t>();
+  auto *wp = new JsWritePlan();
+  wp->plan.emplace(limits);
+  return wp;
+}
+
 static void jswp_put(JsWritePlan &self, const std::string &key,
                      const std::string &value) {
   self.check();
@@ -577,6 +588,11 @@ static void jswp_ensure_range_unchanged(JsWritePlan &self,
 
 static void jswp_close(JsWritePlan &self) { delete &self; }
 
+static auto jswp_has_snapshot(JsWritePlan &self) -> bool {
+  self.check();
+  return self.plan->has_snapshot();
+}
+
 // ---------------------------------------------------------------------------
 // Iterator close helpers
 // ---------------------------------------------------------------------------
@@ -598,6 +614,15 @@ static auto js_file_manifest_get_files(JsFileManifest &self) -> val {
 }
 static auto js_file_manifest_get_through_sequence(JsFileManifest &self) -> double {
   return self.through_sequence;
+}
+
+static auto jsdb_stats(JsDB &self) -> val {
+  auto stats = self.db.stats();
+  auto result = val::object();
+  for (auto &[key, value] : stats) {
+    result.set(key, static_cast<double>(value));
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +653,7 @@ EMSCRIPTEN_BINDINGS(bytecask) {
       .function("createManifest", &jsdb_create_manifest, allow_raw_pointers())
       .function("changesSince", &jsdb_changes_since, allow_raw_pointers())
       .function("ingest", &jsdb_ingest)
+      .function("stats", &jsdb_stats)
       .function("close", &jsdb_close);
 
   class_<JsSnapshot>("Snapshot")
@@ -643,6 +669,7 @@ EMSCRIPTEN_BINDINGS(bytecask) {
       .constructor<>()
       .class_function("withSnapshot", &jswp_with_snapshot,
                       allow_raw_pointers())
+      .class_function("withLimits", &jswp_with_limits, allow_raw_pointers())
       .function("put", &jswp_put)
       .function("del", &jswp_del)
       .function("delRange", &jswp_del_range)
@@ -650,6 +677,7 @@ EMSCRIPTEN_BINDINGS(bytecask) {
       .function("ensureAbsent", &jswp_ensure_absent)
       .function("ensureUnchanged", &jswp_ensure_unchanged)
       .function("ensureRangeUnchanged", &jswp_ensure_range_unchanged)
+      .function("hasSnapshot", &jswp_has_snapshot)
       .function("close", &jswp_close);
 
   class_<JsEntryIterator>("EntryIterator")

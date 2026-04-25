@@ -4627,7 +4627,7 @@ TEST_CASE("current_sequence stays at zero for nosync-only writes",
 // ---------------------------------------------------------------------------
 // durable_sequence: long-poll wakes on sync write
 // ---------------------------------------------------------------------------
-TEST_CASE("current_sequence long-poll wakes on sync write", "[durable_seq]") {
+TEST_CASE("current_sequence long-poll wakes on sync write", "[durable_seq][concurrency]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
 
