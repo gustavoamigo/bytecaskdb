@@ -137,8 +137,8 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
     case WritePlan::Precondition::MustBeUnchanged: {
       // ensure_unchanged already enforced snap_ is present at build time.
       const auto snap_entry = snap_state->key_dir.get(key_span);
-      const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence : 0;
-      const std::uint64_t cur_seq = cur_entry ? cur_entry->sequence : 0;
+      const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
+      const std::uint64_t cur_seq = cur_entry ? cur_entry->sequence() : 0;
       if (cur_seq != snap_seq) return false;
       break;
     }
@@ -158,8 +158,8 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
       auto [key_span, entry] = *it;
       if (Key{key_span} >= Key{to_span}) break;
       const auto snap_entry = snap_state->key_dir.get(key_span);
-      const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence : 0;
-      if (entry.sequence != snap_seq) return false;
+      const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
+      if (entry.sequence() != snap_seq) return false;
     }
 
     // Check snapshot for keys deleted since snapshot.
@@ -196,7 +196,7 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
       const bool deleted = snap_entry && !cur_entry;
       const bool modified =
           snap_entry && cur_entry &&
-          cur_entry->sequence != snap_entry->sequence;
+          cur_entry->sequence() != snap_entry->sequence();
       if (appeared || deleted || modified) return false;
     }
   }
@@ -274,8 +274,8 @@ void TransientEngineState::apply_writes(
             const auto existing = key_dir_.get(key_span);
             if (existing) {
               const auto dec =
-                  entry_size(key_span.size(), existing->value_size);
-              const auto ef = existing->file_id;
+                  entry_size(key_span.size(), existing->value_size());
+              const auto ef = existing->file_id();
               file_stats_.update(
                   ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
             }
@@ -285,8 +285,8 @@ void TransientEngineState::apply_writes(
               fs.live_bytes += sz;
               fs.total_bytes += sz;
             });
-            key_dir_.set(key_span, KeyDirEntry{next_seq_, offsets[io_idx],
-                                                active_file_id_, val_size});
+            key_dir_.set(key_span, KeyDirEntry::make(next_seq_, offsets[io_idx],
+                                                      active_file_id_, val_size));
             ++next_seq_;
             ++io_idx;
           } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
@@ -294,8 +294,8 @@ void TransientEngineState::apply_writes(
             const auto existing = key_dir_.get(key_span);
             if (existing) {
               const auto dec =
-                  entry_size(key_span.size(), existing->value_size);
-              const auto ef = existing->file_id;
+                  entry_size(key_span.size(), existing->value_size());
+              const auto ef = existing->file_id();
               file_stats_.update(
                   ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
             }
@@ -320,8 +320,8 @@ void TransientEngineState::apply_writes(
               auto [key_span, entry] = *it;
               if (Key{key_span} >= Key{to_span}) break;
               const auto dec =
-                  entry_size(key_span.size(), entry.value_size);
-              const auto ef = entry.file_id;
+                  entry_size(key_span.size(), entry.value_size());
+              const auto ef = entry.file_id();
               file_stats_.update(
                   ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
               to_erase.emplace_back(key_span);
@@ -388,8 +388,8 @@ void TransientEngineState::apply_ingest(
       const auto existing = key_dir_.get(e.key);
       if (existing) {
         const auto dec =
-            entry_size(e.key.size(), existing->value_size);
-        const auto ef = existing->file_id;
+            entry_size(e.key.size(), existing->value_size());
+        const auto ef = existing->file_id();
         file_stats_.update(
             ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
       }
@@ -399,8 +399,8 @@ void TransientEngineState::apply_ingest(
         fs.live_bytes += sz;
         fs.total_bytes += sz;
       });
-      key_dir_.set(e.key, KeyDirEntry{e.sequence, offset,
-                                       active_file_id_, val_size});
+      key_dir_.set(e.key, KeyDirEntry::make(e.sequence, offset,
+                                             active_file_id_, val_size));
       break;
     }
 
@@ -408,8 +408,8 @@ void TransientEngineState::apply_ingest(
       const auto existing = key_dir_.get(e.key);
       if (existing) {
         const auto dec =
-            entry_size(e.key.size(), existing->value_size);
-        const auto ef = existing->file_id;
+            entry_size(e.key.size(), existing->value_size());
+        const auto ef = existing->file_id();
         file_stats_.update(
             ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
       }
@@ -429,8 +429,8 @@ void TransientEngineState::apply_ingest(
         auto [key_span, entry] = *it;
         if (Key{key_span} >= Key{e.value}) break;
         const auto dec =
-            entry_size(key_span.size(), entry.value_size);
-        const auto ef = entry.file_id;
+            entry_size(key_span.size(), entry.value_size());
+        const auto ef = entry.file_id();
         file_stats_.update(
             ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
         to_erase.emplace_back(key_span);
@@ -464,6 +464,7 @@ void TransientEngineState::apply_ingest(
 
 void TransientEngineState::apply_rotate_file(
     std::shared_ptr<DataFile> new_file) {
+  KeyDirEntry::check_file_id(next_file_id_);
   active_file_id_ = next_file_id_++;
   files_.set(active_file_id_, std::move(new_file));
   file_stats_.set(active_file_id_, FileStats{});
@@ -479,10 +480,10 @@ void TransientEngineState::apply_vacuum(
   for (const auto &m : scan.mappings) {
     const std::span<const std::byte> key_span{m.key};
     const auto cur = key_dir_.get(key_span);
-    if (cur && cur->sequence == m.sequence) {
+    if (cur && cur->sequence() == m.sequence) {
       key_dir_.set(key_span,
-                   KeyDirEntry{m.sequence, m.new_offset, dest_file_id,
-                               m.value_size});
+                   KeyDirEntry::make(m.sequence, m.new_offset, dest_file_id,
+                                     m.value_size));
     } else {
       actual_live_bytes -= entry_size(m.key.size(), m.value_size);
     }
@@ -534,10 +535,10 @@ void TransientEngineState::apply_resume(
 
     if (e.entry_type == EntryType::Put) {
       const auto existing = key_dir_.get(key_span);
-      if (!existing || existing->sequence < e.sequence) {
+      if (!existing || existing->sequence() < e.sequence) {
         if (existing) {
-          const auto dec = entry_size(key_span.size(), existing->value_size);
-          const auto ef = existing->file_id;
+          const auto dec = entry_size(key_span.size(), existing->value_size());
+          const auto ef = existing->file_id();
           file_stats_.update(ef,
                              [dec](FileStats &fs) { fs.live_bytes -= dec; });
         }
@@ -545,14 +546,14 @@ void TransientEngineState::apply_resume(
         file_stats_.update(file_id,
                            [inc](FileStats &fs) { fs.live_bytes += inc; });
         key_dir_.set(key_span,
-                     KeyDirEntry{e.sequence, e.file_offset, file_id,
-                                 e.value_size});
+                     KeyDirEntry::make(e.sequence, e.file_offset, file_id,
+                                       e.value_size));
       }
     } else if (e.entry_type == EntryType::Delete) {
       const auto existing = key_dir_.get(key_span);
-      if (existing && existing->sequence < e.sequence) {
-        const auto dec = entry_size(key_span.size(), existing->value_size);
-        const auto ef = existing->file_id;
+      if (existing && existing->sequence() < e.sequence) {
+        const auto dec = entry_size(key_span.size(), existing->value_size());
+        const auto ef = existing->file_id();
         file_stats_.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
         key_dir_.erase(key_span);
       }
@@ -628,6 +629,7 @@ DB::DB(std::filesystem::path dir, Options opts)
       size_limits_{std::min(opts.max_key_bytes, kMaxKeySize),
                    std::min(opts.max_value_bytes, kMaxValueSize)},
       state_{std::make_shared<EngineState>()} {
+  KeyDirEntry::check_file_offset(opts.max_file_bytes);
   std::filesystem::create_directories(dir_);
 
   // Acquire exclusive advisory lock on the database directory.
@@ -734,7 +736,7 @@ auto DB::get(const ReadOptions &opts, BytesView key,
   if (!kv) {
     return false;
   }
-  if (kv->value_size == 0) {
+  if (kv->value_size() == 0) {
     out.clear();
     return true;
   }
@@ -744,12 +746,12 @@ auto DB::get(const ReadOptions &opts, BytesView key,
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   thread_local Bytes io_buf;
 #pragma clang diagnostic pop
-  (*s->files.get(kv->file_id))
-      ->read_value(kv->file_offset, narrow<std::uint16_t>(key.size()),
-                   kv->value_size, opts.verify_checksums, io_buf, out);
+  (*s->files.get(kv->file_id()))
+      ->read_value(kv->file_offset(), narrow<std::uint16_t>(key.size()),
+                   kv->value_size(), opts.verify_checksums, io_buf, out);
   counters_.disk_reads.fetch_add(1, std::memory_order_relaxed);
   counters_.disk_read_bytes.fetch_add(
-      static_cast<std::int64_t>(kv->value_size), std::memory_order_relaxed);
+      static_cast<std::int64_t>(kv->value_size()), std::memory_order_relaxed);
   return true;
 }
 
@@ -1010,7 +1012,7 @@ auto Snapshot::get(const ReadOptions& opts, BytesView key,
                    Bytes &out) const -> bool {
   const auto kv = state_->key_dir.get(key);
   if (!kv) return false;
-  if (kv->value_size == 0) {
+  if (kv->value_size() == 0) {
     out.clear();
     return true;
   }
@@ -1018,9 +1020,9 @@ auto Snapshot::get(const ReadOptions& opts, BytesView key,
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   thread_local Bytes io_buf;
 #pragma clang diagnostic pop
-  (*state_->files.get(kv->file_id))
-      ->read_value(kv->file_offset, narrow<std::uint16_t>(key.size()),
-                   kv->value_size, opts.verify_checksums, io_buf, out);
+  (*state_->files.get(kv->file_id()))
+      ->read_value(kv->file_offset(), narrow<std::uint16_t>(key.size()),
+                   kv->value_size(), opts.verify_checksums, io_buf, out);
   return true;
 }
 
@@ -1304,9 +1306,9 @@ auto DB::vacuum_scan_and_copy(
     switch (entry.entry_type) {
     case EntryType::Put: {
       const auto existing = snap->key_dir.get(entry.key);
-      if (existing && existing->file_id == source_file_id &&
-          existing->file_offset == entry_off &&
-          existing->sequence == entry.sequence) {
+      if (existing && existing->file_id() == source_file_id &&
+          existing->file_offset() == entry_off &&
+          existing->sequence() == entry.sequence) {
         const auto new_off =
             dest_file.append_entry(entry.sequence, EntryType::Put, entry.key,
                              entry.value);
@@ -1772,14 +1774,14 @@ void DB::validate_state_consistency(const EngineState &s) const {
   std::uint64_t max_seq = 0;
   for (auto it = s.key_dir.begin(); it != std::default_sentinel; ++it) {
     auto [key_span, entry] = *it;
-    if (!s.files.contains(entry.file_id)) {
+    if (!s.files.contains(entry.file_id())) {
       throw std::runtime_error{std::format(
           "state consistency: key references file_id {} not in registry",
-          entry.file_id)};
+          entry.file_id())};
     }
-    computed_live[entry.file_id] +=
-        entry_size(key_span.size(), entry.value_size);
-    if (entry.sequence > max_seq) max_seq = entry.sequence;
+    computed_live[entry.file_id()] +=
+        entry_size(key_span.size(), entry.value_size());
+    if (entry.sequence() > max_seq) max_seq = entry.sequence();
   }
 
   if (max_seq > 0 && s.next_seq <= max_seq) {
@@ -1918,15 +1920,15 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
             continue;
           }
           t.upsert(he->key,
-                   KeyDirEntry{he->sequence, he->file_offset, file_id,
-                               he->value_size},
+                   KeyDirEntry::make(he->sequence, he->file_offset, file_id,
+                                     he->value_size),
                    seq_wins);
         } else if (he->entry_type == EntryType::Delete) {
           const auto k = Key{he->key};
           auto &tomb_seq = tombstones[k];
           if (he->sequence > tomb_seq) tomb_seq = he->sequence;
           const auto existing = t.get(he->key);
-          if (existing && existing->sequence < he->sequence) {
+          if (existing && existing->sequence() < he->sequence) {
             t.erase(he->key);
           }
         } else if (he->entry_type == EntryType::RangeDel) {
@@ -1939,7 +1941,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
                it != std::default_sentinel; ++it) {
             auto [key_span, entry] = *it;
             if (Key{key_span} >= end) break;
-            if (entry.sequence < he->sequence) {
+            if (entry.sequence() < he->sequence) {
               to_erase.emplace_back(key_span);
             }
           }
@@ -1987,7 +1989,7 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
   for (const auto &[key, tomb_seq] : b.tombstones) {
     std::span<const std::byte> key_span{key.begin(), key.size()};
     const auto entry = merged.get(key_span);
-    if (entry && entry->sequence < tomb_seq) {
+    if (entry && entry->sequence() < tomb_seq) {
       merged = merged.erase(key_span);
     }
   }
@@ -1995,7 +1997,7 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
   for (const auto &[key, tomb_seq] : a.tombstones) {
     std::span<const std::byte> key_span{key.begin(), key.size()};
     const auto entry = merged.get(key_span);
-    if (entry && entry->sequence < tomb_seq) {
+    if (entry && entry->sequence() < tomb_seq) {
       merged = merged.erase(key_span);
     }
   }
@@ -2017,7 +2019,7 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
                it != std::default_sentinel; ++it) {
             auto [key_span, entry] = *it;
             if (Key{key_span} >= rt.end) break;
-            if (entry.sequence < rt.seq) {
+            if (entry.sequence() < rt.seq) {
               to_erase.emplace_back(key_span);
             }
           }
@@ -2161,7 +2163,7 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
   for (auto it = final_result.key_dir.begin(); it != std::default_sentinel;
        ++it) {
     const auto &[key_span, kde] = *it;
-    live_accum[kde.file_id] += entry_size(key_span.size(), kde.value_size);
+    live_accum[kde.file_id()] += entry_size(key_span.size(), kde.value_size());
   }
   auto fstats_t = final_result.file_stats.transient();
   for (const auto [fid, _] : final_result.file_stats) {

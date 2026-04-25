@@ -6,7 +6,7 @@
 
 **ByteCaskDB** is a fast, predictable embedded key-value store written in C++. Reads and writes have flat, predictable latency from thousands of keys to hundreds of millions.
 
-All keys in memory at all times — a deliberate design choice that removes an entire class of complexity that exists solely to minimise disk access and makes every point lookup O(1) with flat, predictable latency. At ~70 bytes per key, 128 GB of RAM holds close to two billion keys. Very few moving parts — an in-memory key directory and an append-only data file — is what keeps that latency flat whether you have 1,000 records or 100 million. 
+All keys in memory at all times — a deliberate design choice that removes an entire class of complexity that exists solely to minimise disk access and makes every point lookup O(1) with flat, predictable latency. At ~50 bytes per key, 128 GB of RAM holds close to 2.7 billion keys. Very few moving parts — an in-memory key directory and an append-only data file — is what keeps that latency flat whether you have 1,000 records or 100 million. 
 
 Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCaskDB replaces the original hash-table key directory with a **[persistent radix tree](docs/persistent_radix_tree_design.md)** — enabling ordered range queries, prefix scans, and prefix compaction, while keeping the simplicity that makes Bitcask fast. Snapshots are O(1) — just a root pointer copy. Full MVCC and serializable conflict detection are supported with no separate transaction type required.
 
@@ -196,7 +196,7 @@ for (auto& key : db.rkeys_from({}, to_bytes("user:~"))) { ... }
 namespace bytecask {
 
 struct Options {
-    uint64_t max_file_bytes{64 * 1024 * 1024};  // active file rotation threshold (default 64 MiB)
+    uint64_t max_file_bytes{64 * 1024 * 1024};  // active file rotation threshold (default 64 MiB, hard ceiling: 4 GiB)
     unsigned recovery_threads{4};                // parallelism for hint-file replay at open
     // When true (default): any CRC error during recovery causes DB::open to throw.
     // When false: corrupt entries and hint files are skipped; DB opens with the
@@ -205,7 +205,7 @@ struct Options {
     bool fail_recovery_on_crc_errors{true};
     Mode initial_mode{Mode::Leader};             // leader allows normal writes; follower allows ingest
     uint32_t max_key_bytes{4096};                // max key size (hard ceiling: 65,535 — u16 wire format)
-    uint32_t max_value_bytes{4 * 1024 * 1024};   // max value size (hard ceiling: ~4 GiB — u32 wire format)
+    uint32_t max_value_bytes{4 * 1024 * 1024};   // max value size (hard ceiling: 16 MiB — packed KeyDirEntry)
 };
 
 struct WriteOptions {

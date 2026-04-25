@@ -88,15 +88,15 @@ inline void assert_consistent(const DB &db) {
   std::uint64_t max_seq = 0;
   for (auto it = state->key_dir.begin(); it != std::default_sentinel; ++it) {
     auto [key_span, entry] = *it;
-    computed_live[entry.file_id] +=
-        entry_size(key_span.size(), entry.value_size);
+    computed_live[entry.file_id()] +=
+        entry_size(key_span.size(), entry.value_size());
 
     // 2. No dangling file references.
-    INFO("key references file_id=" << entry.file_id);
-    CHECK(state->files.contains(entry.file_id));
+    INFO("key references file_id=" << entry.file_id());
+    CHECK(state->files.contains(entry.file_id()));
 
     // 5. Track max sequence for next_seq check.
-    if (entry.sequence > max_seq) max_seq = entry.sequence;
+    if (entry.sequence() > max_seq) max_seq = entry.sequence();
   }
 
   for (const auto [file_id, fs] : state->file_stats) {

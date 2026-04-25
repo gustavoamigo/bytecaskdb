@@ -20,7 +20,7 @@
 #ifdef __EMSCRIPTEN__
 #include <mimalloc.h>
 #else
-#include <mimalloc.h>
+#include <jemalloc/jemalloc.h>
 #include <sys/resource.h>
 #endif
 
@@ -166,7 +166,7 @@ int main() {
 
   const char *base = std::getenv("BC_BENCH_DIR");
   auto parent = base && *base ? std::filesystem::path{base}
-                              : std::filesystem::temp_directory_path();
+                              : std::filesystem::path{"./.tmp"};
   auto dir = parent / "memory_profile";
   std::filesystem::create_directories(dir);
 

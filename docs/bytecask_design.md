@@ -90,6 +90,17 @@ Keys are stored as byte sequences within the radix tree's prefix-compressed node
 
 The on-disk entry header imposes hard ceilings: keys are limited to 65,535 bytes (u16 `key_size` field) and values to 4,294,967,295 bytes (u32 `value_size` field). These cannot be raised without a format change.
 
+The in-memory `KeyDirEntry` is bit-packed into two 64-bit words (16 bytes) to reduce radix tree node size. Field limits enforced by the packing:
+
+| Field | Bits | Max value |
+|---|---|---|
+| sequence | 48 | 281 trillion (~8.9 years at 1M ops/sec) |
+| file_id | 16 | 65,535 |
+| file_offset | 32 | 4 GiB per file |
+| value_size | 24 | 16 MiB per value |
+
+These limits are validated at construction time (`KeyDirEntry::make`). The on-disk format is unaffected — packing is in-memory only. All field access goes through accessor methods so the internal layout can be changed without touching call sites.
+
 Configurable limits are enforced at the API boundary — before any data is copied into a `WritePlan` or written to disk:
 
 | Limit | Default | Hard ceiling | Rationale |

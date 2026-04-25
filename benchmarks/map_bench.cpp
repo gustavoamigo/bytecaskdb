@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 import bytecask.radix_tree;
+import bytecask;
 
 // ---------------------------------------------------------------------------
 // Global allocation tracker — counts bytes allocated via operator new.
@@ -114,8 +115,8 @@ auto to_bytes(const std::string &s) -> std::span<const std::byte> {
 
 struct RTreeAdapter {
   using key_type = std::string;
-  using map_type = bytecask::PersistentRadixTree<int>;
-  using transient_type = bytecask::TransientRadixTree<int>;
+  using map_type = bytecask::PersistentRadixTree<bytecask::KeyDirEntry>;
+  using transient_type = bytecask::TransientRadixTree<bytecask::KeyDirEntry>;
 
   static auto make_keys(const std::vector<std::string> &strs)
       -> std::vector<key_type> {
@@ -125,14 +126,16 @@ struct RTreeAdapter {
   static auto build(const std::vector<key_type> &keys) -> map_type {
     auto t = map_type{};
     for (std::size_t i = 0; i < keys.size(); ++i)
-      t = t.set(to_bytes(keys[i]), static_cast<int>(i));
+      t = t.set(to_bytes(keys[i]),
+                bytecask::KeyDirEntry::make(i, 0, 0, 0));
     return t;
   }
 
   static auto transient_build(const std::vector<key_type> &keys) -> map_type {
     auto tr = map_type{}.transient();
     for (std::size_t i = 0; i < keys.size(); ++i)
-      tr.set(to_bytes(keys[i]), static_cast<int>(i));
+      tr.set(to_bytes(keys[i]),
+             bytecask::KeyDirEntry::make(i, 0, 0, 0));
     return std::move(tr).persistent();
   }
 
@@ -144,20 +147,20 @@ struct RTreeAdapter {
     return m.lower_bound(to_bytes(k));
   }
 
-  static auto iterate_sum(const map_type &m) -> int {
-    int sum = 0;
+  static auto iterate_sum(const map_type &m) -> std::uint64_t {
+    std::uint64_t sum = 0;
     for (auto it = m.begin(); it != m.end(); ++it) {
       auto [k, v] = *it;
-      sum += v;
+      sum += v.sequence;
     }
     return sum;
   }
 
-  static auto iterate_reverse_sum(const map_type &m) -> int {
-    int sum = 0;
+  static auto iterate_reverse_sum(const map_type &m) -> std::uint64_t {
+    std::uint64_t sum = 0;
     for (auto it = m.rbegin(); it != m.rend(); ++it) {
       auto [k, v] = *it;
-      sum += v;
+      sum += v.sequence;
     }
     return sum;
   }
@@ -170,7 +173,8 @@ struct RTreeAdapter {
       -> transient_type {
     auto tr = map_type{}.transient();
     for (std::size_t i = 0; i < keys.size(); ++i)
-      tr.set(to_bytes(keys[i]), static_cast<int>(i));
+      tr.set(to_bytes(keys[i]),
+             bytecask::KeyDirEntry::make(i, 0, 0, 0));
     return tr;
   }
 
@@ -185,7 +189,8 @@ struct RTreeAdapter {
                                const std::vector<key_type> &keys) -> map_type {
     auto tr = base.transient();
     for (std::size_t i = 0; i < keys.size(); ++i)
-      tr.set(to_bytes(keys[i]), static_cast<int>(i) + 1);
+      tr.set(to_bytes(keys[i]),
+             bytecask::KeyDirEntry::make(i + 1, 0, 0, 0));
     return std::move(tr).persistent();
   }
 };
@@ -383,6 +388,8 @@ template <typename A> void BM_PrefixedMemory(benchmark::State &state) {
 // Merge benchmarks — disjoint vs overlapping, and split-build-merge vs linear
 // ===========================================================================
 
+using RTree = bytecask::PersistentRadixTree<bytecask::KeyDirEntry>;
+
 // Merge-only: two disjoint N/2-key trees (zero overlap).
 // Measures the cost of structural merge when all subtrees are adopted by
 // pointer (best case — no conflict resolution).
@@ -393,10 +400,10 @@ void BM_MergeDisjoint(benchmark::State &state) {
   std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
   auto ta = RTreeAdapter::transient_build(ka);
   auto tb = RTreeAdapter::transient_build(kb);
-  auto resolve = [](const int &, const int &b) { return b; };
+  auto resolve = [](const bytecask::KeyDirEntry &,
+                    const bytecask::KeyDirEntry &b) { return b; };
   for (auto _ : state)
-    benchmark::DoNotOptimize(
-        bytecask::PersistentRadixTree<int>::merge(ta, tb, resolve));
+    benchmark::DoNotOptimize(RTree::merge(ta, tb, resolve));
 }
 
 // Merge-only: two N/2-key trees with ~50% key overlap (worst realistic case).
@@ -409,10 +416,10 @@ void BM_MergeOverlapping(benchmark::State &state) {
   std::vector<std::string> kb(all.begin() + quarter, all.end());
   auto ta = RTreeAdapter::transient_build(ka);
   auto tb = RTreeAdapter::transient_build(kb);
-  auto resolve = [](const int &, const int &b) { return b; };
+  auto resolve = [](const bytecask::KeyDirEntry &,
+                    const bytecask::KeyDirEntry &b) { return b; };
   for (auto _ : state)
-    benchmark::DoNotOptimize(
-        bytecask::PersistentRadixTree<int>::merge(ta, tb, resolve));
+    benchmark::DoNotOptimize(RTree::merge(ta, tb, resolve));
 }
 
 // Full parallel-recovery simulation (measured sequentially):
@@ -425,12 +432,12 @@ void BM_SplitBuildMerge(benchmark::State &state) {
   auto all = generate_keys(n);
   std::vector<std::string> ka(all.begin(), all.begin() + std::ssize(all) / 2);
   std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
-  auto resolve = [](const int &, const int &b) { return b; };
+  auto resolve = [](const bytecask::KeyDirEntry &,
+                    const bytecask::KeyDirEntry &b) { return b; };
   for (auto _ : state) {
     auto ta = RTreeAdapter::transient_build(ka);
     auto tb = RTreeAdapter::transient_build(kb);
-    benchmark::DoNotOptimize(
-        bytecask::PersistentRadixTree<int>::merge(ta, tb, resolve));
+    benchmark::DoNotOptimize(RTree::merge(ta, tb, resolve));
   }
 }
 
@@ -445,12 +452,12 @@ void BM_SplitBuildMergeOverlapping(benchmark::State &state) {
   auto mid = std::ssize(all) / 2;
   std::vector<std::string> ka(all.begin(), all.begin() + mid + overlap);
   std::vector<std::string> kb(all.begin() + mid - overlap, all.end());
-  auto resolve = [](const int &, const int &b) { return b; };
+  auto resolve = [](const bytecask::KeyDirEntry &,
+                    const bytecask::KeyDirEntry &b) { return b; };
   for (auto _ : state) {
     auto ta = RTreeAdapter::transient_build(ka);
     auto tb = RTreeAdapter::transient_build(kb);
-    benchmark::DoNotOptimize(
-        bytecask::PersistentRadixTree<int>::merge(ta, tb, resolve));
+    benchmark::DoNotOptimize(RTree::merge(ta, tb, resolve));
   }
 }
 
@@ -460,12 +467,12 @@ void BM_SplitBuildMergePrefixed(benchmark::State &state) {
   auto all = generate_prefixed_keys(n);
   std::vector<std::string> ka(all.begin(), all.begin() + std::ssize(all) / 2);
   std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
-  auto resolve = [](const int &, const int &b) { return b; };
+  auto resolve = [](const bytecask::KeyDirEntry &,
+                    const bytecask::KeyDirEntry &b) { return b; };
   for (auto _ : state) {
     auto ta = RTreeAdapter::transient_build(ka);
     auto tb = RTreeAdapter::transient_build(kb);
-    benchmark::DoNotOptimize(
-        bytecask::PersistentRadixTree<int>::merge(ta, tb, resolve));
+    benchmark::DoNotOptimize(RTree::merge(ta, tb, resolve));
   }
 }
 

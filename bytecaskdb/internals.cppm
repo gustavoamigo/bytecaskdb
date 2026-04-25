@@ -58,28 +58,82 @@ struct FileStats {
 // ---------------------------------------------------------------------------
 // KeyDirEntry — one slot in the in-memory key directory.
 //
+// Bit-packed into two 64-bit words to reduce per-node radix tree overhead.
+// Access is through accessor methods so the internal layout can be changed
+// without touching call sites.
+//
+// Layout:
+//   word0 [63:16] sequence  (48 bits, max 281 T)
+//         [15: 0] file_id   (16 bits, max 65 535)
+//   word1 [63:32] file_offset (32 bits, max 4 GiB)
+//         [31: 8] value_size  (24 bits, max 16 MiB)
+//         [ 7: 0] reserved
+//
 // file_id is a monotonic integer handle, assigned by DB, that indexes
-// into the engine's file registry. Using a compact integer avoids pointer-
-// stability hazards (pointers into a growing container would be invalidated)
-// and keeps each entry to a fixed small size.
-// file_offset is the byte offset where the full DataEntry begins.
+// into the engine's file registry. file_offset is the byte offset where
+// the full DataEntry begins.
 // ---------------------------------------------------------------------------
 export struct KeyDirEntry {
-  std::uint64_t sequence{};
-  std::uint64_t file_offset{};
-  std::uint32_t file_id{};
-  std::uint32_t value_size{};
+  std::uint64_t word0_{};
+  std::uint64_t word1_{};
+
+  // Field limits — checked at construction time.
+  static constexpr std::uint64_t kMaxSequence  = (std::uint64_t{1} << 48) - 1;
+  static constexpr std::uint32_t kMaxFileId    = (std::uint32_t{1} << 16) - 1;
+  static constexpr std::uint64_t kMaxFileOffset = (std::uint64_t{1} << 32) - 1;
+  static constexpr std::uint32_t kMaxValueSize = (std::uint32_t{1} << 24) - 1;
+
+  // Limit-checking helpers — usable both from make() and from call sites
+  // that validate individual fields before construction (e.g. file rotation).
+  static void check_sequence(std::uint64_t v) {
+    if (v > kMaxSequence)
+      throw std::runtime_error("sequence " + std::to_string(v) +
+                               " exceeds packed limit " + std::to_string(kMaxSequence));
+  }
+  static void check_file_id(std::uint32_t v) {
+    if (v > kMaxFileId)
+      throw std::runtime_error("file_id " + std::to_string(v) +
+                               " exceeds packed limit " + std::to_string(kMaxFileId));
+  }
+  static void check_file_offset(std::uint64_t v) {
+    if (v > kMaxFileOffset)
+      throw std::runtime_error("file_offset " + std::to_string(v) +
+                               " exceeds packed limit " + std::to_string(kMaxFileOffset));
+  }
+  static void check_value_size(std::uint32_t v) {
+    if (v > kMaxValueSize)
+      throw std::runtime_error("value_size " + std::to_string(v) +
+                               " exceeds packed limit " + std::to_string(kMaxValueSize));
+  }
+
+  static auto make(std::uint64_t sequence, std::uint64_t file_offset,
+                   std::uint32_t file_id, std::uint32_t value_size)
+      -> KeyDirEntry {
+    check_sequence(sequence);
+    check_file_id(file_id);
+    check_file_offset(file_offset);
+    check_value_size(value_size);
+    KeyDirEntry e;
+    e.word0_ = (sequence << 16) | file_id;
+    e.word1_ = (file_offset << 32) | (static_cast<std::uint64_t>(value_size) << 8);
+    return e;
+  }
+
+  [[nodiscard]] auto sequence()    const -> std::uint64_t { return word0_ >> 16; }
+  [[nodiscard]] auto file_id()     const -> std::uint32_t { return static_cast<std::uint32_t>(word0_ & 0xFFFFu); }
+  [[nodiscard]] auto file_offset() const -> std::uint64_t { return word1_ >> 32; }
+  [[nodiscard]] auto value_size()  const -> std::uint32_t { return static_cast<std::uint32_t>((word1_ >> 8) & 0xFF'FFFFu); }
 };
-static_assert(sizeof(KeyDirEntry) == 24);
+static_assert(sizeof(KeyDirEntry) == 16);
 
 // Canonical key-ownership comparator. Returns true if `a` is strictly newer
 // than `b`. Sequence numbers are unique per logical write, so equal sequences
 // must point to the same physical record. If they don't, the database is
 // corrupt and recovery is aborted.
 export inline auto kde_newer(const KeyDirEntry &a, const KeyDirEntry &b) -> bool {
-  if (a.sequence != b.sequence) return a.sequence > b.sequence;
+  if (a.sequence() != b.sequence()) return a.sequence() > b.sequence();
   // Same sequence — must be the same physical record.
-  if (a.file_id != b.file_id || a.file_offset != b.file_offset) {
+  if (a.file_id() != b.file_id() || a.file_offset() != b.file_offset()) {
     throw std::runtime_error(
         "bytecask: corrupt database — two entries share the same sequence "
         "number but differ in physical location");

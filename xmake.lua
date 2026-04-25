@@ -1,6 +1,7 @@
 add_rules("mode.debug", "mode.release", "mode.releasedbg")
 
 add_requires("crc32c")
+add_requires("jemalloc", {optional = true})
 -- Test dependency — optional so `xmake build` (default targets)
 -- doesn't download/build it unless the consuming target is explicitly built.
 add_requires("catch2 3.x", {optional = true})
@@ -157,7 +158,7 @@ target("memory_profile")
     set_kind("binary")
     set_default(false)
     add_files("benchmarks/memory_profile.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
-    add_packages("crc32c")
+    add_packages("crc32c", "jemalloc")
     on_config(function(t)
         apply_sanitizer(t)
         add_release_opts(t)
