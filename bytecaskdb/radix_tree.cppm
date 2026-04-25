@@ -254,6 +254,8 @@ template <typename V> struct Node {
 
       std::unique_ptr<ChildStore> kids;
       if (has_kids) {
+        // Raw cast: internal_node() would re-check the flag we just read.
+        // Safe because has_kids is true and mut points to an InternalNode.
         auto* internal = static_cast<InternalNode<V>*>(mut);
         kids = std::move(internal->children_);
         delete internal;
@@ -409,7 +411,7 @@ template <typename V> struct Node {
       auto *self = internal_node();
       assert(self != nullptr);
       auto* n = new InternalNode<V>();
-      n->packed_tag_ = packed_tag_ & kFlagBits;
+      n->packed_tag_ |= packed_tag_ & kHasValueBit;
       n->value_ = value_;
       n->prefix = prefix;
       if (self->children_)
@@ -434,7 +436,7 @@ template <typename V> struct Node {
   // Used when the caller will insert children into the clone.
   [[nodiscard]] auto clone_as_internal() const -> IntrusivePtr<Node> {
     auto* n = new InternalNode<V>();
-    n->packed_tag_ = (packed_tag_ & kHasValueBit) | kHasChildrenBit;
+    n->packed_tag_ |= packed_tag_ & kHasValueBit;
     n->value_ = value_;
     n->prefix = prefix;
     if (has_children_flag()) {
@@ -453,6 +455,7 @@ template <typename V> struct Node {
 // sizeof(InternalNode<KeyDirEntry>) == 48, glibc usable=56.
 // ---------------------------------------------------------------------------
 template <typename V> struct InternalNode : Node<V> {
+  InternalNode() { Node<V>::packed_tag_ |= Node<V>::kHasChildrenBit; }
   std::unique_ptr<typename Node<V>::ChildStore> children_;
 };
 
@@ -472,9 +475,7 @@ auto make_leaf() -> IntrusivePtr<Node<V>> {
 
 template <typename V>
 auto make_internal() -> IntrusivePtr<Node<V>> {
-  auto* n = new InternalNode<V>();
-  n->packed_tag_ |= Node<V>::kHasChildrenBit;
-  return IntrusivePtr<Node<V>>::adopt(n);
+  return IntrusivePtr<Node<V>>::adopt(new InternalNode<V>());
 }
 
 // Promote a leaf node to internal. Returns a new InternalNode with the
@@ -485,9 +486,8 @@ auto promote_to_internal(const IntrusivePtr<Node<V>> &node)
     -> IntrusivePtr<Node<V>> {
   assert(!node->has_children_flag());
   auto* n = new InternalNode<V>();
-  n->packed_tag_ = (node->packed_tag_ & ~Node<V>::kFlagBits) |
-                   (node->packed_tag_ & Node<V>::kHasValueBit) |
-                   Node<V>::kHasChildrenBit;
+  n->packed_tag_ |= (node->packed_tag_ & Node<V>::kHasValueBit) |
+                    (node->packed_tag_ & Node<V>::kTagMask);
   n->value_ = node->value_;
   n->prefix = node->prefix;
   return IntrusivePtr<Node<V>>::adopt(n);
@@ -1385,7 +1385,8 @@ private:
         merged_prefix.push_back(child->prefix[i]);
       child->prefix = std::move(merged_prefix);
       return std::move(child);
-    }    std::vector<std::byte> merged;
+    }
+    std::vector<std::byte> merged;
     merged.reserve(total);
     for (std::size_t i = 0; i < node->prefix.size(); ++i)
       merged.push_back(node->prefix[i]);
