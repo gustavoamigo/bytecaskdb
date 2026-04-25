@@ -83,10 +83,16 @@ end
 
 -- Global defaults applied to all targets
 set_toolchains("clang")
-add_syslinks("pthread")
 set_languages("c++23")
 set_policy("build.c++.modules", true)
 add_cxflags(table.unpack(common_flags))
+
+-- Native-only helper: adds pthread to the current target.
+-- Called from each native target's on_config instead of globally,
+-- because WASM targets run single-threaded and have no pthread.
+local function add_native_syslinks(t)
+    t:add("syslinks", "pthread")
+end
 
 if is_mode("release") or is_mode("releasedbg") then
     add_cxflags("-O3", "-fomit-frame-pointer")
@@ -118,6 +124,7 @@ target("bytecask_tests")
     add_packages("catch2", "crc32c")
     add_defines("BYTECASK_TESTING")
     on_config(function(t)
+        add_native_syslinks(t)
         apply_sanitizer(t)
         apply_coverage(t)
         add_release_opts(t)
@@ -145,6 +152,7 @@ target("map_bench")
     add_packages("benchmark", "crc32c")
     add_defines("BYTECASK_TESTING")
     on_config(function(t)
+        add_native_syslinks(t)
         apply_sanitizer(t)
         add_release_opts(t)
     end)
@@ -157,6 +165,7 @@ target("engine_bench")
     add_packages("benchmark", "crc32c", "rocksdb")
     add_defines("BENCH_NO_LEVELDB")
     on_config(function(t)
+        add_native_syslinks(t)
         apply_sanitizer(t)
         add_release_opts(t)
     end)
@@ -167,6 +176,7 @@ target("memory_profile")
     add_files("benchmarks/memory_profile.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
     add_packages("crc32c", "jemalloc")
     on_config(function(t)
+        add_native_syslinks(t)
         apply_sanitizer(t)
         add_release_opts(t)
     end)
@@ -186,7 +196,10 @@ target("bytecask")
     add_cxxflags("-fPIC", {force = true})  -- required when linking into a shared object (e.g. MariaDB plugin)
     add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp", "src/bytecask_c.cpp")
     add_packages("crc32c")
-    on_config(apply_sanitizer)
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+    end)
 
 -- Python bindings via nanobind.
 -- Wraps the C++23 module interface directly (not the C API).
@@ -258,6 +271,7 @@ target("bytecaskdb_python")
         add_shflags("-undefined", "dynamic_lookup", {force = true})
     end
     on_config(function(t)
+        add_native_syslinks(t)
         apply_sanitizer(t)
         add_release_opts(t)
     end)
@@ -274,7 +288,10 @@ target("fuzz_data_entry")
     add_includedirs("bytecaskdb")
     add_packages("crc32c")
     add_defines("BYTECASK_TESTING")
-    on_config(apply_sanitizer)
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+    end)
 
 target("fuzz_hint_entry")
     set_kind("binary")
@@ -283,7 +300,10 @@ target("fuzz_hint_entry")
     add_includedirs("bytecaskdb")
     add_packages("crc32c")
     add_defines("BYTECASK_TESTING")
-    on_config(apply_sanitizer)
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+    end)
 
 -- Seed corpus generator for fuzz targets.
 -- Build: xmake build gen_fuzz_corpus
@@ -294,3 +314,199 @@ target("gen_fuzz_corpus")
     add_files("tests/fuzz/gen_corpus.cpp", "bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
     add_includedirs("bytecaskdb")
     add_packages("crc32c")
+    on_config(function(t)
+        add_native_syslinks(t)
+    end)
+
+-- ── WASM / Emscripten targets ───────────────────────────────────────────────
+--
+-- Custom toolchain that uses the EMSDK-bundled Clang for compilation (so
+-- xmake's C++ module dependency scanner recognises it as real Clang) and
+-- em++ for linking (where it adds JS glue and the WASM runtime).
+--
+-- Build:  xmake build wasm_smoke_test
+-- Run:    node bytecaskdb-node/wasm/build/wasm_smoke_test.js
+--
+-- Prerequisites: Emscripten SDK activated, and WASM crc32c pre-built:
+--   cd bytecaskdb-node/wasm && bash build.sh  (first run builds deps)
+
+toolchain("emcc-clang")
+    set_kind("standalone")
+    set_description("Emscripten via EMSDK Clang (C++ module compatible)")
+
+    on_check(function(toolchain)
+        import("detect.sdks.find_emsdk")
+        local emsdk = find_emsdk()
+        if emsdk then
+            toolchain:config_set("sdkdir", emsdk.sdkdir)
+            toolchain:config_set("bindir", path.join(emsdk.sdkdir, "upstream", "bin"))
+            toolchain:config_set("emscripten", emsdk.emscripten)
+            return true
+        end
+        return false
+    end)
+
+    on_load(function(toolchain)
+        local sdkdir = toolchain:config("sdkdir")
+        local bindir = toolchain:config("bindir")
+        local emscripten = toolchain:config("emscripten")
+        local sysroot = path.join(sdkdir, "upstream", "emscripten", "cache", "sysroot")
+
+        -- Real Clang for compilation — passes xmake's tool-name and version checks
+        toolchain:set("toolset", "cxx", path.join(bindir, "clang++"))
+        toolchain:set("toolset", "cc",  path.join(bindir, "clang"))
+        -- em++ for linking — adds JS glue, WASM runtime, Emscripten libraries
+        toolchain:set("toolset", "ld", path.join(emscripten, "em++"))
+        toolchain:set("toolset", "sh", path.join(emscripten, "em++"))
+        toolchain:set("toolset", "ar", path.join(emscripten, "emar"))
+
+        -- Target wasm32-unknown-emscripten with the EMSDK sysroot
+        toolchain:add("cxflags", "--target=wasm32-unknown-emscripten")
+        toolchain:add("cxflags", "--sysroot=" .. sysroot)
+        -- Emscripten compat headers (provides xlocale.h and others)
+        toolchain:add("cxflags", "-Xclang", "-iwithsysroot/include/compat")
+        -- Prevent the host GCC/libstdc++ headers from leaking into the WASM build
+        toolchain:add("cxflags", "-nostdinc++")
+        toolchain:add("cxflags", "-isystem" .. path.join(sysroot, "include", "c++", "v1"))
+        toolchain:add("cxflags", "-DBYTECASK_SINGLE_THREADED")
+        toolchain:add("cxflags", "-fwasm-exceptions")
+    end)
+toolchain_end()
+
+-- Common WASM link flags applied to each WASM target via add_wasm_ldflags().
+local wasm_dir = path.join(os.projectdir(), "bytecaskdb-node", "wasm")
+local wasm_crc32c = path.join(wasm_dir, "build", "crc32c-wasm")
+
+-- Common WASM target setup. Each WASM target calls this in on_config.
+local function add_wasm_ldflags(t)
+    t:add("ldflags",
+        "-fwasm-exceptions",
+        "-sNODERAWFS=1", "-sENVIRONMENT=node", "-lnoderawfs.js",
+        "-sMALLOC=mimalloc", "-sALLOW_MEMORY_GROWTH", "-sEXIT_RUNTIME=1",
+        "--pre-js", path.join(wasm_dir, "pre.js"),
+        "--js-library", path.join(wasm_dir, "syscall_overrides.js"),
+        "-L" .. path.join(wasm_crc32c, "lib"),
+        {force = true})
+end
+
+-- Common WASM policies shared by all WASM targets.
+local function set_wasm_policies()
+    set_toolchains("emcc-clang")
+    set_languages("c++23")
+    set_policy("build.c++.modules", true)
+    set_policy("build.c++.modules.clang.fallbackscanner", true)
+    set_policy("build.c++.modules.std", false)
+end
+
+-- Run WASM targets via node, forwarding extra arguments.
+local function wasm_on_run(target)
+    import("core.base.option")
+    local args = table.join({target:targetfile()}, option.get("arguments") or {})
+    os.execv("node", args)
+end
+
+-- Common WASM source files and crc32c dependency.
+local function add_wasm_sources()
+    add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
+    add_includedirs(path.join(wasm_crc32c, "include"))
+    add_linkdirs(path.join(wasm_crc32c, "lib"))
+    add_links("crc32c")
+end
+
+target("wasm_smoke_test")
+    set_kind("binary")
+    set_default(false)
+    set_wasm_policies()
+    add_wasm_sources()
+    add_files("bytecaskdb-node/wasm/test_node.cpp")
+    on_config(add_wasm_ldflags)
+    on_run(wasm_on_run)
+    set_extension(".js")
+    set_targetdir(path.join(wasm_dir, "build"))
+
+target("wasm_embind")
+    set_kind("binary")
+    set_default(false)
+    set_wasm_policies()
+    add_wasm_sources()
+    add_files("bytecaskdb-node/wasm/bytecask_embind.cpp")
+    on_config(function(t)
+        t:add("ldflags",
+            "-fwasm-exceptions",
+            "-lembind",
+            "-sNODERAWFS=1", "-sENVIRONMENT=node", "-lnoderawfs.js",
+            "-sMALLOC=mimalloc", "-sALLOW_MEMORY_GROWTH",
+            "-sMODULARIZE=1", "-sEXPORT_NAME=createByteCask",
+            "--pre-js", path.join(wasm_dir, "pre.js"),
+            "--js-library", path.join(wasm_dir, "syscall_overrides.js"),
+            "-L" .. path.join(wasm_crc32c, "lib"),
+            {force = true})
+    end)
+    set_basename("bytecask")
+    set_extension(".mjs")
+    set_targetdir(path.join(wasm_dir, "build"))
+
+target("wasm_engine_bench")
+    set_kind("binary")
+    set_default(false)
+    set_wasm_policies()
+    add_wasm_sources()
+    add_files("benchmarks/engine_bench.cpp")
+    add_defines("BENCH_NO_LEVELDB", "BENCH_NO_ROCKSDB", "BENCH_NO_MT")
+    add_cxflags("-Wno-global-constructors")
+    on_config(function(t)
+        local bench_prefix = path.join(wasm_dir, "build", "benchmark-wasm")
+        t:add("includedirs", path.join(bench_prefix, "include"))
+        t:add("linkdirs", path.join(bench_prefix, "lib"))
+        t:add("links", "benchmark", "benchmark_main")
+        add_wasm_ldflags(t)
+    end)
+    set_basename("engine_bench_nodefs")
+    set_extension(".js")
+    set_targetdir(path.join(wasm_dir, "build"))
+    on_run(wasm_on_run)
+
+target("wasm_memory_profile")
+    set_kind("binary")
+    set_default(false)
+    set_wasm_policies()
+    add_wasm_sources()
+    add_files("benchmarks/memory_profile.cpp")
+    on_config(add_wasm_ldflags)
+    set_basename("memory_profile")
+    set_extension(".js")
+    set_targetdir(path.join(wasm_dir, "build"))
+    on_run(wasm_on_run)
+
+target("wasm_tests")
+    set_kind("binary")
+    set_default(false)
+    set_wasm_policies()
+    add_wasm_sources()
+    add_files("tests/*.cpp", "tests/proof/generated/*.cpp")
+    add_files("bytecaskdb-node/wasm/catch2_stringmakers.cpp")
+    add_includedirs("bytecaskdb", "tests")
+    add_defines("BYTECASK_TESTING")
+    on_config(function(t)
+        local catch2_prefix = path.join(wasm_dir, "build", "catch2-wasm")
+        t:add("includedirs", path.join(catch2_prefix, "include"))
+        t:add("linkdirs", path.join(catch2_prefix, "lib"))
+        t:add("links", "Catch2Main", "Catch2")
+        add_wasm_ldflags(t)
+        t:add("ldflags", "-sSTACK_SIZE=2097152", {force = true})
+    end)
+    set_basename("bytecask_tests")
+    set_extension(".js")
+    set_targetdir(path.join(wasm_dir, "build"))
+    -- Single-threaded WASM cannot run threading tests. Automatically exclude
+    -- [concurrency] and [lock] tagged tests, matching run_tests.sh behavior.
+    on_run(function(target)
+        import("core.base.option")
+        local user_args = option.get("arguments") or {}
+        local args = table.join({target:targetfile()}, user_args)
+        if #user_args == 0 then
+            table.insert(args, "~[concurrency]")
+            table.insert(args, "~[lock]")
+        end
+        os.execv("node", args)
+    end)

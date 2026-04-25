@@ -196,6 +196,71 @@ Attempt to recover from a degraded state.
 
 ---
 
+### `.mode()`
+
+Returns the current engine mode.
+
+- **returns** `string` — `'leader'` or `'follower'`
+
+---
+
+### `.setMode(mode)`
+
+Switch engine mode.
+
+- **mode** `string` — `'leader'` or `'follower'`
+
+---
+
+### `.currentSequence(timeoutMs?)`
+
+Returns the highest sequence confirmed durable by fdatasync.
+
+- **timeoutMs** `number?` — `0` (default): non-blocking. `> 0`: blocks until durable_seq advances or timeout expires.
+- **returns** `number`
+
+---
+
+### `.stats()`
+
+Returns all operational counters and gauges as a flat object.
+
+- **returns** `Record<string, number>` — monotonic counters (bytes_written, fsyncs, vacuum_bytes_reclaimed, crc_failures, io_errors, degraded_transitions) and gauges (degraded, open_files)
+
+```js
+const s = db.stats();
+console.log(s.bytes_written, s.fsyncs, s.open_files);
+```
+
+---
+
+### `.createManifest()`
+
+Rotates the active file, waits for all hint files, and returns a manifest of sealed files with a snapshot.
+
+- **returns** `FileManifest`
+
+---
+
+### `.changesSince(snap, fromSeq)`
+
+Returns a lazy iterator over data entries with sequence > `fromSeq`.
+
+- **snap** `Snapshot`
+- **fromSeq** `number`
+- **returns** `ChangeIterator`
+
+---
+
+### `.ingest(entries)`
+
+Applies pre-sequenced entries from a leader. Follower mode only.
+
+- **entries** `DataEntry[]`
+- **throws** if not in follower mode or engine is degraded
+
+---
+
 ### `.close()`
 
 Close the database and free C++ memory. Also available via `Symbol.dispose`.
@@ -250,6 +315,18 @@ Create a guarded batch. Consumes the snapshot — the `Snapshot` object becomes 
 
 - **snap** `Snapshot` — consumed
 
+### `WritePlan.withLimits(opts)`
+
+Create an unguarded batch with key/value size limits. Useful when you want size validation without a snapshot.
+
+- **opts** `{ maxKeyBytes?: number, maxValueBytes?: number }`
+
+```js
+const plan = WritePlan.withLimits({ maxKeyBytes: 256, maxValueBytes: 1024 });
+plan.put('k', 'v');
+db.applyBatch(plan);
+```
+
 ### `.put(key, value)`
 
 Add a put operation to the batch.
@@ -277,6 +354,12 @@ Guard: reject the batch if `key` has changed since the snapshot. Requires a snap
 ### `.ensureRangeUnchanged(from, to)`
 
 Guard: reject the batch if any key in `[from, to)` has changed since the snapshot. Requires a snapshot-backed plan.
+
+### `.hasSnapshot()`
+
+Check whether this plan was constructed with a snapshot.
+
+- **returns** `boolean`
 
 ### `.close()`
 
