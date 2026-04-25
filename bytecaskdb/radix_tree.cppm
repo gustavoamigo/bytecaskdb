@@ -319,16 +319,36 @@ template <typename V> struct Node {
   // Children: null for leaf nodes, heap-allocated for internal nodes.
   // 94% of nodes are leaves — they pay only 8 B (null pointer) instead
   // of embedding an empty vector in the node.
-  using ChildSlot = std::pair<std::byte, IntrusivePtr<Node>>;
-  using ChildVec = std::vector<ChildSlot>;
-  std::unique_ptr<ChildVec> children_;
+  //
+  // SoA layout: parallel vectors of transition bytes and child pointers.
+  // Eliminates 7 bytes of alignment padding per slot that
+  // pair<byte, IntrusivePtr<Node>> would waste (1 + 7 pad + 8 = 16 → 1 + 8 = 9).
+  struct ChildRef {
+    std::byte &transition;
+    IntrusivePtr<Node> &ptr;
+  };
+  struct ConstChildRef {
+    const std::byte &transition;
+    const IntrusivePtr<Node> &ptr;
+  };
+  struct ChildStore {
+    std::vector<std::byte> transition_bytes;
+    std::vector<IntrusivePtr<Node>> ptrs;
+    [[nodiscard]] auto size() const noexcept -> std::size_t {
+      return transition_bytes.size();
+    }
+    [[nodiscard]] auto empty() const noexcept -> bool {
+      return transition_bytes.empty();
+    }
+  };
+  std::unique_ptr<ChildStore> children_;
 
   void addref() const noexcept {
     refcount_.fetch_add(1, std::memory_order_relaxed);
   }
   // Iterative tail-release avoids the O(depth) recursive destructor chain
   // that otherwise occurs via ~IntrusivePtr → release → delete → ~Node →
-  // ~ChildVec → ~IntrusivePtr → … .
+  // ~ChildStore → ~IntrusivePtr → … .
   //
   // Profiling (perf record, MergeOverlapping/100K) showed this cascade as
   // 29% of total merge time. Converting the last-child release to a loop
@@ -353,8 +373,8 @@ template <typename V> struct Node {
       // becomes the next iteration's cur, converting tail recursion
       // into a loop.
       const Node* tail = nullptr;
-      for (auto& [b, child_ptr] : *kids) {
-        auto* raw = child_ptr.detach();
+      for (std::size_t i = 0; i < kids->size(); ++i) {
+        auto* raw = kids->ptrs[i].detach();
         if (!raw) continue;
         if (tail)
           tail->release();
@@ -390,54 +410,66 @@ template <typename V> struct Node {
   [[nodiscard]] auto has_children() const noexcept -> bool {
     return children_ && !children_->empty();
   }
-  [[nodiscard]] auto child_at(std::size_t i) const -> const ChildSlot & {
-    return (*children_)[i];
+  [[nodiscard]] auto child_at(std::size_t i) const -> ConstChildRef {
+    return {children_->transition_bytes[i], children_->ptrs[i]};
   }
-  [[nodiscard]] auto child_at(std::size_t i) -> ChildSlot & {
-    return (*children_)[i];
+  [[nodiscard]] auto child_at(std::size_t i) -> ChildRef {
+    return {children_->transition_bytes[i], children_->ptrs[i]};
   }
 
   // Find child by transition byte. Children are sorted by transition byte.
   // Linear scan is used because prefix compression keeps child counts small
   // (typically 1–4), where it outperforms binary search.
-  [[nodiscard]] auto find_child(std::byte b) const -> const ChildSlot * {
+  [[nodiscard]] auto find_child(std::byte b) const
+      -> std::optional<ConstChildRef> {
     if (!children_)
-      return nullptr;
-    for (auto &c : *children_) {
-      if (c.first == b)
-        return &c;
+      return std::nullopt;
+    for (std::size_t i = 0; i < children_->size(); ++i) {
+      if (children_->transition_bytes[i] == b)
+        return ConstChildRef{children_->transition_bytes[i],
+                             children_->ptrs[i]};
     }
-    return nullptr;
+    return std::nullopt;
   }
 
-  [[nodiscard]] auto find_child_mut(std::byte b) -> ChildSlot * {
+  [[nodiscard]] auto find_child_mut(std::byte b) -> std::optional<ChildRef> {
     if (!children_)
-      return nullptr;
-    for (auto &c : *children_) {
-      if (c.first == b)
-        return &c;
+      return std::nullopt;
+    for (std::size_t i = 0; i < children_->size(); ++i) {
+      if (children_->transition_bytes[i] == b)
+        return ChildRef{children_->transition_bytes[i], children_->ptrs[i]};
     }
-    return nullptr;
+    return std::nullopt;
   }
 
   // Insert child in sorted order by transition byte.
   void insert_child(std::byte b, IntrusivePtr<Node> child) {
     if (!children_)
-      children_ = std::make_unique<ChildVec>();
-    auto it = children_->begin();
-    while (it != children_->end() && it->first < b)
-      ++it;
-    assert((it == children_->end() || it->first != b) &&
+      children_ = std::make_unique<ChildStore>();
+    std::size_t pos = 0;
+    while (pos < children_->size() && children_->transition_bytes[pos] < b)
+      ++pos;
+    assert((pos == children_->size() || children_->transition_bytes[pos] != b) &&
            "duplicate transition byte");
-    children_->insert(it, {b, std::move(child)});
+    children_->transition_bytes.insert(
+        children_->transition_bytes.begin() +
+            static_cast<std::ptrdiff_t>(pos),
+        b);
+    children_->ptrs.insert(
+        children_->ptrs.begin() + static_cast<std::ptrdiff_t>(pos),
+        std::move(child));
   }
 
   void remove_child(std::byte b) {
     if (!children_)
       return;
-    for (auto it = children_->begin(); it != children_->end(); ++it) {
-      if (it->first == b) {
-        children_->erase(it);
+    for (std::size_t i = 0; i < children_->size(); ++i) {
+      if (children_->transition_bytes[i] == b) {
+        children_->transition_bytes.erase(
+            children_->transition_bytes.begin() +
+                static_cast<std::ptrdiff_t>(i));
+        children_->ptrs.erase(children_->ptrs.begin() +
+                              static_cast<std::ptrdiff_t>(i));
         return;
       }
     }
@@ -451,7 +483,7 @@ template <typename V> struct Node {
     n->value_ = value_;
     n->prefix = prefix;
     if (children_)
-      n->children_ = std::make_unique<ChildVec>(*children_);
+      n->children_ = std::make_unique<ChildStore>(*children_);
     return n;
   }
 
@@ -604,10 +636,10 @@ private:
       }
       auto transition = remaining[0];
       remaining = remaining.subspan(1);
-      auto *child = cur->find_child(transition);
+      auto child = cur->find_child(transition);
       if (!child)
         return nullptr;
-      cur = child->second.get();
+      cur = child->ptr.get();
     }
     return nullptr;
   }
@@ -676,11 +708,11 @@ private:
     // Recurse into child.
     auto transition = remaining[0];
     auto child_key = remaining.subspan(1);
-    auto *existing_child = new_node->find_child_mut(transition);
+    auto existing_child = new_node->find_child_mut(transition);
     if (existing_child) {
       auto [new_child, inserted] =
-          set_impl(existing_child->second, child_key, std::move(val));
-      existing_child->second = std::move(new_child);
+          set_impl(existing_child->ptr, child_key, std::move(val));
+      existing_child->ptr = std::move(new_child);
       return {std::move(new_node), inserted};
     }
     // No child for this transition — create a leaf.
@@ -733,11 +765,11 @@ private:
     // Recurse.
     auto transition = remaining[0];
     auto child_key = remaining.subspan(1);
-    auto *existing = node->find_child(transition);
+    auto existing = node->find_child(transition);
     if (!existing)
       return {node, false};
 
-    auto [new_child, removed] = erase_impl(existing->second, child_key);
+    auto [new_child, removed] = erase_impl(existing->ptr, child_key);
     if (!removed)
       return {node, false};
 
@@ -755,8 +787,8 @@ private:
       }
       return {std::move(new_node), true};
     }
-    auto *child_slot = new_node->find_child_mut(transition);
-    child_slot->second = std::move(new_child);
+    auto child_slot = new_node->find_child_mut(transition);
+    child_slot->ptr = std::move(new_child);
     // Path compression on the child side: child might now be a routing node
     // with 1 child and no value — but that's the child's responsibility,
     // already handled in the recursive call.
@@ -768,8 +800,9 @@ private:
   static auto merge_with_child(IntrusivePtr<Node<V>> node)
       -> IntrusivePtr<Node<V>> {
     assert(!node->has_value() && node->child_count() == 1);
-    auto transition = node->child_at(0).first;
-    auto child = node->child_at(0).second->clone();
+    auto slot0 = node->child_at(0);
+    auto transition = slot0.transition;
+    auto child = slot0.ptr->clone();
 
     typename Node<V>::Prefix merged_prefix;
     for (auto b : node->prefix)
@@ -835,12 +868,12 @@ private:
         a_suffix.push_back(pa[i]);
       a_trimmed->prefix = std::move(a_suffix);
 
-      auto *existing = new_b->find_child_mut(pa[cpl]);
+      auto existing = new_b->find_child_mut(pa[cpl]);
       std::size_t overlaps = 0;
       if (existing) {
         auto [child, child_overlaps] =
-            merge_impl(a_trimmed, existing->second, resolve);
-        existing->second = std::move(child);
+            merge_impl(a_trimmed, existing->ptr, resolve);
+        existing->ptr = std::move(child);
         overlaps = child_overlaps;
       } else {
         new_b->insert_child(pa[cpl], std::move(a_trimmed));
@@ -858,12 +891,12 @@ private:
         b_suffix.push_back(pb[i]);
       b_trimmed->prefix = std::move(b_suffix);
 
-      auto *existing = new_a->find_child_mut(pb[cpl]);
+      auto existing = new_a->find_child_mut(pb[cpl]);
       std::size_t overlaps = 0;
       if (existing) {
         auto [child, child_overlaps] =
-            merge_impl(existing->second, b_trimmed, resolve);
-        existing->second = std::move(child);
+            merge_impl(existing->ptr, b_trimmed, resolve);
+        existing->ptr = std::move(child);
         overlaps = child_overlaps;
       } else {
         new_a->insert_child(pb[cpl], std::move(b_trimmed));
@@ -887,16 +920,16 @@ private:
 
     if (b->has_children()) {
       for (std::size_t i = 0; i < b->child_count(); ++i) {
-        auto [tb, child_b] = b->child_at(i);
-        auto *slot = merged->find_child_mut(tb);
+        auto b_slot = b->child_at(i);
+        auto slot = merged->find_child_mut(b_slot.transition);
         if (slot) {
           auto [child, child_overlaps] =
-              merge_impl(slot->second, child_b, resolve);
-          slot->second = std::move(child);
+              merge_impl(slot->ptr, b_slot.ptr, resolve);
+          slot->ptr = std::move(child);
           overlaps += child_overlaps;
         } else {
           // Disjoint subtree — share it in O(1), no clone needed.
-          merged->insert_child(tb, child_b);
+          merged->insert_child(b_slot.transition, b_slot.ptr);
         }
       }
     }
@@ -1078,11 +1111,11 @@ private:
 
     auto transition = remaining[0];
     auto child_key = remaining.subspan(1);
-    auto *existing_child = mutable_node->find_child_mut(transition);
+    auto existing_child = mutable_node->find_child_mut(transition);
     if (existing_child) {
       auto [new_child, inserted] =
-          set_transient(existing_child->second, child_key, std::move(val), tag);
-      existing_child->second = std::move(new_child);
+          set_transient(existing_child->ptr, child_key, std::move(val), tag);
+      existing_child->ptr = std::move(new_child);
       return {std::move(mutable_node), inserted};
     }
     auto leaf = make_intrusive<Node<V>>();
@@ -1162,12 +1195,12 @@ private:
 
     auto transition = remaining[0];
     auto child_key = remaining.subspan(1);
-    auto *existing_child = mutable_node->find_child_mut(transition);
+    auto existing_child = mutable_node->find_child_mut(transition);
     if (existing_child) {
       auto [new_child, displaced, inserted] = upsert_transient(
-          existing_child->second, child_key, std::move(val), tag,
+          existing_child->ptr, child_key, std::move(val), tag,
           std::forward<Pred>(should_replace));
-      existing_child->second = std::move(new_child);
+      existing_child->ptr = std::move(new_child);
       return {std::move(mutable_node), std::move(displaced), inserted};
     }
     auto leaf = make_intrusive<Node<V>>();
@@ -1211,12 +1244,12 @@ private:
 
     auto transition = remaining[0];
     auto child_key = remaining.subspan(1);
-    auto *existing = node->find_child(transition);
+    auto existing = node->find_child(transition);
     if (!existing)
       return {node, false};
 
     auto [new_child, removed] =
-        erase_transient(existing->second, child_key, tag);
+        erase_transient(existing->ptr, child_key, tag);
     if (!removed)
       return {node, false};
 
@@ -1231,8 +1264,8 @@ private:
       }
       return {std::move(mutable_node), true};
     }
-    auto *child_slot = mutable_node->find_child_mut(transition);
-    child_slot->second = std::move(new_child);
+    auto child_slot = mutable_node->find_child_mut(transition);
+    child_slot->ptr = std::move(new_child);
     return {std::move(mutable_node), true};
   }
 
@@ -1240,8 +1273,9 @@ private:
                                          std::uint32_t tag)
       -> IntrusivePtr<Node<V>> {
     assert(!node->has_value() && node->child_count() == 1);
-    auto transition = node->child_at(0).first;
-    auto child = ensure_mutable(node->child_at(0).second, tag);
+    auto slot = node->child_at(0);
+    auto transition = slot.transition;
+    auto child = ensure_mutable(slot.ptr, tag);
 
     typename Node<V>::Prefix merged_prefix;
     for (std::size_t i = 0; i < node->prefix.size(); ++i)
@@ -1400,11 +1434,11 @@ private:
     while (!stack_.empty()) {
       auto &frame = stack_.back();
       if (frame.child_idx < frame.node->child_count()) {
-        auto &[transition, child] = frame.node->child_at(frame.child_idx);
+        auto slot = frame.node->child_at(frame.child_idx);
         ++frame.child_idx;
         auto key_before = current_key_.size();
-        current_key_.push_back(transition);
-        push_node(child, key_before);
+        current_key_.push_back(slot.transition);
+        push_node(slot.ptr, key_before);
         if (stack_.back().node->has_value())
           return;
         // Continue DFS.
@@ -1424,10 +1458,10 @@ private:
       auto &frame = stack_.back();
       auto last = frame.node->child_count() - 1;
       frame.child_idx = frame.node->child_count();
-      auto &[transition, child] = frame.node->child_at(last);
+      auto slot = frame.node->child_at(last);
       auto key_before = current_key_.size();
-      current_key_.push_back(transition);
-      push_node(child, key_before);
+      current_key_.push_back(slot.transition);
+      push_node(slot.ptr, key_before);
     }
   }
 
@@ -1464,10 +1498,10 @@ private:
         // we popped (current_key_ already trimmed to frame's key_len + prefix).
         --frame.child_idx;
         auto prev_idx = frame.child_idx - 1;
-        auto &[transition, child] = frame.node->child_at(prev_idx);
+        auto slot = frame.node->child_at(prev_idx);
         auto key_before = current_key_.size();
-        current_key_.push_back(transition);
-        push_node(child, key_before);
+        current_key_.push_back(slot.transition);
+        push_node(slot.ptr, key_before);
         stack_.back().child_idx = stack_.back().node->child_count();
         descend_rightmost();
         return;
@@ -1539,7 +1573,7 @@ private:
 
       bool descended = false;
       for (std::size_t i = 0; i < cur->child_count(); ++i) {
-        auto cb = cur->child_at(i).first;
+        auto cb = cur->child_at(i).transition;
         if (cb < target_byte)
           continue;
 
@@ -1548,7 +1582,7 @@ private:
           stack_.push_back({cur, i + 1, klb});
           klb = current_key_.size();
           current_key_.push_back(cb);
-          cur = cur->child_at(i).second;
+          cur = cur->child_at(i).ptr;
           remaining = child_remaining;
           descended = true;
           break;
