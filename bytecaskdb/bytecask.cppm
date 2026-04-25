@@ -857,9 +857,8 @@ private:
   // Merges two RecoveryResults with sequence-based conflict resolution.
   static auto recovery_merge_results(RecoveryResult a, RecoveryResult b)
       -> RecoveryResult;
-  // Reconstructs key_dir from hint files using a single thread.
-  auto recovery_load_serial(EngineState s, bool strict) -> EngineState;
-  // Reconstructs key_dir using file-level fan-in parallelism.
+  // Reconstructs key_dir from hint files. Uses file-level fan-in parallelism
+  // when recovery_threads > 1; single-threaded otherwise.
   auto recovery_load_parallel(EngineState s, unsigned recovery_threads,
                                bool strict) -> EngineState;
 

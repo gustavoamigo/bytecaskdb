@@ -841,7 +841,7 @@ This is a single code path: `flush_hints_for()` is the same function used by rot
 
 ### Parallel Recovery
 
-`Bytecask::open(dir, max_file_bytes, recovery_threads)` accepts an optional `recovery_threads` parameter (default 1 = serial). When `recovery_threads > 1`, recovery uses `parallel_recover_existing_files`:
+`Bytecask::open(dir, max_file_bytes, recovery_threads)` accepts an optional `recovery_threads` parameter (default 4). A single unified code path handles all thread counts — there is no separate serial implementation. When `recovery_threads == 1`, the same algorithm runs on the calling thread without spawning workers:
 
 1. **Phase 1 (serial, shared)**: same as above — open files, generate missing hints. Factored into `open_and_prepare_files()`, shared by both paths.
 2. **Phase 2 (parallel build)**: round-robin assign files to W workers. Each builds a `RecoveryResult{key_dir, tombstones, max_seq, file_stats}` independently.
@@ -1293,7 +1293,7 @@ The seam is intentionally minimal:
 - Dependencies: crc32c (google/crc32c, hardware-accelerated CRC-32C)
 - Primary target: `bytecask` (includes `src/*.cpp` + `src/engine/*.cppm`)
 - Test target: `bytecask_tests` (includes `tests/*.cpp` + `src/engine/*.cppm`)
-- Status: Full `Bytecask` SWMR engine with `open`, `get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from`. Key directory backed by `PersistentRadixTree<KeyDirEntry>`. Per-file fragmentation tracking via `FileStats` (`live_bytes`, `total_bytes`) maintained on every write and reconstructed during recovery. `open()` always creates a fresh active data file; recovery from hint files (serial and parallel). 1.2M+ assertions, 103 test cases.
+- Status: Full `Bytecask` SWMR engine with `open`, `get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from`. Key directory backed by `PersistentRadixTree<KeyDirEntry>`. Per-file fragmentation tracking via `FileStats` (`live_bytes`, `total_bytes`) maintained on every write and reconstructed during recovery. `open()` always creates a fresh active data file; unified recovery path from hint files (single-threaded or parallel). 1.2M+ assertions, 103 test cases.
 
 ## Current repository structure
 

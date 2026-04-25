@@ -651,12 +651,8 @@ DB::DB(std::filesystem::path dir, Options opts)
   try {
     EngineState s;
     const auto recovery_start = std::chrono::steady_clock::now();
-    if (opts.recovery_threads <= 1) {
-      s = recovery_load_serial(std::move(s), opts.fail_recovery_on_crc_errors);
-    } else {
-      s = recovery_load_parallel(std::move(s), opts.recovery_threads,
-                                 opts.fail_recovery_on_crc_errors);
-    }
+    s = recovery_load_parallel(std::move(s), opts.recovery_threads,
+                               opts.fail_recovery_on_crc_errors);
     const auto recovery_end = std::chrono::steady_clock::now();
     counters_.recovery_duration_us =
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2042,136 +2038,6 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
   return {std::move(merged), std::move(merged_tombs),
           std::move(merged_range_tombs),
           std::max(a.max_seq, b.max_seq), std::move(a.file_stats)};
-}
-
-// Reconstructs the key directory from hint files (serial path).
-// Pre-generates missing hint files from raw data scans,
-// then recovers exclusively from hints — single code path.
-// Returns a new EngineState with key_dir populated and next_seq set to
-// max_seen + 1. next_file_id is advanced for each recovered file.
-auto DB::recovery_load_serial(EngineState s, bool strict) -> EngineState {
-  auto files = recovery_prepare_files(s, strict);
-
-  // Use a plain hash map for live_bytes accumulation — in-place mutation is
-  // O(1) per entry vs. the copy-out/write-back overhead of TransientU32Map::update().
-  // Converted to PersistentU32Map once at the end.
-  std::unordered_map<std::uint32_t, FileStats> fstats_scratch;
-  for (const auto &rf : files) {
-    fstats_scratch.emplace(rf.file_id, FileStats{0, rf.total_bytes});
-  }
-
-  std::uint64_t max_seq = 0;
-  auto transient_key_dir = s.key_dir.transient();
-  std::map<Key, std::uint64_t> tombstones;
-  std::vector<RangeTombstone> range_tombstones;
-
-  for (auto &[file_id, data_file, hint_path, tb] : files) {
-    try {
-      auto hint = HintFile::OpenForRead(hint_path);
-      auto scanner = hint.make_scanner();
-      while (auto he = scanner.next()) {
-        // Track per-file sequence bounds for ALL entries, including those
-        // suppressed by tombstones. Bounds represent the range of sequences
-        // physically present in the file, not just live ones.
-        if (he->sequence > max_seq) max_seq = he->sequence;
-        auto &file_fs = fstats_scratch[file_id];
-        if (file_fs.min_sequence == 0 || he->sequence < file_fs.min_sequence)
-          file_fs.min_sequence = he->sequence;
-        if (he->sequence > file_fs.max_sequence)
-          file_fs.max_sequence = he->sequence;
-
-        if (he->entry_type == EntryType::Put) {
-          const auto k = Key{he->key};
-          const auto tomb_it = tombstones.find(k);
-          if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
-            continue;
-          }
-          // Check range tombstones.
-          bool suppressed = false;
-          for (const auto &rt : range_tombstones) {
-            if (rt.seq >= he->sequence && k >= rt.start && k < rt.end) {
-              suppressed = true;
-              break;
-            }
-          }
-          if (suppressed) {
-            continue;
-          }
-          const auto existing = transient_key_dir.get(he->key);
-          auto incoming = KeyDirEntry{he->sequence, he->file_offset,
-                                      file_id, he->value_size};
-          if (!existing || kde_newer(incoming, *existing)) {
-            if (existing) {
-              const auto dec =
-                  entry_size(he->key.size(), existing->value_size);
-              fstats_scratch[existing->file_id].live_bytes -= dec;
-            }
-            const auto inc = entry_size(he->key.size(), he->value_size);
-            fstats_scratch[file_id].live_bytes += inc;
-            transient_key_dir.set(he->key, incoming);
-          }
-        } else if (he->entry_type == EntryType::Delete) {
-          const auto k = Key{he->key};
-          auto &tomb_seq = tombstones[k];
-          if (he->sequence > tomb_seq) tomb_seq = he->sequence;
-          const auto existing = transient_key_dir.get(he->key);
-          if (existing && existing->sequence < he->sequence) {
-            const auto dec =
-                entry_size(he->key.size(), existing->value_size);
-            fstats_scratch[existing->file_id].live_bytes -= dec;
-            transient_key_dir.erase(he->key);
-          }
-        } else if (he->entry_type == EntryType::RangeDel) {
-          const auto start = Key{he->key};
-          const auto end = Key{he->end_key};
-          range_tombstones.push_back({start, end, he->sequence});
-          // Erase keys in [start, end) with sequence < this tombstone.
-          std::vector<Key> to_erase;
-          for (auto it = transient_key_dir.lower_bound(he->key);
-               it != std::default_sentinel; ++it) {
-            auto [key_span, entry] = *it;
-            if (Key{key_span} >= end) break;
-            if (entry.sequence < he->sequence) {
-              const auto dec = entry_size(key_span.size(), entry.value_size);
-              fstats_scratch[entry.file_id].live_bytes -= dec;
-              to_erase.emplace_back(key_span);
-            }
-          }
-          for (const auto &ek : to_erase) {
-            transient_key_dir.erase(std::span<const std::byte>{ek});
-          }
-        }
-      }
-    } catch (const std::exception &e) {
-      if (strict) throw;
-      std::fprintf(stderr,
-                   "bytecask: skipping hint file '%s' due to CRC error: %s\n",
-                   hint_path.string().c_str(), e.what());
-    }
-  }
-
-  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
-  for (const auto &[id, fs] : fstats_scratch) fstats_t.set(id, fs);
-  s.key_dir = std::move(transient_key_dir).persistent();
-
-  // Recompute live_bytes canonically from the final key_dir, matching
-  // the parallel path's Phase 4. The incremental tracking above may diverge
-  // from parallel due to non-deterministic directory iteration order
-  // affecting which file_id wins when entries share the same sequence.
-  std::unordered_map<std::uint32_t, std::uint64_t> live_accum;
-  for (auto it = s.key_dir.begin(); it != std::default_sentinel; ++it) {
-    const auto &[key_span, kde] = *it;
-    live_accum[kde.file_id] += entry_size(key_span.size(), kde.value_size);
-  }
-  for (const auto &[id, _] : fstats_scratch) {
-    const auto acc_it = live_accum.find(id);
-    const auto live = (acc_it != live_accum.end()) ? acc_it->second : 0ULL;
-    fstats_t.update(id, [live](FileStats &fs) { fs.live_bytes = live; });
-  }
-
-  s.file_stats = std::move(fstats_t).persistent();
-  s.next_seq = max_seq + 1;
-  return s;
 }
 
 // Parallel recovery: file-level partitioning with sequential accumulator merge.
