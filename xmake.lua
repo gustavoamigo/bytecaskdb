@@ -6,19 +6,11 @@ add_requires("jemalloc", {optional = true})
 -- doesn't download/build it unless the consuming target is explicitly built.
 add_requires("catch2 3.x", {optional = true})
 
--- Benchmark option: `xmake f --enable-benchmarks=true`
--- Downloads benchmark, leveldb, and rocksdb only when enabled.
-option("enable-benchmarks")
-    set_default(false)
-    set_showmenu(true)
-    set_description("Download and build benchmark dependencies (benchmark, leveldb, rocksdb)")
-option_end()
-
-if has_config("enable-benchmarks") then
-    add_requires("benchmark")
-    -- add_requires("leveldb")
-    add_requires("rocksdb", {system = true})
-end
+-- Benchmark dependencies — optional so `xmake build` (default targets)
+-- doesn't download/build them unless a consuming target is explicitly built.
+add_requires("benchmark", {optional = true})
+-- add_requires("leveldb", {optional = true})
+add_requires("rocksdb", {system = true, optional = true})
 
 -- Sanitizer option: `xmake f --sanitizer=address` or `--sanitizer=thread`
 option("sanitizer")
