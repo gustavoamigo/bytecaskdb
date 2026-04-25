@@ -205,7 +205,7 @@ struct Options {
     bool fail_recovery_on_crc_errors{true};
     Mode initial_mode{Mode::Leader};             // leader allows normal writes; follower allows ingest
     uint32_t max_key_bytes{4096};                // max key size (hard ceiling: 65,535 — u16 wire format)
-    uint32_t max_value_bytes{4 * 1024 * 1024};   // max value size (hard ceiling: 16 MiB — packed KeyDirEntry)
+    uint32_t max_value_bytes{4 * 1024 * 1024};   // max value size (hard ceiling: 256 MiB — packed KeyDirEntry)
 };
 
 struct WriteOptions {

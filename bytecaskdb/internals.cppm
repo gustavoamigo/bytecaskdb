@@ -62,12 +62,14 @@ struct FileStats {
 // Access is through accessor methods so the internal layout can be changed
 // without touching call sites.
 //
-// Layout:
-//   word0 [63:16] sequence  (48 bits, max 281 T)
-//         [15: 0] file_id   (16 bits, max 65 535)
-//   word1 [63:32] file_offset (32 bits, max 4 GiB)
-//         [31: 8] value_size  (24 bits, max 16 MiB)
-//         [ 7: 0] reserved
+// Layout (variant 3b — split file_id):
+//   word0 [63:16] sequence     (48 bits, max 281 T)
+//         [15: 0] file_id_low  (16 bits)
+//   word1 [63:32] file_offset  (32 bits, max 4 GiB)
+//         [31: 4] value_size   (28 bits, max 256 MiB)
+//         [ 3: 0] file_id_high ( 4 bits)
+//
+// file_id = (file_id_high << 16) | file_id_low — effective 20 bits (max 1 048 575).
 //
 // file_id is a monotonic integer handle, assigned by DB, that indexes
 // into the engine's file registry. file_offset is the byte offset where
@@ -79,9 +81,9 @@ export struct KeyDirEntry {
 
   // Field limits — checked at construction time.
   static constexpr std::uint64_t kMaxSequence  = (std::uint64_t{1} << 48) - 1;
-  static constexpr std::uint32_t kMaxFileId    = (std::uint32_t{1} << 16) - 1;
+  static constexpr std::uint32_t kMaxFileId    = (std::uint32_t{1} << 20) - 1;
   static constexpr std::uint64_t kMaxFileOffset = (std::uint64_t{1} << 32) - 1;
-  static constexpr std::uint32_t kMaxValueSize = (std::uint32_t{1} << 24) - 1;
+  static constexpr std::uint32_t kMaxValueSize = (std::uint32_t{1} << 28) - 1;
 
   // Limit-checking helpers — usable both from make() and from call sites
   // that validate individual fields before construction (e.g. file rotation).
@@ -114,15 +116,21 @@ export struct KeyDirEntry {
     check_file_offset(file_offset);
     check_value_size(value_size);
     KeyDirEntry e;
-    e.word0_ = (sequence << 16) | file_id;
-    e.word1_ = (file_offset << 32) | (static_cast<std::uint64_t>(value_size) << 8);
+    e.word0_ = (sequence << 16) | (file_id & 0xFFFFu);
+    e.word1_ = (file_offset << 32) |
+               (static_cast<std::uint64_t>(value_size) << 4) |
+               (file_id >> 16);
     return e;
   }
 
   [[nodiscard]] auto sequence()    const -> std::uint64_t { return word0_ >> 16; }
-  [[nodiscard]] auto file_id()     const -> std::uint32_t { return static_cast<std::uint32_t>(word0_ & 0xFFFFu); }
+  [[nodiscard]] auto file_id()     const -> std::uint32_t {
+    auto low  = static_cast<std::uint32_t>(word0_ & 0xFFFFu);
+    auto high = static_cast<std::uint32_t>(word1_ & 0xFu);
+    return (high << 16) | low;
+  }
   [[nodiscard]] auto file_offset() const -> std::uint64_t { return word1_ >> 32; }
-  [[nodiscard]] auto value_size()  const -> std::uint32_t { return static_cast<std::uint32_t>((word1_ >> 8) & 0xFF'FFFFu); }
+  [[nodiscard]] auto value_size()  const -> std::uint32_t { return static_cast<std::uint32_t>((word1_ >> 4) & 0xFFF'FFFFu); }
 };
 static_assert(sizeof(KeyDirEntry) == 16);
 

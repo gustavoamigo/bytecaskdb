@@ -95,9 +95,9 @@ The in-memory `KeyDirEntry` is bit-packed into two 64-bit words (16 bytes) to re
 | Field | Bits | Max value |
 |---|---|---|
 | sequence | 48 | 281 trillion (~8.9 years at 1M ops/sec) |
-| file_id | 16 | 65,535 |
+| file_id | 20 | 1,048,575 (split across word0 and word1) |
 | file_offset | 32 | 4 GiB per file |
-| value_size | 24 | 16 MiB per value |
+| value_size | 28 | 256 MiB per value |
 
 These limits are validated at construction time (`KeyDirEntry::make`). The on-disk format is unaffected — packing is in-memory only. All field access goes through accessor methods so the internal layout can be changed without touching call sites.
 
