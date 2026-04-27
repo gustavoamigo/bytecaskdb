@@ -18,6 +18,7 @@ TARGET = "memory_profile"
 BINARY = REPO_ROOT / "build/linux/x86_64/release/memory_profile"
 DEFAULT_SIZES = [50_000, 100_000, 500_000, 1_000_000, 10_000_000]
 DEFAULT_FORMATS = ["prefixed", "binary"]
+HIGH_ENTROPY_FORMATS = ["uuidv4_binary", "uuidv4_text", "uuidv4_prefixed", "sha256_bin", "sha256_hex"]
 VALUE_SIZE = 245  # must match kValueSize in memory_profile.cpp
 
 
@@ -59,9 +60,11 @@ def parse_output(text: str) -> dict[str, int]:
     return results
 
 
-def run_profile(n: int, key_format: str = "prefixed") -> dict[str, int]:
+def run_profile(n: int, key_format: str = "prefixed", unordered_view: bool = False) -> dict[str, int]:
     bend_dir = str(REPO_ROOT / ".tmp")
     env = {"BC_DATASET_SIZE": str(n), "BC_BENCH_DIR": bend_dir, "BC_KEY_FORMAT": key_format}
+    if unordered_view:
+        env["BC_USE_UNORDERED_VIEW"] = "1"
     # Inherit PATH and other essentials
     import os
     full_env = {**os.environ, **env}
@@ -92,14 +95,14 @@ def print_summary(label: str, rows: list[tuple[int, int, int, float]], key_size:
         )
 
 
-def run_format(sizes: list[int], key_format: str) -> tuple[list[tuple[int, int, int, float]], int, int]:
+def run_format(sizes: list[int], key_format: str, unordered_view: bool = False) -> tuple[list[tuple[int, int, int, float]], int, int]:
     rows: list[tuple[int, int, int, float]] = []
     key_size: int = 0
     value_size: int = VALUE_SIZE
 
     for n in sizes:
         print(f"\n{'=' * 60}")
-        measurements = run_profile(n, key_format)
+        measurements = run_profile(n, key_format, unordered_view=unordered_view)
 
         if not key_size:
             key_size = measurements.get("meta/key_size", 0)
@@ -133,6 +136,12 @@ def main() -> None:
              "sha256_hex, sha256_bin, uuidv4_text, uuidv4_prefixed, uuidv4_binary, "
              "hash_prefixed, binary, zipfian, clustered, many_partitions, mixed",
     )
+    parser.add_argument(
+        "--unordered-view",
+        action="store_true",
+        help="Route keys through UnorderedView (linear hashing). "
+             "Defaults to high-entropy key formats when --key-formats is not set.",
+    )
     args = parser.parse_args()
 
     sizes = DEFAULT_SIZES
@@ -142,20 +151,28 @@ def main() -> None:
     formats = DEFAULT_FORMATS
     if args.key_formats:
         formats = [f.strip() for f in args.key_formats.split(",")]
+    elif args.unordered_view:
+        formats = HIGH_ENTROPY_FORMATS
 
     build(args.skip_build)
 
     all_results: list[tuple[str, list[tuple[int, int, int, float]], int, int]] = []
 
     for fmt in formats:
+        label = f"{fmt.upper()} KEYS"
+        if args.unordered_view:
+            label += " (UnorderedView)"
         print("\n" + "=" * 60)
-        print(f"  {fmt.upper()} KEYS")
+        print(f"  {label}")
         print("=" * 60)
-        rows, key_size, value_size = run_format(sizes, fmt)
+        rows, key_size, value_size = run_format(sizes, fmt, unordered_view=args.unordered_view)
         all_results.append((fmt, rows, key_size, value_size))
 
     for fmt, rows, key_size, value_size in all_results:
-        print_summary(f"{fmt} keys", rows, key_size, value_size)
+        label = f"{fmt} keys"
+        if args.unordered_view:
+            label += " (UnorderedView)"
+        print_summary(label, rows, key_size, value_size)
 
 
 if __name__ == "__main__":

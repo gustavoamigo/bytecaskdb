@@ -14,6 +14,7 @@
 //   hash_prefixed, binary, zipfian, clustered, many_partitions, mixed
 
 #include "../tests/key_generators.h"
+#include "unordered_view.h"
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
@@ -47,6 +48,11 @@ auto dataset_size() -> std::size_t {
 auto key_format() -> std::string {
   const char *env = std::getenv("BC_KEY_FORMAT");
   return (env && *env) ? std::string{env} : "prefixed";
+}
+
+auto use_unordered_view() -> bool {
+  const char *env = std::getenv("BC_USE_UNORDERED_VIEW");
+  return env && *env && std::string{env} != "0";
 }
 
 auto make_value() -> std::array<std::byte, kValueSize> {
@@ -116,6 +122,7 @@ void print_memory(const char *phase) {
 int main() {
   auto n = dataset_size();
   auto format = key_format();
+  auto use_uv = use_unordered_view();
   auto *shape = key_generators::key_shape_by_name(format);
   if (!shape) {
     std::fprintf(stderr, "Unknown BC_KEY_FORMAT: %s\nAvailable formats:", format.c_str());
@@ -133,8 +140,9 @@ int main() {
   for (auto &k : keys)
     total_key_bytes += k.size();
   auto avg_key_size = keys.empty() ? std::size_t{0} : total_key_bytes / keys.size();
-  std::printf("=== Memory Profile (%zu keys, %zu-byte %s keys, %zu-byte values) ===\n",
-              n, avg_key_size, format.c_str(), kValueSize);
+  std::printf("=== Memory Profile (%zu keys, %zu-byte %s keys, %zu-byte values%s) ===\n",
+              n, avg_key_size, format.c_str(), kValueSize,
+              use_uv ? ", UnorderedView" : "");
 
   const char *base = std::getenv("BC_BENCH_DIR");
   auto parent = base && *base ? std::filesystem::path{base}
@@ -147,19 +155,57 @@ int main() {
   {
     // Use large file rotation threshold to avoid hitting fd limits at scale.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 512 * 1024 * 1024});
-    bytecask::WriteOptions wo;
-    wo.sync = false;
 
-    for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
-      auto end = std::min(i + kPopulateBatchSize, n);
-      bytecask::WritePlan plan;
-      for (std::size_t j = i; j < end; ++j)
-        plan.put(bc_key(keys[j]), val_view);
-      wo.sync = (end == n);
-      (void)db.apply_batch(wo, std::move(plan));
+    if (use_uv) {
+      // Route through UnorderedView — linear hashing maps arbitrary keys
+      // into sequential bucket keys for efficient radix tree compression.
+      unordered_view::Options uv_opts;
+      const char *cap_env = std::getenv("BC_UV_BUCKET_CAPACITY");
+      if (cap_env && *cap_env)
+        uv_opts.bucket_capacity = static_cast<std::uint32_t>(std::stoul(cap_env));
+      unordered_view::UnorderedView view{db, "uv", uv_opts};
+      for (std::size_t i = 0; i < n; ++i)
+        view.put(bc_key(keys[i]), val_view);
+      // Final sync.
+      db.put({.sync = true}, bc_key(keys[0]), val_view);
+    } else {
+      bytecask::WriteOptions wo;
+      wo.sync = false;
+
+      for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
+        auto end = std::min(i + kPopulateBatchSize, n);
+        bytecask::WritePlan plan;
+        for (std::size_t j = i; j < end; ++j)
+          plan.put(bc_key(keys[j]), val_view);
+        wo.sync = (end == n);
+        (void)db.apply_batch(wo, std::move(plan));
+      }
     }
 
     print_memory("after insert");
+
+    // Dump all DB keys to a file for inspection.
+    const char *dump_env = std::getenv("BC_DUMP_KEYS");
+    if (dump_env && *dump_env) {
+      auto *f = std::fopen(dump_env, "w");
+      if (f) {
+        std::size_t count = 0;
+        for (auto &key : db.keys_from({}, {})) {
+          // Print each key as hex + ASCII side-by-side.
+          for (auto b : key)
+            std::fprintf(f, "%02x", std::to_integer<unsigned>(b));
+          std::fprintf(f, "  ");
+          for (auto b : key) {
+            auto c = std::to_integer<unsigned char>(b);
+            std::fprintf(f, "%c", (c >= 32 && c < 127) ? c : '.');
+          }
+          std::fprintf(f, "\n");
+          ++count;
+        }
+        std::fclose(f);
+        std::printf("  Dumped %zu keys to %s\n", count, dump_env);
+      }
+    }
   }
 
   print_memory("after close");

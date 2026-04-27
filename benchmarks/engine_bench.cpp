@@ -68,6 +68,8 @@ import bytecask.hint_entry;
 import bytecask.hint_file;
 import bytecask.types;
 
+#include "unordered_view.h"
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -370,6 +372,51 @@ struct BcAdapterStale : BcAdapter {
     ro.staleness_tolerance = std::chrono::milliseconds{100};
     bytecask::Bytes value;
     auto found = db.engine.get(ro, bc_key(k), value);
+    benchmark::DoNotOptimize(found);
+    benchmark::DoNotOptimize(value.data());
+  }
+};
+
+struct BcUnorderedViewAdapter {
+  struct Db {
+    TmpDir dir;
+    bytecask::DB engine;
+    std::unique_ptr<unordered_view::UnorderedView> view;
+
+    Db(std::string_view tag, const std::vector<std::string> *populate_keys,
+       const std::vector<std::byte> *populate_val)
+        : dir{tag}, engine{bytecask::DB::open(dir.path)},
+          view{std::make_unique<unordered_view::UnorderedView>(engine, "uv")} {
+      if (populate_keys && populate_val) {
+        auto val_view = bytecask::BytesView{populate_val->data(),
+                                            populate_val->size()};
+        for (const auto &k : *populate_keys) {
+          view->put(bc_key(k), val_view);
+        }
+        // Final sync.
+        engine.put({.sync = true}, bc_key((*populate_keys)[0]), val_view);
+      }
+    }
+  };
+
+  static auto open_empty(std::string_view tag) -> Db {
+    return Db{tag, nullptr, nullptr};
+  }
+
+  static auto open_populated(std::string_view tag,
+                             const std::vector<std::string> &keys,
+                             const std::vector<std::byte> &val) -> Db {
+    return Db{tag, &keys, &val};
+  }
+
+  static void put(Db &db, const std::string &k,
+                  const std::vector<std::byte> &v, bool /*sync*/) {
+    db.view->put(bc_key(k), bc_val(v));
+  }
+
+  static void get(Db &db, const std::string &k) {
+    bytecask::Bytes value;
+    auto found = db.view->get(bc_key(k), value);
     benchmark::DoNotOptimize(found);
     benchmark::DoNotOptimize(value.data());
   }
@@ -1274,6 +1321,7 @@ void BM_RecoveryParallel(benchmark::State &state) {
 #define BENCH(...) BENCHMARK(__VA_ARGS__)->UseRealTime()
 
 using Bc  = BcAdapter;
+using BcUV = BcUnorderedViewAdapter;
 #ifndef BENCH_NO_LEVELDB
 using Ldb = LdbAdapter<true>;
 using LdbNC = LdbAdapter<false>;
@@ -1291,6 +1339,10 @@ BENCH(BM_Del<Bc, true>)           ->Name("ByteCaskDB/Del/Sync");
 BENCH(BM_Get<Bc>)                 ->Name("ByteCaskDB/Get");
 BENCH(BM_Range<Bc, kRangeLen>)    ->Name("ByteCaskDB/Range50");
 BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCaskDB/MixedBatch/Sync");
+
+// --- UnorderedView ---
+BENCH(BM_Put<BcUV, false>)          ->Name("UnorderedView/Put/NoSync");
+BENCH(BM_Get<BcUV>)                 ->Name("UnorderedView/Get");
 
 
 
@@ -1341,6 +1393,12 @@ BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(8
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(16);
 BENCH(BM_GetMT<Rdb>)                ->Name("RocksDB/GetMT")           ->Threads(32);
 #endif
+// --- UnorderedView GetMT ---
+BENCH(BM_GetMT<BcUV>)              ->Name("UnorderedView/GetMT")      ->Threads(2);
+BENCH(BM_GetMT<BcUV>)              ->Name("UnorderedView/GetMT")      ->Threads(4);
+BENCH(BM_GetMT<BcUV>)              ->Name("UnorderedView/GetMT")      ->Threads(8);
+BENCH(BM_GetMT<BcUV>)              ->Name("UnorderedView/GetMT")      ->Threads(16);
+BENCH(BM_GetMT<BcUV>)              ->Name("UnorderedView/GetMT")      ->Threads(32);
 
 // --- ReadAndWriteLoad (read throughput with 1 background writer) ---
 BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCaskDB/ReadAndWriteLoad/Sync")            ->Threads(2);
