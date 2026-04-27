@@ -1236,13 +1236,22 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
     return;
   }
 
+  // Uses std::string instead of std::vector<std::byte> for SSO: keys under
+  // ~22 bytes (libstdc++) are stored inline — no heap allocation per entry.
   struct PendingHint {
     std::uint64_t seq;
     EntryType type;
     std::uint64_t file_off;
     std::uint32_t val_size;
-    std::vector<std::byte> key;
-    std::vector<std::byte> end_key; // non-empty only for RangeDel
+    std::string key;
+    std::string end_key; // non-empty only for RangeDel
+  };
+
+  auto as_str = [](std::span<const std::byte> s) -> std::string {
+    return {reinterpret_cast<const char *>(s.data()), s.size()};
+  };
+  auto as_bytes = [](const std::string &s) -> std::span<const std::byte> {
+    return std::as_bytes(std::span{s.data(), s.size()});
   };
 
   auto hint = HintFile::OpenForWrite(tmp_path);
@@ -1263,11 +1272,10 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
       }
       entries.push_back(
           {entry.sequence, entry.entry_type, entry_off,
-           narrow<std::uint32_t>(entry.value.size()), entry.key,
+           narrow<std::uint32_t>(entry.value.size()), as_str(entry.key),
            entry.entry_type == EntryType::RangeDel
-               ? std::vector<std::byte>{entry.value.begin(),
-                                        entry.value.end()}
-               : std::vector<std::byte>{}});
+               ? as_str(entry.value)
+               : std::string{}});
     }
   } catch (const std::exception &e) {
     if (strict) throw;
@@ -1283,9 +1291,11 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
 
   for (const auto &pe : entries) {
     if (pe.type == EntryType::RangeDel) {
-      hint.append_range_del(pe.seq, pe.file_off, pe.key, pe.end_key);
+      hint.append_range_del(pe.seq, pe.file_off, as_bytes(pe.key),
+                            as_bytes(pe.end_key));
     } else {
-      hint.append(pe.seq, pe.type, pe.file_off, pe.key, pe.val_size);
+      hint.append(pe.seq, pe.type, pe.file_off, as_bytes(pe.key),
+                  pe.val_size);
     }
   }
   hint.sync();

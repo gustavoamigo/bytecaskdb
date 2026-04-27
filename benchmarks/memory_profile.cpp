@@ -108,7 +108,19 @@ auto measure_current_rss() -> std::size_t {
   return static_cast<std::size_t>(resident) * 4096;
 }
 
+void purge_jemalloc() {
+  // Force jemalloc to return all freed pages to the OS so that RSS
+  // reflects live allocations, not the allocator's retained free lists.
+  unsigned narenas = 0;
+  std::size_t sz = sizeof(narenas);
+  mallctl("arenas.narenas", &narenas, &sz, nullptr, 0);
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "arena.%u.purge", narenas);
+  mallctl(buf, nullptr, nullptr, nullptr, 0);
+}
+
 void print_memory(const char *phase) {
+  //purge_jemalloc();
   struct rusage ru;
   getrusage(RUSAGE_SELF, &ru);
   std::printf("  [%s]\n", phase);
@@ -132,14 +144,14 @@ int main() {
     return 1;
   }
 
-  auto keys = shape->generate(n);
+  // Compute avg key size from a single sample key — no bulk allocation.
+  std::string key_buf;
+  shape->make_key(0, n, key_buf);
+  auto avg_key_size = key_buf.size();
+
   auto val = make_value();
   bytecask::BytesView val_view{val.data(), val.size()};
 
-  std::size_t total_key_bytes = 0;
-  for (auto &k : keys)
-    total_key_bytes += k.size();
-  auto avg_key_size = keys.empty() ? std::size_t{0} : total_key_bytes / keys.size();
   std::printf("=== Memory Profile (%zu keys, %zu-byte %s keys, %zu-byte values%s) ===\n",
               n, avg_key_size, format.c_str(), kValueSize,
               use_uv ? ", UnorderedView" : "");
@@ -153,8 +165,7 @@ int main() {
   print_memory("before open");
 
   {
-    // Use large file rotation threshold to avoid hitting fd limits at scale.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 512 * 1024 * 1024});
+    auto db = bytecask::DB::open(dir);
 
     if (use_uv) {
       // Route through UnorderedView — linear hashing maps arbitrary keys
@@ -164,10 +175,31 @@ int main() {
       if (cap_env && *cap_env)
         uv_opts.bucket_capacity = static_cast<std::uint32_t>(std::stoul(cap_env));
       unordered_view::UnorderedView view{db, "uv", uv_opts};
-      for (std::size_t i = 0; i < n; ++i)
-        view.put(bc_key(keys[i]), val_view);
+      for (std::size_t i = 0; i < n; ++i) {
+        shape->make_key(i, n, key_buf);
+        view.put(bc_key(key_buf), val_view);
+      }
       // Final sync.
-      db.put({.sync = true}, bc_key(keys[0]), val_view);
+      shape->make_key(0, n, key_buf);
+      db.put({.sync = true}, bc_key(key_buf), val_view);
+
+      // Print allocation / I/O counters.
+      auto &s = view.stats();
+      std::printf("\n  UnorderedView stats:\n");
+      std::printf("    splits:              %12lu  (empty: %lu)\n", s.splits, s.split_empty);
+      std::printf("    split_entries_moved:  %12lu\n", s.split_entries_moved);
+      std::printf("    split_tombstones_gc: %12lu\n", s.split_tombstones_gc);
+      std::printf("    split_db_reads:      %12lu\n", s.split_db_reads);
+      std::printf("    split_db_writes:     %12lu\n", s.split_db_writes);
+      std::printf("    put_append:          %12lu  (no-read fast path)\n", s.put_append);
+      std::printf("    put_chain_update:    %12lu  (read-modify-write)\n", s.put_chain_update);
+      std::printf("    chain_decodes:       %12lu\n", s.chain_decodes);
+      std::printf("    chain_encodes:       %12lu\n", s.chain_encodes);
+      std::printf("    splits/put ratio:    %12.4f\n",
+                  n > 0 ? static_cast<double>(s.splits) / static_cast<double>(n) : 0.0);
+      std::printf("    entries_moved/put:   %12.4f\n",
+                  n > 0 ? static_cast<double>(s.split_entries_moved) / static_cast<double>(n) : 0.0);
+      std::printf("\n");
     } else {
       bytecask::WriteOptions wo;
       wo.sync = false;
@@ -175,12 +207,15 @@ int main() {
       for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
         auto end = std::min(i + kPopulateBatchSize, n);
         bytecask::WritePlan plan;
-        for (std::size_t j = i; j < end; ++j)
-          plan.put(bc_key(keys[j]), val_view);
+        for (std::size_t j = i; j < end; ++j) {
+          shape->make_key(j, n, key_buf);
+          plan.put(bc_key(key_buf), val_view);
+        }
         wo.sync = (end == n);
         (void)db.apply_batch(wo, std::move(plan));
       }
     }
+    //(void)db.vacuum();
 
     print_memory("after insert");
 
@@ -208,6 +243,7 @@ int main() {
     }
   }
 
+  // purge_jemalloc();
   print_memory("after close");
 
   std::error_code ec;

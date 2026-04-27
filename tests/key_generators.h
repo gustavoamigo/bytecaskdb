@@ -19,12 +19,29 @@
 
 namespace key_generators {
 
+// ---------------------------------------------------------------------------
+// splitmix64 — fast hash for deriving per-index pseudo-random state.
+// Used by make_key functions that need random-looking content from an index.
+// ---------------------------------------------------------------------------
+
+inline auto splitmix64(std::uint64_t x) -> std::uint64_t {
+  x += 0x9e3779b97f4a7c15;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111eb;
+  return x ^ (x >> 31);
+}
+
 inline auto generate_uniform_keys(std::size_t n) -> std::vector<std::string> {
   std::vector<std::string> keys;
   keys.reserve(n);
   for (std::size_t i = 0; i < n; ++i)
     keys.push_back("key_" + std::to_string(i));
   return keys;
+}
+
+inline void make_uniform_key(std::size_t i, std::size_t /*n*/,
+                             std::string &buf) {
+  buf = "key_" + std::to_string(i);
 }
 
 inline auto generate_prefixed_keys(std::size_t n) -> std::vector<std::string> {
@@ -44,6 +61,21 @@ inline auto generate_prefixed_keys(std::size_t n) -> std::vector<std::string> {
   return keys;
 }
 
+inline void make_prefixed_key(std::size_t i, std::size_t n,
+                              std::string &buf) {
+  static constexpr std::array pfxs = {
+      "user::", "order::", "session::", "invoice::", "product::"};
+  auto per_prefix = n / pfxs.size();
+  auto pfx_idx = (per_prefix > 0) ? i / per_prefix : 0;
+  if (pfx_idx >= pfxs.size()) pfx_idx = pfxs.size() - 1;
+  auto sub_i = i - pfx_idx * per_prefix;
+  std::ostringstream oss;
+  oss << pfxs[pfx_idx] << "018f6e2c-" << std::hex << std::setfill('0')
+      << std::setw(4) << (sub_i >> 16) << "-7000-8000-" << std::setw(12)
+      << (sub_i & 0xFFFFFFFF);
+  buf = oss.str();
+}
+
 inline auto generate_incremental_keys(std::size_t n)
     -> std::vector<std::string> {
   std::vector<std::string> keys;
@@ -51,6 +83,11 @@ inline auto generate_incremental_keys(std::size_t n)
   for (std::size_t i = 1; i <= n; ++i)
     keys.push_back(std::to_string(i));
   return keys;
+}
+
+inline void make_incremental_key(std::size_t i, std::size_t /*n*/,
+                                 std::string &buf) {
+  buf = std::to_string(i + 1);
 }
 
 // UUIDv7 keys — time-ordered UUIDs (RFC 9562). The first 48 bits encode a
@@ -115,6 +152,36 @@ inline auto generate_uuidv7_keys(std::size_t n) -> std::vector<std::string> {
   return keys;
 }
 
+inline void make_uuidv7_key(std::size_t i, std::size_t /*n*/,
+                            std::string &buf) {
+  static constexpr char hex_chars[] = "0123456789abcdef";
+  auto encode_hex = [](char *dst, std::uint64_t val, int nibbles) {
+    for (int j = nibbles - 1; j >= 0; --j) {
+      dst[j] = hex_chars[val & 0xF];
+      val >>= 4;
+    }
+  };
+  auto base_ms = static_cast<std::uint64_t>(0x018F6E2C0000);
+  constexpr std::size_t keys_per_ms = 50;
+  auto seq_base = static_cast<std::uint64_t>(0x1A2B3C4D5E6F);
+  auto ts = base_ms + i / keys_per_ms;
+  auto seq = seq_base + i;
+  auto rand_a = (seq >> 50) & 0xFFF;
+  auto rand_b = seq & 0x3FFFFFFFFFFFFFFF;
+  buf.resize(36);
+  encode_hex(buf.data(), ts >> 16, 8);
+  buf[8] = '-';
+  encode_hex(buf.data() + 9, ts & 0xFFFF, 4);
+  buf[13] = '-';
+  buf[14] = '7';
+  encode_hex(buf.data() + 15, rand_a, 3);
+  buf[18] = '-';
+  buf[19] = hex_chars[8 | ((rand_b >> 60) & 0x3)];
+  encode_hex(buf.data() + 20, (rand_b >> 48) & 0xFFF, 3);
+  buf[23] = '-';
+  encode_hex(buf.data() + 24, rand_b & 0xFFFFFFFFFFFF, 12);
+}
+
 // UUIDv7 binary keys — raw 16 bytes with the same time-ordered monotonic
 // structure as the text UUIDv7, but stored as binary (no hex encoding).
 // Used by systems that store UUIDs in compact binary form.
@@ -164,6 +231,34 @@ inline auto generate_uuidv7_binary_keys(std::size_t n)
   return keys;
 }
 
+inline void make_uuidv7_binary_key(std::size_t i, std::size_t /*n*/,
+                                   std::string &buf) {
+  auto base_ms = static_cast<std::uint64_t>(0x018F6E2C0000);
+  constexpr std::size_t keys_per_ms = 50;
+  auto seq_base = static_cast<std::uint64_t>(0x1A2B3C4D5E6F);
+  auto ts = base_ms + i / keys_per_ms;
+  auto seq = seq_base + i;
+  auto rand_a = (seq >> 50) & 0xFFF;
+  auto rand_b = seq & 0x3FFFFFFFFFFFFFFF;
+  buf.resize(16);
+  buf[0] = static_cast<char>((ts >> 40) & 0xFF);
+  buf[1] = static_cast<char>((ts >> 32) & 0xFF);
+  buf[2] = static_cast<char>((ts >> 24) & 0xFF);
+  buf[3] = static_cast<char>((ts >> 16) & 0xFF);
+  buf[4] = static_cast<char>((ts >> 8) & 0xFF);
+  buf[5] = static_cast<char>(ts & 0xFF);
+  buf[6] = static_cast<char>(0x70 | ((rand_a >> 8) & 0x0F));
+  buf[7] = static_cast<char>(rand_a & 0xFF);
+  buf[8] = static_cast<char>(0x80 | ((rand_b >> 56) & 0x3F));
+  buf[9] = static_cast<char>((rand_b >> 48) & 0xFF);
+  buf[10] = static_cast<char>((rand_b >> 40) & 0xFF);
+  buf[11] = static_cast<char>((rand_b >> 32) & 0xFF);
+  buf[12] = static_cast<char>((rand_b >> 24) & 0xFF);
+  buf[13] = static_cast<char>((rand_b >> 16) & 0xFF);
+  buf[14] = static_cast<char>((rand_b >> 8) & 0xFF);
+  buf[15] = static_cast<char>(rand_b & 0xFF);
+}
+
 // SHA-256 hex keys — 64-character hex strings like git object hashes or
 // content-addressed storage keys. Fully random, no prefix structure.
 inline auto generate_sha256_hex_keys(std::size_t n)
@@ -182,6 +277,21 @@ inline auto generate_sha256_hex_keys(std::size_t n)
   return keys;
 }
 
+inline void make_sha256_hex_key(std::size_t i, std::size_t /*n*/,
+                                std::string &buf) {
+  static constexpr char hex_chars[] = "0123456789abcdef";
+  buf.resize(64);
+  // 64 hex chars = 32 nibbles from 4 splitmix64 calls (64 bits = 16 nibbles each).
+  for (int block = 0; block < 4; ++block) {
+    auto h = splitmix64(42 + i * 4 + static_cast<std::size_t>(block));
+    for (int j = 0; j < 16; ++j) {
+      buf[static_cast<std::size_t>(block * 16 + j)] =
+          hex_chars[h & 0xF];
+      h >>= 4;
+    }
+  }
+}
+
 // SHA-256 binary keys — raw 32 bytes, as stored by content-addressed systems
 // that skip hex encoding for compactness.
 inline auto generate_sha256_bin_keys(std::size_t n)
@@ -197,6 +307,20 @@ inline auto generate_sha256_bin_keys(std::size_t n)
     keys.push_back(std::move(k));
   }
   return keys;
+}
+
+inline void make_sha256_bin_key(std::size_t i, std::size_t /*n*/,
+                                std::string &buf) {
+  buf.resize(32);
+  // 32 bytes = 4 splitmix64 calls (8 bytes each).
+  for (int block = 0; block < 4; ++block) {
+    auto h = splitmix64(43 + i * 4 + static_cast<std::size_t>(block));
+    for (int j = 0; j < 8; ++j) {
+      buf[static_cast<std::size_t>(block * 8 + j)] =
+          static_cast<char>(h & 0xFF);
+      h >>= 8;
+    }
+  }
 }
 
 // Zipfian / skewed distribution — a small number of "hot" keys appear
@@ -223,6 +347,18 @@ inline auto generate_zipfian_keys(std::size_t n) -> std::vector<std::string> {
   return keys;
 }
 
+inline void make_zipfian_key(std::size_t i, std::size_t n,
+                             std::string &buf) {
+  if (i < n / 20) {
+    buf = "hot_" + std::to_string(i);
+  } else {
+    std::ostringstream oss;
+    oss << "cold_partition_" << (i % 10) << "/key_"
+        << std::setfill('0') << std::setw(8) << i;
+    buf = oss.str();
+  }
+}
+
 // High-cardinality clustering — many keys under a few partitions.
 // Mimics a database where most keys belong to a handful of large tables.
 inline auto generate_clustered_keys(std::size_t n)
@@ -240,6 +376,16 @@ inline auto generate_clustered_keys(std::size_t n)
   return keys;
 }
 
+inline void make_clustered_key(std::size_t i, std::size_t /*n*/,
+                               std::string &buf) {
+  static constexpr std::array partitions = {
+      "users/", "orders/", "events/"};
+  std::ostringstream oss;
+  oss << partitions[i % partitions.size()]
+      << std::setfill('0') << std::setw(10) << i;
+  buf = oss.str();
+}
+
 // Many small partitions — keys spread across many distinct prefixes.
 // Opposite of clustered: wide fanout at the first level.
 inline auto generate_many_partitions_keys(std::size_t n)
@@ -254,6 +400,15 @@ inline auto generate_many_partitions_keys(std::size_t n)
     keys.push_back(oss.str());
   }
   return keys;
+}
+
+inline void make_many_partitions_key(std::size_t i, std::size_t n,
+                                     std::string &buf) {
+  auto num_partitions = n / 2;
+  std::ostringstream oss;
+  oss << "p" << std::setfill('0') << std::setw(6) << (i % num_partitions)
+      << "/k" << std::setw(4) << (i / num_partitions);
+  buf = oss.str();
 }
 
 // UUIDv4 text format — 36-byte keys like "550e8400-e29b-41d4-a716-446655440000".
@@ -281,6 +436,29 @@ inline auto generate_uuidv4_text_keys(std::size_t n)
     keys.push_back(std::move(uuid));
   }
   return keys;
+}
+
+inline void make_uuidv4_text_key(std::size_t i, std::size_t /*n*/,
+                                 std::string &buf) {
+  static constexpr char hex_chars[] = "0123456789abcdef";
+  buf.resize(36);
+  // 32 hex nibbles needed (36 - 4 dashes). Use 2 splitmix64 calls (32 nibbles).
+  auto h0 = splitmix64(314 + i * 2);
+  auto h1 = splitmix64(314 + i * 2 + 1);
+  int nibble = 0;
+  std::uint64_t h = h0;
+  for (std::size_t j = 0; j < 36; ++j) {
+    if (j == 8 || j == 13 || j == 18 || j == 23) {
+      buf[j] = '-';
+    } else {
+      if (nibble == 16) { h = h1; }
+      buf[j] = hex_chars[h & 0xF];
+      h >>= 4;
+      ++nibble;
+    }
+  }
+  buf[14] = '4';
+  buf[19] = hex_chars[8 | (static_cast<int>(buf[19]) & 0x3)];
 }
 
 // UUIDv4 text with type prefixes — "user::550e8400-...", "order::550e8400-...".
@@ -314,6 +492,36 @@ inline auto generate_prefixed_uuidv4_keys(std::size_t n)
   return keys;
 }
 
+inline void make_prefixed_uuidv4_key(std::size_t i, std::size_t n,
+                                     std::string &buf) {
+  static constexpr std::array prefixes = {
+      "user::", "order::", "session::", "invoice::", "product::"};
+  static constexpr char hex_chars[] = "0123456789abcdef";
+  auto per_prefix = n / prefixes.size();
+  auto pfx_idx = (per_prefix > 0) ? i / per_prefix : 0;
+  if (pfx_idx >= prefixes.size()) pfx_idx = prefixes.size() - 1;
+  auto sub_i = i - pfx_idx * per_prefix;
+  // Generate UUID from splitmix64 keyed on sub-index.
+  auto h0 = splitmix64(271 + sub_i * 2);
+  auto h1 = splitmix64(271 + sub_i * 2 + 1);
+  std::string uuid(36, '\0');
+  int nibble = 0;
+  std::uint64_t h = h0;
+  for (std::size_t j = 0; j < 36; ++j) {
+    if (j == 8 || j == 13 || j == 18 || j == 23) {
+      uuid[j] = '-';
+    } else {
+      if (nibble == 16) { h = h1; }
+      uuid[j] = hex_chars[h & 0xF];
+      h >>= 4;
+      ++nibble;
+    }
+  }
+  uuid[14] = '4';
+  uuid[19] = hex_chars[8 | (static_cast<int>(uuid[19]) & 0x3)];
+  buf = std::string(prefixes[pfx_idx]) + uuid;
+}
+
 // UUIDv4 binary format — raw 16 bytes, no hex encoding.
 // Some systems store UUIDs as raw bytes for compactness. Keys are 16 bytes
 // with random content — the tree sees opaque binary, no structure to exploit.
@@ -338,6 +546,29 @@ inline auto generate_uuidv4_binary_keys(std::size_t n)
     keys.push_back(std::move(k));
   }
   return keys;
+}
+
+inline void make_uuidv4_binary_key(std::size_t i, std::size_t /*n*/,
+                                   std::string &buf) {
+  buf.resize(16);
+  // 16 bytes = 2 splitmix64 calls.
+  auto h0 = splitmix64(161 + i * 2);
+  auto h1 = splitmix64(161 + i * 2 + 1);
+  for (int j = 0; j < 8; ++j) {
+    buf[static_cast<std::size_t>(j)] = static_cast<char>(h0 & 0xFF);
+    h0 >>= 8;
+  }
+  for (int j = 0; j < 8; ++j) {
+    buf[static_cast<std::size_t>(8 + j)] = static_cast<char>(h1 & 0xFF);
+    h1 >>= 8;
+  }
+  buf[6] = static_cast<char>((static_cast<unsigned char>(buf[6]) & 0x0F) | 0x40);
+  buf[8] = static_cast<char>((static_cast<unsigned char>(buf[8]) & 0x3F) | 0x80);
+  // Stamp index in last 4 bytes for uniqueness.
+  buf[12] = static_cast<char>((i >> 24) & 0xFF);
+  buf[13] = static_cast<char>((i >> 16) & 0xFF);
+  buf[14] = static_cast<char>((i >> 8) & 0xFF);
+  buf[15] = static_cast<char>(i & 0xFF);
 }
 
 // Hash-prefixed ordered keys — a common pattern in Cassandra/DynamoDB where
@@ -372,6 +603,25 @@ inline auto generate_hash_prefixed_keys(std::size_t n)
   return keys;
 }
 
+inline void make_hash_prefixed_key(std::size_t i, std::size_t /*n*/,
+                                   std::string &buf) {
+  static constexpr std::size_t kPartitions = 8;
+  static constexpr char hex_chars[] = "0123456789abcdef";
+  // Derive partition hashes deterministically from splitmix64.
+  auto part = i % kPartitions;
+  auto h = splitmix64(77 + part);
+  char hash_prefix[9];
+  for (int j = 0; j < 8; ++j) {
+    hash_prefix[j] = hex_chars[h & 0xF];
+    h >>= 4;
+  }
+  hash_prefix[8] = '\0';
+  std::ostringstream oss;
+  oss << hash_prefix << "::item::" << std::setfill('0')
+      << std::setw(8) << (i / kPartitions);
+  buf = oss.str();
+}
+
 // Binary / non-ASCII keys with 0x00, 0x80, 0xFF bytes embedded.
 // Tests edge cases in prefix comparison and child byte transitions.
 inline auto generate_binary_keys(std::size_t n) -> std::vector<std::string> {
@@ -391,6 +641,19 @@ inline auto generate_binary_keys(std::size_t n) -> std::vector<std::string> {
     keys.push_back(k);
   }
   return keys;
+}
+
+inline void make_binary_key(std::size_t i, std::size_t /*n*/,
+                            std::string &buf) {
+  buf.resize(8);
+  buf[0] = static_cast<char>(i & 0xFF);
+  buf[1] = '\x00';
+  buf[2] = '\x80';
+  buf[3] = '\xFF';
+  buf[4] = static_cast<char>((i >> 8) & 0xFF);
+  buf[5] = static_cast<char>((i >> 16) & 0xFF);
+  buf[6] = static_cast<char>((i >> 24) & 0xFF);
+  buf[7] = static_cast<char>(i % 127);
 }
 
 // Mixed shape — combines real-world key types into one pool to test whether
@@ -426,30 +689,64 @@ inline auto generate_mixed_keys(std::size_t n) -> std::vector<std::string> {
   return keys;
 }
 
+// Streaming mixed: generates from sub-generators in order (no shuffle).
+// The batch version shuffles for benchmark fairness; streaming skips that
+// since memory profiling doesn't care about insertion order.
+inline void make_mixed_key(std::size_t i, std::size_t n, std::string &buf) {
+  struct Slice {
+    double pct;
+    void (*make)(std::size_t, std::size_t, std::string &);
+  };
+  static constexpr std::array<Slice, 7> slices = {{
+      {0.25, make_prefixed_uuidv4_key},
+      {0.20, make_clustered_key},
+      {0.15, make_hash_prefixed_key},
+      {0.10, make_uuidv4_text_key},
+      {0.10, make_uuidv4_binary_key},
+      {0.10, make_sha256_hex_key},
+      {0.10, make_sha256_bin_key},
+  }};
+  // Map global index i to (slice, sub-index).
+  std::size_t offset = 0;
+  for (auto &[pct, make] : slices) {
+    auto count = static_cast<std::size_t>(static_cast<double>(n) * pct);
+    if (i < offset + count) {
+      make(i - offset, count, buf);
+      return;
+    }
+    offset += count;
+  }
+  // Padding keys for remainder.
+  buf = "pad_" + std::to_string(i);
+}
+
 // Key shape descriptor for parameterized tests and benchmarks.
+// generate(): returns all N keys in a vector (for benchmarks/tests).
+// make_key(): writes one key into a reusable buffer (for memory profiling).
 struct KeyShape {
   std::string name;
   std::vector<std::string> (*generate)(std::size_t);
+  void (*make_key)(std::size_t i, std::size_t n, std::string &buf);
 };
 
 inline auto all_key_shapes() -> std::vector<KeyShape> {
   return {
-      {"uniform", generate_uniform_keys},
-      {"prefixed", generate_prefixed_keys},
-      {"incremental", generate_incremental_keys},
-      {"uuidv7", generate_uuidv7_keys},
-      {"uuidv7_binary", generate_uuidv7_binary_keys},
-      {"sha256_hex", generate_sha256_hex_keys},
-      {"sha256_bin", generate_sha256_bin_keys},
-      {"uuidv4_text", generate_uuidv4_text_keys},
-      {"uuidv4_prefixed", generate_prefixed_uuidv4_keys},
-      {"uuidv4_binary", generate_uuidv4_binary_keys},
-      {"hash_prefixed", generate_hash_prefixed_keys},
-      {"binary", generate_binary_keys},
-      {"zipfian", generate_zipfian_keys},
-      {"clustered", generate_clustered_keys},
-      {"many_partitions", generate_many_partitions_keys},
-      {"mixed", generate_mixed_keys},
+      {"uniform", generate_uniform_keys, make_uniform_key},
+      {"prefixed", generate_prefixed_keys, make_prefixed_key},
+      {"incremental", generate_incremental_keys, make_incremental_key},
+      {"uuidv7", generate_uuidv7_keys, make_uuidv7_key},
+      {"uuidv7_binary", generate_uuidv7_binary_keys, make_uuidv7_binary_key},
+      {"sha256_hex", generate_sha256_hex_keys, make_sha256_hex_key},
+      {"sha256_bin", generate_sha256_bin_keys, make_sha256_bin_key},
+      {"uuidv4_text", generate_uuidv4_text_keys, make_uuidv4_text_key},
+      {"uuidv4_prefixed", generate_prefixed_uuidv4_keys, make_prefixed_uuidv4_key},
+      {"uuidv4_binary", generate_uuidv4_binary_keys, make_uuidv4_binary_key},
+      {"hash_prefixed", generate_hash_prefixed_keys, make_hash_prefixed_key},
+      {"binary", generate_binary_keys, make_binary_key},
+      {"zipfian", generate_zipfian_keys, make_zipfian_key},
+      {"clustered", generate_clustered_keys, make_clustered_key},
+      {"many_partitions", generate_many_partitions_keys, make_many_partitions_key},
+      {"mixed", generate_mixed_keys, make_mixed_key},
   };
 }
 
