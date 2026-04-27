@@ -192,6 +192,9 @@ int main() {
       std::printf("    split_db_reads:      %12lu\n", s.split_db_reads);
       std::printf("    split_db_writes:     %12lu\n", s.split_db_writes);
       std::printf("    put_append:          %12lu  (no-read fast path)\n", s.put_append);
+      std::printf("    put_bloom_skip:      %12lu  (bloom no-collision → overwrite)\n", s.put_bloom_skip);
+      std::printf("    put_bloom_rmw:       %12lu  (bloom maybe-collision → RMW)\n", s.put_bloom_rmw);
+      std::printf("    bloom_collisions_set:%12lu\n", s.bloom_collisions_set);
       std::printf("    put_chain_update:    %12lu  (read-modify-write)\n", s.put_chain_update);
       std::printf("    chain_decodes:       %12lu\n", s.chain_decodes);
       std::printf("    chain_encodes:       %12lu\n", s.chain_encodes);
@@ -216,6 +219,7 @@ int main() {
       }
     }
     //(void)db.vacuum();
+    (void)db.flush_hints();
 
     print_memory("after insert");
 

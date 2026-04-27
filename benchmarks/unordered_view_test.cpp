@@ -56,22 +56,20 @@ struct TempDir {
 // Brute-forces with sequential strings — fast since hash16 is 16-bit.
 auto find_hash16_collision()
     -> std::pair<std::string, std::string> {
-  constexpr std::uint32_t kFpSeed = 0x9E3779B9;
+  auto fp = [](const std::string &s) -> std::uint16_t {
+    return unordered_view::fib_hash16(unordered_view::fnv1a_64(
+        reinterpret_cast<const std::byte *>(s.data()), s.size()));
+  };
+
   // Pick a target: hash16 of "collision_a".
   std::string key_a = "collision_a";
-  auto h_a = static_cast<std::uint16_t>(unordered_view::murmur3_32(
-      reinterpret_cast<const std::byte *>(key_a.data()), key_a.size(),
-      kFpSeed));
+  auto h_a = fp(key_a);
 
   // Find another key with same hash16.
   for (unsigned i = 0; i < 200'000; ++i) {
     auto candidate = std::format("collision_{}", i);
     if (candidate == key_a) continue;
-    auto h = static_cast<std::uint16_t>(unordered_view::murmur3_32(
-        reinterpret_cast<const std::byte *>(candidate.data()),
-        candidate.size(), kFpSeed));
-    if (h == h_a) {
-      // Also need same bucket — use seed 0 for routing.
+    if (fp(candidate) == h_a) {
       return {key_a, candidate};
     }
   }

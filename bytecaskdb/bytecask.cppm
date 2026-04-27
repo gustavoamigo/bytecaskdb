@@ -774,6 +774,9 @@ public:
   // EngineState. Designed for pull-based scraping (Prometheus, logging).
   [[nodiscard]] auto stats() const -> std::map<std::string, std::int64_t>;
 
+    // Drains background hint tasks then writes all sealed hint files.
+    // temporary in public for memoery profile - TODO: Move it back to private:
+  void flush_hints();
 private:
   explicit DB(std::filesystem::path dir, Options opts);
 
@@ -796,8 +799,7 @@ private:
                                bool strict = true);
   // Writes hint files for all sealed files in s.
   void flush_hints(const EngineState &s);
-  // Drains background hint tasks then writes all sealed hint files.
-  void flush_hints();
+
   
 
   // Vacuum helpers

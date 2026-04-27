@@ -23,10 +23,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <span>
@@ -38,72 +40,126 @@ import bytecask;
 namespace unordered_view {
 
 // ---------------------------------------------------------------------------
-// MurmurHash3 — 32-bit finalizer (Austin Appleby, public domain)
+// Fast hashing for routing and fingerprinting.
+//
+// FNV-1a hashes arbitrary byte sequences into 64 bits. Fibonacci
+// multiplication then mixes the result into the desired width —
+// a single multiply + shift, much cheaper than full MurmurHash3.
 // ---------------------------------------------------------------------------
 
-inline auto murmur3_32(const std::byte *data, std::size_t len,
-                       std::uint32_t seed) -> std::uint32_t {
-  auto getblock = [](const std::byte *p, std::size_t i) -> std::uint32_t {
-    std::uint32_t val;
-    std::memcpy(&val, p + i * 4, 4);
-    return val;
-  };
-
-  auto fmix32 = [](std::uint32_t h) -> std::uint32_t {
-    h ^= h >> 16;
-    h *= 0x85ebca6b;
-    h ^= h >> 13;
-    h *= 0xc2b2ae35;
-    h ^= h >> 16;
-    return h;
-  };
-
-  const std::size_t nblocks = len / 4;
-  std::uint32_t h1 = seed;
-
-  constexpr std::uint32_t c1 = 0xcc9e2d51;
-  constexpr std::uint32_t c2 = 0x1b873593;
-
-  for (std::size_t i = 0; i < nblocks; ++i) {
-    auto k1 = getblock(data, i);
-    k1 *= c1;
-    k1 = (k1 << 15) | (k1 >> 17);
-    k1 *= c2;
-    h1 ^= k1;
-    h1 = (h1 << 13) | (h1 >> 19);
-    h1 = h1 * 5 + 0xe6546b64;
+inline auto fnv1a_64(const std::byte *data, std::size_t len) -> std::uint64_t {
+  std::uint64_t h = 0xcbf29ce484222325ULL;
+  for (std::size_t i = 0; i < len; ++i) {
+    h ^= std::to_integer<std::uint64_t>(data[i]);
+    h *= 0x100000001b3ULL;
   }
+  return h;
+}
 
-  const auto *tail = data + nblocks * 4;
-  std::uint32_t k1 = 0;
-  switch (len & 3) {
-  case 3:
-    k1 ^= static_cast<std::uint32_t>(std::to_integer<uint8_t>(tail[2])) << 16;
-    [[fallthrough]];
-  case 2:
-    k1 ^= static_cast<std::uint32_t>(std::to_integer<uint8_t>(tail[1])) << 8;
-    [[fallthrough]];
-  case 1:
-    k1 ^= static_cast<std::uint32_t>(std::to_integer<uint8_t>(tail[0]));
-    k1 *= c1;
-    k1 = (k1 << 15) | (k1 >> 17);
-    k1 *= c2;
-    h1 ^= k1;
-  }
+// Fibonacci multiplication: h * golden-ratio-constant, take top bits.
+inline auto fib_hash32(std::uint64_t h) -> std::uint32_t {
+  return static_cast<std::uint32_t>((h * 0x9E3779B97F4A7C15ULL) >> 32);
+}
 
-  h1 ^= static_cast<std::uint32_t>(len);
-  return fmix32(h1);
+inline auto fib_hash16(std::uint64_t h) -> std::uint16_t {
+  return static_cast<std::uint16_t>((h * 0x9E3779B97F4A7C15ULL) >> 48);
 }
 
 // ---------------------------------------------------------------------------
-// BytesHash — hash functor for bytecask::Bytes (std::vector<std::byte>),
-// reuses murmur3_32 already in this file.
+// HasCollisionBloomFilter — probabilistic tracker for hash16 collisions.
+//
+// Answers: "has this (bucket_id, hash16) slot ever held two different
+// original_keys?" A false return is definitive (no collision). A true
+// return may be a false positive (safe: causes an unnecessary RMW).
 // ---------------------------------------------------------------------------
 
-struct BytesHash {
-  auto operator()(const std::vector<std::byte> &v) const noexcept
-      -> std::size_t {
-    return murmur3_32(v.data(), v.size(), 0x12345678);
+class HasCollisionBloomFilter {
+public:
+  // Create an empty filter sized for `expected_items` at the given
+  // false-positive rate.
+  static auto create(std::size_t expected_items, double fp_rate)
+      -> HasCollisionBloomFilter {
+    if (expected_items == 0) expected_items = 1;
+    auto m = static_cast<std::size_t>(
+        std::ceil(-(static_cast<double>(expected_items) * std::log(fp_rate)) /
+                  (std::log(2.0) * std::log(2.0))));
+    // Round up to multiple of 8.
+    m = (m + 7) & ~std::size_t{7};
+    auto k = static_cast<std::uint32_t>(std::round(
+        (static_cast<double>(m) / static_cast<double>(expected_items)) *
+        std::log(2.0)));
+    if (k == 0) k = 1;
+    if (k > 16) k = 16;
+    HasCollisionBloomFilter f;
+    f.num_bits_ = static_cast<std::uint32_t>(m);
+    f.num_hashes_ = k;
+    f.bits_.resize(m / 8, std::byte{0});
+    return f;
+  }
+
+  // Mark a (bucket_id, hash16) slot as having a true collision.
+  void set(std::uint32_t bucket_id, std::uint16_t fp) {
+    if (num_bits_ == 0) return;
+    auto [h1, h2] = double_hash(bucket_id, fp);
+    for (std::uint32_t i = 0; i < num_hashes_; ++i) {
+      auto bit = (h1 + static_cast<std::uint64_t>(i) * h2) % num_bits_;
+      bits_[bit / 8] |= static_cast<std::byte>(1u << (bit % 8));
+    }
+  }
+
+  // Returns false if this slot has definitely never had a collision.
+  // Returns true if it might have (may be a false positive).
+  [[nodiscard]] auto has_collision(std::uint32_t bucket_id,
+                                   std::uint16_t fp) const -> bool {
+    if (num_bits_ == 0) return true; // safe fallback
+    auto [h1, h2] = double_hash(bucket_id, fp);
+    for (std::uint32_t i = 0; i < num_hashes_; ++i) {
+      auto bit = (h1 + static_cast<std::uint64_t>(i) * h2) % num_bits_;
+      if ((bits_[bit / 8] & static_cast<std::byte>(1u << (bit % 8))) ==
+          std::byte{0})
+        return false;
+    }
+    return true;
+  }
+
+  // Serialize: [num_bits:4B LE][num_hashes:4B LE][bitmap bytes...]
+  [[nodiscard]] auto to_bytes() const -> bytecask::Bytes {
+    bytecask::Bytes buf(8 + bits_.size());
+    std::memcpy(buf.data(), &num_bits_, 4);
+    std::memcpy(buf.data() + 4, &num_hashes_, 4);
+    std::memcpy(buf.data() + 8, bits_.data(), bits_.size());
+    return buf;
+  }
+
+  static auto from_bytes(bytecask::BytesView data) -> HasCollisionBloomFilter {
+    HasCollisionBloomFilter f;
+    if (data.size() < 8) return f;
+    std::memcpy(&f.num_bits_, data.data(), 4);
+    std::memcpy(&f.num_hashes_, data.data() + 4, 4);
+    auto bitmap_bytes = f.num_bits_ / 8;
+    if (data.size() < 8 + bitmap_bytes) return f;
+    f.bits_.resize(bitmap_bytes);
+    std::memcpy(f.bits_.data(), data.data() + 8, bitmap_bytes);
+    return f;
+  }
+
+private:
+  std::uint32_t num_bits_{0};
+  std::uint32_t num_hashes_{0};
+  std::vector<std::byte> bits_;
+
+  // Kirsch-Mitzenmacher double hashing from a packed (bucket_id, fp) input.
+  static auto double_hash(std::uint32_t bucket_id, std::uint16_t fp)
+      -> std::pair<std::uint64_t, std::uint64_t> {
+    std::byte buf[6];
+    std::memcpy(buf, &bucket_id, 4);
+    std::memcpy(buf + 4, &fp, 2);
+    auto h1 = fnv1a_64(buf, 6);
+    // Second hash: XOR-twiddle the input for independence.
+    buf[0] ^= std::byte{0x5A};
+    buf[3] ^= std::byte{0xA5};
+    auto h2 = fnv1a_64(buf, 6) | 1ULL; // force odd for coprimality
+    return {h1, h2};
   }
 };
 
@@ -112,10 +168,10 @@ struct BytesHash {
 // ---------------------------------------------------------------------------
 
 struct Options {
-  std::uint32_t initial_size = 64;     // power of 2
-  std::uint32_t bucket_capacity = 128;  // entries per bucket before split
+  std::uint32_t initial_size = 8;     // power of 2
+  std::uint32_t bucket_capacity = 64;  // entries per bucket before split
   float load_factor = 0.75f;
-  std::uint32_t hash_seed = 0;
+  double bloom_fp_rate = 0.01;          // false-positive rate for collision filter
 };
 
 // ---------------------------------------------------------------------------
@@ -131,6 +187,9 @@ struct Stats {
   std::uint64_t split_db_writes{0};     // plan put/del ops inside split
   std::uint64_t put_append{0};          // puts into an empty slot (no read)
   std::uint64_t put_chain_update{0};    // puts that read-modify-write a chain
+  std::uint64_t put_bloom_skip{0};      // bloom "no collision" → direct overwrite
+  std::uint64_t put_bloom_rmw{0};       // bloom "maybe collision" → RMW
+  std::uint64_t bloom_collisions_set{0}; // true collisions detected, bloom bit set
   std::uint64_t chain_decodes{0};       // decode_chain calls (each = heap alloc)
   std::uint64_t chain_encodes{0};       // encode_chain_entry calls
 };
@@ -278,6 +337,7 @@ public:
         version_{0}, entry_count_{0} {
     meta_key_ = ns_ + "/__meta__";
     bucket_prefix_ = ns_ + "/b/";
+    bloom_key_ = ns_ + "/__bloom__";
 
     // Try to load existing metadata.
     bytecask::Bytes meta_buf;
@@ -290,6 +350,20 @@ public:
               bytecask::BytesView{meta.data(), meta.size()});
     }
 
+    // Load or create the collision filter.
+    bytecask::Bytes bloom_buf;
+    if (db_.get({}, to_bv(bloom_key_), bloom_buf)) {
+      collision_filter_ =
+          HasCollisionBloomFilter::from_bytes(bytecask::BytesView{bloom_buf});
+    } else {
+      collision_filter_ = HasCollisionBloomFilter::create(
+          static_cast<std::size_t>(initial_size_) * opts_.bucket_capacity,
+          opts_.bloom_fp_rate);
+      auto bloom_bytes = collision_filter_.to_bytes();
+      db_.put({.sync = false}, to_bv(bloom_key_),
+              bytecask::BytesView{bloom_bytes.data(), bloom_bytes.size()});
+    }
+
     // Recompute entry_count via keys-only scan (in-memory, no disk I/O).
     recompute_entry_count();
   }
@@ -297,23 +371,77 @@ public:
   [[nodiscard]] auto stats() const -> const Stats & { return stats_; }
 
   void put(bytecask::BytesView key, bytecask::BytesView value) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+
     auto bucket = route(key);
     auto fp = hash16(key);
     auto sk = make_slot_key(bucket, fp);
 
-    auto new_entry = encode_chain_entry(key, value);
-    ++stats_.chain_encodes;
-    auto &existing = tl_read_buf();
-    if (!db_.get({.verify_checksums = false}, sk.view(), existing)) {
-      // Slot absent — pure append (the common case).
+    if (!db_.contains_key({}, sk.view())) {
+      // PATH 1: slot absent — pure append, zero reads.
+      auto new_entry = encode_chain_entry(key, value);
+      ++stats_.chain_encodes;
       db_.put({.sync = false}, sk.view(), bytecask::BytesView{new_entry});
       ++entry_count_;
       ++stats_.put_append;
+    } else if (!collision_filter_.has_collision(bucket, fp)) {
+      // PATH 2: slot exists, bloom says no collision — likely a same-key update.
+      // Read the chain to verify. If the key matches, direct overwrite (no
+      // chain rebuild). If it doesn't match, this is the first collision for
+      // this slot — set the bloom bit and fall through to RMW.
+      auto &existing = tl_read_buf();
+      (void)db_.get({.verify_checksums = false}, sk.view(), existing);
+      bool is_same_key = chain_has_only_key(bytecask::BytesView{existing}, key);
+      if (is_same_key) {
+        auto new_entry = encode_chain_entry(key, value);
+        ++stats_.chain_encodes;
+        db_.put({.sync = false}, sk.view(), bytecask::BytesView{new_entry});
+        ++stats_.put_bloom_skip;
+      } else {
+        // True collision detected — set bloom bit and do full RMW.
+        collision_filter_.set(bucket, fp);
+        ++stats_.bloom_collisions_set;
+        auto new_entry = encode_chain_entry(key, value);
+        ++stats_.chain_encodes;
+        auto entries = decode_chain(bytecask::BytesView{existing});
+        ++stats_.chain_decodes;
+        bool found = false;
+        bytecask::Bytes new_chain;
+        for (auto &e : entries) {
+          auto ek = bytecask::BytesView{e.original_key.data(), e.original_key.size()};
+          if (!found && spans_equal(ek, key)) {
+            new_chain.insert(new_chain.end(), new_entry.begin(), new_entry.end());
+            found = true;
+          } else {
+            encode_chain_entry_into(
+                new_chain,
+                bytecask::BytesView{e.original_key.data(), e.original_key.size()},
+                bytecask::BytesView{e.user_value.data(), e.user_value.size()});
+            ++stats_.chain_encodes;
+          }
+        }
+        // Must be !found — this key wasn't in the chain.
+        new_chain.insert(new_chain.end(), new_entry.begin(), new_entry.end());
+        ++entry_count_;
+        // Persist bloom + chain atomically.
+        auto bloom_bytes = collision_filter_.to_bytes();
+        bytecask::WritePlan plan;
+        plan.put(sk.view(), bytecask::BytesView{new_chain.data(), new_chain.size()});
+        plan.put(to_bv(bloom_key_),
+                 bytecask::BytesView{bloom_bytes.data(), bloom_bytes.size()});
+        (void)db_.apply_batch({.sync = false}, std::move(plan));
+        ++stats_.put_bloom_rmw;
+      }
     } else {
-      // Slot occupied — update matching entry or append a new one.
-      ++stats_.put_chain_update;
+      // PATH 3: bloom says maybe collision — full RMW.
+      ++stats_.put_bloom_rmw;
+      auto new_entry = encode_chain_entry(key, value);
+      ++stats_.chain_encodes;
+      auto &existing = tl_read_buf();
+      (void)db_.get({.verify_checksums = false}, sk.view(), existing);
       auto entries = decode_chain(bytecask::BytesView{existing});
       ++stats_.chain_decodes;
+
       bool found = false;
       bytecask::Bytes new_chain;
       for (auto &e : entries) {
@@ -322,18 +450,29 @@ public:
           new_chain.insert(new_chain.end(), new_entry.begin(), new_entry.end());
           found = true;
         } else {
-          auto reenc = encode_chain_entry(
+          encode_chain_entry_into(
+              new_chain,
               bytecask::BytesView{e.original_key.data(), e.original_key.size()},
               bytecask::BytesView{e.user_value.data(), e.user_value.size()});
           ++stats_.chain_encodes;
-          new_chain.insert(new_chain.end(), reenc.begin(), reenc.end());
         }
       }
       if (!found) {
+        // True collision: this key is new to the slot.
         new_chain.insert(new_chain.end(), new_entry.begin(), new_entry.end());
         ++entry_count_;
+        collision_filter_.set(bucket, fp);
+        ++stats_.bloom_collisions_set;
+        // Persist bloom + chain atomically.
+        auto bloom_bytes = collision_filter_.to_bytes();
+        bytecask::WritePlan plan;
+        plan.put(sk.view(), bytecask::BytesView{new_chain.data(), new_chain.size()});
+        plan.put(to_bv(bloom_key_),
+                 bytecask::BytesView{bloom_bytes.data(), bloom_bytes.size()});
+        (void)db_.apply_batch({.sync = false}, std::move(plan));
+      } else {
+        db_.put({.sync = false}, sk.view(), bytecask::BytesView{new_chain});
       }
-      db_.put({.sync = false}, sk.view(), bytecask::BytesView{new_chain});
     }
 
     auto num_buckets = current_num_buckets();
@@ -374,6 +513,7 @@ public:
   }
 
   void del(bytecask::BytesView key) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     auto bucket = route(key);
     auto fp = hash16(key);
     auto sk = make_slot_key(bucket, fp);
@@ -407,8 +547,6 @@ public:
 
 private:
   static constexpr std::size_t kMetaBytes = 16; // 4 × uint32_t
-  // Seed for hash16 — different from routing hash for independence.
-  static constexpr std::uint32_t kFpSeed = 0x9E3779B9;
 
   bytecask::DB &db_;
   std::string ns_;
@@ -424,19 +562,25 @@ private:
   // Cached key prefixes.
   std::string meta_key_;
   std::string bucket_prefix_;
+  std::string bloom_key_;
+
+  // Write serialization — put/del/split hold the lock; get is lock-free.
+  std::mutex write_mutex_;
+
+  // Probabilistic tracker: which (bucket_id, hash16) slots have true collisions.
+  HasCollisionBloomFilter collision_filter_;
 
   // Allocation / I/O counters.
   Stats stats_;
 
-  // 16-bit fingerprint of an original key (different seed from routing hash).
+  // 16-bit fingerprint of an original key.
   static auto hash16(bytecask::BytesView key) -> std::uint16_t {
-    return static_cast<std::uint16_t>(
-        murmur3_32(key.data(), key.size(), kFpSeed));
+    return fib_hash16(fnv1a_64(key.data(), key.size()));
   }
 
   // Route a key to its bucket ID.
   auto route(bytecask::BytesView key) const -> std::uint32_t {
-    auto h = murmur3_32(key.data(), key.size(), opts_.hash_seed);
+    auto h = fib_hash32(fnv1a_64(key.data(), key.size()));
     auto n = initial_size_ * (1u << round_);
     auto bucket = h % n;
     if (bucket < split_pointer_) {
@@ -548,6 +692,7 @@ private:
     }
   }
 
+  // Precondition: caller holds write_mutex_ (called from put()).
   void split() {
     auto n = initial_size_ * (1u << round_);
     auto old_prefix = make_bucket_prefix_key(split_pointer_);
@@ -611,8 +756,8 @@ private:
         auto &e = entries[i];
         if (e.user_value.empty()) { ++stats_.split_tombstones_gc; continue; }
 
-        auto h = murmur3_32(e.original_key.data(), e.original_key.size(),
-                            opts_.hash_seed);
+        auto h = fib_hash32(fnv1a_64(e.original_key.data(),
+                                      e.original_key.size()));
         auto new_bucket = h % new_modulus;
         auto fp = hash16(e.original_key);
         auto sk = make_slot_key(new_bucket, fp);
@@ -726,6 +871,28 @@ private:
                            bytecask::BytesView b) -> bool {
     return a.size() == b.size() &&
            std::equal(a.begin(), a.end(), b.begin());
+  }
+
+  // Returns true if the chain contains only entries for the given key
+  // (no collision — all entries are updates/tombstones of the same key).
+  static auto chain_has_only_key(bytecask::BytesView chain,
+                                  bytecask::BytesView needle) -> bool {
+    std::size_t pos = 0;
+    while (pos + 4 <= chain.size()) {
+      std::uint32_t key_len;
+      std::memcpy(&key_len, chain.data() + pos, 4);
+      pos += 4;
+      if (pos + key_len + 4 > chain.size()) break;
+      auto key_bytes = chain.subspan(pos, key_len);
+      pos += key_len;
+      std::uint32_t val_len;
+      std::memcpy(&val_len, chain.data() + pos, 4);
+      pos += 4;
+      if (pos + val_len > chain.size()) break;
+      pos += val_len;
+      if (!spans_equal(key_bytes, needle)) return false;
+    }
+    return true;
   }
 };
 
