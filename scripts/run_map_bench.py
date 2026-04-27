@@ -84,7 +84,7 @@ def build(skip: bool) -> None:
         print(f"[skip-build] Using existing binary: {BENCH_BINARY}")
         return
     print("Configuring release mode...")
-    subprocess.run(["xmake", "f", "-m", "release", "--enable-benchmarks=true"], check=True, cwd=REPO_ROOT)
+    subprocess.run(["xmake", "f", "-m", "release"], check=True, cwd=REPO_ROOT)
     print(f"Building {BENCH_TARGET}...")
     subprocess.run(["xmake", "build", BENCH_TARGET], check=True, cwd=REPO_ROOT)
 

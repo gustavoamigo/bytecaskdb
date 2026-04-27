@@ -15,7 +15,8 @@
 //   - nosync: WriteOptions::sync = false  (OS page-cache durability)
 //   - sync:   WriteOptions::sync = true   (fdatasync per write)
 //
-// Keys: generate_prefixed_keys() — UUIDv7-like, prefix-heavy, realistic.
+// Keys: each adapter provides generate_keys(); ByteCaskDB/RocksDB/LevelDB use
+//   UUIDv7-like prefix-heavy keys, UnorderedView uses 16-byte binary UUIDv4.
 // Values: 1 KiB of random (incompressible) bytes; LevelDB compression disabled.
 //   Using compressible fill (e.g. 0xAB * 1024) gives LevelDB an unfair
 //   advantage: Snappy collapses 1 KiB to ~15 bytes, fitting the entire dataset
@@ -121,6 +122,27 @@ auto generate_prefixed_keys(std::size_t n) -> std::vector<std::string> {
   return keys;
 }
 
+// Generates n binary-encoded UUIDv4 keys (16 bytes each, fully random).
+// Fixed seed ensures the same dataset is used across populate and lookup paths.
+auto generate_uuid_keys(std::size_t n) -> std::vector<std::string> {
+  std::mt19937_64 rng{0xDEADBEEFCAFEBABEULL};
+  std::uniform_int_distribution<std::uint64_t> dist;
+  std::vector<std::string> keys;
+  keys.reserve(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    std::string key(16, '\0');
+    auto hi = dist(rng);
+    auto lo = dist(rng);
+    // UUIDv4: version = 4, variant = 1
+    hi = (hi & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;
+    lo = (lo & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;
+    std::memcpy(key.data(), &hi, 8);
+    std::memcpy(key.data() + 8, &lo, 8);
+    keys.push_back(std::move(key));
+  }
+  return keys;
+}
+
 auto make_value() -> std::vector<std::byte> {
   std::mt19937 rng{0x1234ABCD};
   std::uniform_int_distribution<unsigned int> dist{0, 255};
@@ -135,7 +157,7 @@ auto bc_key(const std::string &s) -> bytecask::BytesView {
 }
 
 // Formats a prefixed key into buf and returns a BytesView over the written bytes.
-// Key format matches generate_prefixed_keys(): "{prefix}018f6e2c-{hi}-7000-8000-{lo}".
+// Used only by ParRecoverySetup to generate keys without heap allocation.
 auto make_key(char *buf, std::size_t buf_size,
               const char *prefix, std::size_t idx) -> bytecask::BytesView {
   auto len = static_cast<std::size_t>(
@@ -265,6 +287,8 @@ struct TmpDir {
 // ===========================================================================
 
 struct BcAdapter {
+  static auto generate_keys(std::size_t n) { return generate_prefixed_keys(n); }
+
   struct Db {
     TmpDir dir;
     bytecask::DB engine;
@@ -274,26 +298,17 @@ struct BcAdapter {
         : dir{tag}, engine{bytecask::DB::open(dir.path)} {
       if (populate_keys) {
         static constexpr std::size_t kPopulateBatchSize = 100;
-        static constexpr std::array prefixes = {
-            "user::", "order::", "session::", "invoice::", "product::"};
         bytecask::WriteOptions wo;
         wo.sync = false;
         const auto n = populate_keys->size();
-        const auto per_prefix = n / prefixes.size();
-        std::size_t written = 0;
-        for (const auto *pfx : prefixes) {
-          for (std::size_t i = 0; i < per_prefix; i += kPopulateBatchSize) {
-            auto end = std::min(i + kPopulateBatchSize, per_prefix);
-            bytecask::WritePlan plan;
-            for (std::size_t j = i; j < end; ++j) {
-              char buf[64];
-              plan.put(make_key(buf, sizeof(buf), pfx, j),
-                       bc_val(*populate_val));
-            }
-            written += end - i;
-            wo.sync = (written == n);
-            (void)engine.apply_batch(wo, std::move(plan));
+        for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
+          auto end = std::min(i + kPopulateBatchSize, n);
+          bytecask::WritePlan plan;
+          for (std::size_t j = i; j < end; ++j) {
+            plan.put(bc_key((*populate_keys)[j]), bc_val(*populate_val));
           }
+          wo.sync = (end == n);
+          (void)engine.apply_batch(wo, std::move(plan));
         }
       }
     }
@@ -378,6 +393,8 @@ struct BcAdapterStale : BcAdapter {
 };
 
 struct BcUnorderedViewAdapter {
+  static auto generate_keys(std::size_t n) { return generate_uuid_keys(n); }
+
   struct Db {
     TmpDir dir;
     bytecask::DB engine;
@@ -480,6 +497,8 @@ struct BcCasAdapter {
 
 #ifndef BENCH_NO_LEVELDB
 template <bool UseCache = true> struct LdbAdapter {
+  static auto generate_keys(std::size_t n) { return generate_prefixed_keys(n); }
+
   struct Db {
     TmpDir dir;
     leveldb::DB *raw{nullptr};
@@ -580,6 +599,8 @@ template <bool UseCache = true> struct LdbAdapter {
 
 #ifndef BENCH_NO_ROCKSDB
 template <bool UseCache = true> struct RdbAdapter {
+  static auto generate_keys(std::size_t n) { return generate_prefixed_keys(n); }
+
   struct Db {
     TmpDir dir;
     rocksdb::DB *raw{nullptr};
@@ -783,7 +804,7 @@ struct RdbCasAdapter {
 // ──────────────────────────── Put ────────────────────────────────────────────
 
 template <typename A, bool Sync> void BM_Put(benchmark::State &state) {
-  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto keys = A::generate_keys(kDatasetSize);
   static auto val = make_value();
   static auto db = A::open_empty("put");
 
@@ -815,7 +836,7 @@ template <typename A, bool Sync> void BM_Put(benchmark::State &state) {
 // ──────────────────────────── Get ────────────────────────────────────────────
 
 template <typename A> void BM_Get(benchmark::State &state) {
-  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto keys = A::generate_keys(kDatasetSize);
   static auto val = make_value();
   static auto db = A::open_populated("get", keys, val);
 
@@ -844,7 +865,7 @@ template <typename A> void BM_Get(benchmark::State &state) {
 // ──────────────────────────── Del ────────────────────────────────────────────
 
 template <typename A, bool Sync> void BM_Del(benchmark::State &state) {
-  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto keys = A::generate_keys(kDatasetSize);
   static auto val = make_value();
   static auto db = A::open_populated("del", keys, val);
 
@@ -878,7 +899,7 @@ template <typename A, bool Sync> void BM_Del(benchmark::State &state) {
 // ──────────────────────────── Range ──────────────────────────────────────────
 
 template <typename A, int RangeLen> void BM_Range(benchmark::State &state) {
-  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto keys = A::generate_keys(kDatasetSize);
   static auto val = make_value();
   static auto db = A::open_populated("range", keys, val);
 
@@ -908,7 +929,7 @@ template <typename A, int RangeLen> void BM_Range(benchmark::State &state) {
 // 80% get / 10% put / 10% del
 
 template <typename A, bool Sync> void BM_Mixed(benchmark::State &state) {
-  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto keys = A::generate_keys(kDatasetSize);
   static auto val = make_value();
   static auto db = A::open_populated("mixed", keys, val);
 
@@ -946,7 +967,7 @@ template <typename A, bool Sync> void BM_Mixed(benchmark::State &state) {
 // iteration, amortising lock acquisition and fsync across the batch.
 
 template <typename A, bool Sync> void BM_MixedBatch(benchmark::State &state) {
-  static auto keys = generate_prefixed_keys(kDatasetSize);
+  static auto keys = A::generate_keys(kDatasetSize);
   static auto val = make_value();
   static auto db = A::open_populated("batch", keys, val);
 
@@ -982,7 +1003,7 @@ template <typename A, bool Sync> void BM_MixedBatch(benchmark::State &state) {
 // reused across calibration calls to avoid expensive re-population.
 
 template <typename A, bool Sync> void BM_MixedMT(benchmark::State &state) {
-  static std::vector<std::string> shared_keys = generate_prefixed_keys(kDatasetSize);
+  static std::vector<std::string> shared_keys = A::generate_keys(kDatasetSize);
   static std::vector<std::byte> shared_val = make_value();
   static auto shared_db =
       std::make_unique<typename A::Db>("mixed_mt", &shared_keys, &shared_val);
@@ -1024,7 +1045,7 @@ template <typename A, bool Sync> void BM_MixedMT(benchmark::State &state) {
 // Measures read throughput scaling and tail latency under concurrency.
 
 template <typename A> void BM_GetMT(benchmark::State &state) {
-  static std::vector<std::string> shared_keys = generate_prefixed_keys(kDatasetSize);
+  static std::vector<std::string> shared_keys = A::generate_keys(kDatasetSize);
   static std::vector<std::byte> shared_val = make_value();
   static auto shared_db =
       std::make_unique<typename A::Db>("get_mt", &shared_keys, &shared_val);
@@ -1060,7 +1081,7 @@ template <typename A> void BM_GetMT(benchmark::State &state) {
 // others choose per WriteOptions).
 
 template <typename A, bool Sync> void BM_PutMT(benchmark::State &state) {
-  static std::vector<std::string> shared_keys = generate_prefixed_keys(kDatasetSize);
+  static std::vector<std::string> shared_keys = A::generate_keys(kDatasetSize);
   static std::vector<std::byte> shared_val = make_value();
   static auto shared_db =
       std::make_unique<typename A::Db>("put_mt", nullptr, nullptr);
@@ -1098,7 +1119,7 @@ template <typename A, bool Sync> void BM_PutMT(benchmark::State &state) {
 template <typename A>
 void BM_PutMT_PeriodicSync(benchmark::State &state) {
   static std::vector<std::string> shared_keys =
-      generate_prefixed_keys(kDatasetSize);
+      A::generate_keys(kDatasetSize);
   static std::vector<std::byte> shared_val = make_value();
   static auto shared_db =
       std::make_unique<typename A::Db>("put_mt_ps", nullptr, nullptr);
@@ -1142,7 +1163,7 @@ void BM_PutMT_PeriodicSync(benchmark::State &state) {
 
 template <typename A, bool Sync>
 void BM_ReadWhileWriting(benchmark::State &state) {
-  static std::vector<std::string> shared_keys = generate_prefixed_keys(kDatasetSize);
+  static std::vector<std::string> shared_keys = A::generate_keys(kDatasetSize);
   static std::vector<std::byte> shared_val = make_value();
   static auto shared_db = std::make_unique<typename A::Db>(
       "rww", &shared_keys, &shared_val);
@@ -1322,6 +1343,12 @@ void BM_RecoveryParallel(benchmark::State &state) {
 
 using Bc  = BcAdapter;
 using BcUV = BcUnorderedViewAdapter;
+
+// BcAdapter with UUIDv4 keys for apples-to-apples comparison with UnorderedView.
+struct BcUuidAdapter : BcAdapter {
+  static auto generate_keys(std::size_t n) { return generate_uuid_keys(n); }
+};
+using BcUuid = BcUuidAdapter;
 #ifndef BENCH_NO_LEVELDB
 using Ldb = LdbAdapter<true>;
 using LdbNC = LdbAdapter<false>;
@@ -1329,6 +1356,12 @@ using LdbNC = LdbAdapter<false>;
 #ifndef BENCH_NO_ROCKSDB
 using Rdb = RdbAdapter<true>;
 using RdbNC = RdbAdapter<false>;
+
+// RdbAdapter with UUIDv4 keys for apples-to-apples comparison with UnorderedView.
+struct RdbUuidAdapter : RdbAdapter<true> {
+  static auto generate_keys(std::size_t n) { return generate_uuid_keys(n); }
+};
+using RdbUuid = RdbUuidAdapter;
 #endif
 
 // -- Single Threaded Tests ---
@@ -1341,8 +1374,16 @@ BENCH(BM_Range<Bc, kRangeLen>)    ->Name("ByteCaskDB/Range50");
 BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCaskDB/MixedBatch/Sync");
 
 // --- UnorderedView ---
-BENCH(BM_Put<BcUV, false>)          ->Name("UnorderedView/Put/NoSync");
-BENCH(BM_Get<BcUV>)                 ->Name("UnorderedView/Get");
+BENCH(BM_Put<BcUV, false>)          ->Name("ByteCaskDB_UnorderedView/Put/NoSync");
+BENCH(BM_Get<BcUV>)                 ->Name("ByteCaskDB_UnorderedView/Get");
+
+// --- RocksDB with UUIDv4 keys (apples-to-apples with UnorderedView) ---
+#ifndef BENCH_NO_ROCKSDB
+BENCH(BM_Get<RdbUuid>)              ->Name("RocksDB_UUIDv4/Get");
+#endif
+
+// --- ByteCaskDB with UUIDv4 keys (apples-to-apples with UnorderedView) ---
+BENCH(BM_Get<BcUuid>)               ->Name("ByteCaskDB_UUIDv4/Get");
 
 
 
@@ -1394,11 +1435,11 @@ BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(1
 BENCH(BM_GetMT<Rdb>)                ->Name("RocksDB/GetMT")           ->Threads(32);
 #endif
 // --- UnorderedView GetMT ---
-BENCH(BM_GetMT<BcUV>)              ->Name("UnorderedView/GetMT")      ->Threads(2);
-BENCH(BM_GetMT<BcUV>)              ->Name("UnorderedView/GetMT")      ->Threads(4);
-BENCH(BM_GetMT<BcUV>)              ->Name("UnorderedView/GetMT")      ->Threads(8);
-BENCH(BM_GetMT<BcUV>)              ->Name("UnorderedView/GetMT")      ->Threads(16);
-BENCH(BM_GetMT<BcUV>)              ->Name("UnorderedView/GetMT")      ->Threads(32);
+BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(2);
+BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(4);
+BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(8);
+BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(16);
+BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(32);
 
 // --- ReadAndWriteLoad (read throughput with 1 background writer) ---
 BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCaskDB/ReadAndWriteLoad/Sync")            ->Threads(2);

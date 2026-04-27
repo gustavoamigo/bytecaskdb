@@ -8,13 +8,14 @@
 // entirely on the ByteCaskDB public API; no engine internals required.
 //
 // Storage layout:
-//   Key:   <ns>/b/<4B bucket_id><4B timestamp><2B hash16>
-//   Value: [key_len: 4-byte LE u32][original_key][value]
+//   Key:   <ns>/b/<4B bucket_id><2B hash16>
+//   Value: chain of [{key_len:4B}{original_key}{val_len:4B}{user_value}]+
+//          val_len == 0 signals a tombstone. Multiple entries arise only
+//          on hash16 collisions (expected rate: ~1/65536 per bucket slot).
 //
-// The 16-bit fingerprint (hash16) in the key enables keys-only filtering:
-// get scans bucket keys in reverse (newest first) via rkeys_from — pure
-// in-memory radix tree walk — and only fetches values from disk when the
-// fingerprint matches (1/65536 false positive rate).
+// get resolves to a single db.get() point-lookup — one disk read, no scan.
+// put is a pure append when the slot is absent (the common case); a
+// read-modify-write only when the hash16 slot is already occupied.
 //
 // This is a benchmark prototype — not part of the library yet.
 
@@ -22,7 +23,6 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -107,31 +107,53 @@ struct Options {
 };
 
 // ---------------------------------------------------------------------------
-// Value encoding: [key_len: 4-byte LE u32][original_key][value]
+// Chain encoding: zero or more entries packed end-to-end.
+//   entry = [key_len:4B LE][original_key:key_len][val_len:4B LE][user_value:val_len]
+// val_len == 0 is a tombstone.
 // ---------------------------------------------------------------------------
 
-inline auto encode_value(bytecask::BytesView key,
-                         bytecask::BytesView value) -> bytecask::Bytes {
+struct ChainEntry {
+  std::vector<std::byte> original_key;
+  std::vector<std::byte> user_value; // empty = tombstone
+};
+
+// Serialise one entry into chain wire format.
+inline auto encode_chain_entry(bytecask::BytesView key,
+                               bytecask::BytesView value) -> bytecask::Bytes {
   auto key_len = static_cast<std::uint32_t>(key.size());
-  bytecask::Bytes buf(4 + key.size() + value.size());
+  auto val_len = static_cast<std::uint32_t>(value.size());
+  bytecask::Bytes buf(4 + key.size() + 4 + value.size());
   std::memcpy(buf.data(), &key_len, 4);
   std::memcpy(buf.data() + 4, key.data(), key.size());
-  std::memcpy(buf.data() + 4 + key.size(), value.data(), value.size());
+  std::memcpy(buf.data() + 4 + key.size(), &val_len, 4);
+  if (val_len > 0)
+    std::memcpy(buf.data() + 4 + key.size() + 4, value.data(), value.size());
   return buf;
 }
 
-struct DecodedValue {
-  bytecask::BytesView original_key;
-  bytecask::BytesView value;
-};
-
-inline auto decode_value(bytecask::BytesView encoded) -> DecodedValue {
-  std::uint32_t key_len;
-  std::memcpy(&key_len, encoded.data(), 4);
-  return {
-      encoded.subspan(4, key_len),
-      encoded.subspan(4 + key_len),
-  };
+// Parse a chain blob into its constituent entries.
+inline auto decode_chain(bytecask::BytesView chain) -> std::vector<ChainEntry> {
+  std::vector<ChainEntry> entries;
+  std::size_t pos = 0;
+  while (pos + 4 <= chain.size()) {
+    std::uint32_t key_len;
+    std::memcpy(&key_len, chain.data() + pos, 4);
+    pos += 4;
+    if (pos + key_len + 4 > chain.size()) break;
+    auto key_bytes = chain.subspan(pos, key_len);
+    pos += key_len;
+    std::uint32_t val_len;
+    std::memcpy(&val_len, chain.data() + pos, 4);
+    pos += 4;
+    if (pos + val_len > chain.size()) break;
+    auto val_bytes = chain.subspan(pos, val_len);
+    pos += val_len;
+    entries.push_back({
+        {key_bytes.begin(), key_bytes.end()},
+        {val_bytes.begin(), val_bytes.end()},
+    });
+  }
+  return entries;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,13 +187,38 @@ public:
   void put(bytecask::BytesView key, bytecask::BytesView value) {
     auto bucket = route(key);
     auto prefix = make_bucket_prefix(bucket);
-    auto ts = now_ts();
     auto fp = hash16(key);
-    auto full_key = make_entry_key(prefix, ts, fp);
+    auto slot_key = make_entry_key(prefix, fp);
 
-    auto encoded = encode_value(key, value);
-    db_.put({.sync = false}, to_bv(full_key), bytecask::BytesView{encoded});
-    ++entry_count_;
+    auto new_entry = encode_chain_entry(key, value);
+    bytecask::Bytes existing;
+    if (!db_.get({.verify_checksums = false}, to_bv(slot_key), existing)) {
+      // Slot absent — pure append (the common case).
+      db_.put({.sync = false}, to_bv(slot_key), bytecask::BytesView{new_entry});
+      ++entry_count_;
+    } else {
+      // Slot occupied — update matching entry or append a new one.
+      auto entries = decode_chain(bytecask::BytesView{existing});
+      bool found = false;
+      bytecask::Bytes new_chain;
+      for (auto &e : entries) {
+        auto ek = bytecask::BytesView{e.original_key.data(), e.original_key.size()};
+        if (!found && spans_equal(ek, key)) {
+          new_chain.insert(new_chain.end(), new_entry.begin(), new_entry.end());
+          found = true;
+        } else {
+          auto reenc = encode_chain_entry(
+              bytecask::BytesView{e.original_key.data(), e.original_key.size()},
+              bytecask::BytesView{e.user_value.data(), e.user_value.size()});
+          new_chain.insert(new_chain.end(), reenc.begin(), reenc.end());
+        }
+      }
+      if (!found) {
+        new_chain.insert(new_chain.end(), new_entry.begin(), new_entry.end());
+        ++entry_count_;
+      }
+      db_.put({.sync = false}, to_bv(slot_key), bytecask::BytesView{new_chain});
+    }
 
     auto num_buckets = current_num_buckets();
     auto threshold = static_cast<std::size_t>(
@@ -185,34 +232,24 @@ public:
   auto get(bytecask::BytesView key, bytecask::Bytes &out) -> bool {
     auto bucket = route(key);
     auto prefix = make_bucket_prefix(bucket);
-    auto target_fp = hash16(key);
+    auto fp = hash16(key);
+    auto slot_key = make_entry_key(prefix, fp);
 
-    // Reverse keys-only scan: newest first, pure in-memory.
-    auto next_prefix = make_bucket_prefix(bucket + 1);
-    for (auto &rkey :
-         db_.rkeys_from({.verify_checksums = false}, to_bv(next_prefix))) {
-      auto key_span = key_obj_to_bv(rkey);
-      if (!starts_with(key_span, to_bv(prefix)))
-        break;
+    // Single point-lookup — one disk read, no scan.
+    bytecask::Bytes chain_bytes;
+    if (!db_.get({.verify_checksums = false}, to_bv(slot_key), chain_bytes))
+      return false;
 
-      // Fingerprint filter — in-memory, no disk I/O.
-      auto fp = extract_hash16(key_span, prefix.size());
-      if (fp != target_fp)
+    // Walk chain in memory to find the entry for this original_key.
+    auto entries = decode_chain(bytecask::BytesView{chain_bytes});
+    for (auto &e : entries) {
+      if (!spans_equal(
+              bytecask::BytesView{e.original_key.data(), e.original_key.size()},
+              key))
         continue;
-
-      // Fingerprint match — fetch value from disk.
-      bytecask::Bytes encoded;
-      if (!db_.get({.verify_checksums = false}, key_span, encoded))
-        continue;
-
-      auto decoded = decode_value(bytecask::BytesView{encoded});
-      if (!spans_equal(decoded.original_key, key))
-        continue; // false positive (1/65536)
-
-      // Latest match found (reverse scan = newest first).
-      if (decoded.value.empty())
+      if (e.user_value.empty())
         return false; // tombstone
-      out.assign(decoded.value.begin(), decoded.value.end());
+      out.assign(e.user_value.begin(), e.user_value.end());
       return true;
     }
     return false;
@@ -221,28 +258,20 @@ public:
   auto contains_key(bytecask::BytesView key) -> bool {
     auto bucket = route(key);
     auto prefix = make_bucket_prefix(bucket);
-    auto target_fp = hash16(key);
+    auto fp = hash16(key);
+    auto slot_key = make_entry_key(prefix, fp);
 
-    auto next_prefix = make_bucket_prefix(bucket + 1);
-    for (auto &rkey :
-         db_.rkeys_from({.verify_checksums = false}, to_bv(next_prefix))) {
-      auto key_span = key_obj_to_bv(rkey);
-      if (!starts_with(key_span, to_bv(prefix)))
-        break;
+    bytecask::Bytes chain_bytes;
+    if (!db_.get({.verify_checksums = false}, to_bv(slot_key), chain_bytes))
+      return false;
 
-      auto fp = extract_hash16(key_span, prefix.size());
-      if (fp != target_fp)
+    auto entries = decode_chain(bytecask::BytesView{chain_bytes});
+    for (auto &e : entries) {
+      if (!spans_equal(
+              bytecask::BytesView{e.original_key.data(), e.original_key.size()},
+              key))
         continue;
-
-      bytecask::Bytes encoded;
-      if (!db_.get({.verify_checksums = false}, key_span, encoded))
-        continue;
-
-      auto decoded = decode_value(bytecask::BytesView{encoded});
-      if (!spans_equal(decoded.original_key, key))
-        continue;
-
-      return !decoded.value.empty();
+      return !e.user_value.empty();
     }
     return false;
   }
@@ -250,14 +279,34 @@ public:
   void del(bytecask::BytesView key) {
     auto bucket = route(key);
     auto prefix = make_bucket_prefix(bucket);
-    auto ts = now_ts();
     auto fp = hash16(key);
-    auto full_key = make_entry_key(prefix, ts, fp);
+    auto slot_key = make_entry_key(prefix, fp);
 
-    // Tombstone: encode with empty value portion.
-    auto encoded = encode_value(key, {});
-    db_.put({.sync = false}, to_bv(full_key), bytecask::BytesView{encoded});
-    ++entry_count_;
+    auto tombstone = encode_chain_entry(key, {});
+    bytecask::Bytes existing;
+    if (!db_.get({.verify_checksums = false}, to_bv(slot_key), existing)) {
+      db_.put({.sync = false}, to_bv(slot_key), bytecask::BytesView{tombstone});
+    } else {
+      auto entries = decode_chain(bytecask::BytesView{existing});
+      bool found = false;
+      bytecask::Bytes new_chain;
+      for (auto &e : entries) {
+        auto ek = bytecask::BytesView{e.original_key.data(), e.original_key.size()};
+        if (!found && spans_equal(ek, key)) {
+          new_chain.insert(new_chain.end(), tombstone.begin(), tombstone.end());
+          found = true;
+        } else {
+          auto reenc = encode_chain_entry(
+              bytecask::BytesView{e.original_key.data(), e.original_key.size()},
+              bytecask::BytesView{e.user_value.data(), e.user_value.size()});
+          new_chain.insert(new_chain.end(), reenc.begin(), reenc.end());
+        }
+      }
+      if (!found)
+        new_chain.insert(new_chain.end(), tombstone.begin(), tombstone.end());
+      db_.put({.sync = false}, to_bv(slot_key), bytecask::BytesView{new_chain});
+    }
+    --entry_count_;
   }
 
 private:
@@ -315,20 +364,7 @@ private:
     dst[1] = static_cast<char>(v & 0xFF);
   }
 
-  static auto read_be32(const std::byte *src) -> std::uint32_t {
-    return (static_cast<std::uint32_t>(std::to_integer<uint8_t>(src[0])) << 24) |
-           (static_cast<std::uint32_t>(std::to_integer<uint8_t>(src[1])) << 16) |
-           (static_cast<std::uint32_t>(std::to_integer<uint8_t>(src[2])) << 8) |
-           static_cast<std::uint32_t>(std::to_integer<uint8_t>(src[3]));
-  }
 
-  static auto read_be16(const std::byte *src) -> std::uint16_t {
-    return static_cast<std::uint16_t>(
-        (static_cast<std::uint16_t>(std::to_integer<uint8_t>(src[0])) << 8) |
-        static_cast<std::uint16_t>(std::to_integer<uint8_t>(src[1])));
-  }
-
-  // Build bucket prefix: <ns>/b/<4-byte BE bucket_id>
   auto make_bucket_prefix(std::uint32_t bucket_id) const -> std::string {
     std::string result = bucket_prefix_;
     char be[4];
@@ -337,28 +373,14 @@ private:
     return result;
   }
 
-  // Build full entry key: <bucket_prefix><4B BE timestamp><2B BE hash16>
+  // Build slot key: <bucket_prefix><2B BE hash16>
   static auto make_entry_key(const std::string &prefix,
-                             std::uint32_t ts,
                              std::uint16_t fp) -> std::string {
     std::string result = prefix;
-    char be[6];
-    write_be32(be, ts);
-    write_be16(be + 4, fp);
-    result.append(be, 6);
+    char be[2];
+    write_be16(be, fp);
+    result.append(be, 2);
     return result;
-  }
-
-  // Extract timestamp from a full entry key (4 bytes at prefix_len).
-  static auto extract_ts(bytecask::BytesView full_key,
-                         std::size_t prefix_len) -> std::uint32_t {
-    return read_be32(full_key.data() + prefix_len);
-  }
-
-  // Extract hash16 from a full entry key (2 bytes at prefix_len + 4).
-  static auto extract_hash16(bytecask::BytesView full_key,
-                             std::size_t prefix_len) -> std::uint16_t {
-    return read_be16(full_key.data() + prefix_len + 4);
   }
 
   auto serialize_metadata() const -> std::array<std::byte, kMetaBytes> {
@@ -401,44 +423,32 @@ private:
     auto n = initial_size_ * (1u << round_);
     auto old_prefix = make_bucket_prefix(split_pointer_);
 
-    // Phase 1: keys-only scan to collect all entry keys (in-memory, free).
-    std::vector<std::string> all_old_keys;
+    // Phase 1: keys-only scan to collect all slot keys (in-memory, free).
+    std::vector<std::string> old_slot_keys;
     for (auto &key : db_.keys_from({}, to_bv(old_prefix))) {
       auto key_span = key_obj_to_bv(key);
       if (!starts_with(key_span, to_bv(old_prefix)))
         break;
-      all_old_keys.emplace_back(
+      old_slot_keys.emplace_back(
           reinterpret_cast<const char *>(key_span.data()), key_span.size());
     }
 
-    if (all_old_keys.empty()) {
+    if (old_slot_keys.empty()) {
       advance_split_pointer(n);
       return;
     }
 
-    // Phase 2: fetch values and deduplicate by original key (latest ts wins).
-    struct BucketEntry {
-      std::string old_full_key;
-      bytecask::Bytes encoded_value;
-      std::uint32_t ts;
-    };
-    std::map<std::string, BucketEntry> best_by_key;
-
-    for (auto &old_key : all_old_keys) {
-      bytecask::Bytes val;
-      if (!db_.get({.verify_checksums = false}, to_bv(old_key), val))
+    // Phase 2: decode all chains, deduplicate by original_key (last write wins).
+    std::map<std::string, ChainEntry> survivors;
+    for (auto &slot_key : old_slot_keys) {
+      bytecask::Bytes chain_bytes;
+      if (!db_.get({.verify_checksums = false}, to_bv(slot_key), chain_bytes))
         continue;
-
-      auto decoded = decode_value(bytecask::BytesView{val});
-      auto ts = extract_ts(to_bv(old_key), old_prefix.size());
-
-      std::string orig_key_str(
-          reinterpret_cast<const char *>(decoded.original_key.data()),
-          decoded.original_key.size());
-
-      auto it = best_by_key.find(orig_key_str);
-      if (it == best_by_key.end() || ts >= it->second.ts) {
-        best_by_key[orig_key_str] = {old_key, std::move(val), ts};
+      auto entries = decode_chain(bytecask::BytesView{chain_bytes});
+      for (auto &e : entries) {
+        std::string k(reinterpret_cast<const char *>(e.original_key.data()),
+                      e.original_key.size());
+        survivors[k] = std::move(e);
       }
     }
 
@@ -447,27 +457,33 @@ private:
     bytecask::WritePlan plan{std::move(snap)};
     plan.ensure_unchanged(to_bv(meta_key_));
 
-    // Delete ALL old entries in this bucket.
-    for (auto &old_key : all_old_keys) {
-      plan.del(to_bv(old_key));
+    for (auto &slot_key : old_slot_keys) {
+      plan.del(to_bv(slot_key));
     }
 
-    // Re-insert surviving entries (skip tombstones) with fresh timestamps.
-    for (auto &[orig_key_str, entry] : best_by_key) {
-      auto decoded = decode_value(bytecask::BytesView{entry.encoded_value});
+    // Group surviving (non-tombstone) entries by their new slot key.
+    std::map<std::string, bytecask::Bytes> new_chains;
+    for (auto &[orig_key_str, entry] : survivors) {
+      if (entry.user_value.empty())
+        continue; // tombstone — GC during split
 
-      // Skip tombstones — GC during split.
-      if (decoded.value.empty())
-        continue;
-
-      auto h = murmur3_32(decoded.original_key.data(),
-                          decoded.original_key.size(), opts_.hash_seed);
+      auto orig_bv = bytecask::BytesView{entry.original_key.data(),
+                                        entry.original_key.size()};
+      auto h = murmur3_32(orig_bv.data(), orig_bv.size(), opts_.hash_seed);
       auto new_bucket = h % (2 * n);
-      auto fp = hash16(decoded.original_key);
-      auto ts = now_ts();
-      auto new_key = make_entry_key(make_bucket_prefix(new_bucket), ts, fp);
+      auto fp = hash16(orig_bv);
+      auto new_slot_key = make_entry_key(make_bucket_prefix(new_bucket), fp);
 
-      plan.put(to_bv(new_key), bytecask::BytesView{entry.encoded_value});
+      auto entry_bytes = encode_chain_entry(
+          orig_bv,
+          bytecask::BytesView{entry.user_value.data(), entry.user_value.size()});
+      auto &chain = new_chains[new_slot_key];
+      chain.insert(chain.end(), entry_bytes.begin(), entry_bytes.end());
+    }
+
+    for (auto &[new_slot_key, chain] : new_chains) {
+      plan.put(to_bv(new_slot_key),
+               bytecask::BytesView{chain.data(), chain.size()});
     }
 
     // Update metadata.
@@ -518,12 +534,6 @@ private:
   }
 
   // --- Helpers ---
-
-  static auto now_ts() -> std::uint32_t {
-    auto ns = std::chrono::steady_clock::now().time_since_epoch();
-    return static_cast<std::uint32_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(ns).count());
-  }
 
   static auto to_bv(const std::string &s) -> bytecask::BytesView {
     return std::as_bytes(std::span{s.data(), s.size()});
