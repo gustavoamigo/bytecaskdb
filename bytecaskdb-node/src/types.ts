@@ -3,6 +3,10 @@
 
 export type Mode = 'leader' | 'follower';
 
+export interface Disposable {
+  [Symbol.dispose](): void;
+}
+
 export type EntryType = 'put' | 'delete' | 'bulkBegin' | 'bulkEnd' | 'rangeDel';
 
 export interface OpenOptions {

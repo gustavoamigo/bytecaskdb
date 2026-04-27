@@ -174,30 +174,56 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
   // 3. Implicit W-W check on all write keys (only when snapshot present).
   if (snap_state) {
     for (const auto &w : plan.writes_) {
-      const std::byte *key_data = nullptr;
-      std::size_t key_len = 0;
+      bool has_conflict = false;
       std::visit(
-          [&](const auto &op) {
+          [&](const auto &op) -> void {
             using T = std::decay_t<decltype(op)>;
             if constexpr (std::is_same_v<T, WritePlan::PointPut>) {
-              key_data = op.key.data();
-              key_len = op.key.size();
+              const std::span<const std::byte> key_span{op.key};
+              const auto snap_entry = snap_state->key_dir.get(key_span);
+              const auto cur_entry = key_dir_.get(key_span);
+              const bool appeared = !snap_entry && cur_entry;
+              const bool deleted = snap_entry && !cur_entry;
+              const bool modified =
+                  snap_entry && cur_entry &&
+                  cur_entry->sequence() != snap_entry->sequence();
+              if (appeared || deleted || modified) has_conflict = true;
             } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
-              key_data = op.key.data();
-              key_len = op.key.size();
+              const std::span<const std::byte> key_span{op.key};
+              const auto snap_entry = snap_state->key_dir.get(key_span);
+              const auto cur_entry = key_dir_.get(key_span);
+              const bool appeared = !snap_entry && cur_entry;
+              const bool deleted = snap_entry && !cur_entry;
+              const bool modified =
+                  snap_entry && cur_entry &&
+                  cur_entry->sequence() != snap_entry->sequence();
+              if (appeared || deleted || modified) has_conflict = true;
+            } else if constexpr (std::is_same_v<T, WritePlan::RangeDel>) {
+              // Range conflict check: verify no keys in [from, to) changed since snapshot
+              const std::span<const std::byte> from_span{op.from};
+              const std::span<const std::byte> to_span{op.to};
+
+              // Check current state for keys modified since snapshot.
+              for (auto it = key_dir_.lower_bound(from_span);
+                   it != std::default_sentinel && !has_conflict; ++it) {
+                auto [key_span, entry] = *it;
+                if (Key{key_span} >= Key{to_span}) break;
+                const auto snap_entry = snap_state->key_dir.get(key_span);
+                const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
+                if (entry.sequence() != snap_seq) has_conflict = true;
+              }
+
+              // Check snapshot for keys deleted since snapshot.
+              for (auto it = snap_state->key_dir.lower_bound(from_span);
+                   it != std::default_sentinel && !has_conflict; ++it) {
+                auto [key_span, entry] = *it;
+                if (Key{key_span} >= Key{to_span}) break;
+                if (!key_dir_.get(key_span)) has_conflict = true;
+              }
             }
           },
           w);
-      if (!key_data) continue; // RangeDel — skip
-      const std::span<const std::byte> key_span{key_data, key_len};
-      const auto snap_entry = snap_state->key_dir.get(key_span);
-      const auto cur_entry = key_dir_.get(key_span);
-      const bool appeared = !snap_entry && cur_entry;
-      const bool deleted = snap_entry && !cur_entry;
-      const bool modified =
-          snap_entry && cur_entry &&
-          cur_entry->sequence() != snap_entry->sequence();
-      if (appeared || deleted || modified) return false;
+      if (has_conflict) return false;
     }
   }
 
