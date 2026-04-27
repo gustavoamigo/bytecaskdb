@@ -1,4 +1,4 @@
-# mariadb/CMakeLists.txt
+# bytecaskdb-mariadb-plugin/CMakeLists.txt
 #
 # Out-of-tree CMake build for the ByteCaskDB MariaDB storage plugin.
 #
@@ -18,10 +18,10 @@
 #
 # Usage
 # -----
-#   cmake -S mariadb -B mariadb/build \
+#   cmake -S bytecaskdb-mariadb-plugin -B bytecaskdb-mariadb-plugin/build \
 #         -DBYTECASK_ROOT=<bytecask-root> \
 #         -DMARIADB_INCLUDE_DIR=/usr/include/mysql
-#   cmake --build mariadb/build
+#   cmake --build bytecaskdb-mariadb-plugin/build
 #
 # Then load in MariaDB:
 #   INSTALL PLUGIN bytecaskdb SONAME 'ha_bytecaskdb.so';
@@ -115,9 +115,10 @@ add_library(ha_bytecaskdb MODULE
   catalog.cc
   key_encoding.cc
   row_encoding.cc
-  # bytecask_c.cpp is compiled into libbytecask.a by xmake (it imports the
-  # C++23 bytecask module and must be built with the same toolchain that
-  # produced the BMIs).  The C API symbols are linked in via bytecask_static.
+  # bytecask_c.cpp lives in bytecaskdb/ and is compiled by xmake into
+  # libbytecask.a (it imports the C++23 bytecask module and must be built
+  # with the same toolchain that produced the BMIs).  The C API symbols
+  # are linked in via bytecask_static.
 )
 
 target_include_directories(ha_bytecaskdb PRIVATE

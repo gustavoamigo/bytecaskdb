@@ -6,9 +6,8 @@
 // Contains no MariaDB headers. Bridges the stable C API (include/bytecask_c.h)
 // to the C++23 module-based engine.
 //
-// Build note: this file is compiled by mariadb/CMakeLists.txt as part of the
-// plugin — NOT by xmake. This is intentional: it keeps libbytecask.a free of
-// C ABI symbols so that the test suite links against a pure C++23 engine.
+// Build note: compiled by xmake into libbytecask.a alongside the other
+// bytecaskdb/ sources. Contains no MariaDB headers.
 
 #include <cstddef>
 #include <cstdlib>

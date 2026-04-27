@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mariadb/smoke_test.sh — Self-contained smoke test for the ByteCaskDB MariaDB
+# bytecaskdb-mariadb-plugin/smoke_test.sh — Self-contained smoke test for the ByteCaskDB MariaDB
 # storage-engine plugin.
 #
 # Starts a local MariaDB instance (no root required), builds the plugin,
@@ -11,13 +11,13 @@
 #   - libbytecask.a already built:  cd <root> && xmake build bytecask
 #
 # Usage:
-#   ./mariadb/smoke_test.sh          # default — starts local instance
-#   ./mariadb/smoke_test.sh --keep   # leave the local instance running after tests
+#   ./bytecaskdb-mariadb-plugin/smoke_test.sh          # default — starts local instance
+#   ./bytecaskdb-mariadb-plugin/smoke_test.sh --keep   # leave the local instance running after tests
 
 set -euo pipefail
 
 BYTECASK_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD_DIR="${BYTECASK_ROOT}/mariadb/build"
+BUILD_DIR="${BYTECASK_ROOT}/bytecaskdb-mariadb-plugin/build"
 LOCAL_DIR="${BYTECASK_ROOT}/.mariadb_local"
 SOCK="${LOCAL_DIR}/mysql.sock"
 PID_FILE="${LOCAL_DIR}/mariadbd.pid"
@@ -102,7 +102,7 @@ echo "=== ByteCaskDB MariaDB Plugin Smoke Test ==="
 echo ""
 echo "--- Build plugin ---"
 
-cmake -S "${BYTECASK_ROOT}/mariadb" -B "${BUILD_DIR}" \
+cmake -S "${BYTECASK_ROOT}/bytecaskdb-mariadb-plugin" -B "${BUILD_DIR}" \
       -DBYTECASK_ROOT="${BYTECASK_ROOT}" 2>&1 | tail -3
 cmake --build "${BUILD_DIR}" 2>&1 | tail -3
 

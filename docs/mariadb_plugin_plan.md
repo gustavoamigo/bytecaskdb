@@ -1,6 +1,6 @@
 # MariaDB Plugin — Build-Out Plan
 
-> Elaborates a full plan to evolve the Phase-1 POC in `mariadb/` into a
+> Elaborates a full plan to evolve the Phase-1 POC in `bytecaskdb-mariadb-plugin/` into a
 > production-grade `ha_bytecaskdb` storage engine. Reads alongside
 > `docs/mariadb_engine_design.md`, `docs/transaction_design.md`,
 > `.notes/mariadb_engine_guide.md`, and `.notes/del_range.md`.
@@ -26,7 +26,7 @@ These are non-negotiable constraints the plan is built around.
 2. **MariaDB-only Layer 2.** The public `Transaction` described in
    `docs/transaction_design.md` is **not** implemented yet and is **not**
    exposed. The plugin ships its own `MariaDBTxn` internal to
-   `mariadb/`, built directly on the already-public
+   `bytecaskdb-mariadb-plugin/`, built directly on the already-public
    `DB::snapshot()` + `DB::apply_batch(WritePlan)` (Layer 1) via the
    C API (`bytecask_c.h`). The public Transaction in the main project
    is deferred indefinitely — nothing in the plugin should depend on it.
@@ -44,7 +44,7 @@ These are non-negotiable constraints the plan is built around.
 5. **No changes to core ByteCaskDB for MariaDB-specific reasons** other
    than additions already motivated by the engine's own roadmap
    (`del_range`, eventually tombstone GC). All MariaDB-specific
-   machinery lives under `mariadb/`.
+   machinery lives under `bytecaskdb-mariadb-plugin/`.
 
 ---
 
@@ -246,7 +246,7 @@ custom, MariaDB-specific L2 built on top of the Layer 1 C API
 (`bytecask_snapshot`, `bytecask_write_plan_*`,
 `bytecask_apply_batch`). See §4 for the full design.
 
-- New files: `mariadb/bytecaskdb_txn.h`, `.cc`.
+- New files: `bytecaskdb-mariadb-plugin/bytecaskdb_txn.h`, `.cc`.
 - Per-THD instance stored via `thd_get_ha_data` / `thd_set_ha_data`.
 - `external_lock(thd, F_RDLCK|F_WRLCK)` — `txn->begin(thd)`.
   Registers with the MariaDB transaction coordinator via
@@ -524,7 +524,7 @@ today but are trivial.
 ## 4. MariaDB-internal L2 Transaction (`MariaDBTxn`) design
 
 Specialised, MariaDB-only. **Does not ship in the public engine
-surface.** Entirely under `mariadb/`. Built on the Layer 1 C API.
+surface.** Entirely under `bytecaskdb-mariadb-plugin/`. Built on the Layer 1 C API.
 
 ### 4.1 Requirements the public `Transaction` would not meet
 
@@ -542,7 +542,7 @@ surface.** Entirely under `mariadb/`. Built on the Layer 1 C API.
 ### 4.2 Class sketch
 
 ```cpp
-// mariadb/bytecaskdb_txn.h
+// bytecaskdb-mariadb-plugin/bytecaskdb_txn.h
 class MariaDBTxn {
 public:
   explicit MariaDBTxn(bytecask_db_t* db);
@@ -777,7 +777,7 @@ to fit the plugin — Layer 1 is already sufficient for Phases A–F.
 
 ## 9. Testing strategy
 
-1. **MariaDB Test Runner (MTR) suite** under `mariadb/mysql-test/`.
+1. **MariaDB Test Runner (MTR) suite** under `bytecaskdb-mariadb-plugin/mysql-test/`.
    - `ddl.test` — CREATE / DROP / RENAME / ALTER across restart.
    - `crud.test` — INSERT / UPDATE / DELETE / SELECT over PK.
    - `index.test` — secondary index reads, unique constraints.
@@ -785,7 +785,7 @@ to fit the plugin — Layer 1 is already sufficient for Phases A–F.
    - `concurrency.test` — contended writes return deadlock, retry
      succeeds.
    - `recovery.test` — kill -9 mid-workload, restart, verify state.
-2. **Unit tests** under `mariadb/tests/` for the pure helpers:
+2. **Unit tests** under `bytecaskdb-mariadb-plugin/tests/` for the pure helpers:
    `key_encoding`, `row_encoding`, `bytecaskdb_txn` buffer semantics,
    iterator merge, catalog encode/decode. Driven by Catch2 and run
    with `xmake run mariadb_unit_tests`.
