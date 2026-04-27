@@ -39,29 +39,10 @@ handlerton    *bytecaskdb_hton = nullptr;
 static std::mutex                          s_catalog_mu;
 static std::map<std::string, uint32_t>     s_name_to_id;
 static std::map<uint32_t, TableMeta>       s_id_to_meta;
-static uint64_t                            s_next_table_id = 1;
 
 // Rebuilds the in-memory caches by scanning the catalog key range and reading
 // the counter key.  Called once during plugin init.
 static bool catalog_init(bytecask_db_t *db) {
-  // Read the current table_id counter.
-  {
-    auto ckey = counter_key(kCounterTableId);
-    uint8_t *val = nullptr;
-    std::size_t val_len = 0;
-    int rc = bytecask_get(db, ckey.data(), ckey.size(), &val, &val_len);
-    if (rc == 1) {
-      s_next_table_id = decode_counter_value(val, val_len) + 1;
-      bytecask_free_buf(val);
-    } else if (rc == 0) {
-      s_next_table_id = 1;
-    } else {
-      fprintf(stderr, "[ha_bytecaskdb] Failed to read table_id counter: %s\n",
-              bytecask_errmsg());
-      return false;
-    }
-  }
-
   // Scan all table metadata entries.
   auto [lower, upper] = table_meta_scan_bounds();
   auto *iter = bytecask_iter_open(db, lower.data(), lower.size());
@@ -105,8 +86,8 @@ static bool catalog_init(bytecask_db_t *db) {
 
   bytecask_iter_free(iter);
 
-  fprintf(stderr, "[ha_bytecaskdb] Catalog loaded: %zu tables, next_id=%lu\n",
-          s_name_to_id.size(), static_cast<unsigned long>(s_next_table_id));
+  fprintf(stderr, "[ha_bytecaskdb] Catalog loaded: %zu tables\n",
+          s_name_to_id.size());
   return true;
 }
 
@@ -146,8 +127,6 @@ uint32_t catalog_alloc_table_id(bytecask_db_t *db) {
     int result = bytecask_apply_batch(db, plan, /*sync=*/1);
     if (result == 1) {
       // Committed.
-      std::lock_guard<std::mutex> lk{s_catalog_mu};
-      s_next_table_id = new_id + 1;
       return static_cast<uint32_t>(new_id);
     }
     if (result < 0) {
@@ -313,6 +292,21 @@ static int bytecaskdb_close_connection(handlerton *hton, THD *thd) {
   return 0;
 }
 
+static int bytecaskdb_start_consistent_snapshot(handlerton *hton, THD *thd) {
+  // Create a snapshot for consistent reads (needed for mysqldump --single-transaction)
+  if (!g_db) { return 1; }
+
+  auto *txn = static_cast<MariaDBTxn *>(thd_get_ha_data(thd, hton));
+  if (!txn) {
+    txn = new MariaDBTxn(g_db);
+    thd_set_ha_data(thd, hton, txn);
+  }
+
+  // Ensure the transaction has a snapshot for consistent reads
+  txn->begin_if_needed(thd, hton);
+  return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Plugin init / deinit
 // ---------------------------------------------------------------------------
@@ -321,11 +315,12 @@ static int bytecaskdb_init(void *p) {
   auto *hton = static_cast<handlerton *>(p);
   bytecaskdb_hton = hton;
 
-  hton->create           = bytecaskdb_create_handler;
-  hton->commit           = bytecaskdb_commit;
-  hton->rollback         = bytecaskdb_rollback;
-  hton->close_connection = bytecaskdb_close_connection;
-  hton->flags            = HTON_NO_FLAGS;
+  hton->create                   = bytecaskdb_create_handler;
+  hton->commit                   = bytecaskdb_commit;
+  hton->rollback                 = bytecaskdb_rollback;
+  hton->close_connection         = bytecaskdb_close_connection;
+  hton->start_consistent_snapshot = bytecaskdb_start_consistent_snapshot;
+  hton->flags                    = HTON_NO_FLAGS;
 
   // Open the global database inside MariaDB's data directory.
   std::string db_path = std::string(mysql_real_data_home) + "bytecaskdb";
@@ -359,7 +354,6 @@ static int bytecaskdb_deinit(void * /*p*/) {
   std::lock_guard<std::mutex> lk{s_catalog_mu};
   s_name_to_id.clear();
   s_id_to_meta.clear();
-  s_next_table_id = 1;
   return 0;
 }
 

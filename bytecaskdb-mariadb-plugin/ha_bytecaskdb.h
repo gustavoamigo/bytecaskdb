@@ -91,7 +91,9 @@ public:
                      key_part_map keypart_map,
                      enum ha_rkey_function find_flag) override;
   int index_next(uchar *buf) override;
+  int index_prev(uchar *buf) override;
   int index_first(uchar *buf) override;
+  int index_last(uchar *buf) override;
 
   // -------------------------------------------------------------------
   // External lock — transaction lifecycle
@@ -114,7 +116,8 @@ public:
     return HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
            HA_PRIMARY_KEY_REQUIRED_FOR_DELETE |
            HA_TABLE_SCAN_ON_INDEX |
-           HA_REC_NOT_IN_SEQ;
+           HA_REC_NOT_IN_SEQ |
+           HA_BINLOG_ROW_CAPABLE;
   }
 
   ulong index_flags(uint idx, uint part,
@@ -135,8 +138,6 @@ private:
   uint32_t table_id_{0};
   uint16_t schema_version_{1};
 
-  bytecask_iter_t *scan_iter_{nullptr};     // TODO(phase-c): remove after read path migration
-  bytecask_iter_t *index_iter_{nullptr};    // TODO(phase-c): remove after read path migration
   std::unique_ptr<MariaDBTxn::MergeIterator> merge_scan_;
   std::unique_ptr<MariaDBTxn::MergeIterator> merge_index_;
 

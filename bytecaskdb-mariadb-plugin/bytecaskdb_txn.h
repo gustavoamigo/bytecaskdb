@@ -133,6 +133,11 @@ public:
       const uint8_t *hi, size_t hi_len,
       uint32_t table_id);
 
+  std::unique_ptr<MergeIterator> riter_prefix(
+      const uint8_t *hi, size_t hi_len,
+      const uint8_t *lo, size_t lo_len,
+      uint32_t table_id);
+
   // -------------------------------------------------------------------
   // Commit / rollback
   // -------------------------------------------------------------------

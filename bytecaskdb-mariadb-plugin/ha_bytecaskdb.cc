@@ -141,9 +141,6 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
     schema_version_ = static_cast<uint16_t>(meta->schema_version);
   }
 
-  scan_iter_  = nullptr;
-  index_iter_ = nullptr;
-
   // ref_length: 5-byte prefix (1 ns + 4 tid) + PK key length.
   ref_length = 5 + table->key_info[table->s->primary_key].key_length;
   return 0;
@@ -154,14 +151,6 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
 // ---------------------------------------------------------------------------
 
 int ha_bytecaskdb::close() {
-  if (scan_iter_) {
-    bytecask_iter_free(scan_iter_);
-    scan_iter_ = nullptr;
-  }
-  if (index_iter_) {
-    bytecask_iter_free(index_iter_);
-    index_iter_ = nullptr;
-  }
   merge_scan_.reset();
   merge_index_.reset();
   return 0;
@@ -413,6 +402,37 @@ int ha_bytecaskdb::index_first(uchar *buf) {
   auto hi = table_id_upper_bound(table_id_);
   merge_index_ = txn->iter_prefix(lo.data(), lo.size(),
                                    hi.data(), hi.size(), table_id_);
+  if (!merge_index_) { return HA_ERR_GENERIC; }
+
+  return index_read_current(buf);
+}
+
+// ---------------------------------------------------------------------------
+// index_prev()
+// ---------------------------------------------------------------------------
+
+int ha_bytecaskdb::index_prev(uchar *buf) {
+  if (!merge_index_ || !merge_index_->valid()) { return HA_ERR_END_OF_FILE; }
+  merge_index_->next(); // In reverse iterator, next() goes backwards
+  return index_read_current(buf);
+}
+
+// ---------------------------------------------------------------------------
+// index_last()
+// ---------------------------------------------------------------------------
+
+int ha_bytecaskdb::index_last(uchar *buf) {
+  if (!g_db) { return HA_ERR_GENERIC; }
+
+  auto *txn = static_cast<MariaDBTxn *>(
+      thd_get_ha_data(ha_thd(), bytecaskdb_hton));
+  if (!txn) { return HA_ERR_GENERIC; }
+
+  // For reverse iteration, start from the upper bound (end of table range)
+  auto hi = table_id_upper_bound(table_id_);
+  auto lo = table_id_prefix(table_id_);
+  merge_index_ = txn->riter_prefix(hi.data(), hi.size(),
+                                   lo.data(), lo.size(), table_id_);
   if (!merge_index_) { return HA_ERR_GENERIC; }
 
   return index_read_current(buf);
