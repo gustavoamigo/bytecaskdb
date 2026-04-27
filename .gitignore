@@ -2,6 +2,9 @@
 .xmake/
 build/
 
+# Node.js dependencies
+node_modules/
+
 # MacOS Cache
 .DS_Store
 
