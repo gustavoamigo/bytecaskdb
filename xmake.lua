@@ -319,6 +319,9 @@ target("gen_fuzz_corpus")
     end)
 
 -- ── WASM / Emscripten targets ───────────────────────────────────────────────
+-- Only defined when the Emscripten SDK is activated (EMSDK env var set).
+-- CI jobs that don't need WASM (e.g. Python wheel builds) skip these entirely.
+if os.getenv("EMSDK") then
 --
 -- Custom toolchain that uses the EMSDK-bundled Clang for compilation (so
 -- xmake's C++ module dependency scanner recognises it as real Clang) and
@@ -510,3 +513,5 @@ target("wasm_tests")
         end
         os.execv("node", args)
     end)
+
+end -- if os.getenv("EMSDK")
