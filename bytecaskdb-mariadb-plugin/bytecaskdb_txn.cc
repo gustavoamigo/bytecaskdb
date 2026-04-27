@@ -127,6 +127,28 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_prefix(
       snap_iter, buf_it, lookup_.end(), std::move(hi_vec), table_id);
 }
 
+std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
+    const uint8_t *hi, size_t hi_len,
+    const uint8_t *lo, size_t lo_len,
+    uint32_t table_id) {
+  // Open reverse snapshot iterator at hi.
+  bytecask_iter_t *snap_iter = nullptr;
+  if (snap_) {
+    snap_iter = bytecask_snapshot_riter_open(snap_, hi, hi_len);
+  }
+
+  // Find last buffer entry <= hi (reverse iteration).
+  std::vector<uint8_t> lo_vec(lo, lo + lo_len);
+  std::vector<uint8_t> hi_vec(hi, hi + hi_len);
+  auto buf_it = lookup_.upper_bound(hi_vec);
+  if (buf_it != lookup_.begin()) {
+    --buf_it;  // Move to last entry <= hi
+  }
+
+  return std::make_unique<MergeIterator>(
+      snap_iter, buf_it, lookup_.end(), std::move(lo_vec), table_id);
+}
+
 // ---------------------------------------------------------------------------
 // Commit / rollback
 // ---------------------------------------------------------------------------
