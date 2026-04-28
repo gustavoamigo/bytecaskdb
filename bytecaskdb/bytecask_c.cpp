@@ -17,6 +17,7 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <variant>
 
 #include "../include/bytecask_c.h"
 import bytecask;
@@ -60,17 +61,38 @@ struct bytecask_db {
 };
 
 struct bytecask_iter {
-  bytecask::EntryIterator cur;
+  std::variant<bytecask::EntryIterator, bytecask::ReverseEntryIterator> iter;
+  std::variant<std::default_sentinel_t, bytecask::ReverseEntryIterator> sentinel;
   bool valid;
 
   explicit bytecask_iter(bytecask::EntryIterator c)
-      : cur{std::move(c)}, valid{cur != std::default_sentinel} {}
+      : iter{std::move(c)}, sentinel{std::default_sentinel},
+        valid{std::get<bytecask::EntryIterator>(iter) != std::default_sentinel} {}
+
+  explicit bytecask_iter(bytecask::ReverseEntryIterator c, bytecask::ReverseEntryIterator end)
+      : iter{std::move(c)}, sentinel{end},
+        valid{std::get<bytecask::ReverseEntryIterator>(iter) != std::get<bytecask::ReverseEntryIterator>(sentinel)} {}
 
   void advance() {
-    if (valid) {
-      ++cur;
-      valid = (cur != std::default_sentinel);
-    }
+    if (!valid) return;
+
+    std::visit([this](auto& it) {
+      using T = std::decay_t<decltype(it)>;
+      if constexpr (std::is_same_v<T, bytecask::EntryIterator>) {
+        ++it;
+        this->valid = (it != std::default_sentinel);
+      } else if constexpr (std::is_same_v<T, bytecask::ReverseEntryIterator>) {
+        ++it;
+        this->valid = (it != std::get<bytecask::ReverseEntryIterator>(sentinel));
+      }
+    }, iter);
+  }
+
+  auto get_current() const -> std::pair<std::span<const std::byte>, std::span<const std::byte>> {
+    return std::visit([](const auto& it) -> std::pair<std::span<const std::byte>, std::span<const std::byte>> {
+      const auto &[k, v] = *it;
+      return {std::span<const std::byte>{k.begin(), k.end()}, v};
+    }, iter);
   }
 };
 
@@ -263,16 +285,16 @@ int bytecask_iter_key(const bytecask_iter_t *iter,
     return -1;
   }
   try {
-    const auto &[k, v] = *iter->cur;
+    const auto [key_span, value_span] = iter->get_current();
     // Key exposes begin()/end() iterators over std::byte; no data() member.
-    const std::byte *kptr = k.size() > 0 ? &*k.begin() : nullptr;
-    auto *copy = dup_bytes(kptr, k.size());
-    if (!copy && k.size() > 0) {
+    const std::byte *kptr = key_span.size() > 0 ? key_span.data() : nullptr;
+    auto *copy = dup_bytes(kptr, key_span.size());
+    if (!copy && key_span.size() > 0) {
       set_errmsg("out of memory");
       return -1;
     }
     *out_key     = copy;
-    *out_key_len = k.size();
+    *out_key_len = key_span.size();
     return 0;
   } catch (const std::exception &e) {
     set_errmsg(e.what());
@@ -288,14 +310,14 @@ int bytecask_iter_value(const bytecask_iter_t *iter,
     return -1;
   }
   try {
-    const auto &[k, v] = *iter->cur;
-    auto *copy = dup_bytes(v.data(), v.size());
-    if (!copy && !v.empty()) {
+    const auto [key_span, value_span] = iter->get_current();
+    auto *copy = dup_bytes(value_span.data(), value_span.size());
+    if (!copy && !value_span.empty()) {
       set_errmsg("out of memory");
       return -1;
     }
     *out_val     = copy;
-    *out_val_len = v.size();
+    *out_val_len = value_span.size();
     return 0;
   } catch (const std::exception &e) {
     set_errmsg(e.what());
@@ -305,6 +327,52 @@ int bytecask_iter_value(const bytecask_iter_t *iter,
 
 void bytecask_iter_free(bytecask_iter_t *iter) {
   delete iter;
+}
+
+// ---------------------------------------------------------------------------
+// Reverse Iteration
+// ---------------------------------------------------------------------------
+
+bytecask_iter_t *bytecask_riter_open(bytecask_db_t *db,
+                                     const uint8_t *from, std::size_t from_len) {
+  clear_errmsg();
+  if (!db) { set_errmsg("null db handle"); return nullptr; }
+  try {
+    bytecask::ReadOptions opts{};
+    bytecask::BytesView from_view{};
+    if (from && from_len > 0) {
+      from_view = to_view(from, from_len);
+    }
+    auto range = db->db.riter_from(opts, from_view);
+    return new bytecask_iter{range.begin(), range.end()};
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return nullptr;
+  }
+}
+
+int bytecask_riter_next(bytecask_iter_t *iter) {
+  if (!iter) { return 0; }
+  iter->advance();
+  return iter->valid ? 1 : 0;
+}
+
+bytecask_iter_t *bytecask_snapshot_riter_open(bytecask_snapshot_t *snap,
+                                              const uint8_t *from,
+                                              std::size_t from_len) {
+  clear_errmsg();
+  if (!snap) { set_errmsg("null snapshot handle"); return nullptr; }
+  try {
+    bytecask::BytesView from_view{};
+    if (from && from_len > 0) {
+      from_view = to_view(from, from_len);
+    }
+    auto range = snap->snap.riter_from({}, from_view);
+    return new bytecask_iter{range.begin(), range.end()};
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return nullptr;
+  }
 }
 
 // ---------------------------------------------------------------------------

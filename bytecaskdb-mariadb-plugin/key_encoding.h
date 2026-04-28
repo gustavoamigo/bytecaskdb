@@ -9,6 +9,10 @@
 //
 // Key format:
 //   [ns: 1 byte (0x02)][table_id: 4 bytes, big-endian][pk_columns: variable]
+//
+// Secondary index key format:
+//   [ns: 1 byte (0x03)][table_id: 4 bytes, big-endian][index_id: 2 bytes, big-endian]
+//   [index_columns: variable][pk_columns: variable]
 
 #pragma once
 
@@ -45,5 +49,35 @@ bool key_belongs_to_table(const uint8_t *key, std::size_t key_len,
 // Returns the exclusive upper bound [0x02 | (table_id+1)(BE,4)] for bounded
 // iteration over a table's keys.
 std::vector<uint8_t> table_id_upper_bound(uint32_t table_id);
+
+// Encodes a secondary index key: namespace (0x03) + table_id + index_id +
+// packed secondary key columns + embedded primary key.
+// Format: [0x03 | table_id(BE,4) | index_id(BE,2) | sec_key_packed | pk_packed]
+std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
+                                     uint32_t table_id, uint16_t index_id,
+                                     uint active_index);
+
+// Extracts the primary key portion from a secondary index key.
+// sec_key_packed_len is the length of the secondary key portion only.
+std::vector<uint8_t> extract_pk_from_sec_key(const uint8_t *sec_key,
+                                              std::size_t sec_key_len,
+                                              uint sec_key_packed_len);
+
+// Returns the 7-byte prefix [0x03 | table_id(BE,4) | index_id(BE,2)] for
+// iterating a specific secondary index.
+std::vector<uint8_t> index_id_prefix(uint32_t table_id, uint16_t index_id);
+
+// Returns the exclusive upper bound for secondary index iteration.
+std::vector<uint8_t> index_id_upper_bound(uint32_t table_id, uint16_t index_id);
+
+// Returns true if `key` belongs to the specified secondary index.
+bool key_belongs_to_index(const uint8_t *key, std::size_t len,
+                           uint32_t table_id, uint16_t index_id);
+
+// Encodes a unique secondary index key for duplicate checking.
+// Format: [0x03 | table_id(BE,4) | index_id(BE,2) | sec_key] (no PK suffix)
+std::vector<uint8_t> encode_unique_sec_key(TABLE *table, const uchar *buf,
+                                            uint32_t table_id, uint16_t index_id,
+                                            uint active_index);
 
 } // namespace bytecaskdb

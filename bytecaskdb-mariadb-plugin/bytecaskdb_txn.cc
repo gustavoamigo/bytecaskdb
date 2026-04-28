@@ -127,6 +127,47 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_prefix(
       snap_iter, buf_it, lookup_.end(), std::move(hi_vec), table_id);
 }
 
+std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_index_prefix(
+    const uint8_t *lo, size_t lo_len,
+    const uint8_t *hi, size_t hi_len,
+    uint32_t table_id, uint16_t index_id) {
+  // Open snapshot iterator at lo.
+  bytecask_iter_t *snap_iter = nullptr;
+  if (snap_) {
+    snap_iter = bytecask_snapshot_iter_open(snap_, lo, lo_len);
+  }
+
+  // Find first buffer entry >= lo.
+  std::vector<uint8_t> lo_vec(lo, lo + lo_len);
+  std::vector<uint8_t> hi_vec(hi, hi + hi_len);
+  auto buf_it = lookup_.lower_bound(lo_vec);
+
+  return std::make_unique<MergeIterator>(
+      snap_iter, buf_it, lookup_.end(), std::move(hi_vec), table_id, index_id);
+}
+
+std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_index_prefix(
+    const uint8_t *hi, size_t hi_len,
+    const uint8_t *lo, size_t lo_len,
+    uint32_t table_id, uint16_t index_id) {
+  // Open reverse snapshot iterator at hi.
+  bytecask_iter_t *snap_iter = nullptr;
+  if (snap_) {
+    snap_iter = bytecask_snapshot_riter_open(snap_, hi, hi_len);
+  }
+
+  // Find last buffer entry <= hi (reverse iteration).
+  std::vector<uint8_t> lo_vec(lo, lo + lo_len);
+  std::vector<uint8_t> hi_vec(hi, hi + hi_len);
+  auto buf_it = lookup_.upper_bound(hi_vec);
+  if (buf_it != lookup_.begin()) {
+    --buf_it;  // Move to last entry <= hi
+  }
+
+  return std::make_unique<MergeIterator>(
+      snap_iter, buf_it, lookup_.end(), std::move(lo_vec), table_id, index_id);
+}
+
 std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
     const uint8_t *hi, size_t hi_len,
     const uint8_t *lo, size_t lo_len,
@@ -241,6 +282,25 @@ MariaDBTxn::MergeIterator::MergeIterator(
   advance();
 }
 
+MariaDBTxn::MergeIterator::MergeIterator(
+    bytecask_iter_t *snap_iter,
+    LookupMap::const_iterator buf_it,
+    LookupMap::const_iterator buf_end,
+    std::vector<uint8_t> hi,
+    uint32_t table_id, uint16_t index_id)
+    : snap_iter_(snap_iter),
+      buf_it_(buf_it),
+      buf_end_(buf_end),
+      hi_(std::move(hi)),
+      table_id_(table_id),
+      index_id_(index_id),
+      use_index_filter_(true) {
+  // Load initial snapshot position.
+  load_snap_current();
+  // Advance to the first valid merged entry.
+  advance();
+}
+
 MariaDBTxn::MergeIterator::~MergeIterator() {
   if (snap_iter_) {
     bytecask_iter_free(snap_iter_);
@@ -264,9 +324,16 @@ void MariaDBTxn::MergeIterator::load_snap_current() {
   }
 
   // Check if key belongs to this table (within [lo, hi) range).
-  if (!key_belongs_to_table(key_buf, key_len, table_id_)) {
-    bytecask_free_buf(key_buf);
-    return;
+  if (use_index_filter_) {
+    if (!key_belongs_to_index(key_buf, key_len, table_id_, index_id_)) {
+      bytecask_free_buf(key_buf);
+      return;
+    }
+  } else {
+    if (!key_belongs_to_table(key_buf, key_len, table_id_)) {
+      bytecask_free_buf(key_buf);
+      return;
+    }
   }
 
   // Check upper bound.
@@ -310,9 +377,16 @@ void MariaDBTxn::MergeIterator::advance() {
     }
     // Also check table membership for buffer keys.
     if (buf_valid) {
-      if (!key_belongs_to_table(buf_it_->first.data(),
-                                buf_it_->first.size(), table_id_)) {
-        buf_valid = false;
+      if (use_index_filter_) {
+        if (!key_belongs_to_index(buf_it_->first.data(),
+                                  buf_it_->first.size(), table_id_, index_id_)) {
+          buf_valid = false;
+        }
+      } else {
+        if (!key_belongs_to_table(buf_it_->first.data(),
+                                  buf_it_->first.size(), table_id_)) {
+          buf_valid = false;
+        }
       }
     }
 

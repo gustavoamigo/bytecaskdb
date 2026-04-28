@@ -57,6 +57,14 @@ public:
                   LookupMap::const_iterator buf_end,
                   std::vector<uint8_t> hi,
                   uint32_t table_id);
+
+    // Constructor for secondary index iteration.
+    MergeIterator(bytecask_iter_t *snap_iter,
+                  LookupMap::const_iterator buf_it,
+                  LookupMap::const_iterator buf_end,
+                  std::vector<uint8_t> hi,
+                  uint32_t table_id, uint16_t index_id);
+
     ~MergeIterator();
 
     MergeIterator(const MergeIterator &) = delete;
@@ -81,6 +89,8 @@ public:
     LookupMap::const_iterator buf_end_;
     std::vector<uint8_t> hi_;
     uint32_t table_id_;
+    uint16_t index_id_{0};        // 0 = primary key (table) iteration
+    bool use_index_filter_{false}; // true = use key_belongs_to_index
 
     // Cached snapshot key/value (owned copies).
     std::vector<uint8_t> snap_key_;
@@ -137,6 +147,17 @@ public:
       const uint8_t *hi, size_t hi_len,
       const uint8_t *lo, size_t lo_len,
       uint32_t table_id);
+
+  // Opens a merge iterator over [lo, hi) for a specific secondary index.
+  std::unique_ptr<MergeIterator> iter_index_prefix(
+      const uint8_t *lo, size_t lo_len,
+      const uint8_t *hi, size_t hi_len,
+      uint32_t table_id, uint16_t index_id);
+
+  std::unique_ptr<MergeIterator> riter_index_prefix(
+      const uint8_t *hi, size_t hi_len,
+      const uint8_t *lo, size_t lo_len,
+      uint32_t table_id, uint16_t index_id);
 
   // -------------------------------------------------------------------
   // Commit / rollback

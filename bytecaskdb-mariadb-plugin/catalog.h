@@ -80,6 +80,13 @@ struct ColumnMeta {
   uint16_t charset_id;
 };
 
+struct IndexMeta {
+  uint16_t index_id;                      // MariaDB key_info[] position
+  uint16_t key_parts;                     // user_defined_key_parts
+  uint8_t  is_unique;                     // unique constraint flag
+  std::vector<uint16_t> column_indexes;   // fieldnr for each key part
+};
+
 struct TableMeta {
   uint32_t    table_id;
   uint32_t    schema_version;
@@ -88,6 +95,7 @@ struct TableMeta {
   uint16_t    null_bytes;
   uint32_t    pk_parts;
   std::vector<ColumnMeta> columns;
+  std::vector<IndexMeta> indexes;         // non-PK secondary indexes
 };
 
 // Serializes a TableMeta into a byte vector (all little-endian).

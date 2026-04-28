@@ -115,7 +115,6 @@ public:
   ulonglong table_flags() const override {
     return HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
            HA_PRIMARY_KEY_REQUIRED_FOR_DELETE |
-           HA_TABLE_SCAN_ON_INDEX |
            HA_REC_NOT_IN_SEQ |
            HA_BINLOG_ROW_CAPABLE;
   }
