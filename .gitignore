@@ -48,6 +48,9 @@ tests/fuzz/corpus/
 # Local MariaDB instance for plugin smoke tests
 .mariadb_local/
 
+# MariaDB plugin integration tests
+bytecaskdb-mariadb-plugin/.mariadb_integration_test/
+
 .notes
 
 # Claude Code local state

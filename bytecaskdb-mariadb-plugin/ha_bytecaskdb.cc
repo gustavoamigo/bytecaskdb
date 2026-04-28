@@ -243,9 +243,8 @@ int ha_bytecaskdb::rename_table(const char *from, const char *to) {
 int ha_bytecaskdb::write_row(const uchar *buf) {
   if (!g_db) { return HA_ERR_GENERIC; }
 
-  auto *txn = static_cast<MariaDBTxn *>(
-      thd_get_ha_data(ha_thd(), bytecaskdb_hton));
-  if (!txn) { return HA_ERR_GENERIC; }
+  auto *txn = get_or_create_txn(ha_thd(), bytecaskdb_hton);
+  txn->begin_if_needed(ha_thd(), bytecaskdb_hton);
 
   auto key = encode_current_pk(buf);
   auto val = encode_row(table, buf, schema_version_);
@@ -674,6 +673,17 @@ int ha_bytecaskdb::rnd_pos(uchar *buf, uchar *pos) {
 int ha_bytecaskdb::info(uint /*flag*/) {
   stats.records = HA_POS_ERROR;
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// records_in_range() — estimate rows in key range for optimizer
+// ---------------------------------------------------------------------------
+
+ha_rows ha_bytecaskdb::records_in_range(uint /*index*/, const key_range */*min_key*/,
+                                         const key_range */*max_key*/,
+                                         page_range */*pages*/) {
+  // Stub: return unknown for now. MariaDB will use default estimates.
+  return HA_POS_ERROR;
 }
 
 // ---------------------------------------------------------------------------
