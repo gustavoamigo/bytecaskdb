@@ -176,6 +176,26 @@ message(STATUS "Plugin target: ha_bytecaskdb.so")
 # logic is tested.
 
 # ---------------------------------------------------------------------------
+# Integration tests
+# ---------------------------------------------------------------------------
+# Full end-to-end tests that provision MariaDB, load the plugin, and run SQL tests.
+
+add_executable(integration_tests
+  integration_test.cpp
+)
+
+target_include_directories(integration_tests PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+target_compile_options(integration_tests PRIVATE
+  -Wall -Wextra
+  -DBYTECASKDB_TESTS  # Enable test mode guards
+)
+
+target_link_libraries(integration_tests PRIVATE Catch2::Catch2WithMain)
+
+# ---------------------------------------------------------------------------
 # Unit tests for the encoding / catalog layer
 # ---------------------------------------------------------------------------
 # These compile catalog.cc, key_encoding.cc, row_encoding.cc against minimal
