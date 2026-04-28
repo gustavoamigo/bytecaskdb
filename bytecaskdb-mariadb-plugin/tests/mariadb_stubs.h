@@ -28,6 +28,7 @@ struct TABLE_SHARE {
   uint32_t reclength;
   uint16_t null_bytes;
   uint fields;
+  uint keys;  // Add keys field for unit tests
 };
 
 struct Field;

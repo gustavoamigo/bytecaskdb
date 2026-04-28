@@ -148,7 +148,7 @@ TEST_CASE("TableMeta round-trip", "[catalog]") {
   SECTION("with columns") {
     TableMeta meta;
     meta.table_id       = 42;
-    meta.schema_version = 3;
+    meta.schema_version = 2;  // Only v2 supported
     meta.full_name      = std::string("test\0t1\0", 8);
     meta.reclength      = 256;
     meta.null_bytes     = 2;
@@ -157,6 +157,7 @@ TEST_CASE("TableMeta round-trip", "[catalog]") {
         {/*field_type=*/3, /*field_length=*/11, /*is_nullable=*/0, /*charset_id=*/0},
         {/*field_type=*/15, /*field_length=*/100, /*is_nullable=*/1, /*charset_id=*/33},
     };
+    meta.indexes        = {}; // Empty indexes for this test
 
     auto buf = serialize_table_meta(meta);
     REQUIRE(!buf.empty());
@@ -164,7 +165,7 @@ TEST_CASE("TableMeta round-trip", "[catalog]") {
     TableMeta out;
     REQUIRE(deserialize_table_meta(buf.data(), buf.size(), out));
     REQUIRE(out.table_id == 42);
-    REQUIRE(out.schema_version == 3);
+    REQUIRE(out.schema_version == 2);
     REQUIRE(out.full_name == meta.full_name);
     REQUIRE(out.reclength == 256);
     REQUIRE(out.null_bytes == 2);
@@ -176,36 +177,56 @@ TEST_CASE("TableMeta round-trip", "[catalog]") {
     REQUIRE(out.columns[1].field_type == 15);
     REQUIRE(out.columns[1].is_nullable == 1);
     REQUIRE(out.columns[1].charset_id == 33);
+    REQUIRE(out.indexes.empty()); // No indexes in this test
   }
 
   SECTION("empty columns") {
     TableMeta meta;
     meta.table_id       = 1;
-    meta.schema_version = 1;
+    meta.schema_version = 2;  // Only v2 supported
     meta.full_name      = "x";
     meta.reclength      = 10;
     meta.null_bytes     = 0;
     meta.pk_parts       = 0;
     meta.columns        = {};
+    meta.indexes        = {};
 
     auto buf = serialize_table_meta(meta);
     TableMeta out;
     REQUIRE(deserialize_table_meta(buf.data(), buf.size(), out));
     REQUIRE(out.columns.empty());
+    REQUIRE(out.indexes.empty());
     REQUIRE(out.table_id == 1);
+  }
+
+  SECTION("unsupported schema version") {
+    TableMeta meta;
+    meta.table_id       = 1;
+    meta.schema_version = 1;  // Unsupported v1
+    meta.full_name      = "test";
+    meta.reclength      = 8;
+    meta.null_bytes     = 0;
+    meta.pk_parts       = 0;
+    meta.columns        = {};
+    meta.indexes        = {};
+
+    auto buf = serialize_table_meta(meta);
+    REQUIRE(buf.empty()); // Should return empty for v1
   }
 
   SECTION("truncated buffer") {
     TableMeta meta;
     meta.table_id       = 1;
-    meta.schema_version = 1;
+    meta.schema_version = 2;  // Use v2
     meta.full_name      = "db";
     meta.reclength      = 8;
     meta.null_bytes     = 0;
     meta.pk_parts       = 0;
     meta.columns        = {{3, 11, 0, 0}};
+    meta.indexes        = {}; // Empty indexes
 
     auto buf = serialize_table_meta(meta);
+    REQUIRE(!buf.empty()); // v2 should serialize successfully
 
     // Truncate at various points — all must fail gracefully.
     TableMeta out;
@@ -365,5 +386,241 @@ TEST_CASE("row encoding round-trip", "[row_encoding]") {
     for (int i = 0; i < 8; ++i) {
       REQUIRE(decoded[i] == 0);
     }
+  }
+}
+
+// =========================================================================
+// Secondary index key encoding
+// =========================================================================
+
+TEST_CASE("index_id_prefix", "[key_encoding]") {
+  SECTION("table_id 1, index_id 2") {
+    auto p = index_id_prefix(1, 2);
+    REQUIRE(p == std::vector<uint8_t>{0x03, 0, 0, 0, 1, 0, 2});
+  }
+
+  SECTION("table_id 0x01020304, index_id 0x0506") {
+    auto p = index_id_prefix(0x01020304, 0x0506);
+    REQUIRE(p == std::vector<uint8_t>{0x03, 1, 2, 3, 4, 5, 6});
+  }
+}
+
+TEST_CASE("index_id_upper_bound", "[key_encoding]") {
+  SECTION("table_id 1, index_id 2") {
+    auto ub = index_id_upper_bound(1, 2);
+    REQUIRE(ub == std::vector<uint8_t>{0x03, 0, 0, 0, 1, 0, 3});
+  }
+
+  SECTION("upper bound > prefix") {
+    auto prefix = index_id_prefix(42, 3);
+    auto ub     = index_id_upper_bound(42, 3);
+    REQUIRE(prefix < ub);
+  }
+}
+
+TEST_CASE("key_belongs_to_index", "[key_encoding]") {
+  SECTION("matching key") {
+    uint8_t key[] = {0x03, 0, 0, 0, 1, 0, 2, 0xAA, 0xBB};
+    REQUIRE(key_belongs_to_index(key, sizeof(key), 1, 2));
+  }
+
+  SECTION("wrong table_id") {
+    uint8_t key[] = {0x03, 0, 0, 0, 1, 0, 2, 0xAA};
+    REQUIRE_FALSE(key_belongs_to_index(key, sizeof(key), 2, 2));
+  }
+
+  SECTION("wrong index_id") {
+    uint8_t key[] = {0x03, 0, 0, 0, 1, 0, 2, 0xAA};
+    REQUIRE_FALSE(key_belongs_to_index(key, sizeof(key), 1, 3));
+  }
+
+  SECTION("wrong namespace byte") {
+    uint8_t key[] = {0x02, 0, 0, 0, 1, 0, 2};
+    REQUIRE_FALSE(key_belongs_to_index(key, sizeof(key), 1, 2));
+  }
+
+  SECTION("key too short") {
+    uint8_t key[] = {0x03, 0, 0};
+    REQUIRE_FALSE(key_belongs_to_index(key, sizeof(key), 0, 0));
+  }
+
+  SECTION("exact 7-byte key") {
+    uint8_t key[] = {0x03, 0, 0, 0, 5, 0, 1};
+    REQUIRE(key_belongs_to_index(key, sizeof(key), 5, 1));
+  }
+}
+
+TEST_CASE("extract_pk_from_sec_key", "[key_encoding]") {
+  SECTION("normal case") {
+    // Key format: [ns:1][tid:4][iid:2][sec_key:3][pk:2]
+    uint8_t sec_key[] = {0x03, 0, 0, 0, 1, 0, 2,  // 7-byte prefix
+                         0xAA, 0xBB, 0xCC,          // 3-byte sec key
+                         0xDD, 0xEE};               // 2-byte PK
+    auto pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 3);
+    REQUIRE(pk == std::vector<uint8_t>{0xDD, 0xEE});
+  }
+
+  SECTION("empty PK") {
+    uint8_t sec_key[] = {0x03, 0, 0, 0, 1, 0, 2,  // 7-byte prefix
+                         0xAA, 0xBB};              // 2-byte sec key only
+    auto pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 2);
+    REQUIRE(pk.empty());
+  }
+
+  SECTION("key too short") {
+    uint8_t sec_key[] = {0x03, 0, 0};
+    auto pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 10);
+    REQUIRE(pk.empty());
+  }
+}
+
+TEST_CASE("TableMeta with indexes (schema v2)", "[catalog]") {
+  SECTION("schema version 2 with indexes") {
+    TableMeta meta;
+    meta.table_id       = 42;
+    meta.schema_version = 2;  // v2 includes indexes
+    meta.full_name      = std::string("test\0t1\0", 8);
+    meta.reclength      = 256;
+    meta.null_bytes     = 2;
+    meta.pk_parts       = 1;
+    meta.columns        = {{3, 11, 0, 0}};
+    meta.indexes        = {
+        {/*index_id=*/1, /*key_parts=*/1, /*is_unique=*/1, /*columns=*/{0}},
+        {/*index_id=*/2, /*key_parts=*/2, /*is_unique=*/0, /*columns=*/{0, 1}}
+    };
+
+    auto buf = serialize_table_meta(meta);
+    REQUIRE(!buf.empty());
+
+    TableMeta out;
+    REQUIRE(deserialize_table_meta(buf.data(), buf.size(), out));
+    REQUIRE(out.schema_version == 2);
+    REQUIRE(out.indexes.size() == 2);
+    REQUIRE(out.indexes[0].index_id == 1);
+    REQUIRE(out.indexes[0].key_parts == 1);
+    REQUIRE(out.indexes[0].is_unique == 1);
+    REQUIRE(out.indexes[0].column_indexes == std::vector<uint16_t>{0});
+    REQUIRE(out.indexes[1].index_id == 2);
+    REQUIRE(out.indexes[1].key_parts == 2);
+    REQUIRE(out.indexes[1].is_unique == 0);
+    REQUIRE(out.indexes[1].column_indexes == std::vector<uint16_t>{0, 1});
+  }
+}
+
+// =========================================================================
+// Secondary index operations - key structure tests only
+// =========================================================================
+
+TEST_CASE("index_id_prefix and bounds", "[key_encoding]") {
+  SECTION("index prefix generation") {
+    auto prefix = index_id_prefix(100, 5);
+    REQUIRE(prefix.size() == 7);
+    REQUIRE(prefix[0] == 0x03);  // index namespace
+    // table_id = 100 in big-endian
+    REQUIRE(prefix[1] == 0x00);
+    REQUIRE(prefix[2] == 0x00);
+    REQUIRE(prefix[3] == 0x00);
+    REQUIRE(prefix[4] == 0x64);  // 100
+    // index_id = 5 in big-endian
+    REQUIRE(prefix[5] == 0x00);
+    REQUIRE(prefix[6] == 0x05);  // 5
+  }
+
+  SECTION("index upper bound") {
+    auto upper = index_id_upper_bound(100, 5);
+    REQUIRE(upper.size() == 7);
+    REQUIRE(upper[0] == 0x03);
+    REQUIRE(upper[4] == 0x64);   // table_id = 100
+    REQUIRE(upper[6] == 0x06);   // index_id = 6 (5 + 1)
+  }
+
+  SECTION("bounds ordering") {
+    auto prefix = index_id_prefix(42, 3);
+    auto upper = index_id_upper_bound(42, 3);
+    REQUIRE(prefix < upper);
+  }
+}
+
+TEST_CASE("key_belongs_to_index validation", "[key_encoding]") {
+  SECTION("matching index key") {
+    uint8_t key[] = {0x03, 0, 0, 0, 50, 0, 7, 0xAA, 0xBB, 0xCC};
+    REQUIRE(key_belongs_to_index(key, sizeof(key), 50, 7));
+  }
+
+  SECTION("wrong table_id") {
+    uint8_t key[] = {0x03, 0, 0, 0, 50, 0, 7, 0xAA};
+    REQUIRE_FALSE(key_belongs_to_index(key, sizeof(key), 51, 7));
+  }
+
+  SECTION("wrong index_id") {
+    uint8_t key[] = {0x03, 0, 0, 0, 50, 0, 7, 0xAA};
+    REQUIRE_FALSE(key_belongs_to_index(key, sizeof(key), 50, 8));
+  }
+
+  SECTION("wrong namespace") {
+    uint8_t key[] = {0x02, 0, 0, 0, 50, 0, 7};  // row namespace, not index
+    REQUIRE_FALSE(key_belongs_to_index(key, sizeof(key), 50, 7));
+  }
+}
+
+TEST_CASE("extract_pk_from_sec_key validation", "[key_encoding]") {
+  SECTION("normal extraction") {
+    // Format: [ns:1][tid:4][iid:2][sec_key:N][pk:M]
+    uint8_t sec_key[] = {
+      0x03,                    // namespace
+      0x00, 0x00, 0x00, 0x2A,  // table_id = 42
+      0x00, 0x03,              // index_id = 3
+      0xAA, 0xBB, 0xCC,        // 3-byte secondary key
+      0x00, 0x00, 0x00, 0x10   // 4-byte PK = 16
+    };
+
+    auto pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 3);
+    REQUIRE(pk.size() == 4);
+    REQUIRE(pk == std::vector<uint8_t>{0x00, 0x00, 0x00, 0x10});
+  }
+
+  SECTION("empty PK section") {
+    uint8_t sec_key[] = {
+      0x03, 0, 0, 0, 42, 0, 3,  // 7-byte prefix
+      0xAA, 0xBB                // 2-byte secondary key only (no PK)
+    };
+    auto pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 2);
+    REQUIRE(pk.empty());
+  }
+
+  SECTION("truncated key") {
+    uint8_t sec_key[] = {0x03, 0, 0};  // Too short
+    auto pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 10);
+    REQUIRE(pk.empty());
+  }
+}
+
+TEST_CASE("schema v2 index metadata", "[catalog]") {
+  SECTION("index metadata serialization") {
+    TableMeta meta;
+    meta.table_id = 123;
+    meta.schema_version = 2;
+    meta.full_name = std::string("test\0table\0", 11);
+    meta.reclength = 32;
+    meta.null_bytes = 1;
+    meta.pk_parts = 1;
+    meta.columns = {{1, 4, 0, 0}};
+    meta.indexes = {
+      {1, 1, 0, {0}},  // Regular index on column 0
+      {2, 1, 1, {0}}   // Unique index on column 0
+    };
+
+    auto serialized = serialize_table_meta(meta);
+    REQUIRE(!serialized.empty());
+
+    TableMeta deserialized;
+    REQUIRE(deserialize_table_meta(serialized.data(), serialized.size(), deserialized));
+
+    REQUIRE(deserialized.schema_version == 2);
+    REQUIRE(deserialized.indexes.size() == 2);
+    REQUIRE(deserialized.indexes[0].index_id == 1);
+    REQUIRE(deserialized.indexes[0].is_unique == 0);
+    REQUIRE(deserialized.indexes[1].index_id == 2);
+    REQUIRE(deserialized.indexes[1].is_unique == 1);
   }
 }

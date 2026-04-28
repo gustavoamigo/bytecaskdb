@@ -127,6 +127,27 @@ int bytecask_iter_value(const bytecask_iter_t *iter,
 void bytecask_iter_free(bytecask_iter_t *iter);
 
 // ---------------------------------------------------------------------------
+// Reverse Iteration
+//
+// Iterates key-value pairs in descending key order, starting at `from`
+// (inclusive).  Pass from=NULL / from_len=0 to iterate from the end.
+// ---------------------------------------------------------------------------
+
+// Opens a reverse iterator positioned at the last key <= from.
+// Returns NULL on error.
+bytecask_iter_t *bytecask_riter_open(bytecask_db_t *db,
+                                     const uint8_t *from, size_t from_len);
+
+// Advances to the previous entry (reverse iteration).  Returns 1 if a previous entry exists, 0 at start.
+int bytecask_riter_next(bytecask_iter_t *iter);
+
+// Opens a reverse iterator on a snapshot, positioned at the last key <= from.
+// Returns NULL on error.
+bytecask_iter_t *bytecask_snapshot_riter_open(bytecask_snapshot_t *snap,
+                                              const uint8_t *from,
+                                              size_t from_len);
+
+// ---------------------------------------------------------------------------
 // Snapshots
 //
 // A snapshot is a frozen, read-only view of the database at a point in time.

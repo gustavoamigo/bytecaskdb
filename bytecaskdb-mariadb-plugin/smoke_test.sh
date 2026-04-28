@@ -77,6 +77,8 @@ cleanup_sql() {
   run_sql "DROP TABLE IF EXISTS ${TEST_DB}.t;" 2>/dev/null || true
   run_sql "DROP TABLE IF EXISTS ${TEST_DB}.t2;" 2>/dev/null || true
   run_sql "DROP TABLE IF EXISTS ${TEST_DB}.t_renamed;" 2>/dev/null || true
+  run_sql "DROP TABLE IF EXISTS ${TEST_DB}.idx_test;" 2>/dev/null || true
+  run_sql "DROP TABLE IF EXISTS ${TEST_DB}.unique_test;" 2>/dev/null || true
   run_sql "DROP DATABASE IF EXISTS ${TEST_DB};" 2>/dev/null || true
   run_sql "UNINSTALL PLUGIN bytecaskdb;" 2>/dev/null || true
 }
@@ -286,6 +288,114 @@ count=$(run_sql "SELECT COUNT(*) FROM ${TEST_DB}.t;")
 check "DROP + recreate: table is empty" "0" "$count"
 
 run_sql "DROP TABLE ${TEST_DB}.t;"
+
+# ---------------------------------------------------------------------------
+# 5b. Secondary index tests
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "--- Secondary index tests ---"
+
+# Clean up any leftover test table.
+run_sql "DROP TABLE IF EXISTS ${TEST_DB}.idx_test;" 2>/dev/null || true
+
+# Create test table with multiple columns for indexing.
+run_sql "CREATE TABLE ${TEST_DB}.idx_test (
+  id INT PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  category VARCHAR(50) NOT NULL,
+  score INT NOT NULL,
+  status ENUM('active', 'inactive') NOT NULL
+) ENGINE=bytecaskdb;"
+
+# Create secondary indexes (no unique constraint for now).
+run_sql "CREATE INDEX idx_name ON ${TEST_DB}.idx_test(name);"
+run_sql "CREATE INDEX idx_category_score ON ${TEST_DB}.idx_test(category, score);"
+
+# Insert test data.
+run_sql "INSERT INTO ${TEST_DB}.idx_test VALUES
+  (1, 'alice', 'premium', 100, 'active'),
+  (2, 'bob', 'basic', 85, 'active'),
+  (3, 'carol', 'premium', 95, 'inactive'),
+  (4, 'dave', 'basic', 75, 'active');"
+
+# Test single-column index queries.
+result=$(run_sql "SELECT id FROM ${TEST_DB}.idx_test WHERE name='bob';" 2>&1 || true)
+check "Secondary index: name lookup" "2" "$result"
+
+result=$(run_sql "SELECT COUNT(*) FROM ${TEST_DB}.idx_test WHERE name IN ('alice', 'carol');" 2>&1 || true)
+check "Secondary index: name IN query" "2" "$result"
+
+# Test multi-column index queries.
+result=$(run_sql "SELECT id FROM ${TEST_DB}.idx_test WHERE category='premium' AND score >= 95;" 2>&1 || true)
+check "Secondary index: multi-column query" "1" "$result"
+
+result=$(run_sql "SELECT COUNT(*) FROM ${TEST_DB}.idx_test WHERE category='basic';" 2>&1 || true)
+check "Secondary index: category prefix" "2" "$result"
+
+# Add a fifth row to the main table (this should succeed since no unique constraint on main table)
+run_sql "INSERT INTO ${TEST_DB}.idx_test VALUES (5, 'eve', 'premium', 110, 'active');"
+
+# Test unique index constraint by trying to insert duplicate score.
+# Create a separate table for unique constraint testing
+run_sql "CREATE TABLE ${TEST_DB}.unique_test (id INT PRIMARY KEY, score INT NOT NULL) ENGINE=bytecaskdb;"
+run_sql "CREATE UNIQUE INDEX idx_unique_score_test ON ${TEST_DB}.unique_test(score);"
+run_sql "INSERT INTO ${TEST_DB}.unique_test VALUES (1, 100);"
+
+set +e  # Temporarily disable exit on error
+run_sql "INSERT INTO ${TEST_DB}.unique_test VALUES (2, 100);" >/dev/null 2>&1
+if [[ $? -eq 0 ]]; then
+  result="SUCCESS"
+else
+  result="ERROR"
+fi
+set -e  # Re-enable exit on error
+check "Secondary index: unique constraint" "ERROR" "$result"  # Should fail due to duplicate score
+
+# Clean up unique test table
+run_sql "DROP TABLE ${TEST_DB}.unique_test;"
+
+# Test index-based ordering.
+result=$(run_sql "SELECT name FROM ${TEST_DB}.idx_test ORDER BY name LIMIT 1;" 2>&1 || true)
+check "Secondary index: ordering" "alice" "$result"
+
+# Test UPDATE affecting indexes.
+run_sql "UPDATE ${TEST_DB}.idx_test SET score=90 WHERE name='bob';"
+result=$(run_sql "SELECT score FROM ${TEST_DB}.idx_test WHERE name='bob';" 2>&1 || true)
+check "Secondary index: UPDATE index key" "90" "$result"
+
+# Test DELETE with index cleanup - debug version.
+echo "Debug: Testing DELETE operation step by step..."
+
+# Show data before DELETE
+echo "Before DELETE:"
+run_sql "SELECT id, name FROM ${TEST_DB}.idx_test ORDER BY id;"
+
+# Try DELETE and capture any output
+echo "Executing DELETE FROM ${TEST_DB}.idx_test WHERE name='dave';"
+delete_result=$(run_sql "DELETE FROM ${TEST_DB}.idx_test WHERE name='dave';" 2>&1 || echo "DELETE_ERROR")
+echo "Delete result: $delete_result"
+
+# Show data after DELETE
+echo "After DELETE:"
+run_sql "SELECT id, name FROM ${TEST_DB}.idx_test ORDER BY id;"
+
+# Check affected rows
+affected=$(run_sql "SELECT ROW_COUNT();" 2>&1 || true)
+echo "Affected rows: $affected"
+
+count=$(run_sql "SELECT COUNT(*) FROM ${TEST_DB}.idx_test;" 2>&1 || true)
+check "Secondary index: DELETE cleanup" "4" "$count"  # 4 original rows + eve (inserted successfully since no unique constraint on main table) - dave = 4
+
+# Verify remaining data is correct.
+result=$(run_sql "SELECT name FROM ${TEST_DB}.idx_test WHERE score >= 90 ORDER BY name;" 2>&1 || true)
+expected="alice
+bob
+carol"
+check "Secondary index: complex query result" "$expected" "$result"
+
+# Clean up test table.
+run_sql "DROP TABLE ${TEST_DB}.idx_test;"
 
 # ---------------------------------------------------------------------------
 # 5c. Restart persistence test

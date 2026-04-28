@@ -151,14 +151,35 @@ std::string normalize_table_name(const char *name) {
 //     [field_length: 2 bytes]
 //     [is_nullable:  1 byte]
 //     [charset_id:   2 bytes]
+//
+// Schema version 2+ adds:
+//   [index_count:    4 bytes]
+//   For each index:
+//     [index_id:     2 bytes]
+//     [key_parts:    2 bytes]
+//     [is_unique:    1 byte]
+//     For each key part:
+//       [column_idx: 2 bytes]
 // ---------------------------------------------------------------------------
 
 std::vector<uint8_t> serialize_table_meta(const TableMeta &meta) {
+  // Schema version 2 is the only supported version (with indexes)
+  if (meta.schema_version != 2) {
+    return {}; // Return empty vector for unsupported versions
+  }
+
   // Fixed header: 4 + 4 + 2 + name + 2 + 2 + 4 + 4 = 22 + name
   // Per column: 2 + 2 + 1 + 2 = 7
   auto name_len = static_cast<uint16_t>(meta.full_name.size());
   auto col_count = static_cast<uint32_t>(meta.columns.size());
+  auto index_count = static_cast<uint32_t>(meta.indexes.size());
+
   std::size_t total = 22 + name_len + col_count * 7;
+  total += 4; // index_count field
+  for (const auto &index : meta.indexes) {
+    total += 5; // index_id + key_parts + is_unique
+    total += index.column_indexes.size() * 2; // 2 bytes per column index
+  }
 
   std::vector<uint8_t> buf(total);
   uint8_t *p = buf.data();
@@ -179,13 +200,26 @@ std::vector<uint8_t> serialize_table_meta(const TableMeta &meta) {
     write_le16(p, col.charset_id);    p += 2;
   }
 
+  // Schema version 2: serialize indexes (always present)
+  write_le32(p, index_count); p += 4;
+
+  for (const auto &index : meta.indexes) {
+    write_le16(p, index.index_id);  p += 2;
+    write_le16(p, index.key_parts); p += 2;
+    *p++ = index.is_unique;
+
+    for (uint16_t col_idx : index.column_indexes) {
+      write_le16(p, col_idx); p += 2;
+    }
+  }
+
   return buf;
 }
 
 bool deserialize_table_meta(const uint8_t *data, std::size_t len,
                             TableMeta &out) {
-  // Minimum: 22 bytes (header with empty name and zero columns).
-  if (len < 22) {
+  // Minimum: 26 bytes (header with empty name, zero columns, zero indexes).
+  if (len < 26) {
     return false;
   }
 
@@ -194,8 +228,13 @@ bool deserialize_table_meta(const uint8_t *data, std::size_t len,
   out.table_id       = read_le32(p); p += 4;
   out.schema_version = read_le32(p); p += 4;
 
+  // Only support schema version 2
+  if (out.schema_version != 2) {
+    return false;
+  }
+
   uint16_t name_len = read_le16(p); p += 2;
-  if (static_cast<std::size_t>(p - data) + name_len + 12 > len) {
+  if (static_cast<std::size_t>(p - data) + name_len + 16 > len) {
     return false;
   }
   out.full_name.assign(reinterpret_cast<const char *>(p), name_len); p += name_len;
@@ -207,7 +246,7 @@ bool deserialize_table_meta(const uint8_t *data, std::size_t len,
   uint32_t col_count = read_le32(p); p += 4;
 
   std::size_t remaining = len - static_cast<std::size_t>(p - data);
-  if (remaining < col_count * 7) {
+  if (remaining < col_count * 7 + 4) { // columns + index_count
     return false;
   }
 
@@ -218,6 +257,38 @@ bool deserialize_table_meta(const uint8_t *data, std::size_t len,
     out.columns[i].is_nullable  = *p++;
     out.columns[i].charset_id   = read_le16(p); p += 2;
   }
+
+  // Schema version 2: deserialize indexes (always present)
+  remaining = len - static_cast<std::size_t>(p - data);
+  if (remaining < 4) {
+    return false; // Missing index_count field
+  }
+
+  uint32_t index_count = read_le32(p); p += 4;
+  remaining -= 4;
+
+  out.indexes.resize(index_count);
+    for (uint32_t i = 0; i < index_count; ++i) {
+      if (remaining < 5) {
+        return false; // Missing index header
+      }
+
+      out.indexes[i].index_id  = read_le16(p); p += 2;
+      out.indexes[i].key_parts = read_le16(p); p += 2;
+      out.indexes[i].is_unique = *p++;
+      remaining -= 5;
+
+      uint16_t parts = out.indexes[i].key_parts;
+      if (remaining < parts * 2) {
+        return false; // Missing column indexes
+      }
+
+      out.indexes[i].column_indexes.resize(parts);
+      for (uint16_t j = 0; j < parts; ++j) {
+        out.indexes[i].column_indexes[j] = read_le16(p); p += 2;
+        remaining -= 2;
+      }
+    }
 
   return true;
 }
