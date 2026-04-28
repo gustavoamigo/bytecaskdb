@@ -124,6 +124,9 @@ public:
 
   int info(uint flag) override;
 
+  ha_rows records_in_range(uint index, const key_range *min_key,
+                           const key_range *max_key, page_range *pages) override;
+
   uint max_supported_key_length() const override { return MAX_KEY_LENGTH; }
   uint max_supported_keys() const override { return MAX_KEY; }
 
