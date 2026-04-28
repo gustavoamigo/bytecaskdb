@@ -18,6 +18,7 @@
 
 #include "my_global.h"
 #include "handler.h"
+#include "field.h"
 
 #include <cstdint>
 #include <vector>

@@ -103,6 +103,40 @@ std::vector<uint8_t> table_id_upper_bound(uint32_t table_id) {
   return bound;
 }
 
+#ifndef BYTECASKDB_TESTS
+// Fix VARCHAR key encoding by removing length prefixes that break lexicographic order.
+// This is a post-processing step after key_copy() has generated the key.
+// Only compiled when full MariaDB headers are available (not in test builds).
+static void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table, uint active_index) {
+  const KEY &key_info = table->key_info[active_index];
+  uint8_t *key_ptr = key_data;
+
+  for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
+    const KEY_PART_INFO &kp = key_info.key_part[i];
+    Field *field = table->field[kp.fieldnr - 1];
+
+    if (field->type() == MYSQL_TYPE_VARCHAR) {
+      // VARCHAR keys start with length prefix - need to remove it for proper ordering
+      // key_copy stores: [length_byte][data...][padding]
+
+      uint8_t length = key_ptr[0];  // Length is in the first byte
+
+      if (length > 0) {
+        // Move the actual string data to the beginning (remove length prefix)
+        std::memmove(key_ptr, key_ptr + 1, length);
+      }
+
+      // Pad the rest with zeros for consistent key length
+      if (length < kp.length - 1) {
+        std::memset(key_ptr + length, 0, kp.length - 1 - length);
+      }
+    }
+
+    key_ptr += kp.length;
+  }
+}
+#endif
+
 std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
                                      uint32_t table_id, uint16_t index_id,
                                      uint active_index) {
@@ -118,11 +152,16 @@ std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
   write_be32(key.data() + 1, table_id);
   write_be16(key.data() + 5, index_id);
 
-  // Pack secondary key columns.
+  // Pack secondary key columns, then fix VARCHAR encoding for proper ordering.
   key_copy(key.data() + 7,
            const_cast<uchar *>(buf),
            const_cast<KEY *>(&key_info),
            sec_key_len);
+
+  // Post-process to fix VARCHAR length prefix issue for lexicographic ordering
+#ifndef BYTECASKDB_TESTS
+  fix_varchar_key_encoding(key.data() + 7, table, active_index);
+#endif
 
   // Pack primary key for uniqueness.
   if (table->s->primary_key != MAX_KEY && pk_len > 0) {
