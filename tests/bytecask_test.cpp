@@ -4317,6 +4317,143 @@ TEST_CASE("ensure_range_unchanged detects concurrent del_range",
 }
 
 // ---------------------------------------------------------------------------
+// del_range implicit W-W conflict detection (snapshot-based WritePlan)
+// ---------------------------------------------------------------------------
+
+// del_range in a WritePlan with snapshot must detect keys modified in range.
+TEST_CASE("del_range in WritePlan conflicts on modified key in range",
+          "[bytecask][del_range][conflict]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+  db.put({}, to_bytes("c"), to_bytes("3"));
+
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("b"), to_bytes("modified"));
+
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.del_range(to_bytes("a"), to_bytes("d"));
+  CHECK_FALSE(db.apply_batch({}, std::move(plan)));
+}
+
+// del_range in a WritePlan with snapshot must detect keys inserted in range.
+TEST_CASE("del_range in WritePlan conflicts on inserted key in range",
+          "[bytecask][del_range][conflict]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("b"), to_bytes("new"));
+
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.del_range(to_bytes("a"), to_bytes("d"));
+  CHECK_FALSE(db.apply_batch({}, std::move(plan)));
+}
+
+// del_range in a WritePlan with snapshot must detect keys deleted in range.
+TEST_CASE("del_range in WritePlan conflicts on deleted key in range",
+          "[bytecask][del_range][conflict]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+
+  auto snap = db.snapshot();
+  (void)db.del({}, to_bytes("b"));
+
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.del_range(to_bytes("a"), to_bytes("d"));
+  CHECK_FALSE(db.apply_batch({}, std::move(plan)));
+}
+
+// del_range in a WritePlan with snapshot succeeds when no keys changed in range.
+TEST_CASE("del_range in WritePlan succeeds when range is clean",
+          "[bytecask][del_range][conflict]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+  db.put({}, to_bytes("d"), to_bytes("4"));
+
+  auto snap = db.snapshot();
+  // Modify a key outside the range.
+  db.put({}, to_bytes("d"), to_bytes("modified"));
+
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.del_range(to_bytes("a"), to_bytes("c"));
+  CHECK(db.apply_batch({}, std::move(plan)));
+
+  bytecask::Bytes out;
+  CHECK_FALSE(db.get({}, to_bytes("a"), out));
+  CHECK_FALSE(db.get({}, to_bytes("b"), out));
+}
+
+// del_range in a WritePlan with snapshot succeeds on an empty range.
+TEST_CASE("del_range in WritePlan succeeds on empty range",
+          "[bytecask][del_range][conflict]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("z"), to_bytes("26"));
+
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("a"), to_bytes("modified"));
+
+  bytecask::WritePlan plan{std::move(snap)};
+  // Range [m, n) has no keys — should succeed despite other modifications.
+  plan.del_range(to_bytes("m"), to_bytes("n"));
+  CHECK(db.apply_batch({}, std::move(plan)));
+}
+
+// del_range conflict detection is per-range: only the affected range triggers conflict.
+TEST_CASE("del_range in WritePlan — conflict only within range boundary",
+          "[bytecask][del_range][conflict]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+  db.put({}, to_bytes("c"), to_bytes("3"));
+
+  auto snap = db.snapshot();
+  // Modify "c" which is at the exclusive upper bound — outside [a, c).
+  db.put({}, to_bytes("c"), to_bytes("modified"));
+
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.del_range(to_bytes("a"), to_bytes("c"));
+  // "c" is at the exclusive boundary, so no conflict for the range itself.
+  // But "c" is not in the write set either, so no implicit W-W check on it.
+  CHECK(db.apply_batch({}, std::move(plan)));
+}
+
+// Multiple del_range operations in one plan — first clean, second conflicts.
+TEST_CASE("del_range in WritePlan — multiple ranges, one conflicts",
+          "[bytecask][del_range][conflict]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+  db.put({}, to_bytes("x"), to_bytes("24"));
+  db.put({}, to_bytes("y"), to_bytes("25"));
+
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("y"), to_bytes("modified"));
+
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.del_range(to_bytes("a"), to_bytes("c")); // clean range
+  plan.del_range(to_bytes("x"), to_bytes("z")); // conflicting range
+  CHECK_FALSE(db.apply_batch({}, std::move(plan)));
+}
+
+// ---------------------------------------------------------------------------
 // Causality: operation order within a batch/plan must be preserved
 // ---------------------------------------------------------------------------
 

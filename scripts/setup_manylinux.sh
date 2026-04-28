@@ -46,7 +46,7 @@ echo "==> Building python bindinds"
 xmake build bytecaskdb_python
 
 echo "==> Running python test"
-PYTHONPATH=/bytecaskdb/bytecask-python python3 -m pytest bytecask-python/tests/ -v
+PYTHONPATH=/bytecaskdb/bytecaskdb-python python3 -m pytest bytecaskdb-python/tests/ -v
 
 echo "==> Done"
 

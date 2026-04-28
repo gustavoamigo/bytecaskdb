@@ -202,14 +202,14 @@ target("memory_profile")
 -- import them without the matching toolchain; the MariaDB plugin instead
 -- uses the stable header-based C API in include/bytecask_c.h.
 --
--- src/bytecask_c.cpp is compiled here (not in mariadb/CMakeLists.txt) because
--- it imports the C++23 bytecask module and must be built with the same
--- toolchain that produced the BMIs.
+-- bytecaskdb/bytecask_c.cpp is compiled here because it imports
+-- the C++23 bytecask module and must be built with the same toolchain that
+-- produced the BMIs.
 target("bytecask")
     set_kind("static")
     set_default(false)
     add_cxxflags("-fPIC", {force = true})  -- required when linking into a shared object (e.g. MariaDB plugin)
-    add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp", "src/bytecask_c.cpp")
+    add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp", "bytecaskdb/bytecask_c.cpp")
     add_packages("crc32c")
     on_config(function(t)
         add_native_syslinks(t)
@@ -220,11 +220,11 @@ target("bytecask")
 -- Wraps the C++23 module interface directly (not the C API).
 -- Prerequisites: pip install nanobind
 -- Build: xmake build bytecaskdb_python
--- Usage: PYTHONPATH=bytecask-python python3 your_script.py
+-- Usage: PYTHONPATH=bytecaskdb-python python3 your_script.py
 target("bytecaskdb_python")
     set_kind("shared")
     set_default(false)
-    add_files("bytecask-python/src/bytecaskdb_module.cpp")
+    add_files("bytecaskdb-python/src/bytecaskdb_module.cpp")
     add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask.cpp")
     add_packages("crc32c")
     -- nanobind requires compiling nb_combined.cpp from the nanobind package.
@@ -250,7 +250,7 @@ target("bytecaskdb_python")
         t:set("basename", "_bytecaskdb." .. tag)
         t:set("prefixname", "")  -- no "lib" prefix
         t:set("extension", ".so")
-        t:set("targetdir", path.join(os.projectdir(), "bytecask-python", "bytecaskdb"))
+        t:set("targetdir", path.join(os.projectdir(), "bytecaskdb-python", "bytecaskdb"))
         -- Detect free-threaded Python and enable nanobind free-threading support.
         local gil_disabled = os.iorunv(python, {"-c",
             "import sysconfig; print(sysconfig.get_config_var('Py_GIL_DISABLED') or 0)"})

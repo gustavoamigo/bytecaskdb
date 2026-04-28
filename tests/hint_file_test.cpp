@@ -14,7 +14,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <vector>
 import bytecask.hint_entry;
 import bytecask.hint_file;
 import bytecask.types;
@@ -44,12 +43,12 @@ TEST_CASE("HintFile append produces correct file size", "[hintfile]") {
   {
     auto hf = bytecask::HintFile::OpenForWrite(tmp);
     hf.append(1, bytecask::EntryType::Put, 0, to_bytes("hello"), 5);
-    hf.sync();
+    hf.close();
   }
 
-  // "hello" has no shared prefix with the empty previous key → suffix_len = 5
+  // "hello" is 5 bytes, stored in full (no prefix compression).
   const std::size_t expected =
-      bytecask::kHintHeaderSize + 5U + 4U; // entries + file CRC trailer
+      bytecask::kHintHeaderSize + 5U + 4U; // entry + file CRC trailer
   CHECK(std::filesystem::file_size(tmp) == expected);
 }
 
@@ -70,7 +69,7 @@ TEST_CASE("HintFile single entry round-trip", "[hintfile]") {
     auto hf = bytecask::HintFile::OpenForWrite(tmp);
     hf.append(kSeq, bytecask::EntryType::Put, kFileOffset, to_bytes(key_sv),
               kValueSize);
-    hf.sync();
+    hf.close();
   }
 
   auto hf = bytecask::HintFile::OpenForRead(tmp);
@@ -100,7 +99,7 @@ TEST_CASE("HintFile two entries sequential scan", "[hintfile]") {
     auto hf = bytecask::HintFile::OpenForWrite(tmp);
     hf.append(1, bytecask::EntryType::Put, 0, to_bytes("key1"), 10);
     hf.append(2, bytecask::EntryType::Delete, 512, to_bytes("key22"), 20);
-    hf.sync();
+    hf.close();
   }
 
   auto hf = bytecask::HintFile::OpenForRead(tmp);
@@ -136,7 +135,7 @@ TEST_CASE("HintFile CRC mismatch throws", "[hintfile]") {
   {
     auto hf = bytecask::HintFile::OpenForWrite(tmp);
     hf.append(7, bytecask::EntryType::Put, 1024, to_bytes("corrupt"), 50);
-    hf.sync();
+    hf.close();
   }
 
   // Flip the first byte of the entry body to corrupt the file.
@@ -153,26 +152,25 @@ TEST_CASE("HintFile CRC mismatch throws", "[hintfile]") {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: prefix compression round-trip — two entries with a common prefix
+// Test 5: flat keys — both entries store full keys
 // ---------------------------------------------------------------------------
-TEST_CASE("HintFile prefix compression round-trip", "[hintfile]") {
+TEST_CASE("HintFile flat keys round-trip", "[hintfile]") {
   const auto tmp =
-      std::filesystem::temp_directory_path() / "bc_hint_prefix.hint";
+      std::filesystem::temp_directory_path() / "bc_hint_flat.hint";
   std::filesystem::remove(tmp);
 
-  // "user:alice" and "user:bob" share the 5-byte prefix "user:".
+  // "user:alice" (10 bytes) and "user:bob" (8 bytes) — both stored in full.
   {
     auto hf = bytecask::HintFile::OpenForWrite(tmp);
     hf.append(1, bytecask::EntryType::Put, 0,   to_bytes("user:alice"), 10);
     hf.append(2, bytecask::EntryType::Put, 100, to_bytes("user:bob"),   20);
-    hf.sync();
+    hf.close();
   }
 
-  // File size: entry0 has suffix_len=10 (no previous key), entry1 has
-  // suffix_len=3 ("bob") since "user:" (5 bytes) is the shared prefix.
-  // Total = 2*kHintHeaderSize + 10 + 3 + 4 (file CRC)
+  // File size: 2 entries with full keys + file CRC trailer.
+  // Total = 2*kHintHeaderSize + 10 + 8 + 4 (file CRC)
   const std::size_t expected =
-      2 * bytecask::kHintHeaderSize + 10U + 3U + 4U;
+      2 * bytecask::kHintHeaderSize + 10U + 8U + 4U;
   CHECK(std::filesystem::file_size(tmp) == expected);
 
   auto hf = bytecask::HintFile::OpenForRead(tmp);
@@ -190,4 +188,3 @@ TEST_CASE("HintFile prefix compression round-trip", "[hintfile]") {
 
   CHECK_FALSE(scanner.next().has_value());
 }
-

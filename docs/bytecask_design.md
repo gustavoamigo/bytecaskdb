@@ -37,14 +37,14 @@ ByteCaskDB is being integrated as a MariaDB pluggable storage engine (`ha_byteca
 ByteCaskDB uses C++23 modules internally, which are not portable across compilation unit boundaries when linking external code. To cross this boundary (e.g. the MariaDB plugin), a stable `extern "C"` API is provided:
 
 - **`include/bytecask_c.h`**: flat C header with opaque `bytecask_db_t*` / `bytecask_iter_t*` / `bytecask_snapshot_t*` / `bytecask_write_plan_t*` handles. No C++ types, no module imports. Covers: open/close, put/del/get, forward iteration, snapshots, conditional atomic writes (`apply_batch` via `WritePlan`), and vacuum.
-- **`src/bytecask_c.cpp`**: implementation that imports `bytecask` (the C++23 module) and forwards calls through the C API. Compiled into `libbytecask.a`.
+- **`bytecaskdb/bytecask_c.cpp`**: implementation that imports `bytecask` (the C++23 module) and forwards calls through the C API. Compiled into `libbytecask.a`.
 - **`xmake.lua` `bytecask` target**: static library combining all engine module objects plus `bytecask_c.cpp`.
 
 Any out-of-tree consumer (not just the MariaDB plugin) should use this C API boundary rather than importing the C++23 modules directly.
 
 ### Python Bindings
 
-`bytecask-python/` provides Python bindings via [nanobind](https://github.com/wjakob/nanobind), wrapping the C++23 module interface directly (not the C API). The extension exposes DB, Snapshot, WritePlan, all iterator types, and Options. The GIL is released on all I/O paths so multiple Python threads can perform concurrent reads.
+`bytecaskdb-python/` provides Python bindings via [nanobind](https://github.com/wjakob/nanobind), wrapping the C++23 module interface directly (not the C API). The extension exposes DB, Snapshot, WritePlan, all iterator types, and Options. The GIL is released on all I/O paths so multiple Python threads can perform concurrent reads.
 
 **Free-threaded Python (PEP 703)**: the bindings support free-threaded Python 3.13+ (`Py_GIL_DISABLED=1`). The build system auto-detects free-threading via `sysconfig.get_config_var('Py_GIL_DISABLED')` and defines `NB_FREE_THREADED`, which declares `Py_mod_gil = Py_MOD_GIL_NOT_USED` and activates nanobind's locking primitives.
 
@@ -765,30 +765,28 @@ Contrast with `HintFile`, which uses `OpenForWrite` / `OpenForRead` factory func
 
 ### HintFile I/O model
 
-Both write and read modes operate on an in-memory `std::vector<std::byte>` buffer. No OS file descriptor is held open across calls.
+Write and read modes have different I/O strategies.
 
-- **`OpenForWrite(path)`** — creates an empty in-memory buffer. `append()` serializes entries into this buffer. `sync()` opens the file, writes the entire buffer in a single `write()`, calls `fdatasync()`, and closes the fd — all within the `sync()` call.
-- **`OpenForRead(path)`** — reads the entire file into the buffer via a single `pread` and immediately closes the fd. `scan()` operates on the buffer.
+- **`OpenForWrite(path)`** — opens the file immediately. Each `append()` serializes one entry and writes it directly to the fd, updating a running CRC-32C accumulator. `close()` writes the 4-byte CRC trailer, calls `fdatasync()`, and closes the fd. If the HintFile is destroyed without calling `close()` (e.g. exception path), the fd is closed without writing the CRC — the `.hint.tmp` file is cleaned up on next startup.
+- **`OpenForRead(path)`** — reads the entire file into an in-memory buffer via a single `pread` and immediately closes the fd. `scan()` operates on the buffer.
 
-This symmetry eliminates fd lifetime management from the class: no destructor close, no move-constructor fd transfer, defaulted special members.
-
-`HintFile::scan()` returns a `HintEntry` whose `key` is a `std::span<const std::byte>` into the backing buffer — zero allocation per entry. All callers (recovery and tests) use `scan()`.
+`HintEntry.key` is a `std::span<const std::byte>` into the backing buffer — zero allocation per entry, valid for the lifetime of the `HintFile`. All callers (recovery and tests) use `scan()`.
 
 ## Hint File Format (.hint)
 
 ### Purpose
 
-Hint files are compact companion files to sealed (rotated) data files. Each hint entry summarises one data file entry — just enough metadata and the full key — so that the in-memory Key Directory (B-Tree) can be rebuilt at startup by scanning the smaller hint files instead of the raw data files. Only sealed data files have a corresponding hint file; the active data file is recovered by scanning its raw bytes if needed.
+Hint files are compact companion files to sealed (rotated) data files. Each hint entry summarises one data file entry — just enough metadata and the full key — so that the in-memory Key Directory can be rebuilt at startup by scanning the smaller hint files instead of the raw data files. Only sealed data files have a corresponding hint file; the active data file is recovered by scanning its raw bytes if needed.
 
 ### Entry Structure
 
-`flush_hints_for()` writes entries in sorted key order (ascending), enabling prefix compression: each entry stores only the bytes that differ from the previous key.
+`flush_hints_for()` writes entries in data-file append order. Keys are stored in full — no prefix compression.
 
 ```
 +------------------+
-| Hint Header      | 24 bytes
+| Hint Header      | 23 bytes
 +------------------+
-| Suffix Data      | suffix_len bytes (key bytes after the shared prefix)
+| Key Data         | key_len bytes
 +------------------+
      ...repeated for each entry...
 +------------------+
@@ -796,20 +794,19 @@ Hint files are compact companion files to sealed (rotated) data files. Each hint
 +------------------+
 ```
 
-Total fixed overhead per entry: **24 bytes** (header). The key is stored as `prefix_len + suffix_data` (prefix_len bytes are reconstructed by the reader from the previous key). A single 4-byte CRC-32C trailer at the end of the file covers all entry bytes.
+Total fixed overhead per entry: **23 bytes** (header). A single 4-byte CRC-32C trailer at the end of the file covers all entry bytes.
 
 > `BulkBegin`/`BulkEnd` data file entries are **never** written to hint files — only `Put` and `Delete` entries are included.
 
-### Hint Header (24 bytes)
+### Hint Header (23 bytes)
 
 | Offset | Size | Field        | Type   | Description                                    |
 |--------|------|--------------|--------|------------------------------------------------|
 | 0      | 8    | Sequence     | u64 LE | Entry sequence number                          |
-| 8      | 1    | EntryType    | u8     | Entry kind: `Put` (0x01) or `Delete` (0x02) only |
+| 8      | 1    | EntryType    | u8     | Entry kind: `Put` (0x01), `Delete` (0x02), or `RangeDel` (0x05) |
 | 9      | 8    | File Offset  | u64 LE | Byte offset of the entry in the data file      |
 | 17     | 4    | Value Size   | u32 LE | Value length in bytes                          |
-| 21     | 1    | Prefix Len   | u8     | Bytes shared with the previous entry's key (0 for the first entry; capped at 255) |
-| 22     | 2    | Suffix Len   | u16 LE | Length of the key bytes that follow in this entry |
+| 21     | 2    | Key Len      | u16 LE | Length of the key bytes that follow             |
 
 `Value Size` is stored so the reader can compute the full on-disk entry size in the data file without reading it.
 
@@ -823,13 +820,13 @@ Total fixed overhead per entry: **24 bytes** (header). The key is stored as `pre
 
 ### Size Constants
 
-- `kHintHeaderSize = 24` — fixed header fields (no per-entry CRC)
-- Total entry size: `kHintHeaderSize + suffix_len` (variable)
+- `kHintHeaderSize = 23` — fixed header fields (no per-entry CRC)
+- Total entry size: `kHintHeaderSize + key_len` (variable)
 - File overhead: 4 bytes (file CRC trailer)
 
 ### Scanner API
 
-`HintFile::make_scanner()` returns a `Scanner` object that iterates over entries sequentially. The scanner owns a `key_buf_` accumulator for zero-copy prefix reconstruction: `resize()` keeps shared prefix bytes in-place and only the suffix delta is copied per call. `HintEntry.key` is a `span<const byte>` into `key_buf_`, valid until the next `scanner.next()` call.
+`HintFile::make_scanner()` returns a `Scanner` object that iterates over entries sequentially. `HintEntry.key` is a `span<const byte>` into the backing file buffer, valid for the lifetime of the `HintFile`.
 
 ```cpp
 auto scanner = hint.make_scanner();
@@ -906,19 +903,19 @@ Because hint file writes are deferred (see above), this protocol is exercised at
 
 ### Module Plan
 
-`HintFile` will live in a new `bytecask.hint_file` C++20 module (`src/engine/hint_file.cppm`), symmetric with `DataFile`:
+`HintFile` lives in the `bytecask.hint_file` C++20 module (`bytecaskdb/hint_file.cppm`), symmetric with `DataFile`:
 
 Construction uses named static factory functions to make intent explicit at the call site:
 
-- **`HintFile::OpenForWrite(path) -> HintFile`** — opens (or creates) the file with `O_WRONLY | O_CREAT | O_APPEND`.
-- **`HintFile::OpenForRead(path) -> HintFile`** — opens an existing file with `O_RDONLY`. Read and write descriptors are kept independent so scanning a sealed hint file never interferes with an active writer.
+- **`HintFile::OpenForWrite(path) -> HintFile`** — opens the file immediately with `O_WRONLY | O_CREAT | O_TRUNC`. Each `append()` serializes one entry and writes it directly to the fd, updating a running CRC-32C accumulator.
+- **`HintFile::OpenForRead(path) -> HintFile`** — reads the entire file into an in-memory buffer via a single `pread`, verifies the file-level CRC eagerly, and closes the fd.
 
 Write API:
-- **`append(sequence, entry_type, file_offset, key, value_size) -> void`**: Serializes one hint entry using `CrcOutputAdapter` and writes it to the file. Only `Put` and `Delete` are valid entry types; passing `BulkBegin` or `BulkEnd` is a programming error.
-- **`sync() -> void`**: `::fdatasync()` flush, decoupled from `append()` for Group Commit consistency.
+- **`append(sequence, entry_type, file_offset, key, value_size) -> void`**: Serializes one hint entry and writes it to the fd. Only `Put` and `Delete` are valid entry types; passing `BulkBegin` or `BulkEnd` is a programming error.
+- **`close() -> void`**: Writes the 4-byte CRC-32C trailer, calls `fdatasync()`, and closes the fd. If the HintFile is destroyed without calling `close()`, the fd is closed without writing the CRC — the `.hint.tmp` file is cleaned up on next startup.
 
 Read API:
-- **`scan(offset) -> std::optional<std::pair<HintEntry, uint64_t>>`**: Returns a zero-copy view of the hint entry at `offset` bytes. The key is a `std::span<const std::byte>` into the backing buffer — valid while the `HintFile` is alive. Returns `std::nullopt` at end-of-file. Panics on CRC mismatch. Typical usage: `while (auto result = file.scan(offset)) { auto& [entry, next] = *result; offset = next; }`.
+- **`make_scanner() -> Scanner`**: Returns a forward-only scanner. `HintEntry.key` is a `span<const byte>` into the backing buffer — valid for the lifetime of the `HintFile`.
 
 `HintEntry` is a plain struct holding `{uint64_t sequence, EntryType entry_type, uint64_t file_offset, std::span<const std::byte> key, uint32_t value_size}`.
 

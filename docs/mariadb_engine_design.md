@@ -53,7 +53,7 @@ This is the same model used by third-party engines like TokuDB (before inclusion
 ```
 bytecask/
 ├── src/                        # existing engine source
-├── mariadb/                    # NEW: MariaDB plugin source
+├── bytecaskdb-mariadb-plugin/           # NEW: MariaDB plugin source
 │   ├── CMakeLists.txt          # builds ha_bytecaskdb.so
 │   ├── ha_bytecaskdb.h
 │   ├── ha_bytecaskdb.cc
@@ -69,7 +69,7 @@ bytecask/
 └── ...
 ```
 
-The `mariadb/` directory is a self-contained CMake project. It finds MariaDB headers via `mariadb_config --include` and links against the ByteCaskDB static library (built by the existing xmake system or a separate CMake target).
+The `bytecaskdb-mariadb-plugin/` directory is a self-contained CMake project. It finds MariaDB headers via `mariadb_config --include` and links against the ByteCaskDB static library (built by the existing xmake system or a separate CMake target).
 
 ---
 
@@ -241,7 +241,7 @@ The MariaDB L2 Transaction is a thin adapter between MariaDB's `handler` lifecyc
 ### `MariaDBTxn` Class
 
 ```cpp
-// mariadb/bytecaskdb_txn.h
+// bytecaskdb-mariadb-plugin/bytecaskdb_txn.h
 class MariaDBTxn {
 public:
   explicit MariaDBTxn(bytecask::DB& db);

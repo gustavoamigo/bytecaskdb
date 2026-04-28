@@ -6,7 +6,7 @@
 #
 # Prerequisites:
 #   - xmake has already built the bytecaskdb_python target
-#   - The .so/.dylib is in bytecask-python/bytecaskdb/
+#   - The .so/.dylib is in bytecaskdb-python/bytecaskdb/
 #
 # Usage:
 #   ./scripts/build_wheel.sh [output_dir]
@@ -17,7 +17,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PKG_DIR="$PROJECT_ROOT/bytecask-python/bytecaskdb"
+PKG_DIR="$PROJECT_ROOT/bytecaskdb-python/bytecaskdb"
 OUTPUT_DIR="${1:-$PROJECT_ROOT/dist}"
 # Resolve to absolute path before we cd elsewhere.
 OUTPUT_DIR="$(cd "$PROJECT_ROOT" && mkdir -p "$OUTPUT_DIR" && cd "$OUTPUT_DIR" && pwd)"
@@ -27,7 +27,7 @@ OUTPUT_DIR="$(cd "$PROJECT_ROOT" && mkdir -p "$OUTPUT_DIR" && cd "$OUTPUT_DIR" &
 # ---------------------------------------------------------------------------
 
 VERSION=$(python3 -c "
-import sys; sys.path.insert(0, '$PROJECT_ROOT/bytecask-python')
+import sys; sys.path.insert(0, '$PROJECT_ROOT/bytecaskdb-python')
 from bytecaskdb import __version__; print(__version__)")
 
 PYTHON_TAG=$(python3 -c "

@@ -91,7 +91,7 @@ jobs:
 
       - name: Run Python tests
         run: |
-          PYTHONPATH=bytecask-python python3 -m pytest bytecask-python/tests/ -v
+          PYTHONPATH=bytecaskdb-python python3 -m pytest bytecaskdb-python/tests/ -v
 
       - name: Build wheel
         run: |
@@ -152,7 +152,7 @@ jobs:
 
       - name: Run Python tests
         run: |
-          PYTHONPATH=bytecask-python python3 -m pytest bytecask-python/tests/ -v
+          PYTHONPATH=bytecaskdb-python python3 -m pytest bytecaskdb-python/tests/ -v
 
       - name: Build wheel
         run: bash scripts/build_wheel.sh dist/raw

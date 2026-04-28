@@ -4,7 +4,6 @@
 // ByteCaskDB — hint file writing and sequential recovery scan
 
 module;
-#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -38,25 +37,26 @@ namespace {
 constexpr std::size_t kFileCrcSize = 4;
 } // namespace
 
-// Read-write manager for a ByteCask hint file.
+// Writer and reader for ByteCask hint files.
 //
-// Both modes operate on an in-memory buffer — no OS file descriptor is held
-// open across calls. OpenForWrite buffers append()s in memory; sync() writes
-// the entire buffer (plus a 4-byte file-level CRC-32C trailer) to disk in one
-// shot. OpenForRead slurps the file into the buffer at construction time,
-// verifies the CRC eagerly, and exposes a Scanner for sequential access.
+// Write mode (OpenForWrite): opens the file immediately and writes each
+// entry directly to disk via the fd. A running CRC-32C is accumulated
+// across all appended bytes. close() writes the 4-byte CRC trailer,
+// calls fdatasync, and closes the fd.
+//
+// Read mode (OpenForRead): slurps the file into an in-memory buffer,
+// verifies the file-level CRC eagerly, and exposes a Scanner.
 //
 // Thread safety: NOT thread-safe. External synchronization is required.
 export class HintFile {
 public:
   // Forward-only scanner over a hint file's entry region.
-  // Owns a key accumulator for zero-copy prefix decompression:
-  //   HintEntry.key is a span into key_buf_ valid until the next next() call.
+  // HintEntry.key and .end_key are spans into the backing file buffer,
+  // valid for the lifetime of this HintFile.
   //
   // Two usage modes:
   //   next()-style: construct via Scanner(buf), call next() in a while loop.
   //   iterator-style: construct via Scanner(buf, eager), use in range-for.
-  //                   Zero overhead vs next()-style — no wrapper class.
   class Scanner {
   public:
     using iterator_concept = std::input_iterator_tag;
@@ -75,14 +75,12 @@ public:
     }
 
     // Returns the next entry, or nullopt at end of data.
-    // key in the returned HintEntry is valid until the next call.
     // Throws std::runtime_error on a truncated entry.
     [[nodiscard]] auto next() -> std::optional<HintEntry> {
       if (pos_ >= buf_.size()) {
         return std::nullopt;
       }
-      auto [he, consumed] =
-          deserialize_entry(buf_.subspan(pos_), key_buf_, end_key_buf_);
+      auto [he, consumed] = deserialize_entry(buf_.subspan(pos_));
       pos_ += consumed;
       return he;
     }
@@ -98,15 +96,20 @@ public:
   private:
     std::span<const std::byte> buf_; // non-owning; excludes 4-byte CRC trailer
     std::size_t pos_{};
-    std::vector<std::byte> key_buf_;     // backing store for HintEntry.key spans
-    std::vector<std::byte> end_key_buf_; // backing store for HintEntry.end_key spans
-    std::optional<HintEntry> cached_;    // populated only in iterator mode
+    std::optional<HintEntry> cached_; // populated only in iterator mode
   };
 
-  // Creates a write-mode HintFile that buffers entries in memory.
+  // Creates a write-mode HintFile. Opens the file immediately for writing.
   [[nodiscard]] static auto OpenForWrite(std::filesystem::path path)
       -> HintFile {
-    return HintFile{std::move(path)};
+    auto fd = ::open(path.c_str(),
+                     O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd == -1) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("HintFile: cannot open '{}' for write", path.string())};
+    }
+    return HintFile{std::move(path), fd};
   }
 
   // Opens an existing hint file for reading. Reads the entire file into an
@@ -153,91 +156,79 @@ public:
     return HintFile{std::move(path), std::move(buf)};
   }
 
-  ~HintFile() = default;
+  ~HintFile() {
+    // If the write fd is still open (close() was not called — e.g. exception
+    // path), close without writing CRC. The .hint.tmp file will be cleaned
+    // up on next startup.
+    if (write_fd_ != -1) {
+      ::close(write_fd_);
+    }
+  }
+
   HintFile(const HintFile &) = delete;
   HintFile &operator=(const HintFile &) = delete;
-  HintFile(HintFile &&) noexcept = default;
-  HintFile &operator=(HintFile &&) noexcept = default;
 
-  // Encodes one hint entry with prefix compression and appends it to the
-  // in-memory buffer. Keys must arrive in sorted order (as guaranteed by
-  // flush_hints_for_file) for prefix sharing to be effective.
+  HintFile(HintFile &&other) noexcept
+      : path_{std::move(other.path_)},
+        buf_{std::move(other.buf_)},
+        write_fd_{other.write_fd_},
+        crc_{other.crc_} {
+    other.write_fd_ = -1;
+  }
+
+  HintFile &operator=(HintFile &&other) noexcept {
+    if (this != &other) {
+      if (write_fd_ != -1) ::close(write_fd_);
+      path_ = std::move(other.path_);
+      buf_ = std::move(other.buf_);
+      write_fd_ = other.write_fd_;
+      crc_ = other.crc_;
+      other.write_fd_ = -1;
+    }
+    return *this;
+  }
+
+  // Serializes one hint entry and writes it directly to disk.
   void append(std::uint64_t sequence, EntryType entry_type,
               std::uint64_t file_offset, std::span<const std::byte> key,
               std::uint32_t value_size) {
-    // Compute the shared prefix length with the previous key.
-    const auto shared = [&] {
-      const auto n = std::min(last_key_.size(), key.size());
-      std::size_t i = 0;
-      while (i < n && last_key_[i] == key[i]) {
-        ++i;
-      }
-      return i;
-    }();
-    const auto prefix_len =
-        static_cast<std::uint8_t>(std::min(shared, std::size_t{255}));
-    const auto suffix  = key.subspan(prefix_len);
-    auto entry_buf     = serialize_entry(sequence, entry_type, file_offset,
-                                         value_size, prefix_len, suffix);
-    buf_.insert(buf_.end(), entry_buf.begin(), entry_buf.end());
-    last_key_.assign(key.begin(), key.end());
+    auto entry_buf = serialize_entry(sequence, entry_type, file_offset,
+                                     value_size, key);
+    write_bytes(entry_buf);
   }
 
-  // Encodes a RangeDel hint entry: prefix-compressed start_key followed by
-  // the full end_key. Must be called in sorted key order like append().
+  // Serializes a RangeDel hint entry and writes it directly to disk.
   void append_range_del(std::uint64_t sequence, std::uint64_t file_offset,
                         std::span<const std::byte> start_key,
                         std::span<const std::byte> end_key) {
-    const auto shared = [&] {
-      const auto n = std::min(last_key_.size(), start_key.size());
-      std::size_t i = 0;
-      while (i < n && last_key_[i] == start_key[i]) {
-        ++i;
-      }
-      return i;
-    }();
-    const auto prefix_len =
-        static_cast<std::uint8_t>(std::min(shared, std::size_t{255}));
-    const auto suffix = start_key.subspan(prefix_len);
     auto entry_buf = serialize_range_del_entry(sequence, file_offset,
-                                               prefix_len, suffix, end_key);
-    buf_.insert(buf_.end(), entry_buf.begin(), entry_buf.end());
-    last_key_.assign(start_key.begin(), start_key.end());
+                                               start_key, end_key);
+    write_bytes(entry_buf);
   }
 
-  // Appends a 4-byte file-level CRC-32C over all buffered entry bytes, then
-  // writes the entire buffer to disk in a single write() + fdatasync().
-  void sync() {
-    Crc32 crc{};
-    crc.update(view());
-    const auto crc_val  = crc.finalize();
-    const auto old_size = buf_.size();
-    buf_.resize(old_size + kFileCrcSize);
-    ByteWriter tail{std::span{buf_}.subspan(old_size)};
-    tail.put(crc_val);
-
-    auto fd = ::open(path_.c_str(),
-                     O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd == -1) {
-      throw std::system_error{
-          errno, std::generic_category(),
-          std::format("HintFile::sync: cannot open '{}'", path_.string())};
-    }
-    if (!buf_.empty()) {
-      if (::write(fd, buf_.data(), buf_.size()) != std::ssize(buf_)) {
-        const auto err = errno;
-        ::close(fd);
-        throw std::system_error{err, std::generic_category(),
-                                "HintFile::sync: write failed"};
-      }
-    }
-    if (portable_fdatasync(fd) != 0) {
+  // Writes the 4-byte CRC-32C trailer, calls fdatasync, and closes the fd.
+  // Must be called exactly once on a write-mode HintFile.
+  void close() {
+    std::array<std::byte, kFileCrcSize> trailer{};
+    ByteWriter w{trailer};
+    w.put(crc_.finalize());
+    if (::write(write_fd_, trailer.data(), trailer.size()) !=
+        std::ssize(trailer)) {
       const auto err = errno;
-      ::close(fd);
+      ::close(write_fd_);
+      write_fd_ = -1;
       throw std::system_error{err, std::generic_category(),
-                              "HintFile::sync: fdatasync failed"};
+                              "HintFile::close: write CRC trailer failed"};
     }
-    ::close(fd);
+    if (portable_fdatasync(write_fd_) != 0) {
+      const auto err = errno;
+      ::close(write_fd_);
+      write_fd_ = -1;
+      throw std::system_error{err, std::generic_category(),
+                              "HintFile::close: fdatasync failed"};
+    }
+    ::close(write_fd_);
+    write_fd_ = -1;
   }
 
   // Returns a Scanner in iterator mode over the entry bytes.
@@ -268,19 +259,34 @@ public:
   }
 
 private:
-  explicit HintFile(std::filesystem::path path)
-      : path_{std::move(path)} {}
+  // Write-mode constructor: holds the open fd.
+  explicit HintFile(std::filesystem::path path, int fd)
+      : path_{std::move(path)}, write_fd_{fd} {}
 
+  // Read-mode constructor: holds the file buffer.
   explicit HintFile(std::filesystem::path path, std::vector<std::byte> buf)
       : path_{std::move(path)}, buf_{std::move(buf)} {}
+
+  void write_bytes(std::span<const std::byte> data) {
+    if (::write(write_fd_, data.data(), data.size()) !=
+        std::ssize(data)) {
+      const auto err = errno;
+      ::close(write_fd_);
+      write_fd_ = -1;
+      throw std::system_error{err, std::generic_category(),
+                              "HintFile::append: write failed"};
+    }
+    crc_.update(data);
+  }
 
   [[nodiscard]] auto view() const noexcept -> std::span<const std::byte> {
     return {buf_.data(), buf_.size()};
   }
 
   std::filesystem::path path_;
-  std::vector<std::byte> buf_;
-  std::vector<std::byte> last_key_; // tracks previous key for prefix compression
+  std::vector<std::byte> buf_;   // read mode only
+  int write_fd_{-1};             // write mode only; -1 when closed or read mode
+  Crc32 crc_{};                  // write mode only; running CRC accumulator
 };
 
 } // namespace bytecask

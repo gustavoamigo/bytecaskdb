@@ -1226,8 +1226,7 @@ void DB::rotate_active_file(TransientEngineState &t,
 // mid-write) is silently discarded. Idempotent: skips files whose .hint
 // already exists.
 void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
-                               const std::filesystem::path &dir,
-                               bool strict) {
+                               const std::filesystem::path &dir) {
   const auto stem = file->path().stem().string();
   const auto hint_path = dir / (stem + ".hint");
   const auto tmp_path = dir / (stem + ".hint.tmp");
@@ -1236,69 +1235,24 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
     return;
   }
 
-  // Uses std::string instead of std::vector<std::byte> for SSO: keys under
-  // ~22 bytes (libstdc++) are stored inline — no heap allocation per entry.
-  struct PendingHint {
-    std::uint64_t seq;
-    EntryType type;
-    std::uint64_t file_off;
-    std::uint32_t val_size;
-    std::string key;
-    std::string end_key; // non-empty only for RangeDel
-  };
-
-  auto as_str = [](std::span<const std::byte> s) -> std::string {
-    return {reinterpret_cast<const char *>(s.data()), s.size()};
-  };
-  auto as_bytes = [](const std::string &s) -> std::span<const std::byte> {
-    return std::as_bytes(std::span{s.data(), s.size()});
-  };
-
   auto hint = HintFile::OpenForWrite(tmp_path);
-  std::vector<PendingHint> entries;
 
-  try {
-    for (const auto &[entry, entry_off] : scan_committed(*file)) {
-      if (entry.entry_type == EntryType::BulkBegin ||
-          entry.entry_type == EntryType::BulkEnd) {
-        // Batch markers carry sequences that must be visible to recovery
-        // so that next_seq (and therefore durable_seq) is computed past
-        // the marker's sequence. Without them, recovery underestimates
-        // next_seq and the next write reuses a marker's sequence number.
-        // BulkBegin also ensures file_stats.min_sequence is accurate.
-        entries.push_back({entry.sequence, entry.entry_type, entry_off,
-                           0, {}, {}});
-        continue;
-      }
-      entries.push_back(
-          {entry.sequence, entry.entry_type, entry_off,
-           narrow<std::uint32_t>(entry.value.size()), as_str(entry.key),
-           entry.entry_type == EntryType::RangeDel
-               ? as_str(entry.value)
-               : std::string{}});
+  for (const auto &[entry, entry_off] : scan_committed(*file)) {
+    if (entry.entry_type == EntryType::BulkBegin ||
+        entry.entry_type == EntryType::BulkEnd) {
+      hint.append(entry.sequence, entry.entry_type, entry_off, {}, 0);
+      continue;
     }
-  } catch (const std::exception &e) {
-    if (strict) throw;
-    std::cerr << "bytecask: truncated entry in " << file->path()
-              << " while generating hint file, recovering up to this point: "
-              << e.what() << "\n";
-  }
-
-  // Sort by key for prefix compression benefit in the hint file.
-  std::ranges::sort(entries, [](const auto &a, const auto &b) {
-    return a.key < b.key;
-  });
-
-  for (const auto &pe : entries) {
-    if (pe.type == EntryType::RangeDel) {
-      hint.append_range_del(pe.seq, pe.file_off, as_bytes(pe.key),
-                            as_bytes(pe.end_key));
+    if (entry.entry_type == EntryType::RangeDel) {
+      hint.append_range_del(entry.sequence, entry_off, entry.key,
+                            entry.value);
     } else {
-      hint.append(pe.seq, pe.type, pe.file_off, as_bytes(pe.key),
-                  pe.val_size);
+      hint.append(entry.sequence, entry.entry_type, entry_off, entry.key,
+                  narrow<std::uint32_t>(entry.value.size()));
     }
   }
-  hint.sync();
+
+  hint.close();
   std::filesystem::rename(tmp_path, hint_path);
 }
 
@@ -1860,7 +1814,7 @@ void DB::validate_state_consistency(const EngineState &s) const {
 // Phase 1 shared by serial and parallel recovery: remove stale .hint.tmp
 // files, open all data files, seal them, register in s.files, and
 // generate missing hint files. Returns the RecoveredFile list.
-auto DB::recovery_prepare_files(EngineState &s, bool strict)
+auto DB::recovery_prepare_files(EngineState &s)
     -> std::vector<RecoveredFile> {
   for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
     const auto &p = dir_entry.path();
@@ -1886,7 +1840,7 @@ auto DB::recovery_prepare_files(EngineState &s, bool strict)
 
     const auto hint_path = dir_ / (p.stem().string() + ".hint");
     if (!std::filesystem::exists(hint_path)) {
-      flush_hints_for(data_file, dir_, strict);
+      flush_hints_for(data_file, dir_);
     }
 
     files.push_back({file_id, std::move(data_file), hint_path,
@@ -2083,7 +2037,7 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 // then results are merged one-at-a-time into an accumulator as workers finish.
 auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
                                 bool strict) -> EngineState {
-  auto files = recovery_prepare_files(s, strict);
+  auto files = recovery_prepare_files(s);
 
   if (files.empty()) {
     return s;

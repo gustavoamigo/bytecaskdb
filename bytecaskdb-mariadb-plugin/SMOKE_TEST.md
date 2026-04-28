@@ -20,7 +20,7 @@ root access or system-level installation is needed.
 ## Quick start
 
 ```bash
-./mariadb/smoke_test.sh
+./bytecaskdb-mariadb-plugin/smoke_test.sh
 ```
 
 The script is self-contained.  It will:
@@ -37,7 +37,7 @@ Pass `--keep` to leave the local MariaDB running after the tests finish (useful
 for manual debugging):
 
 ```bash
-./mariadb/smoke_test.sh --keep
+./bytecaskdb-mariadb-plugin/smoke_test.sh --keep
 mariadb --socket=.mariadb_local/mysql.sock   # connect manually
 ```
 
@@ -57,7 +57,7 @@ The script avoids touching the system MariaDB.  Instead it starts a private
 | tmpdir        | `.mariadb_local/tmp`               |
 | log-error     | `.mariadb_local/error.log`         |
 | skip-grant-tables | yes (no authentication)        |
-| plugin-dir    | `mariadb/build`                    |
+| plugin-dir    | `bytecaskdb-mariadb-plugin/build`                    |
 
 The `.mariadb_local/` directory is git-ignored.
 
@@ -66,17 +66,17 @@ The `.mariadb_local/` directory is git-ignored.
 MariaDB's default configuration under `/etc/my.cnf.d/` may reference
 compression-provider plugins (`provider_bzip2`, `provider_lz4`, etc.).
 These are normally in `/usr/lib64/mariadb/plugin/`.  Because we override
-`--plugin-dir`, the script symlinks them into `mariadb/build/` so the server
+`--plugin-dir`, the script symlinks them into `bytecaskdb-mariadb-plugin/build/` so the server
 starts cleanly.
 
 ### Plugin build
 
 ```bash
-cmake -S mariadb -B mariadb/build -DBYTECASK_ROOT=$(pwd)
-cmake --build mariadb/build
+cmake -S bytecaskdb-mariadb-plugin -B bytecaskdb-mariadb-plugin/build -DBYTECASK_ROOT=$(pwd)
+cmake --build bytecaskdb-mariadb-plugin/build
 ```
 
-Produces `mariadb/build/ha_bytecaskdb.so` which links against `libbytecask.a`.
+Produces `bytecaskdb-mariadb-plugin/build/ha_bytecaskdb.so` which links against `libbytecask.a`.
 
 ### Test sequence
 
@@ -96,7 +96,7 @@ On exit the script drops the test database and uninstalls the plugin.
 - **MariaDB did not start within 15 s**: check `.mariadb_local/error.log`.
   Common cause: port 3307 already in use or a leftover `mariadbd` process.
   Kill it with `kill $(cat .mariadb_local/mariadbd.pid)`.
-- **Plugin not found**: verify `mariadb/build/ha_bytecaskdb.so` exists.
+- **Plugin not found**: verify `bytecaskdb-mariadb-plugin/build/ha_bytecaskdb.so` exists.
   Re-run `xmake build bytecask` then the smoke test.
 - **Write errors**: check the MariaDB error log for `[ha_bytecaskdb]` messages.
 - **Crash on load**: ensure `libbytecask.a` was built with `-fPIC`
@@ -109,12 +109,12 @@ If you prefer to run the steps by hand:
 ```bash
 # 1. Build
 xmake build bytecask
-cmake -S mariadb -B mariadb/build -DBYTECASK_ROOT=$(pwd)
-cmake --build mariadb/build
+cmake -S bytecaskdb-mariadb-plugin -B bytecaskdb-mariadb-plugin/build -DBYTECASK_ROOT=$(pwd)
+cmake --build bytecaskdb-mariadb-plugin/build
 
 # 2. Symlink provider plugins
 for f in /usr/lib64/mariadb/plugin/provider_*.so; do
-  ln -sf "$f" mariadb/build/
+  ln -sf "$f" bytecaskdb-mariadb-plugin/build/
 done
 
 # 3. Init data dir (first time only)
@@ -130,7 +130,7 @@ mariadbd \
   --pid-file=.mariadb_local/mariadbd.pid \
   --skip-grant-tables \
   --tmpdir=.mariadb_local/tmp \
-  --plugin-dir=$(pwd)/mariadb/build \
+  --plugin-dir=$(pwd)/bytecaskdb-mariadb-plugin/build \
   --log-error=.mariadb_local/error.log &
 
 # 5. Connect and test
