@@ -84,48 +84,47 @@ void gen_hint_entry_corpus(const std::filesystem::path &dir) {
   using bytecask::EntryType;
   std::filesystem::create_directories(dir);
 
-  // Hint serialize_entry: (sequence, entry_type, file_offset, value_size, prefix_len, suffix)
+  // Hint serialize_entry: (sequence, entry_type, file_offset, value_size, key)
 
-  // 1. Single entry (prefix_len=0)
+  // 1. Single entry
   write_file(dir / "single",
              bytecask::serialize_entry(1, EntryType::Put,
                                        uint64_t{0}, uint32_t{100},
-                                       uint8_t{0}, to_bytes("key1")));
+                                       to_bytes("key1")));
 
-  // 2. Two entries with shared prefix (exercises prefix compression)
+  // 2. Two entries with keys that share a prefix
   auto e1 = bytecask::serialize_entry(1, EntryType::Put,
                                        uint64_t{0}, uint32_t{100},
-                                       uint8_t{0}, to_bytes("user:alice"));
+                                       to_bytes("user:alice"));
   auto e2 = bytecask::serialize_entry(2, EntryType::Put,
                                        uint64_t{200}, uint32_t{50},
-                                       uint8_t{5}, to_bytes("bob"));
-  std::vector<std::byte> shared_prefix;
-  shared_prefix.insert(shared_prefix.end(), e1.begin(), e1.end());
-  shared_prefix.insert(shared_prefix.end(), e2.begin(), e2.end());
-  write_file(dir / "shared_prefix", shared_prefix);
+                                       to_bytes("user:bob"));
+  std::vector<std::byte> two_entries;
+  two_entries.insert(two_entries.end(), e1.begin(), e1.end());
+  two_entries.insert(two_entries.end(), e2.begin(), e2.end());
+  write_file(dir / "two_entries", two_entries);
 
-  // 3. Entry with longer suffix
-  write_file(dir / "long_suffix",
+  // 3. Entry with a longer key
+  write_file(dir / "long_key",
              bytecask::serialize_entry(3, EntryType::Put,
                                        uint64_t{500}, uint32_t{200},
-                                       uint8_t{0},
                                        to_bytes("a_relatively_longer_suffix_key")));
 
-  // 4. Multiple entries with varying prefix_len
+  // 4. Multiple entries with varying keys
   auto h1 = bytecask::serialize_entry(1, EntryType::Put,
                                        uint64_t{0}, uint32_t{10},
-                                       uint8_t{0}, to_bytes("stock:widget"));
+                                       to_bytes("stock:widget"));
   auto h2 = bytecask::serialize_entry(2, EntryType::Put,
                                        uint64_t{100}, uint32_t{20},
-                                       uint8_t{6}, to_bytes("gadget"));
+                                       to_bytes("stock:gadget"));
   auto h3 = bytecask::serialize_entry(3, EntryType::Delete,
                                        uint64_t{200}, uint32_t{0},
-                                       uint8_t{6}, to_bytes("gizmo"));
+                                       to_bytes("stock:gizmo"));
   std::vector<std::byte> multi;
   multi.insert(multi.end(), h1.begin(), h1.end());
   multi.insert(multi.end(), h2.begin(), h2.end());
   multi.insert(multi.end(), h3.begin(), h3.end());
-  write_file(dir / "multi_prefix", multi);
+  write_file(dir / "multi_entries", multi);
 }
 
 } // namespace

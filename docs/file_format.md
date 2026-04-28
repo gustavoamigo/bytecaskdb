@@ -163,16 +163,16 @@ enough metadata and the full key to reconstruct the in-memory key directory
 without reading value bytes. Only `Put` and `Delete` entries are written —
 `BulkBegin` and `BulkEnd` are never included.
 
-`flush_hints_for()` writes entries in **ascending key order** so that each entry
-can share a prefix with the previous key (prefix compression).
+Entries are written in data-file append order (the order they appear in the
+companion `.data` file). Keys are stored in full — no prefix compression.
 
 ### File Layout
 
 ```
  ┌──────────────────────────────────────────────────────┐
- │  Entry 0  (24-byte header + suffix_len bytes)        │
+ │  Entry 0  (23-byte header + key_len bytes)           │
  ├──────────────────────────────────────────────────────┤
- │  Entry 1  (24-byte header + suffix_len bytes)        │
+ │  Entry 1  (23-byte header + key_len bytes)           │
  ├──────────────────────────────────────────────────────┤
  │  ...                                                 │
  ├──────────────────────────────────────────────────────┤
@@ -195,15 +195,13 @@ The 4-byte trailer covers all entry bytes. It is verified eagerly by
  ├─────────────────────────────────────────────────────┤
  │  17 – 20  value_size   u32 LE   4 bytes             │
  ├─────────────────────────────────────────────────────┤
- │  21       prefix_len   u8       1 byte              │
- ├─────────────────────────────────────────────────────┤
- │  22 – 23  suffix_len   u16 LE   2 bytes             │
- ├─────────────────────────────────────────────────────┤  ← 24-byte fixed header
- │  24 – …   suffix data           suffix_len bytes    │
+ │  21 – 22  key_len      u16 LE   2 bytes             │
+ ├─────────────────────────────────────────────────────┤  ← 23-byte fixed header
+ │  23 – …   key data              key_len bytes       │
  └─────────────────────────────────────────────────────┘
 ```
 
-Total entry size: `24 + suffix_len` bytes.
+Total entry size: `23 + key_len` bytes.
 
 ### Header Fields
 
@@ -213,28 +211,7 @@ Total entry size: `24 + suffix_len` bytes.
 | 8      | 1    | `entry_type`  | u8     | `Put` (0x01), `Delete` (0x02), or `RangeDel` (0x05) |
 | 9      | 8    | `file_offset` | u64 LE | Byte offset of the entry in the companion `.data` file |
 | 17     | 4    | `value_size`  | u32 LE | Value length in bytes (0 for `Delete`) |
-| 21     | 1    | `prefix_len`  | u8     | Bytes shared with the previous entry's key (0 for the first entry; capped at 255) |
-| 22     | 2    | `suffix_len`  | u16 LE | Length of the suffix bytes that follow this header |
-
-### Key Reconstruction (Prefix Compression)
-
-The full key for entry N is:
-
-```
-key[N] = key[N-1][0 .. prefix_len) || suffix_data
-```
-
-For the first entry `prefix_len` is always 0, so `key[0] = suffix_data`.
-
-A reader must maintain a rolling key buffer (`key_buf`), resize to
-`prefix_len + suffix_len` bytes, and overwrite only the suffix portion:
-
-```
-key_buf.resize(prefix_len + suffix_len)
-key_buf[prefix_len .. prefix_len + suffix_len) = suffix_data
-```
-
-The `key_buf` contents are valid only until the next entry is read.
+| 21     | 2    | `key_len`     | u16 LE | Length of the key bytes that follow this header |
 
 ### File Trailer
 
@@ -249,26 +226,25 @@ discards the hint file and regenerates it from the raw data file during recovery
 
 | Constant          | Value | Meaning |
 |-------------------|-------|---------|
-| `kHintHeaderSize` | 24    | Fixed header fields per entry |
+| `kHintHeaderSize` | 23    | Fixed header fields per entry |
 | File trailer      | 4     | CRC-32C trailer (one per file, not per entry) |
 
 ### RangeDel Hint Entry Extension
 
 When `entry_type == RangeDel` (0x05), the hint entry appends the full end key
-after the start key suffix:
+after the start key:
 
 ```
- [normal hint header: 24 bytes]
- [start_key suffix:   suffix_len bytes]     ← prefix-compressed as usual
- [end_key_len:        u16 LE, 2 bytes]      ← stored in full, no prefix compression
+ [normal hint header: 23 bytes]
+ [start_key:          key_len bytes]
+ [end_key_len:        u16 LE, 2 bytes]
  [end_key:            end_key_len bytes]
 ```
 
 The `value_size` field in the hint header holds the end key length (same as in
-the data file). The end key is stored uncompressed because it bears no
-prefix relationship with the start key.
+the data file).
 
-Total RangeDel hint entry size: `24 + suffix_len + 2 + end_key_len` bytes.
+Total RangeDel hint entry size: `23 + key_len + 2 + end_key_len` bytes.
 
 ---
 

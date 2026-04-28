@@ -789,11 +789,8 @@ private:
 
   // Hint file management
   // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint exists.
-  // strict=true (default): throws on data-file CRC error. strict=false: stops
-  // at the first corrupt entry and writes a partial hint for the valid prefix.
   static void flush_hints_for(const std::shared_ptr<DataFile> &file,
-                               const std::filesystem::path &dir,
-                               bool strict = true);
+                               const std::filesystem::path &dir);
   // Writes hint files for all sealed files in s.
   void flush_hints(const EngineState &s);
   // Drains background hint tasks then writes all sealed hint files.
@@ -848,7 +845,7 @@ private:
 
   // Recovery
   // Phase 1: opens all data files, seals them, generates missing hint files.
-  auto recovery_prepare_files(EngineState &s, bool strict)
+  auto recovery_prepare_files(EngineState &s)
       -> std::vector<RecoveredFile>;
   // Builds a RecoveryResult from a set of hint files; no shared mutable state.
   static auto recovery_build_from_hints(std::span<RecoveredFile> files,
