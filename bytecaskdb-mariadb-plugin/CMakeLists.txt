@@ -212,6 +212,7 @@ FetchContent_MakeAvailable(Catch2)
 
 add_executable(mariadb_plugin_tests
   tests/mariadb_encoding_test.cpp
+  tests/mariadb_txn_simple_test.cpp
   catalog.cc
   key_encoding.cc
   row_encoding.cc
@@ -223,7 +224,10 @@ target_include_directories(mariadb_plugin_tests PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
-target_compile_options(mariadb_plugin_tests PRIVATE -Wall -Wextra)
+target_compile_options(mariadb_plugin_tests PRIVATE
+  -Wall -Wextra
+  -DBYTECASKDB_TESTS  # Enable test mode guards
+)
 
 target_link_libraries(mariadb_plugin_tests PRIVATE Catch2::Catch2WithMain)
 

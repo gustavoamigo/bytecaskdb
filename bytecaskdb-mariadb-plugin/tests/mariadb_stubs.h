@@ -39,6 +39,15 @@ struct TABLE {
   Field **field;
 };
 
+// Transaction-related stubs for MariaDBTxn tests
+struct THD {
+  int dummy = 0;
+};
+
+struct handlerton {
+  int dummy = 0;
+};
+
 // Stubs for key_copy / key_restore — these are MariaDB server functions.
 // The unit tests only exercise functions that don't call these, but the
 // linker needs symbols for the translation units that reference them.
