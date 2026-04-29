@@ -21,6 +21,7 @@ module;
 #include <optional>
 #include <span>
 #include <sys/uio.h>
+#include <sys/mman.h>
 #include <system_error>
 #include <unistd.h>
 #include <utility>
@@ -76,6 +77,9 @@ public:
   }
 
   ~DataFile() {
+    if (mmap_base_) {
+      ::munmap(mmap_base_, mmap_size_);
+    }
     if (fd_ != -1) {
       ::close(fd_);
     }
@@ -99,8 +103,11 @@ public:
   DataFile(DataFile &&other) noexcept
       : path_{std::move(other.path_)}, fd_{other.fd_}, offset_{other.offset_},
         preallocated_end_{other.preallocated_end_},
-        sealed_{other.sealed_}, tainted_{other.tainted_} {
+        sealed_{other.sealed_}, tainted_{other.tainted_},
+        mmap_base_{other.mmap_base_}, mmap_size_{other.mmap_size_} {
     other.fd_ = -1;
+    other.mmap_base_ = nullptr;
+    other.mmap_size_ = 0;
   }
 
   // Closes any fd we currently own before stealing 'other's resources.
@@ -111,6 +118,9 @@ public:
   //   b = std::move(a);              // close(6), b: fd=5, a: fd=-1
   DataFile &operator=(DataFile &&other) noexcept {
     if (this != &other) {
+      if (mmap_base_) {
+        ::munmap(mmap_base_, mmap_size_);
+      }
       if (fd_ != -1) {
         ::close(fd_);
       }
@@ -120,7 +130,11 @@ public:
       sealed_ = other.sealed_;
       tainted_ = other.tainted_;
       preallocated_end_ = other.preallocated_end_;
+      mmap_base_ = other.mmap_base_;
+      mmap_size_ = other.mmap_size_;
       other.fd_ = -1;
+      other.mmap_base_ = nullptr;
+      other.mmap_size_ = 0;
     }
     return *this;
   }
@@ -296,11 +310,16 @@ public:
                   std::uint32_t value_size,
                   std::vector<std::byte> &io_buf) const {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    io_buf.resize(total);
-    if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
-        narrow<ssize_t>(total)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "DataFile::read_entry: pread failed"};
+    if (mmap_base_) {
+      auto *base = mmap_base_ + offset;
+      io_buf.assign(base, base + total);
+    } else {
+      io_buf.resize(total);
+      if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
+          narrow<ssize_t>(total)) {
+        throw std::system_error{errno, std::generic_category(),
+                                "DataFile::read_entry: pread failed"};
+      }
     }
   }
 
@@ -312,7 +331,18 @@ public:
                   std::uint32_t value_size, bool verify,
                   std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const {
-    if (verify) {
+    if (mmap_base_) {
+      if (verify) {
+        const auto total = kHeaderSize + key_size + value_size + kCrcSize;
+        auto *base = mmap_base_ + offset;
+        io_buf.assign(base, base + total);
+        extract_value_into(io_buf, out, true);
+      } else {
+        const auto val_offset = offset + kHeaderSize + key_size;
+        auto *base = mmap_base_ + val_offset;
+        out.assign(base, base + value_size);
+      }
+    } else if (verify) {
       read_entry(offset, key_size, value_size, io_buf);
       extract_value_into(io_buf, out, true);
     } else {
@@ -344,7 +374,18 @@ public:
 
   // Marks the file as sealed: no further appends are permitted.
   // The fd remains open for reads. seal() is called by DB on rotation.
-  void seal() noexcept { sealed_ = true; }
+  void seal() noexcept {
+    sealed_ = true;
+    if (offset_ > 0) {
+      // NOLINTNEXTLINE(performance-no-int-to-ptr)
+      auto *ptr = ::mmap(nullptr, offset_, PROT_READ, MAP_PRIVATE, fd_, 0);
+      if (ptr != MAP_FAILED) {
+        mmap_base_ = static_cast<std::byte *>(ptr);
+        mmap_size_ = offset_;
+        ::madvise(mmap_base_, mmap_size_, MADV_RANDOM);
+      }
+    }
+  }
 
   [[nodiscard]] auto path() const -> const std::filesystem::path & {
     return path_;
@@ -377,6 +418,8 @@ private:
   // Fixed buffer holding the 15-byte header and 4-byte CRC for each append.
   // Avoids heap allocation on the hot write path.
   std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};
+  std::byte *mmap_base_{nullptr};
+  std::size_t mmap_size_{0};
 
   // Preallocates disk blocks up to write_end without changing the file's
   // logical size. Reduces filesystem extent-allocation overhead on the write
