@@ -119,11 +119,24 @@ void purge_jemalloc() {
   mallctl(buf, nullptr, nullptr, nullptr, 0);
 }
 
+auto measure_heap_allocated() -> std::size_t {
+  // Refresh stats before reading.
+  uint64_t epoch = 1;
+  std::size_t epoch_sz = sizeof(epoch);
+  mallctl("epoch", &epoch, &epoch_sz, &epoch, epoch_sz);
+
+  std::size_t allocated = 0;
+  std::size_t sz = sizeof(allocated);
+  mallctl("stats.allocated", &allocated, &sz, nullptr, 0);
+  return allocated;
+}
+
 void print_memory(const char *phase) {
-  //purge_jemalloc();
+  purge_jemalloc();
   struct rusage ru;
   getrusage(RUSAGE_SELF, &ru);
   std::printf("  [%s]\n", phase);
+  print_mib("Heap allocated:", measure_heap_allocated());
   print_mib("RSS:", measure_current_rss());
   print_mib("Peak RSS:", static_cast<std::size_t>(ru.ru_maxrss) * 1024);
 }
@@ -174,6 +187,9 @@ int main() {
       const char *cap_env = std::getenv("BC_UV_BUCKET_CAPACITY");
       if (cap_env && *cap_env)
         uv_opts.bucket_capacity = static_cast<std::uint32_t>(std::stoul(cap_env));
+      const char *sz_env = std::getenv("BC_UV_CAPACITY");
+      if (sz_env && *sz_env)
+        uv_opts.capacity = std::stoull(sz_env);
       unordered_view::UnorderedView view{db, "uv", uv_opts};
       for (std::size_t i = 0; i < n; ++i) {
         shape->make_key(i, n, key_buf);
@@ -218,8 +234,6 @@ int main() {
         (void)db.apply_batch(wo, std::move(plan));
       }
     }
-    //(void)db.vacuum();
-    (void)db.flush_hints();
 
     print_memory("after insert");
 

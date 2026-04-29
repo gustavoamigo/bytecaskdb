@@ -29,6 +29,7 @@ export import :internals;
 import bytecask.batch_iterator;
 import bytecask.concurrency;
 export import bytecask.counters;
+import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.radix_tree;
 export import bytecask.types;

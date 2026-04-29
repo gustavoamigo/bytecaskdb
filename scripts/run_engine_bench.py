@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """Build engine_bench in release mode, run it, and append results to
 benchmarks/engine_bench_results.csv for longitudinal performance tracking.
 

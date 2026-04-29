@@ -62,7 +62,7 @@ def parse_output(text: str) -> dict[str, int]:
 
 def run_profile(n: int, key_format: str = "prefixed", unordered_view: bool = False) -> dict[str, int]:
     bend_dir = str(REPO_ROOT / ".tmp")
-    env = {"BC_DATASET_SIZE": str(n), "BC_BENCH_DIR": bend_dir, "BC_KEY_FORMAT": key_format}
+    env = {"BC_DATASET_SIZE": str(n), "BC_UV_CAPACITY": str(n), "BC_BENCH_DIR": bend_dir, "BC_KEY_FORMAT": key_format}
     if unordered_view:
         env["BC_USE_UNORDERED_VIEW"] = "1"
     # Inherit PATH and other essentials
@@ -83,9 +83,9 @@ def run_profile(n: int, key_format: str = "prefixed", unordered_view: bool = Fal
 def print_summary(label: str, rows: list[tuple[int, int, int, float]], key_size: int, value_size: int) -> None:
     size_label = f"key_size={key_size}, value_size={value_size}" if key_size else f"value_size={value_size}"
     print(f"\n{'=' * 72}")
-    print(f"Summary — {label} (Peak RSS, {size_label})")
+    print(f"Summary — {label} (Heap allocated, {size_label})")
     print(f"{'=' * 72}")
-    print(f"{'Keys':>12}  {'Peak RSS':>12}  {'DB overhead':>12}  {'B/key':>8}  {'Overhead':>10}")
+    print(f"{'Keys':>12}  {'Heap':>12}  {'DB overhead':>12}  {'B/key':>8}  {'Overhead':>10}")
     print(f"{'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 8}  {'-' * 10}")
     for n, peak, db_bytes, per_key in rows:
         effective = per_key - key_size if key_size else per_key
@@ -109,8 +109,10 @@ def run_format(sizes: list[int], key_format: str, unordered_view: bool = False) 
         if measurements.get("meta/value_size"):
             value_size = measurements["meta/value_size"]
 
-        before = measurements.get("before open/RSS", 0)
-        after = measurements.get("after insert/RSS", 0)
+        before = measurements.get("before open/Heap allocated",
+                    measurements.get("before open/RSS", 0))
+        after = measurements.get("after insert/Heap allocated",
+                    measurements.get("after insert/RSS", 0))
         db_bytes = after - before
         per_key = db_bytes / n if n > 0 else 0
         rows.append((n, after, db_bytes, per_key))

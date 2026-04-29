@@ -403,7 +403,8 @@ struct BcUnorderedViewAdapter {
     Db(std::string_view tag, const std::vector<std::string> *populate_keys,
        const std::vector<std::byte> *populate_val)
         : dir{tag}, engine{bytecask::DB::open(dir.path)},
-          view{std::make_unique<unordered_view::UnorderedView>(engine, "uv")} {
+          view{std::make_unique<unordered_view::UnorderedView>(engine, "uv",
+               unordered_view::Options{.capacity = kDatasetSize})} {
       if (populate_keys && populate_val) {
         auto val_view = bytecask::BytesView{populate_val->data(),
                                             populate_val->size()};
@@ -1366,7 +1367,7 @@ using RdbUuid = RdbUuidAdapter;
 
 // -- Single Threaded Tests ---
 // --- ByteCaskDB ---
-BENCH(BM_Put<Bc, false>)          ->Name("ByteCaskDB/Put/NoSync");
+BENCH(BM_Put<Bc, false>)          ->Name("ByteCaskDB/Put/NoSync")->Iterations(kDatasetSize);
 BENCH(BM_Put<Bc, true>)           ->Name("ByteCaskDB/Put/Sync");
 BENCH(BM_Del<Bc, true>)           ->Name("ByteCaskDB/Del/Sync");
 BENCH(BM_Get<Bc>)                 ->Name("ByteCaskDB/Get");
@@ -1374,7 +1375,7 @@ BENCH(BM_Range<Bc, kRangeLen>)    ->Name("ByteCaskDB/Range50");
 BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCaskDB/MixedBatch/Sync");
 
 // --- UnorderedView ---
-BENCH(BM_Put<BcUV, false>)          ->Name("ByteCaskDB_UnorderedView/Put/NoSync");
+BENCH(BM_Put<BcUV, false>)          ->Name("ByteCaskDB_UnorderedView/Put/NoSync")->Iterations(kDatasetSize);
 BENCH(BM_Get<BcUV>)                 ->Name("ByteCaskDB_UnorderedView/Get");
 
 // --- RocksDB with UUIDv4 keys (apples-to-apples with UnorderedView) ---
@@ -1402,7 +1403,7 @@ BENCH(BM_Get<BcUuid>)               ->Name("ByteCaskDB_UUIDv4/Get");
 
 // --- RocksDB ---
 #ifndef BENCH_NO_ROCKSDB
-BENCH(BM_Put<Rdb, false>)          ->Name("RocksDB/Put/NoSync");
+BENCH(BM_Put<Rdb, false>)          ->Name("RocksDB/Put/NoSync")->Iterations(kDatasetSize);
 BENCH(BM_Put<Rdb, true>)           ->Name("RocksDB/Put/Sync");
 BENCH(BM_Del<Rdb, true>)           ->Name("RocksDB/Del/Sync");
 BENCH(BM_Get<Rdb>)                 ->Name("RocksDB/Get");

@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -83,8 +84,10 @@ public:
     auto m = static_cast<std::size_t>(
         std::ceil(-(static_cast<double>(expected_items) * std::log(fp_rate)) /
                   (std::log(2.0) * std::log(2.0))));
-    // Round up to multiple of 8.
+    // Round up to multiple of 8, cap at 3 MiB to stay within DB value limits.
     m = (m + 7) & ~std::size_t{7};
+    static constexpr std::size_t kMaxBits = 3 * 1024 * 1024 * 8;
+    if (m > kMaxBits) m = kMaxBits;
     auto k = static_cast<std::uint32_t>(std::round(
         (static_cast<double>(m) / static_cast<double>(expected_items)) *
         std::log(2.0)));
@@ -168,10 +171,11 @@ private:
 // ---------------------------------------------------------------------------
 
 struct Options {
-  std::uint32_t initial_size = 8;     // power of 2
+  std::uint32_t initial_size = 8;      // power of 2 (overridden when capacity > 0)
   std::uint32_t bucket_capacity = 64;  // entries per bucket before split
   float load_factor = 0.75f;
-  double bloom_fp_rate = 0.01;          // false-positive rate for collision filter
+  double bloom_fp_rate = 0.01;         // false-positive rate for collision filter
+  std::uint64_t capacity = 0;         // expected key count; 0 = no pre-sizing
 };
 
 // ---------------------------------------------------------------------------
@@ -333,7 +337,18 @@ class UnorderedView {
 public:
   UnorderedView(bytecask::DB &db, std::string ns, Options opts = {})
       : db_{db}, ns_{std::move(ns)}, opts_{opts},
-        initial_size_{opts_.initial_size}, split_pointer_{0}, round_{0},
+        initial_size_{[&] {
+          if (opts_.capacity > 0) {
+            auto needed = static_cast<double>(opts_.capacity) /
+                          (static_cast<double>(opts_.bucket_capacity) *
+                           static_cast<double>(opts_.load_factor));
+            return std::max(std::uint32_t{1},
+                static_cast<std::uint32_t>(std::bit_ceil(
+                    static_cast<std::size_t>(std::ceil(needed)))));
+          }
+          return opts_.initial_size;
+        }()},
+        split_pointer_{0}, round_{0},
         version_{0}, entry_count_{0} {
     meta_key_ = ns_ + "/__meta__";
     bucket_prefix_ = ns_ + "/b/";
@@ -356,8 +371,19 @@ public:
       collision_filter_ =
           HasCollisionBloomFilter::from_bytes(bytecask::BytesView{bloom_buf});
     } else {
+      // The bloom tracks collision slots (slots with >1 key sharing a bucket+fp16).
+      // Expected collisions ≈ N² / (2 * num_buckets * 65536) — much smaller than N.
+      // Size for 10x the expected collision count with a floor of 1024.
+      auto total_keys = opts_.capacity > 0
+          ? opts_.capacity
+          : static_cast<std::uint64_t>(initial_size_) * opts_.bucket_capacity;
+      auto num_buckets = static_cast<std::uint64_t>(initial_size_);
+      auto expected_collisions = (total_keys * total_keys) /
+                                 (2 * num_buckets * 65536);
+      auto bloom_size = std::max(std::uint64_t{1024},
+                                 expected_collisions * 10);
       collision_filter_ = HasCollisionBloomFilter::create(
-          static_cast<std::size_t>(initial_size_) * opts_.bucket_capacity,
+          static_cast<std::size_t>(bloom_size),
           opts_.bloom_fp_rate);
       auto bloom_bytes = collision_filter_.to_bytes();
       db_.put({.sync = false}, to_bv(bloom_key_),
