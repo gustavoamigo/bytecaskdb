@@ -21,6 +21,7 @@ module;
 #include <optional>
 #include <span>
 #include <sys/uio.h>
+#include <sys/mman.h>
 #include <system_error>
 #include <unistd.h>
 #include <utility>
@@ -76,6 +77,9 @@ public:
   }
 
   ~DataFile() {
+    if (mmap_base_) {
+      ::munmap(mmap_base_, mmap_size_);
+    }
     if (fd_ != -1) {
       ::close(fd_);
     }
@@ -99,8 +103,11 @@ public:
   DataFile(DataFile &&other) noexcept
       : path_{std::move(other.path_)}, fd_{other.fd_}, offset_{other.offset_},
         preallocated_end_{other.preallocated_end_},
-        sealed_{other.sealed_}, tainted_{other.tainted_} {
+        sealed_{other.sealed_}, tainted_{other.tainted_},
+        mmap_base_{other.mmap_base_}, mmap_size_{other.mmap_size_} {
     other.fd_ = -1;
+    other.mmap_base_ = nullptr;
+    other.mmap_size_ = 0;
   }
 
   // Closes any fd we currently own before stealing 'other's resources.
@@ -111,6 +118,9 @@ public:
   //   b = std::move(a);              // close(6), b: fd=5, a: fd=-1
   DataFile &operator=(DataFile &&other) noexcept {
     if (this != &other) {
+      if (mmap_base_) {
+        ::munmap(mmap_base_, mmap_size_);
+      }
       if (fd_ != -1) {
         ::close(fd_);
       }
@@ -120,7 +130,11 @@ public:
       sealed_ = other.sealed_;
       tainted_ = other.tainted_;
       preallocated_end_ = other.preallocated_end_;
+      mmap_base_ = other.mmap_base_;
+      mmap_size_ = other.mmap_size_;
       other.fd_ = -1;
+      other.mmap_base_ = nullptr;
+      other.mmap_size_ = 0;
     }
     return *this;
   }
@@ -269,61 +283,30 @@ public:
     if (offset >= offset_) {
       return std::nullopt;
     }
-
-    // Read the fixed header to determine variable-length field sizes.
-    std::array<std::byte, kHeaderSize> hdr{};
-    if (::pread(fd_, hdr.data(), kHeaderSize, narrow<off_t>(offset)) !=
-        std::ssize(hdr)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "DataFile::scan: pread header failed"};
-    }
-
-    const auto header = read_header(std::span{hdr});
+    const auto header = read_header(offset);
     std::vector<std::byte> buf;
-    read_entry(offset, header.key_size, header.value_size, buf);
-    auto entry = deserialize_entry(buf);
+    auto view = read_entry(offset, header.key_size, header.value_size, buf);
     const auto next =
         offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
-    return std::make_pair(std::move(entry), next);
+    return std::make_pair(
+        DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
+                  .key = {view.key.begin(), view.key.end()},
+                  .value = {view.value.begin(), view.value.end()}},
+        next);
   }
 
-  // Preads the full entry at offset into io_buf (reusing existing capacity).
-  // The caller supplies key_size and value_size (known from KeyDirEntry or
-  // a prior header parse). After this call, io_buf contains a complete
-  // entry that can be passed to deserialize_entry() or extract_value_into()
-  // depending on what the caller needs.
-  void read_entry(Offset offset, std::uint16_t key_size,
-                  std::uint32_t value_size,
-                  std::vector<std::byte> &io_buf) const {
-    const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    io_buf.resize(total);
-    if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
-        narrow<ssize_t>(total)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "DataFile::read_entry: pread failed"};
-    }
-  }
-
-  // High-level read: extracts only the value into out.
-  // When verify is true, preads the full entry and validates the CRC32
-  // checksum. When false, preads only the value bytes — skipping header,
-  // key, and CRC — for minimum I/O.
+  // High-level read: extracts the value at offset into out.
+  // When verify is true, reads the full entry and validates the CRC32 checksum.
+  // When false, reads only the value bytes for minimum I/O.
   void read_value(Offset offset, std::uint16_t key_size,
                   std::uint32_t value_size, bool verify,
                   std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const {
     if (verify) {
-      read_entry(offset, key_size, value_size, io_buf);
-      extract_value_into(io_buf, out, true);
+      auto view = read_entry(offset, key_size, value_size, io_buf);
+      out.assign(view.value.begin(), view.value.end());
     } else {
-      const auto val_offset = offset + kHeaderSize + key_size;
-      out.resize(value_size);
-      if (::pread(fd_, out.data(), value_size,
-                  narrow<off_t>(val_offset)) !=
-          narrow<ssize_t>(value_size)) {
-        throw std::system_error{errno, std::generic_category(),
-                                "DataFile::read_value: pread failed"};
-      }
+      read_value_unverified(offset, key_size, value_size, out);
     }
   }
 
@@ -344,7 +327,20 @@ public:
 
   // Marks the file as sealed: no further appends are permitted.
   // The fd remains open for reads. seal() is called by DB on rotation.
-  void seal() noexcept { sealed_ = true; }
+  void seal() noexcept {
+    sealed_ = true;
+#ifndef __EMSCRIPTEN__
+    if (offset_ > 0) {
+      // NOLINTNEXTLINE(performance-no-int-to-ptr)
+      auto *ptr = ::mmap(nullptr, offset_, PROT_READ, MAP_PRIVATE, fd_, 0);
+      if (ptr != MAP_FAILED) {
+        mmap_base_ = static_cast<std::byte *>(ptr);
+        mmap_size_ = offset_;
+        ::madvise(mmap_base_, mmap_size_, MADV_RANDOM);
+      }
+    }
+#endif
+  }
 
   [[nodiscard]] auto path() const -> const std::filesystem::path & {
     return path_;
@@ -356,8 +352,10 @@ public:
   [[nodiscard]] auto is_tainted() const noexcept -> bool { return tainted_; }
 
   // Truncates the file to new_size bytes and resets offset_ accordingly.
-  // Clears tainted_. Throws std::system_error on failure.
+  // Clears tainted_. Only valid on unsealed (active) files — a mapped file
+  // must never be truncated. Throws std::system_error on failure.
   void truncate(Offset new_size) {
+    assert(!mmap_base_);
     if (::ftruncate(fd_, narrow<off_t>(new_size)) != 0) {
       throw std::system_error{errno, std::system_category(),
                               "DataFile::truncate"};
@@ -377,6 +375,73 @@ private:
   // Fixed buffer holding the 15-byte header and 4-byte CRC for each append.
   // Avoids heap allocation on the hot write path.
   std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};
+  std::byte *mmap_base_{nullptr};
+  std::size_t mmap_size_{0};
+
+  // Reads the fixed header at offset via mmap or pread.
+  [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
+    if (mmap_base_) {
+      assert(offset + kHeaderSize <= mmap_size_);
+      return bytecask::read_header(std::span{mmap_base_ + offset, kHeaderSize});
+    }
+    std::array<std::byte, kHeaderSize> hdr{};
+    if (::pread(fd_, hdr.data(), kHeaderSize, narrow<off_t>(offset)) !=
+        std::ssize(hdr)) {
+      throw std::system_error{errno, std::generic_category(),
+                              "DataFile::read_header: pread failed"};
+    }
+    return bytecask::read_header(std::span{hdr});
+  }
+
+  // Reads the full entry at offset, verifies CRC, returns non-owning view.
+  // When mmap is active, spans point into mapped memory (io_buf unused).
+  // Otherwise, reads into io_buf and spans point into it.
+  [[nodiscard]] auto read_entry(Offset offset, std::uint16_t key_size,
+                                std::uint32_t value_size,
+                                std::vector<std::byte>& io_buf) const
+      -> DataEntryView {
+    const auto total = kHeaderSize + key_size + value_size + kCrcSize;
+    std::span<const std::byte> raw;
+    if (mmap_base_) {
+      assert(offset + total <= mmap_size_);
+      raw = {mmap_base_ + offset, total};
+    } else {
+      io_buf.resize(total);
+      if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
+          narrow<ssize_t>(total)) {
+        throw std::system_error{errno, std::generic_category(),
+                                "DataFile::read_entry: pread failed"};
+      }
+      raw = io_buf;
+    }
+    const auto header = parse_header_and_verify(raw);
+    auto body = raw.subspan(kHeaderSize);
+    return DataEntryView{
+        .sequence = header.sequence,
+        .entry_type = header.entry_type,
+        .key = body.subspan(0, key_size),
+        .value = body.subspan(key_size, value_size),
+    };
+  }
+
+  // Reads only the value bytes — minimum I/O, no CRC check.
+  void read_value_unverified(Offset offset, std::uint16_t key_size,
+                             std::uint32_t value_size,
+                             std::vector<std::byte>& out) const {
+    const auto val_offset = offset + kHeaderSize + key_size;
+    if (mmap_base_) {
+      assert(val_offset + value_size <= mmap_size_);
+      auto* base = mmap_base_ + val_offset;
+      out.assign(base, base + value_size);
+    } else {
+      out.resize(value_size);
+      if (::pread(fd_, out.data(), value_size,
+                  narrow<off_t>(val_offset)) != narrow<ssize_t>(value_size)) {
+        throw std::system_error{errno, std::generic_category(),
+                                "DataFile::read_value: pread failed"};
+      }
+    }
+  }
 
   // Preallocates disk blocks up to write_end without changing the file's
   // logical size. Reduces filesystem extent-allocation overhead on the write
