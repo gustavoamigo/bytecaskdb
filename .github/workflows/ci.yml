@@ -30,7 +30,7 @@ jobs:
           dnf module enable -y llvm-toolset:rhel8
           dnf install -y \
             clang clang-tools-extra llvm llvm-devel lld \
-            make ninja-build git
+            make ninja-build git python3-pip python3-devel
 
       - name: Install xmake
         run: |
@@ -38,7 +38,7 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Install nanobind
-        run: pip install nanobind
+        run: pip3 install nanobind
 
       - name: Configure xmake
         run: |
@@ -93,7 +93,7 @@ jobs:
           dnf module enable -y llvm-toolset:rhel8
           dnf install -y \
             clang clang-tools-extra llvm llvm-devel lld \
-            make ninja-build git
+            make ninja-build git python3-pip python3-devel
 
       - name: Install xmake
         run: |
@@ -101,7 +101,7 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Install nanobind
-        run: pip install nanobind
+        run: pip3 install nanobind
 
       - name: Configure xmake
         run: |
@@ -150,7 +150,7 @@ jobs:
           dnf module enable -y llvm-toolset:rhel8
           dnf install -y \
             clang clang-tools-extra llvm llvm-devel lld \
-            make ninja-build git
+            make ninja-build git python3-pip python3-devel
 
       - name: Install xmake
         run: |
@@ -158,7 +158,7 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Install nanobind
-        run: pip install nanobind
+        run: pip3 install nanobind
 
       - name: Configure xmake
         run: |
