@@ -3,7 +3,7 @@
 //
 // ByteCaskDB — unit tests for DataFile writev failure handling.
 // Any writev failure (partial write, full write + error, writev = -1)
-// marks the file as tainted. No in-flight recovery is attempted.
+// throws std::system_error. No in-flight recovery is attempted.
 
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
@@ -30,7 +30,7 @@ auto to_bytes(std::string_view sv) -> std::span<const std::byte> {
 
 } // namespace
 
-TEST_CASE("DataFile::append: B3 full write + error return — file is tainted",
+TEST_CASE("DataFile::append: B3 full write + error return — file throws",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_b3_tainted.data";
@@ -48,15 +48,14 @@ TEST_CASE("DataFile::append: B3 full write + error return — file is tainted",
                       std::system_error);
   }
 
-  // Full entry on disk but writev reported an error — file must be tainted.
+  // Full entry on disk but writev reported an error — append threw.
   // No silent recovery is attempted; the engine degrades and resume() handles it.
-  CHECK(file.is_tainted());
   CHECK(file.size() == 0); // offset_ not advanced — append threw before updating it
 
   std::filesystem::remove(path);
 }
 
-TEST_CASE("DataFile::append: B2 partial write — file is tainted",
+TEST_CASE("DataFile::append: B2 partial write — file throws",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_b2_tainted.data";
@@ -74,7 +73,6 @@ TEST_CASE("DataFile::append: B2 partial write — file is tainted",
                       std::system_error);
   }
 
-  CHECK(file.is_tainted());
   CHECK(file.size() == 0);
 
   std::filesystem::remove(path);
