@@ -1,0 +1,187 @@
+# SPDX-License-Identifier: MIT
+# Main CI pipeline: build, test, sanitizers, and fuzz testing (Linux only).
+# macOS coverage is handled by build-wheels.yml.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build and run all test targets
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM toolchain
+        run: |
+          dnf module enable -y llvm-toolset:rhel8
+          dnf install -y \
+            clang clang-tools-extra llvm llvm-devel lld \
+            make ninja-build git
+
+      - name: Install xmake
+        run: |
+          curl -fsSL https://xmake.io/shget.text | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Configure xmake
+        run: |
+          source ~/.xmake/profile
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=llvm \
+            --sdk=/usr/lib64/llvm20 \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            -y
+
+      - name: Build all test targets
+        run: |
+          source ~/.xmake/profile
+          xmake build bytecask_tests
+          xmake build radix_tree_memory_tests
+          xmake build unordered_view_tests
+
+      - name: Run bytecask_tests
+        run: |
+          source ~/.xmake/profile
+          xmake run bytecask_tests
+
+      - name: Run radix_tree_memory_tests
+        run: |
+          source ~/.xmake/profile
+          xmake run radix_tree_memory_tests
+
+      - name: Run unordered_view_tests
+        run: |
+          source ~/.xmake/profile
+          xmake run unordered_view_tests
+
+  # ---------------------------------------------------------------------------
+  # Sanitizer checks (ASan / TSan)
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM toolchain
+        run: |
+          dnf module enable -y llvm-toolset:rhel8
+          dnf install -y \
+            clang clang-tools-extra llvm llvm-devel lld \
+            make ninja-build git
+
+      - name: Install xmake
+        run: |
+          curl -fsSL https://xmake.io/shget.text | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Configure xmake
+        run: |
+          source ~/.xmake/profile
+          export CLANG_TARGET_TRIPLE=$(clang --print-target-triple)
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=llvm \
+            --sdk=/usr/lib64/llvm20 \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            --sanitizer=${{ matrix.sanitizer }} \
+            -m debug -y
+
+      - name: Build
+        run: |
+          source ~/.xmake/profile
+          export CLANG_TARGET_TRIPLE=$(clang --print-target-triple)
+          xmake build bytecask_tests
+
+      - name: Run tests under ${{ matrix.sanitizer }} sanitizer
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'halt_on_error=0 detect_leaks=1' || '' }}
+          TSAN_OPTIONS: ${{ matrix.sanitizer == 'thread' && 'halt_on_error=0 history_size=4' || '' }}
+        run: |
+          source ~/.xmake/profile
+          xmake run bytecask_tests
+
+  # ---------------------------------------------------------------------------
+  # Fuzz testing (libFuzzer + ASan, 60s per target)
+  # ---------------------------------------------------------------------------
+  fuzz:
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_data_entry, fuzz_hint_entry]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM toolchain
+        run: |
+          dnf module enable -y llvm-toolset:rhel8
+          dnf install -y \
+            clang clang-tools-extra llvm llvm-devel lld \
+            make ninja-build git
+
+      - name: Install xmake
+        run: |
+          curl -fsSL https://xmake.io/shget.text | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Configure xmake
+        run: |
+          source ~/.xmake/profile
+          export CLANG_TARGET_TRIPLE=$(clang --print-target-triple)
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=llvm \
+            --sdk=/usr/lib64/llvm20 \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            --sanitizer=fuzzer,address \
+            -m debug -y
+
+      - name: Generate seed corpus
+        run: |
+          source ~/.xmake/profile
+          export CLANG_TARGET_TRIPLE=$(clang --print-target-triple)
+          xmake build gen_fuzz_corpus
+          xmake run gen_fuzz_corpus
+
+      - name: Build fuzz target
+        run: |
+          source ~/.xmake/profile
+          export CLANG_TARGET_TRIPLE=$(clang --print-target-triple)
+          xmake build ${{ matrix.target }}
+
+      - name: Run ${{ matrix.target }} (60s)
+        run: |
+          source ~/.xmake/profile
+          TARGET=${{ matrix.target }}
+          NAME="${TARGET#fuzz_}"
+          CORPUS="tests/fuzz/corpus/$NAME/"
+          SEED="tests/fuzz/seed/$NAME/"
+          mkdir -p "$CORPUS"
+          BIN="build/linux/x86_64/debug/$TARGET"
+          "$BIN" "$CORPUS" "$SEED" -max_total_time=60 -max_len=65536
