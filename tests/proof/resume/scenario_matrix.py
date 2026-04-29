@@ -54,6 +54,15 @@ def is_valid_combination(
     # vacuously. Only degrade_C (orphaned BulkBegin) triggers truncation.
     if failure == ResumeFailureClass.R1 and degrade.degrade_via != DegradeVia.C:
         return False
+    # R2 (sync) and CASCADE (R2→R3) require the file to NOT be sealed so
+    # that resume() enters the truncate/sync/seal block. degrade_H seals
+    # the file during rotation before the fault fires, so resume() skips
+    # that block entirely — the sync fault point is unreachable.
+    if degrade.degrade_via == DegradeVia.H and failure in (
+        ResumeFailureClass.R2,
+        ResumeFailureClass.CASCADE,
+    ):
+        return False
     return True
 
 

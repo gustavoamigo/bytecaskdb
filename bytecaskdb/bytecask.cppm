@@ -2691,23 +2691,28 @@ void DB::resume() {
     // Stop at first CRC error — valid_offset is the last known-good position.
   }
 
-  // Remove garbage bytes / orphaned batch markers via truncation.
-  if (file.size() != valid_offset) {
+  // If the file is already sealed, the failure occurred after rotation
+  // (e.g. creating the new active file). Skip truncate/sync/seal.
+  if (!file.is_sealed()) {
+    // Remove garbage bytes / orphaned batch markers via truncation.
+    if (file.size() != valid_offset) {
 #ifdef BYTECASK_TESTING
-    FAULT_INJECTION(io_resume_truncate);
+      FAULT_INJECTION(io_resume_truncate);
 #endif
-    file.truncate(valid_offset);  // throws std::system_error → stays degraded
+      file.truncate(valid_offset);  // throws std::system_error → stays degraded
+    }
+
+    // Sync the truncated file (may throw → stays degraded).
+#ifdef BYTECASK_TESTING
+    FAULT_INJECTION(io_resume_sync);
+#endif
+    file.sync();
+
+    file.seal();
   }
 
-  // Sync the truncated file (may throw → stays degraded).
-#ifdef BYTECASK_TESTING
-  FAULT_INJECTION(io_resume_sync);
-#endif
-  file.sync();
-
-  // Seal and dispatch hint generation. Both are idempotent: seal() is a flag
-  // set, and flush_hints_for skips files whose .hint already exists.
-  file.seal();
+  // Dispatch hint generation — idempotent (flush_hints_for skips files
+  // whose .hint already exists).
   worker_.dispatch([f = *current->files.get(old_file_id), d = dir_] {
     flush_hints_for(f, d);
   });
@@ -2868,7 +2873,7 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
   std::uint64_t max_seq = 0;
   for (auto it = new_state->key_dir.begin(); it != std::default_sentinel; ++it) {
     auto [key_span, entry] = *it;
-    if (entry.sequence > max_seq) max_seq = entry.sequence;
+    if (entry.sequence() > max_seq) max_seq = entry.sequence();
   }
   if (max_seq > 0 && new_state->next_seq <= max_seq) {
     deem_as_degraded(std::format(

@@ -5,6 +5,7 @@
 
 module;
 #include <array>
+#include <atomic>
 #include <cassert>
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
@@ -22,6 +23,7 @@ module;
 #include <span>
 #include <sys/uio.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
 #include <utility>
@@ -103,7 +105,7 @@ public:
   DataFile(DataFile &&other) noexcept
       : path_{std::move(other.path_)}, fd_{other.fd_}, offset_{other.offset_},
         preallocated_end_{other.preallocated_end_},
-        sealed_{other.sealed_}, tainted_{other.tainted_},
+        sealed_{other.sealed_.load(std::memory_order_relaxed)},
         mmap_base_{other.mmap_base_}, mmap_size_{other.mmap_size_} {
     other.fd_ = -1;
     other.mmap_base_ = nullptr;
@@ -127,8 +129,8 @@ public:
       path_ = std::move(other.path_);
       fd_ = other.fd_;
       offset_ = other.offset_;
-      sealed_ = other.sealed_;
-      tainted_ = other.tainted_;
+      sealed_.store(other.sealed_.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
       preallocated_end_ = other.preallocated_end_;
       mmap_base_ = other.mmap_base_;
       mmap_size_ = other.mmap_size_;
@@ -149,7 +151,7 @@ public:
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_data_file_append);
 #endif
-    assert(!sealed_);
+    assert(!sealed_.load(std::memory_order_relaxed));
     const auto entry_offset = offset_;
 
     write_header_and_crc(hdr_crc_buf_, sequence, entry_type, key, value);
@@ -167,19 +169,15 @@ public:
 #ifdef BYTECASK_TESTING
     // Post-write injection simulates partial or full writes followed by
     // failure. In both cases, bytes are on disk that offset_ will not
-    // account for — the file is tainted before the checkpoint throws.
-    tainted_ = true;
+    // account for — the file enters an indeterminate state.
     FAULT_INJECTION_POST_WRITE(io_data_file_append_partial,
                                fd_, entry_offset, total);
-    tainted_ = false;
 #endif
     if (written != narrow<ssize_t>(total)) {
       // Any writev failure — whether the call returned -1 (possibly with
       // bytes in the page cache on FUSE/network filesystems) or a short
-      // write — leaves the file in an indeterminate state. Always mark
-      // tainted so the caller degrades rather than attempting in-flight
-      // recovery. resume() will restore a consistent state.
-      tainted_ = true;
+      // write — leaves the file in an indeterminate state. The caller
+      // degrades; resume() will restore a consistent state.
       throw std::system_error{errno, std::generic_category(),
                               "DataFile::append: writev failed"};
     }
@@ -191,12 +189,12 @@ public:
   // Batch-appends multiple entries in as few writev() calls as possible.
   // Each chunk of up to kMaxEntriesPerWritev entries is written with a single
   // writev(). Offsets are written into offsets_out (must be same size as
-  // entries). Failure semantics identical to append_entry: tainted + throw.
+  // entries). Failure semantics identical to append_entry: throw on writev failure.
   void append_entries(std::span<const DataEntryView> entries,
                       std::span<Offset> offsets_out) {
     assert(entries.size() == offsets_out.size());
     if (entries.empty()) return;
-    assert(!sealed_);
+    assert(!sealed_.load(std::memory_order_relaxed));
 
     static constexpr std::size_t kIovecsPerEntry = 4;
 #ifdef BYTECASK_TESTING
@@ -259,13 +257,10 @@ public:
           ::writev(fd_, iov.data(), narrow<int>(chunk_size * kIovecsPerEntry));
 
 #ifdef BYTECASK_TESTING
-      tainted_ = true;
       FAULT_INJECTION_POST_WRITE(io_data_file_append_partial,
                                  fd_, offset_, total_bytes);
-      tainted_ = false;
 #endif
       if (written != narrow<ssize_t>(total_bytes)) {
-        tainted_ = true;
         throw std::system_error{errno, std::generic_category(),
                                 "DataFile::append_entries: writev failed"};
       }
@@ -328,31 +323,34 @@ public:
   // Marks the file as sealed: no further appends are permitted.
   // The fd remains open for reads. seal() is called by DB on rotation.
   void seal() noexcept {
-    sealed_ = true;
+    assert(!sealed_.load(std::memory_order_relaxed));
 #ifndef __EMSCRIPTEN__
-    if (offset_ > 0) {
+    struct stat st{};
+    if (::fstat(fd_, &st) == 0 && st.st_size > 0) {
       // NOLINTNEXTLINE(performance-no-int-to-ptr)
-      auto *ptr = ::mmap(nullptr, offset_, PROT_READ, MAP_PRIVATE, fd_, 0);
+      auto *ptr = ::mmap(nullptr, static_cast<std::size_t>(st.st_size),
+                         PROT_READ, MAP_PRIVATE, fd_, 0);
       if (ptr != MAP_FAILED) {
         mmap_base_ = static_cast<std::byte *>(ptr);
-        mmap_size_ = offset_;
+        mmap_size_ = static_cast<std::size_t>(st.st_size);
         ::madvise(mmap_base_, mmap_size_, MADV_RANDOM);
       }
     }
 #endif
+    // Publish gate: all mmap setup is visible before sealed_ becomes true.
+    sealed_.store(true, std::memory_order_release);
   }
 
   [[nodiscard]] auto path() const -> const std::filesystem::path & {
     return path_;
   }
 
-  // Returns true if any writev failure has been detected on this file.
-  // A tainted file has bytes on disk that offset_ does not account for —
-  // subsequent writes would land at incorrect offsets.
-  [[nodiscard]] auto is_tainted() const noexcept -> bool { return tainted_; }
+  [[nodiscard]] auto is_sealed() const noexcept -> bool {
+    return sealed_.load(std::memory_order_relaxed);
+  }
 
   // Truncates the file to new_size bytes and resets offset_ accordingly.
-  // Clears tainted_. Only valid on unsealed (active) files — a mapped file
+  // Only valid on unsealed (active) files — a mapped file
   // must never be truncated. Throws std::system_error on failure.
   void truncate(Offset new_size) {
     assert(!mmap_base_);
@@ -362,7 +360,6 @@ public:
     }
     offset_ = new_size;
     preallocated_end_ = new_size;
-    tainted_ = false;
   }
 
 private:
@@ -370,17 +367,24 @@ private:
   int fd_{-1};
   Offset offset_{0};
   Offset preallocated_end_{0};
-  bool sealed_{false};
-  bool tainted_{false};
+  std::atomic<bool> sealed_{false};
   // Fixed buffer holding the 15-byte header and 4-byte CRC for each append.
   // Avoids heap allocation on the hot write path.
   std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};
   std::byte *mmap_base_{nullptr};
   std::size_t mmap_size_{0};
 
+  // Returns true when the mmap is fully set up and safe to read from.
+  // Acts as a publish gate: sealed_ is stored with release in seal(), after
+  // mmap setup. The acquire load here synchronizes-with that store,
+  // guaranteeing mmap_base_/mmap_size_ are visible.
+  [[nodiscard]] auto mmap_ready() const noexcept -> bool {
+    return sealed_.load(std::memory_order_acquire) && mmap_base_;
+  }
+
   // Reads the fixed header at offset via mmap or pread.
   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
-    if (mmap_base_) {
+    if (mmap_ready()) {
       assert(offset + kHeaderSize <= mmap_size_);
       return bytecask::read_header(std::span{mmap_base_ + offset, kHeaderSize});
     }
@@ -402,7 +406,7 @@ private:
       -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
     std::span<const std::byte> raw;
-    if (mmap_base_) {
+    if (mmap_ready()) {
       assert(offset + total <= mmap_size_);
       raw = {mmap_base_ + offset, total};
     } else {
@@ -429,7 +433,7 @@ private:
                              std::uint32_t value_size,
                              std::vector<std::byte>& out) const {
     const auto val_offset = offset + kHeaderSize + key_size;
-    if (mmap_base_) {
+    if (mmap_ready()) {
       assert(val_offset + value_size <= mmap_size_);
       auto* base = mmap_base_ + val_offset;
       out.assign(base, base + value_size);
@@ -476,7 +480,6 @@ private:
           offset_ += static_cast<Offset>(byte_count);
         }
       }
-      tainted_ = true;
       throw;
     }
   }

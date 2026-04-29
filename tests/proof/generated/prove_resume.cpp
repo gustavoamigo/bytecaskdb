@@ -69,38 +69,6 @@ TEST_CASE("prove_resume__degrade_H__success", "[prove_resume]") {
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
 }
 
-TEST_CASE("prove_resume__degrade_H__sync_fails", "[prove_resume]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  {
-    // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30});
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-    {
-      bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
-      REQUIRE_THROWS_AS(
-          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
-          std::system_error);
-    }
-    REQUIRE(db.is_degraded());
-
-    // Phase 2: inject resume fault → resume() throws, stays degraded.
-    {
-      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_sync"};
-      REQUIRE_THROWS_AS(db.resume(), std::system_error);
-    }
-    REQUIRE(db.is_degraded());
-
-    // Phase 3: clean resume → clears degraded flag.
-    REQUIRE_NOTHROW(db.resume());
-    REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
-    assert_consistent(db);
-  }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
-}
-
 TEST_CASE("prove_resume__degrade_H__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -156,45 +124,6 @@ TEST_CASE("prove_resume__degrade_H__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // Second resume() is a no-op — engine already healthy.
-    REQUIRE_NOTHROW(db.resume());
-    REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
-    assert_consistent(db);
-  }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
-}
-
-TEST_CASE("prove_resume__degrade_H__cascade_r2_r3", "[prove_resume]") {
-  TempDir td;
-  auto dir = td.path / "db";
-  {
-    // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30});
-    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
-    {
-      bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
-      REQUIRE_THROWS_AS(
-          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
-          std::system_error);
-    }
-    REQUIRE(db.is_degraded());
-
-    // Phase 2: inject io_resume_sync → resume() throws, stays degraded.
-    {
-      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_sync"};
-      REQUIRE_THROWS_AS(db.resume(), std::system_error);
-    }
-    REQUIRE(db.is_degraded());
-
-    // Phase 3: inject io_resume_file_creation → resume() throws, stays degraded.
-    {
-      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_file_creation"};
-      REQUIRE_THROWS_AS(db.resume(), std::system_error);
-    }
-    REQUIRE(db.is_degraded());
-
-    // Phase 4: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
     CHECK(db.contains_key({}, to_bytes("k0")));
