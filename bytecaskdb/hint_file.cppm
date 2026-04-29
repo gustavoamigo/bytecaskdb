@@ -231,18 +231,6 @@ public:
     write_fd_ = -1;
   }
 
-  // Returns a Scanner in iterator mode over the entry bytes.
-  // The Scanner holds a non-owning view into this HintFile's buffer; this
-  // HintFile must outlive the Scanner.
-  [[nodiscard]] auto scan_hints() const
-      -> std::ranges::subrange<Scanner, std::default_sentinel_t> {
-    const auto b       = view();
-    const auto entries = (b.size() >= kFileCrcSize)
-                             ? b.subspan(0, b.size() - kFileCrcSize)
-                             : std::span<const std::byte>{};
-    return {Scanner{entries, Scanner::eager}, std::default_sentinel};
-  }
-
   // Returns a Scanner over the entry bytes (excluding the 4-byte CRC trailer).
   // The Scanner holds a non-owning view into this HintFile's buffer; this
   // HintFile must outlive the Scanner.
