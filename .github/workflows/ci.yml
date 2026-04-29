@@ -37,6 +37,9 @@ jobs:
           curl -fsSL https://xmake.io/shget.text | bash
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
+      - name: Install nanobind
+        run: pip install nanobind
+
       - name: Configure xmake
         run: |
           source ~/.xmake/profile
@@ -97,6 +100,9 @@ jobs:
           curl -fsSL https://xmake.io/shget.text | bash
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
+      - name: Install nanobind
+        run: pip install nanobind
+
       - name: Configure xmake
         run: |
           source ~/.xmake/profile
@@ -150,6 +156,9 @@ jobs:
         run: |
           curl -fsSL https://xmake.io/shget.text | bash
           echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install nanobind
+        run: pip install nanobind
 
       - name: Configure xmake
         run: |
