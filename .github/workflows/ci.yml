@@ -11,6 +11,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   # ---------------------------------------------------------------------------
   # Build and run all test targets
