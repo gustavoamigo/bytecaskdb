@@ -42,9 +42,18 @@ ByteCaskDB uses C++23 modules internally, which are not portable across compilat
 
 Any out-of-tree consumer (not just the MariaDB plugin) should use this C API boundary rather than importing the C++23 modules directly.
 
+### C++ Public Header (`include/bytecask.hpp`)
+
+For C++ consumers that want the full typed API without importing C++23 modules, a PIMPL header is provided:
+
+- **`include/bytecask.hpp`**: standard `#pragma once` header. Defines all public types (`WriteOptions`, `ReadOptions`, `Mode`, `Options`, `Snapshot`, `WritePlan`, `DB`, all iterator types, `DbDegraded`, `DbFollowerMode`) in namespace `bytecask::internal`, with `using` aliases in `namespace bytecask` at the bottom. Depends only on the C++ standard library — no module imports.
+- **`bytecaskdb/bytecask_hpp.cpp`**: the only translation unit that `import bytecask;`. Contains all `Impl` struct definitions and out-of-line method bodies. `to_module()`/`from_module()` helpers in an anonymous namespace convert between `bytecask::internal::` (header-defined, plain mangling) and `bytecask::` (module-imported, module-attached mangling) types. `translate_exceptions()` re-throws `bytecask::DbDegraded` and `bytecask::DbFollowerMode` (module-attached) as the header-defined equivalents so callers that include only the header can catch them correctly.
+
+**C++23 module type attachment**: types defined in a module's purview get a `@modulename` suffix in their mangled symbol names. This makes `bytecask::WriteOptions` (from `import bytecask;`) and a nominally identical `WriteOptions` in the header different types at link time. The header resolves this by putting all plain types in `bytecask::internal` namespace (unattached mangling), and using `BYTECASK_HPP_IMPL_MODE` to suppress the `namespace bytecask` aliases in the one TU that imports the module.
+
 ### Python Bindings
 
-`bytecaskdb-python/` provides Python bindings via [nanobind](https://github.com/wjakob/nanobind), wrapping the C++23 module interface directly (not the C API). The extension exposes DB, Snapshot, WritePlan, all iterator types, and Options. The GIL is released on all I/O paths so multiple Python threads can perform concurrent reads.
+`bytecaskdb-python/` provides Python bindings via [nanobind](https://github.com/wjakob/nanobind). The extension includes `include/bytecask.hpp` and links against `libbytecask.a` — it does not import the C++23 module directly. The extension exposes DB, Snapshot, WritePlan, all iterator types, and Options. The GIL is released on all I/O paths so multiple Python threads can perform concurrent reads.
 
 **Free-threaded Python (PEP 703)**: the bindings support free-threaded Python 3.13+ (`Py_GIL_DISABLED=1`). The build system auto-detects free-threading via `sysconfig.get_config_var('Py_GIL_DISABLED')` and defines `NB_FREE_THREADED`, which declares `Py_mod_gil = Py_MOD_GIL_NOT_USED` and activates nanobind's locking primitives.
 

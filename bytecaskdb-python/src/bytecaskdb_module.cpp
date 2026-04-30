@@ -2,11 +2,8 @@
 // Copyright (c) 2026 Gustavo Amigo
 //
 // Python bindings for ByteCaskDB via nanobind.
-// Wraps the C++23 module interface directly.
-//
-// This file is a regular translation unit (not a module unit) that imports
-// the bytecask module. NB_MODULE must live outside any module partition
-// because it declares extern "C" symbols in the global module.
+// Uses the public PIMPL header (include/bytecask.hpp) and links against
+// the bytecask static library — no direct C++23 module compilation here.
 
 #include <chrono>
 #include <cstddef>
@@ -27,7 +24,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
-import bytecask;
+#include "../../include/bytecask.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -47,9 +44,8 @@ auto to_pybytes(const bytecask::Bytes &b) -> nb::bytes {
   return nb::bytes(reinterpret_cast<const char *>(b.data()), b.size());
 }
 
-auto key_to_pybytes(const bytecask::Key &k) -> nb::bytes {
-  auto data = reinterpret_cast<const char *>(&*k.begin());
-  return nb::bytes(data, k.size());
+auto key_to_pybytes(const bytecask::Bytes &k) -> nb::bytes {
+  return nb::bytes(reinterpret_cast<const char *>(k.data()), k.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -401,13 +397,13 @@ NB_MODULE(_bytecaskdb, m) {
   nb::class_<PyEntryIterator>(m, "EntryIterator")
       .def("__iter__", [](PyEntryIterator &self) -> PyEntryIterator & {
         return self;
-      })
+      }, nb::rv_policy::reference)
       .def("__next__", &PyEntryIterator::next, nb::lock_self());
 
   nb::class_<PyKeyIterator>(m, "KeyIterator")
       .def("__iter__", [](PyKeyIterator &self) -> PyKeyIterator & {
         return self;
-      })
+      }, nb::rv_policy::reference)
       .def("__next__", &PyKeyIterator::next, nb::lock_self());
 
   nb::class_<PyReverseEntryIterator>(m, "ReverseEntryIterator")
@@ -499,7 +495,7 @@ NB_MODULE(_bytecaskdb, m) {
           },
           "Iterate (key, value) pairs in ascending order from from_key.",
           "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
-          nb::keep_alive<0, 1>())
+          nb::rv_policy::move, nb::keep_alive<0, 1>())
       .def(
           "keys_from",
           [](PySnapshot &self, nb::bytes from_key,
@@ -511,7 +507,7 @@ NB_MODULE(_bytecaskdb, m) {
           },
           "Iterate keys in ascending order. No disk I/O.",
           "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
-          nb::keep_alive<0, 1>())
+          nb::rv_policy::move, nb::keep_alive<0, 1>())
       .def(
           "riter_from",
           [](PySnapshot &self, nb::bytes from_key,
@@ -686,7 +682,7 @@ NB_MODULE(_bytecaskdb, m) {
           },
           "Iterate (key, value) pairs in ascending order from from_key.",
           "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
-          nb::keep_alive<0, 1>())
+          nb::rv_policy::move, nb::keep_alive<0, 1>())
       .def(
           "keys_from",
           [](PyDB &self, nb::bytes from_key,
@@ -697,7 +693,7 @@ NB_MODULE(_bytecaskdb, m) {
           },
           "Iterate keys in ascending order. No disk I/O.",
           "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
-          nb::keep_alive<0, 1>())
+          nb::rv_policy::move, nb::keep_alive<0, 1>())
       .def(
           "riter_from",
           [](PyDB &self, nb::bytes from_key,
