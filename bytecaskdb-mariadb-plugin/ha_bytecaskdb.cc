@@ -10,7 +10,8 @@
 #include "table.h"
 #include "field.h"
 #include "key.h"
-#include "bytecask_c.h"
+#include "bytecask.hpp"
+#include "bytecask_view.h"
 #include "catalog.h"
 #include "key_encoding.h"
 #include "row_encoding.h"
@@ -19,6 +20,8 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <utility>
 #include <vector>
 
 namespace bytecaskdb {
@@ -196,12 +199,10 @@ int ha_bytecaskdb::delete_table(const char *name) {
   auto upper = table_id_upper_bound(tid.value());
   auto cat_key = table_meta_key(name);
 
-  auto *plan = bytecask_write_plan_new();
-  if (!plan) { return HA_ERR_GENERIC; }
+  bytecask::WritePlan plan;
 
   // Delete all primary key data [0x02 | table_id].
-  bytecask_write_plan_del_range(plan, lower.data(), lower.size(),
-                                upper.data(), upper.size());
+  plan.del_range(as_view(lower), as_view(upper));
 
   // Delete all secondary index ranges [0x03 | table_id | index_id].
   // Schema v2 always has indexes (may be empty)
@@ -209,16 +210,18 @@ int ha_bytecaskdb::delete_table(const char *name) {
     for (const auto &index : meta->indexes) {
       auto idx_lower = index_id_prefix(tid.value(), index.index_id);
       auto idx_upper = index_id_upper_bound(tid.value(), index.index_id);
-      bytecask_write_plan_del_range(plan, idx_lower.data(), idx_lower.size(),
-                                    idx_upper.data(), idx_upper.size());
+      plan.del_range(as_view(idx_lower), as_view(idx_upper));
     }
   }
 
   // Delete catalog entry.
-  bytecask_write_plan_del(plan, cat_key.data(), cat_key.size());
+  plan.del(as_view(cat_key));
 
-  int rc = bytecask_apply_batch(g_db, plan, /*sync=*/1);
-  if (rc < 0) { return HA_ERR_GENERIC; }
+  try {
+    (void)g_db->apply_batch({.sync = true}, std::move(plan));
+  } catch (const std::exception &) {
+    return HA_ERR_GENERIC;
+  }
 
   catalog_evict_from_cache(name);
   return 0;
@@ -448,18 +451,15 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
 
     if (find_flag == HA_READ_KEY_EXACT) {
       // Point lookup via txn->get().
-      uint8_t *val_buf = nullptr;
-      std::size_t val_len = 0;
-      int found = txn->get(search_key.data(), search_key.size(),
-                           &val_buf, &val_len);
+      bytecask::Bytes val;
+      int found = txn->get(search_key.data(), search_key.size(), val);
       if (found < 0) { return HA_ERR_GENERIC; }
       if (found == 0) { return HA_ERR_KEY_NOT_FOUND; }
 
       // Restore key columns into record buffer.
       key_restore(buf, key, &table->key_info[pk_idx], pk_len);
 
-      decode_row(table, val_buf, val_len, buf);
-      bytecask_free_buf(val_buf);
+      decode_row(table, u8_data(val), val.size(), buf);
       return 0;
     }
 
@@ -619,17 +619,15 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
         thd_get_ha_data(ha_thd(), bytecaskdb_hton));
     if (!txn) { return HA_ERR_GENERIC; }
 
-    uint8_t *row_data = nullptr;
-    size_t row_len = 0;
-    int rc = txn->get(row_key.data(), row_key.size(), &row_data, &row_len);
+    bytecask::Bytes row_val;
+    int rc = txn->get(row_key.data(), row_key.size(), row_val);
     if (rc != 1) {
       return HA_ERR_KEY_NOT_FOUND;  // Row was deleted
     }
 
     // 4. Decode PK and row data into MariaDB buffer
     decode_pk(table, row_key.data(), row_key.size(), buf);
-    decode_row(table, row_data, row_len, buf);
-    bytecask_free_buf(row_data);
+    decode_row(table, u8_data(row_val), row_val.size(), buf);
     return 0;
   }
 }
@@ -651,18 +649,16 @@ int ha_bytecaskdb::rnd_pos(uchar *buf, uchar *pos) {
       thd_get_ha_data(ha_thd(), bytecaskdb_hton));
   if (!txn) { return HA_ERR_GENERIC; }
 
-  uint8_t *val_buf = nullptr;
-  std::size_t val_len = 0;
+  bytecask::Bytes val;
 
-  int found = txn->get(pos, ref_length, &val_buf, &val_len);
+  int found = txn->get(pos, ref_length, val);
   if (found < 0) { return HA_ERR_GENERIC; }
   if (found == 0) { return HA_ERR_KEY_NOT_FOUND; }
 
   // Decode PK from ref into record buffer.
   decode_pk(table, pos, ref_length, buf);
 
-  decode_row(table, val_buf, val_len, buf);
-  bytecask_free_buf(val_buf);
+  decode_row(table, u8_data(val), val.size(), buf);
   return 0;
 }
 

@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-#include "bytecask_c.h"
+#include "bytecask.hpp"
 #include "bytecaskdb_txn.h"
 
 namespace bytecaskdb {
@@ -25,21 +25,21 @@ struct TableMeta;
 // Global state — shared across all tables on this server instance.
 // ---------------------------------------------------------------------------
 
-extern bytecask_db_t *g_db;
+extern bytecask::DB  *g_db;
 extern handlerton    *bytecaskdb_hton;
 
 // ---------------------------------------------------------------------------
 // Persistent catalog functions — defined in bytecaskdb_plugin.cc.
 // ---------------------------------------------------------------------------
 
-uint32_t         catalog_alloc_table_id(bytecask_db_t *db);
-bool             catalog_put_table_meta(bytecask_db_t *db,
+uint32_t         catalog_alloc_table_id(bytecask::DB *db);
+bool             catalog_put_table_meta(bytecask::DB *db,
                                         const TableMeta &meta,
                                         const char *name);
-bool             catalog_delete_table_meta(bytecask_db_t *db,
+bool             catalog_delete_table_meta(bytecask::DB *db,
                                            const char *name);
 void             catalog_evict_from_cache(const char *name);
-bool             catalog_rename_table_meta(bytecask_db_t *db,
+bool             catalog_rename_table_meta(bytecask::DB *db,
                                            const char *from,
                                            const char *to);
 std::optional<uint32_t> catalog_lookup_table_id(const char *name);

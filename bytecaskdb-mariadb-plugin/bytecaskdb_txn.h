@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include "bytecask_c.h"
+#include "bytecask.hpp"
+#include "bytecask_view.h"
 
 #include <cstdint>
 #include <cstring>
@@ -47,25 +48,46 @@ public:
 
   // -------------------------------------------------------------------
   // MergeIterator — two-pointer merge of snapshot iter + lookup_ map.
+  //
+  // The snapshot iterator is one of bytecask::EntryIterator (forward) or
+  // bytecask::ReverseEntryIterator (reverse). Stored as optionals; at most
+  // one is engaged. The buffer side is always walked forward (matching the
+  // pre-migration C-API behavior).
   // -------------------------------------------------------------------
 
   class MergeIterator {
   public:
-    // Takes ownership of snap_iter. lo/hi define the key range [lo, hi).
-    MergeIterator(bytecask_iter_t *snap_iter,
+    // Forward construction (full table).
+    MergeIterator(std::optional<bytecask::EntryIterator> snap_it,
                   LookupMap::const_iterator buf_it,
                   LookupMap::const_iterator buf_end,
                   std::vector<uint8_t> hi,
                   uint32_t table_id);
 
-    // Constructor for secondary index iteration.
-    MergeIterator(bytecask_iter_t *snap_iter,
+    // Forward construction (secondary index).
+    MergeIterator(std::optional<bytecask::EntryIterator> snap_it,
                   LookupMap::const_iterator buf_it,
                   LookupMap::const_iterator buf_end,
                   std::vector<uint8_t> hi,
                   uint32_t table_id, uint16_t index_id);
 
-    ~MergeIterator();
+    // Reverse construction (full table).
+    MergeIterator(std::optional<bytecask::ReverseEntryIterator> snap_it,
+                  bytecask::ReverseEntryIterator snap_end,
+                  LookupMap::const_iterator buf_it,
+                  LookupMap::const_iterator buf_end,
+                  std::vector<uint8_t> lo,
+                  uint32_t table_id);
+
+    // Reverse construction (secondary index).
+    MergeIterator(std::optional<bytecask::ReverseEntryIterator> snap_it,
+                  bytecask::ReverseEntryIterator snap_end,
+                  LookupMap::const_iterator buf_it,
+                  LookupMap::const_iterator buf_end,
+                  std::vector<uint8_t> lo,
+                  uint32_t table_id, uint16_t index_id);
+
+    ~MergeIterator() = default;
 
     MergeIterator(const MergeIterator &) = delete;
     MergeIterator &operator=(const MergeIterator &) = delete;
@@ -73,7 +95,7 @@ public:
     bool valid() const { return valid_; }
     void next();
 
-    // Returns pointers to internally owned buffers. Valid until next().
+    // Pointers into internally owned buffers; valid until next().
     const uint8_t *key_data() const { return cur_key_.data(); }
     size_t key_len() const { return cur_key_.size(); }
     const uint8_t *value_data() const { return cur_val_.data(); }
@@ -82,12 +104,19 @@ public:
   private:
     void advance();
     void load_snap_current();
-    bool snap_in_range() const;
+    bool snap_at_end() const;
+    void snap_step();
 
-    bytecask_iter_t *snap_iter_;
+    // At most one of these is engaged.
+    std::optional<bytecask::EntryIterator>        snap_fwd_;
+    std::optional<bytecask::ReverseEntryIterator> snap_rev_;
+    // For reverse iteration the sentinel is a same-typed iterator value.
+    std::optional<bytecask::ReverseEntryIterator> snap_rev_end_;
+    bool reverse_{false};
+
     LookupMap::const_iterator buf_it_;
     LookupMap::const_iterator buf_end_;
-    std::vector<uint8_t> hi_;
+    std::vector<uint8_t> bound_;            // forward: hi (exclusive); reverse: lo (informational only)
     uint32_t table_id_;
     uint16_t index_id_{0};        // 0 = primary key (table) iteration
     bool use_index_filter_{false}; // true = use key_belongs_to_index
@@ -107,14 +136,14 @@ public:
   // Lifecycle
   // -------------------------------------------------------------------
 
-  explicit MariaDBTxn(bytecask_db_t *db) : db_(db) {}
-  ~MariaDBTxn();
+  explicit MariaDBTxn(bytecask::DB *db) : db_(db) {}
+  ~MariaDBTxn() = default;  // optional<Snapshot> handles cleanup
 
   // Acquires snapshot if not held, registers with MariaDB's transaction
   // coordinator via trans_register_ha.
   void begin_if_needed(THD *thd, handlerton *hton);
 
-  bool is_active() const { return snap_ != nullptr; }
+  bool is_active() const { return snap_.has_value(); }
 
   // -------------------------------------------------------------------
   // Write buffering
@@ -129,10 +158,8 @@ public:
   // -------------------------------------------------------------------
 
   // Checks lookup_ first (tombstone = not found), then snapshot.
-  // Returns 1 if found (writes to out_val/out_val_len), 0 if not found,
-  // -1 on error.
-  int get(const uint8_t *key, size_t klen,
-          uint8_t **out_val, size_t *out_val_len);
+  // Returns 1 if found (writes to out), 0 if not found, -1 on error.
+  int get(const uint8_t *key, size_t klen, bytecask::Bytes &out);
 
   // Returns true if key exists (in buffer or snapshot).
   bool exists(const uint8_t *key, size_t klen);
@@ -171,8 +198,8 @@ public:
 private:
   void reset();
 
-  bytecask_db_t *db_;
-  bytecask_snapshot_t *snap_{nullptr};
+  bytecask::DB *db_;
+  std::optional<bytecask::Snapshot> snap_;
 
   // Ordered operation log — replayed into WritePlan at commit time.
   std::vector<Op> ops_;

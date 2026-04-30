@@ -153,11 +153,39 @@ private:
     }
   }
 
+  void link_provider_plugins() {
+    // MariaDB's default config (e.g. /etc/my.cnf.d/provider_*.cnf) may pin
+    // compression-provider plugins as `force_plus_permanent`.  When we override
+    // --plugin-dir to point at our build directory these must be reachable
+    // there too, otherwise mariadbd aborts with "unknown variable
+    // 'provider_<name>=force_plus_permanent'".
+    const char *system_plugin_dirs[] = {
+      "/usr/lib64/mariadb/plugin",
+      "/usr/lib/mariadb/plugin",
+    };
+    for (const char *dir : system_plugin_dirs) {
+      if (!fs::exists(dir)) continue;
+      std::error_code ec;
+      for (const auto &entry : fs::directory_iterator(dir, ec)) {
+        const auto name = entry.path().filename().string();
+        if (name.rfind("provider_", 0) == 0) {
+          fs::path target = fs::path(plugin_dir_) / name;
+          if (!fs::exists(target)) {
+            fs::create_symlink(entry.path(), target, ec);
+          }
+        }
+      }
+      break;
+    }
+  }
+
   void start_server() {
     // Verify plugin exists
     if (!fs::exists(plugin_dir_ + "/ha_bytecaskdb.so")) {
       throw std::runtime_error("ByteCaskDB plugin not found at: " + plugin_dir_ + "/ha_bytecaskdb.so");
     }
+
+    link_provider_plugins();
 
     // Start MariaDB server
     std::string cmd = "mariadbd --datadir=" + data_dir_ +
