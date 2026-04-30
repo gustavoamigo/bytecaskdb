@@ -1,0 +1,86 @@
+# aggregates.yaml — GROUP BY, aggregate function, and HAVING tests
+
+- name: COUNT all rows
+  setup:
+    - DROP DATABASE IF EXISTS ag
+    - CREATE DATABASE ag
+    - CREATE TABLE ag.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ag.t VALUES (1,10),(2,20),(3,30)
+  query: SELECT COUNT(*) FROM ag.t
+  expected:
+    - ['3']
+  teardown:
+    - DROP DATABASE IF EXISTS ag
+
+- name: COUNT on empty table
+  setup:
+    - DROP DATABASE IF EXISTS ag2
+    - CREATE DATABASE ag2
+    - CREATE TABLE ag2.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+  query: SELECT COUNT(*) FROM ag2.t
+  expected:
+    - ['0']
+  teardown:
+    - DROP DATABASE IF EXISTS ag2
+
+- name: SUM and AVG
+  setup:
+    - DROP DATABASE IF EXISTS ag3
+    - CREATE DATABASE ag3
+    - CREATE TABLE ag3.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ag3.t VALUES (1,10),(2,20),(3,30)
+  query: SELECT SUM(v), AVG(v) FROM ag3.t
+  expected:
+    - ['60', '20.0000']
+  teardown:
+    - DROP DATABASE IF EXISTS ag3
+
+- name: GROUP BY on non-indexed column
+  setup:
+    - DROP DATABASE IF EXISTS ag4
+    - CREATE DATABASE ag4
+    - CREATE TABLE ag4.sales (id INT PRIMARY KEY, region VARCHAR(20) NOT NULL, amt INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ag4.sales VALUES (1,'north',100),(2,'south',200),(3,'north',150),(4,'south',50)
+  query: SELECT region, SUM(amt) FROM ag4.sales GROUP BY region ORDER BY region
+  expected:
+    - [north, 250]
+    - [south, 250]
+  teardown:
+    - DROP DATABASE IF EXISTS ag4
+
+- name: HAVING filters groups
+  setup:
+    - DROP DATABASE IF EXISTS ag5
+    - CREATE DATABASE ag5
+    - CREATE TABLE ag5.sales (id INT PRIMARY KEY, region VARCHAR(20) NOT NULL, amt INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ag5.sales VALUES (1,'north',100),(2,'south',200),(3,'north',150),(4,'south',50),(5,'east',10)
+  query: SELECT region, SUM(amt) AS total FROM ag5.sales GROUP BY region HAVING total > 100 ORDER BY region
+  expected:
+    - [north, 250]
+    - [south, 250]
+  teardown:
+    - DROP DATABASE IF EXISTS ag5
+
+- name: MIN and MAX
+  setup:
+    - DROP DATABASE IF EXISTS ag6
+    - CREATE DATABASE ag6
+    - CREATE TABLE ag6.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ag6.t VALUES (1,5),(2,1),(3,9),(4,3)
+  query: SELECT MIN(v), MAX(v) FROM ag6.t
+  expected:
+    - ['1', '9']
+  teardown:
+    - DROP DATABASE IF EXISTS ag6
+
+- name: COUNT ignores NULLs
+  setup:
+    - DROP DATABASE IF EXISTS ag7
+    - CREATE DATABASE ag7
+    - CREATE TABLE ag7.t (id INT PRIMARY KEY, v INT) ENGINE=bytecaskdb
+    - INSERT INTO ag7.t VALUES (1,10),(2,NULL),(3,30)
+  query: SELECT COUNT(*), COUNT(v) FROM ag7.t
+  expected:
+    - ['3', '2']
+  teardown:
+    - DROP DATABASE IF EXISTS ag7

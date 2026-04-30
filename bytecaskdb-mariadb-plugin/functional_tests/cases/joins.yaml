@@ -1,0 +1,120 @@
+# joins.yaml — JOIN tests for ha_bytecaskdb
+# Tests real multi-table SQL that exercises the engine's index and scan paths.
+
+- name: INNER JOIN on PK
+  setup:
+    - DROP DATABASE IF EXISTS jt
+    - CREATE DATABASE jt
+    - CREATE TABLE jt.customers (id INT PRIMARY KEY, name VARCHAR(50) NOT NULL) ENGINE=bytecaskdb
+    - CREATE TABLE jt.orders (id INT PRIMARY KEY, cid INT NOT NULL, amt INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO jt.customers VALUES (1,'alice'),(2,'bob'),(3,'carol')
+    - INSERT INTO jt.orders VALUES (1,1,100),(2,2,200),(3,1,50),(4,3,75)
+  query: >
+    SELECT c.name, o.amt
+    FROM jt.customers c JOIN jt.orders o ON c.id = o.cid
+    ORDER BY o.id
+  expected:
+    - [alice, 100]
+    - [bob, 200]
+    - [alice, 50]
+    - [carol, 75]
+  teardown:
+    - DROP DATABASE IF EXISTS jt
+
+- name: INNER JOIN with aggregate
+  setup:
+    - DROP DATABASE IF EXISTS jt2
+    - CREATE DATABASE jt2
+    - CREATE TABLE jt2.customers (id INT PRIMARY KEY, name VARCHAR(50) NOT NULL) ENGINE=bytecaskdb
+    - CREATE TABLE jt2.orders (id INT PRIMARY KEY, cid INT NOT NULL, amt INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO jt2.customers VALUES (1,'alice'),(2,'bob')
+    - INSERT INTO jt2.orders VALUES (1,1,100),(2,2,200),(3,1,50)
+  query: >
+    SELECT c.name, SUM(o.amt) AS total
+    FROM jt2.customers c JOIN jt2.orders o ON c.id = o.cid
+    GROUP BY c.name ORDER BY c.name
+  expected:
+    - [alice, 150]
+    - [bob, 200]
+  teardown:
+    - DROP DATABASE IF EXISTS jt2
+
+- name: LEFT JOIN includes unmatched rows as NULL
+  setup:
+    - DROP DATABASE IF EXISTS jt3
+    - CREATE DATABASE jt3
+    - CREATE TABLE jt3.customers (id INT PRIMARY KEY, name VARCHAR(50) NOT NULL) ENGINE=bytecaskdb
+    - CREATE TABLE jt3.orders (id INT PRIMARY KEY, cid INT NOT NULL, amt INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO jt3.customers VALUES (1,'alice'),(2,'bob'),(3,'carol')
+    - INSERT INTO jt3.orders VALUES (1,1,100),(2,1,50)
+  query: >
+    SELECT c.name, o.amt
+    FROM jt3.customers c LEFT JOIN jt3.orders o ON c.id = o.cid
+    ORDER BY c.id, o.id
+  expected:
+    - [alice, 100]
+    - [alice, 50]
+    - [bob, NULL]
+    - [carol, NULL]
+  teardown:
+    - DROP DATABASE IF EXISTS jt3
+
+- name: Three-table JOIN
+  setup:
+    - DROP DATABASE IF EXISTS jt4
+    - CREATE DATABASE jt4
+    - CREATE TABLE jt4.customers (id INT PRIMARY KEY, name VARCHAR(50) NOT NULL) ENGINE=bytecaskdb
+    - CREATE TABLE jt4.orders (id INT PRIMARY KEY, cid INT NOT NULL) ENGINE=bytecaskdb
+    - CREATE TABLE jt4.items (id INT PRIMARY KEY, oid INT NOT NULL, product VARCHAR(50) NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO jt4.customers VALUES (1,'alice'),(2,'bob')
+    - INSERT INTO jt4.orders VALUES (1,1),(2,2)
+    - INSERT INTO jt4.items VALUES (1,1,'apple'),(2,1,'banana'),(3,2,'cherry')
+  query: >
+    SELECT c.name, i.product
+    FROM jt4.customers c
+    JOIN jt4.orders o ON c.id = o.cid
+    JOIN jt4.items i ON o.id = i.oid
+    ORDER BY c.name, i.product
+  expected:
+    - [alice, apple]
+    - [alice, banana]
+    - [bob, cherry]
+  teardown:
+    - DROP DATABASE IF EXISTS jt4
+
+- name: Self-join
+  setup:
+    - DROP DATABASE IF EXISTS jt5
+    - CREATE DATABASE jt5
+    - CREATE TABLE jt5.employees (id INT PRIMARY KEY, name VARCHAR(50) NOT NULL, manager_id INT) ENGINE=bytecaskdb
+    - INSERT INTO jt5.employees VALUES (1,'ceo',NULL),(2,'alice',1),(3,'bob',1),(4,'carol',2)
+  query: >
+    SELECT e.name AS employee, m.name AS manager
+    FROM jt5.employees e
+    JOIN jt5.employees m ON e.manager_id = m.id
+    ORDER BY e.id
+  expected:
+    - [alice, ceo]
+    - [bob, ceo]
+    - [carol, alice]
+  teardown:
+    - DROP DATABASE IF EXISTS jt5
+
+- name: JOIN with secondary index on FK column
+  setup:
+    - DROP DATABASE IF EXISTS jt6
+    - CREATE DATABASE jt6
+    - CREATE TABLE jt6.products (id INT PRIMARY KEY, name VARCHAR(50) NOT NULL) ENGINE=bytecaskdb
+    - CREATE TABLE jt6.reviews (id INT PRIMARY KEY, pid INT NOT NULL, score INT NOT NULL) ENGINE=bytecaskdb
+    - CREATE INDEX idx_pid ON jt6.reviews(pid)
+    - INSERT INTO jt6.products VALUES (1,'widget'),(2,'gadget')
+    - INSERT INTO jt6.reviews VALUES (1,1,5),(2,1,4),(3,2,3),(4,2,5)
+  query: >
+    SELECT p.name, AVG(r.score) AS avg_score
+    FROM jt6.products p JOIN jt6.reviews r ON p.id = r.pid
+    GROUP BY p.name ORDER BY p.name
+  expected:
+    - [gadget, '4.0000']
+    - [widget, '4.5000']
+  teardown:
+    - DROP DATABASE IF EXISTS jt6

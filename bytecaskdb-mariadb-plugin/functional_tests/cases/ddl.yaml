@@ -1,0 +1,81 @@
+# ddl.yaml — DDL correctness tests (CREATE, DROP, RENAME, CREATE INDEX)
+
+- name: CREATE TABLE and DROP TABLE removes all rows
+  setup:
+    - DROP DATABASE IF EXISTS ddl
+    - CREATE DATABASE ddl
+    - CREATE TABLE ddl.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ddl.t VALUES (1,10),(2,20)
+    - DROP TABLE ddl.t
+    - CREATE TABLE ddl.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+  query: SELECT COUNT(*) FROM ddl.t
+  expected:
+    - ['0']
+  teardown:
+    - DROP DATABASE IF EXISTS ddl
+
+- name: RENAME TABLE preserves all rows
+  setup:
+    - DROP DATABASE IF EXISTS ddl2
+    - CREATE DATABASE ddl2
+    - CREATE TABLE ddl2.original (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ddl2.original VALUES (1,10),(2,20),(3,30)
+    - RENAME TABLE ddl2.original TO ddl2.renamed
+  query: SELECT SUM(v) FROM ddl2.renamed
+  expected:
+    - ['60']
+  teardown:
+    - DROP DATABASE IF EXISTS ddl2
+
+- name: CREATE INDEX on existing table makes rows queryable by index
+  setup:
+    - DROP DATABASE IF EXISTS ddl3
+    - CREATE DATABASE ddl3
+    - CREATE TABLE ddl3.t (id INT PRIMARY KEY, category VARCHAR(20) NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ddl3.t VALUES (1,'A'),(2,'B'),(3,'A'),(4,'C')
+    - CREATE INDEX idx_cat ON ddl3.t(category)
+  steps:
+    - sql: SELECT COUNT(*) FROM ddl3.t
+      expected: [['4']]
+    - sql: SELECT id, category FROM ddl3.t ORDER BY id
+      expected: [['1','A'],['2','B'],['3','A'],['4','C']]
+    - sql: SELECT id FROM ddl3.t IGNORE INDEX (idx_cat) WHERE category = 'A' ORDER BY id
+      expected: [['1'],['3']]
+    - sql: SELECT category, id FROM ddl3.t USE INDEX (idx_cat) ORDER BY category, id
+      expected: [['A','1'],['A','3'],['B','2'],['C','4']]
+    - sql: SELECT id FROM ddl3.t USE INDEX (idx_cat) WHERE category = 'A'
+      expected: [['1'],['3']]
+    - sql: SELECT id FROM ddl3.t USE INDEX (idx_cat) WHERE category = 'A' ORDER BY id
+      expected: [['1'],['3']]
+  teardown:
+    - DROP DATABASE IF EXISTS ddl3
+
+- name: DROP INDEX still allows full table scan
+  setup:
+    - DROP DATABASE IF EXISTS ddl4
+    - CREATE DATABASE ddl4
+    - CREATE TABLE ddl4.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - CREATE INDEX idx_v ON ddl4.t(v)
+    - INSERT INTO ddl4.t VALUES (1,10),(2,20),(3,30)
+    - DROP INDEX idx_v ON ddl4.t
+  query: SELECT SUM(v) FROM ddl4.t
+  expected:
+    - ['60']
+  teardown:
+    - DROP DATABASE IF EXISTS ddl4
+
+- name: Multiple tables in same database are independent
+  setup:
+    - DROP DATABASE IF EXISTS ddl5
+    - CREATE DATABASE ddl5
+    - CREATE TABLE ddl5.a (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - CREATE TABLE ddl5.b (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ddl5.a VALUES (1,100)
+    - INSERT INTO ddl5.b VALUES (1,200)
+    - DROP TABLE ddl5.a
+  query: SELECT v FROM ddl5.b WHERE id = 1
+  expected:
+    - ['200']
+  teardown:
+    - DROP DATABASE IF EXISTS ddl5
+

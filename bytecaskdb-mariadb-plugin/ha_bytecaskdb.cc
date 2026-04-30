@@ -18,7 +18,6 @@
 #include "bytecaskdb_txn.h"
 
 #include <cassert>
-#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <utility>
@@ -54,7 +53,7 @@ ulong ha_bytecaskdb::index_flags(uint idx, uint /*part*/,
 }
 
 // ---------------------------------------------------------------------------
-// Lock management — no-op (no transactions yet)
+// store_lock — no-op: engine uses OCC, no THR_LOCK needed.
 // ---------------------------------------------------------------------------
 
 THR_LOCK_DATA **ha_bytecaskdb::store_lock(THD * /*thd*/, THR_LOCK_DATA **to,
@@ -254,6 +253,7 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
 
   // Eager dup check: lookup_ then snapshot.
   if (txn->exists(key.data(), key.size())) {
+    errkey = table->s->primary_key;
     return HA_ERR_FOUND_DUPP_KEY;
   }
 
@@ -271,7 +271,8 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
                                            upper.data(), upper.size(),
                                            table_id_, index.index_id);
         if (iter && iter->valid()) {
-          return HA_ERR_FOUND_DUPP_KEY;  // Found existing key with same secondary key
+          errkey = lookup_errkey = static_cast<uint>(index.index_id);
+          return HA_ERR_FOUND_DUPP_KEY;
         }
       }
     }
@@ -284,7 +285,6 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   if (meta) {
     for (const auto &index : meta->indexes) {
       auto sec_key = encode_sec_key(table, buf, table_id_, index.index_id, index.index_id);
-      // Secondary index value is empty (key contains all the data we need)
       txn->buffer_put(sec_key.data(), sec_key.size(), nullptr, 0);
     }
   }
@@ -307,19 +307,45 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
   auto new_pk = encode_current_pk(new_data);
   auto new_val = encode_row(table, new_data, schema_version_);
 
-  // Handle secondary indexes first.
+  // Handle secondary indexes.
   const TableMeta *meta = catalog_lookup_meta(table_id_);
   if (meta) {
-    for (const auto &index : meta->indexes) {
-      auto old_sec_key = encode_sec_key(table, old_data, table_id_, index.index_id, index.index_id);
-      auto new_sec_key = encode_sec_key(table, new_data, table_id_, index.index_id, index.index_id);
+    // old_pk_encoded = [kNsRow | table_id | key_copy(pk)]; pk bytes start at offset 5.
+    auto old_pk_encoded = encode_current_pk(old_data);
+    const uint8_t *pk_bytes     = old_pk_encoded.data() + 5;
+    const size_t   pk_bytes_len = old_pk_encoded.size() - 5;
 
+    for (const auto &index : meta->indexes) {
+      // Locate the old secondary index entry by scanning for the PK suffix.
+      // This avoids relying on field->ptr pointing into the old record buffer,
+      // which is unreliable for VARCHAR fields under move_field_offset.
+      const uint sec_key_field_len = table->key_info[index.index_id].key_length;
+      auto lo   = index_id_prefix(table_id_, index.index_id);
+      auto hi   = index_id_upper_bound(table_id_, index.index_id);
+      auto scan = txn->iter_index_prefix(lo.data(), lo.size(),
+                                         hi.data(), hi.size(),
+                                         table_id_, index.index_id);
+
+      std::vector<uint8_t> old_sec_key;
+      while (scan && scan->valid()) {
+        const uint8_t *k    = scan->key_data();
+        const size_t   klen = scan->key_len();
+        if (klen >= 7 + sec_key_field_len + pk_bytes_len &&
+            std::memcmp(k + 7 + sec_key_field_len, pk_bytes, pk_bytes_len) == 0) {
+          old_sec_key.assign(k, k + klen);
+          break;
+        }
+        scan->next();
+      }
+
+      auto new_sec_key = encode_sec_key(table, new_data, table_id_,
+                                         index.index_id, index.index_id);
       if (old_sec_key != new_sec_key) {
-        // Secondary index key changed - delete old, insert new
-        txn->buffer_del(old_sec_key.data(), old_sec_key.size());
+        if (!old_sec_key.empty()) {
+          txn->buffer_del(old_sec_key.data(), old_sec_key.size());
+        }
         txn->buffer_put(new_sec_key.data(), new_sec_key.size(), nullptr, 0);
       }
-      // If secondary key unchanged, no index operation needed
     }
   }
 
@@ -484,7 +510,27 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
     search_key[4] = static_cast<uint8_t>( table_id_        & 0xFF);
     search_key[5] = static_cast<uint8_t>((active_index >> 8) & 0xFF);
     search_key[6] = static_cast<uint8_t>( active_index       & 0xFF);
-    std::memcpy(search_key.data() + 7, key, sec_key_len);
+    // keypart_map tells us which key parts are valid in `key`. Only copy those
+    // bytes; zero-fill the rest so the scan starts at the correct position.
+    uint actual_packed_len = 0;
+    uint prefix_len = 0;
+    for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
+      if (!(keypart_map & (key_part_map(1) << i))) break;
+      actual_packed_len += key_info.key_part[i].store_length;
+      prefix_len        += key_info.key_part[i].length;
+    }
+    std::memcpy(search_key.data() + 7, key, actual_packed_len);
+    if (actual_packed_len < sec_key_len) {
+      std::memset(search_key.data() + 7 + actual_packed_len, 0,
+                  sec_key_len - actual_packed_len);
+    }
+    // The optimizer key buffer is in key_copy() format (includes VARCHAR length
+    // prefix). encode_sec_key() strips that prefix via fix_varchar_key_encoding;
+    // apply the same transformation here so the search key matches stored keys.
+    fix_varchar_key_encoding(search_key.data() + 7, table, active_index);
+
+    // Save only the covered-prefix bytes for index_next_same comparison.
+    sec_search_key_.assign(search_key.begin(), search_key.begin() + 7 + prefix_len);
 
     // For secondary indexes, always use range scan (even for exact lookups)
     // because we need to iterate through potentially multiple matches
@@ -505,6 +551,43 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
 int ha_bytecaskdb::index_next(uchar *buf) {
   if (!merge_index_ || !merge_index_->valid()) { return HA_ERR_END_OF_FILE; }
   merge_index_->next();
+  return index_read_current(buf);
+}
+
+// ---------------------------------------------------------------------------
+// index_next_same() — advance within an equality range on a secondary index.
+//
+// The default handler uses key_cmp_if_same() which compares the field in
+// record[0] against the original packed key.  That comparison breaks for
+// VARCHAR because fix_varchar_key_encoding() strips the length prefix from
+// stored keys, making the stored format diverge from the packed key format
+// that key_cmp_if_same() expects.
+//
+// Instead we compare the binary secondary-key prefix directly: the first
+// sec_search_key_.size() bytes of the stored key must match the saved search
+// key (both already have the VARCHAR length prefix removed).
+// ---------------------------------------------------------------------------
+
+int ha_bytecaskdb::index_next_same(uchar *buf, const uchar * /*key*/,
+                                    uint /*keylen*/) {
+  if (!merge_index_ || !merge_index_->valid()) { return HA_ERR_END_OF_FILE; }
+  if (active_index == table->s->primary_key) {
+    // Primary index has unique keys — there is never a "next same".
+    return HA_ERR_END_OF_FILE;
+  }
+
+  merge_index_->next();
+  if (!merge_index_->valid()) { return HA_ERR_END_OF_FILE; }
+
+  // Verify the stored key still shares the same search-key prefix.
+  if (!sec_search_key_.empty() &&
+      (merge_index_->key_len() < sec_search_key_.size() ||
+       std::memcmp(merge_index_->key_data(),
+                   sec_search_key_.data(),
+                   sec_search_key_.size()) != 0)) {
+    return HA_ERR_END_OF_FILE;
+  }
+
   return index_read_current(buf);
 }
 
