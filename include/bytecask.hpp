@@ -19,6 +19,10 @@
 
 #pragma once
 
+// bytecask_hpp.cpp includes all std headers before `import bytecask;` to avoid
+// an LLVM 22+ hard error (see that file for the full explanation), then defines
+// this macro so we don't re-include headers that are already in scope.
+#ifndef BYTECASK_HPP_NO_STD_INCLUDES
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +35,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#endif // BYTECASK_HPP_NO_STD_INCLUDES
 
 // ---------------------------------------------------------------------------
 // bytecask::internal namespace — all public types, always defined.

@@ -5,9 +5,44 @@
 //
 // This is the only translation unit that imports the bytecask module. It
 // defines all nested Impl structs and out-of-line method bodies for the
-// bytecask_pub PIMPL wrapper classes declared in include/bytecask.hpp.
+// bytecask::internal PIMPL wrapper classes declared in include/bytecask.hpp.
 
-// Import the module first — populates bytecask:: namespace with all types.
+// Standard library headers must be included BEFORE the module import.
+//
+// On macOS, libc++ marks many inline/template functions with
+// _LIBCPP_HIDE_FROM_ABI, which expands to __attribute__((__abi_tag__("..."))).
+// That tag changes the mangled name so different libc++ versions don't clash
+// at link time.
+//
+// When `import bytecask;` is processed, the compiler loads the module's BMI
+// and resolves exported types that reference std types (e.g., ReadOptions
+// holds std::chrono::milliseconds). On LLVM 22+, this causes those std
+// declarations to become "known" in the importing TU. A subsequent
+// `#include <chrono>` then tries to re-declare the same entities and add
+// __abi_tag__ attributes to declarations that already exist — which LLVM 22
+// rejects as a hard error: "cannot add 'abi_tag' attribute in a redeclaration".
+//
+// Including std headers first establishes their canonical declarations in this
+// TU before the module import. The import then finds them already present and
+// consistent — no conflict.
+//
+// BYTECASK_HPP_NO_STD_INCLUDES tells bytecask.hpp to skip its own copies of
+// these includes since they are already in scope.
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <optional>
+#include <ranges>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+// Import the module — populates bytecask:: namespace with all types.
 import bytecask;
 
 // BYTECASK_HPP_IMPL_MODE suppresses the bytecask:: namespace aliases
@@ -15,10 +50,12 @@ import bytecask;
 // mode the header only defines the bytecask::internal:: types (plain types +
 // PIMPL wrapper classes). Method signatures use bytecask::internal:: types
 // exclusively, so mangling is consistent regardless of how the header is consumed.
+//
+// BYTECASK_HPP_NO_STD_INCLUDES tells the header to skip its own std includes
+// since we already included them above (before the module import).
 #define BYTECASK_HPP_IMPL_MODE
+#define BYTECASK_HPP_NO_STD_INCLUDES
 #include "../include/bytecask.hpp"
-
-#include <optional>
 
 // ---------------------------------------------------------------------------
 // Local conversion helpers — bytecask::internal:: <-> bytecask:: (module) types.
