@@ -10,7 +10,7 @@
 #    The headers live under $(mariadb_config --include-dir) or
 #    /usr/include/mysql on many distributions.
 #
-# 2. ByteCaskDB static archive (libbytecask.a) and its C API header:
+# 2. ByteCaskDB static archive (libbytecask.a) and its C++ header:
 #    Build the static target first:
 #      cd <bytecask-root> && xmake build bytecask
 #    The archive will be at:
@@ -29,10 +29,12 @@
 cmake_minimum_required(VERSION 3.20)
 project(ha_bytecaskdb VERSION 0.1 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# The plugin uses C++17 (not C++23 modules) — it communicates with the engine
-# only through the stable C API in bytecask_c.h.
+# The plugin uses C++20 (not C++23 modules) — it consumes ByteCaskDB through
+# the PIMPL C++ header in include/bytecask.hpp, whose implementation is
+# compiled into libbytecask.a by xmake. The header relies on std::span and
+# std::ranges::subrange, which require C++20.
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -115,10 +117,10 @@ add_library(ha_bytecaskdb MODULE
   catalog.cc
   key_encoding.cc
   row_encoding.cc
-  # bytecask_c.cpp lives in bytecaskdb/ and is compiled by xmake into
+  # bytecask_hpp.cpp lives in bytecaskdb/ and is compiled by xmake into
   # libbytecask.a (it imports the C++23 bytecask module and must be built
-  # with the same toolchain that produced the BMIs).  The C API symbols
-  # are linked in via bytecask_static.
+  # with the same toolchain that produced the BMIs).  The PIMPL symbols
+  # exposed by include/bytecask.hpp are linked in via bytecask_static.
 )
 
 target_include_directories(ha_bytecaskdb PRIVATE

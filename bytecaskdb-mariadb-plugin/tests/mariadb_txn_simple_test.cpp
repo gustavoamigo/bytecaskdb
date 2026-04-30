@@ -6,7 +6,6 @@
 // Tests only the essential buffer_put/exists functionality that would have
 // caught the duplicate INSERT bug, without requiring full MariaDB compilation.
 
-#include "bytecask_c_stubs.h"  // Must be included first
 #include "mariadb_stubs.h"
 
 #include <catch2/catch_test_macros.hpp>
@@ -17,14 +16,17 @@
 #include <map>
 #include <optional>
 
-using namespace bytecaskdb;
+// Opaque DB-handle stand-in. The simple tests never call into ByteCaskDB —
+// they only need a non-null pointer to mirror the MariaDBTxn constructor
+// signature.
+using opaque_db_t = void;
 
 // Minimal MariaDBTxn implementation for testing RYOW semantics
 class SimpleTxn {
 public:
   using LookupMap = std::map<std::vector<uint8_t>, std::optional<std::vector<uint8_t>>>;
 
-  explicit SimpleTxn(bytecask_db_t* db) : db_(db) {}
+  explicit SimpleTxn(opaque_db_t* db) : db_(db) {}
 
   void buffer_put(const uint8_t* key, size_t klen,
                  const uint8_t* val, size_t vlen) {
@@ -68,7 +70,7 @@ public:
   }
 
 private:
-  bytecask_db_t* db_;
+  opaque_db_t* db_;
   LookupMap lookup_;
 };
 
@@ -79,7 +81,7 @@ private:
 class SimpleTxnFixture {
 public:
   SimpleTxnFixture() {
-    db_ = reinterpret_cast<bytecask_db_t*>(0x12345678);
+    db_ = reinterpret_cast<opaque_db_t*>(0x12345678);
   }
 
   std::unique_ptr<SimpleTxn> create_txn() {
@@ -95,7 +97,7 @@ public:
   }
 
 protected:
-  bytecask_db_t* db_;
+  opaque_db_t* db_;
 };
 
 // =========================================================================

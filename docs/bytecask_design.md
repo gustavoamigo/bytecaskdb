@@ -40,6 +40,8 @@ The `build-and-test` CI job also exports Catch2 JUnit XML reports for all three 
 
 ByteCaskDB is being integrated as a MariaDB pluggable storage engine (`ha_bytecask`). The plugin builds out-of-tree against MariaDB development headers and loads via `INSTALL PLUGIN`. The integration uses a MariaDB-internal L2 Transaction built directly on Layer 1 primitives (`snapshot()` + `apply_batch(WritePlan)`), separate from the public `Transaction` class in `transaction_design.md`. Full design: `docs/mariadb_engine_design.md`.
 
+The plugin consumes the engine through the PIMPL C++ header `include/bytecask.hpp` (typed `bytecask::DB`, `Snapshot`, `WritePlan`, RAII iterators, throwing errors). The implementation lives in `bytecaskdb/bytecask_hpp.cpp` and is compiled into `libbytecask.a`, which the plugin links statically.
+
 ### C API / Shared Library Boundary
 
 ByteCaskDB uses C++23 modules internally, which are not portable across compilation unit boundaries when linking external code. To cross this boundary (e.g. the MariaDB plugin), a stable `extern "C"` API is provided:

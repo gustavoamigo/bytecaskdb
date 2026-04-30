@@ -18,19 +18,34 @@
 #include "ha_bytecaskdb.h"
 #include "catalog.h"
 #include "bytecaskdb_txn.h"
+#include "bytecask_view.h"
 
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 
 namespace bytecaskdb {
 
+// Holder for the engine instance. `bytecask::DB` is non-copyable AND
+// non-moveable (relies on mandatory copy elision in `DB::open`), so it cannot
+// live inside `std::unique_ptr` or `std::optional` directly. Wrapping it in a
+// struct whose constructor performs the open allows us to manage its lifetime
+// through `std::unique_ptr<DBHolder>` instead.
+struct DBHolder {
+  bytecask::DB db;
+  DBHolder(const std::string &dir, bytecask::Options opts)
+      : db{bytecask::DB::open(dir, std::move(opts))} {}
+};
+
 // Definitions for the globals declared extern in ha_bytecaskdb.h.
-bytecask_db_t *g_db           = nullptr;
-handlerton    *bytecaskdb_hton = nullptr;
+std::unique_ptr<DBHolder>      g_db_owner;
+bytecask::DB                  *g_db           = nullptr;
+handlerton                    *bytecaskdb_hton = nullptr;
 
 // ---------------------------------------------------------------------------
 // Persistent catalog — in-memory caches rebuilt at startup.
@@ -40,51 +55,29 @@ static std::mutex                          s_catalog_mu;
 static std::map<std::string, uint32_t>     s_name_to_id;
 static std::map<uint32_t, TableMeta>       s_id_to_meta;
 
-// Rebuilds the in-memory caches by scanning the catalog key range and reading
-// the counter key.  Called once during plugin init.
-static bool catalog_init(bytecask_db_t *db) {
-  // Scan all table metadata entries.
+// Rebuilds the in-memory caches by scanning the catalog key range. Called
+// once during plugin init.
+static bool catalog_init(bytecask::DB *db) {
   auto [lower, upper] = table_meta_scan_bounds();
-  auto *iter = bytecask_iter_open(db, lower.data(), lower.size());
-  if (!iter) {
-    fprintf(stderr, "[ha_bytecaskdb] Failed to open catalog iterator: %s\n",
-            bytecask_errmsg());
+  try {
+    for (auto &[k, v] : db->iter_from({}, as_view(lower.data(), lower.size()))) {
+      // Stop if past the upper bound.
+      const auto *kp = u8_data(k);
+      if (k.size() < upper.size() ||
+          std::memcmp(kp, upper.data(), upper.size()) >= 0) {
+        break;
+      }
+
+      TableMeta meta;
+      if (deserialize_table_meta(u8_data(v), v.size(), meta)) {
+        s_name_to_id.emplace(meta.full_name, meta.table_id);
+        s_id_to_meta.emplace(meta.table_id, std::move(meta));
+      }
+    }
+  } catch (const std::exception &e) {
+    fprintf(stderr, "[ha_bytecaskdb] Catalog scan failed: %s\n", e.what());
     return false;
   }
-
-  while (bytecask_iter_valid(iter)) {
-    uint8_t *key = nullptr;
-    std::size_t key_len = 0;
-    if (bytecask_iter_key(iter, &key, &key_len) != 0) {
-      break;
-    }
-
-    // Stop if we've passed the upper bound.
-    if (key_len < upper.size() ||
-        std::memcmp(key, upper.data(), upper.size()) >= 0) {
-      bytecask_free_buf(key);
-      break;
-    }
-
-    uint8_t *val = nullptr;
-    std::size_t val_len = 0;
-    if (bytecask_iter_value(iter, &val, &val_len) != 0) {
-      bytecask_free_buf(key);
-      break;
-    }
-
-    TableMeta meta;
-    if (deserialize_table_meta(val, val_len, meta)) {
-      s_name_to_id.emplace(meta.full_name, meta.table_id);
-      s_id_to_meta.emplace(meta.table_id, std::move(meta));
-    }
-
-    bytecask_free_buf(key);
-    bytecask_free_buf(val);
-    bytecask_iter_next(iter);
-  }
-
-  bytecask_iter_free(iter);
 
   fprintf(stderr, "[ha_bytecaskdb] Catalog loaded: %zu tables\n",
           s_name_to_id.size());
@@ -92,60 +85,62 @@ static bool catalog_init(bytecask_db_t *db) {
 }
 
 // Allocates a new table_id atomically using a snapshot + write plan with
-// ensure_unchanged on the counter key.  Retries on conflict.
-uint32_t catalog_alloc_table_id(bytecask_db_t *db) {
+// auto-conflict detection on the counter key. Retries on conflict.
+uint32_t catalog_alloc_table_id(bytecask::DB *db) {
   auto ckey = counter_key(kCounterTableId);
 
   for (;;) {
-    auto *snap = bytecask_snapshot(db);
-    if (!snap) {
-      return 0;
-    }
+    bytecask::Snapshot snap = db->snapshot();
 
-    // Read current counter from snapshot.
-    uint8_t *val = nullptr;
-    std::size_t val_len = 0;
+    bytecask::Bytes val;
     uint64_t current_id = 0;
-    int rc = bytecask_snapshot_get(snap, ckey.data(), ckey.size(),
-                                   &val, &val_len);
-    if (rc == 1) {
-      current_id = decode_counter_value(val, val_len);
-      bytecask_free_buf(val);
-    } else if (rc < 0) {
-      bytecask_snapshot_free(snap);
+    try {
+      if (snap.get({}, as_view(ckey.data(), ckey.size()), val)) {
+        current_id = decode_counter_value(u8_data(val), val.size());
+      }
+    } catch (const std::exception &e) {
+      fprintf(stderr, "[ha_bytecaskdb] alloc_table_id read failed: %s\n",
+              e.what());
       return 0;
     }
 
     uint64_t new_id = current_id + 1;
     auto new_val = encode_counter_value(new_id);
 
-    auto *plan = bytecask_write_plan_new_with_snapshot(snap);
-    // snap is consumed — don't free it.
-    bytecask_write_plan_put(plan, ckey.data(), ckey.size(),
-                            new_val.data(), new_val.size());
+    bytecask::WritePlan plan{std::move(snap)};
+    plan.put(as_view(ckey.data(), ckey.size()),
+             as_view(new_val.data(), new_val.size()));
 
-    int result = bytecask_apply_batch(db, plan, /*sync=*/1);
-    if (result == 1) {
-      // Committed.
-      return static_cast<uint32_t>(new_id);
-    }
-    if (result < 0) {
+    bool committed = false;
+    try {
+      committed = db->apply_batch(bytecask::WriteOptions{.sync = true},
+                                  std::move(plan));
+    } catch (const std::exception &e) {
+      fprintf(stderr, "[ha_bytecaskdb] alloc_table_id apply failed: %s\n",
+              e.what());
       return 0;
     }
-    // result == 0: conflict, retry.
+
+    if (committed) {
+      return static_cast<uint32_t>(new_id);
+    }
+    // conflict: retry
   }
 }
 
 // Persists table metadata and updates in-memory caches.
-bool catalog_put_table_meta(bytecask_db_t *db, const TableMeta &meta,
+bool catalog_put_table_meta(bytecask::DB *db, const TableMeta &meta,
                             const char *name) {
   auto normalized = normalize_table_name(name);
   auto key = table_meta_key(name);
   auto val = serialize_table_meta(meta);
 
-  int rc = bytecask_put(db, key.data(), key.size(),
-                        val.data(), val.size(), /*sync=*/1);
-  if (rc != 0) {
+  try {
+    db->put(bytecask::WriteOptions{.sync = true},
+            as_view(key.data(), key.size()),
+            as_view(val.data(), val.size()));
+  } catch (const std::exception &e) {
+    fprintf(stderr, "[ha_bytecaskdb] put_table_meta failed: %s\n", e.what());
     return false;
   }
 
@@ -156,12 +151,16 @@ bool catalog_put_table_meta(bytecask_db_t *db, const TableMeta &meta,
 }
 
 // Deletes table metadata and updates in-memory caches.
-bool catalog_delete_table_meta(bytecask_db_t *db, const char *name) {
+bool catalog_delete_table_meta(bytecask::DB *db, const char *name) {
   auto normalized = normalize_table_name(name);
   auto key = table_meta_key(name);
 
-  int rc = bytecask_del(db, key.data(), key.size(), /*sync=*/1);
-  if (rc < 0) {
+  try {
+    (void)db->del(bytecask::WriteOptions{.sync = true},
+                  as_view(key.data(), key.size()));
+  } catch (const std::exception &e) {
+    fprintf(stderr, "[ha_bytecaskdb] delete_table_meta failed: %s\n",
+            e.what());
     return false;
   }
 
@@ -187,39 +186,49 @@ void catalog_evict_from_cache(const char *name) {
 }
 
 // Atomically renames table metadata: deletes old key, inserts new key.
-bool catalog_rename_table_meta(bytecask_db_t *db,
+bool catalog_rename_table_meta(bytecask::DB *db,
                                const char *from, const char *to) {
   auto old_normalized = normalize_table_name(from);
   auto new_normalized = normalize_table_name(to);
   auto old_key = table_meta_key(from);
   auto new_key = table_meta_key(to);
 
-  // Read the existing metadata.
-  uint8_t *val = nullptr;
-  std::size_t val_len = 0;
-  int rc = bytecask_get(db, old_key.data(), old_key.size(), &val, &val_len);
-  if (rc != 1) {
+  // Read existing metadata.
+  bytecask::Bytes val;
+  try {
+    if (!db->get({}, as_view(old_key.data(), old_key.size()), val)) {
+      return false;
+    }
+  } catch (const std::exception &e) {
+    fprintf(stderr, "[ha_bytecaskdb] rename_table_meta read failed: %s\n",
+            e.what());
     return false;
   }
 
-  // Deserialize, update the full_name, re-serialize.
   TableMeta meta;
-  if (!deserialize_table_meta(val, val_len, meta)) {
-    bytecask_free_buf(val);
+  if (!deserialize_table_meta(u8_data(val), val.size(), meta)) {
     return false;
   }
-  bytecask_free_buf(val);
 
   meta.full_name = new_normalized;
   auto new_val = serialize_table_meta(meta);
 
   // Atomic: delete old + put new.
-  auto *plan = bytecask_write_plan_new();
-  bytecask_write_plan_del(plan, old_key.data(), old_key.size());
-  bytecask_write_plan_put(plan, new_key.data(), new_key.size(),
-                          new_val.data(), new_val.size());
-  int result = bytecask_apply_batch(db, plan, /*sync=*/1);
-  if (result != 1) {
+  bytecask::WritePlan plan;
+  plan.del(as_view(old_key.data(), old_key.size()));
+  plan.put(as_view(new_key.data(), new_key.size()),
+           as_view(new_val.data(), new_val.size()));
+
+  bool committed = false;
+  try {
+    committed = db->apply_batch(bytecask::WriteOptions{.sync = true},
+                                std::move(plan));
+  } catch (const std::exception &e) {
+    fprintf(stderr, "[ha_bytecaskdb] rename_table_meta apply failed: %s\n",
+            e.what());
+    return false;
+  }
+  if (!committed) {
     return false;
   }
 
@@ -325,18 +334,22 @@ static int bytecaskdb_init(void *p) {
   // Open the global database inside MariaDB's data directory.
   std::string db_path = std::string(mysql_real_data_home) + "bytecaskdb";
 
-  g_db = bytecask_open(db_path.c_str(), /*recovery_threads=*/4);
-  if (!g_db) {
-    const char *err = bytecask_errmsg();
+  bytecask::Options opts;
+  opts.recovery_threads = 4;
+
+  try {
+    g_db_owner = std::make_unique<DBHolder>(db_path, opts);
+    g_db = &g_db_owner->db;
+  } catch (const std::exception &e) {
     fprintf(stderr, "[ha_bytecaskdb] Failed to open global DB at '%s': %s\n",
-            db_path.c_str(), err ? err : "unknown error");
+            db_path.c_str(), e.what());
     return 1;
   }
 
   if (!catalog_init(g_db)) {
     fprintf(stderr, "[ha_bytecaskdb] Failed to initialize catalog\n");
-    bytecask_close(g_db);
     g_db = nullptr;
+    g_db_owner.reset();
     return 1;
   }
 
@@ -346,10 +359,8 @@ static int bytecaskdb_init(void *p) {
 }
 
 static int bytecaskdb_deinit(void * /*p*/) {
-  if (g_db) {
-    bytecask_close(g_db);
-    g_db = nullptr;
-  }
+  g_db = nullptr;
+  g_db_owner.reset();
   // Clear caches.
   std::lock_guard<std::mutex> lk{s_catalog_mu};
   s_name_to_id.clear();

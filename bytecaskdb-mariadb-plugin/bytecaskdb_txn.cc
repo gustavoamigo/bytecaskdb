@@ -20,16 +20,9 @@ namespace bytecaskdb {
 // MariaDBTxn lifecycle
 // ---------------------------------------------------------------------------
 
-MariaDBTxn::~MariaDBTxn() {
-  if (snap_) {
-    bytecask_snapshot_free(snap_);
-    snap_ = nullptr;
-  }
-}
-
 void MariaDBTxn::begin_if_needed(THD *thd, handlerton *hton) {
   if (!snap_) {
-    snap_ = bytecask_snapshot(db_);
+    snap_.emplace(db_->snapshot());
   }
 
   bool multi = thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
@@ -73,8 +66,7 @@ void MariaDBTxn::buffer_del(const uint8_t *key, size_t klen) {
 // RYOW reads
 // ---------------------------------------------------------------------------
 
-int MariaDBTxn::get(const uint8_t *key, size_t klen,
-                    uint8_t **out_val, size_t *out_val_len) {
+int MariaDBTxn::get(const uint8_t *key, size_t klen, bytecask::Bytes &out) {
   // Check buffer first.
   std::vector<uint8_t> k(key, key + klen);
   auto it = lookup_.find(k);
@@ -84,17 +76,18 @@ int MariaDBTxn::get(const uint8_t *key, size_t klen,
       return 0;
     }
     const auto &val = it->second.value();
-    auto *buf = static_cast<uint8_t *>(malloc(val.size()));
-    if (!buf) { return -1; }
-    std::memcpy(buf, val.data(), val.size());
-    *out_val = buf;
-    *out_val_len = val.size();
+    out.assign(reinterpret_cast<const std::byte *>(val.data()),
+               reinterpret_cast<const std::byte *>(val.data() + val.size()));
     return 1;
   }
 
   // Fall through to snapshot.
   if (!snap_) { return -1; }
-  return bytecask_snapshot_get(snap_, key, klen, out_val, out_val_len);
+  try {
+    return snap_->get({}, as_view(key, klen), out) ? 1 : 0;
+  } catch (...) {
+    return -1;
+  }
 }
 
 bool MariaDBTxn::exists(const uint8_t *key, size_t klen) {
@@ -105,89 +98,102 @@ bool MariaDBTxn::exists(const uint8_t *key, size_t klen) {
   }
 
   if (!snap_) { return false; }
-  return bytecask_snapshot_contains_key(snap_, key, klen) == 1;
+  try {
+    return snap_->contains_key({}, as_view(key, klen));
+  } catch (...) {
+    return false;
+  }
 }
+
+// Helpers to extract a single iterator from a subrange<It, sentinel> by
+// moving its begin(). We can do this safely because the underlying iterator
+// is the only stateful piece — the sentinel is either default_sentinel_t
+// (forward) or another iterator value (reverse).
 
 std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_prefix(
     const uint8_t *lo, size_t lo_len,
     const uint8_t *hi, size_t hi_len,
     uint32_t table_id) {
-  // Open snapshot iterator at lo.
-  bytecask_iter_t *snap_iter = nullptr;
+  std::optional<bytecask::EntryIterator> snap_it;
   if (snap_) {
-    snap_iter = bytecask_snapshot_iter_open(snap_, lo, lo_len);
+    auto range = snap_->iter_from({}, as_view(lo, lo_len));
+    snap_it.emplace(std::move(range.begin()));
   }
 
-  // Find first buffer entry >= lo.
   std::vector<uint8_t> lo_vec(lo, lo + lo_len);
   std::vector<uint8_t> hi_vec(hi, hi + hi_len);
   auto buf_it = lookup_.lower_bound(lo_vec);
 
   return std::make_unique<MergeIterator>(
-      snap_iter, buf_it, lookup_.end(), std::move(hi_vec), table_id);
+      std::move(snap_it), buf_it, lookup_.end(), std::move(hi_vec), table_id);
 }
 
 std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_index_prefix(
     const uint8_t *lo, size_t lo_len,
     const uint8_t *hi, size_t hi_len,
     uint32_t table_id, uint16_t index_id) {
-  // Open snapshot iterator at lo.
-  bytecask_iter_t *snap_iter = nullptr;
+  std::optional<bytecask::EntryIterator> snap_it;
   if (snap_) {
-    snap_iter = bytecask_snapshot_iter_open(snap_, lo, lo_len);
+    auto range = snap_->iter_from({}, as_view(lo, lo_len));
+    snap_it.emplace(std::move(range.begin()));
   }
 
-  // Find first buffer entry >= lo.
   std::vector<uint8_t> lo_vec(lo, lo + lo_len);
   std::vector<uint8_t> hi_vec(hi, hi + hi_len);
   auto buf_it = lookup_.lower_bound(lo_vec);
 
   return std::make_unique<MergeIterator>(
-      snap_iter, buf_it, lookup_.end(), std::move(hi_vec), table_id, index_id);
+      std::move(snap_it), buf_it, lookup_.end(), std::move(hi_vec),
+      table_id, index_id);
 }
 
 std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_index_prefix(
     const uint8_t *hi, size_t hi_len,
     const uint8_t *lo, size_t lo_len,
     uint32_t table_id, uint16_t index_id) {
-  // Open reverse snapshot iterator at hi.
-  bytecask_iter_t *snap_iter = nullptr;
+  std::optional<bytecask::ReverseEntryIterator> snap_it;
+  bytecask::ReverseEntryIterator snap_end{};
   if (snap_) {
-    snap_iter = bytecask_snapshot_riter_open(snap_, hi, hi_len);
+    auto range = snap_->riter_from({}, as_view(hi, hi_len));
+    snap_end = range.end();
+    snap_it.emplace(std::move(range.begin()));
   }
 
-  // Find last buffer entry <= hi (reverse iteration).
   std::vector<uint8_t> lo_vec(lo, lo + lo_len);
   std::vector<uint8_t> hi_vec(hi, hi + hi_len);
   auto buf_it = lookup_.upper_bound(hi_vec);
   if (buf_it != lookup_.begin()) {
-    --buf_it;  // Move to last entry <= hi
+    --buf_it;
   }
 
   return std::make_unique<MergeIterator>(
-      snap_iter, buf_it, lookup_.end(), std::move(lo_vec), table_id, index_id);
+      std::move(snap_it), std::move(snap_end),
+      buf_it, lookup_.end(), std::move(lo_vec),
+      table_id, index_id);
 }
 
 std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
     const uint8_t *hi, size_t hi_len,
     const uint8_t *lo, size_t lo_len,
     uint32_t table_id) {
-  // Open reverse snapshot iterator at hi.
-  bytecask_iter_t *snap_iter = nullptr;
+  std::optional<bytecask::ReverseEntryIterator> snap_it;
+  bytecask::ReverseEntryIterator snap_end{};
   if (snap_) {
-    snap_iter = bytecask_snapshot_riter_open(snap_, hi, hi_len);
+    auto range = snap_->riter_from({}, as_view(hi, hi_len));
+    snap_end = range.end();
+    snap_it.emplace(std::move(range.begin()));
   }
 
-  // Find last buffer entry <= hi (reverse iteration).
   std::vector<uint8_t> lo_vec(lo, lo + lo_len);
   std::vector<uint8_t> hi_vec(hi, hi + hi_len);
   auto buf_it = lookup_.upper_bound(hi_vec);
   if (buf_it != lookup_.begin()) {
-    --buf_it;  // Move to last entry <= hi
+    --buf_it;
   }
 
   return std::make_unique<MergeIterator>(
-      snap_iter, buf_it, lookup_.end(), std::move(lo_vec), table_id);
+      std::move(snap_it), std::move(snap_end),
+      buf_it, lookup_.end(), std::move(lo_vec), table_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,35 +214,31 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
   }
 
   // Build WritePlan from snapshot + replay ops in insertion order.
-  auto *plan = bytecask_write_plan_new_with_snapshot(snap_);
-  snap_ = nullptr;  // consumed by the plan
+  bytecask::WritePlan plan{std::move(*snap_)};
+  snap_.reset();
 
   for (const auto &op : ops_) {
     switch (op.kind) {
     case Op::Put:
-      bytecask_write_plan_put(plan, op.key.data(), op.key.size(),
-                              op.val.data(), op.val.size());
+      plan.put(as_view(op.key), as_view(op.val));
       break;
     case Op::Del:
-      bytecask_write_plan_del(plan, op.key.data(), op.key.size());
+      plan.del(as_view(op.key));
       break;
     }
   }
 
-  int rc = bytecask_apply_batch(db_, plan, /*sync=*/1);
-  // plan is consumed regardless of outcome.
+  bool committed = false;
+  try {
+    committed = db_->apply_batch(bytecask::WriteOptions{.sync = true},
+                                 std::move(plan));
+  } catch (...) {
+    reset();
+    return HA_ERR_INTERNAL_ERROR;
+  }
 
-  if (rc == 1) {
-    reset();
-    return 0;
-  }
-  if (rc == 0) {
-    reset();
-    return HA_ERR_LOCK_DEADLOCK;
-  }
-  // rc < 0
   reset();
-  return HA_ERR_INTERNAL_ERROR;
+  return committed ? 0 : HA_ERR_LOCK_DEADLOCK;
 }
 
 void MariaDBTxn::rollback(THD * /*thd*/, bool all) {
@@ -251,10 +253,7 @@ void MariaDBTxn::rollback(THD * /*thd*/, bool all) {
 }
 
 void MariaDBTxn::reset() {
-  if (snap_) {
-    bytecask_snapshot_free(snap_);
-    snap_ = nullptr;
-  }
+  snap_.reset();
   ops_.clear();
   lookup_.clear();
   registered_stmt_ = false;
@@ -263,123 +262,162 @@ void MariaDBTxn::reset() {
 
 // ---------------------------------------------------------------------------
 // MergeIterator
+//
+// The buffer side always walks forward (matches the pre-migration C-API
+// implementation). The snapshot side is forward (EntryIterator) or reverse
+// (ReverseEntryIterator) depending on which constructor was used.
 // ---------------------------------------------------------------------------
 
 MariaDBTxn::MergeIterator::MergeIterator(
-    bytecask_iter_t *snap_iter,
+    std::optional<bytecask::EntryIterator> snap_it,
     LookupMap::const_iterator buf_it,
     LookupMap::const_iterator buf_end,
     std::vector<uint8_t> hi,
     uint32_t table_id)
-    : snap_iter_(snap_iter),
+    : snap_fwd_(std::move(snap_it)),
+      reverse_(false),
       buf_it_(buf_it),
       buf_end_(buf_end),
-      hi_(std::move(hi)),
+      bound_(std::move(hi)),
       table_id_(table_id) {
-  // Load initial snapshot position.
   load_snap_current();
-  // Advance to the first valid merged entry.
   advance();
 }
 
 MariaDBTxn::MergeIterator::MergeIterator(
-    bytecask_iter_t *snap_iter,
+    std::optional<bytecask::EntryIterator> snap_it,
     LookupMap::const_iterator buf_it,
     LookupMap::const_iterator buf_end,
     std::vector<uint8_t> hi,
     uint32_t table_id, uint16_t index_id)
-    : snap_iter_(snap_iter),
+    : snap_fwd_(std::move(snap_it)),
+      reverse_(false),
       buf_it_(buf_it),
       buf_end_(buf_end),
-      hi_(std::move(hi)),
+      bound_(std::move(hi)),
       table_id_(table_id),
       index_id_(index_id),
       use_index_filter_(true) {
-  // Load initial snapshot position.
   load_snap_current();
-  // Advance to the first valid merged entry.
   advance();
 }
 
-MariaDBTxn::MergeIterator::~MergeIterator() {
-  if (snap_iter_) {
-    bytecask_iter_free(snap_iter_);
-  }
+MariaDBTxn::MergeIterator::MergeIterator(
+    std::optional<bytecask::ReverseEntryIterator> snap_it,
+    bytecask::ReverseEntryIterator snap_end,
+    LookupMap::const_iterator buf_it,
+    LookupMap::const_iterator buf_end,
+    std::vector<uint8_t> lo,
+    uint32_t table_id)
+    : snap_rev_(std::move(snap_it)),
+      snap_rev_end_(std::move(snap_end)),
+      reverse_(true),
+      buf_it_(buf_it),
+      buf_end_(buf_end),
+      bound_(std::move(lo)),
+      table_id_(table_id) {
+  load_snap_current();
+  advance();
+}
+
+MariaDBTxn::MergeIterator::MergeIterator(
+    std::optional<bytecask::ReverseEntryIterator> snap_it,
+    bytecask::ReverseEntryIterator snap_end,
+    LookupMap::const_iterator buf_it,
+    LookupMap::const_iterator buf_end,
+    std::vector<uint8_t> lo,
+    uint32_t table_id, uint16_t index_id)
+    : snap_rev_(std::move(snap_it)),
+      snap_rev_end_(std::move(snap_end)),
+      reverse_(true),
+      buf_it_(buf_it),
+      buf_end_(buf_end),
+      bound_(std::move(lo)),
+      table_id_(table_id),
+      index_id_(index_id),
+      use_index_filter_(true) {
+  load_snap_current();
+  advance();
 }
 
 void MariaDBTxn::MergeIterator::next() {
   advance();
 }
 
+bool MariaDBTxn::MergeIterator::snap_at_end() const {
+  if (!reverse_) {
+    if (!snap_fwd_) return true;
+    return *snap_fwd_ == std::default_sentinel;
+  }
+  if (!snap_rev_ || !snap_rev_end_) return true;
+  return *snap_rev_ == *snap_rev_end_;
+}
+
+void MariaDBTxn::MergeIterator::snap_step() {
+  if (!reverse_ && snap_fwd_) {
+    ++(*snap_fwd_);
+  } else if (reverse_ && snap_rev_) {
+    ++(*snap_rev_);
+  }
+}
+
 void MariaDBTxn::MergeIterator::load_snap_current() {
   snap_valid_ = false;
-  if (!snap_iter_ || !bytecask_iter_valid(snap_iter_)) {
-    return;
-  }
 
-  uint8_t *key_buf = nullptr;
-  size_t key_len = 0;
-  if (bytecask_iter_key(snap_iter_, &key_buf, &key_len) != 0) {
-    return;
-  }
+  if (snap_at_end()) return;
 
-  // Check if key belongs to this table (within [lo, hi) range).
+  const std::pair<bytecask::Bytes, bytecask::Bytes> *kv = nullptr;
+  if (!reverse_) {
+    kv = &(**snap_fwd_);
+  } else {
+    kv = &(**snap_rev_);
+  }
+  const auto *kp = u8_data(kv->first);
+  const auto klen = kv->first.size();
+
   if (use_index_filter_) {
-    if (!key_belongs_to_index(key_buf, key_len, table_id_, index_id_)) {
-      bytecask_free_buf(key_buf);
+    if (!key_belongs_to_index(kp, klen, table_id_, index_id_)) {
       return;
     }
   } else {
-    if (!key_belongs_to_table(key_buf, key_len, table_id_)) {
-      bytecask_free_buf(key_buf);
+    if (!key_belongs_to_table(kp, klen, table_id_)) {
       return;
     }
   }
 
-  // Check upper bound.
-  if (!hi_.empty() &&
-      (key_len >= hi_.size() &&
-       std::memcmp(key_buf, hi_.data(), hi_.size()) >= 0)) {
-    bytecask_free_buf(key_buf);
-    return;
+  // Forward: stop when key >= hi (bound_).
+  // Reverse: don't enforce the lower bound here (matches pre-migration
+  // behavior; row encoding already prefixes by table id).
+  if (!reverse_ && !bound_.empty()) {
+    if (klen >= bound_.size() &&
+        std::memcmp(kp, bound_.data(), bound_.size()) >= 0) {
+      return;
+    }
   }
 
-  snap_key_.assign(key_buf, key_buf + key_len);
-  bytecask_free_buf(key_buf);
-
-  uint8_t *val_buf = nullptr;
-  size_t val_len = 0;
-  if (bytecask_iter_value(snap_iter_, &val_buf, &val_len) != 0) {
-    return;
-  }
-  snap_val_.assign(val_buf, val_buf + val_len);
-  bytecask_free_buf(val_buf);
-
+  snap_key_.assign(kp, kp + klen);
+  snap_val_.assign(u8_data(kv->second),
+                   u8_data(kv->second) + kv->second.size());
   snap_valid_ = true;
-}
-
-bool MariaDBTxn::MergeIterator::snap_in_range() const {
-  return snap_valid_;
 }
 
 void MariaDBTxn::MergeIterator::advance() {
   valid_ = false;
 
   for (;;) {
-    // Check if buffer entry is in range.
     bool buf_valid = (buf_it_ != buf_end_);
-    if (buf_valid && !hi_.empty()) {
+    if (buf_valid && !reverse_ && !bound_.empty()) {
       const auto &bk = buf_it_->first;
-      if (bk.size() >= hi_.size() &&
-          std::memcmp(bk.data(), hi_.data(), hi_.size()) >= 0) {
+      if (bk.size() >= bound_.size() &&
+          std::memcmp(bk.data(), bound_.data(), bound_.size()) >= 0) {
         buf_valid = false;
       }
     }
-    // Also check table membership for buffer keys.
     if (buf_valid) {
       if (use_index_filter_) {
         if (!key_belongs_to_index(buf_it_->first.data(),
-                                  buf_it_->first.size(), table_id_, index_id_)) {
+                                  buf_it_->first.size(),
+                                  table_id_, index_id_)) {
           buf_valid = false;
         }
       } else {
@@ -391,12 +429,10 @@ void MariaDBTxn::MergeIterator::advance() {
     }
 
     if (!snap_valid_ && !buf_valid) {
-      // Both exhausted.
       return;
     }
 
     if (!snap_valid_ && buf_valid) {
-      // Only buffer has data.
       if (buf_it_->second.has_value()) {
         cur_key_ = buf_it_->first;
         cur_val_ = buf_it_->second.value();
@@ -404,16 +440,14 @@ void MariaDBTxn::MergeIterator::advance() {
         valid_ = true;
         return;
       }
-      // Tombstone — skip.
       ++buf_it_;
       continue;
     }
 
     if (snap_valid_ && !buf_valid) {
-      // Only snapshot has data.
       cur_key_ = snap_key_;
       cur_val_ = snap_val_;
-      bytecask_iter_next(snap_iter_);
+      snap_step();
       load_snap_current();
       valid_ = true;
       return;
@@ -426,7 +460,6 @@ void MariaDBTxn::MergeIterator::advance() {
                   : (bk < snap_key_ ? -1 : 1);
 
     if (cmp < 0) {
-      // Buffer key is smaller.
       if (buf_it_->second.has_value()) {
         cur_key_ = bk;
         cur_val_ = buf_it_->second.value();
@@ -434,34 +467,30 @@ void MariaDBTxn::MergeIterator::advance() {
         valid_ = true;
         return;
       }
-      // Tombstone — skip buffer entry.
       ++buf_it_;
       continue;
     }
 
     if (cmp == 0) {
-      // Equal keys — buffer wins.
       bool has_val = buf_it_->second.has_value();
       if (has_val) {
         cur_key_ = bk;
         cur_val_ = buf_it_->second.value();
       }
-      // Advance both.
       ++buf_it_;
-      bytecask_iter_next(snap_iter_);
+      snap_step();
       load_snap_current();
       if (has_val) {
         valid_ = true;
         return;
       }
-      // Tombstone — skip both, continue loop.
       continue;
     }
 
-    // cmp > 0: snapshot key is smaller.
+    // cmp > 0
     cur_key_ = snap_key_;
     cur_val_ = snap_val_;
-    bytecask_iter_next(snap_iter_);
+    snap_step();
     load_snap_current();
     valid_ = true;
     return;

@@ -5,20 +5,65 @@
 //
 // Tests the transaction buffer, RYOW semantics, commit/rollback behavior,
 // and MergeIterator functionality without requiring a full MariaDB server.
+//
+// NOTE: This file is not currently built by CMakeLists.txt. It exercises
+// the real MariaDBTxn class and therefore requires a real bytecask::DB
+// (opened in a temp directory) when wired in. The opaque pointer below
+// is a placeholder that mirrors the constructor's signature; do not enable
+// this target without supplying a real DB instance.
 
-#include "bytecask_c_stubs.h"  // Must be included first for C API stubs
 #include "mariadb_stubs.h"     // MariaDB type stubs
-
+#include "bytecask.hpp"
 #include "bytecaskdb_txn.h"
 #include "catalog.h"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <memory>
+#include <string>
+#include <system_error>
 #include <vector>
+#include <unistd.h>
 
 using namespace bytecaskdb;
+
+namespace {
+
+// RAII helper: opens a real bytecask::DB in a temp directory; removes it on dtor.
+// `bytecask::DB` is non-moveable, so we wrap it in a holder struct (which can
+// initialise the DB via member-init) and own that through unique_ptr.
+struct DBHolder {
+  bytecask::DB db;
+  explicit DBHolder(const std::filesystem::path &dir)
+      : db{bytecask::DB::open(dir)} {}
+};
+
+class TempDB {
+public:
+  TempDB() {
+    static std::atomic<int> counter{0};
+    path_ = std::filesystem::temp_directory_path() /
+            ("bcdb_txn_test_" + std::to_string(::getpid()) +
+             "_" + std::to_string(counter.fetch_add(1)));
+    std::filesystem::remove_all(path_);
+    std::filesystem::create_directories(path_);
+    holder_ = std::make_unique<DBHolder>(path_);
+  }
+  ~TempDB() {
+    holder_.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(path_, ec);
+  }
+  bytecask::DB* db() { return &holder_->db; }
+private:
+  std::filesystem::path path_;
+  std::unique_ptr<DBHolder> holder_;
+};
+
+}  // namespace
 
 // =========================================================================
 // Test Fixtures
@@ -26,13 +71,10 @@ using namespace bytecaskdb;
 
 class MariaDBTxnFixture {
 public:
-  MariaDBTxnFixture() {
-    // Create a mock database handle
-    db_ = reinterpret_cast<bytecask_db_t*>(0x12345678);
-  }
+  MariaDBTxnFixture() = default;
 
   std::unique_ptr<MariaDBTxn> create_txn() {
-    return std::make_unique<MariaDBTxn>(db_);
+    return std::make_unique<MariaDBTxn>(temp_db_.db());
   }
 
   // Helper to create test key-value pairs
@@ -45,7 +87,7 @@ public:
   }
 
 protected:
-  bytecask_db_t* db_;
+  TempDB temp_db_;
 };
 
 // =========================================================================
@@ -85,16 +127,12 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn write buffering", "[txn][buffer]
     txn->buffer_put(key1.data(), key1.size(), val1.data(), val1.size());
 
     // Should be able to read back the value
-    uint8_t* out_val = nullptr;
-    size_t out_val_len = 0;
-
-    int result = txn->get(key1.data(), key1.size(), &out_val, &out_val_len);
+    bytecask::Bytes out_val;
+    int result = txn->get(key1.data(), key1.size(), out_val);
 
     REQUIRE(result == 1);  // Found
-    REQUIRE(out_val_len == val1.size());
-    REQUIRE(std::memcmp(out_val, val1.data(), val1.size()) == 0);
-
-    free(out_val);
+    REQUIRE(out_val.size() == val1.size());
+    REQUIRE(std::memcmp(out_val.data(), val1.data(), val1.size()) == 0);
   }
 
   SECTION("buffer_del creates tombstone") {
@@ -107,9 +145,8 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn write buffering", "[txn][buffer]
     REQUIRE_FALSE(txn->exists(key1.data(), key1.size()));
 
     // get() should return not found
-    uint8_t* out_val = nullptr;
-    size_t out_val_len = 0;
-    int result = txn->get(key1.data(), key1.size(), &out_val, &out_val_len);
+    bytecask::Bytes out_val;
+    int result = txn->get(key1.data(), key1.size(), out_val);
     REQUIRE(result == 0);  // Not found
   }
 
@@ -125,15 +162,12 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn write buffering", "[txn][buffer]
     txn->buffer_put(key1.data(), key1.size(), val1_new.data(), val1_new.size());
 
     // Should see the new value
-    uint8_t* out_val = nullptr;
-    size_t out_val_len = 0;
-    int result = txn->get(key1.data(), key1.size(), &out_val, &out_val_len);
+    bytecask::Bytes out_val;
+    int result = txn->get(key1.data(), key1.size(), out_val);
 
     REQUIRE(result == 1);
-    REQUIRE(out_val_len == val1_new.size());
-    REQUIRE(std::memcmp(out_val, val1_new.data(), val1_new.size()) == 0);
-
-    free(out_val);
+    REQUIRE(out_val.size() == val1_new.size());
+    REQUIRE(std::memcmp(out_val.data(), val1_new.data(), val1_new.size()) == 0);
   }
 }
 
@@ -163,15 +197,12 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn RYOW semantics", "[txn][ryow]") 
   SECTION("get() returns buffered value") {
     txn->buffer_put(key.data(), key.size(), val.data(), val.size());
 
-    uint8_t* out_val = nullptr;
-    size_t out_val_len = 0;
-    int result = txn->get(key.data(), key.size(), &out_val, &out_val_len);
+    bytecask::Bytes out_val;
+    int result = txn->get(key.data(), key.size(), out_val);
 
     REQUIRE(result == 1);  // Found
-    REQUIRE(out_val_len == val.size());
-    REQUIRE(std::memcmp(out_val, val.data(), val.size()) == 0);
-
-    free(out_val);
+    REQUIRE(out_val.size() == val.size());
+    REQUIRE(std::memcmp(out_val.data(), val.data(), val.size()) == 0);
   }
 
   SECTION("exists() returns false after buffer_del") {
@@ -204,9 +235,8 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn isolation between transactions",
     // txn2 should not see it
     REQUIRE_FALSE(txn2->exists(key.data(), key.size()));
 
-    uint8_t* out_val = nullptr;
-    size_t out_val_len = 0;
-    int result = txn2->get(key.data(), key.size(), &out_val, &out_val_len);
+    bytecask::Bytes out_val;
+    int result = txn2->get(key.data(), key.size(), out_val);
     REQUIRE(result == 0);  // Not found in txn2
   }
 
@@ -216,21 +246,16 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn isolation between transactions",
     txn2->buffer_put(key.data(), key.size(), val2.data(), val2.size());
 
     // Each should see their own value
-    uint8_t* out_val1 = nullptr;
-    size_t out_val1_len = 0;
-    int result1 = txn1->get(key.data(), key.size(), &out_val1, &out_val1_len);
+    bytecask::Bytes out_val1;
+    int result1 = txn1->get(key.data(), key.size(), out_val1);
 
-    uint8_t* out_val2 = nullptr;
-    size_t out_val2_len = 0;
-    int result2 = txn2->get(key.data(), key.size(), &out_val2, &out_val2_len);
+    bytecask::Bytes out_val2;
+    int result2 = txn2->get(key.data(), key.size(), out_val2);
 
     REQUIRE(result1 == 1);
     REQUIRE(result2 == 1);
-    REQUIRE(std::memcmp(out_val1, val1.data(), val1.size()) == 0);
-    REQUIRE(std::memcmp(out_val2, val2.data(), val2.size()) == 0);
-
-    free(out_val1);
-    free(out_val2);
+    REQUIRE(std::memcmp(out_val1.data(), val1.data(), val1.size()) == 0);
+    REQUIRE(std::memcmp(out_val2.data(), val2.data(), val2.size()) == 0);
   }
 
   SECTION("REGRESSION TEST: simulate multiple write_row calls") {
@@ -291,13 +316,11 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn edge cases", "[txn][edge]") {
   SECTION("get on non-existent key returns 0") {
     auto key = make_key("nonexistent");
 
-    uint8_t* out_val = nullptr;
-    size_t out_val_len = 0;
-    int result = txn->get(key.data(), key.size(), &out_val, &out_val_len);
+    bytecask::Bytes out_val;
+    int result = txn->get(key.data(), key.size(), out_val);
 
     REQUIRE(result == 0);  // Not found
-    REQUIRE(out_val == nullptr);
-    REQUIRE(out_val_len == 0);
+    REQUIRE(out_val.size() == 0);
   }
 
   SECTION("exists on empty key") {
@@ -313,15 +336,13 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn edge cases", "[txn][edge]") {
     REQUIRE(txn->exists(key.data(), key.size()));
 
     // Should be able to retrieve empty value
-    uint8_t* out_val = nullptr;
-    size_t out_val_len = 0;
-    int result = txn->get(key.data(), key.size(), &out_val, &out_val_len);
+    bytecask::Bytes out_val;
+    int result = txn->get(key.data(), key.size(), out_val);
 
     REQUIRE(result == 1);  // Found
-    REQUIRE(out_val_len == 0);
+    REQUIRE(out_val.size() == 0);
 
     if (out_val) {
-      free(out_val);
     }
   }
 
@@ -336,14 +357,11 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn edge cases", "[txn][edge]") {
     txn->buffer_put(key.data(), key.size(), val3.data(), val3.size());
 
     // Should see the last value
-    uint8_t* out_val = nullptr;
-    size_t out_val_len = 0;
-    int result = txn->get(key.data(), key.size(), &out_val, &out_val_len);
+    bytecask::Bytes out_val;
+    int result = txn->get(key.data(), key.size(), out_val);
 
     REQUIRE(result == 1);
-    REQUIRE(out_val_len == val3.size());
-    REQUIRE(std::memcmp(out_val, val3.data(), val3.size()) == 0);
-
-    free(out_val);
+    REQUIRE(out_val.size() == val3.size());
+    REQUIRE(std::memcmp(out_val.data(), val3.data(), val3.size()) == 0);
   }
 }
