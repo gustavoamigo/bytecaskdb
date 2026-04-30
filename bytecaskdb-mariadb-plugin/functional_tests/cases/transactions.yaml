@@ -1,0 +1,111 @@
+# transactions.yaml — Stateful multi-statement transaction tests.
+# Uses the `steps` format so all statements run on the same connection.
+
+- name: BEGIN/COMMIT persists row
+  setup:
+    - DROP DATABASE IF EXISTS txn
+    - CREATE DATABASE txn
+    - CREATE TABLE txn.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO txn.t VALUES (1, 100)
+    - sql: COMMIT
+    - sql: SELECT v FROM txn.t WHERE id = 1
+      expected: [[100]]
+  teardown:
+    - DROP DATABASE IF EXISTS txn
+
+- name: BEGIN/ROLLBACK discards row
+  setup:
+    - DROP DATABASE IF EXISTS txn2
+    - CREATE DATABASE txn2
+    - CREATE TABLE txn2.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO txn2.t VALUES (1, 100)
+    - sql: ROLLBACK
+    - sql: SELECT COUNT(*) FROM txn2.t
+      expected: [['0']]
+  teardown:
+    - DROP DATABASE IF EXISTS txn2
+
+- name: Read-your-own-writes inside transaction
+  setup:
+    - DROP DATABASE IF EXISTS txn3
+    - CREATE DATABASE txn3
+    - CREATE TABLE txn3.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO txn3.t VALUES (42, 999)
+    - sql: SELECT v FROM txn3.t WHERE id = 42
+      expected: [[999]]
+    - sql: ROLLBACK
+    - sql: SELECT COUNT(*) FROM txn3.t
+      expected: [['0']]
+  teardown:
+    - DROP DATABASE IF EXISTS txn3
+
+- name: Autocommit - each statement is immediately visible
+  setup:
+    - DROP DATABASE IF EXISTS txn4
+    - CREATE DATABASE txn4
+    - CREATE TABLE txn4.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO txn4.t VALUES (1, 10)
+  steps:
+    - sql: UPDATE txn4.t SET v = 20 WHERE id = 1
+    - sql: SELECT v FROM txn4.t WHERE id = 1
+      expected: [['20']]
+  teardown:
+    - DROP DATABASE IF EXISTS txn4
+
+- name: Multi-row transaction is all-or-nothing on commit
+  setup:
+    - DROP DATABASE IF EXISTS txn5
+    - CREATE DATABASE txn5
+    - CREATE TABLE txn5.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO txn5.t VALUES (1, 10)
+    - sql: INSERT INTO txn5.t VALUES (2, 20)
+    - sql: INSERT INTO txn5.t VALUES (3, 30)
+    - sql: COMMIT
+    - sql: SELECT COUNT(*) FROM txn5.t
+      expected: [['3']]
+    - sql: SELECT SUM(v) FROM txn5.t
+      expected: [['60']]
+  teardown:
+    - DROP DATABASE IF EXISTS txn5
+
+- name: UPDATE inside transaction visible after commit
+  setup:
+    - DROP DATABASE IF EXISTS txn6
+    - CREATE DATABASE txn6
+    - CREATE TABLE txn6.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO txn6.t VALUES (1, 100)
+  steps:
+    - sql: BEGIN
+    - sql: UPDATE txn6.t SET v = 200 WHERE id = 1
+    - sql: SELECT v FROM txn6.t WHERE id = 1
+      expected: [['200']]
+    - sql: COMMIT
+    - sql: SELECT v FROM txn6.t WHERE id = 1
+      expected: [['200']]
+  teardown:
+    - DROP DATABASE IF EXISTS txn6
+
+- name: DELETE inside transaction rolled back restores row
+  setup:
+    - DROP DATABASE IF EXISTS txn7
+    - CREATE DATABASE txn7
+    - CREATE TABLE txn7.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO txn7.t VALUES (1, 42)
+  steps:
+    - sql: BEGIN
+    - sql: DELETE FROM txn7.t WHERE id = 1
+    - sql: SELECT COUNT(*) FROM txn7.t
+      expected: [['0']]
+    - sql: ROLLBACK
+    - sql: SELECT v FROM txn7.t WHERE id = 1
+      expected: [['42']]
+  teardown:
+    - DROP DATABASE IF EXISTS txn7

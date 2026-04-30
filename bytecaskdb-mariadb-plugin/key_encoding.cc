@@ -104,10 +104,11 @@ std::vector<uint8_t> table_id_upper_bound(uint32_t table_id) {
 }
 
 #ifndef BYTECASKDB_TESTS
-// Fix VARCHAR key encoding by removing length prefixes that break lexicographic order.
-// This is a post-processing step after key_copy() has generated the key.
+// Fix VARCHAR key encoding by removing the 2-byte LE length prefix that key_copy()
+// inserts (HA_KEY_BLOB_LENGTH = 2).  After stripping, the slot holds raw data
+// left-justified with zero padding, giving correct lexicographic ordering.
 // Only compiled when full MariaDB headers are available (not in test builds).
-static void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table, uint active_index) {
+void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table, uint active_index) {
   const KEY &key_info = table->key_info[active_index];
   uint8_t *key_ptr = key_data;
 
@@ -116,23 +117,16 @@ static void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table, uint activ
     Field *field = table->field[kp.fieldnr - 1];
 
     if (field->type() == MYSQL_TYPE_VARCHAR) {
-      // VARCHAR keys start with length prefix - need to remove it for proper ordering
-      // key_copy stores: [length_byte][data...][padding]
+      // key_copy stores a 2-byte LE length prefix (HA_KEY_BLOB_LENGTH = 2).
+      uint16_t length = static_cast<uint16_t>(key_ptr[0]) |
+                        (static_cast<uint16_t>(key_ptr[1]) << 8);
+      if (length > kp.length) length = kp.length;
 
-      uint8_t length = key_ptr[0];  // Length is in the first byte
-
-      if (length > 0) {
-        // Move the actual string data to the beginning (remove length prefix)
-        std::memmove(key_ptr, key_ptr + 1, length);
-      }
-
-      // Pad the rest with zeros for consistent key length
-      if (length < kp.length - 1) {
-        std::memset(key_ptr + length, 0, kp.length - 1 - length);
-      }
+      std::memmove(key_ptr, key_ptr + HA_KEY_BLOB_LENGTH, length);
+      std::memset(key_ptr + length, 0, kp.store_length - length);
     }
 
-    key_ptr += kp.length;
+    key_ptr += kp.store_length;
   }
 }
 #endif
@@ -235,6 +229,11 @@ std::vector<uint8_t> encode_unique_sec_key(TABLE *table, const uchar *buf,
            const_cast<uchar *>(buf),
            const_cast<KEY *>(&key_info),
            sec_key_len);
+
+  // Fix VARCHAR encoding to match the format used by encode_sec_key.
+#ifndef BYTECASKDB_TESTS
+  fix_varchar_key_encoding(key.data() + 7, table, active_index);
+#endif
 
   return key;
 }

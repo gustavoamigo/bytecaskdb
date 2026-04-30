@@ -1,0 +1,110 @@
+# indexes.yaml — Secondary index behavior tests
+
+- name: Range scan with BETWEEN uses index
+  setup:
+    - DROP DATABASE IF EXISTS idx
+    - CREATE DATABASE idx
+    - CREATE TABLE idx.t (id INT PRIMARY KEY, score INT NOT NULL) ENGINE=bytecaskdb
+    - CREATE INDEX idx_score ON idx.t(score)
+    - INSERT INTO idx.t VALUES (1,10),(2,50),(3,30),(4,20),(5,40)
+  query: SELECT id FROM idx.t WHERE score BETWEEN 20 AND 40 ORDER BY score
+  expected:
+    - ['4']
+    - ['3']
+    - ['5']
+  teardown:
+    - DROP DATABASE IF EXISTS idx
+
+- name: ORDER BY on indexed column
+  setup:
+    - DROP DATABASE IF EXISTS idx2
+    - CREATE DATABASE idx2
+    - CREATE TABLE idx2.t (id INT PRIMARY KEY, name VARCHAR(30) NOT NULL) ENGINE=bytecaskdb
+    - CREATE INDEX idx_name ON idx2.t(name)
+    - INSERT INTO idx2.t VALUES (1,'charlie'),(2,'alice'),(3,'bob')
+  query: SELECT name FROM idx2.t ORDER BY name
+  expected:
+    - [alice]
+    - [bob]
+    - [charlie]
+  teardown:
+    - DROP DATABASE IF EXISTS idx2
+
+- name: UNIQUE index rejects duplicate
+  setup:
+    - DROP DATABASE IF EXISTS idx3
+    - CREATE DATABASE idx3
+    - CREATE TABLE idx3.t (id INT PRIMARY KEY, email VARCHAR(100) NOT NULL) ENGINE=bytecaskdb
+    - CREATE UNIQUE INDEX idx_email ON idx3.t(email)
+    - INSERT INTO idx3.t VALUES (1,'alice@example.com')
+  steps:
+    - sql: INSERT INTO idx3.t VALUES (2,'alice@example.com')
+      error: 1062
+    - sql: SELECT COUNT(*) FROM idx3.t
+      expected: [['1']]
+  teardown:
+    - DROP DATABASE IF EXISTS idx3
+
+- name: Multi-column index prefix scan
+  setup:
+    - DROP DATABASE IF EXISTS idx4
+    - CREATE DATABASE idx4
+    - CREATE TABLE idx4.t (id INT PRIMARY KEY, region VARCHAR(20) NOT NULL, score INT NOT NULL) ENGINE=bytecaskdb
+    - CREATE INDEX idx_region_score ON idx4.t(region, score)
+    - INSERT INTO idx4.t VALUES (1,'north',10),(2,'north',30),(3,'south',20),(4,'north',20)
+  query: SELECT id FROM idx4.t WHERE region = 'north' ORDER BY score
+  expected:
+    - ['1']
+    - ['4']
+    - ['2']
+  teardown:
+    - DROP DATABASE IF EXISTS idx4
+
+- name: Index lookup returns correct row after UPDATE
+  setup:
+    - DROP DATABASE IF EXISTS idx5
+    - CREATE DATABASE idx5
+    - CREATE TABLE idx5.t (id INT PRIMARY KEY, category VARCHAR(20) NOT NULL, v INT NOT NULL) ENGINE=bytecaskdb
+    - CREATE INDEX idx_cat ON idx5.t(category)
+    - INSERT INTO idx5.t VALUES (1,'A',100),(2,'B',200),(3,'A',300)
+  steps:
+    - sql: UPDATE idx5.t SET category = 'B' WHERE id = 1
+    - sql: SELECT id FROM idx5.t WHERE category = 'A' ORDER BY id
+      expected: [['3']]
+    - sql: SELECT id FROM idx5.t WHERE category = 'B' ORDER BY id
+      expected: [['1'], ['2']]
+  teardown:
+    - DROP DATABASE IF EXISTS idx5
+
+- name: Index lookup ignores non-matching rows
+  setup:
+    - DROP DATABASE IF EXISTS idx6
+    - CREATE DATABASE idx6
+    - CREATE TABLE idx6.t (id INT PRIMARY KEY, tag VARCHAR(20) NOT NULL) ENGINE=bytecaskdb
+    - CREATE INDEX idx_tag ON idx6.t(tag)
+    - INSERT INTO idx6.t VALUES (1,'foo'),(2,'baz'),(3,'bar'),(4,'baz')
+  query: SELECT id FROM idx6.t WHERE tag = 'foo'
+  expected:
+    - ['1']
+  teardown:
+    - DROP DATABASE IF EXISTS idx6
+
+- name: Index used in JOIN predicate
+  setup:
+    - DROP DATABASE IF EXISTS idx7
+    - CREATE DATABASE idx7
+    - CREATE TABLE idx7.orders (id INT PRIMARY KEY, status VARCHAR(20) NOT NULL) ENGINE=bytecaskdb
+    - CREATE TABLE idx7.items (id INT PRIMARY KEY, oid INT NOT NULL, name VARCHAR(50) NOT NULL) ENGINE=bytecaskdb
+    - CREATE INDEX idx_oid ON idx7.items(oid)
+    - INSERT INTO idx7.orders VALUES (1,'open'),(2,'closed')
+    - INSERT INTO idx7.items VALUES (1,1,'apple'),(2,1,'banana'),(3,2,'cherry')
+  query: >
+    SELECT o.status, i.name
+    FROM idx7.orders o JOIN idx7.items i ON o.id = i.oid
+    WHERE o.status = 'open'
+    ORDER BY i.name
+  expected:
+    - [open, apple]
+    - [open, banana]
+  teardown:
+    - DROP DATABASE IF EXISTS idx7
