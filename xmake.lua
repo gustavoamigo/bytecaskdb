@@ -214,6 +214,7 @@ target("bytecask")
     on_config(function(t)
         add_native_syslinks(t)
         apply_sanitizer(t)
+        add_release_opts(t)
     end)
 
 -- Python bindings via nanobind.

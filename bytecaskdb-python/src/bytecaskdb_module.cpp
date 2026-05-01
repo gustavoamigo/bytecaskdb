@@ -29,6 +29,20 @@
 namespace nb = nanobind;
 using namespace nb::literals;
 
+// In free-threaded Python (Py_GIL_DISABLED), there is no GIL to release.
+// nanobind's gil_scoped_release/acquire still call PyEval_SaveThread/
+// RestoreThread which contend on CPython's internal thread-state lock,
+// serializing all C++ calls. Replace with no-ops on free-threaded builds.
+#ifdef Py_GIL_DISABLED
+struct ft_gil_release { ft_gil_release() noexcept = default; };
+struct ft_gil_acquire { ft_gil_acquire() noexcept = default; };
+#define BC_GIL_RELEASE ft_gil_release release
+#define BC_GIL_ACQUIRE ft_gil_acquire acquire
+#else
+#define BC_GIL_RELEASE nb::gil_scoped_release release
+#define BC_GIL_ACQUIRE nb::gil_scoped_acquire acquire
+#endif
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -466,9 +480,9 @@ NB_MODULE(_bytecaskdb, m) {
             bytecask::Bytes out;
             auto k = to_view(key);
             auto ropts = opts.value_or(bytecask::ReadOptions{});
-            nb::gil_scoped_release release;
+            BC_GIL_RELEASE;
             bool found = self.snap->get(ropts, k, out);
-            nb::gil_scoped_acquire acquire;
+            BC_GIL_ACQUIRE;
             if (!found) return nb::none();
             return to_pybytes(out);
           },
@@ -605,9 +619,9 @@ NB_MODULE(_bytecaskdb, m) {
             bytecask::Bytes out;
             auto k = to_view(key);
             auto ropts = opts.value_or(bytecask::ReadOptions{});
-            nb::gil_scoped_release release;
+            BC_GIL_RELEASE;
             bool found = self.db.get(ropts, k, out);
-            nb::gil_scoped_acquire acquire;
+            BC_GIL_ACQUIRE;
             if (!found) return nb::none();
             return to_pybytes(out);
           },
@@ -620,7 +634,7 @@ NB_MODULE(_bytecaskdb, m) {
             auto k = to_view(key);
             auto v = to_view(value);
             auto wopts = opts.value_or(bytecask::WriteOptions{});
-            nb::gil_scoped_release release;
+            BC_GIL_RELEASE;
             self.db.put(wopts, k, v);
           },
           "Write key -> value. Overwrites any existing value.",
@@ -631,7 +645,7 @@ NB_MODULE(_bytecaskdb, m) {
              std::optional<bytecask::WriteOptions> opts) -> bool {
             auto k = to_view(key);
             auto wopts = opts.value_or(bytecask::WriteOptions{});
-            nb::gil_scoped_release release;
+            BC_GIL_RELEASE;
             return self.db.del(wopts, k);
           },
           "Delete key. Return True if it existed.",
@@ -643,7 +657,7 @@ NB_MODULE(_bytecaskdb, m) {
             auto f = to_view(from_key);
             auto t = to_view(to_key);
             auto wopts = opts.value_or(bytecask::WriteOptions{});
-            nb::gil_scoped_release release;
+            BC_GIL_RELEASE;
             self.db.del_range(wopts, f, t);
           },
           "Delete all keys in [from_key, to_key) with a single disk append.",
@@ -663,7 +677,7 @@ NB_MODULE(_bytecaskdb, m) {
              std::optional<bytecask::WriteOptions> opts) -> bool {
             auto p = plan.take();
             auto wopts = opts.value_or(bytecask::WriteOptions{});
-            nb::gil_scoped_release release;
+            BC_GIL_RELEASE;
             return self.db.apply_batch(wopts, std::move(p));
           },
           "Apply plan atomically. Return True if committed, False on conflict.",
@@ -725,7 +739,7 @@ NB_MODULE(_bytecaskdb, m) {
           [](PyDB &self, std::optional<bytecask::VacuumOptions> opts)
               -> bool {
             auto vopts = opts.value_or(bytecask::VacuumOptions{});
-            nb::gil_scoped_release release;
+            BC_GIL_RELEASE;
             return self.db.vacuum(vopts);
           },
           "Run one vacuum pass. Return True if a file was vacuumed.",
@@ -742,7 +756,7 @@ NB_MODULE(_bytecaskdb, m) {
           "Diagnostic string describing why the engine degraded, or empty.")
       .def("resume",
            [](PyDB &self) {
-             nb::gil_scoped_release release;
+             BC_GIL_RELEASE;
              self.db.resume();
            },
            "Attempt recovery from a degraded state.")
@@ -759,7 +773,7 @@ NB_MODULE(_bytecaskdb, m) {
       .def(
           "current_sequence",
           [](PyDB &self, std::uint64_t timeout_ms) -> std::uint64_t {
-            nb::gil_scoped_release release;
+            BC_GIL_RELEASE;
             return self.db.current_sequence(
                 std::chrono::milliseconds{timeout_ms});
           },
@@ -817,7 +831,7 @@ NB_MODULE(_bytecaskdb, m) {
                   .value = to_view(val_refs.back()),
               });
             }
-            nb::gil_scoped_release release;
+            BC_GIL_RELEASE;
             self.db.ingest(views);
           },
           "Ingest pre-sequenced entries from a leader (follower mode only).",
