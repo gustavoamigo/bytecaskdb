@@ -8,6 +8,7 @@
 #include "table.h"     // full TABLE / TABLE_SHARE definitions
 #include "key.h"       // key_copy, key_restore
 
+#include <algorithm>
 #include <cstring>
 
 namespace bytecaskdb {
@@ -71,6 +72,9 @@ std::vector<uint8_t> encode_pk(TABLE *table, const uchar *buf,
              const_cast<uchar *>(buf),
              &table->key_info[pk_idx],
              suffix_len);
+#ifndef BYTECASKDB_TESTS
+    make_mem_comparable(key.data() + 5, &table->key_info[pk_idx], suffix_len);
+#endif
   }
 
   return key;
@@ -90,10 +94,13 @@ void decode_pk(TABLE *table, const uint8_t *key, std::size_t key_len,
     return;
   }
   // Strip the 1-byte namespace + 4-byte table_id prefix before key_restore().
-  key_restore(buf,
-              reinterpret_cast<const uchar *>(key + 5),
-              &table->key_info[pk_idx],
-              static_cast<uint>(key_len - 5));
+  // Must undo mem-comparable encoding first since key_restore expects native format.
+  uint pk_len = static_cast<uint>(key_len - 5);
+  std::vector<uint8_t> tmp(key + 5, key + key_len);
+#ifndef BYTECASKDB_TESTS
+  undo_mem_comparable(tmp.data(), &table->key_info[pk_idx], pk_len);
+#endif
+  key_restore(buf, tmp.data(), &table->key_info[pk_idx], pk_len);
 }
 
 std::vector<uint8_t> table_id_prefix(uint32_t table_id) {
@@ -173,6 +180,7 @@ std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
   // Post-process to fix VARCHAR length prefix issue for lexicographic ordering
 #ifndef BYTECASKDB_TESTS
   fix_varchar_key_encoding(key.data() + 7, table, active_index);
+  make_mem_comparable(key.data() + 7, &key_info, sec_key_len);
 #endif
 
   // Append PK bytes for uniqueness, or synthetic rowid for PK-less tables.
@@ -183,6 +191,10 @@ std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
              const_cast<uchar *>(buf),
              &table->key_info[table->s->primary_key],
              suffix_len);
+#ifndef BYTECASKDB_TESTS
+    make_mem_comparable(key.data() + 7 + sec_key_len,
+                        &table->key_info[table->s->primary_key], suffix_len);
+#endif
   }
 
   return key;
@@ -253,9 +265,83 @@ std::vector<uint8_t> encode_unique_sec_key(TABLE *table, const uchar *buf,
   // Fix VARCHAR encoding to match the format used by encode_sec_key.
 #ifndef BYTECASKDB_TESTS
   fix_varchar_key_encoding(key.data() + 7, table, active_index);
+  make_mem_comparable(key.data() + 7, &key_info, sec_key_len);
 #endif
 
   return key;
 }
+
+#ifndef BYTECASKDB_TESTS
+
+namespace {
+
+bool is_integer_type(enum_field_types t) {
+  switch (t) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+      return true;
+    default:
+      return false;
+  }
+}
+
+} // namespace
+
+void make_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
+  uint8_t *p = key_data;
+  uint8_t *end = key_data + key_len;
+
+  for (uint i = 0; i < key_info->user_defined_key_parts && p < end; ++i) {
+    const KEY_PART_INFO &kp = key_info->key_part[i];
+    Field *field = kp.field;
+
+    if (is_integer_type(field->type())) {
+      // Nullable fields have a 1-byte null flag before the data.
+      uint null_bytes = kp.store_length - kp.length;
+      uint8_t *data = p + null_bytes;
+
+      // Only transform if not NULL (null flag == 0 means NULL).
+      if (null_bytes == 0 || p[0] != 0) {
+        uint len = kp.length;
+        std::reverse(data, data + len);
+        if (!field->is_unsigned()) {
+          data[0] ^= 0x80;
+        }
+      }
+    }
+
+    p += kp.store_length;
+  }
+}
+
+void undo_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
+  uint8_t *p = key_data;
+  uint8_t *end = key_data + key_len;
+
+  for (uint i = 0; i < key_info->user_defined_key_parts && p < end; ++i) {
+    const KEY_PART_INFO &kp = key_info->key_part[i];
+    Field *field = kp.field;
+
+    if (is_integer_type(field->type())) {
+      uint null_bytes = kp.store_length - kp.length;
+      uint8_t *data = p + null_bytes;
+
+      if (null_bytes == 0 || p[0] != 0) {
+        uint len = kp.length;
+        if (!field->is_unsigned()) {
+          data[0] ^= 0x80;
+        }
+        std::reverse(data, data + len);
+      }
+    }
+
+    p += kp.store_length;
+  }
+}
+
+#endif
 
 } // namespace bytecaskdb

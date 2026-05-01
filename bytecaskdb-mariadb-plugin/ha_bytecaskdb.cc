@@ -217,10 +217,10 @@ void ha_bytecaskdb::seed_autoinc_counter_if_needed() const {
     if (!key_belongs_to_table(u8_data(k), k.size(), table_id_)) { break; }
     if (k.size() >= 5 + pk_len) {
       std::vector<uchar> scratch(table->s->rec_buff_length, 0);
-      key_restore(scratch.data(),
-                  const_cast<uchar *>(u8_data(k)) + 5,
-                  &table->key_info[pk_idx],
-                  pk_len);
+      std::vector<uint8_t> key_tmp(u8_data(k) + 5, u8_data(k) + 5 + pk_len);
+      undo_mem_comparable(key_tmp.data(), &table->key_info[pk_idx], pk_len);
+      key_restore(scratch.data(), key_tmp.data(),
+                  &table->key_info[pk_idx], pk_len);
       Field *ai_field = table->found_next_number_field;
       if (ai_field) {
         uchar *saved_ptr = ai_field->ptr;
@@ -692,6 +692,7 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
     search_key[3] = static_cast<uint8_t>((table_id_ >>  8) & 0xFF);
     search_key[4] = static_cast<uint8_t>( table_id_        & 0xFF);
     std::memcpy(search_key.data() + 5, key, pk_len);
+    make_mem_comparable(search_key.data() + 5, &table->key_info[pk_idx], pk_len);
 
     if (find_flag == HA_READ_KEY_EXACT) {
       // Point lookup via txn->get().
@@ -747,6 +748,7 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
     // prefix). encode_sec_key() strips that prefix via fix_varchar_key_encoding;
     // apply the same transformation here so the search key matches stored keys.
     fix_varchar_key_encoding(search_key.data() + 7, table, active_index);
+    make_mem_comparable(search_key.data() + 7, &key_info, sec_key_len);
 
     // Save only the covered-prefix bytes for index_next_same comparison.
     sec_search_key_.assign(search_key.begin(), search_key.begin() + 7 + prefix_len);

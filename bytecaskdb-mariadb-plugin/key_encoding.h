@@ -107,4 +107,17 @@ void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table,
                                uint active_index);
 #endif
 
+// Transforms key_copy() output (native little-endian integers) into a
+// mem-comparable encoding (big-endian, sign-bit flipped for signed types).
+// Operates in-place on the key_data starting immediately after any prefix
+// (5-byte for PK, 7-byte for secondary). Only affects integer field types;
+// VARCHARs and other types are left untouched.
+#ifndef BYTECASKDB_TESTS
+void make_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len);
+
+// Reverses make_mem_comparable(): restores native little-endian format from
+// the mem-comparable encoding. Must be called before key_restore().
+void undo_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len);
+#endif
+
 } // namespace bytecaskdb
