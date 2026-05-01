@@ -69,6 +69,7 @@ public:
   int close() override;
   int delete_table(const char *name) override;
   int rename_table(const char *from, const char *to) override;
+  int delete_all_rows() override;
 
   // -------------------------------------------------------------------
   // Write path
