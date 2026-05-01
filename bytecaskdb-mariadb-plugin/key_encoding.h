@@ -81,4 +81,14 @@ std::vector<uint8_t> encode_unique_sec_key(TABLE *table, const uchar *buf,
                                             uint32_t table_id, uint16_t index_id,
                                             uint active_index);
 
+// Removes the VARCHAR length prefix from packed secondary-index key bytes,
+// converting key_copy() output to the same format used by encode_sec_key().
+// Must be called on the key bytes starting immediately after the 7-byte prefix
+// (kNsIndex + table_id + index_id). Used by index_read_map() to bring
+// the optimizer-supplied search key into the same encoding as stored keys.
+#ifndef BYTECASKDB_TESTS
+void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table,
+                               uint active_index);
+#endif
+
 } // namespace bytecaskdb

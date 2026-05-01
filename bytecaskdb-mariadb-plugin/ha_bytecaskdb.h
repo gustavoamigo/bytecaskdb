@@ -91,6 +91,7 @@ public:
                      key_part_map keypart_map,
                      enum ha_rkey_function find_flag) override;
   int index_next(uchar *buf) override;
+  int index_next_same(uchar *buf, const uchar *key, uint keylen) override;
   int index_prev(uchar *buf) override;
   int index_first(uchar *buf) override;
   int index_last(uchar *buf) override;
@@ -142,6 +143,10 @@ private:
 
   std::unique_ptr<MariaDBTxn::MergeIterator> merge_scan_;
   std::unique_ptr<MariaDBTxn::MergeIterator> merge_index_;
+
+  // Saved search key prefix (binary, after fix_varchar_key_encoding) from
+  // index_read_map — used by index_next_same for prefix comparison.
+  std::vector<uint8_t> sec_search_key_;
 
   static void write_table_id_prefix(uint8_t *buf4, uint32_t table_id);
 };
