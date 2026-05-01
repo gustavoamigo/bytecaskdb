@@ -1,0 +1,70 @@
+--- /usr/share/mysql-test/suite/storage_engine/index_type_hash.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/index_type_hash.reject	2026-05-01 19:59:37.904818312 +0100
+@@ -3,17 +3,17 @@
+ <CUSTOM_INDEX> USING HASH (a)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW KEYS IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	1	a	1	a	#	#	NULL	NULL	#	HASH		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	1	a	1	a	#	#	NULL	NULL	#				NO
+ DROP TABLE t1;
+ CREATE TABLE t1 (a <INT_COLUMN>,
+ b <CHAR_COLUMN>,
+ <CUSTOM_INDEX> a_b USING HASH (a,b) COMMENT 'a_b index'
+  ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW KEYS IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	1	a_b	1	a	#	#	NULL	NULL	#	HASH		a_b index
+-t1	1	a_b	2	b	#	#	NULL	NULL	#	HASH		a_b index
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	1	a_b	1	a	#	#	NULL	NULL	#			a_b index	NO
++t1	1	a_b	2	b	#	#	NULL	NULL	#			a_b index	NO
+ DROP TABLE t1;
+ CREATE TABLE t1 (a <INT_COLUMN>,
+ b <CHAR_COLUMN>,
+@@ -21,17 +21,17 @@
+ <CUSTOM_INDEX> USING HASH (b)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW KEYS IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	1	a	1	a	#	#	NULL	NULL	#	HASH		
+-t1	1	b	1	b	#	#	NULL	NULL	#	HASH		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	1	a	1	a	#	#	NULL	NULL	#				NO
++t1	1	b	1	b	#	#	NULL	NULL	#				NO
+ DROP TABLE t1;
+ CREATE TABLE t1 (a <INT_COLUMN>,
+ b <CHAR_COLUMN>,
+ UNIQUE INDEX USING HASH (a)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW KEYS IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	a	1	a	#	#	NULL	NULL	#	HASH		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	a	1	a	#	#	NULL	NULL	#				NO
+ INSERT INTO t1 (a,b) VALUES (1,'a'),(2,'b');
+ INSERT INTO t1 (a,b) VALUES (1,'c');
+ ERROR 23000: Duplicate entry '1' for key 'a'
+@@ -42,8 +42,8 @@
+ INSERT INTO t1 (a,b) VALUES (100,'z');
+ ALTER TABLE t1 ADD <CUSTOM_INDEX> (a) USING HASH COMMENT 'simple index on a';
+ SHOW INDEX FROM t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	1	a	1	a	#	#	NULL	NULL	#	HASH		simple index on a
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	1	a	1	a	#	#	NULL	NULL	#			simple index on a	NO
+ ALTER TABLE t1 DROP KEY a;
+ DROP TABLE t1;
+ CREATE TABLE t1 (a <INT_COLUMN>,
+@@ -51,8 +51,8 @@
+ UNIQUE INDEX USING HASH (a)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW KEYS IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	a	1	a	#	#	NULL	NULL	#	HASH		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	a	1	a	#	#	NULL	NULL	#				NO
+ INSERT INTO t1 (a,b) VALUES (1,'a'),(2,'b');
+ INSERT INTO t1 (a,b) VALUES (1,'c');
+ ERROR 23000: Duplicate entry '1' for key 'a'

@@ -1,0 +1,24 @@
+--- /usr/share/mysql-test/suite/storage_engine/select.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/select.reject	2026-05-01 19:59:39.517940231 +0100
+@@ -114,6 +114,8 @@
+ INTO OUTFILE '<DATADIR>/select.out' 
+ CHARACTER SET utf8
+ FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '''';
++Warnings:
++Warning	1287	'<select expression> INTO <destination>;' is deprecated and will be removed in a future release. Please use 'SELECT <select list> INTO <destination> FROM...' instead
+ 200,'bar'
+ 200,'bar'
+ 100,'foobar'
+@@ -125,8 +127,12 @@
+ ERROR 42000: Result consisted of more than one row
+ SELECT t1.*, t2.* FROM t1, t2 ORDER BY t2.b, t1.a, t2.a, t1.b LIMIT 1
+ INTO DUMPFILE '<DATADIR>/select.dump';
++Warnings:
++Warning	1287	'<select expression> INTO <destination>;' is deprecated and will be removed in a future release. Please use 'SELECT <select list> INTO <destination> FROM...' instead
+ 1z200bar
+ SELECT MIN(a), MAX(a) FROM t1 INTO @min, @max;
++Warnings:
++Warning	1287	'<select expression> INTO <destination>;' is deprecated and will be removed in a future release. Please use 'SELECT <select list> INTO <destination> FROM...' instead
+ SELECT @min, @max;
+ @min	@max
+ 1	200

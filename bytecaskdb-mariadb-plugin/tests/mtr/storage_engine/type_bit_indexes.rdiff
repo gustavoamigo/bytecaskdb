@@ -1,0 +1,59 @@
+--- /usr/share/mysql-test/suite/storage_engine/type_bit_indexes.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/type_bit_indexes.reject	2026-05-01 19:59:47.255290310 +0100
+@@ -6,8 +6,8 @@
+ <CUSTOM_INDEX> b (b)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	1	#	1	b	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	1	#	1	b	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (a,b,c,d) VALUES 
+ (0,0xFFFFF,0,1),(0,256,0xAAA,0x12345),(1,16,0,0xFFFFFFF),(0,11,12,13),
+ (1,100,101,102),(0,12,13,14),(1,13,14,15),(0,101,201,202),(1,1000,1001,1002),
+@@ -31,8 +31,8 @@
+ d BIT(64) <CUSTOM_COL_OPTIONS>
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	PRIMARY	1	b	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	PRIMARY	1	b	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (a,b,c,d) VALUES 
+ (0,0xFFFFF,0,1),(0,256,0xAAA,0x12345),(1,16,0,0xFFFFFFF),(0,11,12,13),
+ (1,100,101,102),(0,12,13,14),(1,13,14,15),(0,101,201,202),(1,1000,1001,1002),
+@@ -60,9 +60,9 @@
+ UNIQUE INDEX b_c (b,c)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	b_c	1	b	#	#	NULL	NULL	#	#		
+-t1	0	b_c	2	c	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	b_c	1	b	#	#	NULL	NULL	#	#			NO
++t1	0	b_c	2	c	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (a,b,c,d) VALUES
+ (0,0xFFFFF,0,1),(0,256,0xAAA,0x12345),(1,16,0,0xFFFFFFF),(0,11,12,13),
+ (1,100,101,102),(0,12,13,14),(1,13,14,15),(0,101,201,202),(1,1000,1001,1002),
+@@ -90,8 +90,8 @@
+ INDEX(a)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	1	a	1	a	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	1	a	1	a	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (a,b,c,d) VALUES
+ (0,0xFFFFF,0,1),(0,256,0xAAA,0x12345),(1,16,0,0xFFFFFFF),(0,11,12,13),
+ (1,100,101,102),(0,12,13,14),(1,13,14,15),(0,101,201,202),(1,1000,1001,1002),
+@@ -111,8 +111,8 @@
+ UNIQUE INDEX (d)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	d	1	d	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	d	1	d	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (a,b,c,d) VALUES
+ (0,0xFFFFF,0,1),(0,256,0xAAA,0x12345),(1,16,0,0xFFFFFFF),(0,11,12,13),
+ (1,100,101,102),(0,12,13,14),(1,13,14,15),(0,101,201,202),(1,1000,1001,1002),

@@ -1,0 +1,44 @@
+--- /usr/share/mysql-test/suite/storage_engine/create_table.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/create_table.reject	2026-05-01 19:59:35.274524806 +0100
+@@ -4,7 +4,7 @@
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ CREATE TABLE IF NOT EXISTS t1 (a <INT_COLUMN>) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ Warnings:
+ Note	1050	Table 't1' already exists
+@@ -13,13 +13,13 @@
+ Table	Create Table
+ t2	CREATE TABLE `t2` (
+   `a` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ CREATE TEMPORARY TABLE t2 LIKE t1;
+ SHOW CREATE TABLE t2;
+ Table	Create Table
+ t2	CREATE TEMPORARY TABLE `t2` (
+   `a` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ DROP TEMPORARY TABLE t2;
+ DROP TABLE t2;
+ DROP TABLE IF EXISTS t1;
+@@ -28,7 +28,7 @@
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `1` int(1) NOT NULL DEFAULT 0
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ SELECT * FROM t1;
+ 1
+ 1
+@@ -40,6 +40,6 @@
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ FLUSH LOGS;
+ DROP TABLE IF EXISTS t1;

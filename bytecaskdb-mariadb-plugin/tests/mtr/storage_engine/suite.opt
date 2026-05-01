@@ -1,0 +1,1 @@
+--plugin-load-add=bytecaskdb=ha_bytecaskdb.so

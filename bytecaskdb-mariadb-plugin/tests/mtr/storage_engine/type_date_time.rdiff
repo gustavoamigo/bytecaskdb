@@ -1,0 +1,11 @@
+--- /usr/share/mysql-test/suite/storage_engine/type_date_time.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/type_date_time.reject	2026-05-01 19:59:48.322884942 +0100
+@@ -13,7 +13,7 @@
+ Field	Type	Null	Key	Default	Extra
+ d	date	#	#	#	
+ dt	datetime	#	#	#	
+-ts	timestamp	#	#	#	on update current_timestamp()
++ts	timestamp	#	#	#	
+ t	time	#	#	#	
+ y	year(4)	#	#	#	
+ y4	year(4)	#	#	#	

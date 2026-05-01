@@ -1,0 +1,56 @@
+--- /usr/share/mysql-test/suite/storage_engine/index_primary.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/index_primary.reject	2026-05-01 19:59:37.037862818 +0100
+@@ -3,8 +3,8 @@
+ b <CHAR_COLUMN>
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW KEYS IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	PRIMARY	1	a	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	PRIMARY	1	a	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (a,b) VALUES (1,'a'),(2,'b');
+ INSERT INTO t1 (a,b) VALUES (1,'c');
+ ERROR 23000: Duplicate entry '1' for key 'PRIMARY'
+@@ -20,9 +20,9 @@
+ PRIMARY KEY (a,b)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	PRIMARY	1	a	#	#	NULL	NULL	#	#		
+-t1	0	PRIMARY	2	b	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	PRIMARY	1	a	#	#	NULL	NULL	#	#			NO
++t1	0	PRIMARY	2	b	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (a,b) VALUES (1,'a'),(1,'b'),(2,'a'),(2,'b');
+ INSERT INTO t1 (a,b) VALUES (1,'b');
+ ERROR 23000: Duplicate entry '1-b' for key 'PRIMARY'
+@@ -34,20 +34,22 @@
+ <CUSTOM_INDEX> (b)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	PRIMARY	1	a	#	#	NULL	NULL	#	#		
+-t1	1	b	1	b	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	PRIMARY	1	a	#	#	NULL	NULL	#	#			NO
++t1	1	b	1	b	#	#	NULL	NULL	#	#			NO
+ DROP TABLE t1;
+ CREATE TABLE t1 (a <INT_COLUMN>,
+ b <CHAR_COLUMN> PRIMARY KEY
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	PRIMARY	1	b	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	PRIMARY	1	b	#	#	NULL	NULL	#	#			NO
+ ALTER TABLE t1 DROP INDEX `PRIMARY`;
+ ALTER TABLE t1 ADD CONSTRAINT PRIMARY KEY pk (a);
++Warnings:
++Warning	1280	Name 'pk' ignored for PRIMARY key.
+ SHOW KEYS IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	PRIMARY	1	a	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	PRIMARY	1	a	#	#	NULL	NULL	#	#			NO
+ ALTER TABLE t1 DROP PRIMARY KEY;
+ DROP TABLE t1;

@@ -1,0 +1,54 @@
+--- /usr/share/mysql-test/suite/storage_engine/type_binary_indexes.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/type_binary_indexes.reject	2026-05-01 19:59:46.722026881 +0100
+@@ -6,8 +6,8 @@
+ <CUSTOM_INDEX> b20 (b20)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	1	#	1	b20	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	1	#	1	b20	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (b,b20,v16,v128) VALUES ('a','char1','varchar1a','varchar1b'),('a','char2','varchar2a','varchar2b'),('b','char3','varchar1a','varchar1b'),('c','char4','varchar3a','varchar3b');
+ SELECT HEX(b20) FROM t1 ORDER BY b20;
+ HEX(b20)
+@@ -22,8 +22,8 @@
+ v128 VARBINARY(128) <CUSTOM_COL_OPTIONS>
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	PRIMARY	1	b20	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	PRIMARY	1	b20	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (b,b20,v16,v128) VALUES ('a','char1','varchar1a','varchar1b'),('a','char2','varchar2a','varchar2b'),('b','char3','varchar1a','varchar1b'),('c','char4','varchar3a','varchar3b');
+ EXPLAIN SELECT HEX(b20) FROM t1 ORDER BY b20;
+ id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+@@ -51,9 +51,9 @@
+ UNIQUE INDEX b_v (b,v128)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	b_v	1	b	#	#	NULL	NULL	#	#		
+-t1	0	b_v	2	v128	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	b_v	1	b	#	#	NULL	NULL	#	#			NO
++t1	0	b_v	2	v128	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (b,b20,v16,v128) VALUES ('a','char1','varchar1a','varchar1b'),('a','char2','varchar2a','varchar2b'),('b','char3','varchar1a','varchar1b'),('c','char4','varchar3a','varchar3b');
+ EXPLAIN SELECT HEX(b), HEX(v128) FROM t1 WHERE b != 'a' AND v128 > 'varchar';
+ id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+@@ -85,13 +85,13 @@
+ INDEX (v16(10))
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	1	v16	1	v16	#	#	10	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	1	v16	1	v16	#	#	10	NULL	#	#			NO
+ INSERT INTO t1 (b,b20,v16,v128) VALUES ('a','char1','varchar1a','varchar1b'),('a','char2','varchar2a','varchar2b'),('b','char3','varchar1a','varchar1b'),('c','char4','varchar3a','varchar3b'),('d','char5','varchar4a','varchar3b'),('e','char6','varchar2a','varchar3b');
+ INSERT INTO t1 (b,b20,v16,v128) SELECT b,b20,v16,v128 FROM t1;
+ EXPLAIN SELECT HEX(SUBSTRING(v16,0,3)) FROM t1 WHERE v16 LIKE 'varchar%';
+ id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+-#	#	#	#	#	NULL	#	#	#	#
++#	#	#	#	#	v16	#	#	#	#
+ SELECT HEX(SUBSTRING(v16,7,3)) FROM t1 WHERE v16 LIKE 'varchar%';
+ HEX(SUBSTRING(v16,7,3))
+ 723161

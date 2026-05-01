@@ -1,1 +1,0 @@
-/usr/share/mysql-test/suite/storage_engine/col_not_null.inc
