@@ -3,6 +3,8 @@
 > **Status: early development.** The core engine works and is well-tested, but the API and on-disk format may change before a stable release. Not recommended for production use yet.
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/gustavoamigo/bytecaskdb)
+[![CI](https://github.com/gustavoamigo/bytecaskdb/actions/workflows/ci.yml/badge.svg)](https://github.com/gustavoamigo/bytecaskdb/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/gustavoamigo/bytecaskdb/branch/main/graph/badge.svg)](https://app.codecov.io/gh/gustavoamigo/bytecaskdb)
 
 **ByteCaskDB** is a fast, predictable embedded key-value store written in C++. Reads and writes have flat, predictable latency from thousands of keys to hundreds of millions.
 

@@ -158,3 +158,53 @@ jobs:
           mkdir -p "$CORPUS"
           BIN="build/linux/x86_64/debug/$TARGET"
           "$BIN" "$CORPUS" "$SEED" -max_total_time=60 -max_len=65536
+
+  # ---------------------------------------------------------------------------
+  # Coverage (LLVM/Clang)
+  # ---------------------------------------------------------------------------
+  coverage:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel \
+            xmake \
+            python3-pip python3-devel \
+            git ninja-build
+          pip3 install nanobind
+
+      - name: Run coverage pipeline
+        run: bash scripts/run_coverage.sh
+
+      - name: Upload coverage HTML artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage/html/
+
+      - name: Upload lcov artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./lcov.info
+          flags: cpp
+          name: bytecask-cpp
+          fail_ci_if_error: false
+          use_oidc: true

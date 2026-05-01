@@ -16,31 +16,50 @@ CLANG_TARGET_TRIPLE="$(clang --print-target-triple)"
 
 # Configure and build with coverage instrumentation
 echo "==> Configuring with coverage..."
-xmake f --coverage=true -m debug -y
+xmake f --toolchain=clang --coverage=true -m debug -y
 
 echo "==> Building..."
 xmake build bytecask_tests
+xmake build radix_tree_memory_tests
+xmake build unordered_view_tests
 
-TEST_BIN="$PROJECT_DIR/build/linux/x86_64/debug/bytecask_tests"
-if [ ! -x "$TEST_BIN" ]; then
-    echo "ERROR: could not find bytecask_tests binary at $TEST_BIN"
+BYTECASK_TEST_BIN="$PROJECT_DIR/build/linux/x86_64/debug/bytecask_tests"
+RADIX_TREE_TEST_BIN="$PROJECT_DIR/build/linux/x86_64/debug/radix_tree_memory_tests"
+UNORDERED_VIEW_TEST_BIN="$PROJECT_DIR/build/linux/x86_64/debug/unordered_view_tests"
+
+if [ ! -x "$BYTECASK_TEST_BIN" ]; then
+    echo "ERROR: could not find bytecask_tests binary at $BYTECASK_TEST_BIN"
+    exit 1
+fi
+if [ ! -x "$RADIX_TREE_TEST_BIN" ]; then
+    echo "ERROR: could not find radix_tree_memory_tests binary at $RADIX_TREE_TEST_BIN"
+    exit 1
+fi
+if [ ! -x "$UNORDERED_VIEW_TEST_BIN" ]; then
+    echo "ERROR: could not find unordered_view_tests binary at $UNORDERED_VIEW_TEST_BIN"
     exit 1
 fi
 
 echo "==> Running tests..."
-LLVM_PROFILE_FILE="$COV_DIR/default.profraw" "$TEST_BIN"
+LLVM_PROFILE_FILE="$COV_DIR/bytecask_tests.profraw" "$BYTECASK_TEST_BIN"
+LLVM_PROFILE_FILE="$COV_DIR/radix_tree_memory_tests.profraw" "$RADIX_TREE_TEST_BIN"
+LLVM_PROFILE_FILE="$COV_DIR/unordered_view_tests.profraw" "$UNORDERED_VIEW_TEST_BIN"
 
 echo "==> Merging profile data..."
-llvm-profdata merge -sparse "$COV_DIR/default.profraw" -o "$COV_DIR/coverage.profdata"
+llvm-profdata merge -sparse "$COV_DIR"/*.profraw -o "$COV_DIR/coverage.profdata"
 
 echo "==> Generating summary..."
-llvm-cov report "$TEST_BIN" \
+llvm-cov report "$BYTECASK_TEST_BIN" \
+    -object="$RADIX_TREE_TEST_BIN" \
+    -object="$UNORDERED_VIEW_TEST_BIN" \
     -instr-profile="$COV_DIR/coverage.profdata" \
     -ignore-filename-regex='tests/|catch2|crc32c|/usr/'
 
 echo ""
 echo "==> Generating HTML report..."
-llvm-cov show "$TEST_BIN" \
+llvm-cov show "$BYTECASK_TEST_BIN" \
+    -object="$RADIX_TREE_TEST_BIN" \
+    -object="$UNORDERED_VIEW_TEST_BIN" \
     -instr-profile="$COV_DIR/coverage.profdata" \
     -ignore-filename-regex='tests/|catch2|crc32c|/usr/' \
     -format=html \
@@ -48,7 +67,9 @@ llvm-cov show "$TEST_BIN" \
 
 echo ""
 echo "==> Generating lcov report (for VS Code Coverage Gutters)..."
-llvm-cov export "$TEST_BIN" \
+llvm-cov export "$BYTECASK_TEST_BIN" \
+    -object="$RADIX_TREE_TEST_BIN" \
+    -object="$UNORDERED_VIEW_TEST_BIN" \
     -instr-profile="$COV_DIR/coverage.profdata" \
     -ignore-filename-regex='tests/|catch2|crc32c|/usr/' \
     -format=lcov > "$PROJECT_DIR/lcov.info"

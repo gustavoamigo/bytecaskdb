@@ -1,0 +1,31 @@
+codecov:
+  require_ci_to_pass: true
+
+coverage:
+  status:
+    project:
+      default:
+        target: 85%
+        threshold: 1%
+        informational: false
+        only_pulls: false
+        flags:
+          - cpp
+    patch:
+      default:
+        target: 80%
+        threshold: 1%
+        informational: false
+        only_pulls: true
+        flags:
+          - cpp
+
+comment:
+  layout: "reach,diff,flags,files"
+  behavior: default
+  require_changes: false
+  hide_project_coverage: false
+
+flags:
+  cpp:
+    carryforward: true

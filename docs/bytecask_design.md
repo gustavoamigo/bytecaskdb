@@ -14,6 +14,10 @@ Canonical location: `docs/bytecask_design.md`.
 
 `scripts/sys-info.sh` reports host hardware characteristics for the current execution context. The memory section is intentionally minimal and privilege-free: it reports the machine's installed RAM capacity from `/proc/meminfo` instead of attempting detailed DIMM inventory. The disk section resolves the filesystem mounted at the script's current working directory via `findmnt --target "$PWD"`, strips any bracketed subvolume suffix from the reported source, and then maps partitions/LVM-style block devices back to their parent physical disk with `lsblk -no PKNAME`. This keeps the output focused on the disk that backs the active repository path instead of listing every block device on the host.
 
+The main CI workflow (`.github/workflows/ci.yml`) includes a dedicated `coverage` job. It runs `scripts/run_coverage.sh` in a Fedora + Clang environment, executes all C++ test binaries (`bytecask_tests`, `radix_tree_memory_tests`, `unordered_view_tests`) with LLVM profile instrumentation, merges profiles with `llvm-profdata`, generates HTML coverage (`coverage/html`), exports `lcov.info`, uploads both artifacts to GitHub Actions, and publishes `lcov.info` to Codecov for repository coverage tracking and badge rendering.
+
+Codecov policy is configured in `.codecov.yml`: project coverage status uses the `cpp` flag with an 85% target (1% threshold), patch coverage status uses the same flag with an 80% target (1% threshold), and CI pass is required before Codecov reports success.
+
 ## Goals
 
 - Provide a clean, minimal API surface for key-value operations.
