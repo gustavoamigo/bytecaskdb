@@ -270,6 +270,13 @@ struct PyDataEntry {
   nb::bytes key;
   nb::bytes value;
 
+  PyDataEntry(std::uint64_t seq, bytecask::EntryType type,
+              nb::bytes key_bytes, nb::bytes value_bytes)
+      : sequence{seq},
+        entry_type{type},
+        key{std::move(key_bytes)},
+        value{std::move(value_bytes)} {}
+
   PyDataEntry(const bytecask::DataEntryView &v)
       : sequence{v.sequence},
         entry_type{v.entry_type},
@@ -436,6 +443,16 @@ NB_MODULE(_bytecaskdb, m) {
 
   nb::class_<PyDataEntry>(m, "DataEntry",
       "A replication data entry with sequence, entry_type, key, and value.")
+      .def(
+        "__init__",
+        [](PyDataEntry *self, std::uint64_t sequence,
+         bytecask::EntryType entry_type,
+         nb::object key, nb::object value) {
+        new (self) PyDataEntry{sequence, entry_type,
+                     nb::bytes{key}, nb::bytes{value}};
+        },
+        "Construct a replication entry from bytes-like key/value payloads.",
+        "sequence"_a, "entry_type"_a, "key"_a, "value"_a)
       .def_ro("sequence", &PyDataEntry::sequence)
       .def_ro("entry_type", &PyDataEntry::entry_type)
       .def_ro("key", &PyDataEntry::key)

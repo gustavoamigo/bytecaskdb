@@ -140,6 +140,36 @@ def test_ingest_idempotency(tmp_path):
     assert follower.get(b"k1") == b"v1"
 
 
+def test_ingest_from_reconstructed_data_entries(tmp_path):
+    leader = bc.DB.open(str(tmp_path / "leader"))
+    opts = bc.WriteOptions()
+    opts.sync = True
+    leader.put(b"k1", b"v1", opts)
+    leader.put(b"k2", b"v2", opts)
+    leader.del_(b"k1", opts)
+
+    snap = leader.snapshot()
+    entries = list(leader.changes_since(snap, 0))
+
+    reconstructed = [
+        bc.DataEntry(
+            sequence=e.sequence,
+            entry_type=e.entry_type,
+            key=bytearray(e.key),
+            value=bytearray(e.value),
+        )
+        for e in entries
+    ]
+
+    follower_opts = bc.Options()
+    follower_opts.initial_mode = bc.Mode.Follower
+    follower = bc.DB.open(str(tmp_path / "follower"), follower_opts)
+    follower.ingest(reconstructed)
+
+    assert follower.get(b"k1") is None
+    assert follower.get(b"k2") == b"v2"
+
+
 def test_leader_to_follower_replication(tmp_path):
     """End-to-end: leader writes, follower replicates via changes_since + ingest."""
     leader = bc.DB.open(str(tmp_path / "leader"))

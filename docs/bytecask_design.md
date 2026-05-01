@@ -63,6 +63,8 @@ For C++ consumers that want the full typed API without importing C++23 modules, 
 
 **Free-threaded Python (PEP 703)**: the bindings support free-threaded Python 3.13+ (`Py_GIL_DISABLED=1`). The build system auto-detects free-threading via `sysconfig.get_config_var('Py_GIL_DISABLED')` and defines `NB_FREE_THREADED`, which declares `Py_mod_gil = Py_MOD_GIL_NOT_USED` and activates nanobind's locking primitives.
 
+`DataEntry` is constructible from Python (`DataEntry(sequence, entry_type, key, value)`) with bytes-like key/value inputs. This enables network replication transports to deserialize wire payloads back into `DataEntry` objects before calling `ingest()`.
+
 The locking strategy respects the engine's existing thread model:
 
 - **DB reads and snapshot reads are unlocked** — the C++ engine provides lock-free reads via immutable snapshots; adding Python-level locks would destroy read scaling.

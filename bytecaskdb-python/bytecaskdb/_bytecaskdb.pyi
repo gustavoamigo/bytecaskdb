@@ -136,6 +136,14 @@ class ChangeIterator:
 class DataEntry:
     """A replication data entry."""
 
+    def __init__(
+        self,
+        sequence: int,
+        entry_type: EntryType,
+        key: bytes | bytearray | memoryview,
+        value: bytes | bytearray | memoryview,
+    ) -> None: ...
+
     @property
     def sequence(self) -> int: ...
     @property
