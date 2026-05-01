@@ -1,0 +1,1 @@
+/usr/share/mysql-test/suite/storage_engine/strict_check_errors.inc

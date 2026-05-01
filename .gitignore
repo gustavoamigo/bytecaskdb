@@ -51,6 +51,10 @@ tests/fuzz/corpus/
 # MariaDB plugin integration tests
 bytecaskdb-mariadb-plugin/.mariadb_integration_test/
 
+# MTR runtime state and output (regenerated on each run)
+bytecaskdb-mariadb-plugin/mtr-var/
+bytecaskdb-mariadb-plugin/mtr-results.txt
+
 .notes
 
 # Claude Code local state

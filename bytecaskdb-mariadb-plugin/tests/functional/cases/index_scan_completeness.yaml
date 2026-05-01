@@ -1,0 +1,53 @@
+# index_scan_completeness.yaml — index scan must return all rows
+
+- name: DESC LIMIT via PK index returns correct value
+  setup:
+    - DROP DATABASE IF EXISTS isc1
+    - CREATE DATABASE isc1
+    - CREATE TABLE isc1.t (i INT PRIMARY KEY, v INT) ENGINE=bytecaskdb
+    - INSERT INTO isc1.t VALUES (1,10),(2,20),(3,30),(10001,99),(5,50),(4,40)
+  steps:
+    - sql: SELECT i FROM isc1.t ORDER BY i DESC LIMIT 1
+      expected: [['10001']]
+    - sql: SELECT i, v FROM isc1.t ORDER BY i
+      expected: [['1','10'],['2','20'],['3','30'],['4','40'],['5','50'],['10001','99']]
+  teardown:
+    - DROP DATABASE IF EXISTS isc1
+
+- name: Secondary index scan returns all matching rows
+  setup:
+    - DROP DATABASE IF EXISTS isc2
+    - CREATE DATABASE isc2
+    - CREATE TABLE isc2.t (a INT PRIMARY KEY, b INT NOT NULL, INDEX idx_b(b)) ENGINE=bytecaskdb
+    - INSERT INTO isc2.t VALUES (1,50),(2,10),(3,30),(4,20),(5,40),(6,60)
+  steps:
+    - sql: SELECT a, b FROM isc2.t WHERE b >= 30 ORDER BY b
+      expected: [['3','30'],['5','40'],['1','50'],['6','60']]
+    - sql: SELECT a, b FROM isc2.t WHERE b < 40 ORDER BY b
+      expected: [['2','10'],['4','20'],['3','30']]
+  teardown:
+    - DROP DATABASE IF EXISTS isc2
+
+- name: Full table scan via secondary index returns all rows
+  setup:
+    - DROP DATABASE IF EXISTS isc3
+    - CREATE DATABASE isc3
+    - CREATE TABLE isc3.t (a INT PRIMARY KEY, b INT NOT NULL, INDEX idx_b(b)) ENGINE=bytecaskdb
+    - INSERT INTO isc3.t VALUES (1,100),(2,200),(3,300),(4,400),(5,500),(6,600),(7,700),(8,800),(9,900),(10,1000)
+  steps:
+    - sql: SELECT b FROM isc3.t ORDER BY b
+      expected: [['100'],['200'],['300'],['400'],['500'],['600'],['700'],['800'],['900'],['1000']]
+  teardown:
+    - DROP DATABASE IF EXISTS isc3
+
+- name: Composite PK index scan with INSERT in non-PK order
+  setup:
+    - DROP DATABASE IF EXISTS isc4
+    - CREATE DATABASE isc4
+    - CREATE TABLE isc4.t (i INT NOT NULL, t INT NOT NULL, PRIMARY KEY(i,t)) ENGINE=bytecaskdb
+    - INSERT INTO isc4.t VALUES (1,2),(1000,100),(5,100),(2,3),(3,4),(4,5),(5,6),(101,102),(10001,103),(10,11)
+  steps:
+    - sql: SELECT i, t FROM isc4.t ORDER BY i, t
+      expected: [['1','2'],['2','3'],['3','4'],['4','5'],['5','6'],['5','100'],['10','11'],['101','102'],['1000','100'],['10001','103']]
+  teardown:
+    - DROP DATABASE IF EXISTS isc4

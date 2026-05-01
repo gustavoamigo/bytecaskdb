@@ -183,7 +183,7 @@ message(STATUS "Plugin target: ha_bytecaskdb.so")
 # Full end-to-end tests that provision MariaDB, load the plugin, and run SQL tests.
 
 add_executable(integration_tests
-  integration_test.cpp
+  tests/unit/integration_test.cpp
 )
 
 target_include_directories(integration_tests PRIVATE
@@ -213,16 +213,16 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Catch2)
 
 add_executable(mariadb_plugin_tests
-  tests/mariadb_encoding_test.cpp
-  tests/mariadb_txn_simple_test.cpp
+  tests/unit/mariadb_encoding_test.cpp
+  tests/unit/mariadb_txn_simple_test.cpp
   catalog.cc
   key_encoding.cc
   row_encoding.cc
 )
 
 target_include_directories(mariadb_plugin_tests PRIVATE
-  # Stubs must come first so tests/my_global.h etc. win over MariaDB headers.
-  "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+  # Stubs must come first so tests/unit/my_global.h etc. win over MariaDB headers.
+  "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit"
   "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 

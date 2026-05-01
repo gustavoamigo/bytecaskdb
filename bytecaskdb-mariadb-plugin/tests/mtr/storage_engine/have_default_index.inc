@@ -1,0 +1,1 @@
+/usr/share/mysql-test/suite/storage_engine/have_default_index.inc
