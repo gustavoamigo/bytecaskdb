@@ -478,4 +478,3 @@ TEST_CASE("MariaDB ByteCaskDB Plugin Integration Tests", "[integration]") {
   db.execute_sql_expect_success("DROP DATABASE IF EXISTS crud_test;");
   db.execute_sql_expect_success("DROP DATABASE IF EXISTS edge_test;");
 }
-}

@@ -79,7 +79,7 @@ int ha_bytecaskdb::external_lock(THD *thd, int lock_type) {
 // ---------------------------------------------------------------------------
 
 int ha_bytecaskdb::create(const char *name, TABLE *table_arg,
-                           HA_CREATE_INFO * /*create_info*/) {
+                           HA_CREATE_INFO *create_info) {
   if (!g_db) { return HA_ERR_GENERIC; }
 
   // Check if table already exists in catalog.
@@ -141,6 +141,10 @@ int ha_bytecaskdb::create(const char *name, TABLE *table_arg,
     return HA_ERR_GENERIC;
   }
 
+  if (create_info->auto_increment_value > 0) {
+    catalog_seed_autoinc(tid, create_info->auto_increment_value - 1);
+  }
+
   return 0;
 }
 
@@ -171,6 +175,9 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
     seed_rowid_counter_if_needed();
   } else {
     ref_length = 5 + table->key_info[pk].key_length;
+    if (table->found_next_number_field) {
+      seed_autoinc_counter_if_needed();
+    }
   }
   return 0;
 }
@@ -194,8 +201,64 @@ void ha_bytecaskdb::seed_rowid_counter_if_needed() const {
   catalog_seed_rowid(table_id_, hw);
 }
 
+// Seeds the autoinc counter on first open of a PK table with AUTO_INCREMENT.
+// Reverse-scans the row namespace to find the last key, restores it into a
+// scratch buffer, then reads the autoinc field value.
+void ha_bytecaskdb::seed_autoinc_counter_if_needed() const {
+  if (catalog_peek_autoinc(table_id_) != 0) { return; }
+
+  const uint pk_idx = table->s->primary_key;
+  const uint pk_len = table->key_info[pk_idx].key_length;
+  auto upper = table_id_upper_bound(table_id_);
+  bytecask::Snapshot snap = g_db->snapshot();
+  uint64_t hw = 0;
+
+  for (auto &k : snap.rkeys_from({}, as_view(upper))) {
+    if (!key_belongs_to_table(u8_data(k), k.size(), table_id_)) { break; }
+    if (k.size() >= 5 + pk_len) {
+      std::vector<uchar> scratch(table->s->rec_buff_length, 0);
+      key_restore(scratch.data(),
+                  const_cast<uchar *>(u8_data(k)) + 5,
+                  &table->key_info[pk_idx],
+                  pk_len);
+      Field *ai_field = table->found_next_number_field;
+      if (ai_field) {
+        uchar *saved_ptr = ai_field->ptr;
+        ai_field->ptr = scratch.data() + ai_field->offset(table->record[0]);
+        hw = static_cast<uint64_t>(ai_field->val_int());
+        ai_field->ptr = saved_ptr;
+      }
+    }
+    break;
+  }
+  catalog_seed_autoinc(table_id_, hw);
+}
+
 // ---------------------------------------------------------------------------
-// close()
+// AUTO_INCREMENT
+// ---------------------------------------------------------------------------
+
+void ha_bytecaskdb::get_auto_increment(ulonglong /*offset*/,
+                                        ulonglong /*increment*/,
+                                        ulonglong nb_desired_values,
+                                        ulonglong *first_value,
+                                        ulonglong *nb_reserved_values) {
+  if (nb_desired_values == 0) { nb_desired_values = 1; }
+  *first_value = catalog_alloc_autoinc_range(table_id_,
+                                             static_cast<uint64_t>(nb_desired_values));
+  *nb_reserved_values = nb_desired_values;
+}
+
+int ha_bytecaskdb::reset_auto_increment(ulonglong value) {
+  catalog_reset_autoinc(table_id_, value > 0 ? value - 1 : 0);
+  return 0;
+}
+
+void ha_bytecaskdb::update_create_info(HA_CREATE_INFO *create_info) {
+  if (!(create_info->used_fields & HA_CREATE_USED_AUTO)) {
+    create_info->auto_increment_value = catalog_peek_autoinc(table_id_) + 1;
+  }
+}
 // ---------------------------------------------------------------------------
 
 int ha_bytecaskdb::close() {
@@ -282,7 +345,10 @@ int ha_bytecaskdb::delete_all_rows() {
   }
 
   if (table->s->primary_key == MAX_KEY) {
-    catalog_seed_rowid(table_id_, 0);
+    catalog_reset_rowid(table_id_, 0);
+  }
+  if (table->found_next_number_field) {
+    catalog_reset_autoinc(table_id_, 0);
   }
   return 0;
 }
@@ -308,6 +374,13 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
 
   auto *txn = get_or_create_txn(ha_thd(), bytecaskdb_hton);
   txn->begin_if_needed(ha_thd(), bytecaskdb_hton);
+
+  // MariaDB 10.11 does not call update_auto_increment() from ha_write_row;
+  // each engine is responsible for calling it inside write_row.
+  if (table->next_number_field && buf == table->record[0]) {
+    int err = update_auto_increment();
+    if (err) { return err; }
+  }
 
   // For PK-less tables, allocate a fresh synthetic rowid for this row.
   const bool no_pk = (table->s->primary_key == MAX_KEY);
@@ -359,6 +432,15 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   // Remember the full key for any immediately-following update_row /
   // delete_row / position call.
   current_row_key_ = std::move(key);
+
+  // Seed the autoinc counter from the actual field value so explicit INSERTs
+  // (e.g. INSERT VALUES (5, ...)) bump the counter for subsequent auto values.
+  if (table->next_number_field && buf == table->record[0]) {
+    uint64_t val = static_cast<uint64_t>(table->next_number_field->val_int());
+    if (val > 0) {
+      catalog_seed_autoinc(table_id_, val);
+    }
+  }
 
   return 0;
 }
@@ -874,8 +956,23 @@ int ha_bytecaskdb::rnd_pos(uchar *buf, uchar *pos) {
 // info() — optimizer statistics
 // ---------------------------------------------------------------------------
 
-int ha_bytecaskdb::info(uint /*flag*/) {
-  stats.records = HA_POS_ERROR;
+int ha_bytecaskdb::info(uint flag) {
+  if (flag & HA_STATUS_VARIABLE) {
+    auto lo = table_id_prefix(table_id_);
+    auto hi = table_id_upper_bound(table_id_);
+    ha_rows count = 0;
+    for (auto &k : g_db->keys_from({}, as_view(lo))) {
+      if (k.size() < hi.size() ||
+          std::memcmp(u8_data(k), hi.data(), hi.size()) >= 0) {
+        break;
+      }
+      ++count;
+    }
+    stats.records = count;
+  }
+  if (flag & HA_STATUS_AUTO) {
+    stats.auto_increment_value = catalog_peek_autoinc(table_id_) + 1;
+  }
   return 0;
 }
 

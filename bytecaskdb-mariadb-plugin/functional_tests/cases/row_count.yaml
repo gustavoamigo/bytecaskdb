@@ -1,0 +1,39 @@
+# row_count.yaml — stats.records / SHOW TABLE STATUS row count
+
+- name: SHOW TABLE STATUS reports correct row count
+  setup:
+    - DROP DATABASE IF EXISTS rc1
+    - CREATE DATABASE rc1
+    - CREATE TABLE rc1.t (a INT PRIMARY KEY, b INT) ENGINE=bytecaskdb
+    - INSERT INTO rc1.t VALUES (1, 10), (2, 20), (3, 30)
+  steps:
+    - sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='rc1' AND TABLE_NAME='t'
+      expected: [['3']]
+  teardown:
+    - DROP DATABASE IF EXISTS rc1
+
+- name: Row count is 0 after DELETE all rows
+  setup:
+    - DROP DATABASE IF EXISTS rc2
+    - CREATE DATABASE rc2
+    - CREATE TABLE rc2.t (a INT PRIMARY KEY, b INT) ENGINE=bytecaskdb
+    - INSERT INTO rc2.t VALUES (1, 10), (2, 20)
+    - DELETE FROM rc2.t
+  steps:
+    - sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='rc2' AND TABLE_NAME='t'
+      expected: [['0']]
+  teardown:
+    - DROP DATABASE IF EXISTS rc2
+
+- name: Row count is 0 after TRUNCATE
+  setup:
+    - DROP DATABASE IF EXISTS rc3
+    - CREATE DATABASE rc3
+    - CREATE TABLE rc3.t (a INT PRIMARY KEY, b INT) ENGINE=bytecaskdb
+    - INSERT INTO rc3.t VALUES (1, 10), (2, 20), (3, 30)
+    - TRUNCATE TABLE rc3.t
+  steps:
+    - sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='rc3' AND TABLE_NAME='t'
+      expected: [['0']]
+  teardown:
+    - DROP DATABASE IF EXISTS rc3

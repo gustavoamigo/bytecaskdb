@@ -1,0 +1,71 @@
+# auto_increment.yaml — AUTO_INCREMENT correctness tests
+
+- name: AUTO_INCREMENT assigns sequential values on INSERT
+  setup:
+    - DROP DATABASE IF EXISTS ai1
+    - CREATE DATABASE ai1
+    - CREATE TABLE ai1.t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ai1.t (v) VALUES (10),(20),(30)
+  query: SELECT id, v FROM ai1.t ORDER BY id
+  expected:
+    - ['1', '10']
+    - ['2', '20']
+    - ['3', '30']
+  teardown:
+    - DROP DATABASE IF EXISTS ai1
+
+- name: SHOW CREATE TABLE reports correct next AUTO_INCREMENT
+  setup:
+    - DROP DATABASE IF EXISTS ai2
+    - CREATE DATABASE ai2
+    - CREATE TABLE ai2.t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ai2.t (v) VALUES (1),(2),(3)
+  steps:
+    - sql: SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA='ai2' AND TABLE_NAME='t'
+      expected: [['4']]
+  teardown:
+    - DROP DATABASE IF EXISTS ai2
+
+- name: TRUNCATE TABLE resets AUTO_INCREMENT to 1
+  setup:
+    - DROP DATABASE IF EXISTS ai3
+    - CREATE DATABASE ai3
+    - CREATE TABLE ai3.t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ai3.t (v) VALUES (10),(20),(30)
+    - TRUNCATE TABLE ai3.t
+    - INSERT INTO ai3.t (v) VALUES (99)
+  query: SELECT id, v FROM ai3.t
+  expected:
+    - ['1', '99']
+  teardown:
+    - DROP DATABASE IF EXISTS ai3
+
+- name: Explicit INSERT values interleave correctly with AUTO_INCREMENT
+  setup:
+    - DROP DATABASE IF EXISTS ai4
+    - CREATE DATABASE ai4
+    - CREATE TABLE ai4.t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ai4.t VALUES (5, 50)
+    - INSERT INTO ai4.t (v) VALUES (60)
+  query: SELECT id, v FROM ai4.t ORDER BY id
+  expected:
+    - ['5', '50']
+    - ['6', '60']
+  teardown:
+    - DROP DATABASE IF EXISTS ai4
+
+- name: DELETE and re-INSERT does not reuse AUTO_INCREMENT values
+  setup:
+    - DROP DATABASE IF EXISTS ai5
+    - CREATE DATABASE ai5
+    - CREATE TABLE ai5.t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO ai5.t (v) VALUES (10),(20),(30)
+    - DELETE FROM ai5.t WHERE id = 3
+    - INSERT INTO ai5.t (v) VALUES (40)
+  query: SELECT id, v FROM ai5.t ORDER BY id
+  expected:
+    - ['1', '10']
+    - ['2', '20']
+    - ['4', '40']
+  teardown:
+    - DROP DATABASE IF EXISTS ai5
