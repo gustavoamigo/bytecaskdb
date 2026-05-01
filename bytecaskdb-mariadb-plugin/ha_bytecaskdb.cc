@@ -253,6 +253,41 @@ int ha_bytecaskdb::delete_table(const char *name) {
 }
 
 // ---------------------------------------------------------------------------
+// delete_all_rows() — TRUNCATE TABLE / DELETE without WHERE
+// ---------------------------------------------------------------------------
+
+int ha_bytecaskdb::delete_all_rows() {
+  if (!g_db) { return HA_ERR_GENERIC; }
+
+  const TableMeta *meta = catalog_lookup_meta(table_id_);
+
+  auto lower = table_id_prefix(table_id_);
+  auto upper = table_id_upper_bound(table_id_);
+
+  bytecask::WritePlan plan;
+  plan.del_range(as_view(lower), as_view(upper));
+
+  if (meta) {
+    for (const auto &index : meta->indexes) {
+      auto idx_lower = index_id_prefix(table_id_, index.index_id);
+      auto idx_upper = index_id_upper_bound(table_id_, index.index_id);
+      plan.del_range(as_view(idx_lower), as_view(idx_upper));
+    }
+  }
+
+  try {
+    (void)g_db->apply_batch({.sync = true}, std::move(plan));
+  } catch (const std::exception &) {
+    return HA_ERR_GENERIC;
+  }
+
+  if (table->s->primary_key == MAX_KEY) {
+    catalog_seed_rowid(table_id_, 0);
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // rename_table()
 // ---------------------------------------------------------------------------
 
