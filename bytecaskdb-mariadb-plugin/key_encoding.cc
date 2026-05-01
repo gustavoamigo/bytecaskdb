@@ -22,6 +22,14 @@ void write_be32(uint8_t *out, uint32_t id) {
   out[3] = static_cast<uint8_t>( id        & 0xFF);
 }
 
+// Writes the 8-byte big-endian representation of `v` into `out`.
+void write_be64(uint8_t *out, uint64_t v) {
+  for (int i = 7; i >= 0; --i) {
+    out[i] = static_cast<uint8_t>(v & 0xFF);
+    v >>= 8;
+  }
+}
+
 // Writes the 2-byte big-endian representation of `id` into `out`.
 void write_be16(uint8_t *out, uint16_t id) {
   out[0] = static_cast<uint8_t>((id >> 8) & 0xFF);
@@ -34,36 +42,45 @@ uint16_t read_be16(const uint8_t *p) {
                                static_cast<uint16_t>(p[1]));
 }
 
-// Returns the maximum byte length of the primary key for `table`.
-// MariaDB stores this in table->key_info[0].key_length for the primary index.
-uint pk_key_length(TABLE *table) {
-  if (table->s->primary_key == MAX_KEY) {
-    return 0;
-  }
-  return table->key_info[table->s->primary_key].key_length;
-}
-
 } // namespace
 
-std::vector<uint8_t> encode_pk(TABLE *table, const uchar *buf,
-                                uint32_t table_id) {
-  const uint pk_idx = table->s->primary_key;
-  const uint pk_len = pk_key_length(table);
+uint64_t read_be64(const uint8_t *p) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) {
+    v = (v << 8) | static_cast<uint64_t>(p[i]);
+  }
+  return v;
+}
 
-  std::vector<uint8_t> key(5 + pk_len);
+std::vector<uint8_t> encode_pk(TABLE *table, const uchar *buf,
+                                uint32_t table_id,
+                                uint64_t synthetic_rowid) {
+  const uint pk_idx = table->s->primary_key;
+  const uint suffix_len = pk_suffix_length(table);
+
+  std::vector<uint8_t> key(5 + suffix_len);
 
   // Write namespace byte + table_id prefix.
   key[0] = kNsRow;
   write_be32(key.data() + 1, table_id);
 
-  if (pk_idx != MAX_KEY && pk_len > 0) {
+  if (pk_idx == MAX_KEY) {
+    write_be64(key.data() + 5, synthetic_rowid);
+  } else if (suffix_len > 0) {
     key_copy(key.data() + 5,
              const_cast<uchar *>(buf),
              &table->key_info[pk_idx],
-             pk_len);
+             suffix_len);
   }
 
   return key;
+}
+
+uint pk_suffix_length(TABLE *table) {
+  if (table->s->primary_key == MAX_KEY) {
+    return 8;  // synthetic rowid
+  }
+  return table->key_info[table->s->primary_key].key_length;
 }
 
 void decode_pk(TABLE *table, const uint8_t *key, std::size_t key_len,
@@ -133,13 +150,14 @@ void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table, uint active_index
 
 std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
                                      uint32_t table_id, uint16_t index_id,
-                                     uint active_index) {
+                                     uint active_index,
+                                     uint64_t synthetic_rowid) {
   const KEY &key_info = table->key_info[active_index];
   const uint sec_key_len = key_info.key_length;
-  const uint pk_len = pk_key_length(table);
+  const uint suffix_len = pk_suffix_length(table);
 
-  // Format: [0x03 | table_id(BE,4) | index_id(BE,2) | sec_key | pk]
-  std::vector<uint8_t> key(7 + sec_key_len + pk_len);
+  // Format: [0x03 | table_id(BE,4) | index_id(BE,2) | sec_key | pk-or-rowid]
+  std::vector<uint8_t> key(7 + sec_key_len + suffix_len);
 
   // Namespace + table_id + index_id prefix.
   key[0] = kNsIndex;
@@ -157,12 +175,14 @@ std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
   fix_varchar_key_encoding(key.data() + 7, table, active_index);
 #endif
 
-  // Pack primary key for uniqueness.
-  if (table->s->primary_key != MAX_KEY && pk_len > 0) {
+  // Append PK bytes for uniqueness, or synthetic rowid for PK-less tables.
+  if (table->s->primary_key == MAX_KEY) {
+    write_be64(key.data() + 7 + sec_key_len, synthetic_rowid);
+  } else if (suffix_len > 0) {
     key_copy(key.data() + 7 + sec_key_len,
              const_cast<uchar *>(buf),
              &table->key_info[table->s->primary_key],
-             pk_len);
+             suffix_len);
   }
 
   return key;
