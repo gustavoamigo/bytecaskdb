@@ -18,6 +18,8 @@ The main CI workflow (`.github/workflows/ci.yml`) includes a dedicated `coverage
 
 Codecov policy is configured in `.codecov.yml`: project coverage status uses the `cpp` flag with an 85% target (1% threshold), patch coverage status uses the same flag with an 80% target (1% threshold), and CI pass is required before Codecov reports success.
 
+The `build-and-test` CI job also exports Catch2 JUnit XML reports for all three C++ test binaries and uploads them to Codecov via `codecov/test-results-action@v1` (OIDC), enabling the Codecov Test Analytics dashboard (`/tests/new`). The raw XML files are retained as a GitHub Actions artifact (`junit-test-results`) for debugging failed test uploads.
+
 ## Goals
 
 - Provide a clean, minimal API surface for key-value operations.
