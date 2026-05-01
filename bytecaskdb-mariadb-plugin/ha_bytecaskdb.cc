@@ -48,8 +48,8 @@ ha_bytecaskdb::ha_bytecaskdb(handlerton *hton, TABLE_SHARE *table_arg)
 
 ulong ha_bytecaskdb::index_flags(uint idx, uint /*part*/,
                                   bool /*all_parts*/) const {
-  // Both primary key and secondary indexes support ordered navigation and range scans
-  return HA_READ_NEXT | HA_READ_ORDER | HA_READ_RANGE;
+  return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE |
+         HA_KEYREAD_ONLY;
 }
 
 // ---------------------------------------------------------------------------
@@ -392,7 +392,7 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   // PK-less rows can't collide on the primary key (synthetic rowids are
   // monotonic), so skip the dup check there. For PK tables, eager dup check.
   if (!no_pk && txn->exists(key.data(), key.size())) {
-    errkey = table->s->primary_key;
+    errkey = saved_errkey_ = table->s->primary_key;
     return HA_ERR_FOUND_DUPP_KEY;
   }
 
@@ -401,16 +401,16 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   if (meta) {
     for (const auto &index : meta->indexes) {
       if (index.is_unique) {
-        // For unique constraints, check if any key with this secondary key prefix exists
         auto unique_prefix = encode_unique_sec_key(table, buf, table_id_, index.index_id, index.index_id);
 
-        // Open iterator at the unique prefix to see if any matching keys exist
         auto upper = index_id_upper_bound(table_id_, index.index_id);
         auto iter = txn->iter_index_prefix(unique_prefix.data(), unique_prefix.size(),
                                            upper.data(), upper.size(),
                                            table_id_, index.index_id);
-        if (iter && iter->valid()) {
-          errkey = lookup_errkey = static_cast<uint>(index.index_id);
+        if (iter && iter->valid() &&
+            iter->key_len() >= unique_prefix.size() &&
+            std::memcmp(iter->key_data(), unique_prefix.data(), unique_prefix.size()) == 0) {
+          errkey = saved_errkey_ = static_cast<uint>(index.index_id);
           return HA_ERR_FOUND_DUPP_KEY;
         }
       }
@@ -512,6 +512,31 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
       auto new_sec_key = encode_sec_key(table, new_data, table_id_,
                                          index.index_id, index.index_id, rowid);
       if (old_sec_key != new_sec_key) {
+        // Unique constraint check: if the key value changed, verify no other
+        // row already has this value.
+        if (index.is_unique) {
+          auto unique_prefix = encode_unique_sec_key(table, new_data, table_id_,
+                                                     index.index_id, index.index_id);
+          auto uhi = index_id_upper_bound(table_id_, index.index_id);
+          auto uiter = txn->iter_index_prefix(unique_prefix.data(), unique_prefix.size(),
+                                              uhi.data(), uhi.size(),
+                                              table_id_, index.index_id);
+          if (uiter && uiter->valid() &&
+              uiter->key_len() >= unique_prefix.size() &&
+              std::memcmp(uiter->key_data(), unique_prefix.data(), unique_prefix.size()) == 0) {
+            // Found a matching unique prefix — check it's not our own row.
+            const uint8_t *uk = uiter->key_data();
+            size_t uklen = uiter->key_len();
+            bool is_self = (uklen >= 7 + sec_key_field_len + pk_bytes_len &&
+                            std::memcmp(uk + 7 + sec_key_field_len,
+                                        pk_bytes, pk_bytes_len) == 0);
+            if (!is_self) {
+              errkey = saved_errkey_ = static_cast<uint>(index.index_id);
+              return HA_ERR_FOUND_DUPP_KEY;
+            }
+          }
+        }
+
         if (!old_sec_key.empty()) {
           txn->buffer_del(old_sec_key.data(), old_sec_key.size());
         }
@@ -973,6 +998,9 @@ int ha_bytecaskdb::info(uint flag) {
   if (flag & HA_STATUS_AUTO) {
     stats.auto_increment_value = catalog_peek_autoinc(table_id_) + 1;
   }
+  if (flag & HA_STATUS_ERRKEY) {
+    errkey = saved_errkey_;
+  }
   return 0;
 }
 
@@ -983,8 +1011,7 @@ int ha_bytecaskdb::info(uint flag) {
 ha_rows ha_bytecaskdb::records_in_range(uint /*index*/, const key_range */*min_key*/,
                                          const key_range */*max_key*/,
                                          page_range */*pages*/) {
-  // Stub: return unknown for now. MariaDB will use default estimates.
-  return HA_POS_ERROR;
+  return stats.records > 0 ? std::max(ha_rows(2), stats.records / 10) : 2;
 }
 
 // ---------------------------------------------------------------------------
