@@ -1,0 +1,31 @@
+# update_unique_key.yaml — UPDATE must reject duplicate unique-key violations
+
+- name: UPDATE rejected when it violates UNIQUE secondary index
+  setup:
+    - DROP DATABASE IF EXISTS uuk1
+    - CREATE DATABASE uuk1
+    - CREATE TABLE uuk1.t (a INT PRIMARY KEY, b INT NOT NULL) ENGINE=bytecaskdb
+    - CREATE UNIQUE INDEX idx_b ON uuk1.t(b)
+    - INSERT INTO uuk1.t VALUES (1, 10), (2, 20), (3, 30)
+  steps:
+    - sql: UPDATE uuk1.t SET b = 20 WHERE a = 1
+      error: 1062
+    - sql: SELECT a, b FROM uuk1.t ORDER BY a
+      expected: [['1', '10'], ['2', '20'], ['3', '30']]
+  teardown:
+    - DROP DATABASE IF EXISTS uuk1
+
+- name: UPDATE succeeds when UNIQUE constraint not violated
+  setup:
+    - DROP DATABASE IF EXISTS uuk2
+    - CREATE DATABASE uuk2
+    - CREATE TABLE uuk2.t (a INT PRIMARY KEY, b INT NOT NULL) ENGINE=bytecaskdb
+    - CREATE UNIQUE INDEX idx_b ON uuk2.t(b)
+    - INSERT INTO uuk2.t VALUES (1, 10), (2, 20)
+    - UPDATE uuk2.t SET b = 99 WHERE a = 1
+  query: SELECT a, b FROM uuk2.t ORDER BY a
+  expected:
+    - ['1', '99']
+    - ['2', '20']
+  teardown:
+    - DROP DATABASE IF EXISTS uuk2

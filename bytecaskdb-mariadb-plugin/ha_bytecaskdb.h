@@ -46,9 +46,17 @@ std::optional<uint32_t> catalog_lookup_table_id(const char *name);
 const TableMeta *catalog_lookup_meta(uint32_t table_id);
 
 uint64_t         catalog_alloc_rowid(uint32_t table_id);
+uint64_t         catalog_alloc_rowid_range(uint32_t table_id, uint64_t count);
 uint64_t         catalog_peek_rowid(uint32_t table_id);
 void             catalog_seed_rowid(uint32_t table_id, uint64_t high_water);
+void             catalog_reset_rowid(uint32_t table_id, uint64_t value);
 void             catalog_drop_rowid(uint32_t table_id);
+
+uint64_t         catalog_alloc_autoinc_range(uint32_t table_id, uint64_t count);
+uint64_t         catalog_peek_autoinc(uint32_t table_id);
+void             catalog_seed_autoinc(uint32_t table_id, uint64_t high_water);
+void             catalog_reset_autoinc(uint32_t table_id, uint64_t value);
+void             catalog_drop_autoinc(uint32_t table_id);
 
 // ---------------------------------------------------------------------------
 // ha_bytecaskdb — the handler class registered with MariaDB.
@@ -109,6 +117,17 @@ public:
   int external_lock(THD *thd, int lock_type) override;
 
   // -------------------------------------------------------------------
+  // AUTO_INCREMENT
+  // -------------------------------------------------------------------
+
+  void get_auto_increment(ulonglong offset, ulonglong increment,
+                          ulonglong nb_desired_values,
+                          ulonglong *first_value,
+                          ulonglong *nb_reserved_values) override;
+  int reset_auto_increment(ulonglong value) override;
+  void update_create_info(HA_CREATE_INFO *create_info) override;
+
+  // -------------------------------------------------------------------
   // Position / random access by row reference
   // -------------------------------------------------------------------
 
@@ -147,6 +166,8 @@ private:
   // Lazily seeds the per-table synthetic rowid counter on first open of
   // a PK-less table by scanning for the largest existing key.
   void seed_rowid_counter_if_needed() const;
+  // Seeds autoinc counter on first open of a table with AUTO_INCREMENT.
+  void seed_autoinc_counter_if_needed() const;
 
   uint32_t table_id_{0};
   uint16_t schema_version_{1};

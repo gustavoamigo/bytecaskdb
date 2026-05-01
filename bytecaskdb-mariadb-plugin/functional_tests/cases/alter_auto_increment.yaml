@@ -1,0 +1,42 @@
+# alter_auto_increment.yaml — ALTER TABLE AUTO_INCREMENT and CREATE TABLE AUTO_INCREMENT
+
+- name: ALTER TABLE AUTO_INCREMENT sets next value
+  setup:
+    - DROP DATABASE IF EXISTS aai1
+    - CREATE DATABASE aai1
+    - CREATE TABLE aai1.t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO aai1.t (v) VALUES (10),(20)
+    - ALTER TABLE aai1.t AUTO_INCREMENT = 100
+    - INSERT INTO aai1.t (v) VALUES (30)
+  query: SELECT id, v FROM aai1.t ORDER BY id
+  expected:
+    - ['1', '10']
+    - ['2', '20']
+    - ['100', '30']
+  teardown:
+    - DROP DATABASE IF EXISTS aai1
+
+- name: CREATE TABLE AUTO_INCREMENT sets initial value
+  setup:
+    - DROP DATABASE IF EXISTS aai2
+    - CREATE DATABASE aai2
+    - CREATE TABLE aai2.t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb AUTO_INCREMENT=50
+    - INSERT INTO aai2.t (v) VALUES (10)
+  query: SELECT id, v FROM aai2.t ORDER BY id
+  expected:
+    - ['50', '10']
+  teardown:
+    - DROP DATABASE IF EXISTS aai2
+
+- name: ALTER TABLE AUTO_INCREMENT is reflected in information_schema
+  setup:
+    - DROP DATABASE IF EXISTS aai3
+    - CREATE DATABASE aai3
+    - CREATE TABLE aai3.t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO aai3.t (v) VALUES (1),(2),(3)
+    - ALTER TABLE aai3.t AUTO_INCREMENT = 200
+  steps:
+    - sql: SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA='aai3' AND TABLE_NAME='t'
+      expected: [['200']]
+  teardown:
+    - DROP DATABASE IF EXISTS aai3

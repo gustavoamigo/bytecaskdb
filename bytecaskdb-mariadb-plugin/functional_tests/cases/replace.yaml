@@ -1,0 +1,43 @@
+# replace.yaml — REPLACE INTO correctness tests
+
+- name: REPLACE INTO inserts when key absent
+  setup:
+    - DROP DATABASE IF EXISTS rp1
+    - CREATE DATABASE rp1
+    - CREATE TABLE rp1.t (a INT PRIMARY KEY, b CHAR(8)) ENGINE=bytecaskdb
+    - REPLACE INTO rp1.t VALUES (1, 'a'), (2, 'b')
+  query: SELECT a, b FROM rp1.t ORDER BY a
+  expected:
+    - ['1', 'a']
+    - ['2', 'b']
+  teardown:
+    - DROP DATABASE IF EXISTS rp1
+
+- name: REPLACE INTO replaces row on PK conflict
+  setup:
+    - DROP DATABASE IF EXISTS rp2
+    - CREATE DATABASE rp2
+    - CREATE TABLE rp2.t (a INT PRIMARY KEY, b CHAR(8)) ENGINE=bytecaskdb
+    - INSERT INTO rp2.t VALUES (1, 'a'), (2, 'b')
+    - REPLACE INTO rp2.t VALUES (2, 'd')
+  query: SELECT a, b FROM rp2.t ORDER BY a
+  expected:
+    - ['1', 'a']
+    - ['2', 'd']
+  teardown:
+    - DROP DATABASE IF EXISTS rp2
+
+- name: REPLACE INTO replaces row on UNIQUE key conflict
+  setup:
+    - DROP DATABASE IF EXISTS rp3
+    - CREATE DATABASE rp3
+    - CREATE TABLE rp3.t (a INT PRIMARY KEY, b CHAR(8) NOT NULL) ENGINE=bytecaskdb
+    - CREATE UNIQUE INDEX idx_b ON rp3.t(b)
+    - INSERT INTO rp3.t VALUES (1, 'x'), (2, 'y')
+    - REPLACE INTO rp3.t VALUES (3, 'x')
+  query: SELECT a, b FROM rp3.t ORDER BY a
+  expected:
+    - ['2', 'y']
+    - ['3', 'x']
+  teardown:
+    - DROP DATABASE IF EXISTS rp3

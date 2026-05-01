@@ -78,6 +78,12 @@ uint64_t catalog_alloc_rowid(uint32_t table_id) {
   return rowid_counter_for(table_id).fetch_add(1) + 1;
 }
 
+// Atomically reserves `count` consecutive values. Returns the first value.
+uint64_t catalog_alloc_rowid_range(uint32_t table_id, uint64_t count) {
+  if (count == 0) { count = 1; }
+  return rowid_counter_for(table_id).fetch_add(count) + 1;
+}
+
 uint64_t catalog_peek_rowid(uint32_t table_id) {
   return rowid_counter_for(table_id).load();
 }
@@ -95,6 +101,56 @@ void catalog_seed_rowid(uint32_t table_id, uint64_t high_water) {
 void catalog_drop_rowid(uint32_t table_id) {
   std::lock_guard<std::mutex> lk{s_rowid_counters_mu};
   s_rowid_counters.erase(table_id);
+}
+
+// Unconditionally sets the counter to `value` — for TRUNCATE / explicit reset.
+void catalog_reset_rowid(uint32_t table_id, uint64_t value) {
+  rowid_counter_for(table_id).store(value);
+}
+
+// ---------------------------------------------------------------------------
+// Per-table AUTO_INCREMENT counters — independent of synthetic rowid counters.
+// ---------------------------------------------------------------------------
+
+static std::mutex                                       s_autoinc_counters_mu;
+static std::map<uint32_t, std::unique_ptr<std::atomic<uint64_t>>>
+                                                        s_autoinc_counters;
+
+static std::atomic<uint64_t> &autoinc_counter_for(uint32_t table_id) {
+  std::lock_guard<std::mutex> lk{s_autoinc_counters_mu};
+  auto it = s_autoinc_counters.find(table_id);
+  if (it == s_autoinc_counters.end()) {
+    auto [ins, _] = s_autoinc_counters.emplace(
+        table_id, std::make_unique<std::atomic<uint64_t>>(0));
+    it = ins;
+  }
+  return *it->second;
+}
+
+uint64_t catalog_alloc_autoinc_range(uint32_t table_id, uint64_t count) {
+  if (count == 0) { count = 1; }
+  return autoinc_counter_for(table_id).fetch_add(count) + 1;
+}
+
+uint64_t catalog_peek_autoinc(uint32_t table_id) {
+  return autoinc_counter_for(table_id).load();
+}
+
+void catalog_seed_autoinc(uint32_t table_id, uint64_t high_water) {
+  auto &c = autoinc_counter_for(table_id);
+  uint64_t expected = c.load();
+  while (high_water > expected &&
+         !c.compare_exchange_weak(expected, high_water)) {
+  }
+}
+
+void catalog_reset_autoinc(uint32_t table_id, uint64_t value) {
+  autoinc_counter_for(table_id).store(value);
+}
+
+void catalog_drop_autoinc(uint32_t table_id) {
+  std::lock_guard<std::mutex> lk{s_autoinc_counters_mu};
+  s_autoinc_counters.erase(table_id);
 }
 
 // Rebuilds the in-memory caches by scanning the catalog key range. Called
@@ -210,6 +266,7 @@ bool catalog_delete_table_meta(bytecask::DB *db, const char *name) {
   auto it = s_name_to_id.find(normalized);
   if (it != s_name_to_id.end()) {
     catalog_drop_rowid(it->second);
+    catalog_drop_autoinc(it->second);
     s_id_to_meta.erase(it->second);
     s_name_to_id.erase(it);
   }
@@ -224,6 +281,7 @@ void catalog_evict_from_cache(const char *name) {
   auto it = s_name_to_id.find(normalized);
   if (it != s_name_to_id.end()) {
     catalog_drop_rowid(it->second);
+    catalog_drop_autoinc(it->second);
     s_id_to_meta.erase(it->second);
     s_name_to_id.erase(it);
   }
@@ -414,6 +472,10 @@ static int bytecaskdb_deinit(void * /*p*/) {
   {
     std::lock_guard<std::mutex> lk{s_rowid_counters_mu};
     s_rowid_counters.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lk{s_autoinc_counters_mu};
+    s_autoinc_counters.clear();
   }
   return 0;
 }
