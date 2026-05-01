@@ -120,7 +120,8 @@ public:
 
   ulonglong table_flags() const override {
     return HA_REC_NOT_IN_SEQ |
-           HA_BINLOG_ROW_CAPABLE;
+           HA_BINLOG_ROW_CAPABLE |
+           HA_NULL_IN_KEY;
   }
 
   ulong index_flags(uint idx, uint part,
