@@ -45,6 +45,11 @@ bool             catalog_rename_table_meta(bytecask::DB *db,
 std::optional<uint32_t> catalog_lookup_table_id(const char *name);
 const TableMeta *catalog_lookup_meta(uint32_t table_id);
 
+uint64_t         catalog_alloc_rowid(uint32_t table_id);
+uint64_t         catalog_peek_rowid(uint32_t table_id);
+void             catalog_seed_rowid(uint32_t table_id, uint64_t high_water);
+void             catalog_drop_rowid(uint32_t table_id);
+
 // ---------------------------------------------------------------------------
 // ha_bytecaskdb — the handler class registered with MariaDB.
 // ---------------------------------------------------------------------------
@@ -114,9 +119,7 @@ public:
   // -------------------------------------------------------------------
 
   ulonglong table_flags() const override {
-    return HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
-           HA_PRIMARY_KEY_REQUIRED_FOR_DELETE |
-           HA_REC_NOT_IN_SEQ |
+    return HA_REC_NOT_IN_SEQ |
            HA_BINLOG_ROW_CAPABLE;
   }
 
@@ -135,8 +138,13 @@ public:
                              enum thr_lock_type lock_type) override;
 
 private:
-  std::vector<uint8_t> encode_current_pk(const uchar *buf) const;
+  // Saves `current_row_key_` from a slice the iterator gave us.
+  void save_current_row_key(const uint8_t *data, std::size_t len);
   int index_read_current(uchar *buf);
+
+  // Lazily seeds the per-table synthetic rowid counter on first open of
+  // a PK-less table by scanning for the largest existing key.
+  void seed_rowid_counter_if_needed() const;
 
   uint32_t table_id_{0};
   uint16_t schema_version_{1};
@@ -147,6 +155,12 @@ private:
   // Saved search key prefix (binary, after fix_varchar_key_encoding) from
   // index_read_map — used by index_next_same for prefix comparison.
   std::vector<uint8_t> sec_search_key_;
+
+  // Full on-disk key of the row most recently materialized by rnd_next /
+  // index_read_map / rnd_pos. Reused by update_row / delete_row / position
+  // so that PK-less synthetic rowids (which are not present in record[0])
+  // round-trip correctly.
+  std::vector<uint8_t> current_row_key_;
 
   static void write_table_id_prefix(uint8_t *buf4, uint32_t table_id);
 };

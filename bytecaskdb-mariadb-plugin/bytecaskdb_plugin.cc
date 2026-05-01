@@ -20,6 +20,7 @@
 #include "bytecaskdb_txn.h"
 #include "bytecask_view.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -54,6 +55,47 @@ handlerton                    *bytecaskdb_hton = nullptr;
 static std::mutex                          s_catalog_mu;
 static std::map<std::string, uint32_t>     s_name_to_id;
 static std::map<uint32_t, TableMeta>       s_id_to_meta;
+
+// Per-table synthetic rowid counters for tables without a PRIMARY KEY.
+// Map insertion is guarded by s_rowid_counters_mu; reads/fetch_add on an
+// existing entry are lock-free via std::atomic.
+static std::mutex                                       s_rowid_counters_mu;
+static std::map<uint32_t, std::unique_ptr<std::atomic<uint64_t>>>
+                                                        s_rowid_counters;
+
+static std::atomic<uint64_t> &rowid_counter_for(uint32_t table_id) {
+  std::lock_guard<std::mutex> lk{s_rowid_counters_mu};
+  auto it = s_rowid_counters.find(table_id);
+  if (it == s_rowid_counters.end()) {
+    auto [ins, _] = s_rowid_counters.emplace(
+        table_id, std::make_unique<std::atomic<uint64_t>>(0));
+    it = ins;
+  }
+  return *it->second;
+}
+
+uint64_t catalog_alloc_rowid(uint32_t table_id) {
+  return rowid_counter_for(table_id).fetch_add(1) + 1;
+}
+
+uint64_t catalog_peek_rowid(uint32_t table_id) {
+  return rowid_counter_for(table_id).load();
+}
+
+void catalog_seed_rowid(uint32_t table_id, uint64_t high_water) {
+  auto &c = rowid_counter_for(table_id);
+  // Only raise the counter; never lower it.
+  uint64_t expected = c.load();
+  while (high_water > expected &&
+         !c.compare_exchange_weak(expected, high_water)) {
+    // expected updated by CAS failure; loop.
+  }
+}
+
+void catalog_drop_rowid(uint32_t table_id) {
+  std::lock_guard<std::mutex> lk{s_rowid_counters_mu};
+  s_rowid_counters.erase(table_id);
+}
 
 // Rebuilds the in-memory caches by scanning the catalog key range. Called
 // once during plugin init.
@@ -167,6 +209,7 @@ bool catalog_delete_table_meta(bytecask::DB *db, const char *name) {
   std::lock_guard<std::mutex> lk{s_catalog_mu};
   auto it = s_name_to_id.find(normalized);
   if (it != s_name_to_id.end()) {
+    catalog_drop_rowid(it->second);
     s_id_to_meta.erase(it->second);
     s_name_to_id.erase(it);
   }
@@ -180,6 +223,7 @@ void catalog_evict_from_cache(const char *name) {
   std::lock_guard<std::mutex> lk{s_catalog_mu};
   auto it = s_name_to_id.find(normalized);
   if (it != s_name_to_id.end()) {
+    catalog_drop_rowid(it->second);
     s_id_to_meta.erase(it->second);
     s_name_to_id.erase(it);
   }
@@ -362,9 +406,15 @@ static int bytecaskdb_deinit(void * /*p*/) {
   g_db = nullptr;
   g_db_owner.reset();
   // Clear caches.
-  std::lock_guard<std::mutex> lk{s_catalog_mu};
-  s_name_to_id.clear();
-  s_id_to_meta.clear();
+  {
+    std::lock_guard<std::mutex> lk{s_catalog_mu};
+    s_name_to_id.clear();
+    s_id_to_meta.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lk{s_rowid_counters_mu};
+    s_rowid_counters.clear();
+  }
   return 0;
 }
 

@@ -29,9 +29,14 @@ namespace bytecaskdb {
 // table->record[1]) into a ByteCaskDB key: namespace byte (0x02) + 4-byte
 // big-endian table_id + MariaDB's internal key representation (key_copy()).
 //
+// For tables without a PRIMARY KEY (table->s->primary_key == MAX_KEY), the
+// caller supplies an 8-byte synthetic rowid which is appended big-endian
+// after the table_id prefix. Result is exactly 13 bytes for PK-less tables.
+//
 // Returns the encoded key as a byte vector.
 std::vector<uint8_t> encode_pk(TABLE *table, const uchar *buf,
-                                uint32_t table_id);
+                                uint32_t table_id,
+                                uint64_t synthetic_rowid = 0);
 
 // Decodes a previously encoded key back into the row buffer `buf` using
 // key_restore().  Strips the 1-byte namespace + 4-byte table_id prefix first.
@@ -52,11 +57,22 @@ bool key_belongs_to_table(const uint8_t *key, std::size_t key_len,
 std::vector<uint8_t> table_id_upper_bound(uint32_t table_id);
 
 // Encodes a secondary index key: namespace (0x03) + table_id + index_id +
-// packed secondary key columns + embedded primary key.
+// packed secondary key columns + embedded primary key (or synthetic rowid).
 // Format: [0x03 | table_id(BE,4) | index_id(BE,2) | sec_key_packed | pk_packed]
+//
+// For PK-less tables, the caller supplies an 8-byte synthetic rowid which is
+// appended big-endian in place of the packed PK suffix.
 std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
                                      uint32_t table_id, uint16_t index_id,
-                                     uint active_index);
+                                     uint active_index,
+                                     uint64_t synthetic_rowid = 0);
+
+// Returns the byte length of the trailing PK / rowid suffix used by
+// encode_pk and encode_sec_key. 8 for PK-less tables, key_length otherwise.
+uint pk_suffix_length(TABLE *table);
+
+// Reads a 8-byte big-endian unsigned integer from `p`.
+uint64_t read_be64(const uint8_t *p);
 
 // Extracts the primary key portion from a secondary index key.
 // sec_key_packed_len is the length of the secondary key portion only.

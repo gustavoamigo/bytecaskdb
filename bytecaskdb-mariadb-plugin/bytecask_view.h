@@ -40,4 +40,8 @@ inline const uint8_t *u8_data(const bytecask::Bytes &b) {
   return reinterpret_cast<const uint8_t *>(b.data());
 }
 
+inline const uint8_t *u8_data(bytecask::BytesView v) {
+  return reinterpret_cast<const uint8_t *>(v.data());
+}
+
 }  // namespace bytecaskdb

@@ -163,9 +163,35 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
     schema_version_ = static_cast<uint16_t>(meta->schema_version);
   }
 
-  // ref_length: 5-byte prefix (1 ns + 4 tid) + PK key length.
-  ref_length = 5 + table->key_info[table->s->primary_key].key_length;
+  // ref_length: 5-byte prefix (1 ns + 4 tid) + PK key length (or 8-byte
+  // synthetic rowid for PK-less tables).
+  const uint pk = table->s->primary_key;
+  if (pk == MAX_KEY) {
+    ref_length = 5 + 8;
+    seed_rowid_counter_if_needed();
+  } else {
+    ref_length = 5 + table->key_info[pk].key_length;
+  }
   return 0;
+}
+
+// Seeds the per-table synthetic rowid counter from disk on first open,
+// by reverse-scanning the row namespace for this table_id. Cheap: a
+// single radix-tree traversal returns the largest existing key in O(1).
+void ha_bytecaskdb::seed_rowid_counter_if_needed() const {
+  if (catalog_peek_rowid(table_id_) != 0) { return; }
+
+  auto upper = table_id_upper_bound(table_id_);
+  bytecask::Snapshot snap = g_db->snapshot();
+  uint64_t hw = 0;
+  for (auto &k : snap.rkeys_from({}, as_view(upper))) {
+    if (!key_belongs_to_table(u8_data(k), k.size(), table_id_)) { break; }
+    if (k.size() >= 13) {
+      hw = read_be64(u8_data(k) + 5);
+    }
+    break;
+  }
+  catalog_seed_rowid(table_id_, hw);
 }
 
 // ---------------------------------------------------------------------------
@@ -248,11 +274,16 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   auto *txn = get_or_create_txn(ha_thd(), bytecaskdb_hton);
   txn->begin_if_needed(ha_thd(), bytecaskdb_hton);
 
-  auto key = encode_current_pk(buf);
+  // For PK-less tables, allocate a fresh synthetic rowid for this row.
+  const bool no_pk = (table->s->primary_key == MAX_KEY);
+  const uint64_t rowid = no_pk ? catalog_alloc_rowid(table_id_) : 0;
+
+  auto key = encode_pk(table, buf, table_id_, rowid);
   auto val = encode_row(table, buf, schema_version_);
 
-  // Eager dup check: lookup_ then snapshot.
-  if (txn->exists(key.data(), key.size())) {
+  // PK-less rows can't collide on the primary key (synthetic rowids are
+  // monotonic), so skip the dup check there. For PK tables, eager dup check.
+  if (!no_pk && txn->exists(key.data(), key.size())) {
     errkey = table->s->primary_key;
     return HA_ERR_FOUND_DUPP_KEY;
   }
@@ -284,10 +315,15 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   // Buffer secondary index operations.
   if (meta) {
     for (const auto &index : meta->indexes) {
-      auto sec_key = encode_sec_key(table, buf, table_id_, index.index_id, index.index_id);
+      auto sec_key = encode_sec_key(table, buf, table_id_,
+                                     index.index_id, index.index_id, rowid);
       txn->buffer_put(sec_key.data(), sec_key.size(), nullptr, 0);
     }
   }
+
+  // Remember the full key for any immediately-following update_row /
+  // delete_row / position call.
+  current_row_key_ = std::move(key);
 
   return 0;
 }
@@ -303,17 +339,35 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
       thd_get_ha_data(ha_thd(), bytecaskdb_hton));
   if (!txn) { return HA_ERR_GENERIC; }
 
-  auto old_pk = encode_current_pk(old_data);
-  auto new_pk = encode_current_pk(new_data);
+  const bool no_pk = (table->s->primary_key == MAX_KEY);
+
+  // Old PK is always the key we just read; current_row_key_ has the real
+  // bytes (including the synthetic rowid for PK-less tables).
+  std::vector<uint8_t> old_pk = current_row_key_;
+  if (old_pk.empty()) {
+    // Defensive fallback for the PK case if no read happened first.
+    old_pk = encode_pk(table, old_data, table_id_);
+  }
+
+  // For PK-less tables the rowid persists across the update, so the new
+  // primary key is the same. For PK tables the new PK comes from new_data.
+  std::vector<uint8_t> new_pk;
+  uint64_t rowid = 0;
+  if (no_pk) {
+    new_pk = old_pk;
+    if (old_pk.size() >= 13) { rowid = read_be64(old_pk.data() + 5); }
+  } else {
+    new_pk = encode_pk(table, new_data, table_id_);
+  }
+
   auto new_val = encode_row(table, new_data, schema_version_);
 
   // Handle secondary indexes.
   const TableMeta *meta = catalog_lookup_meta(table_id_);
   if (meta) {
-    // old_pk_encoded = [kNsRow | table_id | key_copy(pk)]; pk bytes start at offset 5.
-    auto old_pk_encoded = encode_current_pk(old_data);
-    const uint8_t *pk_bytes     = old_pk_encoded.data() + 5;
-    const size_t   pk_bytes_len = old_pk_encoded.size() - 5;
+    // PK suffix bytes start at offset 5; for PK-less tables this is the rowid.
+    const uint8_t *pk_bytes     = old_pk.data() + 5;
+    const size_t   pk_bytes_len = old_pk.size() - 5;
 
     for (const auto &index : meta->indexes) {
       // Locate the old secondary index entry by scanning for the PK suffix.
@@ -339,7 +393,7 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
       }
 
       auto new_sec_key = encode_sec_key(table, new_data, table_id_,
-                                         index.index_id, index.index_id);
+                                         index.index_id, index.index_id, rowid);
       if (old_sec_key != new_sec_key) {
         if (!old_sec_key.empty()) {
           txn->buffer_del(old_sec_key.data(), old_sec_key.size());
@@ -350,7 +404,7 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
   }
 
   if (old_pk == new_pk) {
-    // PK unchanged — simple overwrite.
+    // PK unchanged — simple overwrite. (Always the case for PK-less tables.)
     txn->buffer_put(new_pk.data(), new_pk.size(),
                     new_val.data(), new_val.size());
   } else {
@@ -362,6 +416,10 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
     txn->buffer_put(new_pk.data(), new_pk.size(),
                     new_val.data(), new_val.size());
   }
+
+  // The post-update key is what subsequent calls (rare, but possible)
+  // should reference.
+  current_row_key_ = std::move(new_pk);
 
   return 0;
 }
@@ -377,13 +435,27 @@ int ha_bytecaskdb::delete_row(const uchar *buf) {
       thd_get_ha_data(ha_thd(), bytecaskdb_hton));
   if (!txn) { return HA_ERR_GENERIC; }
 
-  auto key = encode_current_pk(buf);
+  const bool no_pk = (table->s->primary_key == MAX_KEY);
+
+  // Use the key from the row we just read so PK-less synthetic rowids
+  // round-trip correctly. Fall back to re-encoding for the rare PK case
+  // where delete is called without a prior read.
+  std::vector<uint8_t> key = current_row_key_;
+  if (key.empty()) {
+    key = encode_pk(table, buf, table_id_);
+  }
+
+  uint64_t rowid = 0;
+  if (no_pk && key.size() >= 13) {
+    rowid = read_be64(key.data() + 5);
+  }
 
   // Buffer secondary index deletions first.
   const TableMeta *meta = catalog_lookup_meta(table_id_);
   if (meta) {
     for (const auto &index : meta->indexes) {
-      auto sec_key = encode_sec_key(table, buf, table_id_, index.index_id, index.index_id);
+      auto sec_key = encode_sec_key(table, buf, table_id_,
+                                     index.index_id, index.index_id, rowid);
       txn->buffer_del(sec_key.data(), sec_key.size());
     }
   }
@@ -424,6 +496,10 @@ int ha_bytecaskdb::rnd_next(uchar *buf) {
 
   // Decode row value.
   decode_row(table, merge_scan_->value_data(), merge_scan_->value_len(), buf);
+
+  // Save the on-disk key for any follow-up update_row / delete_row /
+  // position call.
+  save_current_row_key(merge_scan_->key_data(), merge_scan_->key_len());
 
   merge_scan_->next();
   return 0;
@@ -486,6 +562,7 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
       key_restore(buf, key, &table->key_info[pk_idx], pk_len);
 
       decode_row(table, u8_data(val), val.size(), buf);
+      save_current_row_key(search_key.data(), search_key.size());
       return 0;
     }
 
@@ -674,6 +751,7 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
     // Primary key access: key is encoded PK, value is row data
     decode_pk(table, merge_index_->key_data(), merge_index_->key_len(), buf);
     decode_row(table, merge_index_->value_data(), merge_index_->value_len(), buf);
+    save_current_row_key(merge_index_->key_data(), merge_index_->key_len());
     return 0;
   } else {
     // Secondary index access: two-step lookup
@@ -687,7 +765,7 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
       return HA_ERR_KEY_NOT_FOUND;
     }
 
-    // 2. Build primary key for row lookup [0x02 | table_id | pk]
+    // 2. Build primary key for row lookup [0x02 | table_id | pk-or-rowid]
     std::vector<uint8_t> row_key(5 + pk_bytes.size());
     row_key[0] = kNsRow;
     // Write table_id in big-endian
@@ -711,6 +789,7 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
     // 4. Decode PK and row data into MariaDB buffer
     decode_pk(table, row_key.data(), row_key.size(), buf);
     decode_row(table, u8_data(row_val), row_val.size(), buf);
+    save_current_row_key(row_key.data(), row_key.size());
     return 0;
   }
 }
@@ -720,7 +799,14 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
 // ---------------------------------------------------------------------------
 
 void ha_bytecaskdb::position(const uchar *record) {
-  auto pk = encode_current_pk(record);
+  // Prefer the on-disk key from the most recent read — required for PK-less
+  // tables (synthetic rowid is not in record[0]) and equivalent for PK tables.
+  if (!current_row_key_.empty() && current_row_key_.size() <= ref_length) {
+    std::memcpy(ref, current_row_key_.data(), current_row_key_.size());
+    return;
+  }
+  // Fallback: re-encode from record (only valid for PK tables).
+  auto pk = encode_pk(table, record, table_id_);
   assert(pk.size() <= ref_length);
   std::memcpy(ref, pk.data(), pk.size());
 }
@@ -742,6 +828,10 @@ int ha_bytecaskdb::rnd_pos(uchar *buf, uchar *pos) {
   decode_pk(table, pos, ref_length, buf);
 
   decode_row(table, u8_data(val), val.size(), buf);
+
+  // Save the position-key as the current row key in case mutation follows.
+  save_current_row_key(pos, ref_length);
+
   return 0;
 }
 
@@ -766,11 +856,11 @@ ha_rows ha_bytecaskdb::records_in_range(uint /*index*/, const key_range */*min_k
 }
 
 // ---------------------------------------------------------------------------
-// encode_current_pk() — private helper
+// save_current_row_key() — private helper
 // ---------------------------------------------------------------------------
 
-std::vector<uint8_t> ha_bytecaskdb::encode_current_pk(const uchar *buf) const {
-  return bytecaskdb::encode_pk(table, buf, table_id_);
+void ha_bytecaskdb::save_current_row_key(const uint8_t *data, std::size_t len) {
+  current_row_key_.assign(data, data + len);
 }
 
 } // namespace bytecaskdb
