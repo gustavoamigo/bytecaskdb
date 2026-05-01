@@ -1,0 +1,42 @@
+--- /usr/share/mysql-test/suite/storage_engine/tbl_standard_opts.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/tbl_standard_opts.reject	2026-05-01 19:59:45.937686747 +0100
+@@ -8,33 +8,33 @@
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+   `b` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=utf8 COMMENT='standard table options'
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci COMMENT='standard table options'
+ ALTER TABLE t1 COMMENT = 'table altered';
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+   `b` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=utf8 COMMENT='table altered'
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci COMMENT='table altered'
+ ALTER TABLE t1 ENGINE=MEMORY;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+   `b` char(8) DEFAULT NULL
+-) ENGINE=MEMORY DEFAULT CHARSET=utf8 COMMENT='table altered'
++) ENGINE=MEMORY DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci COMMENT='table altered'
+ ALTER TABLE t1 ENGINE=<STORAGE_ENGINE>;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+   `b` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=utf8 COMMENT='table altered'
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci COMMENT='table altered'
+ ALTER TABLE t1 CHARACTER SET = latin1 COLLATE = latin1_swedish_ci;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+-  `b` char(8) CHARACTER SET utf8 DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COMMENT='table altered'
++  `b` char(8) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci DEFAULT NULL
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci COMMENT='table altered'
+ DROP TABLE t1;

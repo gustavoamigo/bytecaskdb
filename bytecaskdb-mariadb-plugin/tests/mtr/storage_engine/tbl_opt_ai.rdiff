@@ -1,0 +1,16 @@
+--- /usr/share/mysql-test/suite/storage_engine/tbl_opt_ai.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/tbl_opt_ai.reject	2026-05-01 19:59:40.232126757 +0100
+@@ -4,11 +4,11 @@
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> AUTO_INCREMENT=10 DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> AUTO_INCREMENT=10 DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ ALTER TABLE t1 AUTO_INCREMENT=100;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> AUTO_INCREMENT=100 DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> AUTO_INCREMENT=100 DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ DROP TABLE t1;

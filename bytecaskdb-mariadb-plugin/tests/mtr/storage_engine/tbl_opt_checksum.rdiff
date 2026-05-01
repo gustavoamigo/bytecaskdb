@@ -1,0 +1,17 @@
+--- /usr/share/mysql-test/suite/storage_engine/tbl_opt_checksum.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/tbl_opt_checksum.reject	2026-05-01 19:59:40.959746395 +0100
+@@ -5,12 +5,12 @@
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+   `b` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 CHECKSUM=1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci CHECKSUM=1
+ ALTER TABLE t1 CHECKSUM=0;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+   `b` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ DROP TABLE t1;

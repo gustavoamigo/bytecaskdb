@@ -1,0 +1,165 @@
+--- /usr/share/mysql-test/suite/storage_engine/alter_table.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/alter_table.reject	2026-05-01 19:59:33.179530444 +0100
+@@ -8,7 +8,7 @@
+   `a` int(11) DEFAULT NULL,
+   `c` char(8) DEFAULT NULL,
+   `b` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ ALTER TABLE t1 ALTER COLUMN a SET DEFAULT '0';
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+@@ -16,79 +16,79 @@
+   `a` int(11) DEFAULT 0,
+   `c` char(8) DEFAULT NULL,
+   `b` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ ALTER TABLE t1 ALTER a DROP DEFAULT;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+-  `a` int(11),
++  `a` int(11) DEFAULT NULL,
+   `c` char(8) DEFAULT NULL,
+   `b` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ ALTER TABLE t1 CHANGE COLUMN b b1 <CHAR_COLUMN> FIRST;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `b1` char(8) DEFAULT NULL,
+-  `a` int(11),
++  `a` int(11) DEFAULT NULL,
+   `c` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ ALTER TABLE t1 CHANGE b1 b <INT_COLUMN> AFTER c;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+-  `a` int(11),
++  `a` int(11) DEFAULT NULL,
+   `c` char(8) DEFAULT NULL,
+   `b` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ ALTER TABLE t1 CHANGE b b <CHAR_COLUMN>;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+-  `a` int(11),
++  `a` int(11) DEFAULT NULL,
+   `c` char(8) DEFAULT NULL,
+   `b` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ ALTER TABLE t1 MODIFY COLUMN b <INT_COLUMN>;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+-  `a` int(11),
++  `a` int(11) DEFAULT NULL,
+   `c` char(8) DEFAULT NULL,
+   `b` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ ALTER TABLE t1 MODIFY COLUMN b <CHAR_COLUMN> FIRST;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `b` char(8) DEFAULT NULL,
+-  `a` int(11),
++  `a` int(11) DEFAULT NULL,
+   `c` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ ALTER TABLE t1 MODIFY COLUMN b <INT_COLUMN> AFTER a;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+-  `a` int(11),
++  `a` int(11) DEFAULT NULL,
+   `b` int(11) DEFAULT NULL,
+   `c` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ ALTER TABLE t1 DROP COLUMN b;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+-  `a` int(11),
++  `a` int(11) DEFAULT NULL,
+   `c` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ ALTER TABLE t1 RENAME TO t2;
+ SHOW CREATE TABLE t1;
+ ERROR 42S02: Table 'test.t1' doesn't exist
+ SHOW CREATE TABLE t2;
+ Table	Create Table
+ t2	CREATE TABLE `t2` (
+-  `a` int(11),
++  `a` int(11) DEFAULT NULL,
+   `c` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ DROP TABLE t2;
+ CREATE TABLE t1 (a <INT_COLUMN>, b <INT_COLUMN>) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ INSERT INTO t1 (a,b) VALUES (1,5),(2,2),(4,3);
+@@ -97,14 +97,14 @@
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+   `b` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ ALTER TABLE t1 ORDER BY b ASC, a DESC;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+   `b` int(11) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ SELECT a,b FROM t1;
+ a	b
+ 2	2
+@@ -117,8 +117,8 @@
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+-  `b` char(8) COLLATE latin1_general_cs DEFAULT NULL,
+-  `c` char(8) COLLATE latin1_general_cs DEFAULT NULL
++  `b` char(8) DEFAULT NULL,
++  `c` char(8) DEFAULT NULL
+ ) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_general_cs
+ ALTER TABLE t1 CONVERT TO CHARACTER SET utf8;
+ SHOW CREATE TABLE t1;
+@@ -127,21 +127,21 @@
+   `a` int(11) DEFAULT NULL,
+   `b` char(8) DEFAULT NULL,
+   `c` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=utf8
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci
+ ALTER TABLE t1 DEFAULT CHARACTER SET = latin1 COLLATE latin1_general_ci;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+-  `b` char(8) CHARACTER SET utf8 DEFAULT NULL,
+-  `c` char(8) CHARACTER SET utf8 DEFAULT NULL
++  `b` char(8) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci DEFAULT NULL,
++  `c` char(8) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci DEFAULT NULL
+ ) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_general_ci
+ ALTER TABLE t1 FORCE;
+ SHOW CREATE TABLE t1;
+ Table	Create Table
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+-  `b` char(8) CHARACTER SET utf8 DEFAULT NULL,
+-  `c` char(8) CHARACTER SET utf8 DEFAULT NULL
++  `b` char(8) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci DEFAULT NULL,
++  `c` char(8) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci DEFAULT NULL
+ ) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_general_ci
+ DROP TABLE t1;

@@ -1,0 +1,11 @@
+--- /usr/share/mysql-test/suite/storage_engine/show_table_status.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/show_table_status.reject	2026-05-01 19:59:39.876882538 +0100
+@@ -59,7 +59,7 @@
+ Create_time	###
+ Update_time	###
+ Check_time	NULL
+-Collation	utf8_general_ci
++Collation	utf8mb3_general_ci
+ Checksum	NULL
+ Create_options	
+ Comment	

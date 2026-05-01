@@ -1,0 +1,11 @@
+--- /usr/share/mysql-test/suite/storage_engine/autoincrement.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/autoincrement.reject	2026-05-01 19:59:34.001418531 +0100
+@@ -6,7 +6,7 @@
+   `a` int(11) NOT NULL AUTO_INCREMENT,
+   `b` char(8) DEFAULT NULL,
+   KEY `a` (`a`)
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ INSERT INTO t1 (b) VALUES ('a'),('b');
+ SELECT a,b FROM t1 ORDER BY a;
+ a	b

@@ -1,1 +1,0 @@
-/usr/share/mysql-test/suite/storage_engine/type_date_time.inc

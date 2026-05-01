@@ -1,0 +1,50 @@
+--- /usr/share/mysql-test/suite/storage_engine/misc.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/misc.reject	2026-05-01 19:59:38.650597472 +0100
+@@ -42,6 +42,8 @@
+ event	db	NULL	NULL
+ event	name	NULL	NULL
+ func	name	NULL	NULL
++global_priv	Host	NULL	NULL
++global_priv	User	NULL	NULL
+ gtid_slave_pos	domain_id	NULL	NULL
+ gtid_slave_pos	sub_id	NULL	NULL
+ help_category	help_category_id	NULL	NULL
+@@ -52,18 +54,10 @@
+ help_relation	help_topic_id	NULL	NULL
+ help_topic	help_topic_id	NULL	NULL
+ help_topic	name	NULL	NULL
+-host	Db	NULL	NULL
+-host	Host	NULL	NULL
+ index_stats	db_name	NULL	NULL
+ index_stats	index_name	NULL	NULL
+ index_stats	prefix_arity	NULL	NULL
+ index_stats	table_name	NULL	NULL
+-innodb_index_stats	database_name	NULL	NULL
+-innodb_index_stats	index_name	NULL	NULL
+-innodb_index_stats	stat_name	NULL	NULL
+-innodb_index_stats	table_name	NULL	NULL
+-innodb_table_stats	database_name	NULL	NULL
+-innodb_table_stats	table_name	NULL	NULL
+ plugin	name	NULL	NULL
+ proc	db	NULL	NULL
+ proc	name	NULL	NULL
+@@ -81,6 +75,7 @@
+ roles_mapping	Role	NULL	NULL
+ roles_mapping	User	NULL	NULL
+ servers	Server_name	NULL	NULL
++sys_config	variable	NULL	NULL
+ table_stats	db_name	NULL	NULL
+ table_stats	table_name	NULL	NULL
+ tables_priv	Db	NULL	NULL
+@@ -94,7 +89,7 @@
+ time_zone_transition	Transition_time	NULL	NULL
+ time_zone_transition_type	Time_zone_id	NULL	NULL
+ time_zone_transition_type	Transition_type_id	NULL	NULL
+-transaction_registry	commit_id	NULL	NULL
+-transaction_registry	transaction_id	NULL	NULL
+-user	Host	NULL	NULL
+-user	User	NULL	NULL
++Warnings:
++Warning	1286	Unknown storage engine 'InnoDB'
++Warning	1286	Unknown storage engine 'InnoDB'
++Warning	1286	Unknown storage engine 'InnoDB'

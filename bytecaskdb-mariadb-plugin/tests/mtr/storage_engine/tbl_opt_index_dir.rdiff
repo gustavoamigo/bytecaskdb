@@ -1,0 +1,18 @@
+--- /usr/share/mysql-test/suite/storage_engine/tbl_opt_index_dir.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/tbl_opt_index_dir.reject	2026-05-01 19:59:42.467290281 +0100
+@@ -5,7 +5,7 @@
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+   `b` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 INDEX DIRECTORY='<INDEX_DIR_1>'
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ # For ALTER TABLE the option is ignored
+ # Running ALTER TABLE .. INDEX DIRECTORY = <>
+ Warnings:
+@@ -15,5 +15,5 @@
+ t1	CREATE TABLE `t1` (
+   `a` int(11) DEFAULT NULL,
+   `b` char(8) DEFAULT NULL
+-) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 INDEX DIRECTORY='<INDEX_DIR_1>'
++) ENGINE=<STORAGE_ENGINE> DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+ DROP TABLE t1;

@@ -1,0 +1,48 @@
+--- /usr/share/mysql-test/suite/storage_engine/type_fixed_indexes.result	2026-01-31 10:47:55.000000000 +0000
++++ bytecaskdb-mariadb-plugin/mtr-var/log/type_fixed_indexes.reject	2026-05-01 21:02:05.864474999 +0100
+@@ -6,8 +6,8 @@
+ <CUSTOM_INDEX> d1 (d1)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	1	#	1	d1	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	1	#	1	d1	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (d1,d2,n1,n2) VALUES 
+ (10.22,60.12345,123456,14.3456),
+ (10.0,60.12345,123456,14),
+@@ -34,8 +34,8 @@
+ n2 NUMERIC(65,4) <CUSTOM_COL_OPTIONS>
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	PRIMARY	1	d1	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	PRIMARY	1	d1	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (d1,d2,n1,n2) VALUES 
+ (10.22,60.12345,123456,14.3456),
+ (10.0,60.12345,123456,14),
+@@ -78,9 +78,9 @@
+ UNIQUE INDEX n1_n2 (n1,n2)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	0	n1_n2	1	n1	#	#	NULL	NULL	#	#		
+-t1	0	n1_n2	2	n2	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	0	n1_n2	1	n1	#	#	NULL	NULL	#	#			NO
++t1	0	n1_n2	2	n2	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (d1,d2,n1,n2) VALUES
+ (10.22,60.12345,123456,14.3456),
+ (10.0,60.12345,123456,14),
+@@ -111,8 +111,8 @@
+ INDEX (d2)
+ ) ENGINE=<STORAGE_ENGINE> <CUSTOM_TABLE_OPTIONS>;
+ SHOW INDEX IN t1;
+-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+-t1	1	d2	1	d2	#	#	NULL	NULL	#	#		
++Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
++t1	1	d2	1	d2	#	#	NULL	NULL	#	#			NO
+ INSERT INTO t1 (d1,d2,n1,n2) VALUES
+ (10.22,60.12345,123456,14.3456),
+ (10.0,60.12345,123456,14),
