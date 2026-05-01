@@ -1,0 +1,37 @@
+# index_ordered_scan.yaml — optimizer uses index for ORDER BY
+
+- name: ORDER BY PK uses index (no filesort)
+  setup:
+    - DROP DATABASE IF EXISTS ios1
+    - CREATE DATABASE ios1
+    - CREATE TABLE ios1.t (i INT PRIMARY KEY, v INT) ENGINE=bytecaskdb
+    - INSERT INTO ios1.t VALUES (3,30),(1,10),(5,50),(2,20),(4,40)
+  steps:
+    - sql: SELECT i FROM ios1.t ORDER BY i
+      expected: [['1'],['2'],['3'],['4'],['5']]
+  teardown:
+    - DROP DATABASE IF EXISTS ios1
+
+- name: ORDER BY secondary index uses index
+  setup:
+    - DROP DATABASE IF EXISTS ios2
+    - CREATE DATABASE ios2
+    - CREATE TABLE ios2.t (a INT PRIMARY KEY, b INT NOT NULL, INDEX idx_b(b)) ENGINE=bytecaskdb
+    - INSERT INTO ios2.t VALUES (1,30),(2,10),(3,50),(4,20),(5,40)
+  steps:
+    - sql: SELECT b FROM ios2.t ORDER BY b
+      expected: [['10'],['20'],['30'],['40'],['50']]
+  teardown:
+    - DROP DATABASE IF EXISTS ios2
+
+- name: Index range scan with WHERE clause
+  setup:
+    - DROP DATABASE IF EXISTS ios3
+    - CREATE DATABASE ios3
+    - CREATE TABLE ios3.t (a INT PRIMARY KEY, b INT) ENGINE=bytecaskdb
+    - INSERT INTO ios3.t VALUES (1,10),(2,20),(3,30),(4,40),(5,50)
+  steps:
+    - sql: SELECT a, b FROM ios3.t WHERE a >= 3 ORDER BY a
+      expected: [['3','30'],['4','40'],['5','50']]
+  teardown:
+    - DROP DATABASE IF EXISTS ios3

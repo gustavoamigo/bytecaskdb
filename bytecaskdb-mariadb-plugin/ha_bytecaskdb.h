@@ -185,6 +185,9 @@ private:
   // round-trip correctly.
   std::vector<uint8_t> current_row_key_;
 
+  // Saved across write_row → get_dup_key → info(HA_STATUS_ERRKEY) round-trip.
+  uint saved_errkey_{0};
+
   static void write_table_id_prefix(uint8_t *buf4, uint32_t table_id);
 };
 

@@ -1,0 +1,49 @@
+# unique_insert_no_false_dup.yaml — multi-row INSERT must not report false duplicates
+
+- name: Multi-row INSERT with unique index does not false-positive
+  setup:
+    - DROP DATABASE IF EXISTS uid1
+    - CREATE DATABASE uid1
+    - CREATE TABLE uid1.t (a INT, b CHAR(8), UNIQUE INDEX(a)) ENGINE=bytecaskdb
+    - INSERT INTO uid1.t (a,b) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')
+    - INSERT INTO uid1.t (a,b) VALUES (100,'x'), (6,'f')
+  query: SELECT a, b FROM uid1.t ORDER BY a
+  expected:
+    - ['1', 'a']
+    - ['2', 'b']
+    - ['3', 'c']
+    - ['4', 'd']
+    - ['5', 'e']
+    - ['6', 'f']
+    - ['100', 'x']
+  teardown:
+    - DROP DATABASE IF EXISTS uid1
+
+- name: INSERT with true duplicate on unique index is rejected
+  setup:
+    - DROP DATABASE IF EXISTS uid2
+    - CREATE DATABASE uid2
+    - CREATE TABLE uid2.t (a INT, b CHAR(8), UNIQUE INDEX(a)) ENGINE=bytecaskdb
+    - INSERT INTO uid2.t (a,b) VALUES (1,'a'),(2,'b'),(3,'c')
+  steps:
+    - sql: INSERT INTO uid2.t (a,b) VALUES (1,'z')
+      error: 1062
+    - sql: SELECT a, b FROM uid2.t ORDER BY a
+      expected: [['1', 'a'], ['2', 'b'], ['3', 'c']]
+  teardown:
+    - DROP DATABASE IF EXISTS uid2
+
+- name: INSERT IGNORE skips duplicate and inserts non-duplicate
+  setup:
+    - DROP DATABASE IF EXISTS uid3
+    - CREATE DATABASE uid3
+    - CREATE TABLE uid3.t (a INT, b CHAR(8), UNIQUE INDEX(a)) ENGINE=bytecaskdb
+    - INSERT INTO uid3.t (a,b) VALUES (1,'a'),(2,'b')
+    - INSERT IGNORE INTO uid3.t (a,b) VALUES (1,'z'),(99,'y')
+  query: SELECT a, b FROM uid3.t ORDER BY a
+  expected:
+    - ['1', 'a']
+    - ['2', 'b']
+    - ['99', 'y']
+  teardown:
+    - DROP DATABASE IF EXISTS uid3
