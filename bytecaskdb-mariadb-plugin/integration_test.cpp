@@ -447,11 +447,14 @@ TEST_CASE("MariaDB ByteCaskDB Plugin Integration Tests", "[integration]") {
       "CREATE TABLE edge_test.nullable (id INT PRIMARY KEY, value VARCHAR(50)) ENGINE=bytecaskdb;"
     );
 
-    // This should fail - NULL not supported in indexes
-    REQUIRE_THROWS_AS(
-      db.execute_sql("CREATE INDEX idx_value ON edge_test.nullable(value);"),
-      std::runtime_error
+    // Nullable columns can be indexed
+    db.execute_sql_expect_success("CREATE INDEX idx_value ON edge_test.nullable(value);");
+    db.execute_sql_expect_success("INSERT INTO edge_test.nullable VALUES (1, NULL), (2, 'hello');");
+
+    auto nullable_result = db.execute_sql_single_result(
+      "SELECT value FROM edge_test.nullable WHERE id = 2;"
     );
+    REQUIRE(nullable_result == "hello");
 
     // Test empty strings
     db.execute_sql_expect_success(
@@ -474,4 +477,5 @@ TEST_CASE("MariaDB ByteCaskDB Plugin Integration Tests", "[integration]") {
   db.execute_sql_expect_success("DROP DATABASE IF EXISTS multi_test;");
   db.execute_sql_expect_success("DROP DATABASE IF EXISTS crud_test;");
   db.execute_sql_expect_success("DROP DATABASE IF EXISTS edge_test;");
+}
 }

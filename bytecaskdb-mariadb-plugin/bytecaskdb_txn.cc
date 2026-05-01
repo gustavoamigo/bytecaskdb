@@ -43,7 +43,10 @@ void MariaDBTxn::begin_if_needed(THD *thd, handlerton *hton) {
 void MariaDBTxn::buffer_put(const uint8_t *key, size_t klen,
                             const uint8_t *val, size_t vlen) {
   std::vector<uint8_t> k(key, key + klen);
-  std::vector<uint8_t> v(val, val + vlen);
+  std::vector<uint8_t> v;
+  if (val && vlen > 0) {
+    v.assign(val, val + vlen);
+  }
 
   // Update RYOW overlay.
   lookup_[k] = v;
