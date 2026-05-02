@@ -419,6 +419,28 @@ static int bytecaskdb_start_consistent_snapshot(handlerton *hton, THD *thd) {
 }
 
 // ---------------------------------------------------------------------------
+// SHOW ENGINE BYTECASKDB STATUS
+// ---------------------------------------------------------------------------
+
+static bool bytecaskdb_show_status(handlerton * /*hton*/, THD *thd,
+                                   stat_print_fn *stat_print,
+                                   enum ha_stat_type stat_type) {
+  if (stat_type != HA_ENGINE_STATUS)
+    return false;
+
+  auto counters = g_db->stats();
+  std::string output;
+  for (auto &[name, value] : counters)
+    output += name + ": " + std::to_string(value) + "\n";
+
+  if (g_db->is_degraded())
+    output += "degraded_reason: " + g_db->degraded_reason() + "\n";
+
+  return stat_print(thd, "BYTECASKDB", 10, "", 0,
+                    output.c_str(), output.size());
+}
+
+// ---------------------------------------------------------------------------
 // Plugin init / deinit
 // ---------------------------------------------------------------------------
 
@@ -431,6 +453,7 @@ static int bytecaskdb_init(void *p) {
   hton->rollback                 = bytecaskdb_rollback;
   hton->close_connection         = bytecaskdb_close_connection;
   hton->start_consistent_snapshot = bytecaskdb_start_consistent_snapshot;
+  hton->show_status              = bytecaskdb_show_status;
   hton->flags                    = HTON_NO_FLAGS;
 
   // Open the global database inside MariaDB's data directory.
@@ -438,6 +461,7 @@ static int bytecaskdb_init(void *p) {
 
   bytecask::Options opts;
   opts.recovery_threads = 4;
+  opts.max_value_bytes = 16 * 1024 * 1024;  // MEDIUMBLOB (16 MiB)
 
   try {
     g_db_owner = std::make_unique<DBHolder>(db_path, opts);

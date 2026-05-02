@@ -140,14 +140,15 @@ void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table, uint active_index
     const KEY_PART_INFO &kp = key_info.key_part[i];
     Field *field = table->field[kp.fieldnr - 1];
 
-    if (field->type() == MYSQL_TYPE_VARCHAR) {
-      // key_copy stores a 2-byte LE length prefix (HA_KEY_BLOB_LENGTH = 2).
-      uint16_t length = static_cast<uint16_t>(key_ptr[0]) |
-                        (static_cast<uint16_t>(key_ptr[1]) << 8);
+    if (field->type() == MYSQL_TYPE_VARCHAR ||
+        (kp.key_part_flag & HA_BLOB_PART)) {
+      uint null_off = (kp.null_bit) ? 1 : 0;
+      uint16_t length = static_cast<uint16_t>(key_ptr[null_off]) |
+                        (static_cast<uint16_t>(key_ptr[null_off + 1]) << 8);
       if (length > kp.length) length = kp.length;
 
-      std::memmove(key_ptr, key_ptr + HA_KEY_BLOB_LENGTH, length);
-      std::memset(key_ptr + length, 0, kp.store_length - length);
+      std::memmove(key_ptr + null_off, key_ptr + null_off + HA_KEY_BLOB_LENGTH, length);
+      std::memset(key_ptr + null_off + length, 0, kp.store_length - null_off - length);
     }
 
     key_ptr += kp.store_length;
@@ -275,7 +276,7 @@ std::vector<uint8_t> encode_unique_sec_key(TABLE *table, const uchar *buf,
 
 namespace {
 
-bool is_integer_type(enum_field_types t) {
+bool is_signed_integer_type(enum_field_types t) {
   switch (t) {
     case MYSQL_TYPE_TINY:
     case MYSQL_TYPE_SHORT:
@@ -288,6 +289,38 @@ bool is_integer_type(enum_field_types t) {
   }
 }
 
+bool is_unsigned_le_fixed_type(enum_field_types t) {
+  switch (t) {
+    case MYSQL_TYPE_DATE:
+    case MYSQL_TYPE_NEWDATE:
+    case MYSQL_TYPE_DATETIME:
+    case MYSQL_TYPE_TIMESTAMP:
+    case MYSQL_TYPE_TIME:
+    case MYSQL_TYPE_YEAR:
+    case MYSQL_TYPE_SET:
+    case MYSQL_TYPE_ENUM:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// DATETIME2, TIMESTAMP2, TIME2 store data big-endian in key_copy() output.
+// field->type() returns the old enum (MYSQL_TYPE_DATETIME etc.) so we must
+// check real_type() to avoid reversing already-correct BE bytes.
+bool is_new_temporal_be(Field *field) {
+  auto rt = field->real_type();
+  return rt == MYSQL_TYPE_DATETIME2 ||
+         rt == MYSQL_TYPE_TIMESTAMP2 ||
+         rt == MYSQL_TYPE_TIME2;
+}
+
+bool needs_byte_reversal(Field *field) {
+  if (is_new_temporal_be(field)) return false;
+  auto t = field->real_type();
+  return is_signed_integer_type(t) || is_unsigned_le_fixed_type(t);
+}
+
 } // namespace
 
 void make_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
@@ -298,19 +331,27 @@ void make_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
     const KEY_PART_INFO &kp = key_info->key_part[i];
     Field *field = kp.field;
 
-    if (is_integer_type(field->type())) {
-      // Nullable fields have a 1-byte null flag before the data.
-      uint null_bytes = kp.store_length - kp.length;
-      uint8_t *data = p + null_bytes;
+    bool is_varlen = (field->type() == MYSQL_TYPE_VARCHAR ||
+                      (kp.key_part_flag & HA_BLOB_PART));
+    if (is_varlen) {
+      p += kp.store_length;
+      continue;
+    }
 
-      // Only transform if not NULL (null flag == 0 means NULL).
-      if (null_bytes == 0 || p[0] != 0) {
-        uint len = kp.length;
-        std::reverse(data, data + len);
-        if (!field->is_unsigned()) {
-          data[0] ^= 0x80;
-        }
+    uint null_bytes = kp.store_length - kp.length;
+    bool is_not_null = (null_bytes == 0 || p[0] == 0);
+
+    if (is_not_null && needs_byte_reversal(field)) {
+      uint8_t *data = p + null_bytes;
+      uint len = kp.length;
+      std::reverse(data, data + len);
+      if (is_signed_integer_type(field->type()) && !field->is_unsigned()) {
+        data[0] ^= 0x80;
       }
+    }
+
+    if (null_bytes > 0) {
+      p[0] ^= 0x01;
     }
 
     p += kp.store_length;
@@ -325,17 +366,28 @@ void undo_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
     const KEY_PART_INFO &kp = key_info->key_part[i];
     Field *field = kp.field;
 
-    if (is_integer_type(field->type())) {
-      uint null_bytes = kp.store_length - kp.length;
-      uint8_t *data = p + null_bytes;
+    bool is_varlen = (field->type() == MYSQL_TYPE_VARCHAR ||
+                      (kp.key_part_flag & HA_BLOB_PART));
+    if (is_varlen) {
+      p += kp.store_length;
+      continue;
+    }
 
-      if (null_bytes == 0 || p[0] != 0) {
-        uint len = kp.length;
-        if (!field->is_unsigned()) {
-          data[0] ^= 0x80;
-        }
-        std::reverse(data, data + len);
+    uint null_bytes = kp.store_length - kp.length;
+
+    if (null_bytes > 0) {
+      p[0] ^= 0x01;
+    }
+
+    bool is_not_null = (null_bytes == 0 || p[0] == 0);
+
+    if (is_not_null && needs_byte_reversal(field)) {
+      uint8_t *data = p + null_bytes;
+      uint len = kp.length;
+      if (is_signed_integer_type(field->type()) && !field->is_unsigned()) {
+        data[0] ^= 0x80;
       }
+      std::reverse(data, data + len);
     }
 
     p += kp.store_length;
