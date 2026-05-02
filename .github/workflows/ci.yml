@@ -77,11 +77,18 @@ jobs:
           path: test-results/*.xml
 
       - name: Upload test results to Codecov
-        uses: codecov/test-results-action@v1
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v5
         with:
-          files: ./test-results/*.xml
+          files: |
+            ./test-results/bytecask_tests.xml
+            ./test-results/radix_tree_memory_tests.xml
+            ./test-results/unordered_view_tests.xml
+          report_type: test_results
           flags: cpp
           name: bytecask-cpp-tests
+          slug: gustavoamigo/bytecaskdb
+          token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
           use_oidc: true
 
@@ -226,10 +233,13 @@ jobs:
           path: lcov.info
 
       - name: Upload coverage to Codecov
+        if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v5
         with:
           files: ./lcov.info
           flags: cpp
           name: bytecask-cpp
+          slug: gustavoamigo/bytecaskdb
+          token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
           use_oidc: true
