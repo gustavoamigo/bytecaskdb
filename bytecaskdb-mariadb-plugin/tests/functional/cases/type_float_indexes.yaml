@@ -1,0 +1,179 @@
+# type_float_indexes.yaml — FLOAT/DOUBLE/ENUM index scan patterns from MTR
+
+# --------------------------------------------------------------------------
+# FLOAT secondary index — basic ORDER BY
+# --------------------------------------------------------------------------
+
+- name: FLOAT secondary index ordering
+  setup:
+    - DROP DATABASE IF EXISTS flt1
+    - CREATE DATABASE flt1
+    - CREATE TABLE flt1.t (f FLOAT, v INT, INDEX idx_f(f)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO flt1.t (f, v) VALUES
+      (1.5, 1), (0.5, 2), (-1.5, 3), (100.25, 4), (-100.25, 5), (0.0, 6)
+  query: SELECT f, v FROM flt1.t ORDER BY f
+  expected:
+    - ['-100.25', '5']
+    - ['-1.5', '3']
+    - ['0.0', '6']
+    - ['0.5', '2']
+    - ['1.5', '1']
+    - ['100.25', '4']
+  teardown:
+    - DROP DATABASE IF EXISTS flt1
+
+# --------------------------------------------------------------------------
+# FLOAT PRIMARY KEY — ORDER BY
+# --------------------------------------------------------------------------
+
+- name: FLOAT PRIMARY KEY with ORDER BY
+  setup:
+    - DROP DATABASE IF EXISTS flt4
+    - CREATE DATABASE flt4
+    - >
+      CREATE TABLE flt4.t (f FLOAT PRIMARY KEY, r REAL(20,3), d DOUBLE, dp DOUBLE PRECISION(64,10))
+      ENGINE=bytecaskdb
+    - >
+      INSERT INTO flt4.t (f,r,d,dp) VALUES
+      (1.2345,1422.22,1.2345,1234567.89),(0,0,0,0),(-1,-1,-1,-1),
+      (17.5843,4953453454.44,29229114.0,1111111.23),(4644,1422.22,466664.999,0.5)
+  query: SELECT f FROM flt4.t ORDER BY f
+  expected:
+    - ['-1.0']
+    - ['0.0']
+    - ['1.2345']
+    - ['17.5843']
+    - ['4644.0']
+  teardown:
+    - DROP DATABASE IF EXISTS flt4
+
+# --------------------------------------------------------------------------
+# DOUBLE range scan with WHERE on UNIQUE KEY
+# --------------------------------------------------------------------------
+
+- name: DOUBLE range scan WHERE r > 0 AND d > 0 on UNIQUE KEY(d)
+  setup:
+    - DROP DATABASE IF EXISTS flt5
+    - CREATE DATABASE flt5
+    - >
+      CREATE TABLE flt5.t (f FLOAT, r REAL(20,3), d DOUBLE, dp DOUBLE PRECISION(64,10),
+        UNIQUE KEY(d)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO flt5.t (f,r,d,dp) VALUES
+      (1.2345,1422.22,1.2345,1234567.89),(0,0,0,0),(-1,-1,-1,-1),
+      (17.5843,4953453454.44,29229114.0,1111111.23),(4644,1422.22,466664.999,0.5)
+  query: SELECT d FROM flt5.t WHERE r > 0 AND d > 0 ORDER BY d
+  expected:
+    - ['1.2345']
+    - ['466664.999']
+    - ['29229114.0']
+  teardown:
+    - DROP DATABASE IF EXISTS flt5
+
+# --------------------------------------------------------------------------
+# FLOAT index point lookup
+# --------------------------------------------------------------------------
+
+- name: FLOAT index point lookup via WHERE
+  setup:
+    - DROP DATABASE IF EXISTS flt7
+    - CREATE DATABASE flt7
+    - CREATE TABLE flt7.t (f FLOAT, v INT, INDEX idx_f(f)) ENGINE=bytecaskdb
+    - INSERT INTO flt7.t (f, v) VALUES (1.5, 10), (2.5, 20), (3.5, 30)
+  query: SELECT v FROM flt7.t WHERE f = 2.5
+  expected:
+    - ['20']
+  teardown:
+    - DROP DATABASE IF EXISTS flt7
+
+# --------------------------------------------------------------------------
+# ENUM secondary index ordering
+# --------------------------------------------------------------------------
+
+- name: ENUM secondary index ordering
+  setup:
+    - DROP DATABASE IF EXISTS enm1
+    - CREATE DATABASE enm1
+    - >
+      CREATE TABLE enm1.t (
+        e ENUM('alpha','beta','gamma','delta','epsilon'),
+        v INT,
+        INDEX idx_e(e)
+      ) ENGINE=bytecaskdb
+    - >
+      INSERT INTO enm1.t (e, v) VALUES
+      ('gamma', 1), ('alpha', 2), ('epsilon', 3), ('beta', 4), ('delta', 5)
+  query: SELECT e, v FROM enm1.t ORDER BY e
+  expected:
+    - ['alpha', '2']
+    - ['beta', '4']
+    - ['gamma', '1']
+    - ['delta', '5']
+    - ['epsilon', '3']
+  teardown:
+    - DROP DATABASE IF EXISTS enm1
+
+# --------------------------------------------------------------------------
+# ENUM PRIMARY KEY with BETWEEN range scan
+# --------------------------------------------------------------------------
+
+- name: ENUM PRIMARY KEY with BETWEEN range scan
+  setup:
+    - DROP DATABASE IF EXISTS enm2
+    - CREATE DATABASE enm2
+    - >
+      CREATE TABLE enm2.t (
+        a ENUM('N.America','S.America','Africa','Europe','Australia','Asia','Antarctica'),
+        b ENUM('test1','test2','test3','test4','test5'),
+        c ENUM('1a','1b','1d','1j','4a','4z','5a','5b','6v','6z') PRIMARY KEY
+      ) ENGINE=bytecaskdb
+    - >
+      INSERT INTO enm2.t (a,b,c) VALUES
+      ('N.America','test1','5a'),('Europe','test1','5b'),('Europe','test2','6v'),
+      ('Africa','test3','4z'),('Africa','test4','1j'),('Antarctica','test4','1d')
+  query: SELECT c FROM enm2.t WHERE c BETWEEN '1d' AND '6u'
+  expected:
+    - ['1d']
+    - ['1j']
+    - ['4z']
+    - ['5a']
+    - ['5b']
+  teardown:
+    - DROP DATABASE IF EXISTS enm2
+
+# --------------------------------------------------------------------------
+# DOUBLE SELECT DISTINCT — previously caused infinite loop in index_next_same
+# --------------------------------------------------------------------------
+
+- name: DOUBLE SELECT DISTINCT on indexed column
+  setup:
+    - DROP DATABASE IF EXISTS flt8
+    - CREATE DATABASE flt8
+    - CREATE TABLE flt8.t (d DOUBLE, INDEX idx_d(d)) ENGINE=bytecaskdb
+    - INSERT INTO flt8.t (d) VALUES (1.5), (2.5), (1.5), (3.5), (2.5)
+  query: SELECT DISTINCT d FROM flt8.t ORDER BY d
+  expected:
+    - ['1.5']
+    - ['2.5']
+    - ['3.5']
+  teardown:
+    - DROP DATABASE IF EXISTS flt8
+
+# --------------------------------------------------------------------------
+# FLOAT SELECT DISTINCT — same hang pattern as DOUBLE
+# --------------------------------------------------------------------------
+
+- name: FLOAT SELECT DISTINCT on indexed column
+  setup:
+    - DROP DATABASE IF EXISTS flt9
+    - CREATE DATABASE flt9
+    - CREATE TABLE flt9.t (f FLOAT, INDEX idx_f(f)) ENGINE=bytecaskdb
+    - INSERT INTO flt9.t (f) VALUES (-1.0), (0.0), (1.0), (-1.0), (0.0)
+  query: SELECT DISTINCT f FROM flt9.t ORDER BY f
+  expected:
+    - ['-1.0']
+    - ['0.0']
+    - ['1.0']
+  teardown:
+    - DROP DATABASE IF EXISTS flt9

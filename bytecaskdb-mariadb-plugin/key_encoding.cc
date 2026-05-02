@@ -305,6 +305,10 @@ bool is_unsigned_le_fixed_type(enum_field_types t) {
   }
 }
 
+bool is_float_type(enum_field_types t) {
+  return t == MYSQL_TYPE_FLOAT || t == MYSQL_TYPE_DOUBLE;
+}
+
 // DATETIME2, TIMESTAMP2, TIME2 store data big-endian in key_copy() output.
 // field->type() returns the old enum (MYSQL_TYPE_DATETIME etc.) so we must
 // check real_type() to avoid reversing already-correct BE bytes.
@@ -318,7 +322,7 @@ bool is_new_temporal_be(Field *field) {
 bool needs_byte_reversal(Field *field) {
   if (is_new_temporal_be(field)) return false;
   auto t = field->real_type();
-  return is_signed_integer_type(t) || is_unsigned_le_fixed_type(t);
+  return is_signed_integer_type(t) || is_unsigned_le_fixed_type(t) || is_float_type(t);
 }
 
 } // namespace
@@ -347,6 +351,14 @@ void make_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
       std::reverse(data, data + len);
       if (is_signed_integer_type(field->type()) && !field->is_unsigned()) {
         data[0] ^= 0x80;
+      } else if (is_float_type(field->real_type())) {
+        // IEEE 754: if sign bit set (negative), flip all bits;
+        // if sign bit clear (positive/zero), flip only the sign bit.
+        if (data[0] & 0x80) {
+          for (uint j = 0; j < len; ++j) data[j] ^= 0xFF;
+        } else {
+          data[0] ^= 0x80;
+        }
       }
     }
 
@@ -386,6 +398,14 @@ void undo_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
       uint len = kp.length;
       if (is_signed_integer_type(field->type()) && !field->is_unsigned()) {
         data[0] ^= 0x80;
+      } else if (is_float_type(field->real_type())) {
+        // Undo IEEE 754: if sign bit set (was positive), flip only sign bit;
+        // if sign bit clear (was negative), flip all bits.
+        if (data[0] & 0x80) {
+          data[0] ^= 0x80;
+        } else {
+          for (uint j = 0; j < len; ++j) data[j] ^= 0xFF;
+        }
       }
       std::reverse(data, data + len);
     }

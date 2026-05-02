@@ -118,6 +118,11 @@ lexicographically sortable. The plugin applies a post-processing step
   values sort before positive.
 - **Unsigned LE fixed-width types** (DATE, NEWDATE, DATETIME, TIMESTAMP,
   TIME, YEAR, SET, ENUM): bytes are reversed from LE to BE. No sign flip.
+- **FLOAT and DOUBLE** (IEEE 754): bytes are reversed from LE to BE, then
+  an IEEE 754 sign transformation is applied: if the sign bit is set
+  (negative), flip ALL bits; if clear (positive/zero), flip only the sign
+  bit. This produces correct ordering for all float values including
+  negative numbers and zero.
 - **New temporal types** (DATETIME2, TIMESTAMP2, TIME2): already stored
   big-endian by `key_copy()` — no transformation needed.
 - **VARCHAR and BLOB prefix keys**: handled by `fix_varchar_key_encoding`
@@ -328,6 +333,8 @@ See `SMOKE_TEST.md` for the end-to-end MariaDB test procedure.
 | SHOW ENGINE STATUS | Done | Exposes `g_db->stats()` counters |
 | `HA_READ_PREFIX_LAST` (reverse PK prefix scan) | Done | Used by composite PK auto-increment |
 | Negative integer ordering | Done | Sign-bit flip (XOR 0x80) on MSB after BE conversion |
+| FLOAT/DOUBLE index ordering | Done | IEEE 754 mem-comparable encoding (LE→BE + sign transform) |
+| `HA_READ_AFTER_KEY` (loose index scan) | Done | Used by SELECT DISTINCT / GROUP BY on secondary indexes |
 
 ### Supported data types in indexes
 
@@ -338,13 +345,13 @@ See `SMOKE_TEST.md` for the end-to-end MariaDB test procedure.
 | SET, ENUM | Full |
 | CHAR, VARCHAR | Full |
 | BLOB, TEXT (with prefix length) | Full |
-| FLOAT, DOUBLE | Not yet (scan hangs — disabled in MTR) |
+| FLOAT, DOUBLE | Full |
 | SPATIAL | Not supported |
 | FULLTEXT | Not supported |
 
 Phases A–E and G are functional. The engine handles standard OLTP workloads:
 multi-statement transactions, secondary indexes, DDL that survives restart.
-76 functional tests pass across all supported features. Phase H (operational
+80 functional tests pass across all supported features. Phase H (operational
 features) is the remaining gap before production use.
 
 ---
