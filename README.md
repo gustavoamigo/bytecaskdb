@@ -9,6 +9,7 @@
 Test Analytics dashboard: https://app.codecov.io/gh/gustavoamigo/bytecaskdb/tests/new
 
 CI uploads JUnit test results with per-test source file/line metadata so Test Analytics can show source context instead of a flat list.
+CI also publishes JUnit results directly in GitHub Checks for PR-native test summaries.
 
 **ByteCaskDB** is a fast, predictable embedded key-value store written in C++. Reads and writes have flat, predictable latency from thousands of keys to hundreds of millions.
 
