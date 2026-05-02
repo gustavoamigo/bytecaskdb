@@ -782,11 +782,9 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
     // keypart_map tells us which key parts are valid in `key`. Only copy those
     // bytes; zero-fill the rest so the scan starts at the correct position.
     uint actual_packed_len = 0;
-    uint prefix_len = 0;
     for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
       if (!(keypart_map & (key_part_map(1) << i))) break;
       actual_packed_len += key_info.key_part[i].store_length;
-      prefix_len        += key_info.key_part[i].length;
     }
     std::memcpy(search_key.data() + 7, key, actual_packed_len);
     if (actual_packed_len < sec_key_len) {
@@ -799,15 +797,28 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
     fix_varchar_key_encoding(search_key.data() + 7, table, active_index);
     make_mem_comparable(search_key.data() + 7, &key_info, sec_key_len);
 
-    // Save only the covered-prefix bytes for index_next_same comparison.
-    sec_search_key_.assign(search_key.begin(), search_key.begin() + 7 + prefix_len);
+    // Save the covered-prefix bytes for index_next_same comparison.
+    // Use actual_packed_len (includes null indicators) not just data length.
+    sec_search_key_.assign(search_key.begin(), search_key.begin() + 7 + actual_packed_len);
 
-    // For secondary indexes, always use range scan (even for exact lookups)
-    // because we need to iterate through potentially multiple matches
     auto hi = index_id_upper_bound(table_id_, static_cast<uint16_t>(active_index));
-    merge_index_ = txn->iter_index_prefix(search_key.data(), search_key.size(),
-                                          hi.data(), hi.size(),
-                                          table_id_, static_cast<uint16_t>(active_index));
+
+    if (find_flag == HA_READ_AFTER_KEY) {
+      // Position strictly after all entries with this secondary key value.
+      // Append 0xFF bytes to create an upper bound past all PK suffixes.
+      uint suffix_len = pk_suffix_length(table);
+      std::vector<uint8_t> after_key(search_key.size() + suffix_len);
+      std::memcpy(after_key.data(), search_key.data(), search_key.size());
+      std::memset(after_key.data() + search_key.size(), 0xFF, suffix_len);
+      merge_index_ = txn->iter_index_prefix(after_key.data(), after_key.size(),
+                                            hi.data(), hi.size(),
+                                            table_id_, static_cast<uint16_t>(active_index));
+    } else {
+      // For HA_READ_KEY_EXACT and other modes, start at the search key position.
+      merge_index_ = txn->iter_index_prefix(search_key.data(), search_key.size(),
+                                            hi.data(), hi.size(),
+                                            table_id_, static_cast<uint16_t>(active_index));
+    }
     if (!merge_index_) { return HA_ERR_GENERIC; }
 
     return index_read_current(buf);
@@ -848,6 +859,12 @@ int ha_bytecaskdb::index_next_same(uchar *buf, const uchar * /*key*/,
 
   merge_index_->next();
   if (!merge_index_->valid()) { return HA_ERR_END_OF_FILE; }
+
+  // Safety: verify the key still belongs to our index namespace.
+  if (!key_belongs_to_index(merge_index_->key_data(), merge_index_->key_len(),
+                            table_id_, static_cast<uint16_t>(active_index))) {
+    return HA_ERR_END_OF_FILE;
+  }
 
   // Verify the stored key still shares the same search-key prefix.
   if (!sec_search_key_.empty() &&

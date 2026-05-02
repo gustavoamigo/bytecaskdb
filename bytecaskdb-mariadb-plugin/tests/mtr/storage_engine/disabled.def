@@ -13,7 +13,6 @@ repair_table         : REPAIR TABLE not supported
 select_high_prio     : Table-level lock priority not supported
 truncate_table       : Test uses HANDLER command which is not supported
 type_enum_indexes    : Index scan hangs consuming all available memory
-type_float_indexes   : Index scan hangs consuming all available memory
 type_spatial         : Spatial types not supported
 type_spatial_indexes : Spatial indexes not supported
 update_low_prio      : Table-level lock priority not supported
