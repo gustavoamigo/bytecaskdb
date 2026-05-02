@@ -8,6 +8,8 @@
 
 Test Analytics dashboard: https://app.codecov.io/gh/gustavoamigo/bytecaskdb/tests/new
 
+CI uploads JUnit test results with per-test source file/line metadata so Test Analytics can show source context instead of a flat list.
+
 **ByteCaskDB** is a fast, predictable embedded key-value store written in C++. Reads and writes have flat, predictable latency from thousands of keys to hundreds of millions.
 
 All keys in memory at all times — a deliberate design choice that removes an entire class of complexity that exists solely to minimise disk access and makes every point lookup O(1) with flat, predictable latency. At ~50 bytes per key, 128 GB of RAM holds close to 2.7 billion keys. Very few moving parts — an in-memory key directory and an append-only data file — is what keeps that latency flat whether you have 1,000 records or 100 million. 

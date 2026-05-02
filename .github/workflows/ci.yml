@@ -70,6 +70,13 @@ jobs:
           build/linux/x86_64/release/radix_tree_memory_tests --reporter junit --out test-results/radix_tree_memory_tests.xml
           build/linux/x86_64/release/unordered_view_tests --reporter junit --out test-results/unordered_view_tests.xml
 
+      - name: Enrich JUnit reports with source metadata
+        run: |
+          /usr/bin/python scripts/enrich_junit_sources.py \
+            --pair build/linux/x86_64/release/bytecask_tests:test-results/bytecask_tests.xml \
+            --pair build/linux/x86_64/release/radix_tree_memory_tests:test-results/radix_tree_memory_tests.xml \
+            --pair build/linux/x86_64/release/unordered_view_tests:test-results/unordered_view_tests.xml
+
       - name: Upload JUnit reports artifact
         uses: actions/upload-artifact@v4
         with:
