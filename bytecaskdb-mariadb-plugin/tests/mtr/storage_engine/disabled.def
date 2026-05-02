@@ -1,6 +1,4 @@
 alter_tablespace     : DISCARD/IMPORT TABLESPACE not supported
-autoinc_secondary    : AUTO_INCREMENT on non-first column of multi-part key not supported
-checksum_table_live  : Live CHECKSUM TABLE not implemented
 delete_low_prio      : Table-level lock priority not supported
 foreign_keys         : Foreign key constraints not supported
 fulltext_search      : FULLTEXT indexes not supported
@@ -13,11 +11,9 @@ lock                 : LOCK TABLES blocking semantics not supported
 lock_concurrent      : LOCK TABLES blocking semantics not supported
 repair_table         : REPAIR TABLE not supported
 select_high_prio     : Table-level lock priority not supported
-show_engine          : SHOW ENGINE STATUS not yet implemented
 truncate_table       : Test uses HANDLER command which is not supported
-type_blob_indexes    : Prefix indexes on BLOB columns not supported
+type_enum_indexes    : Index scan hangs consuming all available memory
+type_float_indexes   : Index scan hangs consuming all available memory
 type_spatial         : Spatial types not supported
 type_spatial_indexes : Spatial indexes not supported
-type_text_indexes    : Prefix indexes on TEXT columns not supported
 update_low_prio      : Table-level lock priority not supported
-vcol                 : Generated/virtual columns not supported

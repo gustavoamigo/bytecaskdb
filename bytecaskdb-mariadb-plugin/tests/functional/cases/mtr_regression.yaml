@@ -1,0 +1,322 @@
+# mtr_regression.yaml — reproduces failing MTR storage_engine suite tests
+
+# --------------------------------------------------------------------------
+# type_int_indexes: composite secondary index ordering
+# --------------------------------------------------------------------------
+
+- name: Single-column secondary INT index ordering
+  setup:
+    - DROP DATABASE IF EXISTS mtr1
+    - CREATE DATABASE mtr1
+    - CREATE TABLE mtr1.t (i INT, t TINYINT, s SMALLINT, m MEDIUMINT, b BIGINT, INDEX idx_i(i)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO mtr1.t (i,t,s,m,b) VALUES
+      (1,2,3,4,5),(1000,100,10000,1000000,1000000000000000000),
+      (5,100,10000,1000000,100000000000000000),(2,3,4,5,6),
+      (3,4,5,6,7),(101,102,103,104,105),(10001,103,10002,10003,10004),
+      (10,11,12,13,14),(11,12,13,14,15),(12,13,14,15,16)
+  query: SELECT i FROM mtr1.t ORDER BY i
+  expected:
+    - ['1']
+    - ['2']
+    - ['3']
+    - ['5']
+    - ['10']
+    - ['11']
+    - ['12']
+    - ['101']
+    - ['1000']
+    - ['10001']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr1
+
+- name: Composite secondary index (SMALLINT, MEDIUMINT) ordering
+  setup:
+    - DROP DATABASE IF EXISTS mtr2
+    - CREATE DATABASE mtr2
+    - CREATE TABLE mtr2.t (i INT, t TINYINT, s SMALLINT, m MEDIUMINT, b BIGINT, INDEX s_m(s,m)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO mtr2.t (i,t,s,m,b) VALUES
+      (1,2,3,4,5),(1000,100,10000,1000000,1000000000000000000),
+      (5,100,10000,1000000,100000000000000000),(2,3,4,5,6),
+      (3,4,5,6,7),(101,102,103,104,105),(10001,103,10002,10003,10004),
+      (10,11,12,13,14),(11,12,13,14,15),(12,13,14,15,16)
+  query: SELECT s, m FROM mtr2.t ORDER BY s, m
+  expected:
+    - ['3','4']
+    - ['4','5']
+    - ['5','6']
+    - ['12','13']
+    - ['13','14']
+    - ['14','15']
+    - ['103','104']
+    - ['10000','1000000']
+    - ['10000','1000000']
+    - ['10002','10003']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr2
+
+- name: Composite unique secondary index (BIGINT, TINYINT) ordering
+  setup:
+    - DROP DATABASE IF EXISTS mtr3
+    - CREATE DATABASE mtr3
+    - CREATE TABLE mtr3.t (i INT, t TINYINT, s SMALLINT, m MEDIUMINT, b BIGINT, UNIQUE KEY b_t(b,t)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO mtr3.t (i,t,s,m,b) VALUES
+      (1,2,3,4,5),(1000,100,10000,1000000,1000000000000000000),
+      (5,100,10000,1000000,100000000000000000),(2,3,4,5,6),
+      (3,4,5,6,7),(101,102,103,104,105),(10001,103,10002,10003,10004),
+      (10,11,12,13,14),(11,12,13,14,15),(12,13,14,15,16)
+  query: SELECT b, t FROM mtr3.t ORDER BY b, t
+  expected:
+    - ['5','2']
+    - ['6','3']
+    - ['7','4']
+    - ['14','11']
+    - ['15','12']
+    - ['16','13']
+    - ['105','102']
+    - ['10004','103']
+    - ['100000000000000000','100']
+    - ['1000000000000000000','100']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr3
+
+# --------------------------------------------------------------------------
+# type_date_time_indexes: temporal type index ordering
+# --------------------------------------------------------------------------
+
+- name: DATE index ordering
+  setup:
+    - DROP DATABASE IF EXISTS mtr4
+    - CREATE DATABASE mtr4
+    - CREATE TABLE mtr4.t (d DATE, INDEX idx_d(d)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO mtr4.t (d) VALUES
+      ('2012-01-12'),('2012-01-22'),('2012-03-31'),
+      ('2012-03-13'),('2011-03-31'),('2012-04-09')
+  query: SELECT d FROM mtr4.t ORDER BY d
+  expected:
+    - ['2011-03-31']
+    - ['2012-01-12']
+    - ['2012-01-22']
+    - ['2012-03-13']
+    - ['2012-03-31']
+    - ['2012-04-09']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr4
+
+- name: DATETIME index ordering
+  setup:
+    - DROP DATABASE IF EXISTS mtr5
+    - CREATE DATABASE mtr5
+    - CREATE TABLE mtr5.t (dt DATETIME, INDEX idx_dt(dt)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO mtr5.t (dt) VALUES
+      ('2010-11-22 12:33:54'),('2010-11-22 11:43:14'),
+      ('2011-08-28 21:33:56'),('2011-08-27 21:33:56'),
+      ('2011-08-28 20:33:56'),('2012-04-09 05:27:00')
+  query: SELECT dt FROM mtr5.t ORDER BY dt
+  expected:
+    - ['2010-11-22 11:43:14']
+    - ['2010-11-22 12:33:54']
+    - ['2011-08-27 21:33:56']
+    - ['2011-08-28 20:33:56']
+    - ['2011-08-28 21:33:56']
+    - ['2012-04-09 05:27:00']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr5
+
+- name: TIMESTAMP index ordering
+  setup:
+    - DROP DATABASE IF EXISTS mtr6
+    - CREATE DATABASE mtr6
+    - CREATE TABLE mtr6.t (ts TIMESTAMP, INDEX idx_ts(ts)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO mtr6.t (ts) VALUES
+      ('2011-11-14 21:45:25'),('2011-11-14 21:45:55'),
+      ('1999-04-30 19:11:08'),('1999-03-30 19:11:08'),
+      ('1997-01-31 11:54:01'),('2012-04-09 05:27:00')
+  query: SELECT ts FROM mtr6.t ORDER BY ts
+  expected:
+    - ['1997-01-31 11:54:01']
+    - ['1999-03-30 19:11:08']
+    - ['1999-04-30 19:11:08']
+    - ['2011-11-14 21:45:25']
+    - ['2011-11-14 21:45:55']
+    - ['2012-04-09 05:27:00']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr6
+
+- name: TIME index ordering
+  setup:
+    - DROP DATABASE IF EXISTS mtr7
+    - CREATE DATABASE mtr7
+    - CREATE TABLE mtr7.t (t TIME, INDEX idx_t(t)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO mtr7.t (t) VALUES
+      ('00:12:33'),('00:12:32'),('12:00:00'),
+      ('12:10:00'),('22:04:10'),('05:27:00')
+  query: SELECT t FROM mtr7.t ORDER BY t
+  expected:
+    - ['0:12:32']
+    - ['0:12:33']
+    - ['5:27:00']
+    - ['12:00:00']
+    - ['12:10:00']
+    - ['22:04:10']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr7
+
+- name: YEAR index ordering
+  setup:
+    - DROP DATABASE IF EXISTS mtr8
+    - CREATE DATABASE mtr8
+    - CREATE TABLE mtr8.t (y YEAR, INDEX idx_y(y)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO mtr8.t (y) VALUES
+      ('2000'),('2001'),('1999'),('1998'),('1994'),('2012')
+  query: SELECT y FROM mtr8.t ORDER BY y
+  expected:
+    - ['1994']
+    - ['1998']
+    - ['1999']
+    - ['2000']
+    - ['2001']
+    - ['2012']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr8
+
+# --------------------------------------------------------------------------
+# type_set_indexes: SET type index ordering
+# --------------------------------------------------------------------------
+
+- name: SET index ordering (secondary)
+  setup:
+    - DROP DATABASE IF EXISTS mtr9
+    - CREATE DATABASE mtr9
+    - >
+      CREATE TABLE mtr9.t (
+        a SET('N.America','S.America','Africa','Antarctica','Australia','Europe','Asia'),
+        b SET('test1','test2','test3','test4','test5'),
+        c SET('01','22','23','33','34','39','40','44','50','63','64'),
+        INDEX idx_c(c)
+      ) ENGINE=bytecaskdb
+    - >
+      INSERT INTO mtr9.t (a,b,c) VALUES
+      ('','test2,test3','01,34,44,23'),
+      ('','test2','22'),
+      ('N.America,Asia','test4,test2',''),
+      ('Africa,Europe,Asia','test2,test3','01'),
+      ('Antarctica','test3','34,44'),
+      ('Asia','test5','50'),
+      ('Europe,S.America','test1','39')
+  query: SELECT c FROM mtr9.t ORDER BY c
+  expected:
+    - ['']
+    - ['01']
+    - ['22']
+    - ['39']
+    - ['34,44']
+    - ['01,23,34,44']
+    - ['50']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr9
+
+# --------------------------------------------------------------------------
+# type_blob_indexes / type_text_indexes: BLOB/TEXT prefix key support
+# --------------------------------------------------------------------------
+
+- name: BLOB prefix index (secondary)
+  setup:
+    - DROP DATABASE IF EXISTS mtr10
+    - CREATE DATABASE mtr10
+    - CREATE TABLE mtr10.t (b BLOB, v INT, INDEX idx_b(b(32))) ENGINE=bytecaskdb
+    - >
+      INSERT INTO mtr10.t (b, v) VALUES
+      ('charlie', 3), ('alice', 1), ('bob', 2), ('delta', 4)
+  query: SELECT v FROM mtr10.t ORDER BY b
+  expected:
+    - ['1']
+    - ['2']
+    - ['3']
+    - ['4']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr10
+
+- name: TEXT prefix index (secondary)
+  setup:
+    - DROP DATABASE IF EXISTS mtr11
+    - CREATE DATABASE mtr11
+    - CREATE TABLE mtr11.t (t TEXT, v INT, INDEX idx_t(t(32))) ENGINE=bytecaskdb
+    - >
+      INSERT INTO mtr11.t (t, v) VALUES
+      ('charlie', 3), ('alice', 1), ('bob', 2), ('delta', 4)
+  query: SELECT v FROM mtr11.t ORDER BY t
+  expected:
+    - ['1']
+    - ['2']
+    - ['3']
+    - ['4']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr11
+
+# --------------------------------------------------------------------------
+# autoinc_secondary: AUTO_INCREMENT on non-first PK column
+# --------------------------------------------------------------------------
+
+- name: AUTO_INCREMENT on secondary column of composite PK
+  setup:
+    - DROP DATABASE IF EXISTS mtr12
+    - CREATE DATABASE mtr12
+    - CREATE TABLE mtr12.t (a CHAR(8), b INT AUTO_INCREMENT, PRIMARY KEY (a,b)) ENGINE=bytecaskdb
+    - INSERT INTO mtr12.t (a) VALUES ('a'),('b'),('b'),('c'),('a')
+  query: SELECT a, b FROM mtr12.t ORDER BY a, b
+  expected:
+    - ['a','1']
+    - ['a','5']
+    - ['b','2']
+    - ['b','3']
+    - ['c','4']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr12
+
+# --------------------------------------------------------------------------
+# checksum_table_live: CHECKSUM TABLE EXTENDED
+# --------------------------------------------------------------------------
+
+- name: CHECKSUM TABLE EXTENDED uses full-scan checksummer
+  setup:
+    - DROP DATABASE IF EXISTS mtr13
+    - CREATE DATABASE mtr13
+    - CREATE TABLE mtr13.t (a INT, b CHAR(8)) ENGINE=bytecaskdb CHECKSUM=1
+    - INSERT INTO mtr13.t (a,b) VALUES (1,'a'),(2,'b')
+  steps:
+    - sql: CHECKSUM TABLE mtr13.t EXTENDED
+      expected: [['mtr13.t', '4272806499']]
+    - sql: CHECKSUM TABLE mtr13.t QUICK
+      expected: [['mtr13.t', 'NULL']]
+  teardown:
+    - DROP DATABASE IF EXISTS mtr13
+
+# --------------------------------------------------------------------------
+# Negative integer ordering (signed types with negative values)
+# --------------------------------------------------------------------------
+
+- name: Signed INT ordering with negative values
+  setup:
+    - DROP DATABASE IF EXISTS mtr14
+    - CREATE DATABASE mtr14
+    - CREATE TABLE mtr14.t (i INT, INDEX idx_i(i)) ENGINE=bytecaskdb
+    - INSERT INTO mtr14.t VALUES (-100),(-1),(0),(1),(100),(2147483647),(-2147483648)
+  query: SELECT i FROM mtr14.t ORDER BY i
+  expected:
+    - ['-2147483648']
+    - ['-100']
+    - ['-1']
+    - ['0']
+    - ['1']
+    - ['100']
+    - ['2147483647']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr14

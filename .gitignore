@@ -54,6 +54,7 @@ bytecaskdb-mariadb-plugin/.mariadb_integration_test/
 # MTR runtime state and output (regenerated on each run)
 bytecaskdb-mariadb-plugin/mtr-var/
 bytecaskdb-mariadb-plugin/mtr-results.txt
+bytecaskdb-mariadb-plugin/tests/mtr/**/*.result~
 
 .notes
 

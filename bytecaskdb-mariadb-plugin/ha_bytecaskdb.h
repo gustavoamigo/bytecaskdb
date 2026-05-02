@@ -141,8 +141,13 @@ public:
   ulonglong table_flags() const override {
     return HA_REC_NOT_IN_SEQ |
            HA_BINLOG_ROW_CAPABLE |
-           HA_NULL_IN_KEY;
+           HA_NULL_IN_KEY |
+           HA_CAN_INDEX_BLOBS |
+           HA_AUTO_PART_KEY |
+           HA_CAN_VIRTUAL_COLUMNS;
   }
+
+  const char *index_type(uint) override { return "BYTECASK"; }
 
   ulong index_flags(uint idx, uint part,
                     bool all_parts) const override;
@@ -187,6 +192,10 @@ private:
 
   // Saved across write_row → get_dup_key → info(HA_STATUS_ERRKEY) round-trip.
   uint saved_errkey_{0};
+
+  // Row value buffer kept alive for BLOB pointer lifetime.
+  // decode_row sets BLOB field pointers into this buffer.
+  std::vector<uint8_t> row_value_buf_;
 
   static void write_table_id_prefix(uint8_t *buf4, uint32_t table_id);
 };

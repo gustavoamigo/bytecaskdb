@@ -29,8 +29,9 @@ static library built by the main xmake project.
 ```
 bytecaskdb-mariadb-plugin/
 ├── bytecaskdb_plugin.cc   Plugin entry point. Opens the global DB,
-│                          wires the handlerton callbacks, owns the
-│                          catalog in-memory cache.
+│                          wires the handlerton callbacks (commit,
+│                          rollback, show_status), owns the catalog
+│                          in-memory cache.
 │
 ├── ha_bytecaskdb.h        Handler class declaration + global extern
 │   ha_bytecaskdb.cc       declarations. Contains the full handler class.
@@ -44,17 +45,25 @@ bytecaskdb-mariadb-plugin/
 │                          ColumnMeta, IndexMeta.
 │
 ├── key_encoding.h         Primary key and secondary index key encoding.
-│   key_encoding.cc        Wraps MariaDB's key_copy() + the namespace prefix.
+│   key_encoding.cc        Wraps MariaDB's key_copy() + mem-comparable
+│                          transformation + VARCHAR/BLOB fix.
 │
 ├── row_encoding.h         Row serialization: MariaDB record buffer → bytes.
 │   row_encoding.cc        Adds a 3-byte versioned envelope (format + schema
-│                          version) so ALTER TABLE can add/drop columns.
+│                          version). Handles BLOB data encoding/decoding.
 │
 ├── bytecask_view.h        Inline adapters between MariaDB's uint8_t*+size_t
 │                          and bytecask's BytesView (std::span<const std::byte>).
 │
-├── integration_test.cpp   Catch2 unit tests for the pure helpers (key
-│                          encoding, row encoding, catalog, txn buffer).
+├── tests/
+│   ├── unit/              Catch2 unit tests for pure helpers (key
+│   │                      encoding, row encoding, catalog, txn buffer).
+│   ├── functional/        Python-based integration tests against a live
+│   │   ├── cases/*.yaml   MariaDB instance. YAML-driven test cases.
+│   │   ├── conftest.py    Pytest fixtures (DB connection, server).
+│   │   └── test_*.py      Test runners.
+│   └── mtr/               MariaDB Test Runner suite overlay (rdiff-based).
+│       └── storage_engine/  Tests + rdiff patches + disabled.def.
 │
 └── CMakeLists.txt         Out-of-tree build; finds MariaDB headers via
                            mariadb_config, links against libbytecask.a.
@@ -84,7 +93,7 @@ Every key stored in the DB starts with a 1-byte namespace tag:
 ```
 0x01  Catalog   — TableMeta records and ID counters
 0x02  Row data  — [table_id:4 BE][pk_packed]
-0x03  Indexes   — [table_id:4 BE][index_id:4 BE][sec_key_packed][pk_packed]
+0x03  Indexes   — [table_id:4 BE][index_id:2 BE][sec_key_packed][pk_packed]
 0x04  Admin     — reserved
 ```
 
@@ -96,6 +105,33 @@ for a table in a single disk append, regardless of how many rows it has.
 
 Key encoding lives in `key_encoding.h/cc` (primary and secondary keys) and
 `catalog.h/cc` (catalog keys and metadata serialization).
+
+#### Mem-comparable key encoding
+
+MariaDB's `key_copy()` produces key bytes that are not always
+lexicographically sortable. The plugin applies a post-processing step
+(`make_mem_comparable`) that transforms the key into a byte sequence where
+`memcmp` ordering matches the column's logical ordering:
+
+- **Signed integers** (TINY, SHORT, INT24, LONG, LONGLONG): bytes are
+  reversed from LE to BE, then the MSB is flipped (XOR 0x80) so negative
+  values sort before positive.
+- **Unsigned LE fixed-width types** (DATE, NEWDATE, DATETIME, TIMESTAMP,
+  TIME, YEAR, SET, ENUM): bytes are reversed from LE to BE. No sign flip.
+- **New temporal types** (DATETIME2, TIMESTAMP2, TIME2): already stored
+  big-endian by `key_copy()` — no transformation needed.
+- **VARCHAR and BLOB prefix keys**: handled by `fix_varchar_key_encoding`
+  which strips the 2-byte LE length prefix and left-justifies data with
+  zero padding. Skipped by `make_mem_comparable` since they're already
+  in correct lexicographic order after the fix.
+
+The inverse (`undo_mem_comparable`) is applied by `decode_pk()` before
+calling `key_restore()` to recover the native key format.
+
+The type dispatch uses `Field::real_type()` (not `Field::type()`) to
+correctly distinguish new temporal types (which are already BE) from old
+temporal types (which need reversal), and to identify SET/ENUM fields
+(whose `type()` returns MYSQL_TYPE_STRING).
 
 ### 3. MariaDBTxn — the per-connection transaction
 
@@ -207,17 +243,35 @@ handler can call them from `create()`, `delete_table()`, `rename_table()`.
 ## Row format
 
 Rows are stored as a 3-byte envelope followed by the raw MariaDB record
-buffer (`table->s->reclength` bytes):
+buffer (`table->s->reclength` bytes), optionally followed by BLOB data:
 
 ```
-byte 0:   format version (currently 0x01)
-byte 1-2: schema_version LE u16  (bumped on ALTER TABLE)
-byte 3+:  raw MariaDB record buffer (reclength bytes)
+byte 0:     format version (currently 0x01)
+byte 1-2:   schema_version LE u16  (bumped on ALTER TABLE)
+byte 3..N:  raw MariaDB record buffer (reclength bytes)
+byte N+1..: concatenated BLOB field data (if any)
 ```
 
 The schema version lets the decoder apply defaults for added columns or skip
-dropped columns on rows written before the ALTER. `row_encoding.h/cc`
-handles all of this.
+dropped columns on rows written before the ALTER.
+
+### BLOB handling
+
+BLOB and TEXT fields are stored specially because MariaDB's record buffer
+only contains a length field and a pointer — not the actual data. At encode
+time, the encoder iterates all BLOB fields, dereferences the data pointer,
+and appends the actual data after the record bytes. At decode time, the
+decoder patches the BLOB pointer fields to point into the value buffer.
+
+This requires that the value buffer (`row_value_buf_`) outlives any
+MariaDB operation that reads BLOB data. The handler copies the raw value
+into `row_value_buf_` before advancing the scan iterator, ensuring BLOB
+pointers remain valid until the next row is materialized.
+
+The maximum value size is set to 16 MiB (MEDIUMBLOB). LONGBLOB (4 GiB) is
+not supported.
+
+`row_encoding.h/cc` handles all of this.
 
 ---
 
@@ -256,9 +310,42 @@ See `SMOKE_TEST.md` for the end-to-end MariaDB test procedure.
 | G | `del_range`-backed DDL (O(1) DROP TABLE) | Done |
 | H | Vacuum, resume, replication hooks, backup | Not started |
 
+### Feature matrix
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Integer index ordering (all widths) | Done | Mem-comparable encoding with sign-flip |
+| Temporal index ordering (DATE, DATETIME, TIMESTAMP, TIME, YEAR) | Done | LE→BE reversal; new temporals (DATETIME2 etc.) pass through |
+| SET/ENUM index ordering | Done | `real_type()` dispatch for correct type identification |
+| VARCHAR/CHAR index ordering | Done | `fix_varchar_key_encoding` + skip in `make_mem_comparable` |
+| BLOB/TEXT prefix indexes | Done | `HA_BLOB_PART` handling in `fix_varchar_key_encoding` |
+| BLOB/TEXT storage | Done | Encode appends data; decode patches pointers into value buffer |
+| MEDIUMBLOB support (16 MiB) | Done | `max_value_bytes = 16 MiB` |
+| Virtual/generated columns | Done | `HA_CAN_VIRTUAL_COLUMNS` flag |
+| AUTO_INCREMENT (single PK) | Done | Monotonic counter via catalog |
+| AUTO_INCREMENT (composite PK) | Done | Per-row allocation avoids gaps |
+| CHECKSUM TABLE EXTENDED | Done | Inherited `handler::calculate_checksum()` full-scan |
+| SHOW ENGINE STATUS | Done | Exposes `g_db->stats()` counters |
+| `HA_READ_PREFIX_LAST` (reverse PK prefix scan) | Done | Used by composite PK auto-increment |
+| Negative integer ordering | Done | Sign-bit flip (XOR 0x80) on MSB after BE conversion |
+
+### Supported data types in indexes
+
+| Type | Index support |
+|------|--------------|
+| TINYINT, SMALLINT, MEDIUMINT, INT, BIGINT (signed/unsigned) | Full |
+| DATE, DATETIME, TIMESTAMP, TIME, YEAR | Full |
+| SET, ENUM | Full |
+| CHAR, VARCHAR | Full |
+| BLOB, TEXT (with prefix length) | Full |
+| FLOAT, DOUBLE | Not yet (scan hangs — disabled in MTR) |
+| SPATIAL | Not supported |
+| FULLTEXT | Not supported |
+
 Phases A–E and G are functional. The engine handles standard OLTP workloads:
 multi-statement transactions, secondary indexes, DDL that survives restart.
-Phase H (operational features) is the remaining gap before production use.
+76 functional tests pass across all supported features. Phase H (operational
+features) is the remaining gap before production use.
 
 ---
 
@@ -282,3 +369,14 @@ Phase H (operational features) is the remaining gap before production use.
   the source of truth for recovery.** At startup, `catalog_init()` rebuilds
   the cache from the DB. DDL updates both atomically (DB write first, then
   cache update under `s_catalog_mu`).
+
+- **Value buffer must outlive BLOB pointer access.** `decode_row` sets BLOB
+  field pointers directly into the value buffer. The handler copies the raw
+  value bytes into `row_value_buf_` before advancing the scan iterator.
+  Never advance an iterator or reuse the value buffer while MariaDB may
+  still be reading BLOB data through those pointers.
+
+- **`make_mem_comparable` skips VARCHAR/BLOB key parts.** Those parts are
+  handled by `fix_varchar_key_encoding` which runs first. Applying
+  `make_mem_comparable` to them would corrupt data by misinterpreting the
+  `store_length - length` bytes as null indicators.
