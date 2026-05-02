@@ -1,0 +1,33 @@
+9,10c9,10
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	1	#	1	t	#	#	32	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	1	#	1	t	#	#	32	NULL	#	#			NO
+32a33,34
+> Warnings:
+> Warning	1280	Name 't' ignored for PRIMARY key.
+34,35c36,37
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	0	PRIMARY	1	t	#	#	32	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	0	PRIMARY	1	t	#	#	32	NULL	#	#			NO
+69,71c71,73
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	0	l_tt	1	l	#	#	256	NULL	#	#		
+< t1	0	l_tt	2	tt	#	#	64	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	0	l_tt	1	l	#	#	256	NULL	#	#			NO
+> t1	0	l_tt	2	tt	#	#	64	NULL	#	#			NO
+99c101
+< #	#	#	#	l_tt	l_tt	#	#	#	#
+---
+> #	#	#	#	l_tt	NULL	#	#	#	#
+119,120c121,122
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	1	m	1	m	#	#	128	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	1	m	1	m	#	#	128	NULL	#	#			NO

@@ -1,4 +1,6 @@
 alter_tablespace     : DISCARD/IMPORT TABLESPACE not supported
+autoinc_secondary    : Auto-increment on secondary column of composite PK has different gap behavior
+checksum_table_live  : CHECKSUM TABLE QUICK/LIVE not supported (EXTENDED works)
 delete_low_prio      : Table-level lock priority not supported
 foreign_keys         : Foreign key constraints not supported
 fulltext_search      : FULLTEXT indexes not supported
