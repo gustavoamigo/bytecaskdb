@@ -1,0 +1,6 @@
+10,11c10,11
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	1	#	1	i	#	#	NULL	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	1	#	1	i	#	#	NULL	NULL	#	#			NO

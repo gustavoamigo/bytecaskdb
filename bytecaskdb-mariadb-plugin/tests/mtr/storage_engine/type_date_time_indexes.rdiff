@@ -1,0 +1,58 @@
+10,11c10,11
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	1	#	1	d	#	#	NULL	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	1	#	1	d	#	#	NULL	NULL	#	#			NO
+34,35c34,35
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	1	#	1	dt	#	#	NULL	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	1	#	1	dt	#	#	NULL	NULL	#	#			NO
+58,59c58,59
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	1	#	1	ts	#	#	NULL	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	1	#	1	ts	#	#	NULL	NULL	#	#			NO
+82,83c82,83
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	1	#	1	t	#	#	NULL	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	1	#	1	t	#	#	NULL	NULL	#	#			NO
+106,107c106,107
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	1	#	1	y	#	#	NULL	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	1	#	1	y	#	#	NULL	NULL	#	#			NO
+129,130c129,130
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	0	PRIMARY	1	dt	#	#	NULL	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	0	PRIMARY	1	dt	#	#	NULL	NULL	#	#			NO
+169,170c169,170
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	1	ts	1	ts	#	#	NULL	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	1	ts	1	ts	#	#	NULL	NULL	#	#			NO
+198,200c198,200
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	0	d_t	1	d	#	#	NULL	NULL	#	#		
+< t1	0	d_t	2	t	#	#	NULL	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	0	d_t	1	d	#	#	NULL	NULL	#	#			NO
+> t1	0	d_t	2	t	#	#	NULL	NULL	#	#			NO
+245,247c245,247
+< Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
+< t1	1	y	1	y	#	#	NULL	NULL	#	#		
+< t1	1	y	2	t	#	#	NULL	NULL	#	#		
+---
+> Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+> t1	1	y	1	y	#	#	NULL	NULL	#	#			NO
+> t1	1	y	2	t	#	#	NULL	NULL	#	#			NO
