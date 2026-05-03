@@ -1,0 +1,40 @@
+name: bytecaskdb-wordpress
+
+services:
+  db:
+    build:
+      context: ../../..
+      dockerfile: bytecaskdb-mariadb-plugin/Dockerfile
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpassword
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./mariadb.cnf:/etc/mysql/conf.d/bytecaskdb-wordpress.cnf:z
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect"]
+      start_period: 30s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  wordpress:
+    image: docker.io/library/wordpress:latest
+    ports:
+      - "8080:80"
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - wp_data:/var/www/html
+
+volumes:
+  db_data:
+  wp_data:

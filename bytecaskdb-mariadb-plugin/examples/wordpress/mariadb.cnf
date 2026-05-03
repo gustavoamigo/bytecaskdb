@@ -1,0 +1,8 @@
+[mariadbd]
+# ByteCaskDB as the default (and only) storage engine.
+# skip-innodb makes InnoDB unavailable; removing NO_ENGINE_SUBSTITUTION
+# from sql_mode tells MariaDB to silently redirect ENGINE=InnoDB requests
+# (used by WordPress) to default_storage_engine instead of erroring.
+default_storage_engine = bytecaskdb
+skip-innodb
+sql_mode               = STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER
