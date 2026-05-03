@@ -73,6 +73,7 @@ std::vector<uint8_t> encode_pk(TABLE *table, const uchar *buf,
              &table->key_info[pk_idx],
              suffix_len);
 #ifndef BYTECASKDB_TESTS
+    normalize_padspace_pk(key.data() + 5, &table->key_info[pk_idx]);
     make_mem_comparable(key.data() + 5, &table->key_info[pk_idx], suffix_len);
 #endif
   }
@@ -131,6 +132,8 @@ std::vector<uint8_t> table_id_upper_bound(uint32_t table_id) {
 // Fix VARCHAR key encoding by removing the 2-byte LE length prefix that key_copy()
 // inserts (HA_KEY_BLOB_LENGTH = 2).  After stripping, the slot holds raw data
 // left-justified with zero padding, giving correct lexicographic ordering.
+// For PAD SPACE collations, trailing spaces are stripped before zero-padding
+// so that 'a' and 'a ' produce identical keys (SQL standard comparison semantics).
 // Only compiled when full MariaDB headers are available (not in test builds).
 void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table, uint active_index) {
   const KEY &key_info = table->key_info[active_index];
@@ -148,10 +151,45 @@ void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table, uint active_index
       if (length > kp.length) length = kp.length;
 
       std::memmove(key_ptr + null_off, key_ptr + null_off + HA_KEY_BLOB_LENGTH, length);
+
+      // PAD SPACE: strip trailing 0x20 so 'a' == 'a ' under default collations.
+      if (!(field->charset()->state & MY_CS_NOPAD)) {
+        while (length > 0 && key_ptr[null_off + length - 1] == 0x20)
+          --length;
+      }
+
       std::memset(key_ptr + null_off + length, 0, kp.store_length - null_off - length);
     }
 
     key_ptr += kp.store_length;
+  }
+}
+
+// Normalize VARCHAR key parts in PK encoding for PAD SPACE collations.
+// PK format keeps the 2-byte LE length prefix (unlike fix_varchar_key_encoding
+// which strips it). This function trims trailing 0x20 bytes and updates the
+// length prefix so 'a' and 'a ' produce identical PK keys.
+void normalize_padspace_pk(uint8_t *key_data, const KEY *key_info) {
+  uint8_t *p = key_data;
+  for (uint i = 0; i < key_info->user_defined_key_parts; ++i) {
+    const KEY_PART_INFO &kp = key_info->key_part[i];
+    Field *field = kp.field;
+    if (field->type() == MYSQL_TYPE_VARCHAR &&
+        !(field->charset()->state & MY_CS_NOPAD)) {
+      uint null_off = (kp.null_bit) ? 1 : 0;
+      uint16_t length = static_cast<uint16_t>(p[null_off]) |
+                        (static_cast<uint16_t>(p[null_off + 1]) << 8);
+      if (length > kp.length) length = kp.length;
+      while (length > 0 && p[null_off + 2 + length - 1] == 0x20)
+        --length;
+      // Update the 2-byte LE length prefix.
+      p[null_off] = static_cast<uint8_t>(length & 0xFF);
+      p[null_off + 1] = static_cast<uint8_t>((length >> 8) & 0xFF);
+      // Zero the trimmed trailing bytes.
+      std::memset(p + null_off + 2 + length, 0,
+                  kp.length - length);
+    }
+    p += kp.store_length;
   }
 }
 #endif
@@ -193,6 +231,8 @@ std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
              &table->key_info[table->s->primary_key],
              suffix_len);
 #ifndef BYTECASKDB_TESTS
+    normalize_padspace_pk(key.data() + 7 + sec_key_len,
+                          &table->key_info[table->s->primary_key]);
     make_mem_comparable(key.data() + 7 + sec_key_len,
                         &table->key_info[table->s->primary_key], suffix_len);
 #endif

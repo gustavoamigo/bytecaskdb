@@ -1,10 +1,9 @@
 # check_table.yaml — CHECK TABLE behavior
 #
-# ByteCaskDB does not implement ha_check() so CHECK TABLE returns
-# "The storage engine for the table doesn't support check".
-# FOR UPGRADE mode passes because it only checks frm compatibility.
+# ByteCaskDB implements ha_check() which walks all rows and verifies that
+# every secondary index entry exists. Returns OK for consistent tables.
 
-- name: CHECK TABLE returns unsupported note
+- name: CHECK TABLE returns OK for consistent table
   setup:
     - DROP DATABASE IF EXISTS ck1
     - CREATE DATABASE ck1
@@ -12,7 +11,7 @@
     - INSERT INTO ck1.t VALUES (1, 'a'), (2, 'b'), (3, 'c')
   query: CHECK TABLE ck1.t
   expected:
-    - ['ck1.t', 'check', 'note', "The storage engine for the table doesn't support check"]
+    - ['ck1.t', 'check', 'status', 'OK']
   teardown:
     - DROP DATABASE IF EXISTS ck1
 
@@ -38,7 +37,23 @@
     - INSERT INTO ck8.t2 VALUES (2)
   query: CHECK TABLE ck8.t1, ck8.t2
   expected:
-    - ['ck8.t1', 'check', 'note', "The storage engine for the table doesn't support check"]
-    - ['ck8.t2', 'check', 'note', "The storage engine for the table doesn't support check"]
+    - ['ck8.t1', 'check', 'status', 'OK']
+    - ['ck8.t2', 'check', 'status', 'OK']
   teardown:
     - DROP DATABASE IF EXISTS ck8
+
+- name: CHECK TABLE with secondary index
+  setup:
+    - DROP DATABASE IF EXISTS ck9
+    - CREATE DATABASE ck9
+    - >
+      CREATE TABLE ck9.t (a INT PRIMARY KEY, b INT, c VARCHAR(32),
+        INDEX idx_b(b), INDEX idx_c(c)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO ck9.t VALUES (1, 10, 'hello'), (2, 20, 'world'),
+      (3, 30, 'foo')
+  query: CHECK TABLE ck9.t
+  expected:
+    - ['ck9.t', 'check', 'status', 'OK']
+  teardown:
+    - DROP DATABASE IF EXISTS ck9

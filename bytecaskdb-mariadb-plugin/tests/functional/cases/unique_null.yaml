@@ -1,11 +1,8 @@
 # unique_null.yaml — NULL handling in UNIQUE indexes
 #
-# SQL standard says multiple NULLs should be allowed in a UNIQUE index
-# (NULL != NULL). ByteCaskDB currently treats NULL as a value for
-# uniqueness checks — this is a KNOWN BUG. These tests document
-# the actual behavior.
+# SQL standard: NULL != NULL, so multiple NULLs are allowed in a UNIQUE index.
 
-- name: "KNOWN BUG: multiple NULLs rejected in UNIQUE index"
+- name: Multiple NULLs allowed in UNIQUE index
   setup:
     - DROP DATABASE IF EXISTS un1
     - CREATE DATABASE un1
@@ -13,9 +10,13 @@
       CREATE TABLE un1.t (id INT PRIMARY KEY, v INT, UNIQUE INDEX idx_v(v))
       ENGINE=bytecaskdb
     - INSERT INTO un1.t VALUES (1, NULL)
-  steps:
-    - sql: INSERT INTO un1.t VALUES (2, NULL)
-      error: 1062
+    - INSERT INTO un1.t VALUES (2, NULL)
+    - INSERT INTO un1.t VALUES (3, NULL)
+  query: SELECT id, v FROM un1.t ORDER BY id
+  expected:
+    - ['1', 'NULL']
+    - ['2', 'NULL']
+    - ['3', 'NULL']
   teardown:
     - DROP DATABASE IF EXISTS un1
 
@@ -33,19 +34,20 @@
   teardown:
     - DROP DATABASE IF EXISTS un2
 
-- name: Single NULL allowed in UNIQUE index
+- name: NULLs mixed with non-NULL values in UNIQUE index
   setup:
     - DROP DATABASE IF EXISTS un3
     - CREATE DATABASE un3
     - >
       CREATE TABLE un3.t (id INT PRIMARY KEY, v INT, UNIQUE INDEX idx_v(v))
       ENGINE=bytecaskdb
-    - INSERT INTO un3.t VALUES (1, NULL), (2, 10), (3, 20)
+    - INSERT INTO un3.t VALUES (1, NULL), (2, 10), (3, NULL), (4, 20)
   query: SELECT id, v FROM un3.t ORDER BY id
   expected:
     - ['1', 'NULL']
     - ['2', '10']
-    - ['3', '20']
+    - ['3', 'NULL']
+    - ['4', '20']
   teardown:
     - DROP DATABASE IF EXISTS un3
 
@@ -65,7 +67,7 @@
   teardown:
     - DROP DATABASE IF EXISTS un5
 
-- name: UPDATE UNIQUE column to itself succeeds
+- name: UPDATE UNIQUE column to NULL succeeds (multiple NULLs allowed)
   setup:
     - DROP DATABASE IF EXISTS un6
     - CREATE DATABASE un6
@@ -74,9 +76,10 @@
       ENGINE=bytecaskdb
     - INSERT INTO un6.t VALUES (1, 10), (2, 20), (3, 30)
   steps:
-    - sql: UPDATE un6.t SET v = v
+    - sql: UPDATE un6.t SET v = NULL WHERE id = 2
+    - sql: UPDATE un6.t SET v = NULL WHERE id = 3
     - sql: SELECT id, v FROM un6.t ORDER BY id
-      expected: [['1', '10'], ['2', '20'], ['3', '30']]
+      expected: [['1', '10'], ['2', 'NULL'], ['3', 'NULL']]
   teardown:
     - DROP DATABASE IF EXISTS un6
 
@@ -96,3 +99,19 @@
       expected: [['1']]
   teardown:
     - DROP DATABASE IF EXISTS un7
+
+- name: Composite UNIQUE index with NULL in one column
+  setup:
+    - DROP DATABASE IF EXISTS un8
+    - CREATE DATABASE un8
+    - >
+      CREATE TABLE un8.t (id INT PRIMARY KEY, a INT, b INT,
+        UNIQUE INDEX idx_ab(a, b)) ENGINE=bytecaskdb
+    - INSERT INTO un8.t VALUES (1, 1, NULL), (2, 1, NULL), (3, NULL, 1)
+  query: SELECT id, a, b FROM un8.t ORDER BY id
+  expected:
+    - ['1', '1', 'NULL']
+    - ['2', '1', 'NULL']
+    - ['3', 'NULL', '1']
+  teardown:
+    - DROP DATABASE IF EXISTS un8

@@ -1,22 +1,20 @@
-# varchar_endspace.yaml — VARCHAR trailing-space edge cases in PK and indexes
+# varchar_endspace.yaml — VARCHAR trailing-space handling with PAD SPACE semantics
 #
-# ByteCaskDB uses binary key encoding which means trailing spaces are
-# treated as significant (binary comparison). This differs from the
-# PAD SPACE semantics of default collations (like utf8mb4_general_ci).
-#
-# These tests document the ACTUAL behavior — not ideal SQL semantics.
+# Under default PAD SPACE collations (utf8mb4_general_ci), trailing spaces
+# are insignificant for comparison. 'a' == 'a ' for PK uniqueness and
+# index ordering.
 
-- name: "KNOWN: VARCHAR PK allows 'a' and 'a ' as distinct (binary encoding)"
+- name: VARCHAR PK treats 'a' and 'a ' as duplicates (PAD SPACE)
   setup:
     - DROP DATABASE IF EXISTS ve1
     - CREATE DATABASE ve1
     - CREATE TABLE ve1.t (pk VARCHAR(64) PRIMARY KEY, v INT) ENGINE=bytecaskdb
     - INSERT INTO ve1.t VALUES ('a', 1)
-    - INSERT INTO ve1.t VALUES ('a ', 2)
-  query: SELECT pk, v FROM ve1.t ORDER BY pk
-  expected:
-    - ['a', '1']
-    - ['a ', '2']
+  steps:
+    - sql: INSERT INTO ve1.t VALUES ('a ', 2)
+      error: 1062
+    - sql: SELECT pk, v FROM ve1.t
+      expected: [['a', '1']]
   teardown:
     - DROP DATABASE IF EXISTS ve1
 
@@ -82,3 +80,31 @@
     - ['z', '3']
   teardown:
     - DROP DATABASE IF EXISTS ve8
+
+- name: VARCHAR index lookup with trailing spaces matches (PAD SPACE)
+  setup:
+    - DROP DATABASE IF EXISTS ve9
+    - CREATE DATABASE ve9
+    - >
+      CREATE TABLE ve9.t (pk INT PRIMARY KEY, v VARCHAR(64), INDEX idx_v(v))
+      ENGINE=bytecaskdb
+    - INSERT INTO ve9.t VALUES (1, 'hello'), (2, 'world')
+  query: SELECT pk FROM ve9.t WHERE v = 'hello   '
+  expected:
+    - ['1']
+  teardown:
+    - DROP DATABASE IF EXISTS ve9
+
+- name: UNIQUE VARCHAR index treats trailing spaces as duplicates
+  setup:
+    - DROP DATABASE IF EXISTS ve10
+    - CREATE DATABASE ve10
+    - >
+      CREATE TABLE ve10.t (pk INT PRIMARY KEY, v VARCHAR(64),
+        UNIQUE INDEX idx_v(v)) ENGINE=bytecaskdb
+    - INSERT INTO ve10.t VALUES (1, 'abc')
+  steps:
+    - sql: INSERT INTO ve10.t VALUES (2, 'abc   ')
+      error: 1062
+  teardown:
+    - DROP DATABASE IF EXISTS ve10

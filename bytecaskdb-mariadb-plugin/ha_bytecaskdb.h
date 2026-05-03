@@ -163,6 +163,8 @@ public:
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type) override;
 
+  int check(THD *thd, HA_CHECK_OPT *check_opt) override;
+
 private:
   // Saves `current_row_key_` from a slice the iterator gave us.
   void save_current_row_key(const uint8_t *data, std::size_t len);
