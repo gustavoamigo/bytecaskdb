@@ -38,6 +38,7 @@ RUN dnf module enable -y llvm-toolset:rhel8 && \
     dnf install -y \
         clang clang-tools-extra llvm llvm-devel lld \
         make ninja-build git cmake curl \
+        autoconf automake libtool \
         libstdc++-static \
     && dnf clean all
 
