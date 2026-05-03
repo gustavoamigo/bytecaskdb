@@ -1,0 +1,44 @@
+# check_table.yaml — CHECK TABLE behavior
+#
+# ByteCaskDB does not implement ha_check() so CHECK TABLE returns
+# "The storage engine for the table doesn't support check".
+# FOR UPGRADE mode passes because it only checks frm compatibility.
+
+- name: CHECK TABLE returns unsupported note
+  setup:
+    - DROP DATABASE IF EXISTS ck1
+    - CREATE DATABASE ck1
+    - CREATE TABLE ck1.t (a INT PRIMARY KEY, b CHAR(8)) ENGINE=bytecaskdb
+    - INSERT INTO ck1.t VALUES (1, 'a'), (2, 'b'), (3, 'c')
+  query: CHECK TABLE ck1.t
+  expected:
+    - ['ck1.t', 'check', 'note', "The storage engine for the table doesn't support check"]
+  teardown:
+    - DROP DATABASE IF EXISTS ck1
+
+- name: CHECK TABLE FOR UPGRADE passes (frm-level check only)
+  setup:
+    - DROP DATABASE IF EXISTS ck3
+    - CREATE DATABASE ck3
+    - CREATE TABLE ck3.t (a INT PRIMARY KEY, b CHAR(8)) ENGINE=bytecaskdb
+    - INSERT INTO ck3.t VALUES (1, 'x')
+  query: CHECK TABLE ck3.t FOR UPGRADE
+  expected:
+    - ['ck3.t', 'check', 'status', 'OK']
+  teardown:
+    - DROP DATABASE IF EXISTS ck3
+
+- name: CHECK TABLE multiple tables
+  setup:
+    - DROP DATABASE IF EXISTS ck8
+    - CREATE DATABASE ck8
+    - CREATE TABLE ck8.t1 (a INT PRIMARY KEY) ENGINE=bytecaskdb
+    - CREATE TABLE ck8.t2 (a INT PRIMARY KEY) ENGINE=bytecaskdb
+    - INSERT INTO ck8.t1 VALUES (1)
+    - INSERT INTO ck8.t2 VALUES (2)
+  query: CHECK TABLE ck8.t1, ck8.t2
+  expected:
+    - ['ck8.t1', 'check', 'note', "The storage engine for the table doesn't support check"]
+    - ['ck8.t2', 'check', 'note', "The storage engine for the table doesn't support check"]
+  teardown:
+    - DROP DATABASE IF EXISTS ck8

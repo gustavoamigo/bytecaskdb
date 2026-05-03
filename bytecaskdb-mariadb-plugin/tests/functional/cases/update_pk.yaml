@@ -1,0 +1,83 @@
+# update_pk.yaml — UPDATE on PRIMARY KEY column inside transactions
+
+- name: UPDATE PK column visible inside transaction then ROLLBACK
+  setup:
+    - DROP DATABASE IF EXISTS upk1
+    - CREATE DATABASE upk1
+    - CREATE TABLE upk1.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO upk1.t VALUES (1, 10), (2, 20)
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO upk1.t VALUES (50, 50)
+    - sql: SELECT id, v FROM upk1.t ORDER BY id
+      expected: [['1', '10'], ['2', '20'], ['50', '50']]
+    - sql: ROLLBACK
+    - sql: SELECT id, v FROM upk1.t ORDER BY id
+      expected: [['1', '10'], ['2', '20']]
+  teardown:
+    - DROP DATABASE IF EXISTS upk1
+
+- name: UPDATE PK single row then COMMIT
+  setup:
+    - DROP DATABASE IF EXISTS upk2
+    - CREATE DATABASE upk2
+    - CREATE TABLE upk2.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO upk2.t VALUES (1, 10), (2, 20)
+  steps:
+    - sql: BEGIN
+    - sql: UPDATE upk2.t SET id = 99 WHERE id = 1
+    - sql: SELECT id, v FROM upk2.t ORDER BY id
+      expected: [['2', '20'], ['99', '10']]
+    - sql: COMMIT
+    - sql: SELECT id, v FROM upk2.t ORDER BY id
+      expected: [['2', '20'], ['99', '10']]
+  teardown:
+    - DROP DATABASE IF EXISTS upk2
+
+- name: UPDATE PK to existing value fails with duplicate
+  setup:
+    - DROP DATABASE IF EXISTS upk3
+    - CREATE DATABASE upk3
+    - CREATE TABLE upk3.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO upk3.t VALUES (1, 10), (2, 20)
+  steps:
+    - sql: UPDATE upk3.t SET id = 2 WHERE id = 1
+      error: 1062
+    - sql: SELECT id, v FROM upk3.t ORDER BY id
+      expected: [['1', '10'], ['2', '20']]
+  teardown:
+    - DROP DATABASE IF EXISTS upk3
+
+- name: UPDATE non-index column by secondary key
+  setup:
+    - DROP DATABASE IF EXISTS upk4
+    - CREATE DATABASE upk4
+    - >
+      CREATE TABLE upk4.t (id INT PRIMARY KEY, v INT, extra VARCHAR(32),
+        INDEX idx_v(v)) ENGINE=bytecaskdb
+    - INSERT INTO upk4.t VALUES (1, 100, 'a'), (2, 200, 'b'), (3, 300, 'c')
+  steps:
+    - sql: BEGIN
+    - sql: UPDATE upk4.t SET extra = 'updated' WHERE v = 200
+    - sql: SELECT id, extra FROM upk4.t WHERE v = 200
+      expected: [['2', 'updated']]
+    - sql: ROLLBACK
+    - sql: SELECT id, extra FROM upk4.t WHERE id = 2
+      expected: [['2', 'b']]
+  teardown:
+    - DROP DATABASE IF EXISTS upk4
+
+- name: UPDATE non-indexed column preserves PK and secondary index
+  setup:
+    - DROP DATABASE IF EXISTS upk5
+    - CREATE DATABASE upk5
+    - >
+      CREATE TABLE upk5.t (id INT PRIMARY KEY, v INT, extra VARCHAR(32),
+        INDEX idx_v(v)) ENGINE=bytecaskdb
+    - INSERT INTO upk5.t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')
+  steps:
+    - sql: UPDATE upk5.t SET extra = 'x' WHERE id = 2
+    - sql: SELECT id, v, extra FROM upk5.t WHERE v = 20
+      expected: [['2', '20', 'x']]
+  teardown:
+    - DROP DATABASE IF EXISTS upk5

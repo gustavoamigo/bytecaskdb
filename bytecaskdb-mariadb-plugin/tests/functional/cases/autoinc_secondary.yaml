@@ -1,0 +1,93 @@
+# autoinc_secondary.yaml — AUTO_INCREMENT on composite PK columns
+#
+# ByteCaskDB uses a global auto-increment counter (like InnoDB), not
+# per-group reset (like MyISAM).  The MTR autoinc_secondary test
+# expectations assume MyISAM-style per-group reset, so it is disabled
+# in MTR and covered here with correct expectations for our engine.
+
+# --------------------------------------------------------------------------
+# AUTO_INCREMENT on the leading column of a composite PK — standard behavior
+# --------------------------------------------------------------------------
+
+- name: AUTO_INCREMENT on leading column of composite PK
+  setup:
+    - DROP DATABASE IF EXISTS ais1
+    - CREATE DATABASE ais1
+    - >
+      CREATE TABLE ais1.t (a INT NOT NULL AUTO_INCREMENT, b VARCHAR(64) NOT NULL,
+        PRIMARY KEY (a,b)) ENGINE=bytecaskdb
+    - INSERT INTO ais1.t (b) VALUES ('a'),('b'),('b'),('c'),('a')
+  query: SELECT a, b FROM ais1.t ORDER BY a, b
+  expected:
+    - ['1', 'a']
+    - ['2', 'b']
+    - ['3', 'b']
+    - ['4', 'c']
+    - ['5', 'a']
+  teardown:
+    - DROP DATABASE IF EXISTS ais1
+
+# --------------------------------------------------------------------------
+# AUTO_INCREMENT on the secondary column of a composite PK (no extra index)
+# MyISAM resets per group; InnoDB rejects this entirely.
+# ByteCaskDB allows it with a global counter.
+# --------------------------------------------------------------------------
+
+- name: AUTO_INCREMENT on secondary column of composite PK (global counter)
+  setup:
+    - DROP DATABASE IF EXISTS ais2
+    - CREATE DATABASE ais2
+    - >
+      CREATE TABLE ais2.t (a VARCHAR(64) NOT NULL, b INT NOT NULL AUTO_INCREMENT,
+        PRIMARY KEY (a,b)) ENGINE=bytecaskdb
+    - INSERT INTO ais2.t (a) VALUES ('a'),('b'),('b'),('c'),('a')
+  query: SELECT a, b FROM ais2.t ORDER BY a, b
+  expected:
+    - ['a', '1']
+    - ['a', '5']
+    - ['b', '2']
+    - ['b', '3']
+    - ['c', '4']
+  teardown:
+    - DROP DATABASE IF EXISTS ais2
+
+# --------------------------------------------------------------------------
+# AUTO_INCREMENT on secondary column with a separate index on that column
+# Both InnoDB and ByteCaskDB use a global counter here.
+# --------------------------------------------------------------------------
+
+- name: AUTO_INCREMENT on secondary column with separate index (global counter)
+  setup:
+    - DROP DATABASE IF EXISTS ais3
+    - CREATE DATABASE ais3
+    - >
+      CREATE TABLE ais3.t (a VARCHAR(64) NOT NULL, b INT NOT NULL AUTO_INCREMENT,
+        PRIMARY KEY (a,b), INDEX(b)) ENGINE=bytecaskdb
+    - INSERT INTO ais3.t (a) VALUES ('a'),('b'),('b'),('c'),('a')
+  query: SELECT a, b FROM ais3.t ORDER BY a, b
+  expected:
+    - ['a', '1']
+    - ['a', '5']
+    - ['b', '2']
+    - ['b', '3']
+    - ['c', '4']
+  teardown:
+    - DROP DATABASE IF EXISTS ais3
+
+# --------------------------------------------------------------------------
+# LAST_INSERT_ID() returns the first auto-generated value from the statement
+# --------------------------------------------------------------------------
+
+- name: LAST_INSERT_ID returns first generated value in multi-row INSERT
+  setup:
+    - DROP DATABASE IF EXISTS ais4
+    - CREATE DATABASE ais4
+    - >
+      CREATE TABLE ais4.t (a INT NOT NULL AUTO_INCREMENT, b VARCHAR(64) NOT NULL,
+        PRIMARY KEY (a,b)) ENGINE=bytecaskdb
+    - INSERT INTO ais4.t (b) VALUES ('x'),('y'),('z')
+  query: SELECT LAST_INSERT_ID()
+  expected:
+    - ['1']
+  teardown:
+    - DROP DATABASE IF EXISTS ais4

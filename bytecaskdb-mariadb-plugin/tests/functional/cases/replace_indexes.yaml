@@ -1,0 +1,86 @@
+# replace_indexes.yaml — REPLACE INTO with secondary and unique indexes
+
+- name: REPLACE inserts when no duplicate (with secondary index)
+  setup:
+    - DROP DATABASE IF EXISTS ri1
+    - CREATE DATABASE ri1
+    - >
+      CREATE TABLE ri1.t (a INT PRIMARY KEY, b CHAR(8), c INT,
+        INDEX idx_c(c)) ENGINE=bytecaskdb
+    - REPLACE INTO ri1.t VALUES (1, 'a', 100), (2, 'b', 200), (3, 'c', 300)
+  query: SELECT a, b, c FROM ri1.t ORDER BY c
+  expected:
+    - ['1', 'a', '100']
+    - ['2', 'b', '200']
+    - ['3', 'c', '300']
+  teardown:
+    - DROP DATABASE IF EXISTS ri1
+
+- name: REPLACE on PK conflict replaces row data
+  setup:
+    - DROP DATABASE IF EXISTS ri2
+    - CREATE DATABASE ri2
+    - >
+      CREATE TABLE ri2.t (a INT PRIMARY KEY, b CHAR(8), c INT,
+        INDEX idx_c(c)) ENGINE=bytecaskdb
+    - INSERT INTO ri2.t VALUES (1, 'a', 100), (2, 'b', 200)
+    - REPLACE INTO ri2.t VALUES (2, 'new', 999)
+  steps:
+    - sql: SELECT a, b, c FROM ri2.t ORDER BY a
+      expected: [['1', 'a', '100'], ['2', 'new', '999']]
+    - sql: SELECT a FROM ri2.t WHERE c = 999
+      expected: [['2']]
+  teardown:
+    - DROP DATABASE IF EXISTS ri2
+
+- name: REPLACE on UNIQUE key conflict deletes old row
+  setup:
+    - DROP DATABASE IF EXISTS ri3
+    - CREATE DATABASE ri3
+    - >
+      CREATE TABLE ri3.t (a INT AUTO_INCREMENT PRIMARY KEY, b INT NOT NULL,
+        UNIQUE INDEX idx_b(b)) ENGINE=bytecaskdb
+    - INSERT INTO ri3.t (b) VALUES (10), (20), (30)
+    - REPLACE INTO ri3.t (b) VALUES (20)
+  query: SELECT a, b FROM ri3.t ORDER BY b
+  expected:
+    - ['1', '10']
+    - ['4', '20']
+    - ['3', '30']
+  teardown:
+    - DROP DATABASE IF EXISTS ri3
+
+- name: REPLACE with composite UNIQUE key
+  setup:
+    - DROP DATABASE IF EXISTS ri4
+    - CREATE DATABASE ri4
+    - >
+      CREATE TABLE ri4.t (id INT AUTO_INCREMENT PRIMARY KEY,
+        a INT NOT NULL, b INT NOT NULL,
+        UNIQUE INDEX idx_ab(a, b)) ENGINE=bytecaskdb
+    - INSERT INTO ri4.t (a, b) VALUES (1, 1), (1, 2), (2, 1)
+    - REPLACE INTO ri4.t (a, b) VALUES (1, 2)
+  query: SELECT id, a, b FROM ri4.t ORDER BY a, b
+  expected:
+    - ['1', '1', '1']
+    - ['4', '1', '2']
+    - ['3', '2', '1']
+  teardown:
+    - DROP DATABASE IF EXISTS ri4
+
+- name: REPLACE inside transaction with ROLLBACK
+  setup:
+    - DROP DATABASE IF EXISTS ri5
+    - CREATE DATABASE ri5
+    - CREATE TABLE ri5.t (a INT PRIMARY KEY, b CHAR(8)) ENGINE=bytecaskdb
+    - INSERT INTO ri5.t VALUES (1, 'old')
+  steps:
+    - sql: BEGIN
+    - sql: REPLACE INTO ri5.t VALUES (1, 'new')
+    - sql: SELECT b FROM ri5.t WHERE a = 1
+      expected: [['new']]
+    - sql: ROLLBACK
+    - sql: SELECT b FROM ri5.t WHERE a = 1
+      expected: [['old']]
+  teardown:
+    - DROP DATABASE IF EXISTS ri5

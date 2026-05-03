@@ -1,0 +1,75 @@
+# truncate_transaction.yaml — TRUNCATE TABLE behavior and edge cases
+
+- name: TRUNCATE empties table and resets AUTO_INCREMENT
+  setup:
+    - DROP DATABASE IF EXISTS tr1
+    - CREATE DATABASE tr1
+    - CREATE TABLE tr1.t (a INT AUTO_INCREMENT PRIMARY KEY, b CHAR(8)) ENGINE=bytecaskdb
+    - INSERT INTO tr1.t (b) VALUES ('a'), ('b'), ('c')
+    - TRUNCATE TABLE tr1.t
+    - INSERT INTO tr1.t (b) VALUES ('d')
+  query: SELECT a, b FROM tr1.t
+  expected:
+    - ['1', 'd']
+  teardown:
+    - DROP DATABASE IF EXISTS tr1
+
+- name: TRUNCATE on empty table is no-op
+  setup:
+    - DROP DATABASE IF EXISTS tr2
+    - CREATE DATABASE tr2
+    - CREATE TABLE tr2.t (a INT PRIMARY KEY, b CHAR(8)) ENGINE=bytecaskdb
+    - TRUNCATE TABLE tr2.t
+  query: SELECT COUNT(*) FROM tr2.t
+  expected:
+    - ['0']
+  teardown:
+    - DROP DATABASE IF EXISTS tr2
+
+- name: TRUNCATE then INSERT starts fresh
+  setup:
+    - DROP DATABASE IF EXISTS tr3
+    - CREATE DATABASE tr3
+    - CREATE TABLE tr3.t (a INT PRIMARY KEY, b CHAR(8)) ENGINE=bytecaskdb
+    - INSERT INTO tr3.t VALUES (1, 'a'), (2, 'b'), (3, 'c')
+    - TRUNCATE TABLE tr3.t
+  steps:
+    - sql: SELECT COUNT(*) FROM tr3.t
+      expected: [['0']]
+    - sql: INSERT INTO tr3.t VALUES (10, 'x')
+    - sql: SELECT a, b FROM tr3.t
+      expected: [['10', 'x']]
+  teardown:
+    - DROP DATABASE IF EXISTS tr3
+
+- name: TRUNCATE with secondary index
+  setup:
+    - DROP DATABASE IF EXISTS tr4
+    - CREATE DATABASE tr4
+    - >
+      CREATE TABLE tr4.t (a INT PRIMARY KEY, b INT, INDEX idx_b(b))
+      ENGINE=bytecaskdb
+    - INSERT INTO tr4.t VALUES (1, 10), (2, 20), (3, 30)
+    - TRUNCATE TABLE tr4.t
+    - INSERT INTO tr4.t VALUES (4, 40)
+  query: SELECT a, b FROM tr4.t ORDER BY b
+  expected:
+    - ['4', '40']
+  teardown:
+    - DROP DATABASE IF EXISTS tr4
+
+- name: Data inserted after TRUNCATE is queryable via index
+  setup:
+    - DROP DATABASE IF EXISTS tr5
+    - CREATE DATABASE tr5
+    - >
+      CREATE TABLE tr5.t (a INT PRIMARY KEY, b INT, INDEX idx_b(b))
+      ENGINE=bytecaskdb
+    - INSERT INTO tr5.t VALUES (1, 10), (2, 20)
+    - TRUNCATE TABLE tr5.t
+    - INSERT INTO tr5.t VALUES (3, 30), (4, 40)
+  query: SELECT a FROM tr5.t WHERE b = 30
+  expected:
+    - ['3']
+  teardown:
+    - DROP DATABASE IF EXISTS tr5

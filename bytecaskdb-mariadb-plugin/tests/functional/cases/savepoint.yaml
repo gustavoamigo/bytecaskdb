@@ -1,0 +1,19 @@
+# savepoint.yaml — SAVEPOINT / ROLLBACK TO SAVEPOINT tests
+#
+# NOTE: ByteCaskDB does NOT currently support SAVEPOINT (error 1178).
+# These tests document the expected behavior for when it is implemented.
+# For now they verify the error is correctly raised.
+
+- name: SAVEPOINT returns unsupported error
+  setup:
+    - DROP DATABASE IF EXISTS sp1
+    - CREATE DATABASE sp1
+    - CREATE TABLE sp1.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO sp1.t VALUES (1, 10)
+    - sql: SAVEPOINT s1
+      error: 1178
+    - sql: ROLLBACK
+  teardown:
+    - DROP DATABASE IF EXISTS sp1

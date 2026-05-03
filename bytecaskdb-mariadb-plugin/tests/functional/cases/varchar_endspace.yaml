@@ -1,0 +1,84 @@
+# varchar_endspace.yaml — VARCHAR trailing-space edge cases in PK and indexes
+#
+# ByteCaskDB uses binary key encoding which means trailing spaces are
+# treated as significant (binary comparison). This differs from the
+# PAD SPACE semantics of default collations (like utf8mb4_general_ci).
+#
+# These tests document the ACTUAL behavior — not ideal SQL semantics.
+
+- name: "KNOWN: VARCHAR PK allows 'a' and 'a ' as distinct (binary encoding)"
+  setup:
+    - DROP DATABASE IF EXISTS ve1
+    - CREATE DATABASE ve1
+    - CREATE TABLE ve1.t (pk VARCHAR(64) PRIMARY KEY, v INT) ENGINE=bytecaskdb
+    - INSERT INTO ve1.t VALUES ('a', 1)
+    - INSERT INTO ve1.t VALUES ('a ', 2)
+  query: SELECT pk, v FROM ve1.t ORDER BY pk
+  expected:
+    - ['a', '1']
+    - ['a ', '2']
+  teardown:
+    - DROP DATABASE IF EXISTS ve1
+
+- name: VARCHAR secondary index ordering (lexicographic)
+  setup:
+    - DROP DATABASE IF EXISTS ve4
+    - CREATE DATABASE ve4
+    - >
+      CREATE TABLE ve4.t (pk INT PRIMARY KEY, v VARCHAR(64), INDEX idx_v(v))
+      ENGINE=bytecaskdb
+    - >
+      INSERT INTO ve4.t VALUES (1, 'ab'), (2, 'a'), (3, 'b'), (4, 'aa')
+  query: SELECT pk, v FROM ve4.t ORDER BY v
+  expected:
+    - ['2', 'a']
+    - ['4', 'aa']
+    - ['1', 'ab']
+    - ['3', 'b']
+  teardown:
+    - DROP DATABASE IF EXISTS ve4
+
+- name: Empty string in VARCHAR index
+  setup:
+    - DROP DATABASE IF EXISTS ve6
+    - CREATE DATABASE ve6
+    - CREATE TABLE ve6.t (pk INT PRIMARY KEY, v VARCHAR(64), INDEX idx_v(v)) ENGINE=bytecaskdb
+    - INSERT INTO ve6.t VALUES (1, ''), (2, 'a'), (3, 'b')
+  query: SELECT pk, v FROM ve6.t ORDER BY v
+  expected:
+    - ['1', '']
+    - ['2', 'a']
+    - ['3', 'b']
+  teardown:
+    - DROP DATABASE IF EXISTS ve6
+
+- name: VARCHAR point lookup via index
+  setup:
+    - DROP DATABASE IF EXISTS ve7
+    - CREATE DATABASE ve7
+    - >
+      CREATE TABLE ve7.t (pk INT PRIMARY KEY, v VARCHAR(64), INDEX idx_v(v))
+      ENGINE=bytecaskdb
+    - INSERT INTO ve7.t VALUES (1, 'hello'), (2, 'world'), (3, 'foo')
+  query: SELECT pk FROM ve7.t WHERE v = 'world'
+  expected:
+    - ['2']
+  teardown:
+    - DROP DATABASE IF EXISTS ve7
+
+- name: VARCHAR PK with various lengths
+  setup:
+    - DROP DATABASE IF EXISTS ve8
+    - CREATE DATABASE ve8
+    - CREATE TABLE ve8.t (pk VARCHAR(128) PRIMARY KEY, v INT) ENGINE=bytecaskdb
+    - >
+      INSERT INTO ve8.t VALUES ('short', 1), ('a longer string here', 2),
+      ('z', 3), ('abc', 4)
+  query: SELECT pk, v FROM ve8.t ORDER BY pk
+  expected:
+    - ['a longer string here', '2']
+    - ['abc', '4']
+    - ['short', '1']
+    - ['z', '3']
+  teardown:
+    - DROP DATABASE IF EXISTS ve8

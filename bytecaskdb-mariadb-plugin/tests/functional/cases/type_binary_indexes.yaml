@@ -1,0 +1,105 @@
+# type_binary_indexes.yaml — BINARY, VARBINARY, and BIT types in indexes
+
+- name: BINARY secondary index ordering
+  setup:
+    - DROP DATABASE IF EXISTS bin1
+    - CREATE DATABASE bin1
+    - >
+      CREATE TABLE bin1.t (pk INT PRIMARY KEY, b BINARY(4), INDEX idx_b(b))
+      ENGINE=bytecaskdb
+    - >
+      INSERT INTO bin1.t VALUES
+      (1, 0x00000001), (2, 0xFF000000), (3, 0x00FF0000), (4, 0x000000FF)
+  query: SELECT pk, HEX(b) FROM bin1.t ORDER BY b
+  expected:
+    - ['1', '00000001']
+    - ['4', '000000FF']
+    - ['3', '00FF0000']
+    - ['2', 'FF000000']
+  teardown:
+    - DROP DATABASE IF EXISTS bin1
+
+- name: VARBINARY PRIMARY KEY ordering
+  setup:
+    - DROP DATABASE IF EXISTS bin2
+    - CREATE DATABASE bin2
+    - >
+      CREATE TABLE bin2.t (b VARBINARY(32) PRIMARY KEY, v INT)
+      ENGINE=bytecaskdb
+    - >
+      INSERT INTO bin2.t VALUES
+      (0x01, 1), (0x0100, 2), (0xFF, 3), (0x00, 4), (0x0001, 5)
+  query: SELECT HEX(b), v FROM bin2.t ORDER BY b
+  expected:
+    - ['00', '4']
+    - ['0001', '5']
+    - ['01', '1']
+    - ['0100', '2']
+    - ['FF', '3']
+  teardown:
+    - DROP DATABASE IF EXISTS bin2
+
+- name: VARBINARY point lookup
+  setup:
+    - DROP DATABASE IF EXISTS bin3
+    - CREATE DATABASE bin3
+    - >
+      CREATE TABLE bin3.t (pk INT PRIMARY KEY, b VARBINARY(16), INDEX idx_b(b))
+      ENGINE=bytecaskdb
+    - INSERT INTO bin3.t VALUES (1, 0xDEADBEEF), (2, 0xCAFEBABE), (3, 0x00)
+  query: SELECT pk FROM bin3.t WHERE b = 0xDEADBEEF
+  expected:
+    - ['1']
+  teardown:
+    - DROP DATABASE IF EXISTS bin3
+
+- name: BIT column in index
+  setup:
+    - DROP DATABASE IF EXISTS bit1
+    - CREATE DATABASE bit1
+    - >
+      CREATE TABLE bit1.t (pk INT PRIMARY KEY, b BIT(8), INDEX idx_b(b))
+      ENGINE=bytecaskdb
+    - INSERT INTO bit1.t VALUES (1, b'00000001'), (2, b'11111111'), (3, b'00000000'), (4, b'10000000')
+  query: SELECT pk, b+0 FROM bit1.t ORDER BY b
+  expected:
+    - ['3', '0']
+    - ['1', '1']
+    - ['4', '128']
+    - ['2', '255']
+  teardown:
+    - DROP DATABASE IF EXISTS bit1
+
+- name: BIT(1) as boolean flag with index
+  setup:
+    - DROP DATABASE IF EXISTS bit2
+    - CREATE DATABASE bit2
+    - >
+      CREATE TABLE bit2.t (pk INT PRIMARY KEY, active BIT(1), INDEX idx_a(active))
+      ENGINE=bytecaskdb
+    - >
+      INSERT INTO bit2.t VALUES (1, b'1'), (2, b'0'), (3, b'1'), (4, b'0')
+  query: SELECT pk FROM bit2.t WHERE active = b'1' ORDER BY pk
+  expected:
+    - ['1']
+    - ['3']
+  teardown:
+    - DROP DATABASE IF EXISTS bit2
+
+- name: BIT(64) wide bit field in index
+  setup:
+    - DROP DATABASE IF EXISTS bit3
+    - CREATE DATABASE bit3
+    - >
+      CREATE TABLE bit3.t (pk INT PRIMARY KEY, b BIT(64), INDEX idx_b(b))
+      ENGINE=bytecaskdb
+    - >
+      INSERT INTO bit3.t VALUES
+      (1, b'0'), (2, b'1'), (3, 0xFFFFFFFFFFFFFFFF)
+  query: SELECT pk, b+0 FROM bit3.t ORDER BY b
+  expected:
+    - ['1', '0']
+    - ['2', '1']
+    - ['3', '18446744073709551615']
+  teardown:
+    - DROP DATABASE IF EXISTS bit3
