@@ -69,6 +69,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-228 | First-timer engine intro doc | Added `docs/bytecask_intro.md`: a short first-timer explanation of how ByteCaskDB works, centered on `EngineState -> TransientEngineState -> EngineState`, with Mermaid diagrams for the steady-state write loop. Linked from README and design doc. |
 | BC-217 | Disable mmap on WASM/Emscripten builds | Guarded `DataFile::seal()` mmap call with `#ifndef __EMSCRIPTEN__`. Emscripten's mmap emulation `malloc`s + `pread`s the file into the WASM heap, doubling memory for every sealed file. WASM builds now use the `pread` fallback exclusively. 1,069 tests pass. |
 | BC-227 | GitHub-native JUnit test reporting | Added `EnricoMi/publish-unit-test-result-action@v2` to `.github/workflows/ci.yml` so test results appear directly in GitHub Checks/PR UI. `build-and-test` now runs test binaries once while emitting JUnit XML, then always publishes JUnit results/artifacts/Codecov test-results even when tests fail (`if: always() && !cancelled()`). |
 | BC-226 | Codecov test context enrichment | Added `scripts/enrich_junit_sources.py` to inject testcase `file`/`line` metadata into Catch2 JUnit reports by joining with `--list-tests --reporter xml` output. CI runs this enrichment before uploading test results to Codecov so Test Analytics is not a flat list without source context. |

@@ -434,7 +434,7 @@ ByteCaskDB is designed around four core tenets, in priority order:
 
 **Recovery**: on `open`, the engine generates a hint file for any data file that lacks one (including the most recent active file), then replays all hint files in parallel to rebuild the key directory. Hint files are compact per-file indexes written atomically (`write → fdatasync → rename`) by a background worker after each file rotation and synchronously at engine close. No raw data-file scan is performed — recovery reads only hint files.
 
-See [`docs/bytecask_design.md`](docs/bytecask_design.md) for the full design reference.
+Start with [`docs/bytecask_intro.md`](docs/bytecask_intro.md) for a first-pass happy-path overview, then use [`docs/bytecask_design.md`](docs/bytecask_design.md) as the full design reference.
 
 ## Building
 
