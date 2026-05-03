@@ -1,0 +1,7 @@
+.git
+.xmake
+build
+.mariadb_functional_test
+.mariadb_local
+bytecaskdb-mariadb-plugin/build
+bytecaskdb-mariadb-plugin/mtr-var
