@@ -101,10 +101,15 @@ set_target_properties(bytecask_static PROPERTIES
   IMPORTED_LOCATION "${BYTECASK_LIB}")
 
 # ByteCaskDB uses crc32c internally; link it too.
-find_library(CRC32C_LIB   NAMES crc32c HINTS /usr/lib64 /usr/lib)
+find_library(CRC32C_LIB   NAMES crc32c HINTS /usr/lib64 /usr/lib /usr/local/lib /usr/local/lib64)
 if(NOT CRC32C_LIB)
   message(FATAL_ERROR "crc32c not found.  Install google-crc32c-devel (Fedora) or libcrc32c-dev (Debian).")
 endif()
+
+# When ON, embed libstdc++ and libgcc statically so the .so has no C++ runtime
+# version dependency at all — only glibc symbols remain.  Use for portable builds
+# (e.g. Docker) where the runtime image may ship an older libstdc++.
+option(BYTECASKDB_STATIC_LIBSTDCXX "Statically link libstdc++ and libgcc into the plugin" OFF)
 
 # ---------------------------------------------------------------------------
 # Plugin shared library
@@ -122,6 +127,10 @@ add_library(ha_bytecaskdb MODULE
   # with the same toolchain that produced the BMIs).  The PIMPL symbols
   # exposed by include/bytecask.hpp are linked in via bytecask_static.
 )
+
+if(BYTECASKDB_STATIC_LIBSTDCXX)
+  target_link_options(ha_bytecaskdb PRIVATE -static-libstdc++ -static-libgcc)
+endif()
 
 target_include_directories(ha_bytecaskdb PRIVATE
   # server/private must precede server which must precede the client include
@@ -154,10 +163,11 @@ target_compile_options(ha_bytecaskdb PRIVATE
 
 # MariaDB plugins must not link the server symbols — they are dlopen'd into
 # the server at runtime.  Link only the runtime and our static archive.
+# stdc++ is omitted here: the C++ compiler driver adds it implicitly, and
+# BYTECASKDB_STATIC_LIBSTDCXX controls whether that implicit link is static.
 target_link_libraries(ha_bytecaskdb PRIVATE
   bytecask_static
   "${CRC32C_LIB}"
-  stdc++
   m
   dl
 )
