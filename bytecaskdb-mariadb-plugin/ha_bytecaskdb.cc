@@ -494,40 +494,16 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
   // Handle secondary indexes.
   const TableMeta *meta = catalog_lookup_meta(table_id_);
   if (meta) {
-    // PK suffix bytes start at offset 5; for PK-less tables this is the rowid.
     const uint8_t *pk_bytes     = old_pk.data() + 5;
     const size_t   pk_bytes_len = old_pk.size() - 5;
 
     for (const auto &index : meta->indexes) {
-      // Locate the old secondary index entry by scanning for the PK suffix.
-      // This avoids relying on field->ptr pointing into the old record buffer,
-      // which is unreliable for VARCHAR fields under move_field_offset.
-      const uint sec_key_field_len = table->key_info[index.index_id].key_length;
-      auto lo   = index_id_prefix(table_id_, index.index_id);
-      auto hi   = index_id_upper_bound(table_id_, index.index_id);
-      auto scan = txn->iter_index_prefix(lo.data(), lo.size(),
-                                         hi.data(), hi.size(),
-                                         table_id_, index.index_id);
-
-      std::vector<uint8_t> old_sec_key;
-      while (scan && scan->valid()) {
-        const uint8_t *k    = scan->key_data();
-        const size_t   klen = scan->key_len();
-        if (klen >= 7 + sec_key_field_len + pk_bytes_len &&
-            std::memcmp(k + 7 + sec_key_field_len, pk_bytes, pk_bytes_len) == 0) {
-          old_sec_key.assign(k, k + klen);
-          break;
-        }
-        scan->next();
-      }
-
+      auto old_sec_key = encode_sec_key(table, old_data, table_id_,
+                                         index.index_id, index.index_id, rowid);
       auto new_sec_key = encode_sec_key(table, new_data, table_id_,
                                          index.index_id, index.index_id, rowid);
       if (old_sec_key != new_sec_key) {
-        // Unique constraint check: if the key value changed, verify no other
-        // row already has this value.
         if (index.is_unique) {
-          // SQL standard: NULL != NULL — skip dup check if any key part is NULL.
           const KEY &ki = table->key_info[index.index_id];
           bool has_null = false;
           for (uint p = 0; p < ki.user_defined_key_parts; ++p) {
@@ -535,6 +511,7 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
             if (f->is_null_in_record(new_data)) { has_null = true; break; }
           }
           if (!has_null) {
+            const uint sec_key_field_len = ki.key_length;
             auto unique_prefix = encode_unique_sec_key(table, new_data, table_id_,
                                                        index.index_id, index.index_id);
             auto uhi = index_id_upper_bound(table_id_, index.index_id);
@@ -544,7 +521,6 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
             if (uiter && uiter->valid() &&
                 uiter->key_len() >= unique_prefix.size() &&
                 std::memcmp(uiter->key_data(), unique_prefix.data(), unique_prefix.size()) == 0) {
-              // Found a matching unique prefix — check it's not our own row.
               const uint8_t *uk = uiter->key_data();
               size_t uklen = uiter->key_len();
               bool is_self = (uklen >= 7 + sec_key_field_len + pk_bytes_len &&
@@ -558,9 +534,7 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
           }
         }
 
-        if (!old_sec_key.empty()) {
-          txn->buffer_del(old_sec_key.data(), old_sec_key.size());
-        }
+        txn->buffer_del(old_sec_key.data(), old_sec_key.size());
         txn->buffer_put(new_sec_key.data(), new_sec_key.size(), nullptr, 0);
       }
     }
@@ -882,6 +856,16 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
                                             table_id_, static_cast<uint16_t>(active_index));
     }
     if (!merge_index_) { return HA_ERR_GENERIC; }
+
+    if (find_flag == HA_READ_KEY_EXACT) {
+      if (!merge_index_->valid()) { return HA_ERR_KEY_NOT_FOUND; }
+      // Verify the found key actually has the search prefix (sans PK suffix).
+      size_t prefix_len = 7 + actual_packed_len;
+      if (merge_index_->key_len() < prefix_len ||
+          std::memcmp(merge_index_->key_data(), search_key.data(), prefix_len) != 0) {
+        return HA_ERR_KEY_NOT_FOUND;
+      }
+    }
 
     return index_read_current(buf);
   }
