@@ -404,6 +404,15 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   if (meta) {
     for (const auto &index : meta->indexes) {
       if (index.is_unique) {
+        // SQL standard: NULL != NULL — skip dup check if any key part is NULL.
+        const KEY &ki = table->key_info[index.index_id];
+        bool has_null = false;
+        for (uint p = 0; p < ki.user_defined_key_parts; ++p) {
+          Field *f = table->field[ki.key_part[p].fieldnr - 1];
+          if (f->is_null_in_record(buf)) { has_null = true; break; }
+        }
+        if (has_null) continue;
+
         auto unique_prefix = encode_unique_sec_key(table, buf, table_id_, index.index_id, index.index_id);
 
         auto upper = index_id_upper_bound(table_id_, index.index_id);
@@ -518,24 +527,33 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
         // Unique constraint check: if the key value changed, verify no other
         // row already has this value.
         if (index.is_unique) {
-          auto unique_prefix = encode_unique_sec_key(table, new_data, table_id_,
-                                                     index.index_id, index.index_id);
-          auto uhi = index_id_upper_bound(table_id_, index.index_id);
-          auto uiter = txn->iter_index_prefix(unique_prefix.data(), unique_prefix.size(),
-                                              uhi.data(), uhi.size(),
-                                              table_id_, index.index_id);
-          if (uiter && uiter->valid() &&
-              uiter->key_len() >= unique_prefix.size() &&
-              std::memcmp(uiter->key_data(), unique_prefix.data(), unique_prefix.size()) == 0) {
-            // Found a matching unique prefix — check it's not our own row.
-            const uint8_t *uk = uiter->key_data();
-            size_t uklen = uiter->key_len();
-            bool is_self = (uklen >= 7 + sec_key_field_len + pk_bytes_len &&
-                            std::memcmp(uk + 7 + sec_key_field_len,
-                                        pk_bytes, pk_bytes_len) == 0);
-            if (!is_self) {
-              errkey = saved_errkey_ = static_cast<uint>(index.index_id);
-              return HA_ERR_FOUND_DUPP_KEY;
+          // SQL standard: NULL != NULL — skip dup check if any key part is NULL.
+          const KEY &ki = table->key_info[index.index_id];
+          bool has_null = false;
+          for (uint p = 0; p < ki.user_defined_key_parts; ++p) {
+            Field *f = table->field[ki.key_part[p].fieldnr - 1];
+            if (f->is_null_in_record(new_data)) { has_null = true; break; }
+          }
+          if (!has_null) {
+            auto unique_prefix = encode_unique_sec_key(table, new_data, table_id_,
+                                                       index.index_id, index.index_id);
+            auto uhi = index_id_upper_bound(table_id_, index.index_id);
+            auto uiter = txn->iter_index_prefix(unique_prefix.data(), unique_prefix.size(),
+                                                uhi.data(), uhi.size(),
+                                                table_id_, index.index_id);
+            if (uiter && uiter->valid() &&
+                uiter->key_len() >= unique_prefix.size() &&
+                std::memcmp(uiter->key_data(), unique_prefix.data(), unique_prefix.size()) == 0) {
+              // Found a matching unique prefix — check it's not our own row.
+              const uint8_t *uk = uiter->key_data();
+              size_t uklen = uiter->key_len();
+              bool is_self = (uklen >= 7 + sec_key_field_len + pk_bytes_len &&
+                              std::memcmp(uk + 7 + sec_key_field_len,
+                                          pk_bytes, pk_bytes_len) == 0);
+              if (!is_self) {
+                errkey = saved_errkey_ = static_cast<uint>(index.index_id);
+                return HA_ERR_FOUND_DUPP_KEY;
+              }
             }
           }
         }
@@ -658,6 +676,49 @@ int ha_bytecaskdb::rnd_end() {
 }
 
 // ---------------------------------------------------------------------------
+// check() — CHECK TABLE implementation
+// ---------------------------------------------------------------------------
+
+int ha_bytecaskdb::check(THD * /*thd*/, HA_CHECK_OPT * /*check_opt*/) {
+  if (!g_db) return HA_ADMIN_FAILED;
+
+  const TableMeta *meta = catalog_lookup_meta(table_id_);
+  if (!meta || meta->indexes.empty())
+    return HA_ADMIN_OK;
+
+  auto *txn = static_cast<MariaDBTxn *>(
+      thd_get_ha_data(ha_thd(), bytecaskdb_hton));
+  if (!txn) return HA_ADMIN_FAILED;
+
+  int rc = rnd_init(true);
+  if (rc) return HA_ADMIN_FAILED;
+
+  uchar *buf = table->record[0];
+  bool corrupt = false;
+
+  while ((rc = rnd_next(buf)) == 0) {
+    for (const auto &index : meta->indexes) {
+      // Build the full secondary key (including PK suffix) for this row.
+      // For PK-less tables, extract the synthetic rowid from current_row_key_.
+      uint64_t rowid = 0;
+      if (table->s->primary_key == MAX_KEY && current_row_key_.size() >= 13) {
+        rowid = read_be64(current_row_key_.data() + 5);
+      }
+      auto sec_key = encode_sec_key(table, buf, table_id_,
+                                     index.index_id, index.index_id, rowid);
+      if (!txn->exists(sec_key.data(), sec_key.size())) {
+        corrupt = true;
+        break;
+      }
+    }
+    if (corrupt) break;
+  }
+
+  rnd_end();
+  return corrupt ? HA_ADMIN_CORRUPT : HA_ADMIN_OK;
+}
+
+// ---------------------------------------------------------------------------
 // index_init() / index_end()
 // ---------------------------------------------------------------------------
 
@@ -709,6 +770,7 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
       std::memset(search_key.data() + 5 + actual_prefix_len, 0,
                   pk_len - actual_prefix_len);
     }
+    normalize_padspace_pk(search_key.data() + 5, &pk_info);
     make_mem_comparable(search_key.data() + 5, &pk_info, pk_len);
 
     if (find_flag == HA_READ_KEY_EXACT) {

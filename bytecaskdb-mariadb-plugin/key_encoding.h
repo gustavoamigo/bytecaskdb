@@ -105,6 +105,11 @@ std::vector<uint8_t> encode_unique_sec_key(TABLE *table, const uchar *buf,
 #ifndef BYTECASKDB_TESTS
 void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table,
                                uint active_index);
+
+// Normalizes VARCHAR key parts for PAD SPACE collations in PK encoding.
+// Strips trailing 0x20 bytes and updates the 2-byte LE length prefix so that
+// 'a' and 'a ' produce identical encoded keys.
+void normalize_padspace_pk(uint8_t *key_data, const KEY *key_info);
 #endif
 
 // Transforms key_copy() output (native little-endian integers) into a
