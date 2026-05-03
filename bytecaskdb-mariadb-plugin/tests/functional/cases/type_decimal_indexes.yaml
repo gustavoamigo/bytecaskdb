@@ -1,0 +1,112 @@
+# type_decimal_indexes.yaml — DECIMAL/NUMERIC index ordering and range scans
+
+- name: DECIMAL secondary index ordering (signed)
+  setup:
+    - DROP DATABASE IF EXISTS dec1
+    - CREATE DATABASE dec1
+    - >
+      CREATE TABLE dec1.t (pk INT PRIMARY KEY, d DECIMAL(6,2) SIGNED,
+        INDEX idx_d(d)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO dec1.t VALUES
+      (1, -99.99), (2, -1.50), (3, 0.00), (4, 1.50), (5, 99.99)
+  query: SELECT pk, d FROM dec1.t ORDER BY d
+  expected:
+    - ['1', '-99.99']
+    - ['2', '-1.50']
+    - ['3', '0.00']
+    - ['4', '1.50']
+    - ['5', '99.99']
+  teardown:
+    - DROP DATABASE IF EXISTS dec1
+
+- name: DECIMAL PRIMARY KEY ordering
+  setup:
+    - DROP DATABASE IF EXISTS dec2
+    - CREATE DATABASE dec2
+    - >
+      CREATE TABLE dec2.t (d DECIMAL(10,4) PRIMARY KEY, v INT)
+      ENGINE=bytecaskdb
+    - >
+      INSERT INTO dec2.t VALUES
+      (100.0001, 1), (-50.5000, 2), (0.0000, 3), (999.9999, 4), (-999.9999, 5)
+  query: SELECT d, v FROM dec2.t ORDER BY d
+  expected:
+    - ['-999.9999', '5']
+    - ['-50.5000', '2']
+    - ['0.0000', '3']
+    - ['100.0001', '1']
+    - ['999.9999', '4']
+  teardown:
+    - DROP DATABASE IF EXISTS dec2
+
+- name: DECIMAL range scan with WHERE
+  setup:
+    - DROP DATABASE IF EXISTS dec3
+    - CREATE DATABASE dec3
+    - >
+      CREATE TABLE dec3.t (pk INT PRIMARY KEY, d DECIMAL(8,2),
+        INDEX idx_d(d)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO dec3.t VALUES
+      (1, -100.00), (2, -10.00), (3, 0.00), (4, 10.00), (5, 100.00)
+  query: SELECT pk, d FROM dec3.t WHERE d BETWEEN -10.00 AND 10.00 ORDER BY d
+  expected:
+    - ['2', '-10.00']
+    - ['3', '0.00']
+    - ['4', '10.00']
+  teardown:
+    - DROP DATABASE IF EXISTS dec3
+
+- name: DECIMAL UNSIGNED in index
+  setup:
+    - DROP DATABASE IF EXISTS dec4
+    - CREATE DATABASE dec4
+    - >
+      CREATE TABLE dec4.t (pk INT PRIMARY KEY, d DECIMAL(5,2) UNSIGNED,
+        INDEX idx_d(d)) ENGINE=bytecaskdb
+    - INSERT INTO dec4.t VALUES (1, 0.00), (2, 50.50), (3, 999.99)
+  query: SELECT pk, d FROM dec4.t ORDER BY d
+  expected:
+    - ['1', '0.00']
+    - ['2', '50.50']
+    - ['3', '999.99']
+  teardown:
+    - DROP DATABASE IF EXISTS dec4
+
+- name: DECIMAL with NULL in index
+  setup:
+    - DROP DATABASE IF EXISTS dec5
+    - CREATE DATABASE dec5
+    - >
+      CREATE TABLE dec5.t (pk INT PRIMARY KEY, d DECIMAL(6,2),
+        INDEX idx_d(d)) ENGINE=bytecaskdb
+    - INSERT INTO dec5.t VALUES (1, NULL), (2, -1.00), (3, NULL), (4, 1.00)
+  query: SELECT pk, d FROM dec5.t ORDER BY d
+  expected:
+    - ['1', 'NULL']
+    - ['3', 'NULL']
+    - ['2', '-1.00']
+    - ['4', '1.00']
+  teardown:
+    - DROP DATABASE IF EXISTS dec5
+
+- name: NUMERIC composite secondary index
+  setup:
+    - DROP DATABASE IF EXISTS dec6
+    - CREATE DATABASE dec6
+    - >
+      CREATE TABLE dec6.t (pk INT PRIMARY KEY,
+        a DECIMAL(4,1), b DECIMAL(4,1),
+        INDEX idx_ab(a, b)) ENGINE=bytecaskdb
+    - >
+      INSERT INTO dec6.t VALUES
+      (1, 1.0, 9.0), (2, 1.0, 1.0), (3, 9.0, 1.0), (4, -1.0, 5.0)
+  query: SELECT pk, a, b FROM dec6.t ORDER BY a, b
+  expected:
+    - ['4', '-1.0', '5.0']
+    - ['2', '1.0', '1.0']
+    - ['1', '1.0', '9.0']
+    - ['3', '9.0', '1.0']
+  teardown:
+    - DROP DATABASE IF EXISTS dec6

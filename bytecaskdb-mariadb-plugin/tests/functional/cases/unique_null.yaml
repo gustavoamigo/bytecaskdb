@@ -1,0 +1,98 @@
+# unique_null.yaml — NULL handling in UNIQUE indexes
+#
+# SQL standard says multiple NULLs should be allowed in a UNIQUE index
+# (NULL != NULL). ByteCaskDB currently treats NULL as a value for
+# uniqueness checks — this is a KNOWN BUG. These tests document
+# the actual behavior.
+
+- name: "KNOWN BUG: multiple NULLs rejected in UNIQUE index"
+  setup:
+    - DROP DATABASE IF EXISTS un1
+    - CREATE DATABASE un1
+    - >
+      CREATE TABLE un1.t (id INT PRIMARY KEY, v INT, UNIQUE INDEX idx_v(v))
+      ENGINE=bytecaskdb
+    - INSERT INTO un1.t VALUES (1, NULL)
+  steps:
+    - sql: INSERT INTO un1.t VALUES (2, NULL)
+      error: 1062
+  teardown:
+    - DROP DATABASE IF EXISTS un1
+
+- name: UNIQUE index rejects duplicate non-NULL values
+  setup:
+    - DROP DATABASE IF EXISTS un2
+    - CREATE DATABASE un2
+    - >
+      CREATE TABLE un2.t (id INT PRIMARY KEY, v INT, UNIQUE INDEX idx_v(v))
+      ENGINE=bytecaskdb
+    - INSERT INTO un2.t VALUES (1, 10)
+  steps:
+    - sql: INSERT INTO un2.t VALUES (2, 10)
+      error: 1062
+  teardown:
+    - DROP DATABASE IF EXISTS un2
+
+- name: Single NULL allowed in UNIQUE index
+  setup:
+    - DROP DATABASE IF EXISTS un3
+    - CREATE DATABASE un3
+    - >
+      CREATE TABLE un3.t (id INT PRIMARY KEY, v INT, UNIQUE INDEX idx_v(v))
+      ENGINE=bytecaskdb
+    - INSERT INTO un3.t VALUES (1, NULL), (2, 10), (3, 20)
+  query: SELECT id, v FROM un3.t ORDER BY id
+  expected:
+    - ['1', 'NULL']
+    - ['2', '10']
+    - ['3', '20']
+  teardown:
+    - DROP DATABASE IF EXISTS un3
+
+- name: UPDATE to duplicate UNIQUE value is rejected
+  setup:
+    - DROP DATABASE IF EXISTS un5
+    - CREATE DATABASE un5
+    - >
+      CREATE TABLE un5.t (id INT PRIMARY KEY, v INT, UNIQUE INDEX idx_v(v))
+      ENGINE=bytecaskdb
+    - INSERT INTO un5.t VALUES (1, 10), (2, 20)
+  steps:
+    - sql: UPDATE un5.t SET v = 10 WHERE id = 2
+      error: 1062
+    - sql: SELECT id, v FROM un5.t ORDER BY id
+      expected: [['1', '10'], ['2', '20']]
+  teardown:
+    - DROP DATABASE IF EXISTS un5
+
+- name: UPDATE UNIQUE column to itself succeeds
+  setup:
+    - DROP DATABASE IF EXISTS un6
+    - CREATE DATABASE un6
+    - >
+      CREATE TABLE un6.t (id INT PRIMARY KEY, v INT, UNIQUE INDEX idx_v(v))
+      ENGINE=bytecaskdb
+    - INSERT INTO un6.t VALUES (1, 10), (2, 20), (3, 30)
+  steps:
+    - sql: UPDATE un6.t SET v = v
+    - sql: SELECT id, v FROM un6.t ORDER BY id
+      expected: [['1', '10'], ['2', '20'], ['3', '30']]
+  teardown:
+    - DROP DATABASE IF EXISTS un6
+
+- name: Multi-row INSERT fails entirely on UNIQUE violation
+  setup:
+    - DROP DATABASE IF EXISTS un7
+    - CREATE DATABASE un7
+    - >
+      CREATE TABLE un7.t (id INT PRIMARY KEY, v INT NOT NULL, UNIQUE INDEX idx_v(v))
+      ENGINE=bytecaskdb
+    - INSERT INTO un7.t VALUES (1, 10)
+  steps:
+    - sql: >
+        INSERT INTO un7.t VALUES (2, 20), (3, 30), (4, 10), (5, 50)
+      error: 1062
+    - sql: SELECT COUNT(*) FROM un7.t
+      expected: [['1']]
+  teardown:
+    - DROP DATABASE IF EXISTS un7

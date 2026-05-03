@@ -1,0 +1,72 @@
+# autoinc_overflow.yaml — AUTO_INCREMENT overflow and edge cases
+
+- name: TINYINT UNSIGNED AUTO_INCREMENT overflow
+  setup:
+    - DROP DATABASE IF EXISTS aio1
+    - CREATE DATABASE aio1
+    - CREATE TABLE aio1.t (a TINYINT UNSIGNED AUTO_INCREMENT PRIMARY KEY) ENGINE=bytecaskdb
+    - INSERT INTO aio1.t VALUES (254)
+  steps:
+    - sql: INSERT INTO aio1.t VALUES (NULL)
+    - sql: SELECT a FROM aio1.t ORDER BY a
+      expected: [['254'], ['255']]
+    - sql: INSERT INTO aio1.t VALUES (NULL)
+      error: 167
+  teardown:
+    - DROP DATABASE IF EXISTS aio1
+
+- name: BIGINT UNSIGNED AUTO_INCREMENT near max
+  setup:
+    - DROP DATABASE IF EXISTS aio2
+    - CREATE DATABASE aio2
+    - CREATE TABLE aio2.t (a BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, b CHAR(8)) ENGINE=bytecaskdb
+    - INSERT INTO aio2.t VALUES (18446744073709551613, 'a')
+  steps:
+    - sql: INSERT INTO aio2.t VALUES (NULL, 'b')
+    - sql: SELECT a, b FROM aio2.t ORDER BY a
+      expected: [['18446744073709551613', 'a'], ['18446744073709551614', 'b']]
+    - sql: INSERT INTO aio2.t VALUES (NULL, 'c')
+      error: 1467
+  teardown:
+    - DROP DATABASE IF EXISTS aio2
+
+- name: Explicit value beyond current counter resets counter correctly
+  setup:
+    - DROP DATABASE IF EXISTS aio3
+    - CREATE DATABASE aio3
+    - CREATE TABLE aio3.t (a INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, b INT) ENGINE=bytecaskdb
+    - INSERT INTO aio3.t VALUES (100, 1)
+    - INSERT INTO aio3.t VALUES (NULL, 2)
+  query: SELECT a, b FROM aio3.t ORDER BY a
+  expected:
+    - ['100', '1']
+    - ['101', '2']
+  teardown:
+    - DROP DATABASE IF EXISTS aio3
+
+- name: SIGNED TINYINT AUTO_INCREMENT overflow
+  setup:
+    - DROP DATABASE IF EXISTS aio4
+    - CREATE DATABASE aio4
+    - CREATE TABLE aio4.t (a TINYINT SIGNED AUTO_INCREMENT PRIMARY KEY) ENGINE=bytecaskdb
+    - INSERT INTO aio4.t VALUES (126)
+  steps:
+    - sql: INSERT INTO aio4.t VALUES (NULL)
+    - sql: SELECT a FROM aio4.t ORDER BY a
+      expected: [['126'], ['127']]
+    - sql: INSERT INTO aio4.t VALUES (NULL)
+      error: 167
+  teardown:
+    - DROP DATABASE IF EXISTS aio4
+
+- name: AUTO_INCREMENT with DOUBLE column
+  setup:
+    - DROP DATABASE IF EXISTS aio5
+    - CREATE DATABASE aio5
+    - CREATE TABLE aio5.t (a DOUBLE AUTO_INCREMENT PRIMARY KEY, b CHAR(8)) ENGINE=bytecaskdb
+    - INSERT INTO aio5.t VALUES (2177, 'x')
+  query: SELECT a, b FROM aio5.t
+  expected:
+    - ['2177.0', 'x']
+  teardown:
+    - DROP DATABASE IF EXISTS aio5

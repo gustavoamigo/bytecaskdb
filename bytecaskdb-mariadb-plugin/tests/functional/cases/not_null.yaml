@@ -1,0 +1,105 @@
+# not_null.yaml — NOT NULL constraint enforcement edge cases
+
+- name: INSERT NULL into NOT NULL column fails
+  setup:
+    - DROP DATABASE IF EXISTS nn1
+    - CREATE DATABASE nn1
+    - CREATE TABLE nn1.t (a INT PRIMARY KEY, b INT NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: INSERT INTO nn1.t VALUES (1, NULL)
+      error: 1048
+  teardown:
+    - DROP DATABASE IF EXISTS nn1
+
+- name: INSERT explicit NULL into NOT NULL VARCHAR fails
+  setup:
+    - DROP DATABASE IF EXISTS nn2
+    - CREATE DATABASE nn2
+    - CREATE TABLE nn2.t (a INT PRIMARY KEY, b VARCHAR(64) NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: INSERT INTO nn2.t VALUES (1, NULL)
+      error: 1048
+  teardown:
+    - DROP DATABASE IF EXISTS nn2
+
+- name: UPDATE to NULL on NOT NULL column fails
+  setup:
+    - DROP DATABASE IF EXISTS nn3
+    - CREATE DATABASE nn3
+    - CREATE TABLE nn3.t (a INT PRIMARY KEY, b INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO nn3.t VALUES (1, 10)
+  steps:
+    - sql: UPDATE nn3.t SET b = NULL WHERE a = 1
+      error: 1048
+    - sql: SELECT a, b FROM nn3.t
+      expected: [['1', '10']]
+  teardown:
+    - DROP DATABASE IF EXISTS nn3
+
+- name: NOT NULL with DEFAULT value works
+  setup:
+    - DROP DATABASE IF EXISTS nn4
+    - CREATE DATABASE nn4
+    - >
+      CREATE TABLE nn4.t (a INT PRIMARY KEY, b INT NOT NULL DEFAULT 42)
+      ENGINE=bytecaskdb
+    - INSERT INTO nn4.t (a) VALUES (1)
+  query: SELECT a, b FROM nn4.t
+  expected:
+    - ['1', '42']
+  teardown:
+    - DROP DATABASE IF EXISTS nn4
+
+- name: Multiple NOT NULL columns mixed with nullable
+  setup:
+    - DROP DATABASE IF EXISTS nn5
+    - CREATE DATABASE nn5
+    - >
+      CREATE TABLE nn5.t (a INT PRIMARY KEY, b INT NOT NULL, c INT, d VARCHAR(32) NOT NULL)
+      ENGINE=bytecaskdb
+    - INSERT INTO nn5.t VALUES (1, 10, NULL, 'hello')
+  query: SELECT a, b, c, d FROM nn5.t
+  expected:
+    - ['1', '10', 'NULL', 'hello']
+  teardown:
+    - DROP DATABASE IF EXISTS nn5
+
+- name: Multi-row INSERT fails entirely when one row violates NOT NULL
+  setup:
+    - DROP DATABASE IF EXISTS nn6
+    - CREATE DATABASE nn6
+    - CREATE TABLE nn6.t (a INT PRIMARY KEY, b INT NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: INSERT INTO nn6.t VALUES (1, 10), (2, NULL), (3, 30)
+      error: 1048
+    - sql: SELECT COUNT(*) FROM nn6.t
+      expected: [['0']]
+  teardown:
+    - DROP DATABASE IF EXISTS nn6
+
+- name: NOT NULL on all common types
+  setup:
+    - DROP DATABASE IF EXISTS nn7
+    - CREATE DATABASE nn7
+    - >
+      CREATE TABLE nn7.t (
+        pk INT PRIMARY KEY,
+        ti TINYINT NOT NULL,
+        si SMALLINT NOT NULL,
+        mi MEDIUMINT NOT NULL,
+        bi BIGINT NOT NULL,
+        f FLOAT NOT NULL,
+        d DOUBLE NOT NULL,
+        dc DECIMAL(10,2) NOT NULL,
+        dt DATE NOT NULL,
+        c CHAR(8) NOT NULL,
+        vc VARCHAR(64) NOT NULL
+      ) ENGINE=bytecaskdb
+    - >
+      INSERT INTO nn7.t VALUES
+      (1, 1, 2, 3, 4, 1.5, 2.5, 3.50, '2024-01-01', 'abc', 'def')
+  query: SELECT pk, ti, si, mi, bi, f, d, dc, dt, c, vc FROM nn7.t
+  expected:
+    - ['1', '1', '2', '3', '4', '1.5', '2.5', '3.50', '2024-01-01', 'abc', 'def']
+  teardown:
+    - DROP DATABASE IF EXISTS nn7
