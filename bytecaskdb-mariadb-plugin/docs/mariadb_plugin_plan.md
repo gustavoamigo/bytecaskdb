@@ -406,14 +406,14 @@ Everything below is **deferred** until the engine is CRUD-complete and
 transaction-correct. The plan reserves the hooks so landing them
 later is additive.
 
-H.1 — Vacuum:
+H.1 — Vacuum: **Done**
 
-- Background thread launched in `bytecaskdb_init()`.
-- Tunable via plugin system variables
-  (`bytecaskdb_vacuum_interval_seconds`,
-  `bytecaskdb_vacuum_min_dead_ratio`).
-- Calls `DB::vacuum()` repeatedly; exits on plugin shutdown.
-- Status variable `bytecaskdb_last_vacuum_ms`, `_files_reclaimed`.
+- Background thread launched in `bytecaskdb_init()`, joined in `bytecaskdb_deinit()`.
+- Calls `DB::vacuum()` in a loop; 500 ms between passes when reclaiming,
+  30 s when idle. Shutdown is immediate via condition variable.
+- Exceptions are logged and the loop retries on the next cycle.
+- Future: expose intervals as plugin system variables; add status variables
+  (`bytecaskdb_last_vacuum_ms`, `_files_reclaimed`).
 
 H.2 — Resume from degraded:
 

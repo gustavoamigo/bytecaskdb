@@ -313,7 +313,7 @@ See `SMOKE_TEST.md` for the end-to-end MariaDB test procedure.
 | E | Secondary indexes (write + read path) | Done |
 | F | Isolation levels (RC, RR, Serializable) | Partial |
 | G | `del_range`-backed DDL (O(1) DROP TABLE) | Done |
-| H | Vacuum, resume, replication hooks, backup | Not started |
+| H | Vacuum, resume, replication hooks, backup | Partial (H.1 done) |
 
 ### Feature matrix
 

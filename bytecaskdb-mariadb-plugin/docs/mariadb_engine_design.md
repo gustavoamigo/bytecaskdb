@@ -233,7 +233,7 @@ What ByteCaskDB currently has vs. what the MariaDB integration needs:
 | WAL / write-ahead log | ByteCaskDB's append-only data files with CRC + atomic batch markers provide crash recovery. No separate WAL needed. |
 | MVCC versioning | `snapshot()` + `apply_batch()` provide snapshot isolation via the SWMR model. No per-row version chain needed — ByteCaskDB's `EngineState` snapshot IS the MVCC mechanism. |
 | Per-key locking | OCC via `apply_batch()` replaces pessimistic locking. Conflicts return `false` → `HA_ERR_LOCK_DEADLOCK`. |
-| Background compaction | Vacuum is caller-driven. MariaDB plugin can run it periodically via a background thread. |
+| Background compaction | Vacuum is caller-driven. The plugin runs a background thread (launched at init, stopped at deinit) that calls `DB::vacuum()` in a loop — 500 ms between passes when reclaiming, 30 s when idle. |
 
 ---
 
