@@ -56,6 +56,10 @@ bytecaskdb-mariadb-plugin/mtr-var/
 bytecaskdb-mariadb-plugin/mtr-results.txt
 bytecaskdb-mariadb-plugin/tests/mtr/**/*.result~
 
+# Sysbench output (regenerated on each run)
+.mariadb_sysbench_*
+bytecaskdb-mariadb-plugin/tests/sysbench_results.csv
+
 .notes
 
 # Claude Code local state
