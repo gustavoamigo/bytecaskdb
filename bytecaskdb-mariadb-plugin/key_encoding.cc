@@ -89,7 +89,7 @@ uint pk_suffix_length(TABLE *table) {
 }
 
 void decode_pk(TABLE *table, const uint8_t *key, std::size_t key_len,
-               uchar *buf) {
+               uchar *buf, std::vector<uint8_t> &scratch) {
   const uint pk_idx = table->s->primary_key;
   if (pk_idx == MAX_KEY || key_len <= 5) {
     return;
@@ -97,11 +97,11 @@ void decode_pk(TABLE *table, const uint8_t *key, std::size_t key_len,
   // Strip the 1-byte namespace + 4-byte table_id prefix before key_restore().
   // Must undo mem-comparable encoding first since key_restore expects native format.
   uint pk_len = static_cast<uint>(key_len - 5);
-  std::vector<uint8_t> tmp(key + 5, key + key_len);
+  scratch.assign(key + 5, key + key_len);
 #ifndef BYTECASKDB_TESTS
-  undo_mem_comparable(tmp.data(), &table->key_info[pk_idx], pk_len);
+  undo_mem_comparable(scratch.data(), &table->key_info[pk_idx], pk_len);
 #endif
-  key_restore(buf, tmp.data(), &table->key_info[pk_idx], pk_len);
+  key_restore(buf, scratch.data(), &table->key_info[pk_idx], pk_len);
 }
 
 std::vector<uint8_t> table_id_prefix(uint32_t table_id) {
@@ -241,17 +241,17 @@ std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
   return key;
 }
 
-std::vector<uint8_t> extract_pk_from_sec_key(const uint8_t *sec_key,
-                                              std::size_t sec_key_len,
-                                              uint sec_key_packed_len) {
+const uint8_t *extract_pk_from_sec_key(const uint8_t *sec_key,
+                                        std::size_t sec_key_len,
+                                        uint sec_key_packed_len,
+                                        std::size_t *pk_len_out) {
   if (sec_key_len <= 7 + sec_key_packed_len) {
-    return {};
+    *pk_len_out = 0;
+    return nullptr;
   }
 
-  const uint8_t *pk_start = sec_key + 7 + sec_key_packed_len;
-  std::size_t pk_len = sec_key_len - 7 - sec_key_packed_len;
-
-  return std::vector<uint8_t>(pk_start, pk_start + pk_len);
+  *pk_len_out = sec_key_len - 7 - sec_key_packed_len;
+  return sec_key + 7 + sec_key_packed_len;
 }
 
 std::vector<uint8_t> index_id_prefix(uint32_t table_id, uint16_t index_id) {

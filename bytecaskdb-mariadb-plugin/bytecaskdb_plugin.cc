@@ -139,6 +139,10 @@ uint64_t catalog_peek_autoinc(uint32_t table_id) {
   return autoinc_counter_for(table_id).load();
 }
 
+std::atomic<uint64_t> *catalog_autoinc_ptr(uint32_t table_id) {
+  return &autoinc_counter_for(table_id);
+}
+
 void catalog_seed_autoinc(uint32_t table_id, uint64_t high_water) {
   auto &c = autoinc_counter_for(table_id);
   uint64_t expected = c.load();
@@ -177,6 +181,10 @@ static std::atomic<int64_t> &row_count_for(uint32_t table_id) {
 
 int64_t catalog_row_count(uint32_t table_id) {
   return row_count_for(table_id).load();
+}
+
+std::atomic<int64_t> *catalog_row_count_ptr(uint32_t table_id) {
+  return &row_count_for(table_id);
 }
 
 void catalog_row_count_add(uint32_t table_id, int64_t delta) {
