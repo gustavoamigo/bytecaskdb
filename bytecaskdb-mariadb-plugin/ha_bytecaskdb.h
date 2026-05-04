@@ -150,7 +150,8 @@ public:
            HA_NULL_IN_KEY |
            HA_CAN_INDEX_BLOBS |
            HA_AUTO_PART_KEY |
-           HA_CAN_VIRTUAL_COLUMNS;
+           HA_CAN_VIRTUAL_COLUMNS |
+           HA_PRIMARY_KEY_IN_READ_INDEX;
   }
 
   const char *index_type(uint) override { return "BYTECASK"; }
@@ -169,6 +170,8 @@ public:
 
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type) override;
+
+  int extra(enum ha_extra_function operation) override;
 
   int check(THD *thd, HA_CHECK_OPT *check_opt) override;
 
@@ -228,6 +231,15 @@ private:
   // Reused across secondary-index row lookups to avoid per-row allocation.
   std::vector<uint8_t> sec_row_key_buf_;
 
+  // Per-handler encode buffers reused across write_row / update_row calls.
+  std::vector<uint8_t> encode_pk_buf_;
+  std::vector<uint8_t> encode_new_pk_buf_;          // update_row only
+  std::vector<uint8_t> encode_row_buf_;
+  std::vector<uint8_t> encode_sec_key_buf_;         // write_row
+  std::vector<uint8_t> encode_unique_sec_key_buf_;  // write_row + update_row
+  std::vector<uint8_t> encode_old_sec_key_buf_;     // update_row
+  std::vector<uint8_t> encode_new_sec_key_buf_;     // update_row
+
   // Saved across write_row → get_dup_key → info(HA_STATUS_ERRKEY) round-trip.
   uint saved_errkey_{0};
 
@@ -244,6 +256,11 @@ private:
 
   // Cached txn pointer, set at external_lock and valid until unlock.
   MariaDBTxn *txn_cached_ = nullptr;
+
+  // Set by HA_EXTRA_KEYREAD / cleared by HA_EXTRA_NO_KEYREAD. When true and
+  // the active index is a covering one whose key parts are decodable, the
+  // index path skips the secondary→PK row fetch.
+  bool keyread_only_ = false;
 
   static void write_table_id_prefix(uint8_t *buf4, uint32_t table_id);
 };

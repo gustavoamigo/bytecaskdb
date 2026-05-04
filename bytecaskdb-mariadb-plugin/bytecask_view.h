@@ -44,4 +44,14 @@ inline const uint8_t *u8_data(bytecask::BytesView v) {
   return reinterpret_cast<const uint8_t *>(v.data());
 }
 
+inline void assign_bytes(bytecask::Bytes &dst, const uint8_t *p, std::size_t n) {
+  dst.assign(reinterpret_cast<const std::byte *>(p),
+             reinterpret_cast<const std::byte *>(p + n));
+}
+
+inline void assign_bytes(bytecask::Bytes &dst, const std::vector<uint8_t> &src) {
+  dst.assign(reinterpret_cast<const std::byte *>(src.data()),
+             reinterpret_cast<const std::byte *>(src.data() + src.size()));
+}
+
 }  // namespace bytecaskdb

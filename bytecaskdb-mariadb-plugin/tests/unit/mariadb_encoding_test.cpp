@@ -610,6 +610,80 @@ TEST_CASE("extract_pk_from_sec_key validation", "[key_encoding]") {
   }
 }
 
+// =========================================================================
+// _into variants — buffer-reuse API
+// =========================================================================
+
+TEST_CASE("encode_row_into matches encode_row", "[row_encoding]") {
+  TABLE_SHARE share{};
+  share.reclength = 8;
+  TABLE tbl{};
+  tbl.s = &share;
+
+  uchar row[8] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80};
+
+  SECTION("equivalent output") {
+    auto returned = encode_row(&tbl, row, 7);
+    std::vector<uint8_t> into;
+    encode_row_into(into, &tbl, row, 7);
+    REQUIRE(into == returned);
+  }
+
+  SECTION("clear+append semantics — pre-populated buffer is overwritten") {
+    std::vector<uint8_t> into(64, 0xCC);
+    auto cap_before = into.capacity();
+    encode_row_into(into, &tbl, row, 7);
+    auto returned = encode_row(&tbl, row, 7);
+    REQUIRE(into == returned);
+    REQUIRE(into.capacity() >= cap_before);
+  }
+
+  SECTION("repeated reuse across rows") {
+    std::vector<uint8_t> into;
+    encode_row_into(into, &tbl, row, 7);
+    auto cap_after_first = into.capacity();
+
+    uchar row2[8] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11};
+    encode_row_into(into, &tbl, row2, 9);
+    REQUIRE(into == encode_row(&tbl, row2, 9));
+    REQUIRE(into.capacity() >= cap_after_first);
+  }
+}
+
+TEST_CASE("encode_pk_into matches encode_pk (PK-less synthetic rowid)",
+          "[key_encoding]") {
+  // PK-less path is exercisable from stubs: pk_idx == MAX_KEY → 8-byte rowid.
+  TABLE_SHARE share{};
+  share.primary_key = MAX_KEY;
+  TABLE tbl{};
+  tbl.s = &share;
+  uchar buf[1] = {0};
+
+  SECTION("equivalent output") {
+    auto returned = encode_pk(&tbl, buf, 42, 0xDEADBEEFCAFEBABEULL);
+    std::vector<uint8_t> into;
+    encode_pk_into(into, &tbl, buf, 42, 0xDEADBEEFCAFEBABEULL);
+    REQUIRE(into == returned);
+  }
+
+  SECTION("clear+append — pre-populated junk overwritten") {
+    std::vector<uint8_t> into(32, 0xAB);
+    auto cap_before = into.capacity();
+    encode_pk_into(into, &tbl, buf, 42, 1);
+    REQUIRE(into == encode_pk(&tbl, buf, 42, 1));
+    REQUIRE(into.capacity() >= cap_before);
+  }
+
+  SECTION("repeated reuse across rows") {
+    std::vector<uint8_t> into;
+    encode_pk_into(into, &tbl, buf, 42, 1);
+    auto cap_after_first = into.capacity();
+    encode_pk_into(into, &tbl, buf, 42, 999);
+    REQUIRE(into == encode_pk(&tbl, buf, 42, 999));
+    REQUIRE(into.capacity() >= cap_after_first);
+  }
+}
+
 TEST_CASE("schema v2 index metadata", "[catalog]") {
   SECTION("index metadata serialization") {
     TableMeta meta;

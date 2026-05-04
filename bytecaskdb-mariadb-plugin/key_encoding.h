@@ -32,8 +32,12 @@ namespace bytecaskdb {
 // For tables without a PRIMARY KEY (table->s->primary_key == MAX_KEY), the
 // caller supplies an 8-byte synthetic rowid which is appended big-endian
 // after the table_id prefix. Result is exactly 13 bytes for PK-less tables.
-//
-// Returns the encoded key as a byte vector.
+
+// Hot-path overload: writes encoded bytes into `out`, reusing capacity.
+void encode_pk_into(std::vector<uint8_t> &out, TABLE *table, const uchar *buf,
+                    uint32_t table_id, uint64_t synthetic_rowid = 0);
+
+// Returning overload: thin wrapper for non-hot callers/tests.
 std::vector<uint8_t> encode_pk(TABLE *table, const uchar *buf,
                                 uint32_t table_id,
                                 uint64_t synthetic_rowid = 0);
@@ -64,6 +68,11 @@ std::vector<uint8_t> table_id_upper_bound(uint32_t table_id);
 //
 // For PK-less tables, the caller supplies an 8-byte synthetic rowid which is
 // appended big-endian in place of the packed PK suffix.
+void encode_sec_key_into(std::vector<uint8_t> &out, TABLE *table, const uchar *buf,
+                          uint32_t table_id, uint16_t index_id,
+                          uint active_index,
+                          uint64_t synthetic_rowid = 0);
+
 std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
                                      uint32_t table_id, uint16_t index_id,
                                      uint active_index,
@@ -98,6 +107,11 @@ bool key_belongs_to_index(const uint8_t *key, std::size_t len,
 
 // Encodes a unique secondary index key for duplicate checking.
 // Format: [0x03 | table_id(BE,4) | index_id(BE,2) | sec_key] (no PK suffix)
+void encode_unique_sec_key_into(std::vector<uint8_t> &out,
+                                 TABLE *table, const uchar *buf,
+                                 uint32_t table_id, uint16_t index_id,
+                                 uint active_index);
+
 std::vector<uint8_t> encode_unique_sec_key(TABLE *table, const uchar *buf,
                                             uint32_t table_id, uint16_t index_id,
                                             uint active_index);
@@ -128,6 +142,20 @@ void make_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len);
 // Reverses make_mem_comparable(): restores native little-endian format from
 // the mem-comparable encoding. Must be called before key_restore().
 void undo_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len);
+
+// Decodes the key parts of `sec_key` directly into `record` for the columns
+// covered by `key_info`. Used to short-circuit the secondary→PK row fetch
+// when the optimizer signals HA_EXTRA_KEYREAD.
+//
+// Returns true on success. Returns false if any key part is of a type the
+// decoder does not (yet) handle (VARCHAR, BLOB, CHAR, nullable parts) — the
+// caller must fall back to the full row fetch in that case.
+//
+// Initial scope: non-null fixed-width integers (signed + unsigned), floats,
+// and temporal types whose mem-comparable transform is fully reversible.
+bool decode_sec_key_into_record(TABLE *table, const KEY *key_info,
+                                 const uint8_t *sec_key, std::size_t sec_key_len,
+                                 uchar *record);
 #endif
 
 } // namespace bytecaskdb

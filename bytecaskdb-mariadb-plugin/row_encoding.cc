@@ -17,8 +17,8 @@ static constexpr uint8_t kRowFormatV1 = 0x01;
 // Envelope size: 1 byte format + 2 bytes schema_version.
 static constexpr std::size_t kEnvelopeSize = 3;
 
-std::vector<uint8_t> encode_row(TABLE *table, const uchar *buf,
-                                uint16_t schema_version) {
+void encode_row_into(std::vector<uint8_t> &out, TABLE *table, const uchar *buf,
+                     uint16_t schema_version) {
   const std::size_t len = table->s->reclength;
 
   // First pass: compute total BLOB data size.
@@ -33,7 +33,8 @@ std::vector<uint8_t> encode_row(TABLE *table, const uchar *buf,
     }
   }
 
-  std::vector<uint8_t> out(kEnvelopeSize + len + blob_total);
+  out.clear();
+  out.resize(kEnvelopeSize + len + blob_total);
 
   // Envelope.
   out[0] = kRowFormatV1;
@@ -62,7 +63,12 @@ std::vector<uint8_t> encode_row(TABLE *table, const uchar *buf,
       blob_dst += blob_len;
     }
   }
+}
 
+std::vector<uint8_t> encode_row(TABLE *table, const uchar *buf,
+                                uint16_t schema_version) {
+  std::vector<uint8_t> out;
+  encode_row_into(out, table, buf, schema_version);
   return out;
 }
 
