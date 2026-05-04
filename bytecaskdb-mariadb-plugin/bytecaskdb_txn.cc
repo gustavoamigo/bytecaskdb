@@ -10,6 +10,7 @@
 #include "handler.h"
 #include "mysql/plugin.h"
 #include "sql_priv.h"
+#include "mysqld_error.h"
 
 #include <cassert>
 #include <cstring>
@@ -264,7 +265,11 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
     bool committed = db_->apply_batch(bytecask::WriteOptions{.sync = true},
                                       std::move(plan));
     reset();
-    return committed ? 0 : HA_ERR_LOCK_DEADLOCK;
+    if (!committed) {
+      my_error(ER_LOCK_DEADLOCK, MYF(0));
+      return HA_ERR_LOCK_DEADLOCK;
+    }
+    return 0;
   } catch (const std::exception &e) {
     fprintf(stderr, "[bytecaskdb] commit failed: %s\n", e.what());
     reset();

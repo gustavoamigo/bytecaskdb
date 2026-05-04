@@ -112,7 +112,7 @@ def test_ww_conflict(make_connection):
                     cur.execute("COMMIT")
                     successes.append(True)
                 except pymysql.err.OperationalError as e:
-                    if e.args[0] == 1180:
+                    if e.args[0] in (1180, 1213):
                         conflicts.append(True)
                         cur.execute("ROLLBACK")
                     else:
@@ -132,7 +132,7 @@ def test_ww_conflict(make_connection):
 
     assert not other_errors, f"Unexpected errors: {other_errors}"
     assert len(successes) == 1, f"Expected 1 success, got {len(successes)}"
-    assert len(conflicts) == 1, f"Expected 1 conflict (1180), got {len(conflicts)}"
+    assert len(conflicts) == 1, f"Expected 1 conflict (1213), got {len(conflicts)}"
 
 
 # ---------------------------------------------------------------------------
