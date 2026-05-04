@@ -17,11 +17,24 @@
 #include "row_encoding.h"
 #include "bytecaskdb_txn.h"
 
+#undef WITH_WSREP
+#include <mysql/server/private/sql_class.h>
+#include <mysql/server/private/sql_alter.h>
+#include <mysql/service_thd_alloc.h>
+#include <private/service_versions.h>
+
 #include <cassert>
 #include <cstring>
 #include <exception>
 #include <utility>
 #include <vector>
+
+extern "C" {
+struct thd_alloc_service_st *thd_alloc_service =
+    reinterpret_cast<struct thd_alloc_service_st *>(VERSION_thd_alloc);
+struct my_print_error_service_st *my_print_error_service =
+    reinterpret_cast<struct my_print_error_service_st *>(VERSION_my_print_error);
+}
 
 namespace bytecaskdb {
 
@@ -96,7 +109,7 @@ int ha_bytecaskdb::create(const char *name, TABLE *table_arg,
   // Build TableMeta from the TABLE structure.
   TableMeta meta;
   meta.table_id       = tid;
-  meta.schema_version = 2;  // v2 includes secondary index support
+  meta.schema_version = 2;  // may be upgraded to 3 if FKs present
   meta.full_name      = normalize_table_name(name);
   meta.reclength      = static_cast<uint16_t>(table_arg->s->reclength);
   meta.null_bytes     = static_cast<uint16_t>(table_arg->s->null_bytes);
@@ -136,6 +149,38 @@ int ha_bytecaskdb::create(const char *name, TABLE *table_arg,
 
     meta.indexes.push_back(std::move(idx_meta));
   }
+
+  // Extract FK constraints from create_info->alter_info->key_list (covers
+  // both CREATE TABLE ... FOREIGN KEY and copy-ALTER ADD FOREIGN KEY).
+  // Must use create_info->alter_info (not thd->lex->alter_info) because
+  // mysql_prepare_alter_table() merges existing FKs into a local copy.
+  Alter_info *alter_info = create_info->alter_info;
+  if (alter_info && alter_info->key_list.elements) {
+    List_iterator<Key> key_it(alter_info->key_list);
+    Key *k;
+    while ((k = key_it++)) {
+      if (k->type != Key::FOREIGN_KEY) continue;
+      auto *fk = static_cast<Foreign_key *>(k);
+      FKMeta fk_meta;
+      fk_meta.name.assign(fk->constraint_name.str, fk->constraint_name.length);
+      fk_meta.ref_db.assign(fk->ref_db.str, fk->ref_db.length);
+      fk_meta.ref_table.assign(fk->ref_table.str, fk->ref_table.length);
+      List_iterator<Key_part_spec> col_it(fk->columns);
+      Key_part_spec *col;
+      while ((col = col_it++)) {
+        fk_meta.fk_cols.emplace_back(col->field_name.str, col->field_name.length);
+      }
+      List_iterator<Key_part_spec> ref_it(fk->ref_columns);
+      Key_part_spec *ref_col;
+      while ((ref_col = ref_it++)) {
+        fk_meta.ref_cols.emplace_back(ref_col->field_name.str, ref_col->field_name.length);
+      }
+      fk_meta.update_opt = static_cast<uint8_t>(fk->update_opt);
+      fk_meta.delete_opt = static_cast<uint8_t>(fk->delete_opt);
+      meta.fks.push_back(std::move(fk_meta));
+    }
+  }
+  meta.schema_version = meta.fks.empty() ? 2 : 3;
 
   if (!catalog_put_table_meta(g_db, meta, name)) {
     return HA_ERR_GENERIC;
@@ -1140,6 +1185,169 @@ ha_rows ha_bytecaskdb::records_in_range(uint /*index*/, const key_range */*min_k
 
 void ha_bytecaskdb::save_current_row_key(const uint8_t *data, std::size_t len) {
   current_row_key_.assign(data, data + len);
+}
+
+// ---------------------------------------------------------------------------
+// check_if_supported_inplace_alter() — DROP FK and column rename are inplace
+// ---------------------------------------------------------------------------
+
+enum_alter_inplace_result ha_bytecaskdb::check_if_supported_inplace_alter(
+    TABLE * /*altered_table*/, Alter_inplace_info *ha_alter_info) {
+  const ulonglong dominated =
+      ALTER_DROP_FOREIGN_KEY | ALTER_COLUMN_NAME;
+  if (ha_alter_info->handler_flags & dominated) {
+    return HA_ALTER_INPLACE_NO_LOCK;
+  }
+  return HA_ALTER_INPLACE_NOT_SUPPORTED;
+}
+
+// ---------------------------------------------------------------------------
+// inplace_alter_table() — DROP FK / column rename: update catalog
+// ---------------------------------------------------------------------------
+
+bool ha_bytecaskdb::inplace_alter_table(TABLE * /*altered_table*/,
+                                         Alter_inplace_info *ha_alter_info) {
+  if (!g_db) { return true; }
+
+  const TableMeta *meta = catalog_lookup_meta(table_id_);
+  if (!meta) { return false; }
+
+  bool has_drop_fk = (ha_alter_info->handler_flags & ALTER_DROP_FOREIGN_KEY) != 0;
+  bool has_rename  = (ha_alter_info->handler_flags & ALTER_COLUMN_NAME) != 0;
+
+  if (meta->fks.empty() && !has_drop_fk) {
+    return false;
+  }
+
+  TableMeta updated = *meta;
+  pre_alter_fks_ = updated.fks;
+
+  // Handle DROP FOREIGN KEY
+  if (has_drop_fk) {
+    List_iterator<Alter_drop> it(ha_alter_info->alter_info->drop_list);
+    Alter_drop *drop;
+    while ((drop = it++)) {
+      if (drop->type != Alter_drop::FOREIGN_KEY) continue;
+      const char *drop_name = drop->name;
+      bool found = false;
+      for (auto fk_it = updated.fks.begin(); fk_it != updated.fks.end(); ++fk_it) {
+        if (my_strcasecmp(system_charset_info, fk_it->name.c_str(), drop_name) == 0) {
+          updated.fks.erase(fk_it);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        my_error(ER_CANT_DROP_FIELD_OR_KEY, MYF(0), drop_name);
+        return true;
+      }
+    }
+  }
+
+  // Handle column renames — update FK column references
+  if (has_rename) {
+    List_iterator<Create_field> field_it(ha_alter_info->alter_info->create_list);
+    Create_field *cf;
+    while ((cf = field_it++)) {
+      if (!cf->field) continue;
+      if (my_strcasecmp(system_charset_info,
+                        cf->field->field_name.str, cf->field_name.str) == 0)
+        continue;
+      for (auto &fk : updated.fks) {
+        for (auto &col : fk.fk_cols) {
+          if (my_strcasecmp(system_charset_info,
+                            col.c_str(), cf->field->field_name.str) == 0) {
+            col.assign(cf->field_name.str, cf->field_name.length);
+          }
+        }
+      }
+    }
+  }
+
+  updated.schema_version = updated.fks.empty() ? 2 : 3;
+
+  const char *table_name = table->s->normalized_path.str;
+  if (!catalog_put_table_meta(g_db, updated, table_name)) {
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// commit_inplace_alter_table() — rollback restores pre-ALTER FK list
+// ---------------------------------------------------------------------------
+
+bool ha_bytecaskdb::commit_inplace_alter_table(TABLE * /*altered_table*/,
+                                                Alter_inplace_info * /*ha_alter_info*/,
+                                                bool commit) {
+  if (commit) {
+    pre_alter_fks_.clear();
+    return false;
+  }
+
+  // Rollback: restore the original FK list.
+  const TableMeta *meta = catalog_lookup_meta(table_id_);
+  if (!meta) { return true; }
+
+  TableMeta restored = *meta;
+  restored.fks = std::move(pre_alter_fks_);
+  restored.schema_version = restored.fks.empty() ? 2 : 3;
+
+  const char *table_name = table->s->normalized_path.str;
+  if (!catalog_put_table_meta(g_db, restored, table_name)) {
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// get_foreign_key_list() — expose FK metadata for DROP FK resolution
+// ---------------------------------------------------------------------------
+
+int ha_bytecaskdb::get_foreign_key_list(THD *thd,
+                                         List<FOREIGN_KEY_INFO> *f_key_list) {
+  const TableMeta *meta = catalog_lookup_meta(table_id_);
+  if (!meta) { return 0; }
+
+  for (const auto &fk : meta->fks) {
+    auto *fk_info = static_cast<FOREIGN_KEY_INFO *>(
+        thd_alloc(thd, sizeof(FOREIGN_KEY_INFO)));
+    new (fk_info) FOREIGN_KEY_INFO();
+
+    fk_info->foreign_id = thd_make_lex_string(thd, nullptr,
+                                               fk.name.c_str(),
+                                               fk.name.length(), 1);
+    fk_info->foreign_db = thd_make_lex_string(thd, nullptr,
+                                               table->s->db.str,
+                                               table->s->db.length, 1);
+    fk_info->foreign_table = thd_make_lex_string(thd, nullptr,
+                                                  table->s->table_name.str,
+                                                  table->s->table_name.length, 1);
+    fk_info->referenced_db = thd_make_lex_string(thd, nullptr,
+                                                  fk.ref_db.c_str(),
+                                                  fk.ref_db.length(), 1);
+    fk_info->referenced_table = thd_make_lex_string(thd, nullptr,
+                                                     fk.ref_table.c_str(),
+                                                     fk.ref_table.length(), 1);
+    fk_info->referenced_key_name = thd_make_lex_string(thd, nullptr,
+                                                        "PRIMARY", 7, 1);
+    fk_info->update_method = static_cast<enum_fk_option>(fk.update_opt);
+    fk_info->delete_method = static_cast<enum_fk_option>(fk.delete_opt);
+
+    for (const auto &col : fk.fk_cols) {
+      LEX_CSTRING *col_name = thd_make_lex_string(thd, nullptr,
+                                                   col.c_str(), col.length(), 1);
+      fk_info->foreign_fields.push_back(col_name);
+    }
+    for (const auto &col : fk.ref_cols) {
+      LEX_CSTRING *col_name = thd_make_lex_string(thd, nullptr,
+                                                   col.c_str(), col.length(), 1);
+      fk_info->referenced_fields.push_back(col_name);
+    }
+
+    f_key_list->push_back(fk_info);
+  }
+  return 0;
 }
 
 } // namespace bytecaskdb

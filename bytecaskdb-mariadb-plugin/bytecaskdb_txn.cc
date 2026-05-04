@@ -216,32 +216,31 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
     return 0;
   }
 
-  // Build WritePlan from snapshot + replay ops in insertion order.
-  bytecask::WritePlan plan{std::move(*snap_)};
-  snap_.reset();
-
-  for (const auto &op : ops_) {
-    switch (op.kind) {
-    case Op::Put:
-      plan.put(as_view(op.key), as_view(op.val));
-      break;
-    case Op::Del:
-      plan.del(as_view(op.key));
-      break;
-    }
-  }
-
-  bool committed = false;
   try {
-    committed = db_->apply_batch(bytecask::WriteOptions{.sync = true},
-                                 std::move(plan));
-  } catch (...) {
+    // Build WritePlan from snapshot + replay ops in insertion order.
+    bytecask::WritePlan plan{std::move(*snap_)};
+    snap_.reset();
+
+    for (const auto &op : ops_) {
+      switch (op.kind) {
+      case Op::Put:
+        plan.put(as_view(op.key), as_view(op.val));
+        break;
+      case Op::Del:
+        plan.del(as_view(op.key));
+        break;
+      }
+    }
+
+    bool committed = db_->apply_batch(bytecask::WriteOptions{.sync = true},
+                                      std::move(plan));
+    reset();
+    return committed ? 0 : HA_ERR_LOCK_DEADLOCK;
+  } catch (const std::exception &e) {
+    fprintf(stderr, "[bytecaskdb] commit failed: %s\n", e.what());
     reset();
     return HA_ERR_INTERNAL_ERROR;
   }
-
-  reset();
-  return committed ? 0 : HA_ERR_LOCK_DEADLOCK;
 }
 
 void MariaDBTxn::rollback(THD * /*thd*/, bool all) {

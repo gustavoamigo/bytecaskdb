@@ -16,10 +16,9 @@
 
 #include "bytecask.hpp"
 #include "bytecaskdb_txn.h"
+#include "catalog.h"
 
 namespace bytecaskdb {
-
-struct TableMeta;
 
 // ---------------------------------------------------------------------------
 // Global state — shared across all tables on this server instance.
@@ -158,12 +157,33 @@ public:
                            const key_range *max_key, page_range *pages) override;
 
   uint max_supported_key_length() const override { return MAX_KEY_LENGTH; }
+  uint max_supported_key_part_length() const override { return 3072; }
   uint max_supported_keys() const override { return MAX_KEY; }
 
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type) override;
 
   int check(THD *thd, HA_CHECK_OPT *check_opt) override;
+
+  // -------------------------------------------------------------------
+  // Inplace ALTER support (DROP FOREIGN KEY)
+  // -------------------------------------------------------------------
+
+  enum_alter_inplace_result check_if_supported_inplace_alter(
+      TABLE *altered_table,
+      Alter_inplace_info *ha_alter_info) override;
+  bool inplace_alter_table(TABLE *altered_table,
+                           Alter_inplace_info *ha_alter_info) override;
+  bool commit_inplace_alter_table(TABLE *altered_table,
+                                  Alter_inplace_info *ha_alter_info,
+                                  bool commit) override;
+
+  // -------------------------------------------------------------------
+  // FK metadata exposure
+  // -------------------------------------------------------------------
+
+  int get_foreign_key_list(THD *thd,
+                           List<FOREIGN_KEY_INFO> *f_key_list) override;
 
 private:
   // Saves `current_row_key_` from a slice the iterator gave us.
@@ -194,6 +214,9 @@ private:
 
   // Saved across write_row → get_dup_key → info(HA_STATUS_ERRKEY) round-trip.
   uint saved_errkey_{0};
+
+  // Snapshot of FK list before inplace ALTER, for rollback.
+  std::vector<FKMeta> pre_alter_fks_;
 
   // Row value buffer kept alive for BLOB pointer lifetime.
   // decode_row sets BLOB field pointers into this buffer.

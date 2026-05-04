@@ -87,6 +87,16 @@ struct IndexMeta {
   std::vector<uint16_t> column_indexes;   // fieldnr for each key part
 };
 
+struct FKMeta {
+  std::string name;
+  std::string ref_db;
+  std::string ref_table;
+  std::vector<std::string> fk_cols;
+  std::vector<std::string> ref_cols;
+  uint8_t update_opt{0};
+  uint8_t delete_opt{0};
+};
+
 struct TableMeta {
   uint32_t    table_id;
   uint32_t    schema_version;
@@ -95,7 +105,8 @@ struct TableMeta {
   uint16_t    null_bytes;
   uint32_t    pk_parts;
   std::vector<ColumnMeta> columns;
-  std::vector<IndexMeta> indexes;         // non-PK secondary indexes
+  std::vector<IndexMeta>  indexes;        // non-PK secondary indexes
+  std::vector<FKMeta>     fks;            // FK constraint names (DDL lifecycle only)
 };
 
 // Serializes a TableMeta into a byte vector (all little-endian).
