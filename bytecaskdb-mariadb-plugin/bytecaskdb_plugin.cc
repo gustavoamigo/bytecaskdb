@@ -378,7 +378,7 @@ static handler *bytecaskdb_create_handler(handlerton *hton,
 }
 
 // ---------------------------------------------------------------------------
-// Handlerton callbacks — commit / rollback / close_connection
+// Handlerton callbacks — commit / rollback / savepoints / close_connection
 // ---------------------------------------------------------------------------
 
 static int bytecaskdb_commit(handlerton *hton, THD *thd, bool all) {
@@ -391,6 +391,27 @@ static int bytecaskdb_rollback(handlerton *hton, THD *thd, bool all) {
   auto *txn = static_cast<MariaDBTxn *>(thd_get_ha_data(thd, hton));
   if (!txn) { return 0; }
   txn->rollback(thd, all);
+  return 0;
+}
+
+static int bytecaskdb_savepoint_set(handlerton *hton, THD *thd, void *sv) {
+  auto *txn = static_cast<MariaDBTxn *>(thd_get_ha_data(thd, hton));
+  if (!txn) { return 0; }
+  txn->savepoint_set(sv);
+  return 0;
+}
+
+static int bytecaskdb_savepoint_rollback(handlerton *hton, THD *thd, void *sv) {
+  auto *txn = static_cast<MariaDBTxn *>(thd_get_ha_data(thd, hton));
+  if (!txn) { return 0; }
+  txn->savepoint_rollback(sv);
+  return 0;
+}
+
+static int bytecaskdb_savepoint_release(handlerton *hton, THD *thd, void *sv) {
+  auto *txn = static_cast<MariaDBTxn *>(thd_get_ha_data(thd, hton));
+  if (!txn) { return 0; }
+  txn->savepoint_release(sv);
   return 0;
 }
 
@@ -455,6 +476,10 @@ static int bytecaskdb_init(void *p) {
   hton->start_consistent_snapshot = bytecaskdb_start_consistent_snapshot;
   hton->show_status              = bytecaskdb_show_status;
   hton->flags                    = HTON_SUPPORTS_FOREIGN_KEYS;
+  hton->savepoint_offset         = sizeof(uint32_t);
+  hton->savepoint_set            = bytecaskdb_savepoint_set;
+  hton->savepoint_rollback       = bytecaskdb_savepoint_rollback;
+  hton->savepoint_release        = bytecaskdb_savepoint_release;
 
   // Open the global database inside MariaDB's data directory.
   std::string db_path = std::string(mysql_real_data_home) + "bytecaskdb";

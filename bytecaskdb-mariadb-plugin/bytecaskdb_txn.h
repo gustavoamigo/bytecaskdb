@@ -187,13 +187,17 @@ public:
       uint32_t table_id, uint16_t index_id);
 
   // -------------------------------------------------------------------
-  // Commit / rollback
+  // Commit / rollback / savepoints
   // -------------------------------------------------------------------
 
   // Returns 0 on success, HA_ERR_LOCK_DEADLOCK on conflict,
   // HA_ERR_INTERNAL_ERROR on engine error.
   int commit(THD *thd, bool all);
   void rollback(THD *thd, bool all);
+
+  void savepoint_set(void *sv);
+  void savepoint_rollback(void *sv);
+  void savepoint_release(void *sv);
 
 private:
   void reset();
