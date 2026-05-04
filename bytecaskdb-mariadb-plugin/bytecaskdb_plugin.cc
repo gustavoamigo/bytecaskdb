@@ -435,6 +435,12 @@ const TableMeta *catalog_lookup_meta(uint32_t table_id) {
   return nullptr;
 }
 
+} // namespace bytecaskdb
+
+#ifndef PLUGIN_TESTING
+
+namespace bytecaskdb {
+
 // ---------------------------------------------------------------------------
 // Handler factory — called by MariaDB for every open/create
 // ---------------------------------------------------------------------------
@@ -668,3 +674,5 @@ maria_declare_plugin(ha_bytecaskdb) {
     "0.2",            // version string
     MariaDB_PLUGIN_MATURITY_GAMMA,
 } maria_declare_plugin_end;
+
+#endif // !PLUGIN_TESTING

@@ -102,12 +102,14 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn basic lifecycle", "[txn][lifecyc
   }
 
   SECTION("becomes active after begin_if_needed") {
-    // Mock THD and handlerton for begin_if_needed
+    // Simulate multi-statement mode (BEGIN or non-autocommit).
+    g_stub_thd_options = OPTION_BEGIN;
     THD thd{};
     handlerton hton{};
 
     txn->begin_if_needed(&thd, &hton);
     REQUIRE(txn->is_active());
+    g_stub_thd_options = 0;
   }
 }
 
@@ -342,8 +344,7 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn edge cases", "[txn][edge]") {
     REQUIRE(result == 1);  // Found
     REQUIRE(out_val.size() == 0);
 
-    if (out_val) {
-    }
+    (void)out_val;
   }
 
   SECTION("overwrite same key multiple times") {

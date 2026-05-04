@@ -103,6 +103,11 @@ public:
     }
     size_t value_len() const { return cur_val_.size(); }
 
+    // Swap buffers with caller — preserves capacity across rows, avoiding
+    // per-row heap allocations in steady state.
+    void swap_value(bytecask::Bytes &other) { cur_val_.swap(other); }
+    void swap_key(std::vector<uint8_t> &other) { cur_key_.swap(other); }
+
     // Moves cur_val_ out — caller takes ownership. Iterator value is left empty.
     bytecask::Bytes steal_value() { return std::move(cur_val_); }
 
@@ -207,8 +212,13 @@ public:
   void savepoint_rollback(void *sv);
   void savepoint_release(void *sv);
 
+  // Row count tracking — called by write_row/delete_row to record the
+  // delta so it can be reverted on rollback or commit failure.
+  void track_row_count_delta(uint32_t table_id, int64_t delta);
+
 private:
   void reset();
+  void revert_row_count_deltas();
 
   bytecask::DB *db_;
   std::optional<bytecask::Snapshot> snap_;
@@ -218,6 +228,10 @@ private:
 
   // RYOW overlay — fast lookups by key.  nullopt = tombstone.
   LookupMap lookup_;
+
+  // Per-table row count deltas accumulated during this transaction.
+  // Reverted on rollback or commit failure.
+  std::map<uint32_t, int64_t> row_count_deltas_;
 
   bool registered_stmt_{false};
   bool registered_all_{false};
