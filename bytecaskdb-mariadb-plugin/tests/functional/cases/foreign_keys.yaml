@@ -1,0 +1,124 @@
+# foreign_keys.yaml — FK metadata tracking (DDL lifecycle only, no enforcement)
+#
+# ByteCaskDB stores FK constraint names so that DROP FOREIGN KEY can find them.
+# These tests verify the ADD → DROP round-trip works and that dropping a
+# non-existent constraint fails correctly (error 1091).
+
+- name: ALTER TABLE ADD FOREIGN KEY then DROP FOREIGN KEY succeeds
+  setup:
+    - DROP DATABASE IF EXISTS fk1
+    - CREATE DATABASE fk1
+    - >
+      CREATE TABLE fk1.parent (id INT PRIMARY KEY) ENGINE=bytecaskdb
+    - >
+      CREATE TABLE fk1.child (id INT PRIMARY KEY, parent_id INT NOT NULL)
+      ENGINE=bytecaskdb
+  steps:
+    - sql: >
+        ALTER TABLE fk1.child ADD CONSTRAINT fk_child_parent
+        FOREIGN KEY (parent_id) REFERENCES fk1.parent(id)
+    - sql: ALTER TABLE fk1.child DROP FOREIGN KEY fk_child_parent
+    - sql: SELECT COUNT(*) FROM fk1.child
+      expected: [['0']]
+  teardown:
+    - DROP DATABASE IF EXISTS fk1
+
+- name: CREATE TABLE with inline FOREIGN KEY then DROP FOREIGN KEY succeeds
+  setup:
+    - DROP DATABASE IF EXISTS fk2
+    - CREATE DATABASE fk2
+    - >
+      CREATE TABLE fk2.parent (id INT PRIMARY KEY) ENGINE=bytecaskdb
+    - >
+      CREATE TABLE fk2.child (
+        id INT PRIMARY KEY,
+        parent_id INT NOT NULL,
+        CONSTRAINT fk_inline_parent FOREIGN KEY (parent_id) REFERENCES fk2.parent(id)
+      ) ENGINE=bytecaskdb
+  steps:
+    - sql: ALTER TABLE fk2.child DROP FOREIGN KEY fk_inline_parent
+    - sql: SELECT COUNT(*) FROM fk2.child
+      expected: [['0']]
+  teardown:
+    - DROP DATABASE IF EXISTS fk2
+
+- name: DROP FOREIGN KEY on non-existent constraint fails with error 1091
+  setup:
+    - DROP DATABASE IF EXISTS fk3
+    - CREATE DATABASE fk3
+    - >
+      CREATE TABLE fk3.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: ALTER TABLE fk3.t DROP FOREIGN KEY fk_does_not_exist
+      error: 1091
+  teardown:
+    - DROP DATABASE IF EXISTS fk3
+
+- name: ADD FOREIGN KEY, DROP it, then DROP again fails with error 1091
+  setup:
+    - DROP DATABASE IF EXISTS fk4
+    - CREATE DATABASE fk4
+    - >
+      CREATE TABLE fk4.parent (id INT PRIMARY KEY) ENGINE=bytecaskdb
+    - >
+      CREATE TABLE fk4.child (id INT PRIMARY KEY, parent_id INT NOT NULL)
+      ENGINE=bytecaskdb
+  steps:
+    - sql: >
+        ALTER TABLE fk4.child ADD CONSTRAINT fk_roundtrip
+        FOREIGN KEY (parent_id) REFERENCES fk4.parent(id)
+    - sql: ALTER TABLE fk4.child DROP FOREIGN KEY fk_roundtrip
+    - sql: ALTER TABLE fk4.child DROP FOREIGN KEY fk_roundtrip
+      error: 1091
+  teardown:
+    - DROP DATABASE IF EXISTS fk4
+
+- name: Renaming an FK column via ALTER TABLE CHANGE succeeds inplace
+  setup:
+    - DROP DATABASE IF EXISTS fk6
+    - CREATE DATABASE fk6
+    - >
+      CREATE TABLE fk6.parent (id INT PRIMARY KEY) ENGINE=bytecaskdb
+    - >
+      CREATE TABLE fk6.child (
+        id INT PRIMARY KEY,
+        parent_id INT NOT NULL,
+        CONSTRAINT fk_rename_test FOREIGN KEY (parent_id) REFERENCES fk6.parent(id)
+      ) ENGINE=bytecaskdb
+  steps:
+    - sql: ALTER TABLE fk6.child CHANGE parent_id owner_id INT NOT NULL
+    - sql: >
+        SELECT CONSTRAINT_NAME, COLUMN_NAME
+        FROM information_schema.KEY_COLUMN_USAGE
+        WHERE TABLE_SCHEMA='fk6' AND TABLE_NAME='child'
+          AND REFERENCED_TABLE_NAME IS NOT NULL
+      expected: [['fk_rename_test', 'owner_id']]
+    - sql: ALTER TABLE fk6.child DROP FOREIGN KEY fk_rename_test
+  teardown:
+    - DROP DATABASE IF EXISTS fk6
+
+- name: Multiple FK constraints can be added and dropped independently
+  setup:
+    - DROP DATABASE IF EXISTS fk5
+    - CREATE DATABASE fk5
+    - >
+      CREATE TABLE fk5.a (id INT PRIMARY KEY) ENGINE=bytecaskdb
+    - >
+      CREATE TABLE fk5.b (id INT PRIMARY KEY) ENGINE=bytecaskdb
+    - >
+      CREATE TABLE fk5.child (
+        id INT PRIMARY KEY,
+        a_id INT NOT NULL,
+        b_id INT NOT NULL
+      ) ENGINE=bytecaskdb
+  steps:
+    - sql: >
+        ALTER TABLE fk5.child ADD CONSTRAINT fk_to_a
+        FOREIGN KEY (a_id) REFERENCES fk5.a(id)
+    - sql: >
+        ALTER TABLE fk5.child ADD CONSTRAINT fk_to_b
+        FOREIGN KEY (b_id) REFERENCES fk5.b(id)
+    - sql: ALTER TABLE fk5.child DROP FOREIGN KEY fk_to_a
+    - sql: ALTER TABLE fk5.child DROP FOREIGN KEY fk_to_b
+  teardown:
+    - DROP DATABASE IF EXISTS fk5

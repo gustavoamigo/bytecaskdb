@@ -454,7 +454,7 @@ static int bytecaskdb_init(void *p) {
   hton->close_connection         = bytecaskdb_close_connection;
   hton->start_consistent_snapshot = bytecaskdb_start_consistent_snapshot;
   hton->show_status              = bytecaskdb_show_status;
-  hton->flags                    = HTON_NO_FLAGS;
+  hton->flags                    = HTON_SUPPORTS_FOREIGN_KEYS;
 
   // Open the global database inside MariaDB's data directory.
   std::string db_path = std::string(mysql_real_data_home) + "bytecaskdb";
@@ -462,6 +462,7 @@ static int bytecaskdb_init(void *p) {
   bytecask::Options opts;
   opts.recovery_threads = 4;
   opts.max_value_bytes = 16 * 1024 * 1024;  // MEDIUMBLOB (16 MiB)
+  opts.max_key_bytes = 8192;  // secondary index key + PK suffix can exceed 4096
 
   try {
     g_db_owner = std::make_unique<DBHolder>(db_path, opts);

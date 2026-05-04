@@ -154,6 +154,7 @@ target_compile_options(ha_bytecaskdb PRIVATE
   # symbols (_db_my_assert etc.) are absent from the server binary.  Compile
   # the plugin with the same flag so the macros collapse to no-ops.
   -DDBUG_OFF
+  -DDISABLE_DTRACE
   # MariaDB headers trigger some pedantic warnings; suppress known noise.
   -Wno-unused-parameter
   -Wno-missing-field-initializers

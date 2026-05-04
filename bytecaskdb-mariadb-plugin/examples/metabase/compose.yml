@@ -1,0 +1,44 @@
+name: bytecaskdb-metabase
+
+services:
+  db:
+    build:
+      context: ../../..
+      dockerfile: bytecaskdb-mariadb-plugin/Dockerfile
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpassword
+      MARIADB_DATABASE: analytics
+      MARIADB_USER: metabase
+      MARIADB_PASSWORD: metabase
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./mariadb.cnf:/etc/mysql/conf.d/bytecaskdb-metabase.cnf:z
+      - ./init:/docker-entrypoint-initdb.d:z
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect"]
+      start_period: 30s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  metabase:
+    image: docker.io/metabase/metabase:latest
+    ports:
+      - "3000:3000"
+    environment:
+      # Metabase's own application database — stored on ByteCaskDB
+      MB_DB_TYPE: mysql
+      MB_DB_HOST: db
+      MB_DB_PORT: 3306
+      MB_DB_DBNAME: metabase_app
+      MB_DB_USER: metabase
+      MB_DB_PASS: metabase
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - metabase_data:/metabase-data
+
+volumes:
+  db_data:
+  metabase_data:
