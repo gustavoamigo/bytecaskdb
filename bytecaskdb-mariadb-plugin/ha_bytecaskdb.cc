@@ -17,11 +17,13 @@
 #include "row_encoding.h"
 #include "bytecaskdb_txn.h"
 
+#ifndef PLUGIN_TESTING
 #undef WITH_WSREP
 #include <mysql/server/private/sql_class.h>
 #include <mysql/server/private/sql_alter.h>
 #include <mysql/service_thd_alloc.h>
 #include <private/service_versions.h>
+#endif
 
 #include <cassert>
 #include <cstring>
@@ -29,12 +31,20 @@
 #include <utility>
 #include <vector>
 
+#ifdef BYTECASK_TESTING
+#include "fault_injector.h"
+#else
+#define FAULT_INJECTION(name) ((void)0)
+#endif
+
+#ifndef PLUGIN_TESTING
 extern "C" {
 struct thd_alloc_service_st *thd_alloc_service =
     reinterpret_cast<struct thd_alloc_service_st *>(VERSION_thd_alloc);
 struct my_print_error_service_st *my_print_error_service =
     reinterpret_cast<struct my_print_error_service_st *>(VERSION_my_print_error);
 }
+#endif
 
 namespace bytecaskdb {
 
@@ -156,6 +166,7 @@ int ha_bytecaskdb::create(const char *name, TABLE *table_arg,
   // both CREATE TABLE ... FOREIGN KEY and copy-ALTER ADD FOREIGN KEY).
   // Must use create_info->alter_info (not thd->lex->alter_info) because
   // mysql_prepare_alter_table() merges existing FKs into a local copy.
+#ifndef PLUGIN_TESTING
   Alter_info *alter_info = create_info->alter_info;
   if (alter_info && alter_info->key_list.elements) {
     List_iterator<Key> key_it(alter_info->key_list);
@@ -183,6 +194,7 @@ int ha_bytecaskdb::create(const char *name, TABLE *table_arg,
     }
   }
   meta.schema_version = meta.fks.empty() ? 2 : 3;
+#endif
 
   if (!catalog_put_table_meta(g_db, meta, name)) {
     return HA_ERR_GENERIC;
@@ -485,6 +497,8 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   // Buffer primary key operation.
   txn->buffer_put(key.data(), key.size(), val.data(), val.size());
 
+  FAULT_INJECTION("plugin_after_pk_buffer");
+
   // Buffer secondary index operations.
   if (meta) {
     for (const auto &index : meta->indexes) {
@@ -508,7 +522,9 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
     }
   }
 
-  catalog_row_count_add(table_id_, 1);
+  txn->track_row_count_delta(table_id_, 1);
+
+  FAULT_INJECTION("plugin_after_row_count_update");
   return 0;
 }
 // ---------------------------------------------------------------------------
@@ -671,7 +687,7 @@ int ha_bytecaskdb::delete_row(const uchar *buf) {
 
   // Buffer primary key deletion.
   txn->buffer_del(key.data(), key.size());
-  catalog_row_count_add(table_id_, -1);
+  txn->track_row_count_delta(table_id_, -1);
   return 0;
 }
 // ---------------------------------------------------------------------------
@@ -697,19 +713,15 @@ int ha_bytecaskdb::rnd_next(uchar *buf) {
     return HA_ERR_END_OF_FILE;
   }
 
-  // Decode PK from key into record buffer.
   decode_pk(table, merge_scan_->key_data(), merge_scan_->key_len(), buf,
             decode_pk_scratch_);
 
-  // Move value to persistent buffer before advancing (BLOB pointers need it).
-  row_value_buf_ = merge_scan_->steal_value();
+  merge_scan_->swap_value(row_value_buf_);
   decode_row(table,
              reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
              row_value_buf_.size(), buf);
 
-  // Save the on-disk key for any follow-up update_row / delete_row /
-  // position call.
-  save_current_row_key(merge_scan_->key_data(), merge_scan_->key_len());
+  merge_scan_->swap_key(current_row_key_);
 
   merge_scan_->next();
   return 0;
@@ -1089,11 +1101,11 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
     // Primary key access: key is encoded PK, value is row data
     decode_pk(table, merge_index_->key_data(), merge_index_->key_len(), buf,
               decode_pk_scratch_);
-    row_value_buf_ = merge_index_->steal_value();
+    merge_index_->swap_value(row_value_buf_);
     decode_row(table,
                reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
                row_value_buf_.size(), buf);
-    save_current_row_key(merge_index_->key_data(), merge_index_->key_len());
+    merge_index_->swap_key(current_row_key_);
     return 0;
   } else {
     // Secondary index access: two-step lookup
@@ -1236,6 +1248,7 @@ void ha_bytecaskdb::save_current_row_key(const uint8_t *data, std::size_t len) {
 // check_if_supported_inplace_alter() — DROP FK and column rename are inplace
 // ---------------------------------------------------------------------------
 
+#ifndef PLUGIN_TESTING
 enum_alter_inplace_result ha_bytecaskdb::check_if_supported_inplace_alter(
     TABLE * /*altered_table*/, Alter_inplace_info *ha_alter_info) {
   const ulonglong dominated =
@@ -1394,5 +1407,21 @@ int ha_bytecaskdb::get_foreign_key_list(THD *thd,
   }
   return 0;
 }
+#else
+// PLUGIN_TESTING stubs — DDL methods not exercised by proof tests.
+enum_alter_inplace_result ha_bytecaskdb::check_if_supported_inplace_alter(
+    TABLE *, Alter_inplace_info *) {
+  return HA_ALTER_INPLACE_NOT_SUPPORTED;
+}
+bool ha_bytecaskdb::inplace_alter_table(TABLE *, Alter_inplace_info *) {
+  return true;
+}
+bool ha_bytecaskdb::commit_inplace_alter_table(TABLE *, Alter_inplace_info *, bool) {
+  return false;
+}
+int ha_bytecaskdb::get_foreign_key_list(THD *, List<FOREIGN_KEY_INFO> *) {
+  return 0;
+}
+#endif
 
 } // namespace bytecaskdb

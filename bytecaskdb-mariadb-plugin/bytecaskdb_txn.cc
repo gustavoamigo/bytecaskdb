@@ -4,6 +4,7 @@
 // bytecaskdb_txn.cc — MariaDBTxn implementation.
 
 #include "bytecaskdb_txn.h"
+#include "ha_bytecaskdb.h"
 #include "key_encoding.h"
 
 #include "my_global.h"
@@ -264,14 +265,17 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
 
     bool committed = db_->apply_batch(bytecask::WriteOptions{.sync = true},
                                       std::move(plan));
-    reset();
     if (!committed) {
+      revert_row_count_deltas();
+      reset();
       my_error(ER_LOCK_DEADLOCK, MYF(0));
       return HA_ERR_LOCK_DEADLOCK;
     }
+    reset();
     return 0;
   } catch (const std::exception &e) {
     fprintf(stderr, "[bytecaskdb] commit failed: %s\n", e.what());
+    revert_row_count_deltas();
     reset();
     return HA_ERR_INTERNAL_ERROR;
   }
@@ -280,11 +284,13 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
 void MariaDBTxn::rollback(THD * /*thd*/, bool all) {
   if (!all && registered_all_) {
     // Statement rollback within session txn — clear buffer (conservative).
+    revert_row_count_deltas();
     ops_.clear();
     lookup_.clear();
     registered_stmt_ = false;
     return;
   }
+  revert_row_count_deltas();
   reset();
 }
 
@@ -292,8 +298,23 @@ void MariaDBTxn::reset() {
   snap_.reset();
   ops_.clear();
   lookup_.clear();
+  row_count_deltas_.clear();
   registered_stmt_ = false;
   registered_all_ = false;
+}
+
+void MariaDBTxn::track_row_count_delta(uint32_t table_id, int64_t delta) {
+  catalog_row_count_add(table_id, delta);
+  row_count_deltas_[table_id] += delta;
+}
+
+void MariaDBTxn::revert_row_count_deltas() {
+  for (auto &[table_id, delta] : row_count_deltas_) {
+    if (delta != 0) {
+      catalog_row_count_add(table_id, -delta);
+    }
+  }
+  row_count_deltas_.clear();
 }
 
 // ---------------------------------------------------------------------------

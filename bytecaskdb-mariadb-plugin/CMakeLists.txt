@@ -60,6 +60,10 @@ endif()
 # Include directory for the stable C API header.
 set(BYTECASK_INCLUDE_DIR "${BYTECASK_ROOT}/include")
 
+# Location of the testing archive (with BYTECASK_TESTING defined).
+set(BYTECASK_TESTING_LIB
+    "${BYTECASK_ROOT}/build/linux/x86_64/release/libbytecask_testing.a")
+
 # MariaDB include directory.  Try to find it automatically or accept override.
 if(NOT DEFINED MARIADB_INCLUDE_DIR)
   # Try mariadb_config / mysql_config
@@ -245,9 +249,85 @@ target_compile_options(mariadb_plugin_tests PRIVATE
 
 target_link_libraries(mariadb_plugin_tests PRIVATE Catch2::Catch2WithMain)
 
+# ---------------------------------------------------------------------------
+# Transaction tests (linked against ByteCaskDB for real DB access)
+# ---------------------------------------------------------------------------
+
+add_executable(mariadb_txn_tests
+  tests/unit/mariadb_txn_test.cpp
+  bytecaskdb_txn.cc
+  bytecaskdb_plugin.cc
+  catalog.cc
+  key_encoding.cc
+  row_encoding.cc
+)
+
+target_include_directories(mariadb_txn_tests PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit"
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${BYTECASK_INCLUDE_DIR}"
+)
+
+target_compile_options(mariadb_txn_tests PRIVATE
+  -Wall -Wextra
+  -DBYTECASKDB_TESTS
+  -DPLUGIN_TESTING
+)
+
+target_link_libraries(mariadb_txn_tests PRIVATE
+  Catch2::Catch2WithMain
+  bytecask_static
+  "${CRC32C_LIB}"
+)
+
+# ---------------------------------------------------------------------------
+# Proof tests — correctness validation via PluginTestHarness
+# ---------------------------------------------------------------------------
+# These compile ha_bytecaskdb.cc with PLUGIN_TESTING (stub headers) and
+# BYTECASK_TESTING (fault injection checkpoints) against a real bytecask::DB.
+
+file(GLOB PROOF_TEST_SOURCES
+  "${CMAKE_CURRENT_SOURCE_DIR}/tests/proof/prove_*.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tests/proof/generated/prove_*.cpp"
+)
+
+add_executable(mariadb_proof_tests
+  ${PROOF_TEST_SOURCES}
+  tests/proof/harness.cpp
+  ha_bytecaskdb.cc
+  bytecaskdb_plugin.cc
+  bytecaskdb_txn.cc
+  catalog.cc
+  key_encoding.cc
+  row_encoding.cc
+)
+
+target_include_directories(mariadb_proof_tests PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tests/proof"
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${BYTECASK_INCLUDE_DIR}"
+  "${BYTECASK_ROOT}/bytecaskdb"
+)
+
+target_compile_options(mariadb_proof_tests PRIVATE
+  -Wall -Wextra
+  -DPLUGIN_TESTING
+  -DBYTECASK_TESTING
+  -Wno-unused-parameter
+)
+
+target_link_libraries(mariadb_proof_tests PRIVATE
+  Catch2::Catch2WithMain
+  "${BYTECASK_TESTING_LIB}"
+  "${CRC32C_LIB}"
+)
+
 include(CTest)
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 include(Catch)
 catch_discover_tests(mariadb_plugin_tests)
+catch_discover_tests(mariadb_proof_tests)
 
 message(STATUS "Test target: mariadb_plugin_tests")
+message(STATUS "Test target: mariadb_proof_tests")

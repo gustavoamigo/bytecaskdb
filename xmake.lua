@@ -217,6 +217,21 @@ target("bytecask")
         add_release_opts(t)
     end)
 
+-- Testing variant of the bytecask library with BYTECASK_TESTING defined.
+-- Compiles fault injection checkpoints into the library for proof tests.
+-- MIT-licensed — the GPL mariadb_proof_tests target links this as a dependency.
+target("bytecask_testing")
+    set_kind("static")
+    set_default(false)
+    add_cxxflags("-fPIC", {force = true})
+    add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask_c.cpp", "bytecaskdb/bytecask_hpp.cpp")
+    add_packages("crc32c")
+    add_defines("BYTECASK_TESTING")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+    end)
+
 -- Python bindings via nanobind.
 -- Wraps the C++23 module interface directly (not the C API).
 -- Prerequisites: pip install nanobind

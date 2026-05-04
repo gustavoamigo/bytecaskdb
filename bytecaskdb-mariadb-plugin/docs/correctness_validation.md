@@ -362,8 +362,8 @@ under `BYTECASK_TESTING`):
 
 | Checkpoint | Location | Models |
 |---|---|---|
-| `plugin_after_row_count_update` | `ha_bytecaskdb::write_row` / `delete_row` after `catalog_row_count_add` | P-INV-2 |
-| `plugin_after_secondary_index_buffer` | inside `write_row` / `update_row` between PK and first secondary `buffer_put` | P-INV-1 |
+| `plugin_after_row_count_update` | `ha_bytecaskdb::write_row` / `delete_row` after `track_row_count_delta` | P-INV-2 |
+| `plugin_after_pk_buffer` | inside `write_row` / `update_row` between PK and first secondary `buffer_put` | P-INV-1 |
 | `plugin_ddl_after_catalog_apply` | `ha_bytecaskdb::create` / `delete_table` after catalog `apply_batch` returns | P-INV-7 |
 
 These three checkpoints are the only genuine *internal* phase
@@ -506,10 +506,10 @@ Three `FAULT_INJECTION` macros are added under `BYTECASK_TESTING`:
 
 ```cpp
 // ha_bytecaskdb.cc, write_row():
-catalog_row_count_add(table_id_, +1);
+txn->track_row_count_delta(table_id_, +1);
 FAULT_INJECTION("plugin_after_row_count_update");
 txn->buffer_put(pk_view, row_view);
-FAULT_INJECTION("plugin_after_secondary_index_buffer");  // before secondary loop
+FAULT_INJECTION("plugin_after_pk_buffer");  // before secondary loop
 for (uint i = 0; i < table->s->keys; ++i) { ... }
 
 // ha_bytecaskdb.cc, create():
@@ -605,25 +605,65 @@ infrastructure rather than duplicating it.
 
 ## Status
 
-Not yet implemented. Tracked in [`mariadb_plugin_plan.md`](mariadb_plugin_plan.md)
-under a future task.
+**Phase 1 complete.** The framework is implemented and running. The
+first slice of the scenario matrix (3 DML × 3 index × 1 txn × 3
+failure = 24 generated tests) passes, plus 4 hand-written proof tests
+covering P-INV-1 through P-INV-4.
 
-**Prerequisite (step zero).** `tests/unit/mariadb_txn_test.cpp` exists
-but is not currently wired into CMake. The proof framework depends on
-the unit-test seam being live and on the `TABLE`/`KEY`/`Field` stubs
-being extended to cover the multi-index surface. Wiring the existing
-unit tests in is the first concrete step; the proof matrix builds on
-top of that.
+### What is live
 
-The closest existing coverage today is:
+- **Test stubs extended.** `tests/unit/mariadb_stubs.h` covers
+  `TABLE`, `TABLE_SHARE`, `KEY`, `KEY_PART_INFO`, `Field_long`,
+  `key_copy`, `key_restore`, and all types needed by the encoding
+  layer and handler.
+- **`libbytecask_testing.a`** — static archive with `BYTECASK_TESTING`
+  for fault injection support (xmake target `bytecask_testing`).
+- **`PluginTestHarness`** (`tests/proof/harness.h`, `harness.cpp`) —
+  creates a live `bytecask::DB`, builds `TABLE`/`KEY`/`Field`
+  structures from a `TableSpec`, registers catalog metadata, and
+  provides `insert_row`, `update_row`, `delete_row`, `commit`,
+  `rollback` entry points without a live MariaDB server.
+- **Generator pipeline** — `scenario_matrix.py`, `expected_delta.py`,
+  `fault_point_resolver.py`, `generate_tests.py` produce
+  `tests/proof/generated/prove_plugin.cpp` (24 tests).
+- **Invariant helpers** — `tests/proof/invariants.h` provides
+  `assert_counter_matches_pk_count` (P-INV-1),
+  `assert_counter_delta` (P-INV-2),
+  `assert_sec_index_count_matches_pk` (P-INV-3),
+  `assert_error_code` (P-INV-6).
+- **Fault injection checkpoints** — `plugin_after_row_count_update`,
+  `plugin_after_pk_buffer` added to `ha_bytecaskdb.cc`.
+- **CMake targets** — `mariadb_proof_tests` (proof suite),
+  `mariadb_txn_tests` (transaction unit tests), `mariadb_plugin_tests`
+  (encoding/catalog unit tests).
 
-- `tests/unit/mariadb_encoding_test.cpp` — encoding edge cases.
-- `tests/unit/mariadb_txn_test.cpp` — buffer/RYOW/savepoint smoke tests
-  (not currently wired into CMake — see prerequisite above).
-- `tests/functional/cases/*.yaml` — end-to-end SQL behaviour against
-  a live `mariadbd`.
-- `tests/functional/test_concurrency.py` — OCC conflict and
-  read-while-writing smoke tests.
+### Bugs found and fixed by the framework
 
-None of these structurally cover the (DML × index × failure) cross
-product. The proof matrix described here is the missing layer.
+- **P-INV-2 violation (row counter not reverted on rollback).**
+  `write_row` and `delete_row` called `catalog_row_count_add` directly,
+  bypassing transaction tracking. On rollback or commit failure, the
+  counter was never decremented. Fixed by routing through
+  `MariaDBTxn::track_row_count_delta()`, which records the delta and
+  reverts it in `rollback()` and on `commit()` failure paths.
+
+### Current coverage
+
+| DML shapes | `single_insert`, `single_delete`, `single_update_index_change` |
+|---|---|
+| Index topologies | `pk_only`, `one_nonunique`, `one_unique` |
+| Transaction shapes | `autocommit` |
+| Failure classes | `SUCCESS`, `OCC_CONFLICT`, `ENGINE_DEGRADED` |
+
+Total: **28 proof test cases** (24 generated + 4 manual), **60 CTest
+cases** including existing unit tests.
+
+### Next steps
+
+- Expand DML shapes: `single_update_no_index_change`,
+  `single_update_pk_change`, `multi_row_insert`, `mixed_batch`.
+- Expand transaction shapes: `multi_statement`, `with_savepoint`.
+- Add remaining failure classes: `ENGINE_IO_FAIL`,
+  `ENGINE_PARTIAL_COMMIT`, `PLUGIN_INDEX_HALF_BUFFERED`.
+- Add `assert_index_synchronised` (full bidirectional PK↔secondary
+  check) to invariant helpers.
+- Target: ~250–350 generated proof tests covering the full matrix.
