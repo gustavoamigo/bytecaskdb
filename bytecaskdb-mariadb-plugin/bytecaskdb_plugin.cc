@@ -22,6 +22,7 @@
 #include "key_encoding.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -30,6 +31,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 namespace bytecaskdb {
 
@@ -520,6 +522,36 @@ static bool bytecaskdb_show_status(handlerton * /*hton*/, THD *thd,
 }
 
 // ---------------------------------------------------------------------------
+// Background vacuum thread
+// ---------------------------------------------------------------------------
+
+static std::thread             s_vacuum_thread;
+static std::mutex              s_vacuum_mu;
+static std::condition_variable s_vacuum_cv;
+static bool                    s_vacuum_stop = false;
+
+static void vacuum_loop() {
+  static constexpr auto kBusyInterval = std::chrono::milliseconds{500};
+  static constexpr auto kIdleInterval = std::chrono::seconds{30};
+
+  std::unique_lock<std::mutex> lk{s_vacuum_mu};
+  while (!s_vacuum_stop) {
+    bool more_work = false;
+    if (g_db) {
+      lk.unlock();
+      try {
+        more_work = g_db->vacuum();
+      } catch (const std::exception &e) {
+        fprintf(stderr, "[ha_bytecaskdb] vacuum: %s\n", e.what());
+      }
+      lk.lock();
+    }
+    s_vacuum_cv.wait_for(lk, more_work ? kBusyInterval : kIdleInterval,
+                         [] { return s_vacuum_stop; });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin init / deinit
 // ---------------------------------------------------------------------------
 
@@ -565,10 +597,22 @@ static int bytecaskdb_init(void *p) {
 
   fprintf(stderr, "[ha_bytecaskdb] Opened global DB at '%s'\n",
           db_path.c_str());
+
+  s_vacuum_stop = false;
+  s_vacuum_thread = std::thread{vacuum_loop};
+
   return 0;
 }
 
 static int bytecaskdb_deinit(void * /*p*/) {
+  {
+    std::lock_guard<std::mutex> lk{s_vacuum_mu};
+    s_vacuum_stop = true;
+  }
+  s_vacuum_cv.notify_one();
+  if (s_vacuum_thread.joinable())
+    s_vacuum_thread.join();
+
   g_db = nullptr;
   g_db_owner.reset();
   // Clear caches.
