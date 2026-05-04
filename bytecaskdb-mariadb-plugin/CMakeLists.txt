@@ -226,6 +226,7 @@ FetchContent_MakeAvailable(Catch2)
 add_executable(mariadb_plugin_tests
   tests/unit/mariadb_encoding_test.cpp
   tests/unit/mariadb_txn_simple_test.cpp
+  tests/unit/row_count_test.cpp
   catalog.cc
   key_encoding.cc
   row_encoding.cc

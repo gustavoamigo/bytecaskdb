@@ -19,6 +19,7 @@
 #include "catalog.h"
 #include "bytecaskdb_txn.h"
 #include "bytecask_view.h"
+#include "key_encoding.h"
 
 #include <atomic>
 #include <cstdio>
@@ -153,6 +154,42 @@ void catalog_drop_autoinc(uint32_t table_id) {
   s_autoinc_counters.erase(table_id);
 }
 
+// ---------------------------------------------------------------------------
+// Per-table row count counters — seeded at startup, maintained by handler.
+// ---------------------------------------------------------------------------
+
+static std::mutex                                       s_row_count_mu;
+static std::map<uint32_t, std::unique_ptr<std::atomic<int64_t>>>
+                                                        s_row_counts;
+
+static std::atomic<int64_t> &row_count_for(uint32_t table_id) {
+  std::lock_guard<std::mutex> lk{s_row_count_mu};
+  auto it = s_row_counts.find(table_id);
+  if (it == s_row_counts.end()) {
+    auto [ins, _] = s_row_counts.emplace(
+        table_id, std::make_unique<std::atomic<int64_t>>(0));
+    it = ins;
+  }
+  return *it->second;
+}
+
+int64_t catalog_row_count(uint32_t table_id) {
+  return row_count_for(table_id).load();
+}
+
+void catalog_row_count_add(uint32_t table_id, int64_t delta) {
+  row_count_for(table_id).fetch_add(delta);
+}
+
+void catalog_row_count_reset(uint32_t table_id) {
+  row_count_for(table_id).store(0);
+}
+
+void catalog_drop_row_count(uint32_t table_id) {
+  std::lock_guard<std::mutex> lk{s_row_count_mu};
+  s_row_counts.erase(table_id);
+}
+
 // Rebuilds the in-memory caches by scanning the catalog key range. Called
 // once during plugin init.
 static bool catalog_init(bytecask::DB *db) {
@@ -179,6 +216,25 @@ static bool catalog_init(bytecask::DB *db) {
 
   fprintf(stderr, "[ha_bytecaskdb] Catalog loaded: %zu tables\n",
           s_name_to_id.size());
+
+  // Seed per-table row counts by scanning the row namespace for each table.
+  for (auto &[tid, meta] : s_id_to_meta) {
+    auto lo = table_id_prefix(tid);
+    auto hi = table_id_upper_bound(tid);
+    int64_t count = 0;
+    try {
+      for (auto &k : db->keys_from({}, as_view(lo.data(), lo.size()))) {
+        if (k.size() < hi.size() ||
+            std::memcmp(u8_data(k), hi.data(), hi.size()) >= 0) {
+          break;
+        }
+        ++count;
+      }
+    } catch (const std::exception &) {
+    }
+    row_count_for(tid).store(count);
+  }
+
   return true;
 }
 
@@ -267,6 +323,7 @@ bool catalog_delete_table_meta(bytecask::DB *db, const char *name) {
   if (it != s_name_to_id.end()) {
     catalog_drop_rowid(it->second);
     catalog_drop_autoinc(it->second);
+    catalog_drop_row_count(it->second);
     s_id_to_meta.erase(it->second);
     s_name_to_id.erase(it);
   }
@@ -282,6 +339,7 @@ void catalog_evict_from_cache(const char *name) {
   if (it != s_name_to_id.end()) {
     catalog_drop_rowid(it->second);
     catalog_drop_autoinc(it->second);
+    catalog_drop_row_count(it->second);
     s_id_to_meta.erase(it->second);
     s_name_to_id.erase(it);
   }
@@ -526,6 +584,10 @@ static int bytecaskdb_deinit(void * /*p*/) {
   {
     std::lock_guard<std::mutex> lk{s_autoinc_counters_mu};
     s_autoinc_counters.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lk{s_row_count_mu};
+    s_row_counts.clear();
   }
   return 0;
 }

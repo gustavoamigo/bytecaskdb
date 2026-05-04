@@ -21,11 +21,11 @@ namespace bytecaskdb {
 // ---------------------------------------------------------------------------
 
 void MariaDBTxn::begin_if_needed(THD *thd, handlerton *hton) {
-  if (!snap_) {
+  bool multi = thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
+  if (multi && !snap_) {
     snap_.emplace(db_->snapshot());
   }
 
-  bool multi = thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
   if (multi && !registered_all_) {
     trans_register_ha(thd, true, hton, 0);
     registered_all_ = true;
@@ -42,6 +42,10 @@ void MariaDBTxn::begin_if_needed(THD *thd, handlerton *hton) {
 
 void MariaDBTxn::buffer_put(const uint8_t *key, size_t klen,
                             const uint8_t *val, size_t vlen) {
+  if (!snap_) {
+    snap_.emplace(db_->snapshot());
+  }
+
   std::vector<uint8_t> k(key, key + klen);
   std::vector<uint8_t> v;
   if (val && vlen > 0) {
@@ -56,6 +60,10 @@ void MariaDBTxn::buffer_put(const uint8_t *key, size_t klen,
 }
 
 void MariaDBTxn::buffer_del(const uint8_t *key, size_t klen) {
+  if (!snap_) {
+    snap_.emplace(db_->snapshot());
+  }
+
   std::vector<uint8_t> k(key, key + klen);
 
   // Update RYOW overlay: tombstone.
@@ -70,39 +78,44 @@ void MariaDBTxn::buffer_del(const uint8_t *key, size_t klen) {
 // ---------------------------------------------------------------------------
 
 int MariaDBTxn::get(const uint8_t *key, size_t klen, bytecask::Bytes &out) {
-  // Check buffer first.
-  std::vector<uint8_t> k(key, key + klen);
-  auto it = lookup_.find(k);
-  if (it != lookup_.end()) {
-    if (!it->second.has_value()) {
-      // Tombstone — key was deleted in this txn.
-      return 0;
+  if (!lookup_.empty()) {
+    std::vector<uint8_t> k(key, key + klen);
+    auto it = lookup_.find(k);
+    if (it != lookup_.end()) {
+      if (!it->second.has_value()) {
+        return 0;
+      }
+      const auto &val = it->second.value();
+      out.assign(reinterpret_cast<const std::byte *>(val.data()),
+                 reinterpret_cast<const std::byte *>(val.data() + val.size()));
+      return 1;
     }
-    const auto &val = it->second.value();
-    out.assign(reinterpret_cast<const std::byte *>(val.data()),
-               reinterpret_cast<const std::byte *>(val.data() + val.size()));
-    return 1;
   }
 
-  // Fall through to snapshot.
-  if (!snap_) { return -1; }
   try {
-    return snap_->get({}, as_view(key, klen), out) ? 1 : 0;
+    if (snap_) {
+      return snap_->get({}, as_view(key, klen), out) ? 1 : 0;
+    }
+    return db_->get({}, as_view(key, klen), out) ? 1 : 0;
   } catch (...) {
     return -1;
   }
 }
 
 bool MariaDBTxn::exists(const uint8_t *key, size_t klen) {
-  std::vector<uint8_t> k(key, key + klen);
-  auto it = lookup_.find(k);
-  if (it != lookup_.end()) {
-    return it->second.has_value();
+  if (!lookup_.empty()) {
+    std::vector<uint8_t> k(key, key + klen);
+    auto it = lookup_.find(k);
+    if (it != lookup_.end()) {
+      return it->second.has_value();
+    }
   }
 
-  if (!snap_) { return false; }
   try {
-    return snap_->contains_key({}, as_view(key, klen));
+    if (snap_) {
+      return snap_->contains_key({}, as_view(key, klen));
+    }
+    return db_->contains_key({}, as_view(key, klen));
   } catch (...) {
     return false;
   }
@@ -117,6 +130,10 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_prefix(
     const uint8_t *lo, size_t lo_len,
     const uint8_t *hi, size_t hi_len,
     uint32_t table_id) {
+  if (!snap_) {
+    snap_.emplace(db_->snapshot());
+  }
+
   std::optional<bytecask::EntryIterator> snap_it;
   if (snap_) {
     auto range = snap_->iter_from({}, as_view(lo, lo_len));
@@ -135,6 +152,10 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_index_prefix(
     const uint8_t *lo, size_t lo_len,
     const uint8_t *hi, size_t hi_len,
     uint32_t table_id, uint16_t index_id) {
+  if (!snap_) {
+    snap_.emplace(db_->snapshot());
+  }
+
   std::optional<bytecask::EntryIterator> snap_it;
   if (snap_) {
     auto range = snap_->iter_from({}, as_view(lo, lo_len));
@@ -154,6 +175,10 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_index_prefix(
     const uint8_t *hi, size_t hi_len,
     const uint8_t *lo, size_t lo_len,
     uint32_t table_id, uint16_t index_id) {
+  if (!snap_) {
+    snap_.emplace(db_->snapshot());
+  }
+
   std::optional<bytecask::ReverseEntryIterator> snap_it;
   bytecask::ReverseEntryIterator snap_end{};
   if (snap_) {
@@ -179,6 +204,10 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
     const uint8_t *hi, size_t hi_len,
     const uint8_t *lo, size_t lo_len,
     uint32_t table_id) {
+  if (!snap_) {
+    snap_.emplace(db_->snapshot());
+  }
+
   std::optional<bytecask::ReverseEntryIterator> snap_it;
   bytecask::ReverseEntryIterator snap_end{};
   if (snap_) {
