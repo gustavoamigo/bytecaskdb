@@ -105,6 +105,94 @@ modes are necessary but not sufficient.
 
 ---
 
+## Operating Principle — the model is the spec, not the code
+
+**This is the most important rule in this document. Read it before
+touching the framework.**
+
+The reference model in `expected_delta.py` is the **specification** of
+what the plugin must do. The plugin code is the **implementation**.
+When a generated proof test fails, the direction of the fix is fixed:
+
+```
+Test fails  →  the implementation is wrong  →  fix the plugin
+Test fails  →  the model is wrong           →  fix the model only if
+                                                the invariant itself is
+                                                wrong, with explicit
+                                                review and a rationale
+                                                in the commit message
+```
+
+The direction is **never**:
+
+```
+Test fails  →  the test is inconvenient  →  relax the assertion
+Test fails  →  the matrix entry is hard  →  add an elimination rule
+Test fails  →  the invariant is annoying →  weaken the invariant
+```
+
+A proof test exists because a defined scenario must satisfy a defined
+invariant. If the implementation cannot satisfy it, the bug is in the
+implementation. If the scenario or the invariant is genuinely wrong,
+that is a *specification change* and must be reviewed as such — never
+as a side effect of making CI green.
+
+### Why this rule exists
+
+The proof matrix is a **ratchet**. Its value comes entirely from the
+fact that it only moves in one direction: forward, or not at all.
+If failing tests can be silenced by edits to the model, the matrix,
+or the elimination rules, the ratchet is broken and the framework is
+worth nothing — it becomes a self-justifying artifact that proves
+"whatever the code currently does."
+
+This is not a hypothetical concern. AI coding assistants
+(Claude Code, Copilot, Cursor, and similar) will reliably attempt to
+"fix" a failing proof test by editing the test, the expected delta, or
+the elimination filter rather than the production code. That behaviour
+must be rejected on sight. **A proof test failure is a signal about
+the plugin, not about the framework.**
+
+### The decision procedure when a proof test fails
+
+1. **Read the failing assertion.** Identify which invariant (P-INV-N)
+   is violated, in which scenario (DML × index × txn × failure).
+2. **Default assumption: the plugin is wrong.** Investigate the
+   production code path under that scenario. Find the bug. Fix it in
+   the plugin.
+3. **If — and only if — the invariant itself is incorrect** (the
+   scenario should not be expected to satisfy it, for a reason that
+   holds independently of the current code), open a separate change
+   that:
+   - Updates this document to explain why the invariant is wrong.
+   - Updates the model and regenerates the tests.
+   - Is reviewed as a specification change, not a test fix.
+4. **If — and only if — the scenario is genuinely impossible** in the
+   plugin's API surface (not "hard to support" — *impossible*), add
+   an elimination rule to `scenario_matrix.py` with a comment
+   explaining the impossibility.
+
+Edits to `expected_delta.py`, the elimination rules, or the invariant
+list that arrive in the same commit as a "fix" for a failing proof
+test should be rejected in code review. They almost always indicate
+the ratchet was bypassed.
+
+### What this rule does not forbid
+
+- **Improving the model.** Adding a new invariant, refining a
+  scenario, tightening an `expected_delta` entry — all welcome,
+  reviewed as specification changes.
+- **Adding new elimination rules for genuine impossibilities.** A
+  shape that the plugin's API cannot represent is correctly
+  eliminated.
+- **Reorganising the generator** without changing the matrix output.
+  Regeneration produces identical `prove_plugin.cpp`.
+
+The forbidden move is exactly one: **changing the spec to match a
+broken implementation.**
+
+---
+
 ## Goal
 
 For every supported (DML shape, index topology, transaction shape) and
