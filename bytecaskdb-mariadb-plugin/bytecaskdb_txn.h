@@ -98,8 +98,13 @@ public:
     // Pointers into internally owned buffers; valid until next().
     const uint8_t *key_data() const { return cur_key_.data(); }
     size_t key_len() const { return cur_key_.size(); }
-    const uint8_t *value_data() const { return cur_val_.data(); }
+    const uint8_t *value_data() const {
+      return reinterpret_cast<const uint8_t *>(cur_val_.data());
+    }
     size_t value_len() const { return cur_val_.size(); }
+
+    // Moves cur_val_ out — caller takes ownership. Iterator value is left empty.
+    bytecask::Bytes steal_value() { return std::move(cur_val_); }
 
   private:
     void advance();
@@ -121,14 +126,17 @@ public:
     uint16_t index_id_{0};        // 0 = primary key (table) iteration
     bool use_index_filter_{false}; // true = use key_belongs_to_index
 
-    // Cached snapshot key/value (owned copies).
-    std::vector<uint8_t> snap_key_;
-    std::vector<uint8_t> snap_val_;
+    // Cached snapshot key/value — points directly into iterator's internal
+    // buffer. Valid until snap_step() is called.
+    const uint8_t *snap_key_ptr_{nullptr};
+    size_t snap_key_len_{0};
+    const uint8_t *snap_val_ptr_{nullptr};
+    size_t snap_val_len_{0};
     bool snap_valid_{false};
 
-    // Current output (owned copies).
+    // Current output.
     std::vector<uint8_t> cur_key_;
-    std::vector<uint8_t> cur_val_;
+    bytecask::Bytes cur_val_;
     bool valid_{false};
   };
 

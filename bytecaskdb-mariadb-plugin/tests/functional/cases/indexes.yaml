@@ -108,3 +108,44 @@
     - [open, banana]
   teardown:
     - DROP DATABASE IF EXISTS idx7
+
+- name: Covered index SELECT (PK + indexed column only)
+  setup:
+    - DROP DATABASE IF EXISTS idxk
+    - CREATE DATABASE idxk
+    - CREATE TABLE idxk.t (id INT PRIMARY KEY, score INT NOT NULL, payload VARCHAR(50)) ENGINE=bytecaskdb
+    - CREATE INDEX idx_score ON idxk.t(score)
+    - INSERT INTO idxk.t VALUES (1,10,'a'),(2,50,'b'),(3,30,'c'),(4,20,'d'),(5,40,'e')
+  query: SELECT id, score FROM idxk.t WHERE score BETWEEN 20 AND 40 ORDER BY score
+  expected:
+    - ['4', '20']
+    - ['3', '30']
+    - ['5', '40']
+  teardown:
+    - DROP DATABASE IF EXISTS idxk
+
+- name: Covered index then non-covered SELECT in same session
+  setup:
+    - DROP DATABASE IF EXISTS idxk2
+    - CREATE DATABASE idxk2
+    - CREATE TABLE idxk2.t (id INT PRIMARY KEY, score INT NOT NULL, payload VARCHAR(50)) ENGINE=bytecaskdb
+    - CREATE INDEX idx_score ON idxk2.t(score)
+    - INSERT INTO idxk2.t VALUES (1,10,'a'),(2,50,'b'),(3,30,'c')
+  query: SELECT id, score, payload FROM idxk2.t WHERE score = 30
+  expected:
+    - ['3', '30', 'c']
+  teardown:
+    - DROP DATABASE IF EXISTS idxk2
+
+- name: Covered index COUNT(*) on indexed range
+  setup:
+    - DROP DATABASE IF EXISTS idxk3
+    - CREATE DATABASE idxk3
+    - CREATE TABLE idxk3.t (id INT PRIMARY KEY, score INT NOT NULL) ENGINE=bytecaskdb
+    - CREATE INDEX idx_score ON idxk3.t(score)
+    - INSERT INTO idxk3.t VALUES (1,10),(2,20),(3,30),(4,40),(5,50)
+  query: SELECT COUNT(*) FROM idxk3.t WHERE score BETWEEN 20 AND 40
+  expected:
+    - ['3']
+  teardown:
+    - DROP DATABASE IF EXISTS idxk3

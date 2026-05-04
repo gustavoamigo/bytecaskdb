@@ -444,9 +444,6 @@ void MariaDBTxn::MergeIterator::load_snap_current() {
     }
   }
 
-  // Forward: stop when key >= hi (bound_).
-  // Reverse: don't enforce the lower bound here (matches pre-migration
-  // behavior; row encoding already prefixes by table id).
   if (!reverse_ && !bound_.empty()) {
     if (klen >= bound_.size() &&
         std::memcmp(kp, bound_.data(), bound_.size()) >= 0) {
@@ -454,9 +451,10 @@ void MariaDBTxn::MergeIterator::load_snap_current() {
     }
   }
 
-  snap_key_.assign(kp, kp + klen);
-  snap_val_.assign(u8_data(kv->second),
-                   u8_data(kv->second) + kv->second.size());
+  snap_key_ptr_ = kp;
+  snap_key_len_ = klen;
+  snap_val_ptr_ = u8_data(kv->second);
+  snap_val_len_ = kv->second.size();
   snap_valid_ = true;
 }
 
@@ -494,7 +492,7 @@ void MariaDBTxn::MergeIterator::advance() {
     if (!snap_valid_ && buf_valid) {
       if (buf_it_->second.has_value()) {
         cur_key_ = buf_it_->first;
-        cur_val_ = buf_it_->second.value();
+        assign_bytes(cur_val_, buf_it_->second.value());
         ++buf_it_;
         valid_ = true;
         return;
@@ -504,8 +502,8 @@ void MariaDBTxn::MergeIterator::advance() {
     }
 
     if (snap_valid_ && !buf_valid) {
-      cur_key_ = snap_key_;
-      cur_val_ = snap_val_;
+      cur_key_.assign(snap_key_ptr_, snap_key_ptr_ + snap_key_len_);
+      assign_bytes(cur_val_, snap_val_ptr_, snap_val_len_);
       snap_step();
       load_snap_current();
       valid_ = true;
@@ -514,14 +512,21 @@ void MariaDBTxn::MergeIterator::advance() {
 
     // Both have data — compare keys.
     const auto &bk = buf_it_->first;
-    int cmp = (bk.size() == snap_key_.size())
-                  ? std::memcmp(bk.data(), snap_key_.data(), bk.size())
-                  : (bk < snap_key_ ? -1 : 1);
+    int cmp;
+    if (bk.size() == snap_key_len_) {
+      cmp = std::memcmp(bk.data(), snap_key_ptr_, bk.size());
+    } else if (bk.size() < snap_key_len_) {
+      cmp = std::memcmp(bk.data(), snap_key_ptr_, bk.size());
+      if (cmp == 0) cmp = -1;
+    } else {
+      cmp = std::memcmp(bk.data(), snap_key_ptr_, snap_key_len_);
+      if (cmp == 0) cmp = 1;
+    }
 
     if (cmp < 0) {
       if (buf_it_->second.has_value()) {
         cur_key_ = bk;
-        cur_val_ = buf_it_->second.value();
+        assign_bytes(cur_val_, buf_it_->second.value());
         ++buf_it_;
         valid_ = true;
         return;
@@ -534,7 +539,7 @@ void MariaDBTxn::MergeIterator::advance() {
       bool has_val = buf_it_->second.has_value();
       if (has_val) {
         cur_key_ = bk;
-        cur_val_ = buf_it_->second.value();
+        assign_bytes(cur_val_, buf_it_->second.value());
       }
       ++buf_it_;
       snap_step();
@@ -547,8 +552,8 @@ void MariaDBTxn::MergeIterator::advance() {
     }
 
     // cmp > 0
-    cur_key_ = snap_key_;
-    cur_val_ = snap_val_;
+    cur_key_.assign(snap_key_ptr_, snap_key_ptr_ + snap_key_len_);
+    assign_bytes(cur_val_, snap_val_ptr_, snap_val_len_);
     snap_step();
     load_snap_current();
     valid_ = true;

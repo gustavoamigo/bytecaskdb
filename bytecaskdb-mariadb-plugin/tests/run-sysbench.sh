@@ -18,11 +18,11 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-TABLE_SIZE=1000000
-THREADS="1,2,4,8"
+TABLE_SIZE=50000
+THREADS="1,8"
 DURATION=30
-WORKLOADS="oltp_point_select oltp_read_only oltp_write_only oltp_insert oltp_read_write"
-#WORKLOADS="oltp_point_select"
+#WORKLOADS="oltp_point_select oltp_read_only oltp_write_only oltp_insert oltp_read_write"
+WORKLOADS="oltp_point_select oltp_insert oltp_read_only oltp_read_write"
 
 BYTECASKDB_PORT=3320
 INNODB_PORT=3321

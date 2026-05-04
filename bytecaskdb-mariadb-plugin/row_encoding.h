@@ -23,6 +23,9 @@ namespace bytecaskdb {
 
 // Encodes the row in `buf` (table->record[0]) into a byte vector.
 // Prepends a 3-byte envelope: [format=0x01][schema_version LE u16].
+void encode_row_into(std::vector<uint8_t> &out, TABLE *table, const uchar *buf,
+                     uint16_t schema_version);
+
 std::vector<uint8_t> encode_row(TABLE *table, const uchar *buf,
                                 uint16_t schema_version);
 

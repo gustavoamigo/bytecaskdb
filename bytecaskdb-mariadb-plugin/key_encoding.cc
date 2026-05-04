@@ -53,31 +53,37 @@ uint64_t read_be64(const uint8_t *p) {
   return v;
 }
 
-std::vector<uint8_t> encode_pk(TABLE *table, const uchar *buf,
-                                uint32_t table_id,
-                                uint64_t synthetic_rowid) {
+void encode_pk_into(std::vector<uint8_t> &out, TABLE *table, const uchar *buf,
+                    uint32_t table_id, uint64_t synthetic_rowid) {
   const uint pk_idx = table->s->primary_key;
   const uint suffix_len = pk_suffix_length(table);
 
-  std::vector<uint8_t> key(5 + suffix_len);
+  out.clear();
+  out.resize(5 + suffix_len);
 
   // Write namespace byte + table_id prefix.
-  key[0] = kNsRow;
-  write_be32(key.data() + 1, table_id);
+  out[0] = kNsRow;
+  write_be32(out.data() + 1, table_id);
 
   if (pk_idx == MAX_KEY) {
-    write_be64(key.data() + 5, synthetic_rowid);
+    write_be64(out.data() + 5, synthetic_rowid);
   } else if (suffix_len > 0) {
-    key_copy(key.data() + 5,
+    key_copy(out.data() + 5,
              const_cast<uchar *>(buf),
              &table->key_info[pk_idx],
              suffix_len);
 #ifndef BYTECASKDB_TESTS
-    normalize_padspace_pk(key.data() + 5, &table->key_info[pk_idx]);
-    make_mem_comparable(key.data() + 5, &table->key_info[pk_idx], suffix_len);
+    normalize_padspace_pk(out.data() + 5, &table->key_info[pk_idx]);
+    make_mem_comparable(out.data() + 5, &table->key_info[pk_idx], suffix_len);
 #endif
   }
+}
 
+std::vector<uint8_t> encode_pk(TABLE *table, const uchar *buf,
+                                uint32_t table_id,
+                                uint64_t synthetic_rowid) {
+  std::vector<uint8_t> key;
+  encode_pk_into(key, table, buf, table_id, synthetic_rowid);
   return key;
 }
 
@@ -194,50 +200,59 @@ void normalize_padspace_pk(uint8_t *key_data, const KEY *key_info) {
 }
 #endif
 
-std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
-                                     uint32_t table_id, uint16_t index_id,
-                                     uint active_index,
-                                     uint64_t synthetic_rowid) {
+void encode_sec_key_into(std::vector<uint8_t> &out, TABLE *table, const uchar *buf,
+                          uint32_t table_id, uint16_t index_id,
+                          uint active_index,
+                          uint64_t synthetic_rowid) {
   const KEY &key_info = table->key_info[active_index];
   const uint sec_key_len = key_info.key_length;
   const uint suffix_len = pk_suffix_length(table);
 
   // Format: [0x03 | table_id(BE,4) | index_id(BE,2) | sec_key | pk-or-rowid]
-  std::vector<uint8_t> key(7 + sec_key_len + suffix_len);
+  out.clear();
+  out.resize(7 + sec_key_len + suffix_len);
 
   // Namespace + table_id + index_id prefix.
-  key[0] = kNsIndex;
-  write_be32(key.data() + 1, table_id);
-  write_be16(key.data() + 5, index_id);
+  out[0] = kNsIndex;
+  write_be32(out.data() + 1, table_id);
+  write_be16(out.data() + 5, index_id);
 
   // Pack secondary key columns, then fix VARCHAR encoding for proper ordering.
-  key_copy(key.data() + 7,
+  key_copy(out.data() + 7,
            const_cast<uchar *>(buf),
            const_cast<KEY *>(&key_info),
            sec_key_len);
 
   // Post-process to fix VARCHAR length prefix issue for lexicographic ordering
 #ifndef BYTECASKDB_TESTS
-  fix_varchar_key_encoding(key.data() + 7, table, active_index);
-  make_mem_comparable(key.data() + 7, &key_info, sec_key_len);
+  fix_varchar_key_encoding(out.data() + 7, table, active_index);
+  make_mem_comparable(out.data() + 7, &key_info, sec_key_len);
 #endif
 
   // Append PK bytes for uniqueness, or synthetic rowid for PK-less tables.
   if (table->s->primary_key == MAX_KEY) {
-    write_be64(key.data() + 7 + sec_key_len, synthetic_rowid);
+    write_be64(out.data() + 7 + sec_key_len, synthetic_rowid);
   } else if (suffix_len > 0) {
-    key_copy(key.data() + 7 + sec_key_len,
+    key_copy(out.data() + 7 + sec_key_len,
              const_cast<uchar *>(buf),
              &table->key_info[table->s->primary_key],
              suffix_len);
 #ifndef BYTECASKDB_TESTS
-    normalize_padspace_pk(key.data() + 7 + sec_key_len,
+    normalize_padspace_pk(out.data() + 7 + sec_key_len,
                           &table->key_info[table->s->primary_key]);
-    make_mem_comparable(key.data() + 7 + sec_key_len,
+    make_mem_comparable(out.data() + 7 + sec_key_len,
                         &table->key_info[table->s->primary_key], suffix_len);
 #endif
   }
+}
 
+std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
+                                     uint32_t table_id, uint16_t index_id,
+                                     uint active_index,
+                                     uint64_t synthetic_rowid) {
+  std::vector<uint8_t> key;
+  encode_sec_key_into(key, table, buf, table_id, index_id, active_index,
+                       synthetic_rowid);
   return key;
 }
 
@@ -283,32 +298,40 @@ bool key_belongs_to_index(const uint8_t *key, std::size_t len,
   return std::memcmp(key + 1, expected_prefix, 6) == 0;
 }
 
-std::vector<uint8_t> encode_unique_sec_key(TABLE *table, const uchar *buf,
-                                            uint32_t table_id, uint16_t index_id,
-                                            uint active_index) {
+void encode_unique_sec_key_into(std::vector<uint8_t> &out,
+                                 TABLE *table, const uchar *buf,
+                                 uint32_t table_id, uint16_t index_id,
+                                 uint active_index) {
   const KEY &key_info = table->key_info[active_index];
   const uint sec_key_len = key_info.key_length;
 
   // Format: [0x03 | table_id(BE,4) | index_id(BE,2) | sec_key] (no PK for uniqueness)
-  std::vector<uint8_t> key(7 + sec_key_len);
+  out.clear();
+  out.resize(7 + sec_key_len);
 
   // Namespace + table_id + index_id prefix.
-  key[0] = kNsIndex;
-  write_be32(key.data() + 1, table_id);
-  write_be16(key.data() + 5, index_id);
+  out[0] = kNsIndex;
+  write_be32(out.data() + 1, table_id);
+  write_be16(out.data() + 5, index_id);
 
   // Pack secondary key columns only.
-  key_copy(key.data() + 7,
+  key_copy(out.data() + 7,
            const_cast<uchar *>(buf),
            const_cast<KEY *>(&key_info),
            sec_key_len);
 
   // Fix VARCHAR encoding to match the format used by encode_sec_key.
 #ifndef BYTECASKDB_TESTS
-  fix_varchar_key_encoding(key.data() + 7, table, active_index);
-  make_mem_comparable(key.data() + 7, &key_info, sec_key_len);
+  fix_varchar_key_encoding(out.data() + 7, table, active_index);
+  make_mem_comparable(out.data() + 7, &key_info, sec_key_len);
 #endif
+}
 
+std::vector<uint8_t> encode_unique_sec_key(TABLE *table, const uchar *buf,
+                                            uint32_t table_id, uint16_t index_id,
+                                            uint active_index) {
+  std::vector<uint8_t> key;
+  encode_unique_sec_key_into(key, table, buf, table_id, index_id, active_index);
   return key;
 }
 
@@ -452,6 +475,65 @@ void undo_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
 
     p += kp.store_length;
   }
+}
+
+bool decode_sec_key_into_record(TABLE *table, const KEY *key_info,
+                                 const uint8_t *sec_key, std::size_t sec_key_len,
+                                 uchar *record) {
+  // Skip the 7-byte [ns | tid | iid] prefix.
+  if (sec_key_len < 7) return false;
+  const uint8_t *p   = sec_key + 7;
+  const uint8_t *end = sec_key + sec_key_len;
+
+  for (uint i = 0; i < key_info->user_defined_key_parts; ++i) {
+    const KEY_PART_INFO &kp = key_info->key_part[i];
+    Field *field = kp.field;
+
+    // Bail on anything that's not a non-null fixed-width type we know how
+    // to reverse cleanly. The caller falls back to the full row fetch.
+    if (kp.null_bit) return false;
+    if (field->type() == MYSQL_TYPE_VARCHAR ||
+        (kp.key_part_flag & HA_BLOB_PART)) {
+      return false;
+    }
+    auto rt = field->real_type();
+    bool is_be_temporal = (rt == MYSQL_TYPE_DATETIME2 ||
+                            rt == MYSQL_TYPE_TIMESTAMP2 ||
+                            rt == MYSQL_TYPE_TIME2);
+    if (!is_be_temporal &&
+        !is_signed_integer_type(rt) &&
+        !is_unsigned_le_fixed_type(rt) &&
+        !is_float_type(rt)) {
+      return false;
+    }
+
+    if (kp.store_length != kp.length) return false;  // unexpected null padding
+    if (p + kp.length > end) return false;
+
+    // Stage the bytes locally so we don't mutate the caller's key buffer.
+    uint8_t tmp[16];
+    if (kp.length > sizeof(tmp)) return false;
+    std::memcpy(tmp, p, kp.length);
+
+    if (!is_be_temporal) {
+      if (is_signed_integer_type(rt) && !field->is_unsigned()) {
+        tmp[0] ^= 0x80;
+      } else if (is_float_type(rt)) {
+        if (tmp[0] & 0x80) {
+          tmp[0] ^= 0x80;
+        } else {
+          for (uint j = 0; j < kp.length; ++j) tmp[j] ^= 0xFF;
+        }
+      }
+      std::reverse(tmp, tmp + kp.length);
+    }
+
+    std::ptrdiff_t offset = field->ptr - table->record[0];
+    std::memcpy(record + offset, tmp, kp.length);
+
+    p += kp.store_length;
+  }
+  return true;
 }
 
 #endif
