@@ -456,21 +456,29 @@ TEST_CASE("extract_pk_from_sec_key", "[key_encoding]") {
     uint8_t sec_key[] = {0x03, 0, 0, 0, 1, 0, 2,  // 7-byte prefix
                          0xAA, 0xBB, 0xCC,          // 3-byte sec key
                          0xDD, 0xEE};               // 2-byte PK
-    auto pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 3);
-    REQUIRE(pk == std::vector<uint8_t>{0xDD, 0xEE});
+    std::size_t pk_len = 0;
+    const uint8_t *pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 3, &pk_len);
+    REQUIRE(pk != nullptr);
+    REQUIRE(pk_len == 2);
+    REQUIRE(pk[0] == 0xDD);
+    REQUIRE(pk[1] == 0xEE);
   }
 
   SECTION("empty PK") {
     uint8_t sec_key[] = {0x03, 0, 0, 0, 1, 0, 2,  // 7-byte prefix
                          0xAA, 0xBB};              // 2-byte sec key only
-    auto pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 2);
-    REQUIRE(pk.empty());
+    std::size_t pk_len = 0;
+    const uint8_t *pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 2, &pk_len);
+    REQUIRE(pk == nullptr);
+    REQUIRE(pk_len == 0);
   }
 
   SECTION("key too short") {
     uint8_t sec_key[] = {0x03, 0, 0};
-    auto pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 10);
-    REQUIRE(pk.empty());
+    std::size_t pk_len = 0;
+    const uint8_t *pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 10, &pk_len);
+    REQUIRE(pk == nullptr);
+    REQUIRE(pk_len == 0);
   }
 }
 
@@ -574,9 +582,12 @@ TEST_CASE("extract_pk_from_sec_key validation", "[key_encoding]") {
       0x00, 0x00, 0x00, 0x10   // 4-byte PK = 16
     };
 
-    auto pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 3);
-    REQUIRE(pk.size() == 4);
-    REQUIRE(pk == std::vector<uint8_t>{0x00, 0x00, 0x00, 0x10});
+    std::size_t pk_len = 0;
+    const uint8_t *pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 3, &pk_len);
+    REQUIRE(pk != nullptr);
+    REQUIRE(pk_len == 4);
+    REQUIRE(std::vector<uint8_t>(pk, pk + pk_len) ==
+            std::vector<uint8_t>{0x00, 0x00, 0x00, 0x10});
   }
 
   SECTION("empty PK section") {
@@ -584,14 +595,18 @@ TEST_CASE("extract_pk_from_sec_key validation", "[key_encoding]") {
       0x03, 0, 0, 0, 42, 0, 3,  // 7-byte prefix
       0xAA, 0xBB                // 2-byte secondary key only (no PK)
     };
-    auto pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 2);
-    REQUIRE(pk.empty());
+    std::size_t pk_len = 0;
+    const uint8_t *pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 2, &pk_len);
+    REQUIRE(pk == nullptr);
+    REQUIRE(pk_len == 0);
   }
 
   SECTION("truncated key") {
     uint8_t sec_key[] = {0x03, 0, 0};  // Too short
-    auto pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 10);
-    REQUIRE(pk.empty());
+    std::size_t pk_len = 0;
+    const uint8_t *pk = extract_pk_from_sec_key(sec_key, sizeof(sec_key), 10, &pk_len);
+    REQUIRE(pk == nullptr);
+    REQUIRE(pk_len == 0);
   }
 }
 

@@ -40,8 +40,10 @@ std::vector<uint8_t> encode_pk(TABLE *table, const uchar *buf,
 
 // Decodes a previously encoded key back into the row buffer `buf` using
 // key_restore().  Strips the 1-byte namespace + 4-byte table_id prefix first.
+// `scratch` is a caller-owned buffer reused across calls to avoid per-row
+// heap allocations.
 void decode_pk(TABLE *table, const uint8_t *key, std::size_t key_len,
-               uchar *buf);
+               uchar *buf, std::vector<uint8_t> &scratch);
 
 // Returns the 5-byte prefix [0x02 | table_id(BE,4)] for iterating a table's
 // row keys.
@@ -76,9 +78,12 @@ uint64_t read_be64(const uint8_t *p);
 
 // Extracts the primary key portion from a secondary index key.
 // sec_key_packed_len is the length of the secondary key portion only.
-std::vector<uint8_t> extract_pk_from_sec_key(const uint8_t *sec_key,
-                                              std::size_t sec_key_len,
-                                              uint sec_key_packed_len);
+// Returns a pointer to the PK portion within sec_key and writes the length
+// to *pk_len_out. Returns nullptr if the key is too short.
+const uint8_t *extract_pk_from_sec_key(const uint8_t *sec_key,
+                                        std::size_t sec_key_len,
+                                        uint sec_key_packed_len,
+                                        std::size_t *pk_len_out);
 
 // Returns the 7-byte prefix [0x03 | table_id(BE,4) | index_id(BE,2)] for
 // iterating a specific secondary index.
