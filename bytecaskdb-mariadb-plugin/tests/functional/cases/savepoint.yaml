@@ -1,10 +1,6 @@
-# savepoint.yaml — SAVEPOINT / ROLLBACK TO SAVEPOINT tests
-#
-# NOTE: ByteCaskDB does NOT currently support SAVEPOINT (error 1178).
-# These tests document the expected behavior for when it is implemented.
-# For now they verify the error is correctly raised.
+# savepoint.yaml — SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE SAVEPOINT tests
 
-- name: SAVEPOINT returns unsupported error
+- name: ROLLBACK TO SAVEPOINT discards writes after savepoint
   setup:
     - DROP DATABASE IF EXISTS sp1
     - CREATE DATABASE sp1
@@ -13,7 +9,71 @@
     - sql: BEGIN
     - sql: INSERT INTO sp1.t VALUES (1, 10)
     - sql: SAVEPOINT s1
-      error: 1178
-    - sql: ROLLBACK
+    - sql: INSERT INTO sp1.t VALUES (2, 20)
+    - sql: ROLLBACK TO SAVEPOINT s1
+    - sql: COMMIT
+    - sql: SELECT * FROM sp1.t ORDER BY id
+      result:
+        - [1, 10]
   teardown:
     - DROP DATABASE IF EXISTS sp1
+
+- name: RELEASE SAVEPOINT then COMMIT persists all writes
+  setup:
+    - DROP DATABASE IF EXISTS sp2
+    - CREATE DATABASE sp2
+    - CREATE TABLE sp2.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO sp2.t VALUES (1, 10)
+    - sql: SAVEPOINT s1
+    - sql: INSERT INTO sp2.t VALUES (2, 20)
+    - sql: RELEASE SAVEPOINT s1
+    - sql: COMMIT
+    - sql: SELECT * FROM sp2.t ORDER BY id
+      result:
+        - [1, 10]
+        - [2, 20]
+  teardown:
+    - DROP DATABASE IF EXISTS sp2
+
+- name: Nested savepoints rollback to intermediate point
+  setup:
+    - DROP DATABASE IF EXISTS sp3
+    - CREATE DATABASE sp3
+    - CREATE TABLE sp3.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO sp3.t VALUES (1, 10)
+    - sql: SAVEPOINT s1
+    - sql: INSERT INTO sp3.t VALUES (2, 20)
+    - sql: SAVEPOINT s2
+    - sql: INSERT INTO sp3.t VALUES (3, 30)
+    - sql: ROLLBACK TO SAVEPOINT s2
+    - sql: COMMIT
+    - sql: SELECT * FROM sp3.t ORDER BY id
+      result:
+        - [1, 10]
+        - [2, 20]
+  teardown:
+    - DROP DATABASE IF EXISTS sp3
+
+- name: ROLLBACK TO SAVEPOINT then continue writing and COMMIT
+  setup:
+    - DROP DATABASE IF EXISTS sp4
+    - CREATE DATABASE sp4
+    - CREATE TABLE sp4.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO sp4.t VALUES (1, 10)
+    - sql: SAVEPOINT s1
+    - sql: INSERT INTO sp4.t VALUES (2, 20)
+    - sql: ROLLBACK TO SAVEPOINT s1
+    - sql: INSERT INTO sp4.t VALUES (3, 30)
+    - sql: COMMIT
+    - sql: SELECT * FROM sp4.t ORDER BY id
+      result:
+        - [1, 10]
+        - [3, 30]
+  teardown:
+    - DROP DATABASE IF EXISTS sp4

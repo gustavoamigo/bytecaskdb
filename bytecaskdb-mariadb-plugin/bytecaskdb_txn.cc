@@ -263,6 +263,29 @@ void MariaDBTxn::reset() {
 }
 
 // ---------------------------------------------------------------------------
+// Savepoints
+// ---------------------------------------------------------------------------
+
+void MariaDBTxn::savepoint_set(void *sv) {
+  *static_cast<uint32_t *>(sv) = static_cast<uint32_t>(ops_.size());
+}
+
+void MariaDBTxn::savepoint_rollback(void *sv) {
+  uint32_t mark = *static_cast<const uint32_t *>(sv);
+  ops_.resize(mark);
+  lookup_.clear();
+  for (const auto &op : ops_) {
+    if (op.kind == Op::Put)
+      lookup_[op.key] = op.val;
+    else
+      lookup_[op.key] = std::nullopt;
+  }
+}
+
+void MariaDBTxn::savepoint_release(void * /*sv*/) {
+}
+
+// ---------------------------------------------------------------------------
 // MergeIterator
 //
 // The buffer side always walks forward (matches the pre-migration C-API
