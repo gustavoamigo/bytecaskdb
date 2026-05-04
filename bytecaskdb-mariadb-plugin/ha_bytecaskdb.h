@@ -57,6 +57,11 @@ void             catalog_seed_autoinc(uint32_t table_id, uint64_t high_water);
 void             catalog_reset_autoinc(uint32_t table_id, uint64_t value);
 void             catalog_drop_autoinc(uint32_t table_id);
 
+int64_t          catalog_row_count(uint32_t table_id);
+void             catalog_row_count_add(uint32_t table_id, int64_t delta);
+void             catalog_row_count_reset(uint32_t table_id);
+void             catalog_drop_row_count(uint32_t table_id);
+
 // ---------------------------------------------------------------------------
 // ha_bytecaskdb — the handler class registered with MariaDB.
 // ---------------------------------------------------------------------------
@@ -212,6 +217,9 @@ private:
   // round-trip correctly.
   std::vector<uint8_t> current_row_key_;
 
+  // Reused across index_read_map calls to avoid per-call heap allocation.
+  std::vector<uint8_t> search_key_buf_;
+
   // Saved across write_row → get_dup_key → info(HA_STATUS_ERRKEY) round-trip.
   uint saved_errkey_{0};
 
@@ -220,7 +228,7 @@ private:
 
   // Row value buffer kept alive for BLOB pointer lifetime.
   // decode_row sets BLOB field pointers into this buffer.
-  std::vector<uint8_t> row_value_buf_;
+  bytecask::Bytes row_value_buf_;
 
   static void write_table_id_prefix(uint8_t *buf4, uint32_t table_id);
 };

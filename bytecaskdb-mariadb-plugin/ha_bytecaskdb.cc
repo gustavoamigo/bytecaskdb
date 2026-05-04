@@ -398,11 +398,9 @@ int ha_bytecaskdb::delete_all_rows() {
   if (table->found_next_number_field) {
     catalog_reset_autoinc(table_id_, 0);
   }
+  catalog_row_count_reset(table_id_);
   return 0;
 }
-
-// ---------------------------------------------------------------------------
-// rename_table()
 // ---------------------------------------------------------------------------
 
 int ha_bytecaskdb::rename_table(const char *from, const char *to) {
@@ -499,11 +497,9 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
     }
   }
 
+  catalog_row_count_add(table_id_, 1);
   return 0;
 }
-
-// ---------------------------------------------------------------------------
-// update_row()
 // ---------------------------------------------------------------------------
 
 int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
@@ -644,11 +640,9 @@ int ha_bytecaskdb::delete_row(const uchar *buf) {
 
   // Buffer primary key deletion.
   txn->buffer_del(key.data(), key.size());
+  catalog_row_count_add(table_id_, -1);
   return 0;
 }
-
-// ---------------------------------------------------------------------------
-// rnd_init() / rnd_next() / rnd_end() — full table scan
 // ---------------------------------------------------------------------------
 
 int ha_bytecaskdb::rnd_init(bool /*scan*/) {
@@ -677,9 +671,11 @@ int ha_bytecaskdb::rnd_next(uchar *buf) {
   decode_pk(table, merge_scan_->key_data(), merge_scan_->key_len(), buf);
 
   // Copy value to persistent buffer before advancing (BLOB pointers need it).
-  row_value_buf_.assign(merge_scan_->value_data(),
-                        merge_scan_->value_data() + merge_scan_->value_len());
-  decode_row(table, row_value_buf_.data(), row_value_buf_.size(), buf);
+  row_value_buf_.assign(reinterpret_cast<const std::byte *>(merge_scan_->value_data()),
+                        reinterpret_cast<const std::byte *>(merge_scan_->value_data() + merge_scan_->value_len()));
+  decode_row(table,
+             reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
+             row_value_buf_.size(), buf);
 
   // Save the on-disk key for any follow-up update_row / delete_row /
   // position call.
@@ -778,43 +774,39 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
       actual_prefix_len += pk_info.key_part[i].store_length;
     }
 
-    std::vector<uint8_t> search_key(5 + pk_len);
-    search_key[0] = kNsRow;
-    search_key[1] = static_cast<uint8_t>((table_id_ >> 24) & 0xFF);
-    search_key[2] = static_cast<uint8_t>((table_id_ >> 16) & 0xFF);
-    search_key[3] = static_cast<uint8_t>((table_id_ >>  8) & 0xFF);
-    search_key[4] = static_cast<uint8_t>( table_id_        & 0xFF);
-    std::memcpy(search_key.data() + 5, key, actual_prefix_len);
+    search_key_buf_.resize(5 + pk_len);
+    search_key_buf_[0] = kNsRow;
+    search_key_buf_[1] = static_cast<uint8_t>((table_id_ >> 24) & 0xFF);
+    search_key_buf_[2] = static_cast<uint8_t>((table_id_ >> 16) & 0xFF);
+    search_key_buf_[3] = static_cast<uint8_t>((table_id_ >>  8) & 0xFF);
+    search_key_buf_[4] = static_cast<uint8_t>( table_id_        & 0xFF);
+    std::memcpy(search_key_buf_.data() + 5, key, actual_prefix_len);
     if (actual_prefix_len < pk_len) {
-      std::memset(search_key.data() + 5 + actual_prefix_len, 0,
+      std::memset(search_key_buf_.data() + 5 + actual_prefix_len, 0,
                   pk_len - actual_prefix_len);
     }
-    normalize_padspace_pk(search_key.data() + 5, &pk_info);
-    make_mem_comparable(search_key.data() + 5, &pk_info, pk_len);
+    normalize_padspace_pk(search_key_buf_.data() + 5, &pk_info);
+    make_mem_comparable(search_key_buf_.data() + 5, &pk_info, pk_len);
 
     if (find_flag == HA_READ_KEY_EXACT) {
-      // Point lookup via txn->get().
-      bytecask::Bytes val;
-      int found = txn->get(search_key.data(), search_key.size(), val);
+      int found = txn->get(search_key_buf_.data(), search_key_buf_.size(),
+                           row_value_buf_);
       if (found < 0) { return HA_ERR_GENERIC; }
       if (found == 0) { return HA_ERR_KEY_NOT_FOUND; }
 
-      // Restore key columns into record buffer.
       key_restore(buf, key, const_cast<KEY *>(&pk_info), pk_len);
 
-      row_value_buf_.assign(reinterpret_cast<const uint8_t *>(val.data()),
-                            reinterpret_cast<const uint8_t *>(val.data()) + val.size());
-      decode_row(table, row_value_buf_.data(), row_value_buf_.size(), buf);
-      save_current_row_key(search_key.data(), search_key.size());
+      decode_row(table,
+                 reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
+                 row_value_buf_.size(), buf);
+      save_current_row_key(search_key_buf_.data(), search_key_buf_.size());
       return 0;
     }
 
     if (find_flag == HA_READ_PREFIX_LAST ||
         find_flag == HA_READ_PREFIX_LAST_OR_PREV) {
-      // Reverse scan: find the last key within the prefix.
-      // Build upper bound: prefix with trailing 0xFF bytes.
       std::vector<uint8_t> hi_key(5 + pk_len);
-      std::memcpy(hi_key.data(), search_key.data(), 5 + actual_prefix_len);
+      std::memcpy(hi_key.data(), search_key_buf_.data(), 5 + actual_prefix_len);
       std::memset(hi_key.data() + 5 + actual_prefix_len, 0xFF,
                   pk_len - actual_prefix_len);
       make_mem_comparable(hi_key.data() + 5, &pk_info, pk_len);
@@ -824,16 +816,14 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
                                         lo.data(), lo.size(), table_id_);
       if (!merge_index_) { return HA_ERR_GENERIC; }
 
-      // Check that the found key actually has the same prefix.
       int rc = index_read_current(buf);
       if (rc != 0) return rc;
 
-      // Verify the prefix matches.
       if (current_row_key_.size() < 5 + actual_prefix_len) {
         return HA_ERR_KEY_NOT_FOUND;
       }
       if (std::memcmp(current_row_key_.data() + 5,
-                      search_key.data() + 5, actual_prefix_len) != 0) {
+                      search_key_buf_.data() + 5, actual_prefix_len) != 0) {
         return HA_ERR_KEY_NOT_FOUND;
       }
       return 0;
@@ -841,7 +831,7 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
 
     // Forward range scan: open merge iterator at search key.
     auto hi = table_id_upper_bound(table_id_);
-    merge_index_ = txn->iter_prefix(search_key.data(), search_key.size(),
+    merge_index_ = txn->iter_prefix(search_key_buf_.data(), search_key_buf_.size(),
                                      hi.data(), hi.size(), table_id_);
     if (!merge_index_) { return HA_ERR_GENERIC; }
 
@@ -1051,9 +1041,11 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
   if (active_index == table->s->primary_key) {
     // Primary key access: key is encoded PK, value is row data
     decode_pk(table, merge_index_->key_data(), merge_index_->key_len(), buf);
-    row_value_buf_.assign(merge_index_->value_data(),
-                          merge_index_->value_data() + merge_index_->value_len());
-    decode_row(table, row_value_buf_.data(), row_value_buf_.size(), buf);
+    row_value_buf_.assign(reinterpret_cast<const std::byte *>(merge_index_->value_data()),
+                          reinterpret_cast<const std::byte *>(merge_index_->value_data() + merge_index_->value_len()));
+    decode_row(table,
+               reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
+               row_value_buf_.size(), buf);
     save_current_row_key(merge_index_->key_data(), merge_index_->key_len());
     return 0;
   } else {
@@ -1083,17 +1075,15 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
         thd_get_ha_data(ha_thd(), bytecaskdb_hton));
     if (!txn) { return HA_ERR_GENERIC; }
 
-    bytecask::Bytes row_val;
-    int rc = txn->get(row_key.data(), row_key.size(), row_val);
+    int rc = txn->get(row_key.data(), row_key.size(), row_value_buf_);
     if (rc != 1) {
-      return HA_ERR_KEY_NOT_FOUND;  // Row was deleted
+      return HA_ERR_KEY_NOT_FOUND;
     }
 
-    // 4. Decode PK and row data into MariaDB buffer
     decode_pk(table, row_key.data(), row_key.size(), buf);
-    row_value_buf_.assign(reinterpret_cast<const uint8_t *>(row_val.data()),
-                          reinterpret_cast<const uint8_t *>(row_val.data()) + row_val.size());
-    decode_row(table, row_value_buf_.data(), row_value_buf_.size(), buf);
+    decode_row(table,
+               reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
+               row_value_buf_.size(), buf);
     save_current_row_key(row_key.data(), row_key.size());
     return 0;
   }
@@ -1123,18 +1113,15 @@ int ha_bytecaskdb::rnd_pos(uchar *buf, uchar *pos) {
       thd_get_ha_data(ha_thd(), bytecaskdb_hton));
   if (!txn) { return HA_ERR_GENERIC; }
 
-  bytecask::Bytes val;
-
-  int found = txn->get(pos, ref_length, val);
+  int found = txn->get(pos, ref_length, row_value_buf_);
   if (found < 0) { return HA_ERR_GENERIC; }
   if (found == 0) { return HA_ERR_KEY_NOT_FOUND; }
 
-  // Decode PK from ref into record buffer.
   decode_pk(table, pos, ref_length, buf);
 
-  row_value_buf_.assign(reinterpret_cast<const uint8_t *>(val.data()),
-                        reinterpret_cast<const uint8_t *>(val.data()) + val.size());
-  decode_row(table, row_value_buf_.data(), row_value_buf_.size(), buf);
+  decode_row(table,
+             reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
+             row_value_buf_.size(), buf);
 
   // Save the position-key as the current row key in case mutation follows.
   save_current_row_key(pos, ref_length);
@@ -1148,17 +1135,8 @@ int ha_bytecaskdb::rnd_pos(uchar *buf, uchar *pos) {
 
 int ha_bytecaskdb::info(uint flag) {
   if (flag & HA_STATUS_VARIABLE) {
-    auto lo = table_id_prefix(table_id_);
-    auto hi = table_id_upper_bound(table_id_);
-    ha_rows count = 0;
-    for (auto &k : g_db->keys_from({}, as_view(lo))) {
-      if (k.size() < hi.size() ||
-          std::memcmp(u8_data(k), hi.data(), hi.size()) >= 0) {
-        break;
-      }
-      ++count;
-    }
-    stats.records = count;
+    stats.records = static_cast<ha_rows>(
+        std::max(int64_t{0}, catalog_row_count(table_id_)));
   }
   if (flag & HA_STATUS_AUTO) {
     stats.auto_increment_value = catalog_peek_autoinc(table_id_) + 1;
