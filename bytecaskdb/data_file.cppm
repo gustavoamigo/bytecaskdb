@@ -5,7 +5,6 @@
 
 module;
 #include <array>
-#include <atomic>
 #include <cassert>
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
@@ -19,6 +18,7 @@ module;
 #include <filesystem>
 #include <format>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <span>
 #include <sys/uio.h>
@@ -49,114 +49,88 @@ namespace bytecask {
 // Byte offset into a data file, as returned by append() and consumed by read().
 export using Offset = std::uint64_t;
 
-// Read-write manager for a ByteCask data file.
+// ---------------------------------------------------------------------------
+// DataFile — abstract base for all data file implementations.
 //
-// Intent: Manages a physical `.data` file via POSIX I/O. Separates writing
-// (append) from durability (sync) to enable Group Commit: callers batch
-// multiple appends and issue a single sync() when they require crash-safety.
-// The caller owns the global monotonic sequence number and passes it to
-// append().
-//
-// Thread safety: NOT thread-safe. External synchronization is required.
+// Provides the read interface that the engine uses polymorphically.
+// The file registry stores shared_ptr<DataFile>; readers call scan() and
+// read_value() without knowing or caring whether the file is writable or
+// read-only mmap-backed.
 export class DataFile {
 public:
-  // Opens or creates the file via POSIX open(O_RDWR|O_CREAT|O_APPEND).
-  // Throws std::system_error if the file cannot be opened.
-  explicit DataFile(std::filesystem::path path) : path_{std::move(path)} {
-    fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-    if (fd_ == -1) {
-      throw std::system_error{
-          errno, std::generic_category(),
-          std::format("DataFile: cannot open '{}'", path_.string())};
-    }
-    // Hint to the kernel that reads will be random (point lookups by offset).
-    // posix_fadvise is Linux-only; macOS has no equivalent.
-#ifndef __APPLE__
-    ::posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
-#endif
-    offset_ = std::filesystem::file_size(path_);
-    preallocated_end_ = offset_;
-  }
-
-  ~DataFile() {
-    if (mmap_base_) {
-      ::munmap(mmap_base_, mmap_size_);
-    }
-    if (fd_ != -1) {
-      ::close(fd_);
-    }
-  }
-
-  // Copying is disabled: a DataFile owns an OS file descriptor, and duplicating
-  // it would create two objects that both believe they own the same fd and
-  // would each close it on destruction, causing a double-close.
-  //
-  //   DataFile a{"x.data"};
-  //   DataFile b = a;  // ERROR: would give both 'a' and 'b' fd=5;
-  //                    // whichever destructs last calls close(5) twice.
+  virtual ~DataFile();
   DataFile(const DataFile &) = delete;
   DataFile &operator=(const DataFile &) = delete;
 
-  // Transfers ownership of the fd and offset from 'other'. Setting other.fd_
-  // to -1 prevents the moved-from destructor from closing our fd.
-  //
-  //   DataFile a{"x.data"};          // a: fd=5
-  //   DataFile b = std::move(a);     // b: fd=5, a: fd=-1 (harmless destructor)
-  DataFile(DataFile &&other) noexcept
-      : path_{std::move(other.path_)}, fd_{other.fd_}, offset_{other.offset_},
-        preallocated_end_{other.preallocated_end_},
-        sealed_{other.sealed_.load(std::memory_order_relaxed)},
-        mmap_base_{other.mmap_base_}, mmap_size_{other.mmap_size_} {
-    other.fd_ = -1;
-    other.mmap_base_ = nullptr;
-    other.mmap_size_ = 0;
+  [[nodiscard]] virtual auto scan(Offset offset) const
+      -> std::optional<std::pair<DataEntry, Offset>> = 0;
+
+  virtual void read_value(Offset offset, std::uint16_t key_size,
+                          std::uint32_t value_size, bool verify,
+                          std::vector<std::byte> &io_buf,
+                          std::vector<std::byte> &out) const = 0;
+
+  [[nodiscard]] virtual auto size() const noexcept -> Offset = 0;
+
+  [[nodiscard]] auto path() const -> const std::filesystem::path & {
+    return path_;
   }
 
-  // Closes any fd we currently own before stealing 'other's resources.
-  // The self-assignment guard avoids closing the fd we are about to adopt.
-  //
-  //   DataFile a{"a.data"};          // a: fd=5
-  //   DataFile b{"b.data"};          // b: fd=6
-  //   b = std::move(a);              // close(6), b: fd=5, a: fd=-1
-  DataFile &operator=(DataFile &&other) noexcept {
+protected:
+  explicit DataFile(std::filesystem::path path) : path_{std::move(path)} {}
+  DataFile(DataFile &&) noexcept = default;
+  DataFile &operator=(DataFile &&) noexcept = default;
+  std::filesystem::path path_;
+};
+
+DataFile::~DataFile() = default;
+
+// ---------------------------------------------------------------------------
+// WritableDataFile — append-only data file for the active write path.
+//
+// Reads are served via pread. No mmap, no mode transitions.
+// Thread safety: NOT thread-safe. External synchronization required for writes.
+// Concurrent pread-based reads are safe (POSIX guarantees).
+export class WritableDataFile : public DataFile {
+public:
+  [[nodiscard]] static auto openForWrite(std::filesystem::path path)
+      -> std::shared_ptr<WritableDataFile> {
+    return std::shared_ptr<WritableDataFile>(
+        new WritableDataFile{std::move(path)});
+  }
+
+  ~WritableDataFile() override;
+
+  WritableDataFile(WritableDataFile &&other) noexcept
+      : DataFile{std::move(other)}, fd_{other.fd_}, offset_{other.offset_},
+        preallocated_end_{other.preallocated_end_} {
+    other.fd_ = -1;
+  }
+
+  WritableDataFile &operator=(WritableDataFile &&other) noexcept {
     if (this != &other) {
-      if (mmap_base_) {
-        ::munmap(mmap_base_, mmap_size_);
-      }
       if (fd_ != -1) {
         ::close(fd_);
       }
-      path_ = std::move(other.path_);
+      DataFile::operator=(std::move(other));
       fd_ = other.fd_;
       offset_ = other.offset_;
-      sealed_.store(other.sealed_.load(std::memory_order_relaxed),
-                    std::memory_order_relaxed);
       preallocated_end_ = other.preallocated_end_;
-      mmap_base_ = other.mmap_base_;
-      mmap_size_ = other.mmap_size_;
       other.fd_ = -1;
-      other.mmap_base_ = nullptr;
-      other.mmap_size_ = 0;
     }
     return *this;
   }
 
-  // Writes an entry via writev(). Header and CRC are serialized into
-  // hdr_crc_buf_ by data_entry; key and value are passed as direct iovecs.
-  // No heap allocation, no copy of key/value data.
-  // Precondition: the file must not have been sealed.
   [[nodiscard]] auto append_entry(std::uint64_t sequence, EntryType entry_type,
                             std::span<const std::byte> key,
                             std::span<const std::byte> value) -> Offset {
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_data_file_append);
 #endif
-    assert(!sealed_.load(std::memory_order_relaxed));
     const auto entry_offset = offset_;
 
     write_header_and_crc(hdr_crc_buf_, sequence, entry_type, key, value);
 
-    // Scatter-gather write: [header(15), key, value, crc(4)].
     const std::array<::iovec, 4> iov{{
         {hdr_crc_buf_.data(), kHeaderSize},
         {const_cast<std::byte *>(key.data()), key.size()},
@@ -167,17 +141,10 @@ public:
     ensure_preallocated(offset_ + static_cast<Offset>(total));
     const auto written = ::writev(fd_, iov.data(), std::ssize(iov));
 #ifdef BYTECASK_TESTING
-    // Post-write injection simulates partial or full writes followed by
-    // failure. In both cases, bytes are on disk that offset_ will not
-    // account for — the file enters an indeterminate state.
     FAULT_INJECTION_POST_WRITE(io_data_file_append_partial,
                                fd_, entry_offset, total);
 #endif
     if (written != narrow<ssize_t>(total)) {
-      // Any writev failure — whether the call returned -1 (possibly with
-      // bytes in the page cache on FUSE/network filesystems) or a short
-      // write — leaves the file in an indeterminate state. The caller
-      // degrades; resume() will restore a consistent state.
       throw std::system_error{errno, std::generic_category(),
                               "DataFile::append: writev failed"};
     }
@@ -186,20 +153,13 @@ public:
     return entry_offset;
   }
 
-  // Batch-appends multiple entries in as few writev() calls as possible.
-  // Each chunk of up to kMaxEntriesPerWritev entries is written with a single
-  // writev(). Offsets are written into offsets_out (must be same size as
-  // entries). Failure semantics identical to append_entry: throw on writev failure.
   void append_entries(std::span<const DataEntryView> entries,
                       std::span<Offset> offsets_out) {
     assert(entries.size() == offsets_out.size());
     if (entries.empty()) return;
-    assert(!sealed_.load(std::memory_order_relaxed));
 
     static constexpr std::size_t kIovecsPerEntry = 4;
 #ifdef BYTECASK_TESTING
-    // Force multi-writev chunking so proof tests exercise the loop.
-    // A 5-entry large_batch becomes 3 writev calls (2+2+1).
     static constexpr std::size_t kMaxEntriesPerWritev = 2;
 #else
     static constexpr std::size_t kMaxEntriesPerWritev =
@@ -269,12 +229,8 @@ public:
     }
   }
 
-  // Reads and deserializes the entry at the given offset. Returns the entry
-  // and the byte offset of the next entry. Returns std::nullopt when offset is
-  // at or past end of file. Throws std::system_error on I/O failure or
-  // std::runtime_error on CRC mismatch.
   [[nodiscard]] auto scan(Offset offset) const
-      -> std::optional<std::pair<DataEntry, Offset>> {
+      -> std::optional<std::pair<DataEntry, Offset>> override {
     if (offset >= offset_) {
       return std::nullopt;
     }
@@ -290,13 +246,10 @@ public:
         next);
   }
 
-  // High-level read: extracts the value at offset into out.
-  // When verify is true, reads the full entry and validates the CRC32 checksum.
-  // When false, reads only the value bytes for minimum I/O.
   void read_value(Offset offset, std::uint16_t key_size,
                   std::uint32_t value_size, bool verify,
                   std::vector<std::byte> &io_buf,
-                  std::vector<std::byte> &out) const {
+                  std::vector<std::byte> &out) const override {
     if (verify) {
       auto view = read_entry(offset, key_size, value_size, io_buf);
       out.assign(view.value.begin(), view.value.end());
@@ -305,8 +258,6 @@ public:
     }
   }
 
-  // Flushes all pending writes to physical storage via fdatasync.
-  // Call after one or more append()s to guarantee crash-safety (Group Commit).
   void sync() {
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_data_file_sync);
@@ -317,43 +268,11 @@ public:
     }
   }
 
-  // Returns the current file size in bytes (equal to the write offset).
-  [[nodiscard]] auto size() const noexcept -> Offset { return offset_; }
-
-  // Marks the file as sealed: no further appends are permitted.
-  // The fd remains open for reads. seal() is called by DB on rotation.
-  void seal() noexcept {
-    assert(!sealed_.load(std::memory_order_relaxed));
-#ifndef __EMSCRIPTEN__
-    struct stat st{};
-    if (::fstat(fd_, &st) == 0 && st.st_size > 0) {
-      // NOLINTNEXTLINE(performance-no-int-to-ptr)
-      auto *ptr = ::mmap(nullptr, static_cast<std::size_t>(st.st_size),
-                         PROT_READ, MAP_PRIVATE, fd_, 0);
-      if (ptr != MAP_FAILED) {
-        mmap_base_ = static_cast<std::byte *>(ptr);
-        mmap_size_ = static_cast<std::size_t>(st.st_size);
-        ::madvise(mmap_base_, mmap_size_, MADV_RANDOM);
-      }
-    }
-#endif
-    // Publish gate: all mmap setup is visible before sealed_ becomes true.
-    sealed_.store(true, std::memory_order_release);
+  [[nodiscard]] auto size() const noexcept -> Offset override {
+    return offset_;
   }
 
-  [[nodiscard]] auto path() const -> const std::filesystem::path & {
-    return path_;
-  }
-
-  [[nodiscard]] auto is_sealed() const noexcept -> bool {
-    return sealed_.load(std::memory_order_relaxed);
-  }
-
-  // Truncates the file to new_size bytes and resets offset_ accordingly.
-  // Only valid on unsealed (active) files — a mapped file
-  // must never be truncated. Throws std::system_error on failure.
   void truncate(Offset new_size) {
-    assert(!mmap_base_);
     if (::ftruncate(fd_, narrow<off_t>(new_size)) != 0) {
       throw std::system_error{errno, std::system_category(),
                               "DataFile::truncate"};
@@ -363,31 +282,27 @@ public:
   }
 
 private:
-  std::filesystem::path path_;
+  explicit WritableDataFile(std::filesystem::path path)
+      : DataFile{std::move(path)} {
+    fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd_ == -1) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("DataFile: cannot open '{}'", path_.string())};
+    }
+#ifndef __APPLE__
+    ::posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
+#endif
+    offset_ = std::filesystem::file_size(path_);
+    preallocated_end_ = offset_;
+  }
+
   int fd_{-1};
   Offset offset_{0};
   Offset preallocated_end_{0};
-  std::atomic<bool> sealed_{false};
-  // Fixed buffer holding the 15-byte header and 4-byte CRC for each append.
-  // Avoids heap allocation on the hot write path.
   std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};
-  std::byte *mmap_base_{nullptr};
-  std::size_t mmap_size_{0};
 
-  // Returns true when the mmap is fully set up and safe to read from.
-  // Acts as a publish gate: sealed_ is stored with release in seal(), after
-  // mmap setup. The acquire load here synchronizes-with that store,
-  // guaranteeing mmap_base_/mmap_size_ are visible.
-  [[nodiscard]] auto mmap_ready() const noexcept -> bool {
-    return sealed_.load(std::memory_order_acquire) && mmap_base_;
-  }
-
-  // Reads the fixed header at offset via mmap or pread.
   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
-    if (mmap_ready()) {
-      assert(offset + kHeaderSize <= mmap_size_);
-      return bytecask::read_header(std::span{mmap_base_ + offset, kHeaderSize});
-    }
     std::array<std::byte, kHeaderSize> hdr{};
     if (::pread(fd_, hdr.data(), kHeaderSize, narrow<off_t>(offset)) !=
         std::ssize(hdr)) {
@@ -397,27 +312,18 @@ private:
     return bytecask::read_header(std::span{hdr});
   }
 
-  // Reads the full entry at offset, verifies CRC, returns non-owning view.
-  // When mmap is active, spans point into mapped memory (io_buf unused).
-  // Otherwise, reads into io_buf and spans point into it.
   [[nodiscard]] auto read_entry(Offset offset, std::uint16_t key_size,
                                 std::uint32_t value_size,
                                 std::vector<std::byte>& io_buf) const
       -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    std::span<const std::byte> raw;
-    if (mmap_ready()) {
-      assert(offset + total <= mmap_size_);
-      raw = {mmap_base_ + offset, total};
-    } else {
-      io_buf.resize(total);
-      if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
-          narrow<ssize_t>(total)) {
-        throw std::system_error{errno, std::generic_category(),
-                                "DataFile::read_entry: pread failed"};
-      }
-      raw = io_buf;
+    io_buf.resize(total);
+    if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
+        narrow<ssize_t>(total)) {
+      throw std::system_error{errno, std::generic_category(),
+                              "DataFile::read_entry: pread failed"};
     }
+    std::span<const std::byte> raw = io_buf;
     const auto header = parse_header_and_verify(raw);
     auto body = raw.subspan(kHeaderSize);
     return DataEntryView{
@@ -428,28 +334,18 @@ private:
     };
   }
 
-  // Reads only the value bytes — minimum I/O, no CRC check.
   void read_value_unverified(Offset offset, std::uint16_t key_size,
                              std::uint32_t value_size,
                              std::vector<std::byte>& out) const {
     const auto val_offset = offset + kHeaderSize + key_size;
-    if (mmap_ready()) {
-      assert(val_offset + value_size <= mmap_size_);
-      auto* base = mmap_base_ + val_offset;
-      out.assign(base, base + value_size);
-    } else {
-      out.resize(value_size);
-      if (::pread(fd_, out.data(), value_size,
-                  narrow<off_t>(val_offset)) != narrow<ssize_t>(value_size)) {
-        throw std::system_error{errno, std::generic_category(),
-                                "DataFile::read_value: pread failed"};
-      }
+    out.resize(value_size);
+    if (::pread(fd_, out.data(), value_size,
+                narrow<off_t>(val_offset)) != narrow<ssize_t>(value_size)) {
+      throw std::system_error{errno, std::generic_category(),
+                              "DataFile::read_value: pread failed"};
     }
   }
 
-  // Preallocates disk blocks up to write_end without changing the file's
-  // logical size. Reduces filesystem extent-allocation overhead on the write
-  // path. Failure is silently ignored — preallocation is a pure optimization.
   void ensure_preallocated(Offset write_end) {
 #ifdef __linux__
     if (write_end <= preallocated_end_) return;
@@ -486,6 +382,258 @@ private:
 #endif
 };
 
+WritableDataFile::~WritableDataFile() {
+  if (fd_ != -1) {
+    ::close(fd_);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ReadOnlyPosixDataFile — pread-based read-only data file.
+//
+// Used on platforms without mmap (Emscripten) or for empty files where mmap
+// is not possible. All reads go through pread syscalls.
+export class ReadOnlyPosixDataFile : public DataFile {
+public:
+  [[nodiscard]] static auto openForRead(std::filesystem::path path)
+      -> std::shared_ptr<ReadOnlyPosixDataFile> {
+    auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("ReadOnlyPosixDataFile: cannot open '{}'",
+                      path.string())};
+    }
+    struct stat st {};
+    std::size_t file_size = 0;
+    if (::fstat(fd, &st) == 0) {
+      file_size = static_cast<std::size_t>(st.st_size);
+    }
+    return std::shared_ptr<ReadOnlyPosixDataFile>(
+        new ReadOnlyPosixDataFile{std::move(path), fd, file_size});
+  }
+
+  ~ReadOnlyPosixDataFile() override;
+
+  [[nodiscard]] auto scan(Offset offset) const
+      -> std::optional<std::pair<DataEntry, Offset>> override {
+    if (offset >= file_size_) {
+      return std::nullopt;
+    }
+    const auto header = read_header(offset);
+    std::vector<std::byte> buf;
+    auto view = read_entry(offset, header.key_size, header.value_size, buf);
+    const auto next =
+        offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
+    return std::make_pair(
+        DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
+                  .key = {view.key.begin(), view.key.end()},
+                  .value = {view.value.begin(), view.value.end()}},
+        next);
+  }
+
+  void read_value(Offset offset, std::uint16_t key_size,
+                  std::uint32_t value_size, bool verify,
+                  std::vector<std::byte> &io_buf,
+                  std::vector<std::byte> &out) const override {
+    if (verify) {
+      auto view = read_entry(offset, key_size, value_size, io_buf);
+      out.assign(view.value.begin(), view.value.end());
+    } else {
+      const auto val_offset = offset + kHeaderSize + key_size;
+      out.resize(value_size);
+      if (::pread(fd_, out.data(), value_size,
+                  narrow<off_t>(val_offset)) != narrow<ssize_t>(value_size)) {
+        throw std::system_error{
+            errno, std::generic_category(),
+            "ReadOnlyPosixDataFile::read_value: pread failed"};
+      }
+    }
+  }
+
+  [[nodiscard]] auto size() const noexcept -> Offset override {
+    return static_cast<Offset>(file_size_);
+  }
+
+private:
+  ReadOnlyPosixDataFile(std::filesystem::path path, int fd,
+                        std::size_t file_size)
+      : DataFile{std::move(path)}, fd_{fd}, file_size_{file_size} {}
+
+  int fd_;
+  std::size_t file_size_;
+
+  [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
+    std::array<std::byte, kHeaderSize> hdr{};
+    if (::pread(fd_, hdr.data(), kHeaderSize, narrow<off_t>(offset)) !=
+        std::ssize(hdr)) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          "ReadOnlyPosixDataFile::read_header: pread failed"};
+    }
+    return bytecask::read_header(std::span{hdr});
+  }
+
+  [[nodiscard]] auto read_entry(Offset offset, std::uint16_t key_size,
+                                std::uint32_t value_size,
+                                std::vector<std::byte> &io_buf) const
+      -> DataEntryView {
+    const auto total = kHeaderSize + key_size + value_size + kCrcSize;
+    io_buf.resize(total);
+    if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
+        narrow<ssize_t>(total)) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          "ReadOnlyPosixDataFile::read_entry: pread failed"};
+    }
+    const auto header = parse_header_and_verify(io_buf);
+    auto body = std::span<const std::byte>{io_buf}.subspan(kHeaderSize);
+    return DataEntryView{
+        .sequence = header.sequence,
+        .entry_type = header.entry_type,
+        .key = body.subspan(0, key_size),
+        .value = body.subspan(key_size, value_size),
+    };
+  }
+};
+
+ReadOnlyPosixDataFile::~ReadOnlyPosixDataFile() {
+  if (fd_ != -1) {
+    ::close(fd_);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ReadOnlyMmapDataFile — mmap-backed read-only data file.
+//
+// Created from sealed data files. All reads are served directly from the
+// memory-mapped region with no syscall overhead. The file must be non-empty.
+export class ReadOnlyMmapDataFile : public DataFile {
+public:
+  [[nodiscard]] static auto openForRead(std::filesystem::path path)
+      -> std::shared_ptr<ReadOnlyMmapDataFile> {
+    auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("ReadOnlyMmapDataFile: cannot open '{}'",
+                      path.string())};
+    }
+
+    struct stat st {};
+    if (::fstat(fd, &st) != 0 || st.st_size == 0) {
+      ::close(fd);
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("ReadOnlyMmapDataFile: file empty or fstat failed '{}'",
+                      path.string())};
+    }
+
+    auto mmap_size = static_cast<std::size_t>(st.st_size);
+    // NOLINTNEXTLINE(performance-no-int-to-ptr)
+    auto *ptr = ::mmap(nullptr, mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (ptr == MAP_FAILED) {
+      ::close(fd);
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("ReadOnlyMmapDataFile: mmap failed '{}'",
+                      path.string())};
+    }
+    auto *mmap_base = static_cast<std::byte *>(ptr);
+    ::madvise(mmap_base, mmap_size, MADV_RANDOM);
+
+    return std::shared_ptr<ReadOnlyMmapDataFile>(
+        new ReadOnlyMmapDataFile{std::move(path), fd, mmap_base, mmap_size});
+  }
+
+  ~ReadOnlyMmapDataFile() override;
+
+  [[nodiscard]] auto scan(Offset offset) const
+      -> std::optional<std::pair<DataEntry, Offset>> override {
+    if (offset >= mmap_size_) {
+      return std::nullopt;
+    }
+    const auto header = read_header(offset);
+    auto view = read_entry(offset, header.key_size, header.value_size);
+    const auto next =
+        offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
+    return std::make_pair(
+        DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
+                  .key = {view.key.begin(), view.key.end()},
+                  .value = {view.value.begin(), view.value.end()}},
+        next);
+  }
+
+  void read_value(Offset offset, std::uint16_t key_size,
+                  std::uint32_t value_size, bool verify,
+                  [[maybe_unused]] std::vector<std::byte> &io_buf,
+                  std::vector<std::byte> &out) const override {
+    if (verify) {
+      auto view = read_entry(offset, key_size, value_size);
+      out.assign(view.value.begin(), view.value.end());
+    } else {
+      const auto val_offset = offset + kHeaderSize + key_size;
+      assert(val_offset + value_size <= mmap_size_);
+      auto *base = mmap_base_ + val_offset;
+      out.assign(base, base + value_size);
+    }
+  }
+
+  [[nodiscard]] auto size() const noexcept -> Offset override {
+    return static_cast<Offset>(mmap_size_);
+  }
+
+private:
+  ReadOnlyMmapDataFile(std::filesystem::path path, int fd,
+                       std::byte *mmap_base, std::size_t mmap_size)
+      : DataFile{std::move(path)}, fd_{fd},
+        mmap_base_{mmap_base}, mmap_size_{mmap_size} {}
+
+  int fd_;
+  std::byte *mmap_base_;
+  std::size_t mmap_size_;
+
+  [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
+    assert(offset + kHeaderSize <= mmap_size_);
+    return bytecask::read_header(std::span{mmap_base_ + offset, kHeaderSize});
+  }
+
+  [[nodiscard]] auto read_entry(Offset offset, std::uint16_t key_size,
+                                std::uint32_t value_size) const
+      -> DataEntryView {
+    const auto total = kHeaderSize + key_size + value_size + kCrcSize;
+    assert(offset + total <= mmap_size_);
+    std::span<const std::byte> raw{mmap_base_ + offset, total};
+    const auto header = parse_header_and_verify(raw);
+    auto body = raw.subspan(kHeaderSize);
+    return DataEntryView{
+        .sequence = header.sequence,
+        .entry_type = header.entry_type,
+        .key = body.subspan(0, key_size),
+        .value = body.subspan(key_size, value_size),
+    };
+  }
+};
+
+ReadOnlyMmapDataFile::~ReadOnlyMmapDataFile() {
+  ::munmap(mmap_base_, mmap_size_);
+  if (fd_ != -1) {
+    ::close(fd_);
+  }
+}
+
+// Generic factory: returns mmap-backed DataFile when possible, pread-based otherwise.
+export [[nodiscard]] inline auto openDataFileForRead(std::filesystem::path path)
+    -> std::shared_ptr<DataFile> {
+#ifndef __EMSCRIPTEN__
+  struct stat st {};
+  if (::stat(path.c_str(), &st) == 0 && st.st_size > 0) {
+    return ReadOnlyMmapDataFile::openForRead(std::move(path));
+  }
+#endif
+  return ReadOnlyPosixDataFile::openForRead(std::move(path));
+}
+
 // Forward-only iterator over raw entries in a DataFile.
 // Wraps DataFile::scan(offset) into a standard C++ input iterator.
 // Exceptions from scan() (CRC errors, I/O failures) propagate to the caller.
@@ -515,9 +663,6 @@ public:
     return !cached_.has_value();
   }
 
-  // Exposes the byte offset that will be read on the next increment.
-  // After the last successful dereference, this is the offset past the
-  // current entry — useful for callers that need to track file position.
   [[nodiscard]] auto next_offset() const noexcept -> Offset {
     return next_offset_;
   }

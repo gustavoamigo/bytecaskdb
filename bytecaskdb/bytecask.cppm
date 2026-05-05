@@ -468,9 +468,11 @@ public:
   void apply_writes(const WritePlan &plan,
                      std::span<const std::uint64_t> offsets);
 
-  // State transition: register a new file as active after rotation.
+  // State transition: register a sealed read-only file in place of the old
+  // active, then register a new writable file as the new active.
   // Cannot fail.
-  void apply_rotate_file(std::shared_ptr<DataFile> new_file);
+  void apply_rotate_file(std::shared_ptr<DataFile> sealed_old,
+                         std::shared_ptr<DataFile> new_file);
 
   // State transition: remap keys after vacuum scan+copy.
   // Cannot fail.
@@ -513,7 +515,7 @@ public:
   }
 
   // Pure queries the coordinator needs for IO decisions.
-  [[nodiscard]] auto active_file() -> DataFile &;
+  [[nodiscard]] auto active_file() -> WritableDataFile &;
   [[nodiscard]] auto active_file_ptr() const -> std::shared_ptr<DataFile>;
   [[nodiscard]] auto active_file_id() const noexcept -> std::uint32_t;
   [[nodiscard]] auto is_rotation_needed(std::uint64_t threshold) const -> bool;
@@ -822,7 +824,7 @@ private:
   // Batch-aware scan: copies live Puts and tombstones from source_file into dest_file.
   static auto vacuum_scan_and_copy(
       const std::shared_ptr<const EngineState> &snap,
-      const DataFile &source_file, DataFile &dest_file,
+      const DataFile &source_file, WritableDataFile &dest_file,
       std::uint32_t source_file_id) -> VacuumScanResult;
   // Remaps key_dir entries, updates file registry, publishes new state. Caller must hold write_mu_.
   void vacuum_commit(std::uint32_t old_file_id, const VacuumScanResult &scan,
@@ -1644,7 +1646,9 @@ void TransientEngineState::apply_ingest(
 }
 
 void TransientEngineState::apply_rotate_file(
+    std::shared_ptr<DataFile> sealed_old,
     std::shared_ptr<DataFile> new_file) {
+  files_.set(active_file_id_, std::move(sealed_old));
   KeyDirEntry::check_file_id(next_file_id_);
   active_file_id_ = next_file_id_++;
   files_.set(active_file_id_, std::move(new_file));
@@ -1753,8 +1757,8 @@ void TransientEngineState::apply_resume(
   }
 }
 
-auto TransientEngineState::active_file() -> DataFile & {
-  return **files_.get(active_file_id_);
+auto TransientEngineState::active_file() -> WritableDataFile & {
+  return static_cast<WritableDataFile &>(**files_.get(active_file_id_));
 }
 
 auto TransientEngineState::active_file_ptr() const -> std::shared_ptr<DataFile> {
@@ -1852,7 +1856,7 @@ DB::DB(std::filesystem::path dir, Options opts)
     counters_.files_opened.store(file_count, std::memory_order_relaxed);
     s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
-    auto new_active = std::make_shared<DataFile>(dir_ / (stem + ".data"));
+    auto new_active = WritableDataFile::openForWrite(dir_ / (stem + ".data"));
     // +1 for the new active file.
     counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
     auto files_t = s.files.transient();
@@ -1886,9 +1890,8 @@ DB::~DB() {
   auto s = load_state_for_write();
   if (!s->files.empty()) {
     try {
-      auto &active = **s->files.get(s->active_file_id);
-      active.sync();
-      active.seal();
+      auto t = s->transient();
+      t.active_file().sync();
     } catch (...) {}
   }
   try {
@@ -2352,23 +2355,22 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 
 #pragma region File rotation
 
-// Seals the active file, dispatches hint file writing for it to the
-// background worker, and opens a new active file.
+// Opens a read-only mmap-backed file for the old active, dispatches hint
+// generation, and opens a new writable active file.
 // Caller must sync the active file before calling if durability is required.
 void DB::rotate_active_file(TransientEngineState &t,
                             const std::shared_ptr<const EngineState> &) {
-  t.active_file().seal();
-  auto sealed_file = t.active_file_ptr();
-  auto dir = dir_;
-  worker_.dispatch([f = std::move(sealed_file), d = std::move(dir)] {
-    flush_hints_for(f, d);
-  });
+  auto read_only_old = openDataFileForRead(t.active_file().path());
   const auto stem = make_data_file_stem();
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_rotate_file_creation);
 #endif
-  auto new_file = std::make_shared<DataFile>(dir_ / (stem + ".data"));
-  t.apply_rotate_file(std::move(new_file));
+  auto new_file = WritableDataFile::openForWrite(dir_ / (stem + ".data"));
+  t.apply_rotate_file(read_only_old, std::move(new_file));
+  auto dir = dir_;
+  worker_.dispatch([f = std::move(read_only_old), d = std::move(dir)] {
+    flush_hints_for(f, d);
+  });
 }
 
 #pragma endregion
@@ -2437,7 +2439,7 @@ void DB::flush_hints() {
 // Incomplete batches at EOF are silently discarded by the iterator.
 auto DB::vacuum_scan_and_copy(
     const std::shared_ptr<const EngineState> &snap,
-    const DataFile &source_file, DataFile &dest_file,
+    const DataFile &source_file, WritableDataFile &dest_file,
     std::uint32_t source_file_id) -> VacuumScanResult {
   VacuumScanResult result;
 
@@ -2544,17 +2546,16 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_vacuum_compact_tmp_create);
 #endif
-    DataFile tmp_file(tmp_data_path);
-    scan = vacuum_scan_and_copy(snap, old_file, tmp_file, file_id);
-    tmp_file.sync();
+    auto tmp_file = WritableDataFile::openForWrite(tmp_data_path);
+    scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id);
+    tmp_file->sync();
   }
 
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_vacuum_compact_rename);
 #endif
   std::filesystem::rename(tmp_data_path, final_data_path);
-  auto new_file = std::make_shared<DataFile>(final_data_path);
-  new_file->seal();
+  auto new_file = openDataFileForRead(final_data_path);
   flush_hints_for(new_file, dir_);
 
   {
@@ -2664,8 +2665,9 @@ void DB::resume() {
   auto current = load_state_for_write();
   if (!current->degraded) return;  // re-check under lock
 
-  const auto old_file_id = current->active_file_id;
-  auto &file = **current->files.get(old_file_id);
+  auto t = current->transient();
+  const auto old_file_id = t.active_file_id();
+  auto &file = t.active_file();
 
   // Scan the active file to find the last valid committed offset
   // and collect valid committed entries for key_dir replay. Entries written to
@@ -2691,29 +2693,26 @@ void DB::resume() {
     // Stop at first CRC error — valid_offset is the last known-good position.
   }
 
-  // If the file is already sealed, the failure occurred after rotation
-  // (e.g. creating the new active file). Skip truncate/sync/seal.
-  if (!file.is_sealed()) {
-    // Remove garbage bytes / orphaned batch markers via truncation.
-    if (file.size() != valid_offset) {
+  // Remove garbage bytes / orphaned batch markers via truncation.
+  if (std::filesystem::file_size(file.path()) != valid_offset) {
 #ifdef BYTECASK_TESTING
-      FAULT_INJECTION(io_resume_truncate);
+    FAULT_INJECTION(io_resume_truncate);
 #endif
-      file.truncate(valid_offset);  // throws std::system_error → stays degraded
-    }
-
-    // Sync the truncated file (may throw → stays degraded).
-#ifdef BYTECASK_TESTING
-    FAULT_INJECTION(io_resume_sync);
-#endif
-    file.sync();
-
-    file.seal();
+    file.truncate(valid_offset);  // throws std::system_error → stays degraded
   }
+
+  // Sync the truncated file (may throw → stays degraded).
+#ifdef BYTECASK_TESTING
+  FAULT_INJECTION(io_resume_sync);
+#endif
+  file.sync();
+
+  // Open the old active as read-only for hint generation.
+  auto read_only_old = openDataFileForRead(file.path());
 
   // Dispatch hint generation — idempotent (flush_hints_for skips files
   // whose .hint already exists).
-  worker_.dispatch([f = *current->files.get(old_file_id), d = dir_] {
+  worker_.dispatch([f = read_only_old, d = dir_] {
     flush_hints_for(f, d);
   });
 
@@ -2722,13 +2721,12 @@ void DB::resume() {
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_resume_file_creation);
 #endif
-  auto new_file = std::make_shared<DataFile>(dir_ / (stem + ".data"));
+  auto new_file = WritableDataFile::openForWrite(dir_ / (stem + ".data"));
 
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.
-  auto t = current->transient();
   t.apply_resume(old_file_id, committed, valid_offset);
-  t.apply_rotate_file(std::move(new_file));
+  t.apply_rotate_file(std::move(read_only_old), std::move(new_file));
   // All entries recovered from disk were previously synced.
   t.apply_sync(t.next_seq() > 0 ? t.next_seq() - 1 : 0);
   t.apply_clear_degraded();
@@ -2993,8 +2991,7 @@ auto DB::recovery_prepare_files(EngineState &s)
     }
 
     const auto file_id = s.next_file_id++;
-    auto data_file = std::make_shared<DataFile>(p);
-    data_file->seal();
+    auto data_file = openDataFileForRead(p);
     files_t.set(file_id, data_file);
 
     const auto hint_path = dir_ / (p.stem().string() + ".hint");

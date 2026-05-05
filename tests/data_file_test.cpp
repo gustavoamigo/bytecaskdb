@@ -10,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -36,7 +37,7 @@ TEST_CASE("DataFile::append: B3 full write + error return — file throws",
       std::filesystem::temp_directory_path() / "bc_test_b3_tainted.data";
   std::filesystem::remove(path);
 
-  bytecask::DataFile file{path};
+  auto file = bytecask::WritableDataFile::openForWrite(path);
   const auto key = to_bytes("hello");
   const auto val = to_bytes("world");
 
@@ -44,13 +45,13 @@ TEST_CASE("DataFile::append: B3 full write + error return — file throws",
     using PW = bytecask::testing::PostWriteMode;
     bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial",
                                               PW::throw_after};
-    REQUIRE_THROWS_AS(file.append_entry(1, bytecask::EntryType::Put, key, val),
+    REQUIRE_THROWS_AS(file->append_entry(1, bytecask::EntryType::Put, key, val),
                       std::system_error);
   }
 
   // Full entry on disk but writev reported an error — append threw.
   // No silent recovery is attempted; the engine degrades and resume() handles it.
-  CHECK(file.size() == 0); // offset_ not advanced — append threw before updating it
+  CHECK(file->size() == 0); // offset_ not advanced — append threw before updating it
 
   std::filesystem::remove(path);
 }
@@ -61,7 +62,7 @@ TEST_CASE("DataFile::append: B2 partial write — file throws",
       std::filesystem::temp_directory_path() / "bc_test_b2_tainted.data";
   std::filesystem::remove(path);
 
-  bytecask::DataFile file{path};
+  auto file = bytecask::WritableDataFile::openForWrite(path);
   const auto key = to_bytes("hello");
   const auto val = to_bytes("world");
 
@@ -69,11 +70,11 @@ TEST_CASE("DataFile::append: B2 partial write — file throws",
     using PW = bytecask::testing::PostWriteMode;
     bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial",
                                               PW::short_write, 5};
-    REQUIRE_THROWS_AS(file.append_entry(1, bytecask::EntryType::Put, key, val),
+    REQUIRE_THROWS_AS(file->append_entry(1, bytecask::EntryType::Put, key, val),
                       std::system_error);
   }
 
-  CHECK(file.size() == 0);
+  CHECK(file->size() == 0);
 
   std::filesystem::remove(path);
 }
@@ -84,7 +85,7 @@ TEST_CASE("DataFile::append_entries batches multiple entries into one writev",
       std::filesystem::temp_directory_path() / "bc_test_append_entries.data";
   std::filesystem::remove(path);
 
-  bytecask::DataFile file{path};
+  auto file = bytecask::WritableDataFile::openForWrite(path);
   const auto k0 = to_bytes("key0");
   const auto v0 = to_bytes("val0");
   const auto k1 = to_bytes("key1");
@@ -97,8 +98,8 @@ TEST_CASE("DataFile::append_entries batches multiple entries into one writev",
       {3, bytecask::EntryType::Delete, k2, {}},
   }};
   std::array<bytecask::Offset, 3> offsets{};
-  file.append_entries(entries, offsets);
-  file.sync();
+  file->append_entries(entries, offsets);
+  file->sync();
 
   // Offsets must be sequential and start at 0.
   CHECK(offsets[0] == 0);
@@ -108,20 +109,20 @@ TEST_CASE("DataFile::append_entries batches multiple entries into one writev",
   CHECK(offsets[2] == sz0 + sz1);
 
   // Round-trip: scan each entry and verify contents.
-  auto r0 = file.scan(offsets[0]);
+  auto r0 = file->scan(offsets[0]);
   REQUIRE(r0.has_value());
   CHECK(r0->first.sequence == 1);
   CHECK(r0->first.entry_type == bytecask::EntryType::Put);
   CHECK(std::equal(r0->first.key.begin(), r0->first.key.end(), k0.begin()));
   CHECK(std::equal(r0->first.value.begin(), r0->first.value.end(), v0.begin()));
 
-  auto r1 = file.scan(offsets[1]);
+  auto r1 = file->scan(offsets[1]);
   REQUIRE(r1.has_value());
   CHECK(r1->first.sequence == 2);
   CHECK(std::equal(r1->first.key.begin(), r1->first.key.end(), k1.begin()));
   CHECK(std::equal(r1->first.value.begin(), r1->first.value.end(), v1.begin()));
 
-  auto r2 = file.scan(offsets[2]);
+  auto r2 = file->scan(offsets[2]);
   REQUIRE(r2.has_value());
   CHECK(r2->first.sequence == 3);
   CHECK(r2->first.entry_type == bytecask::EntryType::Delete);
@@ -130,7 +131,7 @@ TEST_CASE("DataFile::append_entries batches multiple entries into one writev",
 
   // file.size() must equal total bytes written.
   const auto sz2 = bytecask::kHeaderSize + k2.size() + bytecask::kCrcSize;
-  CHECK(file.size() == sz0 + sz1 + sz2);
+  CHECK(file->size() == sz0 + sz1 + sz2);
 
   std::filesystem::remove(path);
 }

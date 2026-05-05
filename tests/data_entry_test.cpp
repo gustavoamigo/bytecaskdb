@@ -118,10 +118,10 @@ TEST_CASE("DataFile appends two entries with correct offsets and sequences",
   std::filesystem::remove(tmp);
 
   {
-    bytecask::DataFile df{tmp};
-    const auto offset0 = df.append_entry(1, bytecask::EntryType::Put,
+    auto df = bytecask::WritableDataFile::openForWrite(tmp);
+    const auto offset0 = df->append_entry(1, bytecask::EntryType::Put,
                                    to_bytes("key1"), to_bytes("val1"));
-    const auto offset1 = df.append_entry(2, bytecask::EntryType::Put,
+    const auto offset1 = df->append_entry(2, bytecask::EntryType::Put,
                                    to_bytes("key2"), to_bytes("val2"));
 
     CHECK(offset0 == 0);
@@ -131,7 +131,7 @@ TEST_CASE("DataFile appends two entries with correct offsets and sequences",
     CHECK(offset1 == entry0_size);
 
     // Explicit sync: batch both appends into one fdatasync call.
-    df.sync();
+    df->sync();
   }
 
   const auto raw = read_file_bytes(tmp);
@@ -164,21 +164,21 @@ TEST_CASE("DataFile::read round-trips entries at recorded offsets",
   const auto tmp = std::filesystem::temp_directory_path() / "bc_test_read.data";
   std::filesystem::remove(tmp);
 
-  bytecask::DataFile df{tmp};
-  const auto off0 = df.append_entry(7, bytecask::EntryType::Put, to_bytes("hello"),
+  auto df = bytecask::WritableDataFile::openForWrite(tmp);
+  const auto off0 = df->append_entry(7, bytecask::EntryType::Put, to_bytes("hello"),
                               to_bytes("world"));
   const auto off1 =
-      df.append_entry(8, bytecask::EntryType::Put, to_bytes("foo"), to_bytes("bar"));
-  df.sync();
+      df->append_entry(8, bytecask::EntryType::Put, to_bytes("foo"), to_bytes("bar"));
+  df->sync();
 
-  const auto r0 = df.scan(off0);
+  const auto r0 = df->scan(off0);
   REQUIRE(r0.has_value());
   CHECK(r0->first.sequence == 7U);
   CHECK(r0->first.entry_type == bytecask::EntryType::Put);
   CHECK(to_string(r0->first.key) == "hello");
   CHECK(to_string(r0->first.value) == "world");
 
-  const auto r1 = df.scan(off1);
+  const auto r1 = df->scan(off1);
   REQUIRE(r1.has_value());
   CHECK(r1->first.sequence == 8U);
   CHECK(r1->first.entry_type == bytecask::EntryType::Put);
@@ -208,10 +208,10 @@ TEST_CASE("DataFile::append byte layout matches serialize_entry", "[datafile]") 
 
   // DataFile::append via writev must produce identical bytes on disk.
   {
-    bytecask::DataFile df{tmp};
+    auto df = bytecask::WritableDataFile::openForWrite(tmp);
     [[maybe_unused]] auto off =
-        df.append_entry(seq, bytecask::EntryType::Put, to_bytes(key), to_bytes(value));
-    df.sync();
+        df->append_entry(seq, bytecask::EntryType::Put, to_bytes(key), to_bytes(value));
+    df->sync();
   }
 
   const auto actual = read_file_bytes(tmp);
