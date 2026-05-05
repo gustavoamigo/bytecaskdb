@@ -10,7 +10,7 @@
 
 import sys
 from pathlib import Path
-from textwrap import dedent, indent
+from textwrap import dedent
 
 from .scenario_matrix import (
     DMLShape, IndexShape, TxnShape, PluginFailureClass, generate_matrix
@@ -30,6 +30,7 @@ HEADER = '''\
 #include "fault_injector.h"
 
 #include <catch2/catch_test_macros.hpp>
+#include <system_error>
 
 using namespace bytecaskdb::testing;
 using namespace bytecask::testing;
@@ -52,7 +53,9 @@ def table_spec_code(index: IndexShape) -> str:
 
 def setup_code(dml: DMLShape) -> str:
     """Code to set up pre-existing rows needed for update/delete."""
-    if dml in (DMLShape.single_delete, DMLShape.single_update_index_change):
+    if dml in (DMLShape.single_delete, DMLShape.single_update_index_change,
+               DMLShape.single_update_no_index_change,
+               DMLShape.single_update_pk_change):
         return dedent("""\
             // Pre-insert a row to operate on.
             REQUIRE(h.insert_row({10, 20, 30}) == 0);
@@ -61,52 +64,144 @@ def setup_code(dml: DMLShape) -> str:
     return ""
 
 
-def dml_call(dml: DMLShape) -> str:
+def dml_call(dml: DMLShape, failure: PluginFailureClass) -> str:
+    """Generate the DML call, wrapping in try-catch for DML-time faults."""
+    raw_call = _raw_dml_call(dml)
+    if failure in dml_failure_classes():
+        # Wrap in try-catch — the fault throws std::system_error.
+        return f"bool threw = false;\n  try {{\n    {raw_call}\n    (void)rc;\n  }} catch (const std::system_error &) {{\n    threw = true;\n  }}"
+    return raw_call
+
+
+def _raw_dml_call(dml: DMLShape) -> str:
     if dml == DMLShape.single_insert:
         return "int rc = h.insert_row({100, 200, 300});"
     elif dml == DMLShape.single_delete:
         return "int rc = h.delete_row({10, 20, 30});"
     elif dml == DMLShape.single_update_index_change:
         return "int rc = h.update_row({10, 20, 30}, {10, 99, 30});"
+    elif dml == DMLShape.single_update_no_index_change:
+        # Change col[2] (not indexed) from 30 to 99.
+        return "int rc = h.update_row({10, 20, 30}, {10, 20, 99});"
+    elif dml == DMLShape.single_update_pk_change:
+        # Change the PK column (col[0]) from 10 to 50.
+        return "int rc = h.update_row({10, 20, 30}, {50, 20, 30});"
+    elif dml == DMLShape.multi_row_insert:
+        return "int rc = h.insert_row({100, 200, 300});\n    if (rc == 0) rc = h.insert_row({101, 201, 301});\n    if (rc == 0) rc = h.insert_row({102, 202, 302});"
     return "int rc = 0;"
 
 
-def fault_setup(failure: PluginFailureClass) -> str:
+def fault_setup(failure: PluginFailureClass, dml: DMLShape) -> str:
     config = resolve_fault(failure)
     if config.injector_name:
         return f'ScopedFaultInjector guard("{config.injector_name}");'
     return ""
 
 
-def fault_teardown(failure: PluginFailureClass) -> str:
-    """Code after DML for ENGINE_DEGRADED tests — the fault fires at commit."""
-    if failure == PluginFailureClass.ENGINE_DEGRADED:
+def occ_conflict_injection(failure: PluginFailureClass, dml: DMLShape) -> str:
+    """For OCC_CONFLICT, inject a concurrent write after DML (before commit)."""
+    if failure != PluginFailureClass.OCC_CONFLICT:
+        return ""
+    # Write the same key the DML operated on — creates W-W conflict.
+    if dml in (DMLShape.single_delete, DMLShape.single_update_index_change,
+               DMLShape.single_update_no_index_change,
+               DMLShape.single_update_pk_change):
+        return "h.inject_concurrent_write({10, 20, 30});"
+    elif dml == DMLShape.single_insert:
+        return "h.inject_concurrent_write({100, 200, 300});"
+    elif dml == DMLShape.multi_row_insert:
+        return "h.inject_concurrent_write({100, 200, 300});"
+    return ""
+
+
+def commit_failure_classes():
+    """Failure classes where fault fires at commit time (not during DML)."""
+    return {
+        PluginFailureClass.ENGINE_DEGRADED,
+        PluginFailureClass.ENGINE_IO_FAIL,
+        PluginFailureClass.OCC_CONFLICT,
+    }
+
+
+def dml_failure_classes():
+    """Failure classes where fault fires during DML (DML throws)."""
+    return {
+        PluginFailureClass.PLUGIN_INDEX_HALF_BUFFERED,
+    }
+
+
+def fault_teardown(failure: PluginFailureClass, txn: TxnShape) -> str:
+    """Code after DML for failure classes that fire at commit."""
+    if failure in commit_failure_classes():
         return "int commit_rc = h.commit();"
     return ""
 
 
-def assertions(dml: DMLShape, index: IndexShape,
-               failure: PluginFailureClass) -> str:
-    delta = expected_delta(dml, index, TxnShape.autocommit, failure)
-    lines = []
+def txn_wrapper_pre(txn: TxnShape, dml: DMLShape) -> str:
+    """Code before the main DML for multi_statement / with_savepoint."""
+    if txn == TxnShape.multi_statement:
+        return dedent("""\
+            // First statement in multi-statement txn.
+            REQUIRE(h.insert_row({1, 2, 3}) == 0);
+            h.stmt_boundary();
+        """).rstrip()
+    elif txn == TxnShape.with_savepoint:
+        return dedent("""\
+            // Insert a row, then set savepoint (simulated via commit+re-begin).
+            REQUIRE(h.insert_row({1, 2, 3}) == 0);
+            h.stmt_boundary();
+        """).rstrip()
+    return ""
 
-    if failure == PluginFailureClass.ENGINE_DEGRADED:
+
+def committed_row_count(dml: DMLShape) -> int:
+    """Row count after setup commits (before current transaction starts)."""
+    if dml in (DMLShape.single_delete, DMLShape.single_update_index_change,
+               DMLShape.single_update_no_index_change,
+               DMLShape.single_update_pk_change):
+        return 1
+    return 0
+
+
+def expected_final_count(dml: DMLShape, txn: TxnShape,
+                         failure: PluginFailureClass) -> int:
+    """Expected row counter after the test completes."""
+    base = committed_row_count(dml)
+    delta = expected_delta(dml, IndexShape.pk_only, txn, failure)
+
+    if failure != PluginFailureClass.SUCCESS:
+        # Failed transaction — everything in current txn is rolled back.
+        # Counter reverts to committed baseline.
+        return base
+
+    # SUCCESS: current transaction commits.
+    txn_pre_delta = 0
+    if txn in (TxnShape.multi_statement, TxnShape.with_savepoint):
+        txn_pre_delta = 1  # pre-insert of {1,2,3}
+
+    return base + txn_pre_delta + delta.row_count_delta
+
+
+def assertions(dml: DMLShape, index: IndexShape, txn: TxnShape,
+               failure: PluginFailureClass) -> str:
+    lines = []
+    base = committed_row_count(dml)
+    final = expected_final_count(dml, txn, failure)
+
+    if failure in commit_failure_classes():
         lines.append("// DML buffers successfully; fault fires at commit.")
         lines.append("REQUIRE(rc == 0);")
         lines.append("REQUIRE(commit_rc != 0);")
-    elif failure == PluginFailureClass.OCC_CONFLICT:
-        lines.append("// OCC conflict — commit should fail.")
-        lines.append("REQUIRE(rc == 0);")
+        lines.append(f"REQUIRE(h.row_counter() == {base});")
+    elif failure in dml_failure_classes():
+        lines.append("// Fault fires during DML; exception caught, state rolled back.")
+        lines.append("REQUIRE(threw);")
+        lines.append("h.rollback();")
+        lines.append(f"REQUIRE(h.row_counter() == {base});")
     else:
+        # SUCCESS path.
         lines.append("REQUIRE(rc == 0);")
-        if dml == DMLShape.single_insert:
-            lines.append("REQUIRE(h.row_counter() == 1);")
-        elif dml == DMLShape.single_delete:
-            lines.append("// Row counter decremented after delete.")
-            lines.append("REQUIRE(h.row_counter() == 0);")
-        elif dml == DMLShape.single_update_index_change:
-            lines.append("// Update does not change row count.")
-            lines.append("REQUIRE(h.row_counter() == 1);")
+        lines.append(f"REQUIRE(h.row_counter() == {final});")
 
     return "\n  ".join(lines)
 
@@ -118,17 +213,23 @@ def generate_test_case(dml: DMLShape, index: IndexShape,
 
     spec = table_spec_code(index)
     setup = setup_code(dml)
-    fault = fault_setup(failure)
-    call = dml_call(dml)
-    teardown = fault_teardown(failure)
-    asserts = assertions(dml, index, failure)
+    txn_pre = txn_wrapper_pre(txn, dml)
+    fault = fault_setup(failure, dml)
+    call = dml_call(dml, failure)
+    occ_inject = occ_conflict_injection(failure, dml)
+    teardown = fault_teardown(failure, txn)
+    asserts = assertions(dml, index, txn, failure)
 
     body_parts = [f"  {spec}", "  PluginTestHarness h(spec);"]
     if setup:
         body_parts.append(f"  {setup}")
+    if txn_pre:
+        body_parts.append(f"  {txn_pre}")
     if fault:
         body_parts.append(f"  {fault}")
     body_parts.append(f"  {call}")
+    if occ_inject:
+        body_parts.append(f"  {occ_inject}")
     if teardown:
         body_parts.append(f"  {teardown}")
     body_parts.append(f"  {asserts}")

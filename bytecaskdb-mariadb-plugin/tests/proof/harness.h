@@ -53,6 +53,12 @@ public:
   // Transaction control.
   int commit();
   void rollback();
+  void stmt_boundary();   // commit(all=false) — statement boundary within txn
+  void begin_stmt();      // external_lock(F_WRLCK) — start a new statement
+
+  // Injects a concurrent write to the same key the harness would use for
+  // the given column values. Creates an OCC conflict at commit time.
+  void inject_concurrent_write(const std::vector<int32_t> &column_values);
 
   // Inspection.
   bytecask::DB &db() { return holder_->db; }

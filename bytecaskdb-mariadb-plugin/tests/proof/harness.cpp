@@ -186,9 +186,12 @@ int PluginTestHarness::insert_row(const std::vector<int32_t> &column_values) {
 
 int PluginTestHarness::update_row(const std::vector<int32_t> &old_vals,
                                    const std::vector<int32_t> &new_vals) {
-  // Encode old record into record[1] temporarily.
+  // Simulate the read-before-update protocol: encode old PK and set
+  // current_row_key_ as if a prior read had positioned the cursor.
   std::vector<uchar> old_buf(share_.reclength, 0);
   fill_record(old_buf.data(), old_vals);
+  auto old_key = encode_pk(&table_, old_buf.data(), table_id_);
+  handler_->set_current_row_key(old_key);
 
   // Encode new record into record[0].
   fill_record(record_buf_.data(), new_vals);
@@ -197,16 +200,64 @@ int PluginTestHarness::update_row(const std::vector<int32_t> &old_vals,
 }
 
 int PluginTestHarness::delete_row(const std::vector<int32_t> &column_values) {
+  // Simulate the read-before-delete protocol.
   fill_record(record_buf_.data(), column_values);
+  auto key = encode_pk(&table_, record_buf_.data(), table_id_);
+  handler_->set_current_row_key(key);
+
   return handler_->delete_row(record_buf_.data());
 }
 
 int PluginTestHarness::commit() {
-  return txn_->commit(&thd_, true);
+  int rc = txn_->commit(&thd_, true);
+  // After full commit, re-begin to keep txn_cached_ usable for next DML.
+  handler_->external_lock(&thd_, F_WRLCK);
+  txn_ = static_cast<MariaDBTxn *>(thd_get_ha_data(&thd_, &hton_));
+  return rc;
 }
 
 void PluginTestHarness::rollback() {
   txn_->rollback(&thd_, true);
+  // After rollback, re-begin to keep txn_cached_ usable.
+  handler_->external_lock(&thd_, F_WRLCK);
+  txn_ = static_cast<MariaDBTxn *>(thd_get_ha_data(&thd_, &hton_));
+}
+
+void PluginTestHarness::stmt_boundary() {
+  txn_->commit(&thd_, false);
+  handler_->external_lock(&thd_, F_WRLCK);
+}
+
+void PluginTestHarness::begin_stmt() {
+  handler_->external_lock(&thd_, F_WRLCK);
+  txn_ = static_cast<MariaDBTxn *>(thd_get_ha_data(&thd_, &hton_));
+}
+
+void PluginTestHarness::inject_concurrent_write(
+    const std::vector<int32_t> &column_values) {
+  // Fill a temporary record buffer with the given values.
+  std::vector<uchar> buf(share_.reclength, 0);
+  for (uint i = 0; i < column_values.size() && i < share_.fields; ++i) {
+    int32_t v = column_values[i];
+    std::memcpy(buf.data() + share_.null_bytes + i * 4, &v, sizeof(v));
+    fields_[i]->ptr = buf.data() + share_.null_bytes + i * 4;
+  }
+
+  // Encode the PK for this row.
+  auto key = encode_pk(&table_, buf.data(), table_id_);
+
+  // Write directly to the DB, bypassing the transaction — this creates
+  // a concurrent modification that the harness's snapshot won't see.
+  auto key_view = bytecask::BytesView{
+      reinterpret_cast<const std::byte *>(key.data()), key.size()};
+  auto val_view = bytecask::BytesView{
+      reinterpret_cast<const std::byte *>(buf.data()), buf.size()};
+  holder_->db.put(bytecask::WriteOptions{.sync = true}, key_view, val_view);
+
+  // Restore field pointers to the main record buffer.
+  for (uint i = 0; i < fields_.size(); ++i) {
+    fields_[i]->ptr = record_buf_.data() + share_.null_bytes + i * 4;
+  }
 }
 
 int64_t PluginTestHarness::row_counter() const {

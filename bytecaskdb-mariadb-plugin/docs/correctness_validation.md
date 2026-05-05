@@ -362,8 +362,8 @@ under `BYTECASK_TESTING`):
 
 | Checkpoint | Location | Models |
 |---|---|---|
-| `plugin_after_row_count_update` | `ha_bytecaskdb::write_row` / `delete_row` after `track_row_count_delta` | P-INV-2 |
-| `plugin_after_pk_buffer` | inside `write_row` / `update_row` between PK and first secondary `buffer_put` | P-INV-1 |
+| `plugin_after_row_count_update` | `ha_bytecaskdb::write_row` after `track_row_count_delta` | P-INV-2 |
+| `plugin_after_pk_buffer` | `write_row` (after PK buffer, before secondary loop), `update_row` (after secondary loop, before PK write), `delete_row` (after secondary deletions, before PK deletion) | P-INV-1 |
 | `plugin_ddl_after_catalog_apply` | `ha_bytecaskdb::create` / `delete_table` after catalog `apply_batch` returns | P-INV-7 |
 
 These three checkpoints are the only genuine *internal* phase
@@ -506,15 +506,15 @@ Three `FAULT_INJECTION` macros are added under `BYTECASK_TESTING`:
 
 ```cpp
 // ha_bytecaskdb.cc, write_row():
-txn->track_row_count_delta(table_id_, +1);
-FAULT_INJECTION("plugin_after_row_count_update");
 txn->buffer_put(pk_view, row_view);
-FAULT_INJECTION("plugin_after_pk_buffer");  // before secondary loop
+FAULT_INJECTION(plugin_after_pk_buffer);  // before secondary loop
 for (uint i = 0; i < table->s->keys; ++i) { ... }
+txn->track_row_count_delta(table_id_, +1);
+FAULT_INJECTION(plugin_after_row_count_update);
 
 // ha_bytecaskdb.cc, create():
 db_->apply_batch({.sync=true}, std::move(catalog_plan));
-FAULT_INJECTION("plugin_ddl_after_catalog_apply");
+FAULT_INJECTION(plugin_ddl_after_catalog_apply);
 // ... rest of create() ...
 ```
 
@@ -605,10 +605,8 @@ infrastructure rather than duplicating it.
 
 ## Status
 
-**Phase 1 complete.** The framework is implemented and running. The
-first slice of the scenario matrix (3 DML × 3 index × 1 txn × 3
-failure = 24 generated tests) passes, plus 4 hand-written proof tests
-covering P-INV-1 through P-INV-4.
+**Phase 2 complete.** The scenario matrix has been expanded from 24 to
+195 generated proof tests. All pass.
 
 ### What is live
 
@@ -622,20 +620,18 @@ covering P-INV-1 through P-INV-4.
   creates a live `bytecask::DB`, builds `TABLE`/`KEY`/`Field`
   structures from a `TableSpec`, registers catalog metadata, and
   provides `insert_row`, `update_row`, `delete_row`, `commit`,
-  `rollback` entry points without a live MariaDB server.
+  `rollback`, `stmt_boundary`, `inject_concurrent_write` entry points
+  without a live MariaDB server.
 - **Generator pipeline** — `scenario_matrix.py`, `expected_delta.py`,
   `fault_point_resolver.py`, `generate_tests.py` produce
-  `tests/proof/generated/prove_plugin.cpp` (24 tests).
+  `tests/proof/generated/prove_plugin.cpp` (195 tests).
 - **Invariant helpers** — `tests/proof/invariants.h` provides
   `assert_counter_matches_pk_count` (P-INV-1),
   `assert_counter_delta` (P-INV-2),
   `assert_sec_index_count_matches_pk` (P-INV-3),
   `assert_error_code` (P-INV-6).
-- **Fault injection checkpoints** — `plugin_after_row_count_update`,
-  `plugin_after_pk_buffer` added to `ha_bytecaskdb.cc`.
-- **CMake targets** — `mariadb_proof_tests` (proof suite),
-  `mariadb_txn_tests` (transaction unit tests), `mariadb_plugin_tests`
-  (encoding/catalog unit tests).
+- **Fault injection checkpoints** — `plugin_after_pk_buffer` added to
+  `write_row`, `update_row`, and `delete_row` in `ha_bytecaskdb.cc`.
 
 ### Bugs found and fixed by the framework
 
@@ -646,24 +642,31 @@ covering P-INV-1 through P-INV-4.
   `MariaDBTxn::track_row_count_delta()`, which records the delta and
   reverts it in `rollback()` and on `commit()` failure paths.
 
+- **FAULT_INJECTION macro stringification mismatch.** Plugin call sites
+  passed string literals (`"plugin_after_pk_buffer"`) to the macro,
+  which uses `#name` stringification — producing double-quoted strings
+  that never matched `ScopedFaultInjector`'s stored name. Fixed by
+  using bare identifiers (matching engine convention).
+
 ### Current coverage
 
-| DML shapes | `single_insert`, `single_delete`, `single_update_index_change` |
+| Axis | Values |
 |---|---|
+| DML shapes | `single_insert`, `single_delete`, `single_update_index_change`, `single_update_no_index_change`, `single_update_pk_change`, `multi_row_insert` |
 | Index topologies | `pk_only`, `one_nonunique`, `one_unique` |
-| Transaction shapes | `autocommit` |
-| Failure classes | `SUCCESS`, `OCC_CONFLICT`, `ENGINE_DEGRADED` |
+| Transaction shapes | `autocommit`, `multi_statement`, `with_savepoint` |
+| Failure classes | `SUCCESS`, `OCC_CONFLICT`, `ENGINE_DEGRADED`, `ENGINE_IO_FAIL`, `PLUGIN_INDEX_HALF_BUFFERED` |
 
-Total: **28 proof test cases** (24 generated + 4 manual), **60 CTest
-cases** including existing unit tests.
+Total: **195 generated proof tests**, all passing.
 
 ### Next steps
 
-- Expand DML shapes: `single_update_no_index_change`,
-  `single_update_pk_change`, `multi_row_insert`, `mixed_batch`.
-- Expand transaction shapes: `multi_statement`, `with_savepoint`.
-- Add remaining failure classes: `ENGINE_IO_FAIL`,
-  `ENGINE_PARTIAL_COMMIT`, `PLUGIN_INDEX_HALF_BUFFERED`.
+- Expand DML shapes: `mixed_batch`, `replace_existing`,
+  `unique_dup_in_batch`.
+- Add index topologies: `multi_secondary`, `pk_less`.
+- Add transaction shapes: `concurrent_w_w`, `concurrent_unique`.
+- Add remaining failure classes: `ENGINE_PARTIAL_COMMIT`,
+  `PLUGIN_ROWCOUNT_BEFORE_COMMIT`, `PLUGIN_DDL_MIDPOINT`.
 - Add `assert_index_synchronised` (full bidirectional PK↔secondary
   check) to invariant helpers.
 - Target: ~250–350 generated proof tests covering the full matrix.

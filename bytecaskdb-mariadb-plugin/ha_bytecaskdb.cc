@@ -497,7 +497,7 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   // Buffer primary key operation.
   txn->buffer_put(key.data(), key.size(), val.data(), val.size());
 
-  FAULT_INJECTION("plugin_after_pk_buffer");
+  FAULT_INJECTION(plugin_after_pk_buffer);
 
   // Buffer secondary index operations.
   if (meta) {
@@ -524,7 +524,7 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
 
   txn->track_row_count_delta(table_id_, 1);
 
-  FAULT_INJECTION("plugin_after_row_count_update");
+  FAULT_INJECTION(plugin_after_row_count_update);
   return 0;
 }
 // ---------------------------------------------------------------------------
@@ -629,6 +629,8 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
     }
   }
 
+  FAULT_INJECTION(plugin_after_pk_buffer);
+
   if (old_pk == new_pk) {
     // PK unchanged — simple overwrite. (Always the case for PK-less tables.)
     txn->buffer_put(new_pk.data(), new_pk.size(),
@@ -684,6 +686,8 @@ int ha_bytecaskdb::delete_row(const uchar *buf) {
       txn->buffer_del(sec_key.data(), sec_key.size());
     }
   }
+
+  FAULT_INJECTION(plugin_after_pk_buffer);
 
   // Buffer primary key deletion.
   txn->buffer_del(key.data(), key.size());

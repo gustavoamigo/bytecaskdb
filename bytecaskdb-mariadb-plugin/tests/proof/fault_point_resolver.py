@@ -25,4 +25,10 @@ def resolve_fault(failure: PluginFailureClass) -> FaultConfig:
     if failure == PluginFailureClass.ENGINE_DEGRADED:
         return FaultConfig(injector_name="io_data_file_append")
 
+    if failure == PluginFailureClass.ENGINE_IO_FAIL:
+        return FaultConfig(injector_name="io_data_file_sync")
+
+    if failure == PluginFailureClass.PLUGIN_INDEX_HALF_BUFFERED:
+        return FaultConfig(injector_name="plugin_after_pk_buffer")
+
     return FaultConfig()

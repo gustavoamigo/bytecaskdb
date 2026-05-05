@@ -195,6 +195,12 @@ public:
   int get_foreign_key_list(THD *thd,
                            List<FOREIGN_KEY_INFO> *f_key_list) override;
 
+#ifdef PLUGIN_TESTING
+  void set_current_row_key(const std::vector<uint8_t> &key) {
+    current_row_key_ = key;
+  }
+#endif
+
 private:
   // Saves `current_row_key_` from a slice the iterator gave us.
   void save_current_row_key(const uint8_t *data, std::size_t len);
