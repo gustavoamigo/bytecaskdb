@@ -9,6 +9,7 @@
 #include "fault_injector.h"
 
 #include <catch2/catch_test_macros.hpp>
+#include <system_error>
 
 using namespace bytecaskdb::testing;
 using namespace bytecask::testing;
@@ -42,6 +43,152 @@ TEST_CASE("prove_plugin__single_insert__pk_only__autocommit__ENGINE_DEGRADED", "
   // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
   REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__pk_only__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__pk_only__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.insert_row({100, 200, 300});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_insert__pk_only__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__pk_only__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__pk_only__with_savepoint__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.insert_row({100, 200, 300});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_insert__pk_only__with_savepoint__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__pk_only__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
 }
 
 TEST_CASE("prove_plugin__single_insert__one_nonunique__autocommit__SUCCESS", "[prove_plugin]") {
@@ -75,6 +222,239 @@ TEST_CASE("prove_plugin__single_insert__one_nonunique__autocommit__ENGINE_DEGRAD
   // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
   REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_nonunique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_nonunique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.insert_row({100, 200, 300});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_nonunique__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.insert_row({100, 200, 300});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_nonunique__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_nonunique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_nonunique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.insert_row({100, 200, 300});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_nonunique__with_savepoint__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.insert_row({100, 200, 300});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_nonunique__with_savepoint__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_nonunique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_nonunique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.insert_row({100, 200, 300});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 0);
 }
 
 TEST_CASE("prove_plugin__single_insert__one_unique__autocommit__SUCCESS", "[prove_plugin]") {
@@ -108,6 +488,239 @@ TEST_CASE("prove_plugin__single_insert__one_unique__autocommit__ENGINE_DEGRADED"
   // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
   REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_unique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_unique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.insert_row({100, 200, 300});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_unique__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.insert_row({100, 200, 300});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_unique__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_unique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_unique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.insert_row({100, 200, 300});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_unique__with_savepoint__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.insert_row({100, 200, 300});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_unique__with_savepoint__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_unique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__single_insert__one_unique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.insert_row({100, 200, 300});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 0);
 }
 
 TEST_CASE("prove_plugin__single_delete__pk_only__autocommit__SUCCESS", "[prove_plugin]") {
@@ -124,7 +737,6 @@ REQUIRE(h.commit() == 0);
   int rc = h.delete_row({10, 20, 30});
 
   REQUIRE(rc == 0);
-  // Row counter decremented after delete.
   REQUIRE(h.row_counter() == 0);
 }
 
@@ -141,8 +753,14 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.delete_row({10, 20, 30});
 
-  // OCC conflict — commit should fail.
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
 }
 
 TEST_CASE("prove_plugin__single_delete__pk_only__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
@@ -165,6 +783,234 @@ REQUIRE(h.commit() == 0);
   // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
   REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__pk_only__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__pk_only__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.delete_row({10, 20, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__pk_only__multi_statement__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.delete_row({10, 20, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__pk_only__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__pk_only__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__pk_only__with_savepoint__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.delete_row({10, 20, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__pk_only__with_savepoint__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.delete_row({10, 20, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__pk_only__with_savepoint__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__pk_only__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
 }
 
 TEST_CASE("prove_plugin__single_delete__one_nonunique__autocommit__SUCCESS", "[prove_plugin]") {
@@ -182,7 +1028,6 @@ REQUIRE(h.commit() == 0);
   int rc = h.delete_row({10, 20, 30});
 
   REQUIRE(rc == 0);
-  // Row counter decremented after delete.
   REQUIRE(h.row_counter() == 0);
 }
 
@@ -200,8 +1045,14 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.delete_row({10, 20, 30});
 
-  // OCC conflict — commit should fail.
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
 }
 
 TEST_CASE("prove_plugin__single_delete__one_nonunique__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
@@ -225,6 +1076,335 @@ REQUIRE(h.commit() == 0);
   // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
   REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_nonunique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_nonunique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.delete_row({10, 20, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_nonunique__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.delete_row({10, 20, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_nonunique__multi_statement__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.delete_row({10, 20, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_nonunique__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_nonunique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_nonunique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.delete_row({10, 20, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_nonunique__with_savepoint__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.delete_row({10, 20, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_nonunique__with_savepoint__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.delete_row({10, 20, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_nonunique__with_savepoint__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_nonunique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_nonunique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.delete_row({10, 20, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
 }
 
 TEST_CASE("prove_plugin__single_delete__one_unique__autocommit__SUCCESS", "[prove_plugin]") {
@@ -242,7 +1422,6 @@ REQUIRE(h.commit() == 0);
   int rc = h.delete_row({10, 20, 30});
 
   REQUIRE(rc == 0);
-  // Row counter decremented after delete.
   REQUIRE(h.row_counter() == 0);
 }
 
@@ -260,8 +1439,14 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.delete_row({10, 20, 30});
 
-  // OCC conflict — commit should fail.
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
 }
 
 TEST_CASE("prove_plugin__single_delete__one_unique__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
@@ -285,6 +1470,335 @@ REQUIRE(h.commit() == 0);
   // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
   REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_unique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_unique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.delete_row({10, 20, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_unique__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.delete_row({10, 20, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_unique__multi_statement__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.delete_row({10, 20, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_unique__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_unique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_unique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.delete_row({10, 20, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_unique__with_savepoint__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.delete_row({10, 20, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_unique__with_savepoint__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.delete_row({10, 20, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_unique__with_savepoint__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_unique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.delete_row({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_delete__one_unique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.delete_row({10, 20, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__pk_only__autocommit__SUCCESS", "[prove_plugin]") {
@@ -301,7 +1815,6 @@ REQUIRE(h.commit() == 0);
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
   REQUIRE(rc == 0);
-  // Update does not change row count.
   REQUIRE(h.row_counter() == 1);
 }
 
@@ -318,8 +1831,14 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  // OCC conflict — commit should fail.
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__pk_only__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
@@ -342,6 +1861,234 @@ REQUIRE(h.commit() == 0);
   // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
   REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__pk_only__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__pk_only__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__pk_only__multi_statement__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__pk_only__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__pk_only__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__pk_only__with_savepoint__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__pk_only__with_savepoint__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__pk_only__with_savepoint__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__pk_only__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__autocommit__SUCCESS", "[prove_plugin]") {
@@ -359,7 +2106,6 @@ REQUIRE(h.commit() == 0);
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
   REQUIRE(rc == 0);
-  // Update does not change row count.
   REQUIRE(h.row_counter() == 1);
 }
 
@@ -377,8 +2123,14 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  // OCC conflict — commit should fail.
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
@@ -402,6 +2154,335 @@ REQUIRE(h.commit() == 0);
   // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
   REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__multi_statement__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__with_savepoint__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__with_savepoint__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__with_savepoint__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_unique__autocommit__SUCCESS", "[prove_plugin]") {
@@ -419,7 +2500,6 @@ REQUIRE(h.commit() == 0);
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
   REQUIRE(rc == 0);
-  // Update does not change row count.
   REQUIRE(h.row_counter() == 1);
 }
 
@@ -437,8 +2517,14 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  // OCC conflict — commit should fail.
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_unique__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
@@ -462,4 +2548,2235 @@ REQUIRE(h.commit() == 0);
   // DML buffers successfully; fault fires at commit.
   REQUIRE(rc == 0);
   REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_unique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_unique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_unique__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_unique__multi_statement__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_unique__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_unique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_unique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_unique__with_savepoint__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_unique__with_savepoint__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_unique__with_savepoint__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_unique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_index_change__one_unique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {10, 99, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__autocommit__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__autocommit__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__multi_statement__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__with_savepoint__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__with_savepoint__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__with_savepoint__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__autocommit__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__autocommit__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__multi_statement__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__with_savepoint__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__with_savepoint__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__with_savepoint__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__autocommit__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__autocommit__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__multi_statement__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__with_savepoint__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 2);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__with_savepoint__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__with_savepoint__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  // Insert a row, then set savepoint (simulated via commit+re-begin).
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {10, 20, 99});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__pk_only__autocommit__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__pk_only__autocommit__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__pk_only__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__pk_only__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__one_nonunique__autocommit__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__one_nonunique__autocommit__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__one_nonunique__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__one_nonunique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__one_nonunique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__one_unique__autocommit__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__one_unique__autocommit__OCC_CONFLICT", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+
+  h.inject_concurrent_write({10, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__one_unique__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__one_unique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__single_update_pk_change__one_unique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // Pre-insert a row to operate on.
+REQUIRE(h.insert_row({10, 20, 30}) == 0);
+REQUIRE(h.commit() == 0);
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.update_row({10, 20, 30}, {50, 20, 30});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 1);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__pk_only__autocommit__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 3);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__pk_only__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__pk_only__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__pk_only__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 4);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__pk_only__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__pk_only__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__autocommit__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 3);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 4);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, false, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_unique__autocommit__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 3);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_unique__autocommit__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_unique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_unique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_unique__multi_statement__SUCCESS", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  REQUIRE(rc == 0);
+  REQUIRE(h.row_counter() == 4);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_unique__multi_statement__ENGINE_DEGRADED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_append");
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_unique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("io_data_file_sync");
+
+  int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+
+  int commit_rc = h.commit();
+
+  // DML buffers successfully; fault fires at commit.
+  REQUIRE(rc == 0);
+  REQUIRE(commit_rc != 0);
+  REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("prove_plugin__multi_row_insert__one_unique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
+  TableSpec spec;
+  spec.num_int_columns = 3;
+  spec.has_pk = true;
+  spec.secondary_indexes.push_back({1, 1, true, {1}});
+
+  PluginTestHarness h(spec);
+
+  // First statement in multi-statement txn.
+REQUIRE(h.insert_row({1, 2, 3}) == 0);
+h.stmt_boundary();
+
+  ScopedFaultInjector guard("plugin_after_pk_buffer");
+
+  bool threw = false;
+  try {
+    int rc = h.insert_row({100, 200, 300});
+    if (rc == 0) rc = h.insert_row({101, 201, 301});
+    if (rc == 0) rc = h.insert_row({102, 202, 302});
+    (void)rc;
+  } catch (const std::system_error &) {
+    threw = true;
+  }
+
+  // Fault fires during DML; exception caught, state rolled back.
+  REQUIRE(threw);
+  h.rollback();
+  REQUIRE(h.row_counter() == 0);
 }
