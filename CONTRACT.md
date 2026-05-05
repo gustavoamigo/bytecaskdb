@@ -37,8 +37,8 @@ degrades the engine does so *without* publishing the failed transition:
 - Class C (orphaned BulkBegin): same as B — the partial batch is never
   applied to in-memory state.
 - Classes F, G (sync failures): bytes are in the page cache but the
-  key-directory changes are not published. `next_lsn` advances to
-  prevent LSN reuse, but no key-value changes become visible.
+  key-directory changes are not published. `next_seq` advances to
+  prevent sequence reuse, but no key-value changes become visible.
 - Class H (rotation failure): the write succeeded and was published, but
   the rotation to a new file failed. The published state is consistent
   with what recovery would find — the committed entries are on disk.
@@ -109,7 +109,7 @@ Specifically:
   followed by `del(k)`, `get(k)` must return false. If it contains
   `del(k)` followed by `put(k, v2)`, `get(k)` must return `v2`.
 - **Across files**: when a key exists in multiple data files (e.g.
-  after file rotation), the entry with the highest LSN determines
+  after file rotation), the entry with the highest sequence determines
   the key's state. Recovery must produce the same result regardless
   of which files are replayed first.
 
@@ -146,7 +146,7 @@ If any I/O operation (append, sync) throws during execution:
 
 - The caller must receive the exception.
 - The published key directory must reflect zero operations from this call.
-  `next_lsn` must be advanced past all LSNs consumed by appends that reached
+  `next_seq` must be advanced past all sequences consumed by appends that reached
   the file, to prevent reuse of those sequence numbers on the next write.
 - The disk may contain none, some, or all of the bytes from this write.
   The engine must not assume what was written. Any append failure —
@@ -196,20 +196,20 @@ Degrading is an acceptable outcome. The engine must not:
 3. Continue operating with inconsistent in-memory state without
    signaling the divergence.
 
-### Sequence Numbers (LSN)
+### Sequence Numbers
 
-Every append to disk must consume a sequence number from `next_lsn`.
+Every append to disk must consume a sequence number from `next_seq`.
 Every entry written to disk — including `BulkBegin` and `BulkEnd`
-markers — must consume one LSN.
+markers — must consume one sequence.
 
-**On success**: `next_lsn` in the published state must be advanced
-past all consumed LSNs. Each `KeyDirEntry` in `key_dir` must record
-the LSN of its write.
+**On success**: `next_seq` in the published state must be advanced
+past all consumed sequences. Each `KeyDirEntry` in `key_dir` must record
+the sequence of its write.
 
-**On failure**: the local working copy of `next_lsn` must be discarded
-along with the rest of the local state. The published `next_lsn` must
+**On failure**: the local working copy of `next_seq` must be discarded
+along with the rest of the local state. The published `next_seq` must
 be unchanged — the engine must only publish new state after all I/O
-and mutations succeed. LSNs consumed by the failed partial write are now
+and mutations succeed. sequences consumed by the failed partial write are now
 on disk but not reflected in the published counter.
 
 **Must be true, always:**
@@ -221,47 +221,47 @@ on disk but not reflected in the published counter.
 
 - **Uniqueness per key.** Two entries for different logical writes
   must not share a sequence number for the same key with different
-  values. Same key, same LSN, same value is harmless — it is a
+  values. Same key, same sequence, same value is harmless — it is a
   duplicate of the same write and recovery handles it. Same key, same
-  LSN, different value is undefined behavior.
+  sequence, different value is undefined behavior.
 
-- **next_lsn strictly greater than all on-disk LSNs.** `next_lsn`
+- **next_seq strictly greater than all on-disk sequences.** `next_seq`
   must always be greater than any sequence number that exists on disk.
-  A future write must never reuse an LSN already present on disk.
+  A future write must never reuse an sequence already present on disk.
 
-- **next_lsn advances past all consumed LSNs.** If an append fails
-  (classes B1, B2, B3), `next_lsn` must be advanced past all LSNs consumed
+- **next_seq advances past all consumed sequences.** If an append fails
+  (classes B1, B2, B3), `next_seq` must be advanced past all sequences consumed
   by the failed call. Whether or not bytes reached disk is indeterminate from
   userspace — POSIX does not guarantee that `writev = -1` means no bytes were
   written (FUSE and network filesystems may write bytes and still return an
   error). The engine always advances conservatively: gaps are safe, reuse is
   not. If an append reaches disk but the subsequent `fdatasync` fails
-  (classes F and G), `next_lsn` must likewise be advanced past all consumed
-  LSNs. The bytes are in the page cache; reusing those LSNs on the next write
+  (classes F and G), `next_seq` must likewise be advanced past all consumed
+  sequences. The bytes are in the page cache; reusing those sequences on the next write
   would create ambiguous sequence numbers for the same key. Key-directory
   changes are not published in these cases — the write is not visible to
   callers. The engine degrades on F and G: `resume()` is required before
   further writes are accepted. Gaps are safe. Reuse is not.
 
-- **Recovery produces the same next_lsn as a clean run.** Given the
+- **Recovery produces the same next_seq as a clean run.** Given the
   same committed writes, opening a fresh DB from disk must produce
-  `next_lsn == max(all committed sequences) + 1`, regardless of
+  `next_seq == max(all committed sequences) + 1`, regardless of
   failed partial writes on disk.
 
-- **Markers consume their own LSNs.** `BulkBegin` and `BulkEnd`
-  markers must each consume one LSN. A failed batch must not leave a marker
-  LSN that gets reused by a data entry in a subsequent write.
+- **Markers consume their own sequences.** `BulkBegin` and `BulkEnd`
+  markers must each consume one sequence. A failed batch must not leave a marker
+  sequence that gets reused by a data entry in a subsequent write.
 
-- **No caller obligation for LSN safety.** The engine must guarantee
+- **No caller obligation for sequence safety.** The engine must guarantee
   that after any failure, a subsequent `apply_batch` call with any
-  valid `WritePlan` will not produce LSN reuse. The caller must be
+  valid `WritePlan` will not produce sequence reuse. The caller must be
   free to retry with any plan, modify the plan, or abandon it
   entirely.
 
-**Gaps are safe, reuse is not.** Nothing in the engine requires LSN
-contiguity. All operations that depend on LSN comparison must use strict
+**Gaps are safe, reuse is not.** Nothing in the engine requires sequence
+contiguity. All operations that depend on sequence comparison must use strict
 `<`, never equality for ordering or arithmetic on gaps. Duplicate
-LSNs are the actual risk.
+sequences are the actual risk.
 
 ### Durable Sequence (`durable_seq`)
 
@@ -506,7 +506,7 @@ to readers.
 
 | Invariant | Rationale |
 |-----------|-----------|
-| `next_lsn` must not regress | Prevents LSN reuse (§Sequence Numbers). |
+| `next_seq` must not regress | Prevents sequence reuse (§Sequence Numbers). |
 | `active_file_id` must not regress | File IDs are monotonically assigned; rotation only moves forward. |
 | `next_file_id` must not regress | Same monotonicity as `active_file_id`. |
 | `durable_seq` must not regress | Confirmed-durable sequences cannot un-sync. |
@@ -517,7 +517,7 @@ reads remain available). Cost: three integer comparisons per write.
 ### Hot-path checks (debug builds only)
 
 Under `NDEBUG=0`, `store_state` additionally walks the key directory
-to verify `next_lsn > max(all key_dir sequences)`. This is O(n) and
+to verify `next_seq > max(all key_dir sequences)`. This is O(n) and
 too expensive for release builds.
 
 ### Cold-path checks (open, resume — always on)
@@ -529,7 +529,7 @@ published state after `DB::open()` and `resume()`:
 |-----------|------|
 | Active file exists in files registry | O(1) |
 | No dangling file references in key_dir | O(n) |
-| `next_lsn > max(all key_dir sequences)` | O(n) |
+| `next_seq > max(all key_dir sequences)` | O(n) |
 | `file_stats` covers all files | O(f) |
 | `live_bytes` matches key_dir | O(n) |
 

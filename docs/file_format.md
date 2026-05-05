@@ -34,7 +34,7 @@ data_{YYYYMMDDHHmmss}_{RRRR}_V{XX}
 
 | Field              | Description |
 |--------------------|-------------|
-| `YYYYMMDDHHmmss`   | UTC timestamp at second precision. Records when the file was created on disk — **not** the age of its content. After compaction, a file may contain entries much older than its timestamp. |
+| `YYYYMMDDHHmmss`   | UTC timestamp at second precision. Records when the file was created on disk — **not** the age of its content. After vacuum, a file may contain entries much older than its timestamp. |
 | `RRRRRRRR`           | 4-byte random hex salt (8 characters, `00000000`–`ffffffff`). Prevents collisions when multiple files are created within the same second. |
 | `V{XX}`            | File format version. `V01` is the initial version. The engine uses this to select the correct parser at open time. |
 
