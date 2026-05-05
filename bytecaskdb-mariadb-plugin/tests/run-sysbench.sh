@@ -19,10 +19,11 @@ set -euo pipefail
 # Defaults
 # ---------------------------------------------------------------------------
 TABLE_SIZE=50000
-THREADS="1,8"
-DURATION=30
-#WORKLOADS="oltp_point_select oltp_read_only oltp_write_only oltp_insert oltp_read_write"
-WORKLOADS="oltp_point_select oltp_insert oltp_read_only oltp_read_write"
+THREADS="1,16"
+DURATION=10
+WORKLOADS="oltp_point_select oltp_read_only oltp_write_only oltp_insert oltp_read_write"
+#WORKLOADS="oltp_read_only:points_only oltp_read_only:ranges_only oltp_read_only:simple_range oltp_read_only:sum_range oltp_read_only:order_range oltp_read_only:distinct_range"
+#WORKLOADS="oltp_read_only:points_only oltp_read_only:ranges_only oltp_read_only:simple_range oltp_read_only:sum_range oltp_read_only:order_range oltp_read_only:distinct_range"
 
 BYTECASKDB_PORT=3320
 INNODB_PORT=3321
@@ -64,18 +65,28 @@ ROCKSDB_DIR="$BYTECASK_ROOT/.mariadb_sysbench_rocksdb"
 command -v sysbench >/dev/null 2>&1 || { echo "ERROR: sysbench not found"; exit 1; }
 command -v mariadbd >/dev/null 2>&1 || { echo "ERROR: mariadbd not found"; exit 1; }
 
+# ---------------------------------------------------------------------------
+# Build plugin in Release mode
+# ---------------------------------------------------------------------------
+echo "=== Building ByteCaskDB plugin (Release) ==="
+PLUGIN_SRC="$BYTECASK_ROOT/bytecaskdb-mariadb-plugin"
+cmake -S "$PLUGIN_SRC" -B "$PLUGIN_DIR" -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1
+cmake --build "$PLUGIN_DIR" --parallel --target ha_bytecaskdb >/dev/null 2>&1 || {
+  echo "ERROR: plugin build failed"; exit 1;
+}
+
 if [[ ! -f "$PLUGIN_DIR/ha_bytecaskdb.so" ]]; then
-  echo "ERROR: $PLUGIN_DIR/ha_bytecaskdb.so not found — build the plugin first"
+  echo "ERROR: $PLUGIN_DIR/ha_bytecaskdb.so not found after build"
   exit 1
 fi
 
 ROCKSDB_PLUGIN_DIR=""
-for system_dir in /usr/lib64/mariadb/plugin /usr/lib/mariadb/plugin; do
-  if [[ -f "$system_dir/ha_rocksdb.so" ]]; then
-    ROCKSDB_PLUGIN_DIR="$system_dir"
-    break
-  fi
-done
+# for system_dir in /usr/lib64/mariadb/plugin /usr/lib/mariadb/plugin; do
+#   if [[ -f "$system_dir/ha_rocksdb.so" ]]; then
+#     ROCKSDB_PLUGIN_DIR="$system_dir"
+#     break
+#   fi
+# done
 if [[ -z "$ROCKSDB_PLUGIN_DIR" ]]; then
   echo "WARNING: ha_rocksdb.so not found — RocksDB benchmarks will be skipped"
   echo "  Install with: sudo dnf install MariaDB-rocksdb-engine (or equivalent)"
@@ -170,7 +181,7 @@ cleanup() {
   stop_mariadbd "$INNODB_DIR/mariadbd.pid" "$INNODB_DIR"
   stop_mariadbd "$ROCKSDB_DIR/mariadbd.pid" "$ROCKSDB_DIR"
 }
-trap cleanup EXIT INT TERM
+trap cleanup INT TERM
 
 # ---------------------------------------------------------------------------
 # Start instances
@@ -226,20 +237,37 @@ run_bench() {
   local socket="$4"
   local threads="$5"
   local storage_engine="$6"
+  shift 6
+  local extra_args="$*"
+
+  # Parse workload variant: "oltp_read_only:points_only" → base + extra flags
+  local base_workload="$workload"
+  local variant_args=""
+  if [[ "$workload" == *:* ]]; then
+    base_workload="${workload%%:*}"
+    local variant="${workload##*:}"
+    case "$variant" in
+      points_only)    variant_args="--range-selects=off" ;;
+      ranges_only)    variant_args="--point-selects=0" ;;
+      simple_range)   variant_args="--point-selects=0 --sum-ranges=0 --order-ranges=0 --distinct-ranges=0" ;;
+      sum_range)      variant_args="--point-selects=0 --simple-ranges=0 --order-ranges=0 --distinct-ranges=0" ;;
+      order_range)    variant_args="--point-selects=0 --simple-ranges=0 --sum-ranges=0 --distinct-ranges=0" ;;
+      distinct_range) variant_args="--point-selects=0 --simple-ranges=0 --sum-ranges=0 --order-ranges=0" ;;
+    esac
+  fi
 
   local args
   args="$(common_args "$port" "$socket" "$threads")"
 
   # Prepare
-  sysbench "$workload" $args --mysql_storage_engine="$storage_engine" prepare >/dev/null 2>&1
+  sysbench "$base_workload" $args --mysql_storage_engine="$storage_engine" prepare >/dev/null 2>&1
 
   # Run and capture output
   local output
-  output="$(sysbench "$workload" $args --mysql-ignore-errors=1180,1213  run 2>&1)"
+  output="$(sysbench "$base_workload" $args $variant_args --mysql-ignore-errors=1180,1213 run 2>&1)"
 
-# FATAL: `thread_run' function failed: /usr/share/sysbench/oltp_common.lua:469: SQL error, errno = 1213, state = '40001': Deadlock found when trying to get lock; try restarting transaction (snapshot conflict)
-  # Cleanup
-  sysbench "$workload" $args cleanup >/dev/null 2>&1
+  # Cleanup (skip — keep data for EXPLAIN)
+  # sysbench "$base_workload" $args cleanup >/dev/null 2>&1
 
   # Extract metrics (sysbench 1.0 outputs only one percentile: 95th by default)
   local tps avg_lat p95
@@ -361,3 +389,12 @@ else
 fi
 echo ""
 echo "Results saved to: $RESULTS_CSV"
+
+echo ""
+echo "=== Instances still running (Ctrl+C to stop) ==="
+echo "  ByteCaskDB: mariadb --socket=$BYTECASKDB_DIR/mysql.sock -u root sbtest"
+echo "  InnoDB:     mariadb --socket=$INNODB_DIR/mysql.sock -u root sbtest"
+echo ""
+# echo "Press Enter to shut down..."
+# read -r
+cleanup

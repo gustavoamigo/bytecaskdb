@@ -124,9 +124,7 @@ bool MariaDBTxn::exists(const uint8_t *key, size_t klen) {
 }
 
 // Helpers to extract a single iterator from a subrange<It, sentinel> by
-// moving its begin(). We can do this safely because the underlying iterator
-// is the only stateful piece — the sentinel is either default_sentinel_t
-// (forward) or another iterator value (reverse).
+// moving its begin(). Both forward and reverse now use default_sentinel_t.
 
 std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_prefix(
     const uint8_t *lo, size_t lo_len,
@@ -182,10 +180,8 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_index_prefix(
   }
 
   std::optional<bytecask::ReverseEntryIterator> snap_it;
-  bytecask::ReverseEntryIterator snap_end{};
   if (snap_) {
     auto range = snap_->riter_from({}, as_view(hi, hi_len));
-    snap_end = range.end();
     snap_it.emplace(std::move(range.begin()));
   }
 
@@ -197,8 +193,7 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_index_prefix(
   }
 
   return std::make_unique<MergeIterator>(
-      std::move(snap_it), std::move(snap_end),
-      buf_it, lookup_.end(), std::move(lo_vec),
+      std::move(snap_it), buf_it, lookup_.end(), std::move(lo_vec),
       table_id, index_id);
 }
 
@@ -211,10 +206,8 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
   }
 
   std::optional<bytecask::ReverseEntryIterator> snap_it;
-  bytecask::ReverseEntryIterator snap_end{};
   if (snap_) {
     auto range = snap_->riter_from({}, as_view(hi, hi_len));
-    snap_end = range.end();
     snap_it.emplace(std::move(range.begin()));
   }
 
@@ -226,8 +219,7 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
   }
 
   return std::make_unique<MergeIterator>(
-      std::move(snap_it), std::move(snap_end),
-      buf_it, lookup_.end(), std::move(lo_vec), table_id);
+      std::move(snap_it), buf_it, lookup_.end(), std::move(lo_vec), table_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -384,13 +376,11 @@ MariaDBTxn::MergeIterator::MergeIterator(
 
 MariaDBTxn::MergeIterator::MergeIterator(
     std::optional<bytecask::ReverseEntryIterator> snap_it,
-    bytecask::ReverseEntryIterator snap_end,
     LookupMap::const_iterator buf_it,
     LookupMap::const_iterator buf_end,
     std::vector<uint8_t> lo,
     uint32_t table_id)
     : snap_rev_(std::move(snap_it)),
-      snap_rev_end_(std::move(snap_end)),
       reverse_(true),
       buf_it_(buf_it),
       buf_end_(buf_end),
@@ -402,13 +392,11 @@ MariaDBTxn::MergeIterator::MergeIterator(
 
 MariaDBTxn::MergeIterator::MergeIterator(
     std::optional<bytecask::ReverseEntryIterator> snap_it,
-    bytecask::ReverseEntryIterator snap_end,
     LookupMap::const_iterator buf_it,
     LookupMap::const_iterator buf_end,
     std::vector<uint8_t> lo,
     uint32_t table_id, uint16_t index_id)
     : snap_rev_(std::move(snap_it)),
-      snap_rev_end_(std::move(snap_end)),
       reverse_(true),
       buf_it_(buf_it),
       buf_end_(buf_end),
@@ -429,8 +417,8 @@ bool MariaDBTxn::MergeIterator::snap_at_end() const {
     if (!snap_fwd_) return true;
     return *snap_fwd_ == std::default_sentinel;
   }
-  if (!snap_rev_ || !snap_rev_end_) return true;
-  return *snap_rev_ == *snap_rev_end_;
+  if (!snap_rev_) return true;
+  return *snap_rev_ == std::default_sentinel;
 }
 
 void MariaDBTxn::MergeIterator::snap_step() {
@@ -446,14 +434,14 @@ void MariaDBTxn::MergeIterator::load_snap_current() {
 
   if (snap_at_end()) return;
 
-  const std::pair<bytecask::Bytes, bytecask::Bytes> *kv = nullptr;
+  const bytecask::EntryView *entry = nullptr;
   if (!reverse_) {
-    kv = &(**snap_fwd_);
+    entry = &(**snap_fwd_);
   } else {
-    kv = &(**snap_rev_);
+    entry = &(**snap_rev_);
   }
-  const auto *kp = u8_data(kv->first);
-  const auto klen = kv->first.size();
+  const auto *kp = reinterpret_cast<const uint8_t *>(entry->key.data());
+  const auto klen = entry->key.size();
 
   if (use_index_filter_) {
     if (!key_belongs_to_index(kp, klen, table_id_, index_id_)) {
@@ -474,8 +462,8 @@ void MariaDBTxn::MergeIterator::load_snap_current() {
 
   snap_key_ptr_ = kp;
   snap_key_len_ = klen;
-  snap_val_ptr_ = u8_data(kv->second);
-  snap_val_len_ = kv->second.size();
+  snap_val_ptr_ = reinterpret_cast<const uint8_t *>(entry->value.data());
+  snap_val_len_ = entry->value.size();
   snap_valid_ = true;
 }
 

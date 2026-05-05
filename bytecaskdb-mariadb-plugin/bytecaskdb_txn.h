@@ -73,7 +73,6 @@ public:
 
     // Reverse construction (full table).
     MergeIterator(std::optional<bytecask::ReverseEntryIterator> snap_it,
-                  bytecask::ReverseEntryIterator snap_end,
                   LookupMap::const_iterator buf_it,
                   LookupMap::const_iterator buf_end,
                   std::vector<uint8_t> lo,
@@ -81,7 +80,6 @@ public:
 
     // Reverse construction (secondary index).
     MergeIterator(std::optional<bytecask::ReverseEntryIterator> snap_it,
-                  bytecask::ReverseEntryIterator snap_end,
                   LookupMap::const_iterator buf_it,
                   LookupMap::const_iterator buf_end,
                   std::vector<uint8_t> lo,
@@ -120,8 +118,6 @@ public:
     // At most one of these is engaged.
     std::optional<bytecask::EntryIterator>        snap_fwd_;
     std::optional<bytecask::ReverseEntryIterator> snap_rev_;
-    // For reverse iteration the sentinel is a same-typed iterator value.
-    std::optional<bytecask::ReverseEntryIterator> snap_rev_end_;
     bool reverse_{false};
 
     LookupMap::const_iterator buf_it_;
@@ -131,8 +127,8 @@ public:
     uint16_t index_id_{0};        // 0 = primary key (table) iteration
     bool use_index_filter_{false}; // true = use key_belongs_to_index
 
-    // Cached snapshot key/value — points directly into iterator's internal
-    // buffer. Valid until snap_step() is called.
+    // Cached snapshot key/value — points into mmap (or io_buf for active file).
+    // Valid until snap_step() is called.
     const uint8_t *snap_key_ptr_{nullptr};
     size_t snap_key_len_{0};
     const uint8_t *snap_val_ptr_{nullptr};

@@ -58,6 +58,10 @@ auto to_pybytes(const bytecask::Bytes &b) -> nb::bytes {
   return nb::bytes(reinterpret_cast<const char *>(b.data()), b.size());
 }
 
+auto span_to_pybytes(std::span<const std::byte> s) -> nb::bytes {
+  return nb::bytes(reinterpret_cast<const char *>(s.data()), s.size());
+}
+
 auto key_to_pybytes(const bytecask::Bytes &k) -> nb::bytes {
   return nb::bytes(reinterpret_cast<const char *>(k.data()), k.size());
 }
@@ -191,9 +195,9 @@ struct PyEntryIterator {
     if (exhausted) {
       throw nb::stop_iteration();
     }
-    const auto &[key, value] = *cur;
-    auto py_key = key_to_pybytes(key);
-    auto py_val = to_pybytes(value);
+    const auto &entry = *cur;
+    auto py_key = span_to_pybytes(entry.key);
+    auto py_val = span_to_pybytes(entry.value);
     ++cur;
     exhausted = (cur == std::default_sentinel);
     return nb::make_tuple(py_key, py_val);
@@ -222,20 +226,21 @@ struct PyKeyIterator {
 
 struct PyReverseEntryIterator {
   bytecask::ReverseEntryIterator cur;
-  bytecask::ReverseEntryIterator end;
+  bool exhausted;
 
-  PyReverseEntryIterator(bytecask::ReverseEntryIterator c,
-                         bytecask::ReverseEntryIterator e)
-      : cur{std::move(c)}, end{std::move(e)} {}
+  explicit PyReverseEntryIterator(bytecask::ReverseEntryIterator c)
+      : cur{std::move(c)},
+        exhausted{cur == std::default_sentinel} {}
 
   auto next() -> nb::tuple {
-    if (cur == end) {
+    if (exhausted) {
       throw nb::stop_iteration();
     }
-    const auto &[key, value] = *cur;
-    auto py_key = key_to_pybytes(key);
-    auto py_val = to_pybytes(value);
+    const auto &entry = *cur;
+    auto py_key = span_to_pybytes(entry.key);
+    auto py_val = span_to_pybytes(entry.value);
     ++cur;
+    exhausted = (cur == std::default_sentinel);
     return nb::make_tuple(py_key, py_val);
   }
 };
@@ -431,7 +436,7 @@ NB_MODULE(_bytecaskdb, m) {
       .def("__iter__",
            [](PyReverseEntryIterator &self) -> PyReverseEntryIterator & {
              return self;
-           })
+           }, nb::rv_policy::reference)
       .def("__next__", &PyReverseEntryIterator::next, nb::lock_self());
 
   nb::class_<PyReverseKeyIterator>(m, "ReverseKeyIterator")
@@ -546,12 +551,11 @@ NB_MODULE(_bytecaskdb, m) {
             self.check();
             auto ropts = opts.value_or(bytecask::ReadOptions{});
             auto range = self.snap->riter_from(ropts, to_view(from_key));
-            return PyReverseEntryIterator{std::move(range.begin()),
-                                          std::move(range.end())};
+            return PyReverseEntryIterator{std::move(range.begin())};
           },
           "Iterate (key, value) pairs in descending order from from_key.",
           "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
-          nb::keep_alive<0, 1>())
+          nb::rv_policy::move, nb::keep_alive<0, 1>())
       .def(
           "rkeys_from",
           [](PySnapshot &self, nb::bytes from_key,
@@ -732,12 +736,11 @@ NB_MODULE(_bytecaskdb, m) {
               -> PyReverseEntryIterator {
             auto ropts = opts.value_or(bytecask::ReadOptions{});
             auto range = self.db.riter_from(ropts, to_view(from_key));
-            return PyReverseEntryIterator{std::move(range.begin()),
-                                          std::move(range.end())};
+            return PyReverseEntryIterator{std::move(range.begin())};
           },
           "Iterate (key, value) pairs in descending order from from_key.",
           "from_key"_a = nb::bytes("", 0), "opts"_a = nb::none(),
-          nb::keep_alive<0, 1>())
+          nb::rv_policy::move, nb::keep_alive<0, 1>())
       .def(
           "rkeys_from",
           [](PyDB &self, nb::bytes from_key,

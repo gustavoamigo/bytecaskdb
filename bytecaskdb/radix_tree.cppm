@@ -175,6 +175,8 @@ auto make_intrusive(Args &&...args) -> IntrusivePtr<T> {
 export template <typename V> class TransientRadixTree;
 export template <typename V> class RadixTreeIterator;
 export template <typename V> class ReverseRadixTreeIterator;
+export template <typename V> class ValueIterator;
+export template <typename V> class ReverseValueIterator;
 
 // Global edit-tag counter for transient sessions.
 // Relaxed ordering: only uniqueness is required, not inter-thread visibility
@@ -590,6 +592,14 @@ public:
       -> RadixTreeIterator<V>;
   [[nodiscard]] auto upper_bound(std::span<const std::byte> key) const
       -> RadixTreeIterator<V>;
+
+  // Value-only iteration (no key construction — faster tree walk).
+  [[nodiscard]] auto value_begin() const -> ValueIterator<V>;
+  [[nodiscard]] auto value_lower_bound(std::span<const std::byte> key) const
+      -> ValueIterator<V>;
+  [[nodiscard]] auto value_rbegin() const -> ReverseValueIterator<V>;
+  [[nodiscard]] auto value_rlower_bound(std::span<const std::byte> key) const
+      -> ReverseValueIterator<V>;
 
 private:
   // Returns an iterator-typed end sentinel for upper_bound() and as the
@@ -1046,6 +1056,7 @@ private:
 
   friend class TransientRadixTree<V>;
   friend class RadixTreeIterator<V>;
+  friend class ValueIterator<V>;
 };
 
 // ---------------------------------------------------------------------------
@@ -1839,6 +1850,306 @@ auto PersistentRadixTree<V>::upper_bound(std::span<const std::byte> key) const
       ++it;
   }
   return it;
+}
+
+// ---------------------------------------------------------------------------
+// ValueIterator<V>
+//
+// Forward-only tree walk that yields const V& without constructing keys.
+// Identical DFS logic to RadixTreeIterator but with no current_key_ buffer,
+// no key_len in Frame, and no push_back/resize per node.
+// ---------------------------------------------------------------------------
+export template <typename V> class ValueIterator {
+public:
+  using value_type = V;
+  using difference_type = std::ptrdiff_t;
+
+  ValueIterator() = default;
+
+  auto operator*() const -> const V & {
+    return stack_.back().node->value_;
+  }
+
+  auto operator++() -> ValueIterator & {
+    advance();
+    return *this;
+  }
+
+  void operator++(int) { ++*this; }
+
+  auto operator==(std::default_sentinel_t) const noexcept -> bool {
+    return stack_.empty();
+  }
+
+private:
+  struct Frame {
+    IntrusivePtr<Node<V>> node;
+    std::size_t child_idx;
+  };
+
+  std::vector<Frame> stack_;
+
+  explicit ValueIterator(IntrusivePtr<Node<V>> root) {
+    if (!root)
+      return;
+    push_node(root);
+    if (!stack_.empty() && !stack_.back().node->has_value())
+      advance();
+  }
+
+  ValueIterator(IntrusivePtr<Node<V>> root,
+                std::span<const std::byte> target) {
+    stack_.reserve(16);
+    if (!root)
+      return;
+    auto at_target = seek(root, target);
+    if (stack_.empty())
+      return;
+    if (at_target && stack_.back().node->has_value())
+      return;
+    advance();
+  }
+
+  void push_node(const IntrusivePtr<Node<V>> &node) {
+    stack_.push_back({node, 0});
+  }
+
+  void advance() {
+    while (!stack_.empty()) {
+      auto &frame = stack_.back();
+      if (frame.child_idx < frame.node->child_count()) {
+        auto slot = frame.node->child_at(frame.child_idx);
+        ++frame.child_idx;
+        push_node(slot.ptr);
+        if (stack_.back().node->has_value())
+          return;
+      } else {
+        stack_.pop_back();
+      }
+    }
+  }
+
+  void descend_rightmost() {
+    while (stack_.back().node->has_children()) {
+      auto &frame = stack_.back();
+      auto last = frame.node->child_count() - 1;
+      frame.child_idx = frame.node->child_count();
+      auto slot = frame.node->child_at(last);
+      push_node(slot.ptr);
+    }
+  }
+
+  void retreat() {
+    if (stack_.empty())
+      return;
+
+    stack_.pop_back();
+
+    while (!stack_.empty()) {
+      auto &frame = stack_.back();
+      if (frame.child_idx >= 2) {
+        --frame.child_idx;
+        auto prev_idx = frame.child_idx - 1;
+        auto slot = frame.node->child_at(prev_idx);
+        push_node(slot.ptr);
+        stack_.back().child_idx = stack_.back().node->child_count();
+        descend_rightmost();
+        return;
+      }
+      frame.child_idx = 0;
+      if (frame.node->has_value())
+        return;
+      stack_.pop_back();
+    }
+  }
+
+  auto seek(const IntrusivePtr<Node<V>> &root,
+            std::span<const std::byte> target) -> bool {
+    auto remaining = target;
+    auto cur = root;
+
+    while (cur) {
+      auto prefix_span =
+          std::span<const std::byte>{cur->prefix.data(), cur->prefix.size()};
+      auto cpl = common_prefix_length(prefix_span, remaining);
+
+      if (cpl < prefix_span.size() && cpl < remaining.size()) {
+        if (prefix_span[cpl] > remaining[cpl]) {
+          stack_.push_back({cur, 0});
+          return true;
+        }
+        return false;
+      }
+
+      if (cpl < prefix_span.size()) {
+        stack_.push_back({cur, 0});
+        return true;
+      }
+
+      remaining = remaining.subspan(cpl);
+
+      if (remaining.empty()) {
+        stack_.push_back({cur, 0});
+        return true;
+      }
+
+      auto target_byte = remaining[0];
+      auto child_remaining = remaining.subspan(1);
+
+      bool descended = false;
+      for (std::size_t i = 0; i < cur->child_count(); ++i) {
+        auto cb = cur->child_at(i).transition;
+        if (cb < target_byte)
+          continue;
+
+        if (cb == target_byte) {
+          stack_.push_back({cur, i + 1});
+          cur = cur->child_at(i).ptr;
+          remaining = child_remaining;
+          descended = true;
+          break;
+        }
+
+        stack_.push_back({cur, i});
+        return false;
+      }
+
+      if (!descended) {
+        stack_.push_back({cur, cur->child_count()});
+        return false;
+      }
+    }
+    return false;
+  }
+
+  friend class PersistentRadixTree<V>;
+  friend class ReverseValueIterator<V>;
+};
+
+// ---------------------------------------------------------------------------
+// ReverseValueIterator<V>
+//
+// Reverse tree walk yielding const V& without key construction.
+// Wraps ValueIterator and uses its retreat()/descend_rightmost() methods.
+// ---------------------------------------------------------------------------
+export template <typename V> class ReverseValueIterator {
+public:
+  using value_type = V;
+  using difference_type = std::ptrdiff_t;
+
+  ReverseValueIterator() = default;
+
+  explicit ReverseValueIterator(IntrusivePtr<Node<V>> root)
+      : root_{std::move(root)} {
+    if (!root_) {
+      past_rend_ = true;
+      return;
+    }
+    // Descend to the rightmost (largest) value node.
+    cur_.push_node(root_);
+    cur_.stack_.back().child_idx = cur_.stack_.back().node->child_count();
+    cur_.descend_rightmost();
+    if (cur_.stack_.empty())
+      past_rend_ = true;
+  }
+
+  ReverseValueIterator(IntrusivePtr<Node<V>> root,
+                       std::span<const std::byte> upper)
+      : root_{std::move(root)} {
+    if (!root_) {
+      past_rend_ = true;
+      return;
+    }
+    // Seek to the first key >= upper using a forward iterator.
+    ValueIterator<V> fwd;
+    fwd.stack_.reserve(16);
+    auto at_target = fwd.seek(root_, upper);
+    if (fwd.stack_.empty()) {
+      // All keys < upper. Position at the rightmost.
+      cur_.push_node(root_);
+      cur_.stack_.back().child_idx = cur_.stack_.back().node->child_count();
+      cur_.descend_rightmost();
+    } else if (at_target && fwd.stack_.back().node->has_value()) {
+      // Exact match — start here (inclusive).
+      cur_ = std::move(fwd);
+    } else {
+      // fwd is at first key > upper (or at a non-value node >= upper).
+      // Advance fwd to the next value node if needed, then retreat.
+      if (!fwd.stack_.back().node->has_value())
+        fwd.advance();
+      if (fwd.stack_.empty()) {
+        // No key >= upper with a value; position at rightmost.
+        cur_.push_node(root_);
+        cur_.stack_.back().child_idx = cur_.stack_.back().node->child_count();
+        cur_.descend_rightmost();
+      } else {
+        cur_ = std::move(fwd);
+        cur_.retreat();
+      }
+    }
+    if (cur_.stack_.empty())
+      past_rend_ = true;
+  }
+
+  auto operator*() const -> const V & {
+    return cur_.stack_.back().node->value_;
+  }
+
+  auto operator++() -> ReverseValueIterator & {
+    if (past_rend_)
+      return *this;
+    cur_.retreat();
+    if (cur_.stack_.empty())
+      past_rend_ = true;
+    return *this;
+  }
+
+  void operator++(int) { ++*this; }
+
+  auto operator==(std::default_sentinel_t) const noexcept -> bool {
+    return past_rend_;
+  }
+
+  auto operator==(const ReverseValueIterator &other) const noexcept -> bool {
+    if (past_rend_ != other.past_rend_)
+      return false;
+    if (past_rend_)
+      return true;
+    return cur_.stack_.size() == other.cur_.stack_.size();
+  }
+
+private:
+  IntrusivePtr<Node<V>> root_;
+  ValueIterator<V> cur_;
+  bool past_rend_{false};
+
+  friend class PersistentRadixTree<V>;
+};
+
+// Out-of-line: PersistentRadixTree::value_begin()
+template <typename V>
+auto PersistentRadixTree<V>::value_begin() const -> ValueIterator<V> {
+  return ValueIterator<V>{root_};
+}
+
+// Out-of-line: PersistentRadixTree::value_lower_bound()
+template <typename V>
+auto PersistentRadixTree<V>::value_lower_bound(
+    std::span<const std::byte> key) const -> ValueIterator<V> {
+  return ValueIterator<V>{root_, key};
+}
+
+// Out-of-line: PersistentRadixTree::value_rbegin()
+template <typename V>
+auto PersistentRadixTree<V>::value_rbegin() const -> ReverseValueIterator<V> {
+  return ReverseValueIterator<V>{root_};
+}
+
+// Out-of-line: PersistentRadixTree::value_rlower_bound()
+template <typename V>
+auto PersistentRadixTree<V>::value_rlower_bound(
+    std::span<const std::byte> key) const -> ReverseValueIterator<V> {
+  return ReverseValueIterator<V>{root_, key};
 }
 
 } // namespace bytecask

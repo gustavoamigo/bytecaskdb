@@ -62,36 +62,29 @@ struct bytecask_db {
 
 struct bytecask_iter {
   std::variant<bytecask::EntryIterator, bytecask::ReverseEntryIterator> iter;
-  std::variant<std::default_sentinel_t, bytecask::ReverseEntryIterator> sentinel;
   bool valid;
 
   explicit bytecask_iter(bytecask::EntryIterator c)
-      : iter{std::move(c)}, sentinel{std::default_sentinel},
+      : iter{std::move(c)},
         valid{std::get<bytecask::EntryIterator>(iter) != std::default_sentinel} {}
 
-  explicit bytecask_iter(bytecask::ReverseEntryIterator c, bytecask::ReverseEntryIterator end)
-      : iter{std::move(c)}, sentinel{end},
-        valid{std::get<bytecask::ReverseEntryIterator>(iter) != std::get<bytecask::ReverseEntryIterator>(sentinel)} {}
+  explicit bytecask_iter(bytecask::ReverseEntryIterator c)
+      : iter{std::move(c)},
+        valid{std::get<bytecask::ReverseEntryIterator>(iter) != std::default_sentinel} {}
 
   void advance() {
     if (!valid) return;
 
     std::visit([this](auto& it) {
-      using T = std::decay_t<decltype(it)>;
-      if constexpr (std::is_same_v<T, bytecask::EntryIterator>) {
-        ++it;
-        this->valid = (it != std::default_sentinel);
-      } else if constexpr (std::is_same_v<T, bytecask::ReverseEntryIterator>) {
-        ++it;
-        this->valid = (it != std::get<bytecask::ReverseEntryIterator>(sentinel));
-      }
+      ++it;
+      this->valid = (it != std::default_sentinel);
     }, iter);
   }
 
   auto get_current() const -> std::pair<std::span<const std::byte>, std::span<const std::byte>> {
     return std::visit([](const auto& it) -> std::pair<std::span<const std::byte>, std::span<const std::byte>> {
-      const auto &[k, v] = *it;
-      return {std::span<const std::byte>{k.begin(), k.end()}, v};
+      const auto& entry = *it;
+      return {entry.key, entry.value};
     }, iter);
   }
 };
@@ -344,7 +337,7 @@ bytecask_iter_t *bytecask_riter_open(bytecask_db_t *db,
       from_view = to_view(from, from_len);
     }
     auto range = db->db.riter_from(opts, from_view);
-    return new bytecask_iter{range.begin(), range.end()};
+    return new bytecask_iter{range.begin()};
   } catch (const std::exception &e) {
     set_errmsg(e.what());
     return nullptr;
@@ -368,7 +361,7 @@ bytecask_iter_t *bytecask_snapshot_riter_open(bytecask_snapshot_t *snap,
       from_view = to_view(from, from_len);
     }
     auto range = snap->snap.riter_from({}, from_view);
-    return new bytecask_iter{range.begin(), range.end()};
+    return new bytecask_iter{range.begin()};
   } catch (const std::exception &e) {
     set_errmsg(e.what());
     return nullptr;

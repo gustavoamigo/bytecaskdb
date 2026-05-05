@@ -48,25 +48,25 @@ inline PluginBaseline capture_baseline(bytecask::DB &db, uint32_t table_id,
   auto lo = table_id_prefix(table_id);
   auto hi = table_id_upper_bound(table_id);
   bytecask::Bytes val;
-  for (auto &[k, v] : db.iter_from({}, bytecask::BytesView{
+  for (auto &entry : db.iter_from({}, bytecask::BytesView{
            reinterpret_cast<const std::byte *>(lo.data()), lo.size()})) {
-    auto kp = reinterpret_cast<const uint8_t *>(k.data());
-    if (k.size() < lo.size() ||
+    auto kp = reinterpret_cast<const uint8_t *>(entry.key.data());
+    if (entry.key.size() < lo.size() ||
         std::memcmp(kp, hi.data(), hi.size()) >= 0)
       break;
-    b.pk_keys.emplace(kp, kp + k.size());
+    b.pk_keys.emplace(kp, kp + entry.key.size());
   }
 
   for (auto idx_id : index_ids) {
     auto ilo = index_id_prefix(table_id, idx_id);
     auto ihi = index_id_upper_bound(table_id, idx_id);
-    for (auto &[k, v] : db.iter_from({}, bytecask::BytesView{
+    for (auto &entry : db.iter_from({}, bytecask::BytesView{
              reinterpret_cast<const std::byte *>(ilo.data()), ilo.size()})) {
-      auto kp = reinterpret_cast<const uint8_t *>(k.data());
-      if (k.size() < ilo.size() ||
+      auto kp = reinterpret_cast<const uint8_t *>(entry.key.data());
+      if (entry.key.size() < ilo.size() ||
           std::memcmp(kp, ihi.data(), ihi.size()) >= 0)
         break;
-      b.sec_keys[idx_id].emplace(kp, kp + k.size());
+      b.sec_keys[idx_id].emplace(kp, kp + entry.key.size());
     }
   }
 
@@ -80,10 +80,10 @@ inline void assert_counter_matches_pk_count(bytecask::DB &db,
   auto lo = table_id_prefix(table_id);
   auto hi = table_id_upper_bound(table_id);
   int64_t actual = 0;
-  for (auto &[k, v] : db.iter_from({}, bytecask::BytesView{
+  for (auto &entry : db.iter_from({}, bytecask::BytesView{
            reinterpret_cast<const std::byte *>(lo.data()), lo.size()})) {
-    auto kp = reinterpret_cast<const uint8_t *>(k.data());
-    if (k.size() < lo.size() ||
+    auto kp = reinterpret_cast<const uint8_t *>(entry.key.data());
+    if (entry.key.size() < lo.size() ||
         std::memcmp(kp, hi.data(), hi.size()) >= 0)
       break;
     ++actual;
@@ -108,10 +108,10 @@ inline void assert_sec_index_count_matches_pk(bytecask::DB &db,
   auto lo = table_id_prefix(table_id);
   auto hi = table_id_upper_bound(table_id);
   int64_t pk_count = 0;
-  for (auto &[k, v] : db.iter_from({}, bytecask::BytesView{
+  for (auto &entry : db.iter_from({}, bytecask::BytesView{
            reinterpret_cast<const std::byte *>(lo.data()), lo.size()})) {
-    auto kp = reinterpret_cast<const uint8_t *>(k.data());
-    if (k.size() < lo.size() ||
+    auto kp = reinterpret_cast<const uint8_t *>(entry.key.data());
+    if (entry.key.size() < lo.size() ||
         std::memcmp(kp, hi.data(), hi.size()) >= 0)
       break;
     ++pk_count;
@@ -120,10 +120,10 @@ inline void assert_sec_index_count_matches_pk(bytecask::DB &db,
   auto ilo = index_id_prefix(table_id, index_id);
   auto ihi = index_id_upper_bound(table_id, index_id);
   int64_t sec_count = 0;
-  for (auto &[k, v] : db.iter_from({}, bytecask::BytesView{
+  for (auto &entry : db.iter_from({}, bytecask::BytesView{
            reinterpret_cast<const std::byte *>(ilo.data()), ilo.size()})) {
-    auto kp = reinterpret_cast<const uint8_t *>(k.data());
-    if (k.size() < ilo.size() ||
+    auto kp = reinterpret_cast<const uint8_t *>(entry.key.data());
+    if (entry.key.size() < ilo.size() ||
         std::memcmp(kp, ihi.data(), ihi.size()) >= 0)
       break;
     ++sec_count;

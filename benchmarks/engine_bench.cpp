@@ -353,8 +353,9 @@ struct BcAdapter {
     int count = 0;
     for (auto it = range.begin(); it != range.end() && count < limit;
          ++it, ++count) {
-      auto entry = *it;
-      benchmark::DoNotOptimize(entry);
+      auto &entry = *it;
+      benchmark::DoNotOptimize(entry.key.data());
+      benchmark::DoNotOptimize(entry.value.data());
     }
   }
 
@@ -925,6 +926,7 @@ template <typename A, int RangeLen> void BM_Range(benchmark::State &state) {
       static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
   attach_jitter(state, samples);
 }
+
 
 // ──────────────────────────── Mixed ──────────────────────────────────────────
 // 80% get / 10% put / 10% del

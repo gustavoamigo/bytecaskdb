@@ -253,37 +253,43 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// EntryIterator — walks the key directory reading values lazily from disk.
+// EntryIterator — zero-copy forward iterator over key/value spans.
 //
-// Satisfies std::input_iterator. Throws std::system_error on I/O failure.
+// Yields EntryView with non-owning spans into mmap (sealed files) or an
+// internal io_buf (active file). Spans are valid until the next operator++().
+// Uses ValueIterator internally — no key reconstruction during tree walk.
 // ---------------------------------------------------------------------------
 export class EntryIterator {
 public:
-  using iterator_concept = std::bidirectional_iterator_tag;
-  using value_type = std::pair<Key, Bytes>;
+  using iterator_concept = std::input_iterator_tag;
+  using value_type = EntryView;
   using difference_type = std::ptrdiff_t;
 
   EntryIterator() = default;
 
   EntryIterator(std::shared_ptr<const EngineState> state,
-                RadixTreeIterator<KeyDirEntry> cur,
+                ValueIterator<KeyDirEntry> cur,
                 bool verify_checksums = true)
       : state_{std::move(state)}, cur_{std::move(cur)},
         verify_checksums_{verify_checksums} {}
 
-  auto operator*() const -> const value_type & {
+  auto operator*() const -> const EntryView & {
     if (!has_cached_) {
-      auto [key_span, dir_entry] = *cur_;
-      cached_.first = Key{key_span};
+      auto &dir_entry = *cur_;
       if (dir_entry.value_size() == 0) {
-        cached_.second.clear();
+        raw_cached_ = DataEntryView{.sequence = 0, .entry_type = EntryType::Put,
+                                    .key = {}, .value = {}};
       } else {
-        (*state_->files.get(dir_entry.file_id()))
-            ->read_value(dir_entry.file_offset(),
-                        narrow<std::uint16_t>(key_span.size()),
-                        dir_entry.value_size(), verify_checksums_,
-                        io_buf_, cached_.second);
+        auto &file = *(*state_->files.get(dir_entry.file_id()));
+        if (verify_checksums_) {
+          raw_cached_ = file.read_entry(dir_entry.file_offset(),
+                                        dir_entry.value_size(), io_buf_);
+        } else {
+          raw_cached_ = file.read_entry_unverified(dir_entry.file_offset(),
+                                                   dir_entry.value_size(), io_buf_);
+        }
       }
+      cached_ = EntryView{.key = raw_cached_.key, .value = raw_cached_.value};
       has_cached_ = true;
     }
     return cached_;
@@ -295,27 +301,7 @@ public:
     return *this;
   }
 
-  auto operator++(int) -> EntryIterator {
-    auto tmp = *this;
-    ++*this;
-    return tmp;
-  }
-
-  auto operator--() -> EntryIterator & {
-    --cur_;
-    has_cached_ = false;
-    return *this;
-  }
-
-  auto operator--(int) -> EntryIterator {
-    auto tmp = *this;
-    --*this;
-    return tmp;
-  }
-
-  auto operator==(const EntryIterator &other) const noexcept -> bool {
-    return cur_ == other.cur_;
-  }
+  void operator++(int) { ++*this; }
 
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
     return cur_ == std::default_sentinel;
@@ -323,9 +309,10 @@ public:
 
 private:
   std::shared_ptr<const EngineState> state_;
-  RadixTreeIterator<KeyDirEntry> cur_;
-  mutable value_type cached_;
+  ValueIterator<KeyDirEntry> cur_;
   bool verify_checksums_{true};
+  mutable DataEntryView raw_cached_;
+  mutable EntryView cached_;
   mutable Bytes io_buf_;
   mutable bool has_cached_{false};
 };
@@ -378,7 +365,67 @@ private:
 };
 
 export using ReverseKeyIterator = ReverseIterator<KeyIterator>;
-export using ReverseEntryIterator = ReverseIterator<EntryIterator>;
+
+// ---------------------------------------------------------------------------
+// ReverseEntryIterator — zero-copy reverse iterator over key/value spans.
+// ---------------------------------------------------------------------------
+export class ReverseEntryIterator {
+public:
+  using iterator_concept = std::input_iterator_tag;
+  using value_type = EntryView;
+  using difference_type = std::ptrdiff_t;
+
+  ReverseEntryIterator() = default;
+
+  ReverseEntryIterator(std::shared_ptr<const EngineState> state,
+                       ReverseValueIterator<KeyDirEntry> cur,
+                       bool verify_checksums = true)
+      : state_{std::move(state)}, cur_{std::move(cur)},
+        verify_checksums_{verify_checksums} {}
+
+  auto operator*() const -> const EntryView & {
+    if (!has_cached_) {
+      auto &dir_entry = *cur_;
+      if (dir_entry.value_size() == 0) {
+        raw_cached_ = DataEntryView{.sequence = 0, .entry_type = EntryType::Put,
+                                    .key = {}, .value = {}};
+      } else {
+        auto &file = *(*state_->files.get(dir_entry.file_id()));
+        if (verify_checksums_) {
+          raw_cached_ = file.read_entry(dir_entry.file_offset(),
+                                        dir_entry.value_size(), io_buf_);
+        } else {
+          raw_cached_ = file.read_entry_unverified(dir_entry.file_offset(),
+                                                   dir_entry.value_size(), io_buf_);
+        }
+      }
+      cached_ = EntryView{.key = raw_cached_.key, .value = raw_cached_.value};
+      has_cached_ = true;
+    }
+    return cached_;
+  }
+
+  auto operator++() -> ReverseEntryIterator & {
+    ++cur_;
+    has_cached_ = false;
+    return *this;
+  }
+
+  void operator++(int) { ++*this; }
+
+  auto operator==(std::default_sentinel_t) const noexcept -> bool {
+    return cur_ == std::default_sentinel;
+  }
+
+private:
+  std::shared_ptr<const EngineState> state_;
+  ReverseValueIterator<KeyDirEntry> cur_;
+  bool verify_checksums_{true};
+  mutable DataEntryView raw_cached_;
+  mutable EntryView cached_;
+  mutable Bytes io_buf_;
+  mutable bool has_cached_{false};
+};
 
 // ---------------------------------------------------------------------------
 // ChangeIterator — yields raw entries in ascending sequence order (lazy)
@@ -734,7 +781,7 @@ public:
   // When from is empty, starts at the last key in the DB.
   [[nodiscard]] auto riter_from(const ReadOptions &opts,
                                 BytesView from = {}) const
-      -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
+      -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>;
 
   // Returns a range of keys in descending order. Pure in-memory — no disk I/O.
   [[nodiscard]] auto rkeys_from(const ReadOptions &opts,
@@ -976,7 +1023,7 @@ public:
   // When from is empty, starts at the last key in the DB.
   [[nodiscard]] auto riter_from(const ReadOptions& opts,
                                 BytesView from = {}) const
-      -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
+      -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>;
 
   // Returns a range of keys in descending order. Pure in-memory — no disk I/O.
   [[nodiscard]] auto rkeys_from(const ReadOptions& opts,
@@ -2212,8 +2259,9 @@ auto Snapshot::get(const ReadOptions& opts, BytesView key,
 
 auto Snapshot::iter_from(const ReadOptions& opts, BytesView from) const
     -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
-  auto it =
-      from.empty() ? state_->key_dir.begin() : state_->key_dir.lower_bound(from);
+  auto it = from.empty()
+      ? state_->key_dir.value_begin()
+      : state_->key_dir.value_lower_bound(from);
   return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
       EntryIterator{state_, std::move(it), opts.verify_checksums},
       std::default_sentinel};
@@ -2228,13 +2276,13 @@ auto Snapshot::keys_from(const ReadOptions& /*opts*/, BytesView from) const
 }
 
 auto Snapshot::riter_from(const ReadOptions& opts, BytesView from) const
-    -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator> {
-  auto begin_it = from.empty()
-      ? state_->key_dir.rbegin().base()
-      : state_->key_dir.upper_bound(from);
-  auto end_it = state_->key_dir.begin();
-  return {ReverseEntryIterator{EntryIterator{state_, std::move(begin_it), opts.verify_checksums}},
-          ReverseEntryIterator{EntryIterator{state_, std::move(end_it), opts.verify_checksums}}};
+    -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t> {
+  auto it = from.empty()
+      ? state_->key_dir.value_rbegin()
+      : state_->key_dir.value_rlower_bound(from);
+  return std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>{
+      ReverseEntryIterator{state_, std::move(it), opts.verify_checksums},
+      std::default_sentinel};
 }
 
 auto Snapshot::rkeys_from(const ReadOptions& /*opts*/, BytesView from) const
@@ -2259,7 +2307,9 @@ auto Snapshot::rkeys_from(const ReadOptions& /*opts*/, BytesView from) const
 auto DB::iter_from(const ReadOptions &opts, BytesView from) const
     -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
   auto s = load_state_for_read(opts);
-  auto it = from.empty() ? s->key_dir.begin() : s->key_dir.lower_bound(from);
+  auto it = from.empty()
+      ? s->key_dir.value_begin()
+      : s->key_dir.value_lower_bound(from);
   return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
       EntryIterator{s, std::move(it), opts.verify_checksums},
       std::default_sentinel};
@@ -2276,14 +2326,14 @@ auto DB::keys_from(const ReadOptions &opts, BytesView from) const
 }
 
 auto DB::riter_from(const ReadOptions &opts, BytesView from) const
-    -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator> {
+    -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t> {
   auto s = load_state_for_read(opts);
-  auto begin_it = from.empty()
-      ? s->key_dir.rbegin().base()
-      : s->key_dir.upper_bound(from);
-  auto end_it = s->key_dir.begin();
-  return {ReverseEntryIterator{EntryIterator{s, std::move(begin_it), opts.verify_checksums}},
-          ReverseEntryIterator{EntryIterator{s, std::move(end_it), opts.verify_checksums}}};
+  auto it = from.empty()
+      ? s->key_dir.value_rbegin()
+      : s->key_dir.value_rlower_bound(from);
+  return std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>{
+      ReverseEntryIterator{s, std::move(it), opts.verify_checksums},
+      std::default_sentinel};
 }
 
 auto DB::rkeys_from(const ReadOptions &opts, BytesView from) const
