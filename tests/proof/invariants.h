@@ -72,8 +72,8 @@ struct ExpectedDelta {
 inline auto capture_baseline(const DB &db) -> Baseline {
   Baseline bl;
   bl.next_seq = db.engine_state()->next_seq;
-  for (const auto &[key, value] : db.iter_from({})) {
-    bl.key_values[to_string(key)] = value;
+  for (const auto &entry : db.iter_from({})) {
+    bl.key_values[to_string(entry.key)] = Bytes{entry.value.begin(), entry.value.end()};
   }
   return bl;
 }

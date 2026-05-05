@@ -108,6 +108,13 @@ struct DataEntryView {
   std::span<const std::byte> value;
 };
 
+// Non-owning view of a key/value pair. Spans are valid until the iterator
+// that produced them advances.
+struct EntryView {
+  std::span<const std::byte> key;
+  std::span<const std::byte> value;
+};
+
 // Thrown by write operations when the engine is degraded. Reads remain
 // available. Call DB::resume() for in-process recovery.
 //
@@ -183,7 +190,7 @@ public:
   struct Impl;
 
   using iterator_concept = std::input_iterator_tag;
-  using value_type       = std::pair<Bytes, Bytes>;
+  using value_type       = EntryView;
   using difference_type  = std::ptrdiff_t;
 
   EntryIterator() noexcept;
@@ -193,7 +200,7 @@ public:
   EntryIterator(EntryIterator&&) noexcept;
   EntryIterator& operator=(EntryIterator&&) noexcept;
 
-  auto operator*() const -> const std::pair<Bytes, Bytes>&;
+  auto operator*() const -> const EntryView&;
   auto operator++() -> EntryIterator&;
   void operator++(int);
   auto operator==(std::default_sentinel_t) const noexcept -> bool;
@@ -242,7 +249,7 @@ private:
 // ---------------------------------------------------------------------------
 // ReverseEntryIterator — descending (key, value) walk.
 //
-// Copyable for the same reason as ReverseKeyIterator.
+// Move-only; uses default_sentinel_t for end detection.
 // ---------------------------------------------------------------------------
 
 class ReverseEntryIterator {
@@ -250,20 +257,20 @@ public:
   struct Impl;
 
   using iterator_concept = std::input_iterator_tag;
-  using value_type       = std::pair<Bytes, Bytes>;
+  using value_type       = EntryView;
   using difference_type  = std::ptrdiff_t;
 
   ReverseEntryIterator() noexcept;
   ~ReverseEntryIterator();
-  ReverseEntryIterator(const ReverseEntryIterator& other);
-  ReverseEntryIterator& operator=(const ReverseEntryIterator& other);
+  ReverseEntryIterator(const ReverseEntryIterator&) = delete;
+  ReverseEntryIterator& operator=(const ReverseEntryIterator&) = delete;
   ReverseEntryIterator(ReverseEntryIterator&&) noexcept;
   ReverseEntryIterator& operator=(ReverseEntryIterator&&) noexcept;
 
-  auto operator*() const -> const std::pair<Bytes, Bytes>&;
+  auto operator*() const -> const EntryView&;
   auto operator++() -> ReverseEntryIterator&;
   void operator++(int);
-  auto operator==(const ReverseEntryIterator&) const noexcept -> bool;
+  auto operator==(std::default_sentinel_t) const noexcept -> bool;
 
 private:
   explicit ReverseEntryIterator(std::unique_ptr<Impl> impl) noexcept;
@@ -331,7 +338,7 @@ public:
       -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
   [[nodiscard]] auto riter_from(const ReadOptions& opts,
                                 BytesView from = {}) const
-      -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
+      -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>;
   [[nodiscard]] auto rkeys_from(const ReadOptions& opts,
                                 BytesView from = {}) const
       -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
@@ -434,7 +441,7 @@ public:
       -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
   [[nodiscard]] auto riter_from(const ReadOptions& opts,
                                 BytesView from = {}) const
-      -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator>;
+      -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>;
   [[nodiscard]] auto rkeys_from(const ReadOptions& opts,
                                 BytesView from = {}) const
       -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
@@ -484,6 +491,7 @@ using Options              = internal::Options;
 using SizeLimits           = internal::SizeLimits;
 using FileInfo             = internal::FileInfo;
 using DataEntryView        = internal::DataEntryView;
+using EntryView            = internal::EntryView;
 using DbDegraded           = internal::DbDegraded;
 using DbFollowerMode       = internal::DbFollowerMode;
 using DB                   = internal::DB;
@@ -491,10 +499,10 @@ using Snapshot             = internal::Snapshot;
 using WritePlan            = internal::WritePlan;
 using FileManifest         = internal::FileManifest;
 using KeyIterator          = internal::KeyIterator;
-using EntryIterator        = internal::EntryIterator;
-using ReverseKeyIterator   = internal::ReverseKeyIterator;
-using ReverseEntryIterator = internal::ReverseEntryIterator;
-using ChangeIterator       = internal::ChangeIterator;
+using EntryIterator             = internal::EntryIterator;
+using ReverseKeyIterator        = internal::ReverseKeyIterator;
+using ReverseEntryIterator      = internal::ReverseEntryIterator;
+using ChangeIterator            = internal::ChangeIterator;
 
 } // namespace bytecask
 #endif // BYTECASK_HPP_IMPL_MODE

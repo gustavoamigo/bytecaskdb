@@ -72,6 +72,17 @@ public:
 
   [[nodiscard]] virtual auto size() const noexcept -> Offset = 0;
 
+  // Reads full entry (header + key + value + CRC), verifies CRC.
+  // key_size derived from on-disk header. Spans point into io_buf or mmap.
+  [[nodiscard]] virtual auto read_entry(Offset offset, std::uint32_t value_size,
+                                        std::vector<std::byte> &io_buf) const
+      -> DataEntryView = 0;
+
+  // Reads full entry without CRC verification. Spans point into mmap or io_buf.
+  [[nodiscard]] virtual auto read_entry_unverified(
+      Offset offset, std::uint32_t value_size,
+      std::vector<std::byte> &io_buf) const -> DataEntryView = 0;
+
   [[nodiscard]] auto path() const -> const std::filesystem::path & {
     return path_;
   }
@@ -258,6 +269,46 @@ public:
     }
   }
 
+  [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
+                                std::vector<std::byte> &io_buf) const
+      -> DataEntryView override {
+    auto hdr = read_header(offset);
+    return read_entry(offset, hdr.key_size, value_size, io_buf);
+  }
+
+  [[nodiscard]] auto read_entry_unverified(
+      Offset offset, std::uint32_t value_size,
+      std::vector<std::byte> &io_buf) const -> DataEntryView override {
+    static constexpr std::size_t kKeyBudget = 256;
+    const auto speculative_total = kHeaderSize + kKeyBudget + value_size + kCrcSize;
+    io_buf.resize(speculative_total);
+    auto bytes_read = ::pread(fd_, io_buf.data(), speculative_total,
+                             narrow<off_t>(offset));
+    if (bytes_read < narrow<ssize_t>(kHeaderSize)) {
+      throw std::system_error{errno, std::generic_category(),
+                              "WritableDataFile::read_entry_unverified: pread failed"};
+    }
+    auto hdr = bytecask::read_header(
+        std::span<const std::byte>{io_buf.data(), kHeaderSize});
+    const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
+    if (total > speculative_total) {
+      io_buf.resize(total);
+      if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
+          narrow<ssize_t>(total)) {
+        throw std::system_error{errno, std::generic_category(),
+                                "WritableDataFile::read_entry_unverified: pread failed"};
+      }
+    }
+    auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
+                                           hdr.key_size + value_size};
+    return DataEntryView{
+        .sequence = hdr.sequence,
+        .entry_type = hdr.entry_type,
+        .key = body.subspan(0, hdr.key_size),
+        .value = body.subspan(hdr.key_size, value_size),
+    };
+  }
+
   void sync() {
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_data_file_sync);
@@ -422,7 +473,7 @@ public:
     }
     const auto header = read_header(offset);
     std::vector<std::byte> buf;
-    auto view = read_entry(offset, header.key_size, header.value_size, buf);
+    auto view = read_entry_with_key_size(offset, header.key_size, header.value_size, buf);
     const auto next =
         offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
     return std::make_pair(
@@ -437,7 +488,7 @@ public:
                   std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const override {
     if (verify) {
-      auto view = read_entry(offset, key_size, value_size, io_buf);
+      auto view = read_entry_with_key_size(offset, key_size, value_size, io_buf);
       out.assign(view.value.begin(), view.value.end());
     } else {
       const auto val_offset = offset + kHeaderSize + key_size;
@@ -449,6 +500,46 @@ public:
             "ReadOnlyPosixDataFile::read_value: pread failed"};
       }
     }
+  }
+
+  [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
+                                std::vector<std::byte> &io_buf) const
+      -> DataEntryView override {
+    auto hdr = read_header(offset);
+    return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf);
+  }
+
+  [[nodiscard]] auto read_entry_unverified(
+      Offset offset, std::uint32_t value_size,
+      std::vector<std::byte> &io_buf) const -> DataEntryView override {
+    static constexpr std::size_t kKeyBudget = 256;
+    const auto speculative_total = kHeaderSize + kKeyBudget + value_size + kCrcSize;
+    io_buf.resize(speculative_total);
+    auto bytes_read = ::pread(fd_, io_buf.data(), speculative_total,
+                             narrow<off_t>(offset));
+    if (bytes_read < narrow<ssize_t>(kHeaderSize)) {
+      throw std::system_error{errno, std::generic_category(),
+                              "ReadOnlyPosixDataFile::read_entry_unverified: pread failed"};
+    }
+    auto hdr = bytecask::read_header(
+        std::span<const std::byte>{io_buf.data(), kHeaderSize});
+    const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
+    if (total > speculative_total) {
+      io_buf.resize(total);
+      if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
+          narrow<ssize_t>(total)) {
+        throw std::system_error{errno, std::generic_category(),
+                                "ReadOnlyPosixDataFile::read_entry_unverified: pread failed"};
+      }
+    }
+    auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
+                                           hdr.key_size + value_size};
+    return DataEntryView{
+        .sequence = hdr.sequence,
+        .entry_type = hdr.entry_type,
+        .key = body.subspan(0, hdr.key_size),
+        .value = body.subspan(hdr.key_size, value_size),
+    };
   }
 
   [[nodiscard]] auto size() const noexcept -> Offset override {
@@ -474,9 +565,10 @@ private:
     return bytecask::read_header(std::span{hdr});
   }
 
-  [[nodiscard]] auto read_entry(Offset offset, std::uint16_t key_size,
-                                std::uint32_t value_size,
-                                std::vector<std::byte> &io_buf) const
+  [[nodiscard]] auto read_entry_with_key_size(Offset offset,
+                                              std::uint16_t key_size,
+                                              std::uint32_t value_size,
+                                              std::vector<std::byte> &io_buf) const
       -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
     io_buf.resize(total);
@@ -554,7 +646,7 @@ public:
       return std::nullopt;
     }
     const auto header = read_header(offset);
-    auto view = read_entry(offset, header.key_size, header.value_size);
+    auto view = read_entry_with_key_size(offset, header.key_size, header.value_size);
     const auto next =
         offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
     return std::make_pair(
@@ -569,7 +661,7 @@ public:
                   [[maybe_unused]] std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const override {
     if (verify) {
-      auto view = read_entry(offset, key_size, value_size);
+      auto view = read_entry_with_key_size(offset, key_size, value_size);
       out.assign(view.value.begin(), view.value.end());
     } else {
       const auto val_offset = offset + kHeaderSize + key_size;
@@ -577,6 +669,28 @@ public:
       auto *base = mmap_base_ + val_offset;
       out.assign(base, base + value_size);
     }
+  }
+
+  [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
+                                [[maybe_unused]] std::vector<std::byte> &io_buf) const
+      -> DataEntryView override {
+    auto hdr = read_header(offset);
+    return read_entry_with_key_size(offset, hdr.key_size, value_size);
+  }
+
+  [[nodiscard]] auto read_entry_unverified(
+      Offset offset, std::uint32_t value_size,
+      [[maybe_unused]] std::vector<std::byte> &io_buf) const
+      -> DataEntryView override {
+    auto hdr = bytecask::read_header(std::span{mmap_base_ + offset, kHeaderSize});
+    auto body = std::span{mmap_base_ + offset + kHeaderSize,
+                          hdr.key_size + value_size};
+    return DataEntryView{
+        .sequence = hdr.sequence,
+        .entry_type = hdr.entry_type,
+        .key = body.subspan(0, hdr.key_size),
+        .value = body.subspan(hdr.key_size, value_size),
+    };
   }
 
   [[nodiscard]] auto size() const noexcept -> Offset override {
@@ -598,8 +712,9 @@ private:
     return bytecask::read_header(std::span{mmap_base_ + offset, kHeaderSize});
   }
 
-  [[nodiscard]] auto read_entry(Offset offset, std::uint16_t key_size,
-                                std::uint32_t value_size) const
+  [[nodiscard]] auto read_entry_with_key_size(Offset offset,
+                                              std::uint16_t key_size,
+                                              std::uint32_t value_size) const
       -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
     assert(offset + total <= mmap_size_);

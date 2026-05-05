@@ -52,6 +52,13 @@ auto to_string(const bytecask::Key &key) -> std::string {
   return s;
 }
 
+auto to_string(std::span<const std::byte> span) -> std::string {
+  std::string s(span.size(), '\0');
+  std::ranges::transform(span, s.begin(),
+                         [](std::byte b) { return static_cast<char>(b); });
+  return s;
+}
+
 // Convenience wrapper: reads key into a temporary buffer and returns it as
 // optional. Used by tests that don't need to reuse the output buffer.
 auto get_val(const bytecask::DB &db, bytecask::BytesView key)
@@ -252,9 +259,9 @@ TEST_CASE("DB iter_from returns entries in ascending order",
   bytecask::ReadOptions ro;
   std::vector<std::string> keys;
   std::vector<std::string> values;
-  for (auto &[k, v] : db.iter_from(ro)) {
-    keys.push_back(to_string(k));
-    values.push_back(to_string(v));
+  for (auto &entry : db.iter_from(ro)) {
+    keys.push_back(to_string(entry.key));
+    values.push_back(to_string(entry.value));
   }
 
   REQUIRE(keys.size() == 3);
@@ -278,8 +285,8 @@ TEST_CASE("DB iter_from starts from given key", "[bytecask]") {
   db.put({}, to_bytes("cherry"), to_bytes("3"));
 
   std::vector<std::string> keys;
-  for (auto &[k, v] : db.iter_from({}, to_bytes("banana"))) {
-    keys.push_back(to_string(k));
+  for (auto &entry : db.iter_from({}, to_bytes("banana"))) {
+    keys.push_back(to_string(entry.key));
   }
 
   REQUIRE(keys.size() == 2);
@@ -367,9 +374,9 @@ TEST_CASE("DB iter_from spans multiple rotated files",
 
   std::vector<std::string> keys;
   std::vector<std::string> values;
-  for (auto &[k, v] : db.iter_from({})) {
-    keys.push_back(to_string(k));
-    values.push_back(to_string(v));
+  for (auto &entry : db.iter_from({})) {
+    keys.push_back(to_string(entry.key));
+    values.push_back(to_string(entry.value));
   }
 
   REQUIRE(keys.size() == 3);
@@ -840,8 +847,8 @@ TEST_CASE("DB parallel recovery: matches serial result",
   std::map<std::string, std::string> serial_kv;
   {
     auto serial = bytecask::DB::open(db_path, {.max_file_bytes = 1, .recovery_threads = 1});
-    for (auto [key, val] : serial.iter_from({})) {
-      serial_kv[to_string(key)] = to_string(val);
+    for (auto &entry : serial.iter_from({})) {
+      serial_kv[to_string(entry.key)] = to_string(entry.value);
     }
   }
 
@@ -850,8 +857,8 @@ TEST_CASE("DB parallel recovery: matches serial result",
 
   // Collect parallel results.
   std::map<std::string, std::string> parallel_kv;
-  for (auto [key, val] : parallel.iter_from({})) {
-    parallel_kv[to_string(key)] = to_string(val);
+  for (auto &entry : parallel.iter_from({})) {
+    parallel_kv[to_string(entry.key)] = to_string(entry.value);
   }
 
   REQUIRE(serial_kv.size() == parallel_kv.size());
@@ -1056,8 +1063,8 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
   // Helper: collect all (key, value) from a DB into a map.
   auto collect = [](bytecask::DB &db) {
     std::map<std::string, std::string> kv;
-    for (auto [key, val] : db.iter_from({})) {
-      kv[to_string(key)] = to_string(val);
+    for (auto &entry : db.iter_from({})) {
+      kv[to_string(entry.key)] = to_string(entry.value);
     }
     return kv;
   };
@@ -1212,8 +1219,8 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
 
   auto collect = [](bytecask::DB &db) {
     std::map<std::string, std::string> kv;
-    for (auto [key, val] : db.iter_from({})) {
-      kv[to_string(key)] = to_string(val);
+    for (auto &entry : db.iter_from({})) {
+      kv[to_string(entry.key)] = to_string(entry.value);
     }
     return kv;
   };
@@ -1315,8 +1322,8 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
 
   auto collect = [](bytecask::DB &db) {
     std::map<std::string, std::string> kv;
-    for (auto [key, val] : db.iter_from({})) {
-      kv[to_string(key)] = to_string(val);
+    for (auto &entry : db.iter_from({})) {
+      kv[to_string(entry.key)] = to_string(entry.value);
     }
     return kv;
   };
@@ -2530,8 +2537,8 @@ TEST_CASE("Snapshot iter_from is frozen at snapshot time", "[snapshot]") {
   db.put({}, to_bytes("c"), to_bytes("3"));
 
   std::vector<std::string> keys;
-  for (const auto &[k, v] : snap.iter_from({})) {
-    keys.push_back(to_string(k));
+  for (const auto &entry : snap.iter_from({})) {
+    keys.push_back(to_string(entry.key));
   }
   CHECK(keys == std::vector<std::string>{"a", "b"});
 }
@@ -2571,9 +2578,9 @@ TEST_CASE("DB riter_from returns entries in descending order",
   bytecask::ReadOptions ro;
   std::vector<std::string> keys;
   std::vector<std::string> values;
-  for (auto &[k, v] : db.riter_from(ro)) {
-    keys.push_back(to_string(k));
-    values.push_back(to_string(v));
+  for (auto &entry : db.riter_from(ro)) {
+    keys.push_back(to_string(entry.key));
+    values.push_back(to_string(entry.value));
   }
 
   REQUIRE(keys.size() == 3);
@@ -2594,8 +2601,8 @@ TEST_CASE("DB riter_from starts at given key", "[bytecask]") {
   db.put({}, to_bytes("cherry"), to_bytes("3"));
 
   std::vector<std::string> keys;
-  for (auto &[k, v] : db.riter_from({}, to_bytes("banana"))) {
-    keys.push_back(to_string(k));
+  for (auto &entry : db.riter_from({}, to_bytes("banana"))) {
+    keys.push_back(to_string(entry.key));
   }
 
   REQUIRE(keys.size() == 2);
@@ -2614,8 +2621,8 @@ TEST_CASE("DB riter_from with nonexistent key starts at predecessor",
 
   std::vector<std::string> keys;
   // "d" doesn't exist; upper_bound("d") points to "e", so reverse starts at "c"
-  for (auto &[k, v] : db.riter_from({}, to_bytes("d"))) {
-    keys.push_back(to_string(k));
+  for (auto &entry : db.riter_from({}, to_bytes("d"))) {
+    keys.push_back(to_string(entry.key));
   }
 
   REQUIRE(keys.size() == 2);
@@ -2648,8 +2655,8 @@ TEST_CASE("DB riter_from on empty DB yields nothing", "[bytecask]") {
   auto db = bytecask::DB::open(td.path / "db");
 
   std::vector<std::string> keys;
-  for (auto &[k, v] : db.riter_from({})) {
-    keys.push_back(to_string(k));
+  for (auto &entry : db.riter_from({})) {
+    keys.push_back(to_string(entry.key));
   }
   CHECK(keys.empty());
 }
@@ -2665,8 +2672,8 @@ TEST_CASE("Snapshot riter_from is frozen at snapshot time", "[snapshot]") {
   db.put({}, to_bytes("c"), to_bytes("3"));
 
   std::vector<std::string> keys;
-  for (const auto &[k, v] : snap.riter_from({})) {
-    keys.push_back(to_string(k));
+  for (const auto &entry : snap.riter_from({})) {
+    keys.push_back(to_string(entry.key));
   }
   CHECK(keys == std::vector<std::string>{"b", "a"});
 }
@@ -4217,8 +4224,8 @@ TEST_CASE("del_range survives recovery",
 
   auto collect = [](bytecask::DB &db) {
     std::map<std::string, std::string> kv;
-    for (auto [key, val] : db.iter_from({})) {
-      kv[to_string(key)] = to_string(val);
+    for (auto &entry : db.iter_from({})) {
+      kv[to_string(entry.key)] = to_string(entry.value);
     }
     return kv;
   };
@@ -4650,8 +4657,8 @@ TEST_CASE("Recovery model-based: workload with range deletes",
 
   auto collect = [](bytecask::DB &db) {
     std::map<std::string, std::string> kv;
-    for (auto [key, val] : db.iter_from({})) {
-      kv[to_string(key)] = to_string(val);
+    for (auto &entry : db.iter_from({})) {
+      kv[to_string(entry.key)] = to_string(entry.value);
     }
     return kv;
   };

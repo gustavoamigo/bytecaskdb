@@ -205,16 +205,16 @@ void catalog_drop_row_count(uint32_t table_id) {
 static bool catalog_init(bytecask::DB *db) {
   auto [lower, upper] = table_meta_scan_bounds();
   try {
-    for (auto &[k, v] : db->iter_from({}, as_view(lower.data(), lower.size()))) {
+    for (auto &entry : db->iter_from({}, as_view(lower.data(), lower.size()))) {
       // Stop if past the upper bound.
-      const auto *kp = u8_data(k);
-      if (k.size() < upper.size() ||
+      const auto *kp = u8_data(entry.key);
+      if (entry.key.size() < upper.size() ||
           std::memcmp(kp, upper.data(), upper.size()) >= 0) {
         break;
       }
 
       TableMeta meta;
-      if (deserialize_table_meta(u8_data(v), v.size(), meta)) {
+      if (deserialize_table_meta(u8_data(entry.value), entry.value.size(), meta)) {
         s_name_to_id.emplace(meta.full_name, meta.table_id);
         s_id_to_meta.emplace(meta.table_id, std::move(meta));
       }

@@ -179,17 +179,16 @@ auto KeyIterator::operator==(std::default_sentinel_t) const noexcept -> bool {
 
 struct EntryIterator::Impl {
   bytecask::EntryIterator cur;
-  mutable std::pair<Bytes, Bytes> cached;
+  mutable EntryView cached{};
   mutable bool cached_valid{false};
 
   explicit Impl(bytecask::EntryIterator c) : cur{std::move(c)} {}
 
-  auto get() const -> const std::pair<Bytes, Bytes>& {
+  auto get() const -> const EntryView& {
     if (!cached_valid) {
       if (cur != std::default_sentinel) {
-        const auto& [k, v] = *cur;
-        cached.first.assign(k.begin(), k.end());
-        cached.second = v;
+        const auto& entry = *cur;
+        cached = EntryView{entry.key, entry.value};
       }
       cached_valid = true;
     }
@@ -205,7 +204,7 @@ EntryIterator::EntryIterator(std::unique_ptr<Impl> impl) noexcept
     : impl_{std::move(impl)} {}
 
 auto EntryIterator::operator*() const
-    -> const std::pair<Bytes, Bytes>& {
+    -> const EntryView& {
   return impl_->get();
 }
 
@@ -284,23 +283,22 @@ auto ReverseKeyIterator::operator==(const ReverseKeyIterator& other) const noexc
 }
 
 // ---------------------------------------------------------------------------
-// ReverseEntryIterator::Impl — copyable for the same reason as ReverseKeyIterator
+// ReverseEntryIterator::Impl — move-only, uses default_sentinel for end
 // ---------------------------------------------------------------------------
 
 struct ReverseEntryIterator::Impl {
   bytecask::ReverseEntryIterator cur;
-  mutable std::pair<Bytes, Bytes> cached;
+  mutable EntryView cached{};
   mutable bool cached_valid{false};
 
   explicit Impl(bytecask::ReverseEntryIterator c) : cur{std::move(c)} {}
-  Impl(const Impl& o)
-      : cur{o.cur}, cached{o.cached}, cached_valid{o.cached_valid} {}
 
-  auto get() const -> const std::pair<Bytes, Bytes>& {
+  auto get() const -> const EntryView& {
     if (!cached_valid) {
-      const auto& [k, v] = *cur;
-      cached.first.assign(k.begin(), k.end());
-      cached.second = v;
+      if (cur != std::default_sentinel) {
+        const auto& entry = *cur;
+        cached = EntryView{entry.key, entry.value};
+      }
       cached_valid = true;
     }
     return cached;
@@ -314,18 +312,8 @@ ReverseEntryIterator& ReverseEntryIterator::operator=(ReverseEntryIterator&&) no
 ReverseEntryIterator::ReverseEntryIterator(std::unique_ptr<Impl> impl) noexcept
     : impl_{std::move(impl)} {}
 
-ReverseEntryIterator::ReverseEntryIterator(const ReverseEntryIterator& other)
-    : impl_{other.impl_ ? std::make_unique<Impl>(*other.impl_) : nullptr} {}
-
-ReverseEntryIterator& ReverseEntryIterator::operator=(const ReverseEntryIterator& other) {
-  if (this != &other) {
-    impl_ = other.impl_ ? std::make_unique<Impl>(*other.impl_) : nullptr;
-  }
-  return *this;
-}
-
 auto ReverseEntryIterator::operator*() const
-    -> const std::pair<Bytes, Bytes>& {
+    -> const EntryView& {
   return impl_->get();
 }
 
@@ -337,10 +325,8 @@ auto ReverseEntryIterator::operator++() -> ReverseEntryIterator& {
 
 void ReverseEntryIterator::operator++(int) { ++*this; }
 
-auto ReverseEntryIterator::operator==(const ReverseEntryIterator& other) const noexcept -> bool {
-  if (!impl_ && !other.impl_) return true;
-  if (!impl_ || !other.impl_) return false;
-  return impl_->cur == other.impl_->cur;
+auto ReverseEntryIterator::operator==(std::default_sentinel_t) const noexcept -> bool {
+  return !impl_ || (impl_->cur == std::default_sentinel);
 }
 
 // ---------------------------------------------------------------------------
@@ -435,11 +421,11 @@ auto Snapshot::keys_from(const ReadOptions& opts,
 
 auto Snapshot::riter_from(const ReadOptions& opts,
                           BytesView from) const
-    -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator> {
+    -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t> {
   auto r = impl_->snap.riter_from(to_module(opts), from);
   return {
     ReverseEntryIterator{std::make_unique<ReverseEntryIterator::Impl>(r.begin())},
-    ReverseEntryIterator{std::make_unique<ReverseEntryIterator::Impl>(r.end())}
+    std::default_sentinel
   };
 }
 
@@ -606,11 +592,11 @@ auto DB::keys_from(const ReadOptions& opts,
 
 auto DB::riter_from(const ReadOptions& opts,
                     BytesView from) const
-    -> std::ranges::subrange<ReverseEntryIterator, ReverseEntryIterator> {
+    -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t> {
   auto r = impl_->db.riter_from(to_module(opts), from);
   return {
     ReverseEntryIterator{std::make_unique<ReverseEntryIterator::Impl>(r.begin())},
-    ReverseEntryIterator{std::make_unique<ReverseEntryIterator::Impl>(r.end())}
+    std::default_sentinel
   };
 }
 

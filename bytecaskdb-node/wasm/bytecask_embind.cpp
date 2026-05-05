@@ -56,6 +56,10 @@ static auto key_to_js(const bytecask::Key &k) -> val {
   return to_js_uint8array(&*k.begin(), k.size());
 }
 
+static auto span_to_js(std::span<const std::byte> s) -> val {
+  return to_js_uint8array(s.data(), s.size());
+}
+
 // ---------------------------------------------------------------------------
 // Options extraction helpers
 // ---------------------------------------------------------------------------
@@ -140,10 +144,10 @@ struct JsEntryIterator {
       result.set("done", true);
       return result;
     }
-    auto [key, value] = *it;
+    const auto &e = *it;
     auto entry = val::object();
-    entry.set("key", key_to_js(key));
-    entry.set("value", bytes_to_js(value));
+    entry.set("key", span_to_js(e.key));
+    entry.set("value", span_to_js(e.value));
     result.set("value", entry);
     result.set("done", false);
     ++it;
@@ -175,25 +179,24 @@ struct JsKeyIterator {
 
 struct JsReverseEntryIterator {
   std::ranges::subrange<bytecask::ReverseEntryIterator,
-                        bytecask::ReverseEntryIterator> range;
+                        std::default_sentinel_t> range;
   bytecask::ReverseEntryIterator it;
-  bytecask::ReverseEntryIterator end;
 
   explicit JsReverseEntryIterator(
       std::ranges::subrange<bytecask::ReverseEntryIterator,
-                            bytecask::ReverseEntryIterator> r)
-      : range{std::move(r)}, it{range.begin()}, end{range.end()} {}
+                            std::default_sentinel_t> r)
+      : range{std::move(r)}, it{range.begin()} {}
 
   auto next() -> val {
     auto result = val::object();
-    if (it == end) {
+    if (it == std::default_sentinel) {
       result.set("done", true);
       return result;
     }
-    auto [key, value] = *it;
+    const auto &e = *it;
     auto entry = val::object();
-    entry.set("key", key_to_js(key));
-    entry.set("value", bytes_to_js(value));
+    entry.set("key", span_to_js(e.key));
+    entry.set("value", span_to_js(e.value));
     result.set("value", entry);
     result.set("done", false);
     ++it;
@@ -251,10 +254,6 @@ static auto mode_to_string(bytecask::Mode m) -> const char * {
     case bytecask::Mode::Leader: return "leader";
     case bytecask::Mode::Follower: return "follower";
   }
-}
-
-static auto span_to_js(std::span<const std::byte> s) -> val {
-  return to_js_uint8array(s.data(), s.size());
 }
 
 struct JsChangeIterator {

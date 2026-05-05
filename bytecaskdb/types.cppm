@@ -33,4 +33,9 @@ export struct DataEntryView {
   std::span<const std::byte> value;
 };
 
+export struct EntryView {
+  std::span<const std::byte> key;
+  std::span<const std::byte> value;
+};
+
 } // namespace bytecask
