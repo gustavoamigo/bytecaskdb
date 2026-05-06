@@ -276,18 +276,13 @@ public:
   auto operator*() const -> const EntryView & {
     if (!has_cached_) {
       auto &dir_entry = *cur_;
-      if (dir_entry.value_size() == 0) {
-        raw_cached_ = DataEntryView{.sequence = 0, .entry_type = EntryType::Put,
-                                    .key = {}, .value = {}};
+      auto &file = *(*state_->files.get(dir_entry.file_id()));
+      if (verify_checksums_) {
+        raw_cached_ = file.read_entry(dir_entry.file_offset(),
+                                      dir_entry.value_size(), io_buf_);
       } else {
-        auto &file = *(*state_->files.get(dir_entry.file_id()));
-        if (verify_checksums_) {
-          raw_cached_ = file.read_entry(dir_entry.file_offset(),
-                                        dir_entry.value_size(), io_buf_);
-        } else {
-          raw_cached_ = file.read_entry_unverified(dir_entry.file_offset(),
-                                                   dir_entry.value_size(), io_buf_);
-        }
+        raw_cached_ = file.read_entry_unverified(dir_entry.file_offset(),
+                                                 dir_entry.value_size(), io_buf_);
       }
       cached_ = EntryView{.key = raw_cached_.key, .value = raw_cached_.value};
       has_cached_ = true;
@@ -360,6 +355,10 @@ public:
     return cur_ == other.cur_;
   }
 
+  auto operator==(std::default_sentinel_t) const noexcept -> bool {
+    return cur_ == std::default_sentinel;
+  }
+
 private:
   Iter cur_;
 };
@@ -386,18 +385,13 @@ public:
   auto operator*() const -> const EntryView & {
     if (!has_cached_) {
       auto &dir_entry = *cur_;
-      if (dir_entry.value_size() == 0) {
-        raw_cached_ = DataEntryView{.sequence = 0, .entry_type = EntryType::Put,
-                                    .key = {}, .value = {}};
+      auto &file = *(*state_->files.get(dir_entry.file_id()));
+      if (verify_checksums_) {
+        raw_cached_ = file.read_entry(dir_entry.file_offset(),
+                                      dir_entry.value_size(), io_buf_);
       } else {
-        auto &file = *(*state_->files.get(dir_entry.file_id()));
-        if (verify_checksums_) {
-          raw_cached_ = file.read_entry(dir_entry.file_offset(),
-                                        dir_entry.value_size(), io_buf_);
-        } else {
-          raw_cached_ = file.read_entry_unverified(dir_entry.file_offset(),
-                                                   dir_entry.value_size(), io_buf_);
-        }
+        raw_cached_ = file.read_entry_unverified(dir_entry.file_offset(),
+                                                 dir_entry.value_size(), io_buf_);
       }
       cached_ = EntryView{.key = raw_cached_.key, .value = raw_cached_.value};
       has_cached_ = true;

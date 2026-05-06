@@ -64,8 +64,8 @@ public:
                   std::vector<uint8_t> hi,
                   uint32_t table_id);
 
-    // Forward construction (secondary index).
-    MergeIterator(std::optional<bytecask::EntryIterator> snap_it,
+    // Forward construction (secondary index — key-only snapshot).
+    MergeIterator(std::optional<bytecask::KeyIterator> snap_it,
                   LookupMap::const_iterator buf_it,
                   LookupMap::const_iterator buf_end,
                   std::vector<uint8_t> hi,
@@ -78,8 +78,8 @@ public:
                   std::vector<uint8_t> lo,
                   uint32_t table_id);
 
-    // Reverse construction (secondary index).
-    MergeIterator(std::optional<bytecask::ReverseEntryIterator> snap_it,
+    // Reverse construction (secondary index — key-only snapshot).
+    MergeIterator(std::optional<bytecask::ReverseKeyIterator> snap_it,
                   LookupMap::const_iterator buf_it,
                   LookupMap::const_iterator buf_end,
                   std::vector<uint8_t> lo,
@@ -118,6 +118,8 @@ public:
     // At most one of these is engaged.
     std::optional<bytecask::EntryIterator>        snap_fwd_;
     std::optional<bytecask::ReverseEntryIterator> snap_rev_;
+    std::optional<bytecask::KeyIterator>          snap_key_fwd_;
+    std::optional<bytecask::ReverseKeyIterator>   snap_key_rev_;
     bool reverse_{false};
 
     LookupMap::const_iterator buf_it_;

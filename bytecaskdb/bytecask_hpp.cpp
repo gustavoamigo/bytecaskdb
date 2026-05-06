@@ -282,6 +282,11 @@ auto ReverseKeyIterator::operator==(const ReverseKeyIterator& other) const noexc
   return impl_->cur == other.impl_->cur;
 }
 
+auto ReverseKeyIterator::operator==(std::default_sentinel_t) const noexcept -> bool {
+  if (!impl_) return true;
+  return impl_->cur == std::default_sentinel;
+}
+
 // ---------------------------------------------------------------------------
 // ReverseEntryIterator::Impl — move-only, uses default_sentinel for end
 // ---------------------------------------------------------------------------

@@ -1,0 +1,161 @@
+# Functional tests derived from failing MTR tests.
+# These cover secondary index scenarios that MTR revealed as broken:
+# unique constraint enforcement, DELETE via index, composite unique indexes,
+# INSERT IGNORE, ON DUPLICATE KEY UPDATE, and REPLACE without PK.
+
+- name: DELETE via non-unique secondary index
+  setup:
+    - DROP DATABASE IF EXISTS mtr_gap
+    - CREATE DATABASE mtr_gap
+    - CREATE TABLE mtr_gap.t1 (a INT, b CHAR(8), INDEX idx_b(b)) ENGINE=bytecaskdb
+    - INSERT INTO mtr_gap.t1 (a,b) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e'),(6,'x'),(7,'y'),(8,'z')
+  steps:
+    - sql: DELETE FROM mtr_gap.t1 WHERE b > 'y'
+    - sql: SELECT a, b FROM mtr_gap.t1 ORDER BY a
+      expected:
+        - ['1', 'a']
+        - ['2', 'b']
+        - ['3', 'c']
+        - ['4', 'd']
+        - ['5', 'e']
+        - ['6', 'x']
+        - ['7', 'y']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr_gap
+
+- name: DELETE via unique secondary index
+  setup:
+    - DROP DATABASE IF EXISTS mtr_gap
+    - CREATE DATABASE mtr_gap
+    - CREATE TABLE mtr_gap.t1 (a INT, b CHAR(8), UNIQUE INDEX idx_b(b)) ENGINE=bytecaskdb
+    - INSERT INTO mtr_gap.t1 (a,b) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')
+  steps:
+    - sql: DELETE FROM mtr_gap.t1 WHERE b = 'c'
+    - sql: SELECT a, b FROM mtr_gap.t1 ORDER BY a
+      expected:
+        - ['1', 'a']
+        - ['2', 'b']
+        - ['4', 'd']
+        - ['5', 'e']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr_gap
+
+- name: Composite UNIQUE rejects duplicate INSERT
+  setup:
+    - DROP DATABASE IF EXISTS mtr_gap
+    - CREATE DATABASE mtr_gap
+    - CREATE TABLE mtr_gap.t1 (a INT, b CHAR(8), UNIQUE INDEX idx_ab(a, b)) ENGINE=bytecaskdb
+    - INSERT INTO mtr_gap.t1 (a,b) VALUES (1,'a'),(2,'b'),(3,'c')
+  steps:
+    - sql: INSERT INTO mtr_gap.t1 (a,b) VALUES (1,'a')
+      error: 1062
+    - sql: SELECT a, b FROM mtr_gap.t1 ORDER BY a, b
+      expected:
+        - ['1', 'a']
+        - ['2', 'b']
+        - ['3', 'c']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr_gap
+
+- name: Composite UNIQUE rejects duplicate UPDATE
+  setup:
+    - DROP DATABASE IF EXISTS mtr_gap
+    - CREATE DATABASE mtr_gap
+    - CREATE TABLE mtr_gap.t1 (a INT, b CHAR(8), UNIQUE INDEX idx_ab(a, b)) ENGINE=bytecaskdb
+    - INSERT INTO mtr_gap.t1 (a,b) VALUES (1,'a'),(2,'b'),(3,'c'),(100,'a')
+  steps:
+    - sql: UPDATE mtr_gap.t1 SET a=100 WHERE a=1
+      error: 1062
+    - sql: SELECT a, b FROM mtr_gap.t1 ORDER BY a, b
+      expected:
+        - ['1', 'a']
+        - ['2', 'b']
+        - ['3', 'c']
+        - ['100', 'a']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr_gap
+
+- name: INSERT IGNORE skips duplicate on unique secondary index
+  setup:
+    - DROP DATABASE IF EXISTS mtr_gap
+    - CREATE DATABASE mtr_gap
+    - CREATE TABLE mtr_gap.t1 (a INT AUTO_INCREMENT PRIMARY KEY, b INT, UNIQUE INDEX idx_b(b)) ENGINE=bytecaskdb
+    - INSERT INTO mtr_gap.t1 (b) VALUES (10),(20),(30)
+  steps:
+    - sql: INSERT IGNORE INTO mtr_gap.t1 (b) VALUES (20),(40)
+    - sql: SELECT b FROM mtr_gap.t1 ORDER BY b
+      expected:
+        - ['10']
+        - ['20']
+        - ['30']
+        - ['40']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr_gap
+
+- name: ON DUPLICATE KEY UPDATE with unique secondary index
+  setup:
+    - DROP DATABASE IF EXISTS mtr_gap
+    - CREATE DATABASE mtr_gap
+    - CREATE TABLE mtr_gap.t1 (a INT AUTO_INCREMENT PRIMARY KEY, b INT, c VARCHAR(20), UNIQUE INDEX idx_b(b)) ENGINE=bytecaskdb
+    - INSERT INTO mtr_gap.t1 (b, c) VALUES (10,'first'),(20,'second'),(30,'third')
+  steps:
+    - sql: INSERT INTO mtr_gap.t1 (b, c) VALUES (20,'updated') ON DUPLICATE KEY UPDATE c='updated'
+    - sql: SELECT b, c FROM mtr_gap.t1 ORDER BY b
+      expected:
+        - ['10', 'first']
+        - ['20', 'updated']
+        - ['30', 'third']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr_gap
+
+- name: REPLACE deletes via unique secondary index (no explicit PK)
+  setup:
+    - DROP DATABASE IF EXISTS mtr_gap
+    - CREATE DATABASE mtr_gap
+    - CREATE TABLE mtr_gap.t1 (a INT, b CHAR(8), UNIQUE INDEX idx_a(a)) ENGINE=bytecaskdb
+    - INSERT INTO mtr_gap.t1 (a,b) VALUES (1,'a'),(2,'b'),(3,'c')
+  steps:
+    - sql: REPLACE INTO mtr_gap.t1 (a,b) VALUES (2,'d')
+    - sql: SELECT a, b FROM mtr_gap.t1 ORDER BY a
+      expected:
+        - ['1', 'a']
+        - ['2', 'd']
+        - ['3', 'c']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr_gap
+
+- name: UPDATE self-conflict on UNIQUE index
+  setup:
+    - DROP DATABASE IF EXISTS mtr_gap
+    - CREATE DATABASE mtr_gap
+    - CREATE TABLE mtr_gap.t1 (a INT, b CHAR(8), UNIQUE INDEX idx_a(a)) ENGINE=bytecaskdb
+    - INSERT INTO mtr_gap.t1 (a,b) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')
+  steps:
+    - sql: UPDATE mtr_gap.t1 SET a=99 WHERE a IN (2,3)
+      error: 1062
+    - sql: SELECT a, b FROM mtr_gap.t1 ORDER BY a
+      expected:
+        - ['1', 'a']
+        - ['2', 'b']
+        - ['3', 'c']
+        - ['4', 'd']
+        - ['5', 'e']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr_gap
+
+- name: Multi-row INSERT rejects batch when one row conflicts
+  setup:
+    - DROP DATABASE IF EXISTS mtr_gap
+    - CREATE DATABASE mtr_gap
+    - CREATE TABLE mtr_gap.t1 (a INT, b CHAR(8), UNIQUE INDEX idx_a(a)) ENGINE=bytecaskdb
+    - INSERT INTO mtr_gap.t1 (a,b) VALUES (1,'a'),(2,'b'),(3,'c')
+  steps:
+    - sql: INSERT INTO mtr_gap.t1 (a,b) VALUES (1,'x'),(99,'z')
+      error: 1062
+    - sql: SELECT a, b FROM mtr_gap.t1 ORDER BY a
+      expected:
+        - ['1', 'a']
+        - ['2', 'b']
+        - ['3', 'c']
+  teardown:
+    - DROP DATABASE IF EXISTS mtr_gap
