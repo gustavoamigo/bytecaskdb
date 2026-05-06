@@ -5,6 +5,7 @@
 
 module;
 #include <array>
+#include <atomic>
 #include <cassert>
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
@@ -127,9 +128,10 @@ public:
       : DataFile{std::move(other)}, fd_{other.fd_}, offset_{other.offset_},
         preallocated_end_{other.preallocated_end_},
         write_buf_{std::move(other.write_buf_)},
-        buf_size_{other.buf_size_}, buf_capacity_{other.buf_capacity_} {
+        buf_size_{other.buf_size_.load(std::memory_order_relaxed)},
+        buf_capacity_{other.buf_capacity_} {
     other.fd_ = -1;
-    other.buf_size_ = 0;
+    other.buf_size_.store(0, std::memory_order_relaxed);
   }
 
   WritableDataFile &operator=(WritableDataFile &&other) noexcept {
@@ -142,10 +144,11 @@ public:
       offset_ = other.offset_;
       preallocated_end_ = other.preallocated_end_;
       write_buf_ = std::move(other.write_buf_);
-      buf_size_ = other.buf_size_;
+      buf_size_.store(other.buf_size_.load(std::memory_order_relaxed),
+                      std::memory_order_relaxed);
       buf_capacity_ = other.buf_capacity_;
       other.fd_ = -1;
-      other.buf_size_ = 0;
+      other.buf_size_.store(0, std::memory_order_relaxed);
     }
     return *this;
   }
@@ -312,9 +315,10 @@ public:
       Offset offset, std::uint32_t value_size,
       std::vector<std::byte> &io_buf) const
       -> DataEntryView override {
-    auto hdr = read_header(offset);
+    auto bs = buf_size_.load(std::memory_order_acquire);
+    auto hdr = read_header_from(offset, bs);
     const auto body_size = hdr.key_size + value_size;
-    if (offset + kHeaderSize + body_size <= buf_size_) {
+    if (offset + kHeaderSize + body_size <= bs) {
       auto body = std::span<const std::byte>{
           write_buf_.get() + offset + kHeaderSize, body_size};
       return DataEntryView{
@@ -361,8 +365,8 @@ public:
     }
     offset_ = new_size;
     preallocated_end_ = new_size;
-    if (static_cast<std::size_t>(new_size) < buf_size_) {
-      buf_size_ = static_cast<std::size_t>(new_size);
+    if (static_cast<std::size_t>(new_size) < buf_size_.load(std::memory_order_relaxed)) {
+      buf_size_.store(static_cast<std::size_t>(new_size), std::memory_order_release);
     }
   }
 
@@ -390,7 +394,7 @@ private:
         throw std::system_error{errno, std::generic_category(),
                                 "WritableDataFile: failed to populate buffer"};
       }
-      buf_size_ = to_load;
+      buf_size_.store(to_load, std::memory_order_relaxed);
     }
   }
 
@@ -399,14 +403,15 @@ private:
   Offset preallocated_end_{0};
   std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};
   std::unique_ptr<std::byte[]> write_buf_;
-  std::size_t buf_size_{0};
+  std::atomic<std::size_t> buf_size_{0};
   std::size_t buf_capacity_{0};
 
   void buf_append(std::span<const std::byte> data) {
     if (data.empty()) return;
-    if (buf_size_ + data.size() > buf_capacity_) return;
-    std::memcpy(write_buf_.get() + buf_size_, data.data(), data.size());
-    buf_size_ += data.size();
+    auto cur = buf_size_.load(std::memory_order_relaxed);
+    if (cur + data.size() > buf_capacity_) return;
+    std::memcpy(write_buf_.get() + cur, data.data(), data.size());
+    buf_size_.store(cur + data.size(), std::memory_order_release);
   }
 
   // Reads serve from the write buffer when the offset is within capacity.
@@ -414,7 +419,13 @@ private:
   // rotation leaves the active file oversized in degraded mode.
 
   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
-    if (offset + kHeaderSize <= buf_size_) {
+    auto bs = buf_size_.load(std::memory_order_acquire);
+    return read_header_from(offset, bs);
+  }
+
+  [[nodiscard]] auto read_header_from(Offset offset, std::size_t bs) const
+      -> EntryHeader {
+    if (offset + kHeaderSize <= bs) {
       return bytecask::read_header(
           std::span<const std::byte>{write_buf_.get() + offset, kHeaderSize});
     }
@@ -426,7 +437,8 @@ private:
                                 std::vector<std::byte>& io_buf) const
       -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    if (offset + total <= buf_size_) {
+    auto bs = buf_size_.load(std::memory_order_acquire);
+    if (offset + total <= bs) {
       io_buf.assign(write_buf_.get() + offset,
                     write_buf_.get() + offset + total);
     } else {
@@ -452,7 +464,8 @@ private:
                              std::uint32_t value_size,
                              std::vector<std::byte>& out) const {
     const auto val_offset = offset + kHeaderSize + key_size;
-    if (val_offset + value_size <= buf_size_) {
+    auto bs = buf_size_.load(std::memory_order_acquire);
+    if (val_offset + value_size <= bs) {
       out.assign(write_buf_.get() + val_offset,
                  write_buf_.get() + val_offset + value_size);
     } else {
