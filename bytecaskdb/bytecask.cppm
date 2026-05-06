@@ -1903,7 +1903,8 @@ DB::DB(std::filesystem::path dir, Options opts)
     counters_.files_opened.store(file_count, std::memory_order_relaxed);
     s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
-    auto new_active = WritableDataFile::openForWrite(dir_ / (stem + ".data"));
+    auto new_active = WritableDataFile::openForWrite(
+        dir_ / (stem + ".data"), rotation_threshold_);
     // +1 for the new active file.
     counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
     auto files_t = s.files.transient();
@@ -2225,6 +2226,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     }
   }
 
+  assert(t.active_file().size() <= rotation_threshold_);
   store_state(current, std::move(t).persistent());
 }
 
@@ -2415,7 +2417,8 @@ void DB::rotate_active_file(TransientEngineState &t,
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_rotate_file_creation);
 #endif
-  auto new_file = WritableDataFile::openForWrite(dir_ / (stem + ".data"));
+  auto new_file = WritableDataFile::openForWrite(
+      dir_ / (stem + ".data"), rotation_threshold_);
   t.apply_rotate_file(read_only_old, std::move(new_file));
   auto dir = dir_;
   worker_.dispatch([f = std::move(read_only_old), d = std::move(dir)] {
@@ -2596,7 +2599,8 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_vacuum_compact_tmp_create);
 #endif
-    auto tmp_file = WritableDataFile::openForWrite(tmp_data_path);
+    auto tmp_file = WritableDataFile::openForWrite(
+        tmp_data_path, rotation_threshold_);
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id);
     tmp_file->sync();
   }
@@ -2771,7 +2775,8 @@ void DB::resume() {
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_resume_file_creation);
 #endif
-  auto new_file = WritableDataFile::openForWrite(dir_ / (stem + ".data"));
+  auto new_file = WritableDataFile::openForWrite(
+      dir_ / (stem + ".data"), rotation_threshold_);
 
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.
@@ -3645,6 +3650,29 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     remaining = remaining.subspan(chunk_end);
   }
 
+  // Post-loop rotation: if the last chunk pushed the active file past the
+  // threshold, rotate now so the invariant (active file <= threshold) holds.
+  if (t.is_rotation_needed(rotation_threshold_)) {
+    try {
+      t.active_file().sync();
+      t.apply_sync(t.next_seq() - 1);
+    } catch (...) {
+      auto err_t = current->transient();
+      err_t.apply_degrade(
+          "ingest rotation fdatasync failed: call resume() to recover.");
+      store_state(std::move(err_t).persistent());
+      throw;
+    }
+    try {
+      rotate_active_file(t, current);
+    } catch (...) {
+      t.apply_degrade(
+          "ingest post-rotation file creation failed: call resume().");
+      store_state(current, std::move(t).persistent());
+      throw;
+    }
+  }
+
   // Final sync: ensure last chunk is durable before publishing.
   try {
     t.active_file().sync();
@@ -3657,6 +3685,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     throw;
   }
 
+  assert(t.active_file().size() <= rotation_threshold_);
   store_state(current, std::move(t).persistent());
 }
 

@@ -11,18 +11,21 @@
 #   - sysbench installed
 #
 # Usage:
-#   ./bytecaskdb-mariadb-plugin/tests/run-sysbench.sh [--table-size=N] [--threads=LIST] [--time=S]
+#   ./bytecaskdb-mariadb-plugin/tests/run-sysbench.sh [--table-size=N] [--threads=LIST] [--time=S] [--engines=LIST]
+#
+#   --engines: comma-separated list of engines to benchmark (default: bytecaskdb,innodb,rocksdb)
+#              e.g. --engines=bytecaskdb or --engines=bytecaskdb,innodb
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-TABLE_SIZE=50000
+TABLE_SIZE=1000000
 THREADS="1,16"
 DURATION=10
+ENGINES="bytecaskdb,innodb,rocksdb"
 WORKLOADS="oltp_point_select oltp_read_only oltp_write_only oltp_insert oltp_read_write"
-#WORKLOADS="oltp_read_only:points_only oltp_read_only:ranges_only oltp_read_only:simple_range oltp_read_only:sum_range oltp_read_only:order_range oltp_read_only:distinct_range"
 #WORKLOADS="oltp_read_only:points_only oltp_read_only:ranges_only oltp_read_only:simple_range oltp_read_only:sum_range oltp_read_only:order_range oltp_read_only:distinct_range"
 
 BYTECASKDB_PORT=3320
@@ -37,8 +40,9 @@ for arg in "$@"; do
     --table-size=*) TABLE_SIZE="${arg#*=}" ;;
     --threads=*)    THREADS="${arg#*=}" ;;
     --time=*)       DURATION="${arg#*=}" ;;
+    --engines=*)    ENGINES="${arg#*=}" ;;
     --help|-h)
-      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30]"
+      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--engines=bytecaskdb,innodb,rocksdb]"
       exit 0
       ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -46,6 +50,10 @@ for arg in "$@"; do
 done
 
 IFS=',' read -ra THREAD_LIST <<< "$THREADS"
+IFS=',' read -ra ENGINE_LIST <<< "$ENGINES"
+
+# Helper to check if an engine is enabled
+engine_enabled() { for e in "${ENGINE_LIST[@]}"; do [[ "$e" == "$1" ]] && return 0; done; return 1; }
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -68,28 +76,32 @@ command -v mariadbd >/dev/null 2>&1 || { echo "ERROR: mariadbd not found"; exit 
 # ---------------------------------------------------------------------------
 # Build plugin in Release mode
 # ---------------------------------------------------------------------------
-echo "=== Building ByteCaskDB plugin (Release) ==="
-PLUGIN_SRC="$BYTECASK_ROOT/bytecaskdb-mariadb-plugin"
-cmake -S "$PLUGIN_SRC" -B "$PLUGIN_DIR" -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1
-cmake --build "$PLUGIN_DIR" --parallel --target ha_bytecaskdb >/dev/null 2>&1 || {
-  echo "ERROR: plugin build failed"; exit 1;
-}
+if engine_enabled bytecaskdb; then
+  echo "=== Building ByteCaskDB plugin (Release) ==="
+  PLUGIN_SRC="$BYTECASK_ROOT/bytecaskdb-mariadb-plugin"
+  cmake -S "$PLUGIN_SRC" -B "$PLUGIN_DIR" -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1
+  cmake --build "$PLUGIN_DIR" --parallel --target ha_bytecaskdb >/dev/null 2>&1 || {
+    echo "ERROR: plugin build failed"; exit 1;
+  }
 
-if [[ ! -f "$PLUGIN_DIR/ha_bytecaskdb.so" ]]; then
-  echo "ERROR: $PLUGIN_DIR/ha_bytecaskdb.so not found after build"
-  exit 1
+  if [[ ! -f "$PLUGIN_DIR/ha_bytecaskdb.so" ]]; then
+    echo "ERROR: $PLUGIN_DIR/ha_bytecaskdb.so not found after build"
+    exit 1
+  fi
 fi
 
 ROCKSDB_PLUGIN_DIR=""
-# for system_dir in /usr/lib64/mariadb/plugin /usr/lib/mariadb/plugin; do
-#   if [[ -f "$system_dir/ha_rocksdb.so" ]]; then
-#     ROCKSDB_PLUGIN_DIR="$system_dir"
-#     break
-#   fi
-# done
-if [[ -z "$ROCKSDB_PLUGIN_DIR" ]]; then
-  echo "WARNING: ha_rocksdb.so not found — RocksDB benchmarks will be skipped"
-  echo "  Install with: sudo dnf install MariaDB-rocksdb-engine (or equivalent)"
+if engine_enabled rocksdb; then
+  for system_dir in /usr/lib64/mariadb/plugin /usr/lib/mariadb/plugin; do
+    if [[ -f "$system_dir/ha_rocksdb.so" ]]; then
+      ROCKSDB_PLUGIN_DIR="$system_dir"
+      break
+    fi
+  done
+  if [[ -z "$ROCKSDB_PLUGIN_DIR" ]]; then
+    echo "WARNING: ha_rocksdb.so not found — RocksDB benchmarks will be skipped"
+    echo "  Install with: sudo dnf install MariaDB-rocksdb-engine (or equivalent)"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -186,26 +198,36 @@ trap cleanup INT TERM
 # ---------------------------------------------------------------------------
 # Start instances
 # ---------------------------------------------------------------------------
-echo "=== Starting ByteCaskDB MariaDB instance (port $BYTECASKDB_PORT) ==="
-symlink_providers "$PLUGIN_DIR"
-start_mariadbd \
-  "$BYTECASKDB_DIR/data" \
-  "$BYTECASKDB_DIR/mysql.sock" \
-  "$BYTECASKDB_PORT" \
-  "$BYTECASKDB_DIR/mariadbd.pid" \
-  "$BYTECASKDB_DIR/error.log" \
-  --plugin-dir="$PLUGIN_DIR" \
-  --plugin-load-add=bytecaskdb=ha_bytecaskdb.so
+if engine_enabled bytecaskdb; then
+  echo "=== Starting ByteCaskDB MariaDB instance (port $BYTECASKDB_PORT) ==="
+  symlink_providers "$PLUGIN_DIR"
+  start_mariadbd \
+    "$BYTECASKDB_DIR/data" \
+    "$BYTECASKDB_DIR/mysql.sock" \
+    "$BYTECASKDB_PORT" \
+    "$BYTECASKDB_DIR/mariadbd.pid" \
+    "$BYTECASKDB_DIR/error.log" \
+    --plugin-dir="$PLUGIN_DIR" \
+    --plugin-load-add=bytecaskdb=ha_bytecaskdb.so
+fi
 
-echo "=== Starting InnoDB MariaDB instance (port $INNODB_PORT) ==="
-start_mariadbd \
-  "$INNODB_DIR/data" \
-  "$INNODB_DIR/mysql.sock" \
-  "$INNODB_PORT" \
-  "$INNODB_DIR/mariadbd.pid" \
-  "$INNODB_DIR/error.log"
+if engine_enabled innodb; then
+  echo "=== Starting InnoDB MariaDB instance (port $INNODB_PORT) ==="
+  start_mariadbd \
+    "$INNODB_DIR/data" \
+    "$INNODB_DIR/mysql.sock" \
+    "$INNODB_PORT" \
+    "$INNODB_DIR/mariadbd.pid" \
+    "$INNODB_DIR/error.log" \
+    --innodb-buffer-pool-size=1G \
+    --innodb-log-file-size=256M \
+    --innodb-flush-log-at-trx-commit=1 \
+    --innodb-flush-method=O_DIRECT \
+    --innodb-io-capacity=2000 \
+    --innodb-io-capacity-max=4000
+fi
 
-if [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
+if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
   echo "=== Starting RocksDB MariaDB instance (port $ROCKSDB_PORT) ==="
   start_mariadbd \
     "$ROCKSDB_DIR/data" \
@@ -214,7 +236,9 @@ if [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
     "$ROCKSDB_DIR/mariadbd.pid" \
     "$ROCKSDB_DIR/error.log" \
     --plugin-load-add=rocksdb=ha_rocksdb.so \
-    --plugin-dir="$ROCKSDB_PLUGIN_DIR"
+    --plugin-dir="$ROCKSDB_PLUGIN_DIR" \
+    --rocksdb-block-cache-size=1G \
+    --rocksdb-max-background-jobs=4
 fi
 
 # ---------------------------------------------------------------------------
@@ -287,11 +311,12 @@ run_bench() {
 # Run all benchmarks
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Sysbench OLTP Benchmark: ByteCaskDB vs InnoDB vs RocksDB ==="
+echo "=== Sysbench OLTP Benchmark ==="
+echo "    Engines: ${ENGINES}"
 echo "    Table size: $TABLE_SIZE rows | Duration: ${DURATION}s per run"
 echo "    Threads: ${THREADS}"
 echo "    Workloads: $WORKLOADS"
-if [[ -z "$ROCKSDB_PLUGIN_DIR" ]]; then
+if engine_enabled rocksdb && [[ -z "$ROCKSDB_PLUGIN_DIR" ]]; then
   echo "    RocksDB: SKIPPED (plugin not found)"
 fi
 echo ""
@@ -306,21 +331,25 @@ for workload in $WORKLOADS; do
   for t in "${THREAD_LIST[@]}"; do
     echo "--- $workload | threads=$t ---"
 
-    echo -n "  ByteCaskDB: "
-    result_bc="$(run_bench bytecaskdb "$workload" "$BYTECASKDB_PORT" "$BYTECASKDB_DIR/mysql.sock" "$t" bytecaskdb)"
-    echo "$result_bc" >> "$RESULTS_CSV"
-    ALL_RESULTS+=("$result_bc")
-    tps_bc="$(echo "$result_bc" | cut -d, -f4)"
-    echo "${tps_bc} tps"
+    if engine_enabled bytecaskdb; then
+      echo -n "  ByteCaskDB: "
+      result_bc="$(run_bench bytecaskdb "$workload" "$BYTECASKDB_PORT" "$BYTECASKDB_DIR/mysql.sock" "$t" bytecaskdb)"
+      echo "$result_bc" >> "$RESULTS_CSV"
+      ALL_RESULTS+=("$result_bc")
+      tps_bc="$(echo "$result_bc" | cut -d, -f4)"
+      echo "${tps_bc} tps"
+    fi
 
-    echo -n "  InnoDB:     "
-    result_in="$(run_bench innodb "$workload" "$INNODB_PORT" "$INNODB_DIR/mysql.sock" "$t" innodb)"
-    echo "$result_in" >> "$RESULTS_CSV"
-    ALL_RESULTS+=("$result_in")
-    tps_in="$(echo "$result_in" | cut -d, -f4)"
-    echo "${tps_in} tps"
+    if engine_enabled innodb; then
+      echo -n "  InnoDB:     "
+      result_in="$(run_bench innodb "$workload" "$INNODB_PORT" "$INNODB_DIR/mysql.sock" "$t" innodb)"
+      echo "$result_in" >> "$RESULTS_CSV"
+      ALL_RESULTS+=("$result_in")
+      tps_in="$(echo "$result_in" | cut -d, -f4)"
+      echo "${tps_in} tps"
+    fi
 
-    if [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
+    if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
       echo -n "  RocksDB:    "
       result_rk="$(run_bench rocksdb "$workload" "$ROCKSDB_PORT" "$ROCKSDB_DIR/mysql.sock" "$t" rocksdb)"
       echo "$result_rk" >> "$RESULTS_CSV"
@@ -337,17 +366,24 @@ done
 # Print comparison table
 # ---------------------------------------------------------------------------
 echo ""
-if [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
-  echo "=============================================================================================================="
-  printf "%-22s %4s | %10s %8s %8s | %10s %8s %8s | %10s %8s %8s\n" \
-    "Workload" "Thr" "BC tps" "avg" "p95" "InnoDB tps" "avg" "p95" "RocksDB tps" "avg" "p95"
-  echo "--------------------------------------------------------------------------------------------------------------"
-else
-  echo "========================================================================================"
-  printf "%-22s %4s | %10s %8s %8s | %10s %8s %8s\n" \
-    "Workload" "Thr" "BC tps" "avg" "p95" "InnoDB tps" "avg" "p95"
-  echo "----------------------------------------------------------------------------------------"
+
+# Build header dynamically based on enabled engines
+header_fmt="%-22s %4s"
+header_args=("Workload" "Thr")
+if engine_enabled bytecaskdb; then
+  header_fmt+=" | %10s %8s %8s"
+  header_args+=("BC tps" "avg" "p95")
 fi
+if engine_enabled innodb; then
+  header_fmt+=" | %10s %8s %8s"
+  header_args+=("InnoDB tps" "avg" "p95")
+fi
+if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
+  header_fmt+=" | %10s %8s %8s"
+  header_args+=("RocksDB tps" "avg" "p95")
+fi
+
+printf "$header_fmt\n" "${header_args[@]}"
 
 for workload in $WORKLOADS; do
   for t in "${THREAD_LIST[@]}"; do
@@ -363,38 +399,25 @@ for workload in $WORKLOADS; do
       fi
     done
 
-    bc_tps="$(echo "$bc_line" | cut -d, -f4)"
-    bc_avg="$(echo "$bc_line" | cut -d, -f5)"
-    bc_p95="$(echo "$bc_line" | cut -d, -f6)"
-    in_tps="$(echo "$in_line" | cut -d, -f4)"
-    in_avg="$(echo "$in_line" | cut -d, -f5)"
-    in_p95="$(echo "$in_line" | cut -d, -f6)"
-
-    if [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
-      rk_tps="$(echo "$rk_line" | cut -d, -f4)"
-      rk_avg="$(echo "$rk_line" | cut -d, -f5)"
-      rk_p95="$(echo "$rk_line" | cut -d, -f6)"
-      printf "%-22s %4s | %10s %8s %8s | %10s %8s %8s | %10s %8s %8s\n" \
-        "$workload" "$t" "$bc_tps" "$bc_avg" "$bc_p95" "$in_tps" "$in_avg" "$in_p95" "$rk_tps" "$rk_avg" "$rk_p95"
-    else
-      printf "%-22s %4s | %10s %8s %8s | %10s %8s %8s\n" \
-        "$workload" "$t" "$bc_tps" "$bc_avg" "$bc_p95" "$in_tps" "$in_avg" "$in_p95"
+    row_fmt="%-22s %4s"
+    row_args=("$workload" "$t")
+    if engine_enabled bytecaskdb; then
+      row_fmt+=" | %10s %8s %8s"
+      row_args+=("$(echo "$bc_line" | cut -d, -f4)" "$(echo "$bc_line" | cut -d, -f5)" "$(echo "$bc_line" | cut -d, -f6)")
     fi
+    if engine_enabled innodb; then
+      row_fmt+=" | %10s %8s %8s"
+      row_args+=("$(echo "$in_line" | cut -d, -f4)" "$(echo "$in_line" | cut -d, -f5)" "$(echo "$in_line" | cut -d, -f6)")
+    fi
+    if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
+      row_fmt+=" | %10s %8s %8s"
+      row_args+=("$(echo "$rk_line" | cut -d, -f4)" "$(echo "$rk_line" | cut -d, -f5)" "$(echo "$rk_line" | cut -d, -f6)")
+    fi
+    printf "$row_fmt\n" "${row_args[@]}"
   done
 done
-if [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
-  echo "=============================================================================================================="
-else
-  echo "========================================================================================"
-fi
+
 echo ""
 echo "Results saved to: $RESULTS_CSV"
 
-echo ""
-echo "=== Instances still running (Ctrl+C to stop) ==="
-echo "  ByteCaskDB: mariadb --socket=$BYTECASKDB_DIR/mysql.sock -u root sbtest"
-echo "  InnoDB:     mariadb --socket=$INNODB_DIR/mysql.sock -u root sbtest"
-echo ""
-# echo "Press Enter to shut down..."
-# read -r
 cleanup

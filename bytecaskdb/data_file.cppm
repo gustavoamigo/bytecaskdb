@@ -14,6 +14,7 @@ module;
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <format>
@@ -99,23 +100,36 @@ DataFile::~DataFile() = default;
 // ---------------------------------------------------------------------------
 // WritableDataFile — append-only data file for the active write path.
 //
-// Reads are served via pread. No mmap, no mode transitions.
-// Thread safety: NOT thread-safe. External synchronization required for writes.
-// Concurrent pread-based reads are safe (POSIX guarantees).
+// Writes are buffered in a fixed-capacity write buffer and simultaneously
+// flushed to the kernel via writev. Reads are served directly from the buffer
+// — no pread syscalls needed. The buffer never reallocates: it is allocated
+// once at construction and its capacity equals the rotation threshold.
+//
+// Invariant: no published KeyDirEntry ever points to an offset beyond the
+// buffer capacity, because rotation replaces this file with a ReadOnlyMmapDataFile
+// in the same store_state that publishes the new offsets.
+//
+// Thread safety: NOT thread-safe for writes (external synchronization required).
+// Concurrent reads from the buffer are safe: the buffer never reallocates and
+// bytes once written are never mutated.
 export class WritableDataFile : public DataFile {
 public:
-  [[nodiscard]] static auto openForWrite(std::filesystem::path path)
+  [[nodiscard]] static auto openForWrite(std::filesystem::path path,
+                                         std::size_t capacity = 0)
       -> std::shared_ptr<WritableDataFile> {
     return std::shared_ptr<WritableDataFile>(
-        new WritableDataFile{std::move(path)});
+        new WritableDataFile{std::move(path), capacity});
   }
 
   ~WritableDataFile() override;
 
   WritableDataFile(WritableDataFile &&other) noexcept
       : DataFile{std::move(other)}, fd_{other.fd_}, offset_{other.offset_},
-        preallocated_end_{other.preallocated_end_} {
+        preallocated_end_{other.preallocated_end_},
+        write_buf_{std::move(other.write_buf_)},
+        buf_size_{other.buf_size_}, buf_capacity_{other.buf_capacity_} {
     other.fd_ = -1;
+    other.buf_size_ = 0;
   }
 
   WritableDataFile &operator=(WritableDataFile &&other) noexcept {
@@ -127,7 +141,11 @@ public:
       fd_ = other.fd_;
       offset_ = other.offset_;
       preallocated_end_ = other.preallocated_end_;
+      write_buf_ = std::move(other.write_buf_);
+      buf_size_ = other.buf_size_;
+      buf_capacity_ = other.buf_capacity_;
       other.fd_ = -1;
+      other.buf_size_ = 0;
     }
     return *this;
   }
@@ -149,6 +167,7 @@ public:
         {hdr_crc_buf_.data() + kHeaderSize, kCrcSize},
     }};
     const auto total = kHeaderSize + key.size() + value.size() + kCrcSize;
+
     ensure_preallocated(offset_ + static_cast<Offset>(total));
     const auto written = ::writev(fd_, iov.data(), std::ssize(iov));
 #ifdef BYTECASK_TESTING
@@ -159,6 +178,11 @@ public:
       throw std::system_error{errno, std::generic_category(),
                               "DataFile::append: writev failed"};
     }
+
+    buf_append(std::span{hdr_crc_buf_.data(), kHeaderSize});
+    buf_append(key);
+    buf_append(value);
+    buf_append(std::span{hdr_crc_buf_.data() + kHeaderSize, kCrcSize});
 
     offset_ += static_cast<Offset>(total);
     return entry_offset;
@@ -236,6 +260,14 @@ public:
                                 "DataFile::append_entries: writev failed"};
       }
 
+      for (std::size_t i = 0; i < chunk_size; ++i) {
+        const auto &e = entries[base + i];
+        buf_append(std::span{hdr_crcs[i].data(), kHeaderSize});
+        buf_append(e.key);
+        buf_append(e.value);
+        buf_append(std::span{hdr_crcs[i].data() + kHeaderSize, kCrcSize});
+      }
+
       offset_ += static_cast<Offset>(total_bytes);
     }
   }
@@ -245,9 +277,9 @@ public:
     if (offset >= offset_) {
       return std::nullopt;
     }
-    const auto header = read_header(offset);
+    auto header = scan_read_header(offset);
     std::vector<std::byte> buf;
-    auto view = read_entry(offset, header.key_size, header.value_size, buf);
+    auto view = scan_read_entry(offset, header.key_size, header.value_size, buf);
     const auto next =
         offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
     return std::make_pair(
@@ -278,29 +310,28 @@ public:
 
   [[nodiscard]] auto read_entry_unverified(
       Offset offset, std::uint32_t value_size,
-      std::vector<std::byte> &io_buf) const -> DataEntryView override {
-    static constexpr std::size_t kKeyBudget = 256;
-    const auto speculative_total = kHeaderSize + kKeyBudget + value_size + kCrcSize;
-    io_buf.resize(speculative_total);
-    auto bytes_read = ::pread(fd_, io_buf.data(), speculative_total,
-                             narrow<off_t>(offset));
-    if (bytes_read < narrow<ssize_t>(kHeaderSize)) {
+      std::vector<std::byte> &io_buf) const
+      -> DataEntryView override {
+    auto hdr = read_header(offset);
+    const auto body_size = hdr.key_size + value_size;
+    if (offset + kHeaderSize + body_size <= buf_size_) {
+      auto body = std::span<const std::byte>{
+          write_buf_.get() + offset + kHeaderSize, body_size};
+      return DataEntryView{
+          .sequence = hdr.sequence,
+          .entry_type = hdr.entry_type,
+          .key = body.subspan(0, hdr.key_size),
+          .value = body.subspan(hdr.key_size, value_size),
+      };
+    }
+    io_buf.resize(body_size);
+    if (::pread(fd_, io_buf.data(), body_size,
+                narrow<off_t>(offset + kHeaderSize)) !=
+        narrow<ssize_t>(body_size)) {
       throw std::system_error{errno, std::generic_category(),
                               "WritableDataFile::read_entry_unverified: pread failed"};
     }
-    auto hdr = bytecask::read_header(
-        std::span<const std::byte>{io_buf.data(), kHeaderSize});
-    const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
-    if (total > speculative_total) {
-      io_buf.resize(total);
-      if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
-          narrow<ssize_t>(total)) {
-        throw std::system_error{errno, std::generic_category(),
-                                "WritableDataFile::read_entry_unverified: pread failed"};
-      }
-    }
-    auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
-                                           hdr.key_size + value_size};
+    std::span<const std::byte> body{io_buf};
     return DataEntryView{
         .sequence = hdr.sequence,
         .entry_type = hdr.entry_type,
@@ -330,11 +361,14 @@ public:
     }
     offset_ = new_size;
     preallocated_end_ = new_size;
+    if (static_cast<std::size_t>(new_size) < buf_size_) {
+      buf_size_ = static_cast<std::size_t>(new_size);
+    }
   }
 
 private:
-  explicit WritableDataFile(std::filesystem::path path)
-      : DataFile{std::move(path)} {
+  WritableDataFile(std::filesystem::path path, std::size_t capacity)
+      : DataFile{std::move(path)}, buf_capacity_{capacity} {
     fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (fd_ == -1) {
       throw std::system_error{
@@ -346,21 +380,45 @@ private:
 #endif
     offset_ = std::filesystem::file_size(path_);
     preallocated_end_ = offset_;
+    if (buf_capacity_ > 0) {
+      write_buf_ = std::make_unique<std::byte[]>(buf_capacity_);
+    }
+    if (offset_ > 0 && buf_capacity_ > 0) {
+      auto to_load = std::min(static_cast<std::size_t>(offset_), buf_capacity_);
+      if (::pread(fd_, write_buf_.get(), to_load, 0) !=
+          narrow<ssize_t>(to_load)) {
+        throw std::system_error{errno, std::generic_category(),
+                                "WritableDataFile: failed to populate buffer"};
+      }
+      buf_size_ = to_load;
+    }
   }
 
   int fd_{-1};
   Offset offset_{0};
   Offset preallocated_end_{0};
   std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};
+  std::unique_ptr<std::byte[]> write_buf_;
+  std::size_t buf_size_{0};
+  std::size_t buf_capacity_{0};
+
+  void buf_append(std::span<const std::byte> data) {
+    if (data.empty()) return;
+    if (buf_size_ + data.size() > buf_capacity_) return;
+    std::memcpy(write_buf_.get() + buf_size_, data.data(), data.size());
+    buf_size_ += data.size();
+  }
+
+  // Reads serve from the write buffer when the offset is within capacity.
+  // Fallback to pread for offsets beyond the buffer: happens when a failed
+  // rotation leaves the active file oversized in degraded mode.
 
   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
-    std::array<std::byte, kHeaderSize> hdr{};
-    if (::pread(fd_, hdr.data(), kHeaderSize, narrow<off_t>(offset)) !=
-        std::ssize(hdr)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "DataFile::read_header: pread failed"};
+    if (offset + kHeaderSize <= buf_size_) {
+      return bytecask::read_header(
+          std::span<const std::byte>{write_buf_.get() + offset, kHeaderSize});
     }
-    return bytecask::read_header(std::span{hdr});
+    return scan_read_header(offset);
   }
 
   [[nodiscard]] auto read_entry(Offset offset, std::uint16_t key_size,
@@ -368,11 +426,16 @@ private:
                                 std::vector<std::byte>& io_buf) const
       -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    io_buf.resize(total);
-    if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
-        narrow<ssize_t>(total)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "DataFile::read_entry: pread failed"};
+    if (offset + total <= buf_size_) {
+      io_buf.assign(write_buf_.get() + offset,
+                    write_buf_.get() + offset + total);
+    } else {
+      io_buf.resize(total);
+      if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
+          narrow<ssize_t>(total)) {
+        throw std::system_error{errno, std::generic_category(),
+                                "WritableDataFile::read_entry: pread failed"};
+      }
     }
     std::span<const std::byte> raw = io_buf;
     const auto header = parse_header_and_verify(raw);
@@ -389,12 +452,49 @@ private:
                              std::uint32_t value_size,
                              std::vector<std::byte>& out) const {
     const auto val_offset = offset + kHeaderSize + key_size;
-    out.resize(value_size);
-    if (::pread(fd_, out.data(), value_size,
-                narrow<off_t>(val_offset)) != narrow<ssize_t>(value_size)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "DataFile::read_value: pread failed"};
+    if (val_offset + value_size <= buf_size_) {
+      out.assign(write_buf_.get() + val_offset,
+                 write_buf_.get() + val_offset + value_size);
+    } else {
+      out.resize(value_size);
+      if (::pread(fd_, out.data(), value_size, narrow<off_t>(val_offset)) !=
+          narrow<ssize_t>(value_size)) {
+        throw std::system_error{errno, std::generic_category(),
+                                "WritableDataFile::read_value_unverified: pread failed"};
+      }
     }
+  }
+
+  [[nodiscard]] auto scan_read_header(Offset offset) const -> EntryHeader {
+    std::array<std::byte, kHeaderSize> hdr{};
+    if (::pread(fd_, hdr.data(), kHeaderSize, narrow<off_t>(offset)) !=
+        std::ssize(hdr)) {
+      throw std::system_error{errno, std::generic_category(),
+                              "WritableDataFile::scan: pread header failed"};
+    }
+    return bytecask::read_header(std::span{hdr});
+  }
+
+  [[nodiscard]] auto scan_read_entry(Offset offset, std::uint16_t key_size,
+                                     std::uint32_t value_size,
+                                     std::vector<std::byte>& io_buf) const
+      -> DataEntryView {
+    const auto total = kHeaderSize + key_size + value_size + kCrcSize;
+    io_buf.resize(total);
+    if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
+        narrow<ssize_t>(total)) {
+      throw std::system_error{errno, std::generic_category(),
+                              "WritableDataFile::scan: pread entry failed"};
+    }
+    std::span<const std::byte> raw = io_buf;
+    const auto header = parse_header_and_verify(raw);
+    auto body = raw.subspan(kHeaderSize);
+    return DataEntryView{
+        .sequence = header.sequence,
+        .entry_type = header.entry_type,
+        .key = body.subspan(0, key_size),
+        .value = body.subspan(key_size, value_size),
+    };
   }
 
   void ensure_preallocated(Offset write_end) {
