@@ -238,6 +238,7 @@ public:
   auto operator++() -> ReverseKeyIterator&;
   void operator++(int);
   auto operator==(const ReverseKeyIterator&) const noexcept -> bool;
+  auto operator==(std::default_sentinel_t) const noexcept -> bool;
 
 private:
   explicit ReverseKeyIterator(std::unique_ptr<Impl> impl) noexcept;

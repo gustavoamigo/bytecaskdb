@@ -156,9 +156,9 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_index_prefix(
     snap_.emplace(db_->snapshot());
   }
 
-  std::optional<bytecask::EntryIterator> snap_it;
+  std::optional<bytecask::KeyIterator> snap_it;
   if (snap_) {
-    auto range = snap_->iter_from({}, as_view(lo, lo_len));
+    auto range = snap_->keys_from({}, as_view(lo, lo_len));
     snap_it.emplace(std::move(range.begin()));
   }
 
@@ -179,9 +179,9 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_index_prefix(
     snap_.emplace(db_->snapshot());
   }
 
-  std::optional<bytecask::ReverseEntryIterator> snap_it;
+  std::optional<bytecask::ReverseKeyIterator> snap_it;
   if (snap_) {
-    auto range = snap_->riter_from({}, as_view(hi, hi_len));
+    auto range = snap_->rkeys_from({}, as_view(hi, hi_len));
     snap_it.emplace(std::move(range.begin()));
   }
 
@@ -357,12 +357,12 @@ MariaDBTxn::MergeIterator::MergeIterator(
 }
 
 MariaDBTxn::MergeIterator::MergeIterator(
-    std::optional<bytecask::EntryIterator> snap_it,
+    std::optional<bytecask::KeyIterator> snap_it,
     LookupMap::const_iterator buf_it,
     LookupMap::const_iterator buf_end,
     std::vector<uint8_t> hi,
     uint32_t table_id, uint16_t index_id)
-    : snap_fwd_(std::move(snap_it)),
+    : snap_key_fwd_(std::move(snap_it)),
       reverse_(false),
       buf_it_(buf_it),
       buf_end_(buf_end),
@@ -391,12 +391,12 @@ MariaDBTxn::MergeIterator::MergeIterator(
 }
 
 MariaDBTxn::MergeIterator::MergeIterator(
-    std::optional<bytecask::ReverseEntryIterator> snap_it,
+    std::optional<bytecask::ReverseKeyIterator> snap_it,
     LookupMap::const_iterator buf_it,
     LookupMap::const_iterator buf_end,
     std::vector<uint8_t> lo,
     uint32_t table_id, uint16_t index_id)
-    : snap_rev_(std::move(snap_it)),
+    : snap_key_rev_(std::move(snap_it)),
       reverse_(true),
       buf_it_(buf_it),
       buf_end_(buf_end),
@@ -414,18 +414,22 @@ void MariaDBTxn::MergeIterator::next() {
 
 bool MariaDBTxn::MergeIterator::snap_at_end() const {
   if (!reverse_) {
-    if (!snap_fwd_) return true;
-    return *snap_fwd_ == std::default_sentinel;
+    if (snap_fwd_) return *snap_fwd_ == std::default_sentinel;
+    if (snap_key_fwd_) return *snap_key_fwd_ == std::default_sentinel;
+    return true;
   }
-  if (!snap_rev_) return true;
-  return *snap_rev_ == std::default_sentinel;
+  if (snap_rev_) return *snap_rev_ == std::default_sentinel;
+  if (snap_key_rev_) return *snap_key_rev_ == std::default_sentinel;
+  return true;
 }
 
 void MariaDBTxn::MergeIterator::snap_step() {
-  if (!reverse_ && snap_fwd_) {
-    ++(*snap_fwd_);
-  } else if (reverse_ && snap_rev_) {
-    ++(*snap_rev_);
+  if (!reverse_) {
+    if (snap_fwd_) ++(*snap_fwd_);
+    else if (snap_key_fwd_) ++(*snap_key_fwd_);
+  } else {
+    if (snap_rev_) ++(*snap_rev_);
+    else if (snap_key_rev_) ++(*snap_key_rev_);
   }
 }
 
@@ -434,14 +438,40 @@ void MariaDBTxn::MergeIterator::load_snap_current() {
 
   if (snap_at_end()) return;
 
-  const bytecask::EntryView *entry = nullptr;
+  const uint8_t *kp = nullptr;
+  size_t klen = 0;
+
   if (!reverse_) {
-    entry = &(**snap_fwd_);
+    if (snap_fwd_) {
+      const auto &entry = **snap_fwd_;
+      kp = reinterpret_cast<const uint8_t *>(entry.key.data());
+      klen = entry.key.size();
+      snap_val_ptr_ = reinterpret_cast<const uint8_t *>(entry.value.data());
+      snap_val_len_ = entry.value.size();
+    } else if (snap_key_fwd_) {
+      const auto &key_bytes = **snap_key_fwd_;
+      kp = reinterpret_cast<const uint8_t *>(key_bytes.data());
+      klen = key_bytes.size();
+      snap_val_ptr_ = nullptr;
+      snap_val_len_ = 0;
+    }
   } else {
-    entry = &(**snap_rev_);
+    if (snap_rev_) {
+      const auto &entry = **snap_rev_;
+      kp = reinterpret_cast<const uint8_t *>(entry.key.data());
+      klen = entry.key.size();
+      snap_val_ptr_ = reinterpret_cast<const uint8_t *>(entry.value.data());
+      snap_val_len_ = entry.value.size();
+    } else if (snap_key_rev_) {
+      const auto &key_bytes = **snap_key_rev_;
+      kp = reinterpret_cast<const uint8_t *>(key_bytes.data());
+      klen = key_bytes.size();
+      snap_val_ptr_ = nullptr;
+      snap_val_len_ = 0;
+    }
   }
-  const auto *kp = reinterpret_cast<const uint8_t *>(entry->key.data());
-  const auto klen = entry->key.size();
+
+  if (!kp) return;
 
   if (use_index_filter_) {
     if (!key_belongs_to_index(kp, klen, table_id_, index_id_)) {
@@ -462,8 +492,6 @@ void MariaDBTxn::MergeIterator::load_snap_current() {
 
   snap_key_ptr_ = kp;
   snap_key_len_ = klen;
-  snap_val_ptr_ = reinterpret_cast<const uint8_t *>(entry->value.data());
-  snap_val_len_ = entry->value.size();
   snap_valid_ = true;
 }
 
