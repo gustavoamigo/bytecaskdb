@@ -1,0 +1,53 @@
+# type_blob_index_scan.yaml — isolate full index scan vs point lookup
+
+- name: Full table scan with BLOB inequality works
+  setup:
+    - DROP DATABASE IF EXISTS bis1
+    - CREATE DATABASE bis1
+    - CREATE TABLE bis1.t1 (b BLOB, t TINYBLOB, m MEDIUMBLOB, l LONGBLOB, UNIQUE INDEX l_t (l(256),t(64))) ENGINE=bytecaskdb
+    - INSERT INTO bis1.t1 (b,t,m,l) VALUES ('','','',''),('a','b','c','d'),('b','d','c','b'),('test1','test2','test3','test4'),(REPEAT('a',128),REPEAT('b',128),REPEAT('c',128),REPEAT('d',128)),(HEX('abcd'),HEX('def'),HEX('a'),HEX('abc')),('abc','def','ghi','jkl'),('test2','test3','test4','test5'),('test3','test4','test5','test6'),(REPEAT('b',128),REPEAT('f',128),REPEAT('e',128),REPEAT('d',128)),(REPEAT('c',128),REPEAT('b',128),REPEAT('c',128),REPEAT('e',128))
+  query: SELECT COUNT(*) FROM bis1.t1 USE INDEX () WHERE l != 'test1'
+  expected:
+    - ['11']
+  teardown:
+    - DROP DATABASE IF EXISTS bis1
+
+- name: Index range scan WHERE l >= empty finds all rows
+  setup:
+    - DROP DATABASE IF EXISTS bis2
+    - CREATE DATABASE bis2
+    - CREATE TABLE bis2.t1 (b BLOB, t TINYBLOB, m MEDIUMBLOB, l LONGBLOB, UNIQUE INDEX l_t (l(256),t(64))) ENGINE=bytecaskdb
+    - INSERT INTO bis2.t1 (b,t,m,l) VALUES ('','','',''),('a','b','c','d'),('b','d','c','b'),('test1','test2','test3','test4'),(REPEAT('a',128),REPEAT('b',128),REPEAT('c',128),REPEAT('d',128)),(HEX('abcd'),HEX('def'),HEX('a'),HEX('abc')),('abc','def','ghi','jkl'),('test2','test3','test4','test5'),('test3','test4','test5','test6'),(REPEAT('b',128),REPEAT('f',128),REPEAT('e',128),REPEAT('d',128)),(REPEAT('c',128),REPEAT('b',128),REPEAT('c',128),REPEAT('e',128))
+  query: SELECT COUNT(*) FROM bis2.t1 FORCE INDEX (l_t) WHERE l >= ''
+  expected:
+    - ['11']
+  teardown:
+    - DROP DATABASE IF EXISTS bis2
+
+- name: Index point lookup on BLOB prefix finds row
+  setup:
+    - DROP DATABASE IF EXISTS bis3
+    - CREATE DATABASE bis3
+    - CREATE TABLE bis3.t1 (b BLOB, t TINYBLOB, m MEDIUMBLOB, l LONGBLOB, UNIQUE INDEX l_t (l(256),t(64))) ENGINE=bytecaskdb
+    - INSERT INTO bis3.t1 (b,t,m,l) VALUES ('','','',''),('a','b','c','d'),('b','d','c','b'),('test1','test2','test3','test4'),(REPEAT('a',128),REPEAT('b',128),REPEAT('c',128),REPEAT('d',128)),(HEX('abcd'),HEX('def'),HEX('a'),HEX('abc')),('abc','def','ghi','jkl'),('test2','test3','test4','test5'),('test3','test4','test5','test6'),(REPEAT('b',128),REPEAT('f',128),REPEAT('e',128),REPEAT('d',128)),(REPEAT('c',128),REPEAT('b',128),REPEAT('c',128),REPEAT('e',128))
+  query: SELECT CAST(l AS CHAR) FROM bis3.t1 FORCE INDEX (l_t) WHERE l = 'test4'
+  expected:
+    - ['test4']
+  teardown:
+    - DROP DATABASE IF EXISTS bis3
+
+- name: Full index scan via SELECT on indexed column only
+  setup:
+    - DROP DATABASE IF EXISTS bis4
+    - CREATE DATABASE bis4
+    - CREATE TABLE bis4.t1 (b BLOB, t TINYBLOB, m MEDIUMBLOB, l LONGBLOB, UNIQUE INDEX l_t (l(256),t(64))) ENGINE=bytecaskdb
+    - INSERT INTO bis4.t1 (b,t,m,l) VALUES ('','','',''),('a','b','c','d'),('b','d','c','b'),('test1','test2','test3','test4'),(REPEAT('a',128),REPEAT('b',128),REPEAT('c',128),REPEAT('d',128)),(HEX('abcd'),HEX('def'),HEX('a'),HEX('abc')),('abc','def','ghi','jkl'),('test2','test3','test4','test5'),('test3','test4','test5','test6'),(REPEAT('b',128),REPEAT('f',128),REPEAT('e',128),REPEAT('d',128)),(REPEAT('c',128),REPEAT('b',128),REPEAT('c',128),REPEAT('e',128))
+  steps:
+    - sql: SELECT COUNT(*) FROM bis4.t1 FORCE INDEX (l_t) WHERE l IS NOT NULL OR l IS NULL
+      expected: [['11']]
+    - sql: SELECT COUNT(*) FROM bis4.t1 FORCE INDEX (l_t) WHERE l != 'test1'
+      expected: [['11']]
+  teardown:
+    - DROP DATABASE IF EXISTS bis4
+
+

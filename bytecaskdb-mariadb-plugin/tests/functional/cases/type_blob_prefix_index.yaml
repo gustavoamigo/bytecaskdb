@@ -1,0 +1,87 @@
+# type_blob_prefix_index.yaml — BLOB/TEXT prefix index scan regressions from MTR
+
+- name: INDEX on first BLOB column with prefix 32 finds rows
+  setup:
+    - DROP DATABASE IF EXISTS bpi1
+    - CREATE DATABASE bpi1
+    - CREATE TABLE bpi1.t1 (b BLOB, t TINYBLOB, m MEDIUMBLOB, l LONGBLOB, INDEX (b(32))) ENGINE=bytecaskdb
+    - INSERT INTO bpi1.t1 (b,t,m,l) VALUES ('test1','t2','t3','t4'),('abc','d','e','f')
+  query: SELECT CAST(b AS CHAR) FROM bpi1.t1 WHERE b = 'test1'
+  expected:
+    - ['test1']
+  teardown:
+    - DROP DATABASE IF EXISTS bpi1
+
+- name: INDEX on third BLOB column with prefix 32 finds rows
+  setup:
+    - DROP DATABASE IF EXISTS bpi2
+    - CREATE DATABASE bpi2
+    - CREATE TABLE bpi2.t1 (b BLOB, t TINYBLOB, m MEDIUMBLOB, l LONGBLOB, INDEX (m(32))) ENGINE=bytecaskdb
+    - INSERT INTO bpi2.t1 (b,t,m,l) VALUES ('test1','t2','test3','t4'),('abc','d','ghi','f')
+  query: SELECT CAST(m AS CHAR) FROM bpi2.t1 WHERE m = 'test3'
+  expected:
+    - ['test3']
+  teardown:
+    - DROP DATABASE IF EXISTS bpi2
+
+- name: INDEX on third BLOB column with prefix 128 finds rows
+  setup:
+    - DROP DATABASE IF EXISTS bpi3
+    - CREATE DATABASE bpi3
+    - CREATE TABLE bpi3.t1 (b BLOB, t TINYBLOB, m MEDIUMBLOB, l LONGBLOB, INDEX (m(128))) ENGINE=bytecaskdb
+    - INSERT INTO bpi3.t1 (b,t,m,l) VALUES ('test1','t2','test3','t4'),('abc','d','ghi','f')
+  query: SELECT CAST(m AS CHAR) FROM bpi3.t1 WHERE m = 'test3'
+  expected:
+    - ['test3']
+  teardown:
+    - DROP DATABASE IF EXISTS bpi3
+
+- name: TEXT column with prefix 128 index finds rows
+  setup:
+    - DROP DATABASE IF EXISTS bpi4
+    - CREATE DATABASE bpi4
+    - CREATE TABLE bpi4.t1 (t TEXT, tt TINYTEXT, m MEDIUMTEXT, l LONGTEXT, INDEX (m(128))) ENGINE=bytecaskdb
+    - INSERT INTO bpi4.t1 (t,tt,m,l) VALUES ('a','b','test3','d'),('x','y','hello','z')
+  query: SELECT m FROM bpi4.t1 WHERE m = 'test3'
+  expected:
+    - ['test3']
+  teardown:
+    - DROP DATABASE IF EXISTS bpi4
+
+- name: Composite BLOB prefix index scan returns matching rows
+  setup:
+    - DROP DATABASE IF EXISTS bpi5
+    - CREATE DATABASE bpi5
+    - CREATE TABLE bpi5.t1 (b BLOB, t TINYBLOB, m MEDIUMBLOB, l LONGBLOB, UNIQUE INDEX l_t (l(256), t(64))) ENGINE=bytecaskdb
+    - INSERT INTO bpi5.t1 (b,t,m,l) VALUES ('a','b','c','d'),('test1','test2','test3','test4'),('x','y','z','w')
+  query: SELECT CAST(l AS CHAR), CAST(t AS CHAR) FROM bpi5.t1 WHERE l = 'test4'
+  expected:
+    - ['test4', 'test2']
+  teardown:
+    - DROP DATABASE IF EXISTS bpi5
+
+- name: BLOB prefix index with long values finds exact match
+  setup:
+    - DROP DATABASE IF EXISTS bpi6
+    - CREATE DATABASE bpi6
+    - CREATE TABLE bpi6.t1 (b BLOB, m MEDIUMBLOB, INDEX (m(128))) ENGINE=bytecaskdb
+    - INSERT INTO bpi6.t1 (b,m) VALUES ('x',REPEAT('a',128)),('y','short'),('z',REPEAT('b',200))
+  query: SELECT CAST(b AS CHAR) FROM bpi6.t1 WHERE m = 'short'
+  expected:
+    - ['y']
+  teardown:
+    - DROP DATABASE IF EXISTS bpi6
+
+- name: Full table scan vs index scan on BLOB prefix index
+  setup:
+    - DROP DATABASE IF EXISTS bpi7
+    - CREATE DATABASE bpi7
+    - CREATE TABLE bpi7.t1 (b BLOB, t TINYBLOB, m MEDIUMBLOB, l LONGBLOB, INDEX (m(128))) ENGINE=bytecaskdb
+    - INSERT INTO bpi7.t1 (b,t,m,l) VALUES ('test1','test2','test3','test4'),('abc','def','ghi','jkl')
+  steps:
+    - sql: SELECT CAST(m AS CHAR) FROM bpi7.t1 USE INDEX () WHERE m = 'test3'
+      expected: [['test3']]
+    - sql: SELECT CAST(m AS CHAR) FROM bpi7.t1 WHERE m = 'test3'
+      expected: [['test3']]
+  teardown:
+    - DROP DATABASE IF EXISTS bpi7

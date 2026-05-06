@@ -401,6 +401,10 @@ void make_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
     bool is_varlen = (field->type() == MYSQL_TYPE_VARCHAR ||
                       (kp.key_part_flag & HA_BLOB_PART));
     if (is_varlen) {
+      uint null_bytes = (kp.null_bit) ? 1 : 0;
+      if (null_bytes > 0) {
+        p[0] ^= 0x01;
+      }
       p += kp.store_length;
       continue;
     }
@@ -444,6 +448,10 @@ void undo_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
     bool is_varlen = (field->type() == MYSQL_TYPE_VARCHAR ||
                       (kp.key_part_flag & HA_BLOB_PART));
     if (is_varlen) {
+      uint null_bytes = (kp.null_bit) ? 1 : 0;
+      if (null_bytes > 0) {
+        p[0] ^= 0x01;
+      }
       p += kp.store_length;
       continue;
     }
