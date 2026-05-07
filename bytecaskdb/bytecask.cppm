@@ -186,13 +186,14 @@ export struct Options {
   // Maximum value size in bytes. Values exceeding this limit are rejected with
   // std::invalid_argument. Hard ceiling: 16,777,215 (24-bit packed KeyDirEntry).
   std::uint32_t max_value_bytes{kDefaultMaxValueBytes};
-  // When true (default), sealed files are memory-mapped for zero-copy reads.
-  // When false, reads use pread(2), avoiding virtual address space pressure.
-  bool use_mmap{true};
-  // When true (default), the active file maintains a heap buffer (sized to
-  // max_file_bytes) for fast reads without syscalls. When false, active-file
-  // reads use pread(2), saving one max_file_bytes allocation.
-  bool use_write_buffer{true};
+  // When true, sealed files are memory-mapped for zero-copy reads.
+  // When false (default), reads use pread(2), avoiding virtual address space
+  // pressure under memory contention.
+  bool use_mmap{false};
+  // When true, the active file maintains a heap buffer (sized to
+  // max_file_bytes) for fast reads without syscalls. When false (default),
+  // active-file reads use pread(2), saving one max_file_bytes allocation.
+  bool use_write_buffer{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -947,8 +948,8 @@ private:
   std::filesystem::path dir_;
   int lock_fd_{-1};  // flock() on dir_/.lock; released by close() in ~DB()
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
-  bool use_mmap_{true};
-  bool use_write_buffer_{true};
+  bool use_mmap_{false};
+  bool use_write_buffer_{false};
   SizeLimits size_limits_;
   mutable Counters counters_;
   // All mutable state — SWMR. Writers publish via atomic_store()
