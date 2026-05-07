@@ -1,0 +1,17 @@
+# type_blob_explain.yaml — check what access path MariaDB uses
+
+- name: EXPLAIN shows access method for BLOB inequality
+  setup:
+    - DROP DATABASE IF EXISTS bex1
+    - CREATE DATABASE bex1
+    - CREATE TABLE bex1.t1 (b BLOB, t TINYBLOB, m MEDIUMBLOB, l LONGBLOB, UNIQUE INDEX l_t (l(256),t(64))) ENGINE=bytecaskdb
+    - INSERT INTO bex1.t1 (b,t,m,l) VALUES ('','','',''),('a','b','c','d'),('b','d','c','b'),('test1','test2','test3','test4'),(REPEAT('a',128),REPEAT('b',128),REPEAT('c',128),REPEAT('d',128)),(HEX('abcd'),HEX('def'),HEX('a'),HEX('abc')),('abc','def','ghi','jkl'),('test2','test3','test4','test5'),('test3','test4','test5','test6'),(REPEAT('b',128),REPEAT('f',128),REPEAT('e',128),REPEAT('d',128)),(REPEAT('c',128),REPEAT('b',128),REPEAT('c',128),REPEAT('e',128))
+  steps:
+    - sql: EXPLAIN SELECT COUNT(*) FROM bex1.t1 WHERE l != 'test1'
+      expected: discard
+    - sql: EXPLAIN SELECT COUNT(*) FROM bex1.t1 FORCE INDEX (l_t) WHERE l >= ''
+      expected: discard
+    - sql: EXPLAIN SELECT COUNT(*) FROM bex1.t1 FORCE INDEX (l_t) WHERE l IS NOT NULL OR l IS NULL
+      expected: discard
+  teardown:
+    - DROP DATABASE IF EXISTS bex1
