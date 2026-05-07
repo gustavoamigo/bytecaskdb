@@ -26,7 +26,7 @@ Each example includes a `compose.yml` and tuned `mariadb.cnf`.
 ./tests/run-mtr-tests.sh
 
 # Sysbench OLTP benchmarks (ByteCaskDB vs InnoDB vs RocksDB)
-./tests/run-sysbench.sh [--engines=bytecaskdb,innodb,rocksdb] [--table-size=N] [--threads=LIST] [--time=S]
+./benchmarks/run-sysbench.sh [--engines=bytecaskdb,innodb,rocksdb] [--table-size=N] [--threads=LIST] [--time=S]
 ```
 
 ## Documentation
@@ -97,13 +97,13 @@ Sysbench: 1 table, `--report-interval=0`, `--time=10`.
 
 ```bash
 # All engines (default)
-./bytecaskdb-mariadb-plugin/tests/run-sysbench.sh
+./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh
 
 # ByteCaskDB only
-./bytecaskdb-mariadb-plugin/tests/run-sysbench.sh --engines=bytecaskdb
+./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh --engines=bytecaskdb
 
 # Custom parameters
-./bytecaskdb-mariadb-plugin/tests/run-sysbench.sh --engines=bytecaskdb,innodb --table-size=1000000 --threads=1,4,16 --time=30
+./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh --engines=bytecaskdb,innodb --table-size=1000000 --threads=1,4,16 --time=30
 ```
 
 ---

@@ -562,7 +562,7 @@ the gaps explicitly:
   this framework; covered by functional tests under
   `tests/functional/cases/`.
 - **Performance regressions.** The proof matrix is a correctness
-  ratchet, not a performance one. Sysbench (`tests/run-sysbench.sh`)
+  ratchet, not a performance one. Sysbench (`benchmarks/run-sysbench.sh`)
   remains the perf gate.
 
 ---

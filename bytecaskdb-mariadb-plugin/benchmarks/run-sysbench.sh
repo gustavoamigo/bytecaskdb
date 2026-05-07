@@ -11,7 +11,7 @@
 #   - sysbench installed
 #
 # Usage:
-#   ./bytecaskdb-mariadb-plugin/tests/run-sysbench.sh [--table-size=N] [--threads=LIST] [--time=S] [--engines=LIST]
+#   ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh [--table-size=N] [--threads=LIST] [--time=S] [--engines=LIST]
 #
 #   --engines: comma-separated list of engines to benchmark (default: bytecaskdb,innodb,rocksdb)
 #              e.g. --engines=bytecaskdb or --engines=bytecaskdb,innodb
@@ -21,7 +21,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-TABLE_SIZE=1000000
+TABLE_SIZE=50000
 THREADS="1,16"
 DURATION=10
 ENGINES="bytecaskdb,innodb,rocksdb"
@@ -130,7 +130,8 @@ start_mariadbd() {
   local port="$3"
   local pid_file="$4"
   local log_file="$5"
-  shift 5
+  local defaults_file="$6"
+  shift 6
   local extra_args=("$@")
 
   rm -rf "$data_dir"
@@ -139,7 +140,13 @@ start_mariadbd() {
   mariadb-install-db --datadir="$data_dir" --auth-root-authentication-method=normal \
     >/dev/null 2>&1
 
+  local defaults_arg=()
+  if [[ -n "$defaults_file" ]]; then
+    defaults_arg=("--defaults-extra-file=$defaults_file")
+  fi
+
   mariadbd \
+    "${defaults_arg[@]}" \
     --datadir="$data_dir" \
     --socket="$socket" \
     --port="$port" \
@@ -207,6 +214,7 @@ if engine_enabled bytecaskdb; then
     "$BYTECASKDB_PORT" \
     "$BYTECASKDB_DIR/mariadbd.pid" \
     "$BYTECASKDB_DIR/error.log" \
+    "$SCRIPT_DIR/bytecaskdb.cnf" \
     --plugin-dir="$PLUGIN_DIR" \
     --plugin-load-add=bytecaskdb=ha_bytecaskdb.so
 fi
@@ -219,6 +227,7 @@ if engine_enabled innodb; then
     "$INNODB_PORT" \
     "$INNODB_DIR/mariadbd.pid" \
     "$INNODB_DIR/error.log" \
+    "" \
     --innodb-buffer-pool-size=1G \
     --innodb-log-file-size=256M \
     --innodb-flush-log-at-trx-commit=1 \
@@ -235,6 +244,7 @@ if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
     "$ROCKSDB_PORT" \
     "$ROCKSDB_DIR/mariadbd.pid" \
     "$ROCKSDB_DIR/error.log" \
+    "" \
     --plugin-load-add=rocksdb=ha_rocksdb.so \
     --plugin-dir="$ROCKSDB_PLUGIN_DIR" \
     --rocksdb-block-cache-size=1G \
