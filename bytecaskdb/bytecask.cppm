@@ -186,6 +186,13 @@ export struct Options {
   // Maximum value size in bytes. Values exceeding this limit are rejected with
   // std::invalid_argument. Hard ceiling: 16,777,215 (24-bit packed KeyDirEntry).
   std::uint32_t max_value_bytes{kDefaultMaxValueBytes};
+  // When true (default), sealed files are memory-mapped for zero-copy reads.
+  // When false, reads use pread(2), avoiding virtual address space pressure.
+  bool use_mmap{true};
+  // When true (default), the active file maintains a heap buffer (sized to
+  // max_file_bytes) for fast reads without syscalls. When false, active-file
+  // reads use pread(2), saving one max_file_bytes allocation.
+  bool use_write_buffer{true};
 };
 
 // ---------------------------------------------------------------------------
@@ -940,6 +947,8 @@ private:
   std::filesystem::path dir_;
   int lock_fd_{-1};  // flock() on dir_/.lock; released by close() in ~DB()
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
+  bool use_mmap_{true};
+  bool use_write_buffer_{true};
   SizeLimits size_limits_;
   mutable Counters counters_;
   // All mutable state — SWMR. Writers publish via atomic_store()
@@ -1852,6 +1861,7 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
 // Throws std::system_error if the directory cannot be prepared.
 DB::DB(std::filesystem::path dir, Options opts)
     : dir_{std::move(dir)}, rotation_threshold_{opts.max_file_bytes},
+      use_mmap_{opts.use_mmap}, use_write_buffer_{opts.use_write_buffer},
       size_limits_{std::min(opts.max_key_bytes, kMaxKeySize),
                    std::min(opts.max_value_bytes, kMaxValueSize)},
       state_{std::make_shared<EngineState>()} {
@@ -1898,7 +1908,8 @@ DB::DB(std::filesystem::path dir, Options opts)
     s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
     auto new_active = WritableDataFile::openForWrite(
-        dir_ / (stem + ".data"), rotation_threshold_);
+        dir_ / (stem + ".data"),
+        use_write_buffer_ ? rotation_threshold_ : 0);
     // +1 for the new active file.
     counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
     auto files_t = s.files.transient();
@@ -2406,13 +2417,14 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 // Caller must sync the active file before calling if durability is required.
 void DB::rotate_active_file(TransientEngineState &t,
                             const std::shared_ptr<const EngineState> &) {
-  auto read_only_old = openDataFileForRead(t.active_file().path());
+  auto read_only_old = openDataFileForRead(t.active_file().path(), use_mmap_);
   const auto stem = make_data_file_stem();
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_rotate_file_creation);
 #endif
   auto new_file = WritableDataFile::openForWrite(
-      dir_ / (stem + ".data"), rotation_threshold_);
+      dir_ / (stem + ".data"),
+      use_write_buffer_ ? rotation_threshold_ : 0);
   t.apply_rotate_file(read_only_old, std::move(new_file));
   auto dir = dir_;
   worker_.dispatch([f = std::move(read_only_old), d = std::move(dir)] {
@@ -2594,7 +2606,7 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
     FAULT_INJECTION(io_vacuum_compact_tmp_create);
 #endif
     auto tmp_file = WritableDataFile::openForWrite(
-        tmp_data_path, rotation_threshold_);
+        tmp_data_path, use_write_buffer_ ? rotation_threshold_ : 0);
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id);
     tmp_file->sync();
   }
@@ -2603,7 +2615,7 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
   FAULT_INJECTION(io_vacuum_compact_rename);
 #endif
   std::filesystem::rename(tmp_data_path, final_data_path);
-  auto new_file = openDataFileForRead(final_data_path);
+  auto new_file = openDataFileForRead(final_data_path, use_mmap_);
   flush_hints_for(new_file, dir_);
 
   {
@@ -2756,7 +2768,7 @@ void DB::resume() {
   file.sync();
 
   // Open the old active as read-only for hint generation.
-  auto read_only_old = openDataFileForRead(file.path());
+  auto read_only_old = openDataFileForRead(file.path(), use_mmap_);
 
   // Dispatch hint generation — idempotent (flush_hints_for skips files
   // whose .hint already exists).
@@ -2770,7 +2782,8 @@ void DB::resume() {
   FAULT_INJECTION(io_resume_file_creation);
 #endif
   auto new_file = WritableDataFile::openForWrite(
-      dir_ / (stem + ".data"), rotation_threshold_);
+      dir_ / (stem + ".data"),
+      use_write_buffer_ ? rotation_threshold_ : 0);
 
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.
@@ -3040,7 +3053,7 @@ auto DB::recovery_prepare_files(EngineState &s)
     }
 
     const auto file_id = s.next_file_id++;
-    auto data_file = openDataFileForRead(p);
+    auto data_file = openDataFileForRead(p, use_mmap_);
     files_t.set(file_id, data_file);
 
     const auto hint_path = dir_ / (p.stem().string() + ".hint");

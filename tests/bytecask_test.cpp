@@ -6301,3 +6301,112 @@ TEST_CASE("stats: all expected keys are present in dump",
   }
   CHECK(s.size() == expected.size());
 }
+
+// ---------------------------------------------------------------------------
+// Options: use_mmap and use_write_buffer
+// ---------------------------------------------------------------------------
+
+TEST_CASE("use_mmap=false: put/get with file rotation",
+          "[bytecask][no_mmap]") {
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path, {.max_file_bytes = 64, .use_mmap = false});
+  constexpr int kCount = 50;
+  for (int i = 0; i < kCount; ++i) {
+    auto key = std::format("k{:04d}", i);
+    auto val = std::format("v{:04d}", i);
+    db.put({.sync = false}, to_bytes(key), to_bytes(val));
+  }
+  bytecask::Bytes out;
+  for (int i = 0; i < kCount; ++i) {
+    auto key = std::format("k{:04d}", i);
+    auto val = std::format("v{:04d}", i);
+    REQUIRE(db.get({}, to_bytes(key), out));
+    CHECK(to_string(out) == val);
+  }
+}
+
+TEST_CASE("use_write_buffer=false: put/get round-trip",
+          "[bytecask][no_write_buffer]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path, {.use_write_buffer = false});
+  constexpr int kCount = 20;
+  for (int i = 0; i < kCount; ++i) {
+    auto key = std::format("k{:04d}", i);
+    auto val = std::format("v{:04d}", i);
+    db.put({.sync = false}, to_bytes(key), to_bytes(val));
+  }
+  bytecask::Bytes out;
+  for (int i = 0; i < kCount; ++i) {
+    auto key = std::format("k{:04d}", i);
+    auto val = std::format("v{:04d}", i);
+    REQUIRE(db.get({}, to_bytes(key), out));
+    CHECK(to_string(out) == val);
+  }
+}
+
+TEST_CASE("use_mmap=false use_write_buffer=false: full low-memory mode",
+          "[bytecask][low_memory]") {
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path,
+      {.max_file_bytes = 64, .use_mmap = false, .use_write_buffer = false});
+  constexpr int kCount = 50;
+  for (int i = 0; i < kCount; ++i) {
+    auto key = std::format("k{:04d}", i);
+    auto val = std::format("v{:04d}", i);
+    db.put({.sync = false}, to_bytes(key), to_bytes(val));
+  }
+  bytecask::Bytes out;
+  for (int i = 0; i < kCount; ++i) {
+    auto key = std::format("k{:04d}", i);
+    auto val = std::format("v{:04d}", i);
+    REQUIRE(db.get({}, to_bytes(key), out));
+    CHECK(to_string(out) == val);
+  }
+}
+
+TEST_CASE("use_mmap=false: recovery loads sealed files via pread",
+          "[bytecask][no_mmap][recovery]") {
+  TempDir td;
+  auto db_path = td.path / "db";
+  {
+    auto db = bytecask::DB::open(
+        db_path, {.max_file_bytes = 64, .use_mmap = false});
+    for (int i = 0; i < 50; ++i) {
+      auto key = std::format("k{:04d}", i);
+      auto val = std::format("v{:04d}", i);
+      db.put({.sync = false}, to_bytes(key), to_bytes(val));
+    }
+  }
+  auto db = bytecask::DB::open(db_path, {.use_mmap = false});
+  bytecask::Bytes out;
+  for (int i = 0; i < 50; ++i) {
+    auto key = std::format("k{:04d}", i);
+    auto val = std::format("v{:04d}", i);
+    REQUIRE(db.get({}, to_bytes(key), out));
+    CHECK(to_string(out) == val);
+  }
+}
+
+TEST_CASE("use_mmap=false: vacuum reclaims space",
+          "[bytecask][no_mmap][vacuum]") {
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path, {.max_file_bytes = 64, .use_mmap = false});
+  for (int i = 0; i < 30; ++i) {
+    auto key = std::format("k{:04d}", i);
+    db.put({.sync = false}, to_bytes(key), to_bytes("initial"));
+  }
+  for (int i = 0; i < 30; ++i) {
+    auto key = std::format("k{:04d}", i);
+    db.put({.sync = false}, to_bytes(key), to_bytes("updated"));
+  }
+  while (db.vacuum({.fragmentation_threshold = 0.0})) {}
+  bytecask::Bytes out;
+  for (int i = 0; i < 30; ++i) {
+    auto key = std::format("k{:04d}", i);
+    REQUIRE(db.get({}, to_bytes(key), out));
+    CHECK(to_string(out) == "updated");
+  }
+}
