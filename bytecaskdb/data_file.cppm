@@ -852,7 +852,7 @@ ReadOnlyMmapDataFile::~ReadOnlyMmapDataFile() {
 
 // Generic factory: returns mmap-backed DataFile when possible, pread-based otherwise.
 export [[nodiscard]] inline auto openDataFileForRead(
-    std::filesystem::path path, bool use_mmap = true)
+    std::filesystem::path path, bool use_mmap = false)
     -> std::shared_ptr<DataFile> {
 #ifndef __EMSCRIPTEN__
   if (use_mmap) {
