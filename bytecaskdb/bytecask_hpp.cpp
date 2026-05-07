@@ -87,6 +87,8 @@ auto to_module(bytecask::internal::Options o) noexcept -> bytecask::Options {
     static_cast<bytecask::Mode>(o.initial_mode),
     o.max_key_bytes,
     o.max_value_bytes,
+    o.use_mmap,
+    o.use_write_buffer,
   };
 }
 
