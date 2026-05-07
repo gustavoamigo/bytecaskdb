@@ -1,8 +1,8 @@
 services:
   innodb:
     image: docker.io/library/mariadb:10.11
-    mem_limit: 1g
-    memswap_limit: 1g
+    mem_limit: 2g
+    memswap_limit: 4g
     cpus: 4
     volumes:
       - ./innodb.cnf:/etc/mysql/mariadb.conf.d/90-benchmark.cnf:ro,Z
@@ -19,8 +19,8 @@ services:
     build:
       context: ../../..
       dockerfile: bytecaskdb-mariadb-plugin/Dockerfile
-    mem_limit: 1g
-    memswap_limit: 1g
+    mem_limit: 2g
+    memswap_limit: 4g
     cpus: 4
     restart: on-failure:3
     volumes:
