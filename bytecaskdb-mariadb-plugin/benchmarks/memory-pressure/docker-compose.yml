@@ -1,0 +1,53 @@
+services:
+  innodb:
+    image: docker.io/library/mariadb:10.11
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 4
+    volumes:
+      - ./innodb.cnf:/etc/mysql/mariadb.conf.d/90-benchmark.cnf:ro,Z
+    environment:
+      MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: 1
+      MARIADB_DATABASE: sbtest
+    healthcheck:
+      test: ["CMD", "mariadb", "-u", "root", "-e", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  bytecaskdb:
+    build:
+      context: ../../..
+      dockerfile: bytecaskdb-mariadb-plugin/Dockerfile
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 4
+    restart: on-failure:3
+    volumes:
+      - ./bytecaskdb.cnf:/etc/mysql/mariadb.conf.d/90-benchmark.cnf:ro,Z
+    environment:
+      MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: 1
+      MARIADB_DATABASE: sbtest
+    healthcheck:
+      test: ["CMD", "mariadb", "-u", "root", "-e", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  sysbench:
+    build:
+      context: .
+      dockerfile: Dockerfile.sysbench
+    privileged: true
+    pid: host
+    cpus: 4
+    security_opt:
+      - label:disable
+    depends_on:
+      innodb:
+        condition: service_healthy
+      bytecaskdb:
+        condition: service_healthy
+    volumes:
+      - ./run-benchmark.sh:/benchmark/run-benchmark.sh:ro,Z
+      - ./results:/results:Z

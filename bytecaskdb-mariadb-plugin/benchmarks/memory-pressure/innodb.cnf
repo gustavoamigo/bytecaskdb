@@ -1,0 +1,14 @@
+[mariadbd]
+innodb_buffer_pool_size        = 700M
+innodb_flush_method            = O_DIRECT
+innodb_flush_log_at_trx_commit = 1
+innodb_log_file_size           = 128M
+innodb_io_capacity             = 2000
+innodb_io_capacity_max         = 4000
+
+performance_schema             = OFF
+skip-log-bin
+sync_binlog                    = 0
+table_open_cache               = 200
+thread_cache_size              = 8
+max_connections                = 64
