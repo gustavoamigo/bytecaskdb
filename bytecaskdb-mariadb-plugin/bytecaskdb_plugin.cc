@@ -14,6 +14,7 @@
 #include "my_global.h"
 #include "handler.h"
 #include "mysql/plugin.h"
+#include "log.h"
 
 #include "ha_bytecaskdb.h"
 #include "catalog.h"
@@ -32,6 +33,28 @@
 #include <optional>
 #include <string>
 #include <thread>
+
+// ---------------------------------------------------------------------------
+// System variables (global scope — MariaDB plugin API requirement)
+// ---------------------------------------------------------------------------
+
+static my_bool sysvar_use_mmap = FALSE;
+static MYSQL_SYSVAR_BOOL(use_mmap, sysvar_use_mmap,
+    PLUGIN_VAR_READONLY,
+    "Use mmap for sealed data files (default OFF)",
+    nullptr, nullptr, FALSE);
+
+static my_bool sysvar_use_write_buffer = FALSE;
+static MYSQL_SYSVAR_BOOL(use_write_buffer, sysvar_use_write_buffer,
+    PLUGIN_VAR_READONLY,
+    "Use write buffer for active data file (default OFF)",
+    nullptr, nullptr, FALSE);
+
+static struct st_mysql_sys_var *bytecaskdb_system_variables[] = {
+    MYSQL_SYSVAR(use_mmap),
+    MYSQL_SYSVAR(use_write_buffer),
+    nullptr,
+};
 
 namespace bytecaskdb {
 
@@ -220,11 +243,11 @@ static bool catalog_init(bytecask::DB *db) {
       }
     }
   } catch (const std::exception &e) {
-    fprintf(stderr, "[ha_bytecaskdb] Catalog scan failed: %s\n", e.what());
+    sql_print_error("ByteCaskDB: catalog scan failed: %s", e.what());
     return false;
   }
 
-  fprintf(stderr, "[ha_bytecaskdb] Catalog loaded: %zu tables\n",
+  sql_print_information("ByteCaskDB: catalog loaded: %zu tables",
           s_name_to_id.size());
 
   // Seed per-table row counts by scanning the row namespace for each table.
@@ -263,7 +286,7 @@ uint32_t catalog_alloc_table_id(bytecask::DB *db) {
         current_id = decode_counter_value(u8_data(val), val.size());
       }
     } catch (const std::exception &e) {
-      fprintf(stderr, "[ha_bytecaskdb] alloc_table_id read failed: %s\n",
+      sql_print_error("ByteCaskDB: alloc_table_id read failed: %s",
               e.what());
       return 0;
     }
@@ -280,7 +303,7 @@ uint32_t catalog_alloc_table_id(bytecask::DB *db) {
       committed = db->apply_batch(bytecask::WriteOptions{.sync = true},
                                   std::move(plan));
     } catch (const std::exception &e) {
-      fprintf(stderr, "[ha_bytecaskdb] alloc_table_id apply failed: %s\n",
+      sql_print_error("ByteCaskDB: alloc_table_id apply failed: %s",
               e.what());
       return 0;
     }
@@ -304,7 +327,7 @@ bool catalog_put_table_meta(bytecask::DB *db, const TableMeta &meta,
             as_view(key.data(), key.size()),
             as_view(val.data(), val.size()));
   } catch (const std::exception &e) {
-    fprintf(stderr, "[ha_bytecaskdb] put_table_meta failed: %s\n", e.what());
+    sql_print_error("ByteCaskDB: put_table_meta failed: %s", e.what());
     return false;
   }
 
@@ -323,7 +346,7 @@ bool catalog_delete_table_meta(bytecask::DB *db, const char *name) {
     (void)db->del(bytecask::WriteOptions{.sync = true},
                   as_view(key.data(), key.size()));
   } catch (const std::exception &e) {
-    fprintf(stderr, "[ha_bytecaskdb] delete_table_meta failed: %s\n",
+    sql_print_error("ByteCaskDB: delete_table_meta failed: %s",
             e.what());
     return false;
   }
@@ -370,7 +393,7 @@ bool catalog_rename_table_meta(bytecask::DB *db,
       return false;
     }
   } catch (const std::exception &e) {
-    fprintf(stderr, "[ha_bytecaskdb] rename_table_meta read failed: %s\n",
+    sql_print_error("ByteCaskDB: rename_table_meta read failed: %s",
             e.what());
     return false;
   }
@@ -394,7 +417,7 @@ bool catalog_rename_table_meta(bytecask::DB *db,
     committed = db->apply_batch(bytecask::WriteOptions{.sync = true},
                                 std::move(plan));
   } catch (const std::exception &e) {
-    fprintf(stderr, "[ha_bytecaskdb] rename_table_meta apply failed: %s\n",
+    sql_print_error("ByteCaskDB: rename_table_meta apply failed: %s",
             e.what());
     return false;
   }
@@ -556,7 +579,7 @@ static void vacuum_loop() {
       try {
         more_work = g_db->vacuum();
       } catch (const std::exception &e) {
-        fprintf(stderr, "[ha_bytecaskdb] vacuum: %s\n", e.what());
+        sql_print_error("ByteCaskDB: vacuum error: %s", e.what());
       }
       lk.lock();
     }
@@ -592,25 +615,30 @@ static int bytecaskdb_init(void *p) {
   opts.recovery_threads = 4;
   opts.max_value_bytes = 16 * 1024 * 1024;  // MEDIUMBLOB (16 MiB)
   opts.max_key_bytes = 8192;  // secondary index key + PK suffix can exceed 4096
+  opts.use_mmap = sysvar_use_mmap;
+  opts.use_write_buffer = sysvar_use_write_buffer;
 
   try {
     g_db_owner = std::make_unique<DBHolder>(db_path, opts);
     g_db = &g_db_owner->db;
   } catch (const std::exception &e) {
-    fprintf(stderr, "[ha_bytecaskdb] Failed to open global DB at '%s': %s\n",
+    sql_print_error("ByteCaskDB: failed to open global DB at '%s': %s",
             db_path.c_str(), e.what());
     return 1;
   }
 
   if (!catalog_init(g_db)) {
-    fprintf(stderr, "[ha_bytecaskdb] Failed to initialize catalog\n");
+    sql_print_error("ByteCaskDB: failed to initialize catalog");
     g_db = nullptr;
     g_db_owner.reset();
     return 1;
   }
 
-  fprintf(stderr, "[ha_bytecaskdb] Opened global DB at '%s'\n",
+  sql_print_information("ByteCaskDB: opened global DB at '%s'",
           db_path.c_str());
+  sql_print_information("ByteCaskDB: use_mmap=%s, use_write_buffer=%s",
+          sysvar_use_mmap ? "ON" : "OFF",
+          sysvar_use_write_buffer ? "ON" : "OFF");
 
   s_vacuum_stop = false;
   s_vacuum_thread = std::thread{vacuum_loop};
@@ -670,7 +698,7 @@ maria_declare_plugin(ha_bytecaskdb) {
     bytecaskdb::bytecaskdb_deinit,
     0x0002,           // version 0.2
     nullptr,          // status variables
-    nullptr,          // system variables
+    bytecaskdb_system_variables,
     "0.2",            // version string
     MariaDB_PLUGIN_MATURITY_GAMMA,
 } maria_declare_plugin_end;
