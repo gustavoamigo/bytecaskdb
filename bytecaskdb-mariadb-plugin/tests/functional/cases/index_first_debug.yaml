@@ -1,0 +1,57 @@
+# index_first_debug.yaml — test whether index_first works for different key types
+
+- name: Full index scan on INT secondary index
+  setup:
+    - DROP DATABASE IF EXISTS ifd1
+    - CREATE DATABASE ifd1
+    - CREATE TABLE ifd1.t1 (id INT AUTO_INCREMENT PRIMARY KEY, a INT, INDEX idx_a (a)) ENGINE=bytecaskdb
+    - INSERT INTO ifd1.t1 (a) VALUES (10),(20),(30)
+  steps:
+    - sql: SELECT COUNT(*) FROM ifd1.t1 FORCE INDEX (idx_a) WHERE a IS NOT NULL OR a IS NULL
+      expected: [['3']]
+    - sql: SELECT a FROM ifd1.t1 FORCE INDEX (idx_a) WHERE a > 0 ORDER BY a
+      expected: [['10'], ['20'], ['30']]
+  teardown:
+    - DROP DATABASE IF EXISTS ifd1
+
+- name: Full index scan on VARCHAR secondary index
+  setup:
+    - DROP DATABASE IF EXISTS ifd2
+    - CREATE DATABASE ifd2
+    - CREATE TABLE ifd2.t1 (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(100), INDEX idx_v (v)) ENGINE=bytecaskdb
+    - INSERT INTO ifd2.t1 (v) VALUES ('aaa'),('bbb'),('ccc')
+  steps:
+    - sql: SELECT COUNT(*) FROM ifd2.t1 FORCE INDEX (idx_v) WHERE v IS NOT NULL OR v IS NULL
+      expected: [['3']]
+    - sql: SELECT v FROM ifd2.t1 FORCE INDEX (idx_v) WHERE v > '' ORDER BY v
+      expected: [['aaa'], ['bbb'], ['ccc']]
+  teardown:
+    - DROP DATABASE IF EXISTS ifd2
+
+- name: Full index scan on BLOB prefix secondary index (small data)
+  setup:
+    - DROP DATABASE IF EXISTS ifd3
+    - CREATE DATABASE ifd3
+    - CREATE TABLE ifd3.t1 (id INT AUTO_INCREMENT PRIMARY KEY, b BLOB, INDEX idx_b (b(32))) ENGINE=bytecaskdb
+    - INSERT INTO ifd3.t1 (b) VALUES ('aaa'),('bbb'),('ccc')
+  steps:
+    - sql: SELECT COUNT(*) FROM ifd3.t1 FORCE INDEX (idx_b) WHERE b IS NOT NULL OR b IS NULL
+      expected: [['3']]
+    - sql: SELECT CAST(b AS CHAR) FROM ifd3.t1 FORCE INDEX (idx_b) WHERE b > '' ORDER BY b
+      expected: [['aaa'], ['bbb'], ['ccc']]
+  teardown:
+    - DROP DATABASE IF EXISTS ifd3
+
+- name: Full index scan on composite BLOB prefix secondary index
+  setup:
+    - DROP DATABASE IF EXISTS ifd4
+    - CREATE DATABASE ifd4
+    - CREATE TABLE ifd4.t1 (id INT AUTO_INCREMENT PRIMARY KEY, l LONGBLOB, t TINYBLOB, UNIQUE INDEX l_t (l(256),t(64))) ENGINE=bytecaskdb
+    - INSERT INTO ifd4.t1 (l,t) VALUES ('d','b'),('test4','test2'),('w','y')
+  steps:
+    - sql: SELECT COUNT(*) FROM ifd4.t1 FORCE INDEX (l_t) WHERE l IS NOT NULL OR l IS NULL
+      expected: [['3']]
+    - sql: SELECT CAST(l AS CHAR) FROM ifd4.t1 FORCE INDEX (l_t) WHERE l > '' ORDER BY l
+      expected: [['d'], ['test4'], ['w']]
+  teardown:
+    - DROP DATABASE IF EXISTS ifd4
