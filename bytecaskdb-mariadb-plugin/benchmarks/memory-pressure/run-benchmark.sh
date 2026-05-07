@@ -2,13 +2,12 @@
 # Memory pressure benchmark: InnoDB vs ByteCaskDB
 #
 # Runs sysbench OLTP workloads against both engines under 1GB memory limits.
-# Drops caches between runs to ensure cold-start fairness.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-TABLE_SIZE=5000000
+TABLE_SIZE=3000000
 THREADS="1 8 16"
 WARMUP=30
 DURATION=60
@@ -21,9 +20,6 @@ DB_USER=root
 DB_NAME=sbtest
 
 RESULTS_CSV=/results/results.csv
-
-# InnoDB buffer pool minimum for flush cycle (bytes) — must be >= 6MB
-BP_MIN=8388608
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -43,24 +39,6 @@ wait_for_db() {
   done
 }
 
-drop_caches() {
-  sync
-  if ! echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; then
-    log "  WARNING: cannot drop caches (run with sudo podman-compose for full cache isolation)"
-  fi
-}
-
-flush_innodb_bp() {
-  local bp_full
-  bp_full="$(mariadb -h "$INNODB_HOST" -P "$DB_PORT" -u "$DB_USER" -N \
-    -e "SELECT @@innodb_buffer_pool_size")"
-  mariadb -h "$INNODB_HOST" -P "$DB_PORT" -u "$DB_USER" \
-    -e "SET GLOBAL innodb_buffer_pool_size = $BP_MIN"
-  sleep 5
-  mariadb -h "$INNODB_HOST" -P "$DB_PORT" -u "$DB_USER" \
-    -e "SET GLOBAL innodb_buffer_pool_size = $bp_full"
-  sleep 5
-}
 
 sysbench_args() {
   local host="$1"
@@ -164,17 +142,12 @@ for workload in $WORKLOADS; do
   for t in $THREADS; do
     log "--- $workload | threads=$t ---"
 
-    # Cold-start InnoDB
-    flush_innodb_bp
-    drop_caches
     log "  InnoDB: running (warmup=${WARMUP}s, measure=${DURATION}s)..."
     result_in="$(run_measurement innodb "$workload" "$INNODB_HOST" "$t")"
     echo "$result_in" >> "$RESULTS_CSV"
     ALL_RESULTS+=("$result_in")
     log "  InnoDB: $(echo "$result_in" | cut -d, -f4) tps"
 
-    # Cold-start ByteCaskDB
-    drop_caches
     log "  ByteCaskDB: running (warmup=${WARMUP}s, measure=${DURATION}s)..."
     result_bc="$(run_measurement bytecaskdb "$workload" "$BYTECASKDB_HOST" "$t")"
     echo "$result_bc" >> "$RESULTS_CSV"
