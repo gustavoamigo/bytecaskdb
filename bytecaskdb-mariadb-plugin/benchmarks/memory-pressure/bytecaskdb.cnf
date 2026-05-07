@@ -1,0 +1,12 @@
+[mariadbd]
+default_storage_engine = bytecaskdb
+innodb_buffer_pool_size = 8M
+
+performance_schema             = OFF
+skip-log-bin
+sync_binlog                    = 0
+table_open_cache               = 200
+thread_cache_size              = 8
+max_connections                = 64
+
+sql_mode = STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER
