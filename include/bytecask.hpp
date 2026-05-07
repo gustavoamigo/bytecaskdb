@@ -86,6 +86,8 @@ struct Options {
   Mode initial_mode{Mode::Leader};
   std::uint32_t max_key_bytes{4096};
   std::uint32_t max_value_bytes{4U * 1024 * 1024};
+  bool use_mmap{false};
+  bool use_write_buffer{false};
 };
 
 struct SizeLimits {
