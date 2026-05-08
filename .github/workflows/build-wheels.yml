@@ -44,7 +44,7 @@ jobs:
       BYTECASK_MARCH: x86-64-v3
     strategy:
       matrix:
-        python: ["cp312-cp312", "cp313-cp313", "cp313-cp313t", "cp314-cp314", "cp314-cp314t"]
+        python: ["cp312-cp312", "cp313-cp313", "cp314-cp314", "cp314-cp314t", "cp315-cp315", "cp315-cp315t"]
     steps:
       - uses: actions/checkout@v4
 
@@ -64,7 +64,7 @@ jobs:
         run: |
           export PATH=/opt/python/${{ matrix.python }}/bin:$PATH
           echo "/opt/python/${{ matrix.python }}/bin" >> $GITHUB_PATH
-          python3 -m pip install nanobind pytest auditwheel
+          pip install nanobind pytest auditwheel
 
       - name: Configure xmake
         run: |
@@ -123,7 +123,7 @@ jobs:
     runs-on: macos-14
     strategy:
       matrix:
-        python-version: ["3.12", "3.13", "3.13t", "3.14", "3.14t"]
+        python-version: ["3.12", "3.13", "3.14", "3.14t", "3.15", "3.15t"]
     steps:
       - uses: actions/checkout@v4
 
