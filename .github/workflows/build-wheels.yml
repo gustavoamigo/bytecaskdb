@@ -64,7 +64,7 @@ jobs:
         run: |
           export PATH=/opt/python/${{ matrix.python }}/bin:$PATH
           echo "/opt/python/${{ matrix.python }}/bin" >> $GITHUB_PATH
-          pip install nanobind pytest auditwheel
+          python3 -m pip install nanobind pytest auditwheel
 
       - name: Configure xmake
         run: |
