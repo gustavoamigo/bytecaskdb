@@ -31,12 +31,25 @@ from tests.proof.resume.scenario_matrix import (
 # ---------------------------------------------------------------------------
 
 
+def _build_open_opts(degrade: DegradeShape, max_file_bytes: int | None = None) -> str:
+    """Build C++ designated-initializer list for Options from degrade shape."""
+    parts: List[str] = []
+    if max_file_bytes is not None:
+        parts.append(f".max_file_bytes = {max_file_bytes}")
+    if degrade.use_mmap:
+        parts.append(".use_mmap = true")
+    if degrade.use_write_buffer:
+        parts.append(".use_write_buffer = true")
+    return ", ".join(parts)
+
+
 def gen_degrade_setup(degrade: DegradeShape) -> str:
     """Generate C++ to establish the degraded state."""
     if degrade.degrade_via == DegradeVia.H:
+        opts = _build_open_opts(degrade, max_file_bytes=30)
         return (
             "    // Establish degrade_H: write k0, then fault on rotation after p0.\n"
-            "    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30});\n"
+            f"    auto db = bytecask::DB::open(dir, {{{opts}}});\n"
             '    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));\n'
             "    {\n"
             '      bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};\n'
@@ -47,11 +60,16 @@ def gen_degrade_setup(degrade: DegradeShape) -> str:
             "    REQUIRE(db.is_degraded());"
         )
     elif degrade.degrade_via == DegradeVia.C:
+        opts = _build_open_opts(degrade)
+        if opts:
+            open_call = f"bytecask::DB::open(dir, {{{opts}}})"
+        else:
+            open_call = "bytecask::DB::open(dir)"
         return (
             "    // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd\n"
             "    // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).\n"
             "    // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.\n"
-            "    auto db = bytecask::DB::open(dir);\n"
+            f"    auto db = {open_call};\n"
             '    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));\n'
             "    {\n"
             "      bytecask::WritePlan plan;\n"
@@ -65,10 +83,15 @@ def gen_degrade_setup(degrade: DegradeShape) -> str:
             "    REQUIRE(db.is_degraded());"
         )
     elif degrade.degrade_via == DegradeVia.F:
+        opts = _build_open_opts(degrade)
+        if opts:
+            open_call = f"bytecask::DB::open(dir, {{{opts}}})"
+        else:
+            open_call = "bytecask::DB::open(dir)"
         return (
             "    // Establish degrade_F: k0 committed (sync=false); p0 appended but\n"
             "    // commit sync (fdatasync) fails. Bytes in page cache, key_dir not published.\n"
-            "    auto db = bytecask::DB::open(dir);\n"
+            f"    auto db = {open_call};\n"
             '    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));\n'
             "    {\n"
             '      bytecask::testing::ScopedFaultInjector fi_degrade{"io_data_file_sync"};\n'
@@ -79,10 +102,11 @@ def gen_degrade_setup(degrade: DegradeShape) -> str:
             "    REQUIRE(db.is_degraded());"
         )
     else:  # DegradeVia.G
+        opts = _build_open_opts(degrade, max_file_bytes=1)
         return (
             "    // Establish degrade_G: k0 committed (sync=false); p0 appended with\n"
             "    // sync=false on small max_file_bytes. Pre-rotation sync fails.\n"
-            "    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});\n"
+            f"    auto db = bytecask::DB::open(dir, {{{opts}}});\n"
             '    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));\n'
             "    {\n"
             '      bytecask::testing::ScopedFaultInjector fi_degrade{"io_data_file_sync"};\n'
@@ -162,10 +186,13 @@ def gen_clean_resume_and_checks(delta: ResumeDelta, phase_num: int = 3) -> str:
     return "\n".join(lines)
 
 
-def gen_recovery_check(delta: ResumeDelta) -> str:
+def gen_recovery_check(degrade: DegradeShape, delta: ResumeDelta) -> str:
     """Generate assert_keys_recoverable call after db scope closes."""
     present = "{" + ", ".join(f'"{k}"' for k in delta.keys_present) + "}"
     absent = "{" + ", ".join(f'"{k}"' for k in delta.keys_absent) + "}"
+    opts = _build_open_opts(degrade)
+    if opts:
+        return f"  assert_keys_recoverable(dir, {present}, {absent}, {{{opts}}});"
     return f"  assert_keys_recoverable(dir, {present}, {absent});"
 
 
@@ -197,7 +224,7 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
         parts.append(gen_clean_resume_and_checks(delta))
 
     parts.append("  }")
-    parts.append(gen_recovery_check(delta))
+    parts.append(gen_recovery_check(degrade, delta))
     parts.append("}")
     return "\n".join(parts)
 

@@ -168,8 +168,9 @@ inline void assert_resumable(DB &db) {
 // DB's destructor flushes hint files that recovery depends on).
 inline void assert_recoverable(const std::filesystem::path &dir,
                                const Baseline &before,
-                               const ExpectedDelta &expected) {
-  auto recovered = DB::open(dir);
+                               const ExpectedDelta &expected,
+                               const Options &opts = {}) {
+  auto recovered = DB::open(dir, opts);
 
   // Pre-existing keys that were not removed or overwritten must be present
   // with their original values.
@@ -232,8 +233,9 @@ inline void assert_recoverable(const std::filesystem::path &dir,
 inline void assert_keys_recoverable(
     const std::filesystem::path &dir,
     const std::vector<std::string> &keys_present,
-    const std::vector<std::string> &keys_absent = {}) {
-  auto recovered = DB::open(dir);
+    const std::vector<std::string> &keys_absent = {},
+    const Options &opts = {}) {
+  auto recovered = DB::open(dir, opts);
   for (const auto &key : keys_present) {
     INFO("key must be present after recovery: " << key);
     CHECK(recovered.contains_key({}, to_bytes(key)));
@@ -366,8 +368,9 @@ inline void assert_vacuum_no_change(const DB &db, const VacuumBaseline &before,
 
 // Opens a fresh DB and verifies all pre-vacuum keys survive.
 inline void assert_vacuum_recoverable(const std::filesystem::path &dir,
-                                      const VacuumBaseline &before) {
-  auto recovered = DB::open(dir);
+                                      const VacuumBaseline &before,
+                                      const Options &opts = {}) {
+  auto recovered = DB::open(dir, opts);
   for (const auto &[key, value] : before.keys.key_values) {
     INFO("key must survive vacuum and recovery: " << key);
     CHECK(recovered.contains_key({}, to_bytes(key)));

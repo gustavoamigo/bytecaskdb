@@ -1478,3 +1478,217 @@ TEST_CASE("BC-201 ReverseRadixTreeIterator ++ past rend stays past rend",
   ++rit;
   CHECK(rit == t.rend());
 }
+
+// ---------------------------------------------------------------------------
+// ValueIterator: ascending value order
+// ---------------------------------------------------------------------------
+TEST_CASE("ValueIterator ascending order", "[radix_tree]") {
+  auto t = Tree{}
+               .set(to_bytes("cherry"), 3)
+               .set(to_bytes("apple"), 1)
+               .set(to_bytes("banana"), 2);
+
+  std::vector<int> values;
+  for (auto it = t.value_begin(); it != std::default_sentinel; ++it)
+    values.push_back(*it);
+
+  REQUIRE(values == std::vector<int>{1, 2, 3});
+}
+
+// ---------------------------------------------------------------------------
+// ValueIterator: empty tree
+// ---------------------------------------------------------------------------
+TEST_CASE("ValueIterator empty tree", "[radix_tree]") {
+  const Tree t;
+  CHECK(t.value_begin() == std::default_sentinel);
+}
+
+// ---------------------------------------------------------------------------
+// value_lower_bound: exact match
+// ---------------------------------------------------------------------------
+TEST_CASE("value_lower_bound exact match", "[radix_tree]") {
+  auto t = Tree{}
+               .set(to_bytes("apple"), 1)
+               .set(to_bytes("banana"), 2)
+               .set(to_bytes("cherry"), 3);
+
+  auto it = t.value_lower_bound(to_bytes("banana"));
+  REQUIRE(it != std::default_sentinel);
+  CHECK(*it == 2);
+}
+
+// ---------------------------------------------------------------------------
+// value_lower_bound: prefix byte overshoot (OS-1)
+// ---------------------------------------------------------------------------
+TEST_CASE("value_lower_bound prefix overshoot", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("cherry"), 1);
+  auto it = t.value_lower_bound(to_bytes("banana"));
+  REQUIRE(it != std::default_sentinel);
+  CHECK(*it == 1);
+}
+
+// ---------------------------------------------------------------------------
+// value_lower_bound: target exhausted before prefix ends (OS-2)
+// ---------------------------------------------------------------------------
+TEST_CASE("value_lower_bound target exhausted", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("abc"), 1).set(to_bytes("abd"), 2);
+  auto it = t.value_lower_bound(to_bytes("ab"));
+  REQUIRE(it != std::default_sentinel);
+  CHECK(*it == 1);
+}
+
+// ---------------------------------------------------------------------------
+// value_lower_bound: past end
+// ---------------------------------------------------------------------------
+TEST_CASE("value_lower_bound past end", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("aaa"), 1);
+  CHECK(t.value_lower_bound(to_bytes("zzz")) == std::default_sentinel);
+}
+
+// ---------------------------------------------------------------------------
+// value_lower_bound: between keys
+// ---------------------------------------------------------------------------
+TEST_CASE("value_lower_bound between keys", "[radix_tree]") {
+  auto t = Tree{}
+               .set(to_bytes("aaa"), 1)
+               .set(to_bytes("ccc"), 2)
+               .set(to_bytes("eee"), 3);
+
+  auto it = t.value_lower_bound(to_bytes("bbb"));
+  REQUIRE(it != std::default_sentinel);
+  CHECK(*it == 2);
+}
+
+// ---------------------------------------------------------------------------
+// ReverseValueIterator: descending value order
+// ---------------------------------------------------------------------------
+TEST_CASE("ReverseValueIterator descending order", "[radix_tree]") {
+  auto t = Tree{}
+               .set(to_bytes("apple"), 1)
+               .set(to_bytes("banana"), 2)
+               .set(to_bytes("cherry"), 3);
+
+  std::vector<int> values;
+  for (auto it = t.value_rbegin(); it != std::default_sentinel; ++it)
+    values.push_back(*it);
+
+  REQUIRE(values == std::vector<int>{3, 2, 1});
+}
+
+// ---------------------------------------------------------------------------
+// ReverseValueIterator: empty tree
+// ---------------------------------------------------------------------------
+TEST_CASE("ReverseValueIterator empty tree", "[radix_tree]") {
+  const Tree t;
+  CHECK(t.value_rbegin() == std::default_sentinel);
+}
+
+// ---------------------------------------------------------------------------
+// ReverseValueIterator: single element
+// ---------------------------------------------------------------------------
+TEST_CASE("ReverseValueIterator single element", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("only"), 42);
+  auto it = t.value_rbegin();
+  REQUIRE(it != std::default_sentinel);
+  CHECK(*it == 42);
+  ++it;
+  CHECK(it == std::default_sentinel);
+}
+
+// ---------------------------------------------------------------------------
+// ReverseValueIterator retreat branch B: sibling nodes
+// ---------------------------------------------------------------------------
+TEST_CASE("ReverseValueIterator sibling nodes", "[radix_tree]") {
+  auto t = Tree{}
+               .set(to_bytes("ba"), 1)
+               .set(to_bytes("bb"), 2)
+               .set(to_bytes("bc"), 3);
+
+  std::vector<int> values;
+  for (auto it = t.value_rbegin(); it != std::default_sentinel; ++it)
+    values.push_back(*it);
+
+  REQUIRE(values == std::vector<int>{3, 2, 1});
+}
+
+// ---------------------------------------------------------------------------
+// ReverseValueIterator retreat branch D: parent node has value
+// ---------------------------------------------------------------------------
+TEST_CASE("ReverseValueIterator parent has value", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("ab"), 1).set(to_bytes("abc"), 2);
+
+  std::vector<int> values;
+  for (auto it = t.value_rbegin(); it != std::default_sentinel; ++it)
+    values.push_back(*it);
+
+  REQUIRE(values == std::vector<int>{2, 1});
+}
+
+// ---------------------------------------------------------------------------
+// ReverseValueIterator retreat branch E: routing node without value
+// ---------------------------------------------------------------------------
+TEST_CASE("ReverseValueIterator routing node without value", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("abc"), 1).set(to_bytes("abd"), 2);
+
+  std::vector<int> values;
+  for (auto it = t.value_rbegin(); it != std::default_sentinel; ++it)
+    values.push_back(*it);
+
+  REQUIRE(values == std::vector<int>{2, 1});
+}
+
+// ---------------------------------------------------------------------------
+// value_rlower_bound: exact match (RL-C)
+// ---------------------------------------------------------------------------
+TEST_CASE("value_rlower_bound exact match", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("abc"), 1).set(to_bytes("abd"), 2);
+  auto it = t.value_rlower_bound(to_bytes("abd"));
+  REQUIRE(it != std::default_sentinel);
+  CHECK(*it == 2);
+}
+
+// ---------------------------------------------------------------------------
+// value_rlower_bound: all keys less than upper (RL-B)
+// ---------------------------------------------------------------------------
+TEST_CASE("value_rlower_bound all keys less", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("a"), 1).set(to_bytes("b"), 2);
+  auto it = t.value_rlower_bound(to_bytes("z"));
+  REQUIRE(it != std::default_sentinel);
+  CHECK(*it == 2);
+}
+
+// ---------------------------------------------------------------------------
+// value_rlower_bound: no key <= upper (RL-E)
+// ---------------------------------------------------------------------------
+TEST_CASE("value_rlower_bound no key le upper", "[radix_tree]") {
+  auto t = Tree{}.set(to_bytes("m"), 1).set(to_bytes("n"), 2);
+  auto it = t.value_rlower_bound(to_bytes("a"));
+  CHECK(it == std::default_sentinel);
+}
+
+// ---------------------------------------------------------------------------
+// value_rlower_bound: retreat from overshoot (RL-D3)
+// ---------------------------------------------------------------------------
+TEST_CASE("value_rlower_bound retreat from overshoot", "[radix_tree]") {
+  auto t = Tree{}
+               .set(to_bytes("ba"), 1)
+               .set(to_bytes("bb"), 2)
+               .set(to_bytes("bc"), 3);
+  auto it = t.value_rlower_bound(to_bytes("bba"));
+  REQUIRE(it != std::default_sentinel);
+  CHECK(*it == 2);
+}
+
+// ---------------------------------------------------------------------------
+// value_rlower_bound: deep tree descend_rightmost
+// ---------------------------------------------------------------------------
+TEST_CASE("value_rlower_bound deep tree", "[radix_tree]") {
+  auto t = Tree{}
+               .set(to_bytes("a"), 1)
+               .set(to_bytes("ab"), 2)
+               .set(to_bytes("abc"), 3)
+               .set(to_bytes("abcd"), 4);
+  auto it = t.value_rlower_bound(to_bytes("z"));
+  REQUIRE(it != std::default_sentinel);
+  CHECK(*it == 4);
+}
