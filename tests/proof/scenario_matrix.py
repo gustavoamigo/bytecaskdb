@@ -34,6 +34,8 @@ class StateShape:
     num_keys: int
     max_file_bytes: Optional[int] = None
     delete_after_create: bool = False  # create keys then delete them (tombstone state)
+    use_mmap: bool = False
+    use_write_buffer: bool = False
 
     @property
     def at_rotation(self) -> bool:
@@ -70,6 +72,15 @@ STATE_SHAPES = [
     StateShape("populated_db", num_keys=10),
     StateShape("rotation_threshold", num_keys=1, max_file_bytes=1),
     StateShape("deleted_key", num_keys=1, delete_after_create=True),
+    StateShape("single_key_buffered", num_keys=1, use_mmap=True, use_write_buffer=True),
+    StateShape("populated_db_buffered", num_keys=10, use_mmap=True, use_write_buffer=True),
+    StateShape(
+        "rotation_threshold_buffered",
+        num_keys=1,
+        max_file_bytes=1,
+        use_mmap=True,
+        use_write_buffer=True,
+    ),
 ]
 
 PLAN_SHAPES = [

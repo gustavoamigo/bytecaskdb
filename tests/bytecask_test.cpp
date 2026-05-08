@@ -5743,6 +5743,59 @@ TEST_CASE("ingest triggers file rotation", "[replication]") {
   }
 }
 
+TEST_CASE("ingest post-loop rotation: last entry tips file past threshold",
+          "[replication]") {
+  TempDir td;
+
+  auto leader = bytecask::DB::open(td.path / "leader");
+  for (char c = 'a'; c <= 'e'; ++c)
+    leader.put({}, to_bytes(std::string(1, c)), to_bytes("x"));
+
+  auto snap = leader.snapshot();
+  auto changes = leader.changes_since(snap, 0);
+
+  struct OwnedEntry {
+    std::uint64_t sequence;
+    bytecask::EntryType entry_type;
+    bytecask::Bytes key;
+    bytecask::Bytes value;
+  };
+  std::vector<OwnedEntry> owned;
+  for (const auto &e : changes) {
+    owned.push_back({e.sequence, e.entry_type,
+                     bytecask::Bytes{e.key.begin(), e.key.end()},
+                     bytecask::Bytes{e.value.begin(), e.value.end()}});
+  }
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &o : owned) {
+    views.push_back({o.sequence, o.entry_type, o.key, o.value});
+  }
+
+  // 5 entries × 21 bytes = 105 bytes total. With max_file_bytes=100,
+  // the last entry crosses the threshold but mid-loop guard (i+1 < size)
+  // is false, so the post-loop rotation block fires instead.
+  bytecask::Bytes out;
+  {
+    auto follower = bytecask::DB::open(
+        td.path / "follower",
+        {.max_file_bytes = 100, .initial_mode = bytecask::Mode::Follower});
+    follower.ingest(views);
+
+    for (char c = 'a'; c <= 'e'; ++c) {
+      REQUIRE(follower.get({}, to_bytes(std::string(1, c)), out));
+      CHECK(to_string(out) == "x");
+    }
+  }
+
+  {
+    auto reopened = bytecask::DB::open(td.path / "follower");
+    for (char c = 'a'; c <= 'e'; ++c) {
+      REQUIRE(reopened.get({}, to_bytes(std::string(1, c)), out));
+      CHECK(to_string(out) == "x");
+    }
+  }
+}
+
 TEST_CASE("batch-safe rotation: batch is not split across files",
           "[replication]") {
   TempDir td;
@@ -6300,6 +6353,39 @@ TEST_CASE("stats: all expected keys are present in dump",
     CHECK(s.contains(name));
   }
   CHECK(s.size() == expected.size());
+}
+
+// ---------------------------------------------------------------------------
+// ReadOptions: verify_checksums=false exercises read_entry_unverified paths
+// ---------------------------------------------------------------------------
+
+TEST_CASE("iter_from and riter_from with verify_checksums=false",
+          "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path, {.max_file_bytes = 64});
+
+  for (int i = 0; i < 20; ++i) {
+    auto key = std::format("key:{:04d}", i);
+    auto val = std::format("val:{:04d}", i);
+    db.put({.sync = false}, to_bytes(key), to_bytes(val));
+  }
+
+  bytecask::ReadOptions ropts{.verify_checksums = false};
+
+  std::vector<std::string> forward_keys;
+  for (const auto &[key, value] : db.iter_from(ropts)) {
+    forward_keys.push_back(to_string(key));
+  }
+  CHECK(forward_keys.size() == 20);
+  CHECK(std::is_sorted(forward_keys.begin(), forward_keys.end()));
+
+  std::vector<std::string> reverse_keys;
+  for (const auto &[key, value] : db.riter_from(ropts)) {
+    reverse_keys.push_back(to_string(key));
+  }
+  CHECK(reverse_keys.size() == 20);
+  CHECK(std::is_sorted(reverse_keys.begin(), reverse_keys.end(),
+                        std::greater<>{}));
 }
 
 // ---------------------------------------------------------------------------

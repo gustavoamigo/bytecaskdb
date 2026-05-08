@@ -33,14 +33,25 @@ from tests.proof.vacuum_compact.scenario_matrix import (
 # ---------------------------------------------------------------------------
 
 
+def _build_open_opts(state: CompactStateShape) -> str:
+    """Build the C++ designated-initializer list for Options from state fields."""
+    parts = [f".max_file_bytes = {state.max_file_bytes}"]
+    if state.use_mmap:
+        parts.append(".use_mmap = true")
+    if state.use_write_buffer:
+        parts.append(".use_write_buffer = true")
+    return ", ".join(parts)
+
+
 def gen_setup(state: CompactStateShape) -> str:
     """Generate C++ to create the initial DB state with a sealed file."""
     lines: List[str] = []
     lines.append(
         f"    // Setup: write {state.sealed_keys} to file_0, trigger rotation to seal it."
     )
+    opts = _build_open_opts(state)
     lines.append(
-        f"    auto db = bytecask::DB::open(dir, {{.max_file_bytes = {state.max_file_bytes}}});"
+        f"    auto db = bytecask::DB::open(dir, {{{opts}}});"
     )
     for key in state.sealed_keys:
         lines.append(
@@ -118,7 +129,8 @@ def gen_test(
     parts.append("")
     parts.append(gen_assertions(delta))
     parts.append("  }")
-    parts.append("  assert_vacuum_recoverable(dir, before);")
+    opts = _build_open_opts(state)
+    parts.append(f"  assert_vacuum_recoverable(dir, before, {{{opts}}});")
     parts.append("}")
     return "\n".join(parts)
 

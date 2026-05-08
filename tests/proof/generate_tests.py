@@ -61,13 +61,25 @@ def existing_keys(state: StateShape) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+def _build_open_opts(state: StateShape) -> str:
+    """Build the C++ designated-initializer list for Options from state fields."""
+    parts: List[str] = []
+    if state.max_file_bytes is not None:
+        parts.append(f".max_file_bytes = {state.max_file_bytes}")
+    if state.use_mmap:
+        parts.append(".use_mmap = true")
+    if state.use_write_buffer:
+        parts.append(".use_write_buffer = true")
+    return ", ".join(parts)
+
+
 def gen_setup(state: StateShape) -> str:
     """Generate C++ to create initial DB state."""
     lines: List[str] = []
-    if state.max_file_bytes is not None:
+    opts = _build_open_opts(state)
+    if opts:
         lines.append(
-            f"    auto db = bytecask::DB::open("
-            f"dir, {{.max_file_bytes = {state.max_file_bytes}}});"
+            f"    auto db = bytecask::DB::open(dir, {{{opts}}});"
         )
     else:
         lines.append("    auto db = bytecask::DB::open(dir);")
@@ -284,7 +296,11 @@ def gen_test(
 
     # Recovery
     if should_check_recovery(delta, failure):
-        parts.append("  assert_recoverable(dir, before, expected);")
+        opts = _build_open_opts(state)
+        if opts:
+            parts.append(f"  assert_recoverable(dir, before, expected, {{{opts}}});")
+        else:
+            parts.append("  assert_recoverable(dir, before, expected);")
     else:
         if failure in (FailureClass.F, FailureClass.G):
             parts.append(

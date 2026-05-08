@@ -2073,10 +2073,9 @@ public:
       // Exact match — start here (inclusive).
       cur_ = std::move(fwd);
     } else {
-      // fwd is at first key > upper (or at a non-value node >= upper).
-      // Advance fwd to the next value node if needed, then retreat.
-      if (!fwd.stack_.back().node->has_value())
-        fwd.advance();
+      // fwd is at or past the target — advance to the next value node,
+      // then retreat to find the last value node <= upper.
+      fwd.advance();
       if (fwd.stack_.empty()) {
         // No key >= upper with a value; position at rightmost.
         cur_.push_node(root_);
