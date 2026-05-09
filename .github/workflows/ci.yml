@@ -40,7 +40,7 @@ jobs:
             xmake \
             python3-pip python3-devel \
             git ninja-build
-          pip3 install nanobind
+          pip3 install nanobind pytest hypothesis
 
       - name: Configure xmake
         run: |
@@ -63,6 +63,11 @@ jobs:
           build/linux/x86_64/release/radix_tree_memory_tests --reporter junit --out test-results/radix_tree_memory_tests.xml || status=1
           build/linux/x86_64/release/unordered_view_tests --reporter junit --out test-results/unordered_view_tests.xml || status=1
           exit "$status"
+
+      - name: Run proof independence tests (Hypothesis)
+        run: |
+          xmake build bytecaskdb_python
+          PYTHONPATH=bytecaskdb-python python3 -m pytest tests/proof/test_independence.py -v
 
       - name: Enrich JUnit reports with source metadata
         if: ${{ always() && !cancelled() }}
@@ -129,7 +134,7 @@ jobs:
             xmake \
             python3-pip python3-devel \
             git ninja-build
-          pip3 install nanobind
+          pip3 install nanobind pytest hypothesis
 
       - name: Configure xmake
         run: |
@@ -174,7 +179,7 @@ jobs:
             xmake \
             python3-pip python3-devel \
             git ninja-build
-          pip3 install nanobind
+          pip3 install nanobind pytest hypothesis
 
       - name: Configure xmake
         run: |
@@ -226,7 +231,7 @@ jobs:
             xmake \
             python3-pip python3-devel \
             git ninja-build
-          pip3 install nanobind
+          pip3 install nanobind pytest hypothesis
 
       - name: Run coverage pipeline
         run: bash scripts/run_coverage.sh

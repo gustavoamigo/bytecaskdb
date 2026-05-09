@@ -35,7 +35,7 @@ RUN dnf install -y \
 # Keep devcontainer behavior aligned with wheel/manylinux builds:
 # xmake's Python target imports nanobind during target loading.
 RUN python3 -m pip install --no-cache-dir --upgrade pip \
-    && python3 -m pip install --no-cache-dir nanobind pytest auditwheel
+    && python3 -m pip install --no-cache-dir nanobind pytest hypothesis auditwheel
 
 # Verify the environment
 RUN gcc --version && xmake --version --root

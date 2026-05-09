@@ -986,3 +986,103 @@ the following safe to attempt without losing correctness:
 - External contributors
 
 Each experiment either clears the baseline or it does not.
+
+---
+
+## Property-Based Validation of the Independence Assumption
+
+### The assumption
+
+The proof matrix makes a structural independence assumption: the
+correctness of a transition depends only on operation types and their
+ordering, not on the specific key bytes, value bytes, or value sizes.
+Every test uses one fixed set of symbolic values (`"new0"`, `"v0"`,
+etc.) across all 800 matrix cells. If some code path accidentally
+depends on value content — a length-dependent branch, a key that
+collides with an internal sentinel, or a value size that crosses a
+buffer boundary — the current matrix would not catch it.
+
+### Approach
+
+The delta model produces 18 structurally distinct deltas across 800
+matrix cells. These collapse further:
+
+- 2 "empty deltas" (nothing written) — failure cases. No value
+  independence to validate.
+- 4 "remove-only deltas" — no new values written. Value independence
+  is trivially true, but **key-byte independence** is testable.
+- 12 "value-writing deltas" — these come in 6 SUCCESS/H pairs
+  (identical except `degraded`/`threw` flags).
+
+The real cardinality for property-based testing is:
+
+| # | Delta shape | seq_advance | Representative plan |
+|---|-------------|-------------|---------------------|
+| 1 | 1 added, 1 value | 1 | `single_put` |
+| 2 | 1 added, 1 value | 4 | `causality_overwrite` (last-write-wins) |
+| 3 | 1 added, 1 value | 5 | `causality_put_del_put` |
+| 4 | 1 added + 1 removed, 1 value | 4 | `mixed_batch` |
+| 5 | 2 added, 2 values | 4 | `multi_put` |
+| 6 | 3 added, 3 values | 5 | `large_batch` |
+
+Plus 2 remove-only deltas for key-byte independence:
+
+| 7 | 0 added, 1 removed | 1 | `single_delete` |
+| 8 | 0 added, 1 removed | 4 | `causality_put_del` |
+
+**8 property tests** total.
+
+### What each property test does
+
+For each distinct delta:
+1. Generate random key bytes and value bytes (varying lengths,
+   binary content, edge sizes near buffer boundaries).
+2. Run the corresponding plan against the real engine.
+3. Assert the structural delta matches `expected_delta`'s prediction
+   — same key membership, same seq_advance, same causal ordering.
+
+This directly tests: "for a given plan shape and failure class, the
+engine produces the same structural delta regardless of what concrete
+bytes the keys and values contain."
+
+### Scope
+
+- Cover SUCCESS for all 8 deltas. Optionally cover class H for
+  deltas 1–6 (the engine takes a different code path: write commits
+  but rotation fails). That would add 6 more for 14 total.
+- Use Hypothesis (Python) driving the C++ engine through the Python
+  bindings, or a C++ property framework (rapidcheck) if bindings
+  don't cover the needed surface.
+- Value size ranges should include: empty, 1 byte, typical (64 B),
+  near page boundary (4095/4096/4097 B), and near max_value_bytes.
+- Key size ranges should include: 1 byte, typical, and near
+  max_key_bytes.
+
+### What this does NOT replace
+
+The deterministic proof matrix remains the primary validation. It
+exhausts the behavioral space (all failure classes × all plan shapes ×
+all state shapes). The property tests complement it by exhausting the
+value space for each behavioral equivalence class — validating the
+assumption that lets the deterministic matrix use symbolic values.
+
+### Implementation
+
+8 Hypothesis property tests in
+`tests/proof/test_independence.py` cover SUCCESS for all
+8 delta shapes. Each test generates random key bytes (1 B to 4096 B)
+and value bytes (0 B to 16 KiB) including null bytes and
+page-boundary-adjacent sizes, executes the corresponding plan, and
+asserts:
+
+1. Key membership matches the delta prediction.
+2. Values read back identically.
+3. Sequence advance matches `n + (2 if n > 1 else 0)`.
+4. Engine is not degraded.
+5. Recovery (close + reopen) preserves all keys and values.
+
+Class H coverage (fault injection during rotation) is deferred — the
+Python bindings do not expose `ScopedFaultInjector`. A future
+rapidcheck-based C++ implementation could cover the H path.
+
+Run: `PYTHONPATH=bytecaskdb-python pytest tests/proof/test_independence.py`

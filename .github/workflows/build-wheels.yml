@@ -64,7 +64,7 @@ jobs:
         run: |
           export PATH=/opt/python/${{ matrix.python }}/bin:$PATH
           echo "/opt/python/${{ matrix.python }}/bin" >> $GITHUB_PATH
-          pip install nanobind pytest auditwheel
+          pip install nanobind pytest hypothesis auditwheel
 
       - name: Configure xmake
         run: |
@@ -92,7 +92,7 @@ jobs:
 
       - name: Run Python tests
         run: |
-          PYTHONPATH=bytecaskdb-python python3 -m pytest bytecaskdb-python/tests/ -v
+          PYTHONPATH=bytecaskdb-python python3 -m pytest bytecaskdb-python/tests/ tests/proof/test_independence.py -v
 
       - name: Build wheel
         run: |
@@ -136,7 +136,7 @@ jobs:
           brew install llvm xmake
 
       - name: Install Python dependencies
-        run: pip install nanobind pytest delocate
+        run: pip install nanobind pytest hypothesis delocate
 
       - name: Configure xmake
         run: |
@@ -153,7 +153,7 @@ jobs:
 
       - name: Run Python tests
         run: |
-          PYTHONPATH=bytecaskdb-python python3 -m pytest bytecaskdb-python/tests/ -v
+          PYTHONPATH=bytecaskdb-python python3 -m pytest bytecaskdb-python/tests/ tests/proof/test_independence.py -v
 
       - name: Build wheel
         run: bash scripts/build_wheel.sh dist/raw
