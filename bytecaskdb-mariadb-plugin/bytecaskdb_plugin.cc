@@ -23,17 +23,22 @@
 #include "key_encoding.h"
 
 #include <atomic>
+#include <cinttypes>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 
+#ifndef PLUGIN_TESTING
 // ---------------------------------------------------------------------------
 // System variables (global scope — MariaDB plugin API requirement)
 // ---------------------------------------------------------------------------
@@ -55,6 +60,7 @@ static struct st_mysql_sys_var *bytecaskdb_system_variables[] = {
     MYSQL_SYSVAR(use_write_buffer),
     nullptr,
 };
+#endif // !PLUGIN_TESTING
 
 namespace bytecaskdb {
 
@@ -567,6 +573,12 @@ static std::mutex              s_vacuum_mu;
 static std::condition_variable s_vacuum_cv;
 static bool                    s_vacuum_stop = false;
 
+// Backup: vacuum pause state (guarded by s_vacuum_mu).
+static int                                s_vacuum_pause_count = 0;
+static bool                               s_vacuum_in_progress = false;
+static std::condition_variable            s_vacuum_idle_cv;
+static std::optional<bytecask::FileManifest> s_backup_manifest;
+
 static void vacuum_loop() {
   static constexpr auto kBusyInterval = std::chrono::milliseconds{500};
   static constexpr auto kIdleInterval = std::chrono::seconds{30};
@@ -574,7 +586,8 @@ static void vacuum_loop() {
   std::unique_lock<std::mutex> lk{s_vacuum_mu};
   while (!s_vacuum_stop) {
     bool more_work = false;
-    if (g_db) {
+    if (g_db && s_vacuum_pause_count == 0) {
+      s_vacuum_in_progress = true;
       lk.unlock();
       try {
         more_work = g_db->vacuum();
@@ -582,10 +595,113 @@ static void vacuum_loop() {
         sql_print_error("ByteCaskDB: vacuum error: %s", e.what());
       }
       lk.lock();
+      s_vacuum_in_progress = false;
+      s_vacuum_idle_cv.notify_all();
     }
     s_vacuum_cv.wait_for(lk, more_work ? kBusyInterval : kIdleInterval,
-                         [] { return s_vacuum_stop; });
+                         [] { return s_vacuum_stop || s_vacuum_pause_count == 0; });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Backup: manifest file helpers
+// ---------------------------------------------------------------------------
+
+static constexpr const char *kBackupManifestName = "backup_manifest.txt";
+
+static void write_backup_manifest(const std::string &db_path,
+                                  const bytecask::FileManifest &manifest) {
+  auto path = std::filesystem::path{db_path} / kBackupManifestName;
+  std::ofstream out{path, std::ios::trunc};
+  out << "# ByteCaskDB backup manifest\n";
+  out << "# through_sequence: " << manifest.through_sequence << "\n";
+  for (const auto &f : manifest.files) {
+    out << f.data_path.filename().string() << "\n";
+    out << f.hint_path.filename().string() << "\n";
+  }
+  out.flush();
+}
+
+static void remove_backup_manifest(const std::string &db_path) {
+  std::filesystem::remove(std::filesystem::path{db_path} / kBackupManifestName);
+}
+
+// Called during bytecaskdb_init before DB::open(). If backup_manifest.txt
+// exists, this is a restore from backup: move any .data/.hint files not
+// listed in the manifest to a discarded/ subfolder, then delete the manifest.
+static void apply_backup_manifest(const std::string &db_path) {
+  auto manifest_path = std::filesystem::path{db_path} / kBackupManifestName;
+  if (!std::filesystem::exists(manifest_path))
+    return;
+
+  std::set<std::string> allowed;
+  {
+    std::ifstream in{manifest_path};
+    std::string line;
+    while (std::getline(in, line)) {
+      if (line.empty() || line[0] == '#') continue;
+      allowed.insert(line);
+    }
+  }
+
+  auto discard_dir = std::filesystem::path{db_path} / "discarded";
+  bool discarded_any = false;
+  for (const auto &entry : std::filesystem::directory_iterator{db_path}) {
+    if (!entry.is_regular_file()) continue;
+    auto name = entry.path().filename().string();
+    auto ext = entry.path().extension().string();
+    if (ext != ".data" && ext != ".hint") continue;
+    if (allowed.contains(name)) continue;
+
+    if (!discarded_any) {
+      std::filesystem::create_directories(discard_dir);
+      discarded_any = true;
+    }
+    std::filesystem::rename(entry.path(), discard_dir / name);
+    sql_print_information("ByteCaskDB: restore — moved unlisted file '%s' "
+                          "to discarded/", name.c_str());
+  }
+
+  std::filesystem::remove(manifest_path);
+  sql_print_information("ByteCaskDB: restore — backup manifest applied, "
+                        "%zu files retained", allowed.size());
+}
+
+// ---------------------------------------------------------------------------
+// Backup: handlerton callbacks
+// ---------------------------------------------------------------------------
+
+static void bytecaskdb_prepare_for_backup() {
+  if (!g_db) return;
+
+  std::unique_lock<std::mutex> lk{s_vacuum_mu};
+  s_vacuum_pause_count++;
+  s_vacuum_idle_cv.wait(lk, [] { return !s_vacuum_in_progress; });
+
+  lk.unlock();
+  auto manifest = g_db->create_manifest();
+  std::string db_path = std::string(mysql_real_data_home) + "bytecaskdb";
+  write_backup_manifest(db_path, manifest);
+  lk.lock();
+  s_backup_manifest.emplace(std::move(manifest));
+
+  sql_print_information("ByteCaskDB: backup started — vacuum paused, "
+                        "%zu files sealed, through_sequence=%" PRIu64,
+                        s_backup_manifest->files.size(),
+                        s_backup_manifest->through_sequence);
+}
+
+static void bytecaskdb_end_backup() {
+  std::string db_path = std::string(mysql_real_data_home) + "bytecaskdb";
+
+  std::lock_guard<std::mutex> lk{s_vacuum_mu};
+  s_backup_manifest.reset();
+  remove_backup_manifest(db_path);
+  if (s_vacuum_pause_count > 0)
+    s_vacuum_pause_count--;
+  s_vacuum_cv.notify_one();
+
+  sql_print_information("ByteCaskDB: backup ended — vacuum resumed");
 }
 
 // ---------------------------------------------------------------------------
@@ -607,9 +723,15 @@ static int bytecaskdb_init(void *p) {
   hton->savepoint_set            = bytecaskdb_savepoint_set;
   hton->savepoint_rollback       = bytecaskdb_savepoint_rollback;
   hton->savepoint_release        = bytecaskdb_savepoint_release;
+  hton->prepare_for_backup       = bytecaskdb_prepare_for_backup;
+  hton->end_backup               = bytecaskdb_end_backup;
 
   // Open the global database inside MariaDB's data directory.
   std::string db_path = std::string(mysql_real_data_home) + "bytecaskdb";
+
+  // If backup_manifest.txt exists, this is a restore from backup: move
+  // unlisted files to discarded/ before opening.
+  apply_backup_manifest(db_path);
 
   bytecask::Options opts;
   opts.recovery_threads = 4;
@@ -641,6 +763,9 @@ static int bytecaskdb_init(void *p) {
           sysvar_use_write_buffer ? "ON" : "OFF");
 
   s_vacuum_stop = false;
+  s_vacuum_pause_count = 0;
+  s_vacuum_in_progress = false;
+  s_backup_manifest.reset();
   s_vacuum_thread = std::thread{vacuum_loop};
 
   return 0;
