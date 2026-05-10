@@ -302,6 +302,8 @@ struct THD {
 struct handlerton {
   int slot{0};
   int dummy{0};
+  void (*prepare_for_backup)(){nullptr};
+  void (*end_backup)(){nullptr};
 };
 
 // MariaDB session option flags.
@@ -439,3 +441,10 @@ public:
 
   virtual int update_auto_increment() { return 0; }
 };
+
+// Stub: MariaDB logging functions.
+inline void sql_print_information(const char * /*fmt*/, ...) {}
+inline void sql_print_error(const char * /*fmt*/, ...) {}
+
+// Stub: MariaDB global data directory.
+inline const char *mysql_real_data_home = "/tmp/bytecaskdb_test/";

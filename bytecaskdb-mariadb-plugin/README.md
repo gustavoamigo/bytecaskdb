@@ -13,6 +13,79 @@ Ready-to-run Docker Compose setups demonstrating ByteCaskDB as a drop-in storage
 
 Each example includes a `compose.yml` and tuned `mariadb.cnf`.
 
+## Backup and Restore
+
+ByteCaskDB's append-only architecture makes backup simple: sealed data files are immutable, so backup reduces to sealing the active file and copying the sealed files. No redo log replay, no prepare step, no rollback.
+
+The plugin hooks into MariaDB's `BACKUP STAGE` protocol. When `BACKUP STAGE START` fires, the plugin pauses vacuum, seals the active file, and writes a `backup_manifest.txt` listing exactly which files to copy. When `BACKUP STAGE END` fires, the manifest is removed and vacuum resumes. Reads and writes continue normally during the backup — only vacuum is paused.
+
+### Method 1: Script-based backup
+
+The simplest approach. No external tools required.
+
+**Backup:**
+
+```sql
+BACKUP STAGE START;
+-- Plugin seals the active file and writes backup_manifest.txt
+```
+
+```bash
+cd /var/lib/mysql/bytecaskdb/
+rsync --files-from=backup_manifest.txt . /backup/bytecaskdb/
+cp backup_manifest.txt /backup/bytecaskdb/
+```
+
+```sql
+BACKUP STAGE END;
+-- Manifest removed, vacuum resumed
+```
+
+**Restore:**
+
+1. Stop MariaDB.
+2. Replace `datadir/bytecaskdb/` with the backup copy (which includes `backup_manifest.txt`).
+3. Start MariaDB. The plugin detects the manifest, moves any unlisted `.data`/`.hint` files to `discarded/`, deletes the manifest, and opens normally.
+
+### Method 2: mariabackup
+
+mariabackup handles `.frm` files, InnoDB/Aria data, and binlog position. It does not copy ByteCaskDB data files (it only knows about InnoDB, Aria, MyISAM, and CSV file extensions). The operator copies `bytecaskdb/` separately using the manifest.
+
+**Backup:**
+
+```bash
+# 1. mariabackup captures .frm files, InnoDB, Aria, and binlog position.
+#    This runs BACKUP STAGE internally, which triggers the plugin to
+#    seal the active file and write backup_manifest.txt.
+mariabackup --backup --target-dir=/backup --user=root
+
+# 2. Copy ByteCaskDB data files listed in the manifest.
+cd /var/lib/mysql/bytecaskdb/
+rsync --files-from=backup_manifest.txt . /backup/bytecaskdb/
+cp backup_manifest.txt /backup/bytecaskdb/
+
+# 3. Prepare the backup (InnoDB redo log apply).
+mariabackup --prepare --target-dir=/backup
+```
+
+**Restore:**
+
+```bash
+# 1. Stop MariaDB.
+systemctl stop mariadb
+
+# 2. Replace the data directory with the backup.
+mariabackup --copy-back --target-dir=/backup
+# or: rm -rf /var/lib/mysql && cp -r /backup /var/lib/mysql
+
+# 3. Start MariaDB. The plugin applies the manifest automatically:
+#    unlisted files are moved to bytecaskdb/discarded/, the manifest
+#    is deleted, and the database opens with only the sealed files.
+systemctl start mariadb
+```
+
+See [`docs/backup_design.md`](docs/backup_design.md) for the full design, vacuum interaction, crash safety, and limitations.
+
 ## Tests
 
 ```bash

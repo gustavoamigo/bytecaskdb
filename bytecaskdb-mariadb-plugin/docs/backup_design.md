@@ -188,24 +188,48 @@ For script-based backup without `BACKUP STAGE` (e.g. `FLUSH TABLES WITH READ LOC
 
 ## Implementation plan
 
-### Minimal version (backup without binlog)
+### Implemented: backup without binlog
+
+The plugin registers two handlerton callbacks — `prepare_for_backup` (called at `BACKUP STAGE START`) and `end_backup` (called at `BACKUP STAGE END`). MariaDB does not expose per-stage engine callbacks; the intermediate stages (FLUSH, WAIT_FOR_FLUSH, LOCK_COMMIT) are coordinated by the SQL layer via MDL locks.
+
+**`prepare_for_backup`:**
+
+1. Pauses the background vacuum thread (reference-counted, waits for any in-progress vacuum pass to complete).
+2. Seals the active file via `create_manifest()` — rotates it into a sealed `.data`+`.hint` pair, opens a fresh active file for new writes.
+3. Writes `backup_manifest.txt` to the data directory listing all sealed files and the `through_sequence` consistency point.
+4. Holds the `FileManifest` alive — its `Snapshot` keeps file descriptors open.
+
+**`end_backup`:**
+
+1. Releases the `FileManifest`.
+2. Removes `backup_manifest.txt` from the data directory.
+3. Decrements the vacuum pause counter. Resumes vacuum when counter reaches zero.
+
+**Restore-time manifest cleanup:**
+
+On startup, before `DB::open()`, the plugin checks for `backup_manifest.txt` in the data directory. If present:
+
+1. Reads the allowed file list from the manifest.
+2. Moves any `.data`/`.hint` files NOT in the manifest to a `discarded/` subfolder.
+3. Deletes `backup_manifest.txt`.
+
+This enables **mariabackup compatibility** without mariabackup-side changes: mariabackup copies the entire directory (including the post-seal active file that may have torn entries), and the manifest-based cleanup removes that file before `DB::open()` sees it.
+
+**Crash safety of the manifest file:**
+
+The manifest must be deleted in exactly two places:
+- After `BACKUP STAGE END` — `end_backup()` removes it from the live data directory.
+- On startup (restore) — `bytecaskdb_init()` removes it after filtering files.
+
+If neither fires (e.g. crash between `BACKUP STAGE START` and `END`), the manifest remains. On next startup the plugin sees it and runs the discard logic — but since no restore happened (the files are the originals), the manifest lists exactly the files present, nothing gets discarded, and the manifest is deleted. Safe no-op.
+
+### Future: production version (binlog-coordinated, incremental)
 
 | Step | Scope |
 |------|-------|
-| 1. Expose `create_manifest()` in plugin | Thin wrapper that calls `g_db->create_manifest()` |
-| 2. Vacuum pause/resume primitive | Thread-safe flag or condvar that the vacuum loop checks; pause blocks until the current vacuum pass completes |
-| 3. `hton->backup_stage` — FLUSH only | Pause vacuum, seal active file. Resume on END. Sufficient for no-binlog backup. |
-| 4. Backup script | Shell script: `FLUSH TABLES WITH READ LOCK`, copy sealed files, record `through_sequence`, unlock |
-
-### Production version (binlog-coordinated, incremental)
-
-| Step | Scope |
-|------|-------|
-| 5. `BACKUP_BLOCK_COMMIT` re-seal | Second seal under global commit lock so `through_sequence` matches binlog position |
+| 5. `BACKUP_BLOCK_COMMIT` re-seal | Second seal under global commit lock so `through_sequence` matches binlog position. Requires a per-stage engine callback or an alternative coordination mechanism. |
 | 6. Internal vacuum fencing on flush/lock paths | Pause vacuum automatically on `FLUSH TABLES` and `BACKUP STAGE` without operator intervention |
 | 7. Incremental metadata | Persist last-backup `file_id` so incremental backup copies only new files |
-
-Steps 1–4 are straightforward. Steps 5–7 require more care: the re-seal must handle the edge case where no writes landed between FLUSH and BLOCK_COMMIT (no-op seal), the vacuum fence must be reentrant for nested backup operations, and incremental metadata needs a durable storage location that survives restore.
 
 ---
 
