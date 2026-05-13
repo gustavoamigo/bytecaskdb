@@ -18259,7 +18259,7 @@ TEST_CASE("prove__single_key_buffered__single_put__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18275,7 +18275,7 @@ TEST_CASE("prove__single_key_buffered__single_put__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__single_put__append_fails_nothing_written", "[prove]") {
@@ -18290,7 +18290,7 @@ TEST_CASE("prove__single_key_buffered__single_put__append_fails_nothing_written"
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18309,7 +18309,7 @@ TEST_CASE("prove__single_key_buffered__single_put__append_fails_nothing_written"
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__single_put__append_fails_partial_write", "[prove]") {
@@ -18324,7 +18324,7 @@ TEST_CASE("prove__single_key_buffered__single_put__append_fails_partial_write", 
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18344,7 +18344,7 @@ TEST_CASE("prove__single_key_buffered__single_put__append_fails_partial_write", 
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__single_put__append_fails_after_full_write", "[prove]") {
@@ -18359,7 +18359,7 @@ TEST_CASE("prove__single_key_buffered__single_put__append_fails_after_full_write
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18379,7 +18379,7 @@ TEST_CASE("prove__single_key_buffered__single_put__append_fails_after_full_write
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__single_put__commit_sync_fails", "[prove]") {
@@ -18394,7 +18394,7 @@ TEST_CASE("prove__single_key_buffered__single_put__commit_sync_fails", "[prove]"
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18430,7 +18430,7 @@ TEST_CASE("prove__single_key_buffered__single_delete__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18446,7 +18446,7 @@ TEST_CASE("prove__single_key_buffered__single_delete__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__single_delete__append_fails_nothing_written", "[prove]") {
@@ -18461,7 +18461,7 @@ TEST_CASE("prove__single_key_buffered__single_delete__append_fails_nothing_writt
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18480,7 +18480,7 @@ TEST_CASE("prove__single_key_buffered__single_delete__append_fails_nothing_writt
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__single_delete__append_fails_partial_write", "[prove]") {
@@ -18495,7 +18495,7 @@ TEST_CASE("prove__single_key_buffered__single_delete__append_fails_partial_write
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18515,7 +18515,7 @@ TEST_CASE("prove__single_key_buffered__single_delete__append_fails_partial_write
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__single_delete__append_fails_after_full_write", "[prove]") {
@@ -18530,7 +18530,7 @@ TEST_CASE("prove__single_key_buffered__single_delete__append_fails_after_full_wr
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18550,7 +18550,7 @@ TEST_CASE("prove__single_key_buffered__single_delete__append_fails_after_full_wr
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__single_delete__commit_sync_fails", "[prove]") {
@@ -18565,7 +18565,7 @@ TEST_CASE("prove__single_key_buffered__single_delete__commit_sync_fails", "[prov
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18601,7 +18601,7 @@ TEST_CASE("prove__single_key_buffered__multi_put__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18618,7 +18618,7 @@ TEST_CASE("prove__single_key_buffered__multi_put__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__multi_put__append_fails_nothing_written", "[prove]") {
@@ -18633,7 +18633,7 @@ TEST_CASE("prove__single_key_buffered__multi_put__append_fails_nothing_written",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18653,7 +18653,7 @@ TEST_CASE("prove__single_key_buffered__multi_put__append_fails_nothing_written",
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__multi_put__append_fails_partial_write", "[prove]") {
@@ -18668,7 +18668,7 @@ TEST_CASE("prove__single_key_buffered__multi_put__append_fails_partial_write", "
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18689,7 +18689,7 @@ TEST_CASE("prove__single_key_buffered__multi_put__append_fails_partial_write", "
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__multi_put__append_fails_after_full_write", "[prove]") {
@@ -18704,7 +18704,7 @@ TEST_CASE("prove__single_key_buffered__multi_put__append_fails_after_full_write"
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18725,7 +18725,7 @@ TEST_CASE("prove__single_key_buffered__multi_put__append_fails_after_full_write"
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__multi_put__on_bulk_end_append", "[prove]") {
@@ -18740,7 +18740,7 @@ TEST_CASE("prove__single_key_buffered__multi_put__on_bulk_end_append", "[prove]"
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18760,7 +18760,7 @@ TEST_CASE("prove__single_key_buffered__multi_put__on_bulk_end_append", "[prove]"
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__multi_put__commit_sync_fails", "[prove]") {
@@ -18775,7 +18775,7 @@ TEST_CASE("prove__single_key_buffered__multi_put__commit_sync_fails", "[prove]")
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18812,7 +18812,7 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18829,7 +18829,7 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_nothing_written", "[prove]") {
@@ -18844,7 +18844,7 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_nothing_written
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18864,7 +18864,7 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_nothing_written
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_partial_write", "[prove]") {
@@ -18879,7 +18879,7 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_partial_write",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18900,7 +18900,7 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_partial_write",
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_after_full_write", "[prove]") {
@@ -18915,7 +18915,7 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_after_full_writ
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18936,7 +18936,7 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_after_full_writ
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__mixed_batch__on_bulk_end_append", "[prove]") {
@@ -18951,7 +18951,7 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__on_bulk_end_append", "[prove
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -18971,7 +18971,7 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__on_bulk_end_append", "[prove
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__mixed_batch__commit_sync_fails", "[prove]") {
@@ -18986,7 +18986,7 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__commit_sync_fails", "[prove]
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19023,7 +19023,7 @@ TEST_CASE("prove__single_key_buffered__large_batch__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19041,7 +19041,7 @@ TEST_CASE("prove__single_key_buffered__large_batch__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__large_batch__append_fails_nothing_written", "[prove]") {
@@ -19056,7 +19056,7 @@ TEST_CASE("prove__single_key_buffered__large_batch__append_fails_nothing_written
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19077,7 +19077,7 @@ TEST_CASE("prove__single_key_buffered__large_batch__append_fails_nothing_written
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__large_batch__append_fails_partial_write", "[prove]") {
@@ -19092,7 +19092,7 @@ TEST_CASE("prove__single_key_buffered__large_batch__append_fails_partial_write",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19114,7 +19114,7 @@ TEST_CASE("prove__single_key_buffered__large_batch__append_fails_partial_write",
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__large_batch__append_fails_after_full_write", "[prove]") {
@@ -19129,7 +19129,7 @@ TEST_CASE("prove__single_key_buffered__large_batch__append_fails_after_full_writ
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19151,7 +19151,7 @@ TEST_CASE("prove__single_key_buffered__large_batch__append_fails_after_full_writ
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__large_batch__on_bulk_end_append", "[prove]") {
@@ -19166,7 +19166,7 @@ TEST_CASE("prove__single_key_buffered__large_batch__on_bulk_end_append", "[prove
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19187,7 +19187,7 @@ TEST_CASE("prove__single_key_buffered__large_batch__on_bulk_end_append", "[prove
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__large_batch__commit_sync_fails", "[prove]") {
@@ -19202,7 +19202,7 @@ TEST_CASE("prove__single_key_buffered__large_batch__commit_sync_fails", "[prove]
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19240,7 +19240,7 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__success", "[prove
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -19259,7 +19259,7 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__success", "[prove
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_nothing_written", "[prove]") {
@@ -19274,7 +19274,7 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_noth
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -19296,7 +19296,7 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_noth
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_partial_write", "[prove]") {
@@ -19311,7 +19311,7 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_part
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -19334,7 +19334,7 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_part
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_after_full_write", "[prove]") {
@@ -19349,7 +19349,7 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_afte
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -19372,7 +19372,7 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_afte
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__single_put_with_guards__commit_sync_fails", "[prove]") {
@@ -19387,7 +19387,7 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__commit_sync_fails
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -19426,7 +19426,7 @@ TEST_CASE("prove__single_key_buffered__conflicting_plan__before_any_io", "[prove
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -19446,7 +19446,7 @@ TEST_CASE("prove__single_key_buffered__conflicting_plan__before_any_io", "[prove
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_overwrite__success", "[prove]") {
@@ -19461,7 +19461,7 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__success", "[prove]")
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19478,7 +19478,7 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__success", "[prove]")
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_nothing_written", "[prove]") {
@@ -19493,7 +19493,7 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_nothing
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19513,7 +19513,7 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_nothing
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_partial_write", "[prove]") {
@@ -19528,7 +19528,7 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_partial
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19549,7 +19549,7 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_partial
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_after_full_write", "[prove]") {
@@ -19564,7 +19564,7 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_after_f
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19585,7 +19585,7 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_after_f
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_overwrite__on_bulk_end_append", "[prove]") {
@@ -19600,7 +19600,7 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__on_bulk_end_append",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19620,7 +19620,7 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__on_bulk_end_append",
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_overwrite__commit_sync_fails", "[prove]") {
@@ -19635,7 +19635,7 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__commit_sync_fails", 
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19672,7 +19672,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19689,7 +19689,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_nothing_written", "[prove]") {
@@ -19704,7 +19704,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_nothing_w
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19724,7 +19724,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_nothing_w
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_partial_write", "[prove]") {
@@ -19739,7 +19739,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_partial_w
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19760,7 +19760,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_partial_w
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_after_full_write", "[prove]") {
@@ -19775,7 +19775,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_after_ful
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19796,7 +19796,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_after_ful
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_put_del__on_bulk_end_append", "[prove]") {
@@ -19811,7 +19811,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__on_bulk_end_append", "
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19831,7 +19831,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__on_bulk_end_append", "
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_put_del__commit_sync_fails", "[prove]") {
@@ -19846,7 +19846,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__commit_sync_fails", "[
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19883,7 +19883,7 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19900,7 +19900,7 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_nothing_written", "[prove]") {
@@ -19915,7 +19915,7 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_nothing_w
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19935,7 +19935,7 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_nothing_w
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_partial_write", "[prove]") {
@@ -19950,7 +19950,7 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_partial_w
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -19971,7 +19971,7 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_partial_w
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_after_full_write", "[prove]") {
@@ -19986,7 +19986,7 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_after_ful
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20007,7 +20007,7 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_after_ful
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_del_put__on_bulk_end_append", "[prove]") {
@@ -20022,7 +20022,7 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__on_bulk_end_append", "
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20042,7 +20042,7 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__on_bulk_end_append", "
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_del_put__commit_sync_fails", "[prove]") {
@@ -20057,7 +20057,7 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__commit_sync_fails", "[
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20094,7 +20094,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__success", "[prove]
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20112,7 +20112,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__success", "[prove]
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_nothing_written", "[prove]") {
@@ -20127,7 +20127,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_nothi
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20148,7 +20148,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_nothi
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_partial_write", "[prove]") {
@@ -20163,7 +20163,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_parti
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20185,7 +20185,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_parti
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_after_full_write", "[prove]") {
@@ -20200,7 +20200,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_after
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20222,7 +20222,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_after
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_put_del_put__on_bulk_end_append", "[prove]") {
@@ -20237,7 +20237,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__on_bulk_end_append
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20258,7 +20258,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__on_bulk_end_append
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__causality_put_del_put__commit_sync_fails", "[prove]") {
@@ -20273,7 +20273,7 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__commit_sync_fails"
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20311,7 +20311,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__success", "[pro
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20328,7 +20328,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__success", "[pro
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_nothing_written", "[prove]") {
@@ -20343,7 +20343,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_no
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20363,7 +20363,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_no
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_partial_write", "[prove]") {
@@ -20378,7 +20378,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_pa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20399,7 +20399,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_pa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_after_full_write", "[prove]") {
@@ -20414,7 +20414,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_af
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20435,7 +20435,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_af
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__on_bulk_end_append", "[prove]") {
@@ -20450,7 +20450,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__on_bulk_end_app
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20470,7 +20470,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__on_bulk_end_app
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__commit_sync_fails", "[prove]") {
@@ -20485,7 +20485,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__commit_sync_fai
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20522,7 +20522,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__success", "[prove
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20539,7 +20539,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__success", "[prove
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_nothing_written", "[prove]") {
@@ -20554,7 +20554,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_noth
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20574,7 +20574,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_noth
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_partial_write", "[prove]") {
@@ -20589,7 +20589,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_part
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20610,7 +20610,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_part
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_after_full_write", "[prove]") {
@@ -20625,7 +20625,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_afte
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20646,7 +20646,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_afte
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del__on_bulk_end_append", "[prove]") {
@@ -20661,7 +20661,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__on_bulk_end_appen
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20681,7 +20681,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__on_bulk_end_appen
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del__commit_sync_fails", "[prove]") {
@@ -20696,7 +20696,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__commit_sync_fails
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20733,7 +20733,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__success", "[prove
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20750,7 +20750,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__success", "[prove
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_nothing_written", "[prove]") {
@@ -20765,7 +20765,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_noth
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20785,7 +20785,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_noth
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_partial_write", "[prove]") {
@@ -20800,7 +20800,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_part
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20821,7 +20821,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_part
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_after_full_write", "[prove]") {
@@ -20836,7 +20836,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_afte
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20857,7 +20857,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_afte
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_del_put__on_bulk_end_append", "[prove]") {
@@ -20872,7 +20872,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__on_bulk_end_appen
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20892,7 +20892,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__on_bulk_end_appen
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_del_put__commit_sync_fails", "[prove]") {
@@ -20907,7 +20907,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__commit_sync_fails
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20944,7 +20944,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__success", "[p
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20962,7 +20962,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__success", "[p
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_nothing_written", "[prove]") {
@@ -20977,7 +20977,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -20998,7 +20998,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_partial_write", "[prove]") {
@@ -21013,7 +21013,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21035,7 +21035,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_after_full_write", "[prove]") {
@@ -21050,7 +21050,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21072,7 +21072,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__on_bulk_end_append", "[prove]") {
@@ -21087,7 +21087,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__on_bulk_end_a
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21108,7 +21108,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__on_bulk_end_a
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__commit_sync_fails", "[prove]") {
@@ -21123,7 +21123,7 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__commit_sync_f
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21161,7 +21161,7 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__success", "[prove]"
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21177,7 +21177,7 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__success", "[prove]"
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_nothing_written", "[prove]") {
@@ -21192,7 +21192,7 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_nothin
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21211,7 +21211,7 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_nothin
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_partial_write", "[prove]") {
@@ -21226,7 +21226,7 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_partia
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21246,7 +21246,7 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_partia
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_after_full_write", "[prove]") {
@@ -21261,7 +21261,7 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_after_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21281,7 +21281,7 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_after_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__sequential_overwrite__commit_sync_fails", "[prove]") {
@@ -21296,7 +21296,7 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__commit_sync_fails",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21332,7 +21332,7 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__success", "[pr
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21348,7 +21348,7 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__success", "[pr
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_nothing_written", "[prove]") {
@@ -21363,7 +21363,7 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_n
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21382,7 +21382,7 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_n
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_partial_write", "[prove]") {
@@ -21397,7 +21397,7 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_p
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21417,7 +21417,7 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_p
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_after_full_write", "[prove]") {
@@ -21432,7 +21432,7 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_a
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21452,7 +21452,7 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_a
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__commit_sync_fails", "[prove]") {
@@ -21467,7 +21467,7 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__commit_sync_fa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -21503,7 +21503,7 @@ TEST_CASE("prove__populated_db_buffered__single_put__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -21528,7 +21528,7 @@ TEST_CASE("prove__populated_db_buffered__single_put__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__single_put__append_fails_nothing_written", "[prove]") {
@@ -21543,7 +21543,7 @@ TEST_CASE("prove__populated_db_buffered__single_put__append_fails_nothing_writte
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -21571,7 +21571,7 @@ TEST_CASE("prove__populated_db_buffered__single_put__append_fails_nothing_writte
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__single_put__append_fails_partial_write", "[prove]") {
@@ -21586,7 +21586,7 @@ TEST_CASE("prove__populated_db_buffered__single_put__append_fails_partial_write"
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -21615,7 +21615,7 @@ TEST_CASE("prove__populated_db_buffered__single_put__append_fails_partial_write"
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__single_put__append_fails_after_full_write", "[prove]") {
@@ -21630,7 +21630,7 @@ TEST_CASE("prove__populated_db_buffered__single_put__append_fails_after_full_wri
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -21659,7 +21659,7 @@ TEST_CASE("prove__populated_db_buffered__single_put__append_fails_after_full_wri
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__single_put__commit_sync_fails", "[prove]") {
@@ -21674,7 +21674,7 @@ TEST_CASE("prove__populated_db_buffered__single_put__commit_sync_fails", "[prove
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -21719,7 +21719,7 @@ TEST_CASE("prove__populated_db_buffered__single_delete__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -21744,7 +21744,7 @@ TEST_CASE("prove__populated_db_buffered__single_delete__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_nothing_written", "[prove]") {
@@ -21759,7 +21759,7 @@ TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_nothing_wri
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -21787,7 +21787,7 @@ TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_nothing_wri
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_partial_write", "[prove]") {
@@ -21802,7 +21802,7 @@ TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_partial_wri
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -21831,7 +21831,7 @@ TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_partial_wri
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_after_full_write", "[prove]") {
@@ -21846,7 +21846,7 @@ TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_after_full_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -21875,7 +21875,7 @@ TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_after_full_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__single_delete__commit_sync_fails", "[prove]") {
@@ -21890,7 +21890,7 @@ TEST_CASE("prove__populated_db_buffered__single_delete__commit_sync_fails", "[pr
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -21935,7 +21935,7 @@ TEST_CASE("prove__populated_db_buffered__multi_put__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -21961,7 +21961,7 @@ TEST_CASE("prove__populated_db_buffered__multi_put__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_nothing_written", "[prove]") {
@@ -21976,7 +21976,7 @@ TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_nothing_written
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22005,7 +22005,7 @@ TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_nothing_written
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_partial_write", "[prove]") {
@@ -22020,7 +22020,7 @@ TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_partial_write",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22050,7 +22050,7 @@ TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_partial_write",
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_after_full_write", "[prove]") {
@@ -22065,7 +22065,7 @@ TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_after_full_writ
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22095,7 +22095,7 @@ TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_after_full_writ
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__multi_put__on_bulk_end_append", "[prove]") {
@@ -22110,7 +22110,7 @@ TEST_CASE("prove__populated_db_buffered__multi_put__on_bulk_end_append", "[prove
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22139,7 +22139,7 @@ TEST_CASE("prove__populated_db_buffered__multi_put__on_bulk_end_append", "[prove
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__multi_put__commit_sync_fails", "[prove]") {
@@ -22154,7 +22154,7 @@ TEST_CASE("prove__populated_db_buffered__multi_put__commit_sync_fails", "[prove]
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22200,7 +22200,7 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22226,7 +22226,7 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_nothing_written", "[prove]") {
@@ -22241,7 +22241,7 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_nothing_writt
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22270,7 +22270,7 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_nothing_writt
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_partial_write", "[prove]") {
@@ -22285,7 +22285,7 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_partial_write
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22315,7 +22315,7 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_partial_write
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_after_full_write", "[prove]") {
@@ -22330,7 +22330,7 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_after_full_wr
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22360,7 +22360,7 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_after_full_wr
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__mixed_batch__on_bulk_end_append", "[prove]") {
@@ -22375,7 +22375,7 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__on_bulk_end_append", "[pro
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22404,7 +22404,7 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__on_bulk_end_append", "[pro
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__mixed_batch__commit_sync_fails", "[prove]") {
@@ -22419,7 +22419,7 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__commit_sync_fails", "[prov
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22465,7 +22465,7 @@ TEST_CASE("prove__populated_db_buffered__large_batch__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22492,7 +22492,7 @@ TEST_CASE("prove__populated_db_buffered__large_batch__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_nothing_written", "[prove]") {
@@ -22507,7 +22507,7 @@ TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_nothing_writt
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22537,7 +22537,7 @@ TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_nothing_writt
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_partial_write", "[prove]") {
@@ -22552,7 +22552,7 @@ TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_partial_write
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22583,7 +22583,7 @@ TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_partial_write
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_after_full_write", "[prove]") {
@@ -22598,7 +22598,7 @@ TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_after_full_wr
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22629,7 +22629,7 @@ TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_after_full_wr
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__large_batch__on_bulk_end_append", "[prove]") {
@@ -22644,7 +22644,7 @@ TEST_CASE("prove__populated_db_buffered__large_batch__on_bulk_end_append", "[pro
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22674,7 +22674,7 @@ TEST_CASE("prove__populated_db_buffered__large_batch__on_bulk_end_append", "[pro
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__large_batch__commit_sync_fails", "[prove]") {
@@ -22689,7 +22689,7 @@ TEST_CASE("prove__populated_db_buffered__large_batch__commit_sync_fails", "[prov
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22736,7 +22736,7 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__success", "[pro
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22764,7 +22764,7 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__success", "[pro
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_nothing_written", "[prove]") {
@@ -22779,7 +22779,7 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_no
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22810,7 +22810,7 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_no
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_partial_write", "[prove]") {
@@ -22825,7 +22825,7 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_pa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22857,7 +22857,7 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_pa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_after_full_write", "[prove]") {
@@ -22872,7 +22872,7 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_af
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22904,7 +22904,7 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_af
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__single_put_with_guards__commit_sync_fails", "[prove]") {
@@ -22919,7 +22919,7 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__commit_sync_fai
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22967,7 +22967,7 @@ TEST_CASE("prove__populated_db_buffered__conflicting_plan__before_any_io", "[pro
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -22996,7 +22996,7 @@ TEST_CASE("prove__populated_db_buffered__conflicting_plan__before_any_io", "[pro
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_overwrite__success", "[prove]") {
@@ -23011,7 +23011,7 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__success", "[prove]
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23037,7 +23037,7 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__success", "[prove]
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_nothing_written", "[prove]") {
@@ -23052,7 +23052,7 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_nothi
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23081,7 +23081,7 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_nothi
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_partial_write", "[prove]") {
@@ -23096,7 +23096,7 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_parti
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23126,7 +23126,7 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_parti
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_after_full_write", "[prove]") {
@@ -23141,7 +23141,7 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_after
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23171,7 +23171,7 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_after
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_overwrite__on_bulk_end_append", "[prove]") {
@@ -23186,7 +23186,7 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__on_bulk_end_append
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23215,7 +23215,7 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__on_bulk_end_append
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_overwrite__commit_sync_fails", "[prove]") {
@@ -23230,7 +23230,7 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__commit_sync_fails"
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23276,7 +23276,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__success", "[prove]")
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23302,7 +23302,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__success", "[prove]")
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_nothing_written", "[prove]") {
@@ -23317,7 +23317,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_nothing
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23346,7 +23346,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_nothing
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_partial_write", "[prove]") {
@@ -23361,7 +23361,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_partial
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23391,7 +23391,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_partial
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_after_full_write", "[prove]") {
@@ -23406,7 +23406,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_after_f
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23436,7 +23436,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_after_f
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_put_del__on_bulk_end_append", "[prove]") {
@@ -23451,7 +23451,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__on_bulk_end_append",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23480,7 +23480,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__on_bulk_end_append",
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_put_del__commit_sync_fails", "[prove]") {
@@ -23495,7 +23495,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__commit_sync_fails", 
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23541,7 +23541,7 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__success", "[prove]")
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23567,7 +23567,7 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__success", "[prove]")
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_nothing_written", "[prove]") {
@@ -23582,7 +23582,7 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_nothing
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23611,7 +23611,7 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_nothing
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_partial_write", "[prove]") {
@@ -23626,7 +23626,7 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_partial
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23656,7 +23656,7 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_partial
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_after_full_write", "[prove]") {
@@ -23671,7 +23671,7 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_after_f
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23701,7 +23701,7 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_after_f
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_del_put__on_bulk_end_append", "[prove]") {
@@ -23716,7 +23716,7 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__on_bulk_end_append",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23745,7 +23745,7 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__on_bulk_end_append",
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_del_put__commit_sync_fails", "[prove]") {
@@ -23760,7 +23760,7 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__commit_sync_fails", 
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23806,7 +23806,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__success", "[prov
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23833,7 +23833,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__success", "[prov
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_nothing_written", "[prove]") {
@@ -23848,7 +23848,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_not
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23878,7 +23878,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_not
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_partial_write", "[prove]") {
@@ -23893,7 +23893,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_par
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23924,7 +23924,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_par
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_after_full_write", "[prove]") {
@@ -23939,7 +23939,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_aft
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -23970,7 +23970,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_aft
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_put_del_put__on_bulk_end_append", "[prove]") {
@@ -23985,7 +23985,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__on_bulk_end_appe
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24015,7 +24015,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__on_bulk_end_appe
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__causality_put_del_put__commit_sync_fails", "[prove]") {
@@ -24030,7 +24030,7 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__commit_sync_fail
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24077,7 +24077,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__success", "[p
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24103,7 +24103,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__success", "[p
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_nothing_written", "[prove]") {
@@ -24118,7 +24118,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24147,7 +24147,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_partial_write", "[prove]") {
@@ -24162,7 +24162,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24192,7 +24192,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_after_full_write", "[prove]") {
@@ -24207,7 +24207,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24237,7 +24237,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__on_bulk_end_append", "[prove]") {
@@ -24252,7 +24252,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__on_bulk_end_a
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24281,7 +24281,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__on_bulk_end_a
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__commit_sync_fails", "[prove]") {
@@ -24296,7 +24296,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__commit_sync_f
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24342,7 +24342,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__success", "[pro
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24368,7 +24368,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__success", "[pro
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_nothing_written", "[prove]") {
@@ -24383,7 +24383,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_no
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24412,7 +24412,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_no
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_partial_write", "[prove]") {
@@ -24427,7 +24427,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_pa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24457,7 +24457,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_pa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_after_full_write", "[prove]") {
@@ -24472,7 +24472,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_af
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24502,7 +24502,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_af
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__on_bulk_end_append", "[prove]") {
@@ -24517,7 +24517,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__on_bulk_end_app
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24546,7 +24546,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__on_bulk_end_app
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__commit_sync_fails", "[prove]") {
@@ -24561,7 +24561,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__commit_sync_fai
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24607,7 +24607,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__success", "[pro
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24633,7 +24633,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__success", "[pro
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_nothing_written", "[prove]") {
@@ -24648,7 +24648,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_no
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24677,7 +24677,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_no
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_partial_write", "[prove]") {
@@ -24692,7 +24692,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_pa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24722,7 +24722,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_pa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_after_full_write", "[prove]") {
@@ -24737,7 +24737,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_af
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24767,7 +24767,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_af
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__on_bulk_end_append", "[prove]") {
@@ -24782,7 +24782,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__on_bulk_end_app
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24811,7 +24811,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__on_bulk_end_app
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__commit_sync_fails", "[prove]") {
@@ -24826,7 +24826,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__commit_sync_fai
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24872,7 +24872,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__success", "
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24899,7 +24899,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__success", "
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fails_nothing_written", "[prove]") {
@@ -24914,7 +24914,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fail
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24944,7 +24944,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fail
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fails_partial_write", "[prove]") {
@@ -24959,7 +24959,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fail
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -24990,7 +24990,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fail
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fails_after_full_write", "[prove]") {
@@ -25005,7 +25005,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fail
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25036,7 +25036,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fail
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__on_bulk_end_append", "[prove]") {
@@ -25051,7 +25051,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__on_bulk_end
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25081,7 +25081,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__on_bulk_end
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__commit_sync_fails", "[prove]") {
@@ -25096,7 +25096,7 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__commit_sync
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25143,7 +25143,7 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__success", "[prove
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25168,7 +25168,7 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__success", "[prove
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_nothing_written", "[prove]") {
@@ -25183,7 +25183,7 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_noth
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25211,7 +25211,7 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_noth
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_partial_write", "[prove]") {
@@ -25226,7 +25226,7 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_part
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25255,7 +25255,7 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_part
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_after_full_write", "[prove]") {
@@ -25270,7 +25270,7 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_afte
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25299,7 +25299,7 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_afte
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__sequential_overwrite__commit_sync_fails", "[prove]") {
@@ -25314,7 +25314,7 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__commit_sync_fails
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25359,7 +25359,7 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__success", "[
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25384,7 +25384,7 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__success", "[
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails_nothing_written", "[prove]") {
@@ -25399,7 +25399,7 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25427,7 +25427,7 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails_partial_write", "[prove]") {
@@ -25442,7 +25442,7 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25471,7 +25471,7 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails_after_full_write", "[prove]") {
@@ -25486,7 +25486,7 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25515,7 +25515,7 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
 
 TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__commit_sync_fails", "[prove]") {
@@ -25530,7 +25530,7 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__commit_sync_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
@@ -25575,7 +25575,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__success", "[prove]") 
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -25591,7 +25591,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__success", "[prove]") 
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_nothing_written", "[prove]") {
@@ -25606,7 +25606,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_nothing_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -25625,7 +25625,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_nothing_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_partial_write", "[prove]") {
@@ -25640,7 +25640,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_partial_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -25660,7 +25660,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_partial_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_after_full_write", "[prove]") {
@@ -25675,7 +25675,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_after_fu
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -25695,7 +25695,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_after_fu
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_put__commit_sync_fails", "[prove]") {
@@ -25710,7 +25710,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__commit_sync_fails", "
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -25746,7 +25746,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__rotation_sync_fails",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -25782,7 +25782,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__rotation_file_creatio
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -25801,7 +25801,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__rotation_file_creatio
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_delete__success", "[prove]") {
@@ -25816,7 +25816,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__success", "[prove]
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -25832,7 +25832,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__success", "[prove]
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_nothing_written", "[prove]") {
@@ -25847,7 +25847,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_nothi
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -25866,7 +25866,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_nothi
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_partial_write", "[prove]") {
@@ -25881,7 +25881,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_parti
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -25901,7 +25901,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_parti
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_after_full_write", "[prove]") {
@@ -25916,7 +25916,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_after
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -25936,7 +25936,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_after
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_delete__commit_sync_fails", "[prove]") {
@@ -25951,7 +25951,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__commit_sync_fails"
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -25987,7 +25987,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__rotation_sync_fail
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26023,7 +26023,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__rotation_file_crea
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26042,7 +26042,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__rotation_file_crea
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__success", "[prove]") {
@@ -26057,7 +26057,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__success", "[prove]") {
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26074,7 +26074,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__success", "[prove]") {
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_nothing_written", "[prove]") {
@@ -26089,7 +26089,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_nothing_w
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26109,7 +26109,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_nothing_w
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_partial_write", "[prove]") {
@@ -26124,7 +26124,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_partial_w
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26145,7 +26145,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_partial_w
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_after_full_write", "[prove]") {
@@ -26160,7 +26160,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_after_ful
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26181,7 +26181,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_after_ful
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__on_bulk_end_append", "[prove]") {
@@ -26196,7 +26196,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__on_bulk_end_append", "
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26216,7 +26216,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__on_bulk_end_append", "
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__commit_sync_fails", "[prove]") {
@@ -26231,7 +26231,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__commit_sync_fails", "[
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26268,7 +26268,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_sync_fails", 
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26305,7 +26305,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_file_creation
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26325,7 +26325,7 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_file_creation
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__success", "[prove]") {
@@ -26340,7 +26340,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__success", "[prove]")
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26357,7 +26357,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__success", "[prove]")
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_nothing_written", "[prove]") {
@@ -26372,7 +26372,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_nothing
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26392,7 +26392,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_nothing
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_partial_write", "[prove]") {
@@ -26407,7 +26407,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_partial
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26428,7 +26428,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_partial
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_after_full_write", "[prove]") {
@@ -26443,7 +26443,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_after_f
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26464,7 +26464,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_after_f
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__on_bulk_end_append", "[prove]") {
@@ -26479,7 +26479,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__on_bulk_end_append",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26499,7 +26499,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__on_bulk_end_append",
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__commit_sync_fails", "[prove]") {
@@ -26514,7 +26514,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__commit_sync_fails", 
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26551,7 +26551,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__rotation_sync_fails"
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26588,7 +26588,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__rotation_file_creati
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26608,7 +26608,7 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__rotation_file_creati
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__success", "[prove]") {
@@ -26623,7 +26623,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__success", "[prove]")
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26641,7 +26641,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__success", "[prove]")
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_nothing_written", "[prove]") {
@@ -26656,7 +26656,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_nothing
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26677,7 +26677,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_nothing
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_partial_write", "[prove]") {
@@ -26692,7 +26692,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_partial
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26714,7 +26714,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_partial
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_after_full_write", "[prove]") {
@@ -26729,7 +26729,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_after_f
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26751,7 +26751,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_after_f
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__on_bulk_end_append", "[prove]") {
@@ -26766,7 +26766,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__on_bulk_end_append",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26787,7 +26787,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__on_bulk_end_append",
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__commit_sync_fails", "[prove]") {
@@ -26802,7 +26802,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__commit_sync_fails", 
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26840,7 +26840,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__rotation_sync_fails"
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26878,7 +26878,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__rotation_file_creati
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -26899,7 +26899,7 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__rotation_file_creati
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__success", "[prove]") {
@@ -26914,7 +26914,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__success",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -26933,7 +26933,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__success",
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fails_nothing_written", "[prove]") {
@@ -26948,7 +26948,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -26970,7 +26970,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fails_partial_write", "[prove]") {
@@ -26985,7 +26985,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -27008,7 +27008,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fails_after_full_write", "[prove]") {
@@ -27023,7 +27023,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -27046,7 +27046,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__commit_sync_fails", "[prove]") {
@@ -27061,7 +27061,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__commit_sy
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -27100,7 +27100,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__rotation_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -27139,7 +27139,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__rotation_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -27161,7 +27161,7 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__rotation_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__conflicting_plan__before_any_io", "[prove]") {
@@ -27176,7 +27176,7 @@ TEST_CASE("prove__rotation_threshold_buffered__conflicting_plan__before_any_io",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     auto snap = db.snapshot();
@@ -27196,7 +27196,7 @@ TEST_CASE("prove__rotation_threshold_buffered__conflicting_plan__before_any_io",
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__success", "[prove]") {
@@ -27211,7 +27211,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__success", "[
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27228,7 +27228,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__success", "[
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails_nothing_written", "[prove]") {
@@ -27243,7 +27243,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27263,7 +27263,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails_partial_write", "[prove]") {
@@ -27278,7 +27278,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27299,7 +27299,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails_after_full_write", "[prove]") {
@@ -27314,7 +27314,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27335,7 +27335,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__on_bulk_end_append", "[prove]") {
@@ -27350,7 +27350,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__on_bulk_end_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27370,7 +27370,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__on_bulk_end_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__commit_sync_fails", "[prove]") {
@@ -27385,7 +27385,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__commit_sync_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27422,7 +27422,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__rotation_syn
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27459,7 +27459,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__rotation_fil
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27479,7 +27479,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__rotation_fil
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__success", "[prove]") {
@@ -27494,7 +27494,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__success", "[pr
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27511,7 +27511,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__success", "[pr
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_nothing_written", "[prove]") {
@@ -27526,7 +27526,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_n
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27546,7 +27546,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_n
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_partial_write", "[prove]") {
@@ -27561,7 +27561,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_p
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27582,7 +27582,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_p
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_after_full_write", "[prove]") {
@@ -27597,7 +27597,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_a
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27618,7 +27618,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_a
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__on_bulk_end_append", "[prove]") {
@@ -27633,7 +27633,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__on_bulk_end_ap
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27653,7 +27653,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__on_bulk_end_ap
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__commit_sync_fails", "[prove]") {
@@ -27668,7 +27668,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__commit_sync_fa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27705,7 +27705,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__rotation_sync_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27742,7 +27742,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__rotation_file_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27762,7 +27762,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__rotation_file_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__success", "[prove]") {
@@ -27777,7 +27777,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__success", "[pr
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27794,7 +27794,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__success", "[pr
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_nothing_written", "[prove]") {
@@ -27809,7 +27809,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_n
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27829,7 +27829,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_n
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_partial_write", "[prove]") {
@@ -27844,7 +27844,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_p
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27865,7 +27865,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_p
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_after_full_write", "[prove]") {
@@ -27880,7 +27880,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_a
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27901,7 +27901,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_a
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__on_bulk_end_append", "[prove]") {
@@ -27916,7 +27916,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__on_bulk_end_ap
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27936,7 +27936,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__on_bulk_end_ap
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__commit_sync_fails", "[prove]") {
@@ -27951,7 +27951,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__commit_sync_fa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -27988,7 +27988,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__rotation_sync_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28025,7 +28025,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__rotation_file_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28045,7 +28045,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__rotation_file_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__success", "[prove]") {
@@ -28060,7 +28060,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__success", 
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28078,7 +28078,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__success", 
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fails_nothing_written", "[prove]") {
@@ -28093,7 +28093,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fai
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28114,7 +28114,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fai
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fails_partial_write", "[prove]") {
@@ -28129,7 +28129,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fai
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28151,7 +28151,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fai
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fails_after_full_write", "[prove]") {
@@ -28166,7 +28166,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fai
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28188,7 +28188,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fai
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__on_bulk_end_append", "[prove]") {
@@ -28203,7 +28203,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__on_bulk_en
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28224,7 +28224,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__on_bulk_en
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__commit_sync_fails", "[prove]") {
@@ -28239,7 +28239,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__commit_syn
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28277,7 +28277,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__rotation_s
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28315,7 +28315,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__rotation_f
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28336,7 +28336,7 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__rotation_f
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__success", "[prove]") {
@@ -28351,7 +28351,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__success
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28368,7 +28368,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__success
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_fails_nothing_written", "[prove]") {
@@ -28383,7 +28383,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28403,7 +28403,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_fails_partial_write", "[prove]") {
@@ -28418,7 +28418,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28439,7 +28439,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_fails_after_full_write", "[prove]") {
@@ -28454,7 +28454,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28475,7 +28475,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__on_bulk_end_append", "[prove]") {
@@ -28490,7 +28490,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__on_bulk
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28510,7 +28510,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__on_bulk
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__commit_sync_fails", "[prove]") {
@@ -28525,7 +28525,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__commit_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28562,7 +28562,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__rotatio
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28599,7 +28599,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__rotatio
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28619,7 +28619,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__rotatio
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__success", "[prove]") {
@@ -28634,7 +28634,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__success",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28651,7 +28651,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__success",
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fails_nothing_written", "[prove]") {
@@ -28666,7 +28666,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28686,7 +28686,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fails_partial_write", "[prove]") {
@@ -28701,7 +28701,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28722,7 +28722,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fails_after_full_write", "[prove]") {
@@ -28737,7 +28737,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28758,7 +28758,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__on_bulk_end_append", "[prove]") {
@@ -28773,7 +28773,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__on_bulk_e
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28793,7 +28793,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__on_bulk_e
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__commit_sync_fails", "[prove]") {
@@ -28808,7 +28808,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__commit_sy
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28845,7 +28845,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__rotation_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28882,7 +28882,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__rotation_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28902,7 +28902,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__rotation_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__success", "[prove]") {
@@ -28917,7 +28917,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__success",
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28934,7 +28934,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__success",
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fails_nothing_written", "[prove]") {
@@ -28949,7 +28949,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -28969,7 +28969,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fails_partial_write", "[prove]") {
@@ -28984,7 +28984,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29005,7 +29005,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fails_after_full_write", "[prove]") {
@@ -29020,7 +29020,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fa
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29041,7 +29041,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fa
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__on_bulk_end_append", "[prove]") {
@@ -29056,7 +29056,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__on_bulk_e
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29076,7 +29076,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__on_bulk_e
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__commit_sync_fails", "[prove]") {
@@ -29091,7 +29091,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__commit_sy
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29128,7 +29128,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__rotation_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29165,7 +29165,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__rotation_
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29185,7 +29185,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__rotation_
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__success", "[prove]") {
@@ -29200,7 +29200,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__succe
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29218,7 +29218,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__succe
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__append_fails_nothing_written", "[prove]") {
@@ -29233,7 +29233,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__appen
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29254,7 +29254,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__appen
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__append_fails_partial_write", "[prove]") {
@@ -29269,7 +29269,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__appen
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29291,7 +29291,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__appen
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__append_fails_after_full_write", "[prove]") {
@@ -29306,7 +29306,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__appen
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29328,7 +29328,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__appen
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__on_bulk_end_append", "[prove]") {
@@ -29343,7 +29343,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__on_bu
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29364,7 +29364,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__on_bu
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__commit_sync_fails", "[prove]") {
@@ -29379,7 +29379,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__commi
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29417,7 +29417,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__rotat
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29455,7 +29455,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__rotat
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29476,7 +29476,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__rotat
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__success", "[prove]") {
@@ -29491,7 +29491,7 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__success", "
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29507,7 +29507,7 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__success", "
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_nothing_written", "[prove]") {
@@ -29522,7 +29522,7 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fail
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29541,7 +29541,7 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fail
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_partial_write", "[prove]") {
@@ -29556,7 +29556,7 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fail
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29576,7 +29576,7 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fail
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_after_full_write", "[prove]") {
@@ -29591,7 +29591,7 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fail
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29611,7 +29611,7 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fail
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__commit_sync_fails", "[prove]") {
@@ -29626,7 +29626,7 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__commit_sync
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29662,7 +29662,7 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_sy
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29698,7 +29698,7 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_fi
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29717,7 +29717,7 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_fi
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__success", "[prove]") {
@@ -29732,7 +29732,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__succes
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29748,7 +29748,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__succes
 
     assert_delta(before, db, expected);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append_fails_nothing_written", "[prove]") {
@@ -29763,7 +29763,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29782,7 +29782,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append_fails_partial_write", "[prove]") {
@@ -29797,7 +29797,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29817,7 +29817,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append_fails_after_full_write", "[prove]") {
@@ -29832,7 +29832,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29852,7 +29852,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
 
 TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__commit_sync_fails", "[prove]") {
@@ -29867,7 +29867,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__commit
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29903,7 +29903,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__rotati
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29939,7 +29939,7 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__rotati
     };
   Baseline before;
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
 
     before = capture_baseline(db);
@@ -29958,5 +29958,5 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__rotati
     assert_delta(before, db, expected);
     assert_resumable(db);
   }
-  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true, .use_write_buffer = true});
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }

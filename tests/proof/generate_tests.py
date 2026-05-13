@@ -68,8 +68,6 @@ def _build_open_opts(state: StateShape) -> str:
         parts.append(f".max_file_bytes = {state.max_file_bytes}")
     if state.use_mmap:
         parts.append(".use_mmap = true")
-    if state.use_write_buffer:
-        parts.append(".use_write_buffer = true")
     return ", ".join(parts)
 
 

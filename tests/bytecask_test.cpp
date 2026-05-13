@@ -654,8 +654,8 @@ TEST_CASE("DB recovery: incomplete batch is discarded",
 
   {
     // Manually write a data file simulating a crash mid-batch.
-    auto df = bytecask::WritableDataFile::openForWrite(
-        db_path / "data_00000000000000_00000000_V01.data");
+    auto df = bytecask::openDataFileForWrite(
+        db_path / "data_00000000000000_00000000_V01.data", 0, false);
     // Standalone entry — should survive.
     std::ignore = df->append_entry(1, bytecask::EntryType::Put, to_bytes("good"),
                             to_bytes("value1"));
@@ -704,8 +704,8 @@ TEST_CASE("DB recovery: order-independent tombstone",
 
     // File with a Put for "gone" (seq=1) and "alive" (seq=2).
     {
-      auto df = bytecask::WritableDataFile::openForWrite(
-          db_path / std::format("{}.data", put_stem));
+      auto df = bytecask::openDataFileForWrite(
+          db_path / std::format("{}.data", put_stem), 0, false);
       std::ignore = df->append_entry(1, bytecask::EntryType::Put, to_bytes("gone"),
                               to_bytes("v1"));
       std::ignore = df->append_entry(2, bytecask::EntryType::Put, to_bytes("alive"),
@@ -715,8 +715,8 @@ TEST_CASE("DB recovery: order-independent tombstone",
 
     // File with a Delete for "gone" (seq=3) — higher sequence wins.
     {
-      auto df = bytecask::WritableDataFile::openForWrite(
-          db_path / std::format("{}.data", del_stem));
+      auto df = bytecask::openDataFileForWrite(
+          db_path / std::format("{}.data", del_stem), 0, false);
       std::ignore = df->append_entry(3, bytecask::EntryType::Delete,
                               to_bytes("gone"), {});
       df->sync();
@@ -5928,7 +5928,7 @@ TEST_CASE("leader-to-follower replication round-trip", "[replication]") {
 
 TEST_CASE("DataFileIterator over empty file yields nothing", "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::WritableDataFile::openForWrite(td.path / "empty.data"); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "empty.data", 0, false); auto &file = *file_ptr;
 
   std::vector<bytecask::DataEntry> entries;
   for (const auto& [entry, off] : bytecask::scan_entries(file)) {
@@ -5939,7 +5939,7 @@ TEST_CASE("DataFileIterator over empty file yields nothing", "[iterator]") {
 
 TEST_CASE("DataFileIterator yields all entries in order", "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::WritableDataFile::openForWrite(td.path / "test.data"); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
   (void)file.append_entry(1, bytecask::EntryType::Put,
                           to_bytes("k1"), to_bytes("v1"));
   (void)file.append_entry(2, bytecask::EntryType::Put,
@@ -5960,7 +5960,7 @@ TEST_CASE("DataFileIterator yields all entries in order", "[iterator]") {
 
 TEST_CASE("DataFileIterator reports correct offsets", "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::WritableDataFile::openForWrite(td.path / "test.data"); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
   auto off1 = file.append_entry(1, bytecask::EntryType::Put,
                                 to_bytes("a"), to_bytes("1"));
   auto off2 = file.append_entry(2, bytecask::EntryType::Put,
@@ -5983,7 +5983,7 @@ TEST_CASE("DataFileIterator reports correct offsets", "[iterator]") {
 TEST_CASE("scan_committed standalone entries yield individual entries",
           "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::WritableDataFile::openForWrite(td.path / "test.data"); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
   (void)file.append_entry(1, bytecask::EntryType::Put,
                           to_bytes("k1"), to_bytes("v1"));
   (void)file.append_entry(2, bytecask::EntryType::Delete,
@@ -6004,7 +6004,7 @@ TEST_CASE("scan_committed standalone entries yield individual entries",
 TEST_CASE("scan_committed yields BulkBegin/BulkEnd as regular entries",
           "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::WritableDataFile::openForWrite(td.path / "test.data"); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
   (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
   (void)file.append_entry(11, bytecask::EntryType::Put,
                           to_bytes("k1"), to_bytes("v1"));
@@ -6030,7 +6030,7 @@ TEST_CASE("scan_committed yields BulkBegin/BulkEnd as regular entries",
 
 TEST_CASE("scan_committed discards incomplete batch at EOF", "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::WritableDataFile::openForWrite(td.path / "test.data"); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
   // Standalone entry first, then an incomplete batch.
   (void)file.append_entry(1, bytecask::EntryType::Put,
                           to_bytes("k1"), to_bytes("v1"));
@@ -6052,7 +6052,7 @@ TEST_CASE("scan_committed discards incomplete batch at EOF", "[iterator]") {
 TEST_CASE("scan_committed interleaved standalone and batch entries",
           "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::WritableDataFile::openForWrite(td.path / "test.data"); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
   (void)file.append_entry(1, bytecask::EntryType::Put,
                           to_bytes("standalone1"), to_bytes("v1"));
   (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
@@ -6078,7 +6078,7 @@ TEST_CASE("scan_committed interleaved standalone and batch entries",
 TEST_CASE("scan_committed committed_offset tracks last committed position",
           "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::WritableDataFile::openForWrite(td.path / "test.data"); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
   (void)file.append_entry(1, bytecask::EntryType::Put,
                           to_bytes("k"), to_bytes("v"));
   (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
@@ -6097,7 +6097,7 @@ TEST_CASE("scan_committed committed_offset tracks last committed position",
 
 TEST_CASE("scan_committed over empty file yields nothing", "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::WritableDataFile::openForWrite(td.path / "empty.data"); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "empty.data", 0, false); auto &file = *file_ptr;
 
   std::vector<std::pair<bytecask::DataEntry, bytecask::Offset>> entries;
   for (const auto& e : bytecask::scan_committed(file)) {
@@ -6108,7 +6108,7 @@ TEST_CASE("scan_committed over empty file yields nothing", "[iterator]") {
 
 TEST_CASE("scan_committed handles RangeDel inside batch", "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::WritableDataFile::openForWrite(td.path / "test.data"); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
   (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
   (void)file.append_entry(11, bytecask::EntryType::Put,
                           to_bytes("k1"), to_bytes("v1"));
@@ -6389,7 +6389,7 @@ TEST_CASE("iter_from and riter_from with verify_checksums=false",
 }
 
 // ---------------------------------------------------------------------------
-// Options: use_mmap and use_write_buffer
+// Options: use_mmap
 // ---------------------------------------------------------------------------
 
 TEST_CASE("use_mmap=false: put/get with file rotation",
@@ -6412,10 +6412,10 @@ TEST_CASE("use_mmap=false: put/get with file rotation",
   }
 }
 
-TEST_CASE("use_write_buffer=false: put/get round-trip",
-          "[bytecask][no_write_buffer]") {
+TEST_CASE("use_mmap=true: put/get round-trip",
+          "[bytecask][mmap]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path, {.use_write_buffer = false});
+  auto db = bytecask::DB::open(td.path, {.use_mmap = true});
   constexpr int kCount = 20;
   for (int i = 0; i < kCount; ++i) {
     auto key = std::format("k{:04d}", i);
@@ -6431,12 +6431,12 @@ TEST_CASE("use_write_buffer=false: put/get round-trip",
   }
 }
 
-TEST_CASE("use_mmap=false use_write_buffer=false: full low-memory mode",
-          "[bytecask][low_memory]") {
+TEST_CASE("use_mmap=false: full pread mode",
+          "[bytecask][pread_mode]") {
   TempDir td;
   auto db = bytecask::DB::open(
       td.path,
-      {.max_file_bytes = 64, .use_mmap = false, .use_write_buffer = false});
+      {.max_file_bytes = 64, .use_mmap = false});
   constexpr int kCount = 50;
   for (int i = 0; i < kCount; ++i) {
     auto key = std::format("k{:04d}", i);

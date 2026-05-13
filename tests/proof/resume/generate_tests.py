@@ -38,8 +38,6 @@ def _build_open_opts(degrade: DegradeShape, max_file_bytes: int | None = None) -
         parts.append(f".max_file_bytes = {max_file_bytes}")
     if degrade.use_mmap:
         parts.append(".use_mmap = true")
-    if degrade.use_write_buffer:
-        parts.append(".use_write_buffer = true")
     return ", ".join(parts)
 
 

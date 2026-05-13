@@ -19,7 +19,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 
 ## Features
 
-- **Sequential write path** — all I/O is sequential appends; no random writes. Every `put` and `del` is one append. `apply_batch` with N operations appends a begin marker, N entries, and an end marker in a single `writev` — still no WAL, no random writes.
+- **Sequential write path** — all I/O is sequential appends; no random writes. Every `put` and `del` is one append. `apply_batch` with N operations appends a begin marker, N entries, and an end marker in a single `pwritev` — still no WAL, no random writes.
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
 - **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append. In-memory cleanup walks the radix tree; disk cost is O(1) regardless of how many keys fall in the range. Available on `DB` and `WritePlan`.
 - **Atomic writes** — every `put`, `del`, and `del_range` is atomic. `apply_batch` makes multiple puts, deletes, and range deletes atomic as a group.
@@ -57,7 +57,7 @@ See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md)
 | Get | 1.29 Mops/s | 431 Kops/s | In-memory radix tree lookup; flat latency regardless of dataset size |
 | Del (Sync) | 184 ops/s | 2 ops/s | Single tombstone append; no compaction write amplification |
 | Range-50 | 28 K scans/s | 68 K scans/s | LSM sorted runs favour sequential value scans |
-| MixedBatch (Sync) | 14 Kops/s | 13 Kops/s | Atomic batch with single `writev` + `fdatasync` |
+| MixedBatch (Sync) | 14 Kops/s | 13 Kops/s | Atomic batch with single `pwritev` + `fdatasync` |
 
 At small dataset sizes (50 k keys), all keys fit in RocksDB's block cache and reads are fast on both engines. From 500 k keys onward, block cache misses begin to dominate and the in-memory key directory approach shows its advantage.
 

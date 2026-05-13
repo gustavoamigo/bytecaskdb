@@ -38,7 +38,7 @@ TEST_CASE("DataFile::append: B3 full write + error return — file throws",
       std::filesystem::temp_directory_path() / "bc_test_b3_tainted.data";
   std::filesystem::remove(path);
 
-  auto file = bytecask::WritableDataFile::openForWrite(path);
+  auto file = bytecask::openDataFileForWrite(path, 0, false);
   const auto key = to_bytes("hello");
   const auto val = to_bytes("world");
 
@@ -63,7 +63,7 @@ TEST_CASE("DataFile::append: B2 partial write — file throws",
       std::filesystem::temp_directory_path() / "bc_test_b2_tainted.data";
   std::filesystem::remove(path);
 
-  auto file = bytecask::WritableDataFile::openForWrite(path);
+  auto file = bytecask::openDataFileForWrite(path, 0, false);
   const auto key = to_bytes("hello");
   const auto val = to_bytes("world");
 
@@ -86,7 +86,7 @@ TEST_CASE("DataFile::append_entries batches multiple entries into one writev",
       std::filesystem::temp_directory_path() / "bc_test_append_entries.data";
   std::filesystem::remove(path);
 
-  auto file = bytecask::WritableDataFile::openForWrite(path);
+  auto file = bytecask::openDataFileForWrite(path, 0, false);
   const auto k0 = to_bytes("key0");
   const auto v0 = to_bytes("val0");
   const auto k1 = to_bytes("key1");
@@ -147,7 +147,7 @@ TEST_CASE("WritableDataFile constructor: fresh file with no buffer",
       std::filesystem::temp_directory_path() / "bc_test_ctor_no_buf.data";
   std::filesystem::remove(path);
 
-  auto file = bytecask::WritableDataFile::openForWrite(path);
+  auto file = bytecask::openDataFileForWrite(path, 0, false);
   CHECK(file->size() == 0);
   CHECK(std::filesystem::exists(path));
 
@@ -160,7 +160,7 @@ TEST_CASE("WritableDataFile constructor: fresh file with no buffer",
   std::filesystem::remove(path);
 }
 
-TEST_CASE("WritableDataFile constructor: reopens existing file with buffer pre-populated",
+TEST_CASE("WritableDataFile constructor: reopens existing file with mmap pre-mapped",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_ctor_reopen_buf.data";
@@ -173,16 +173,16 @@ TEST_CASE("WritableDataFile constructor: reopens existing file with buffer pre-p
 
   // Write one entry and close.
   {
-    auto file = bytecask::WritableDataFile::openForWrite(path);
+    auto file = bytecask::openDataFileForWrite(path, 0, false);
     (void)file->append_entry(1, bytecask::EntryType::Put, key, val);
     file->sync();
   }
 
-  // Re-open with buffer capacity covering the file.
-  auto file = bytecask::WritableDataFile::openForWrite(path, 4096);
+  // Re-open with mmap capacity covering the file.
+  auto file = bytecask::openDataFileForWrite(path, 4096, true);
   CHECK(file->size() == entry_size);
 
-  // Buffer is pre-populated: read_entry_unverified serves from buffer.
+  // mmap is pre-mapped: read_entry_unverified serves from mmap.
   std::vector<std::byte> io_buf;
   auto view = file->read_entry_unverified(0, static_cast<std::uint32_t>(val.size()), io_buf);
   CHECK(view.sequence == 1);
@@ -198,44 +198,8 @@ TEST_CASE("WritableDataFile constructor: reopens existing file with buffer pre-p
 TEST_CASE("WritableDataFile constructor: throws on invalid path",
           "[data_file]") {
   REQUIRE_THROWS_AS(
-      bytecask::WritableDataFile::openForWrite("/nonexistent/dir/file.data"),
+      bytecask::openDataFileForWrite("/nonexistent/dir/file.data", 0, false),
       std::system_error);
-}
-
-// ---------------------------------------------------------------------------
-// Move assignment operator
-// ---------------------------------------------------------------------------
-
-TEST_CASE("WritableDataFile move assignment transfers ownership",
-          "[data_file]") {
-  const auto path_a =
-      std::filesystem::temp_directory_path() / "bc_test_move_a.data";
-  const auto path_b =
-      std::filesystem::temp_directory_path() / "bc_test_move_b.data";
-  std::filesystem::remove(path_a);
-  std::filesystem::remove(path_b);
-
-  auto a = bytecask::WritableDataFile::openForWrite(path_a);
-  auto b = bytecask::WritableDataFile::openForWrite(path_b);
-
-  const auto key = to_bytes("mk");
-  const auto val = to_bytes("mv");
-  (void)a->append_entry(1, bytecask::EntryType::Put, key, val);
-  const auto expected_size = a->size();
-
-  // Move-assign a into b.
-  *b = std::move(*a);
-
-  CHECK(b->path() == path_a);
-  CHECK(b->size() == expected_size);
-
-  // b can still write after receiving a's state.
-  (void)b->append_entry(2, bytecask::EntryType::Put, key, val);
-  CHECK(b->size() == expected_size * 2);
-
-  // a's destructor runs without double-close (fd neutralized to -1).
-  std::filesystem::remove(path_a);
-  std::filesystem::remove(path_b);
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +212,7 @@ TEST_CASE("WritableDataFile::read_entry_unverified buffer fast path",
       std::filesystem::temp_directory_path() / "bc_test_unverified_buf.data";
   std::filesystem::remove(path);
 
-  auto file = bytecask::WritableDataFile::openForWrite(path, 4096);
+  auto file = bytecask::openDataFileForWrite(path, 4096, true);
   const auto key = to_bytes("bufkey");
   const auto val = to_bytes("bufval");
   (void)file->append_entry(42, bytecask::EntryType::Put, key, val);
@@ -273,7 +237,7 @@ TEST_CASE("WritableDataFile::read_entry_unverified pread fallback",
   std::filesystem::remove(path);
 
   // capacity=0 means no buffer — forces pread path.
-  auto file = bytecask::WritableDataFile::openForWrite(path);
+  auto file = bytecask::openDataFileForWrite(path, 0, false);
   const auto key = to_bytes("pkey");
   const auto val = to_bytes("pval");
   (void)file->append_entry(7, bytecask::EntryType::Put, key, val);
@@ -305,7 +269,7 @@ TEST_CASE("ReadOnlyPosixDataFile::read_entry_unverified short key",
   const auto key = to_bytes("shortkey");
   const auto val = to_bytes("shortval");
   {
-    auto w = bytecask::WritableDataFile::openForWrite(path);
+    auto w = bytecask::openDataFileForWrite(path, 0, false);
     (void)w->append_entry(10, bytecask::EntryType::Put, key, val);
     w->sync();
   }
@@ -334,7 +298,7 @@ TEST_CASE("ReadOnlyPosixDataFile::read_entry_unverified long key triggers retry"
   const auto key = to_bytes(long_key_str);
   const auto val = to_bytes("lv");
   {
-    auto w = bytecask::WritableDataFile::openForWrite(path);
+    auto w = bytecask::openDataFileForWrite(path, 0, false);
     (void)w->append_entry(99, bytecask::EntryType::Put, key, val);
     w->sync();
   }
@@ -366,7 +330,7 @@ TEST_CASE("ReadOnlyMmapDataFile::read_entry_unverified",
   const auto key = to_bytes("mmapkey");
   const auto val = to_bytes("mmapval");
   {
-    auto w = bytecask::WritableDataFile::openForWrite(path);
+    auto w = bytecask::openDataFileForWrite(path, 0, false);
     (void)w->append_entry(55, bytecask::EntryType::Put, key, val);
     w->sync();
   }

@@ -697,7 +697,7 @@ TEST_CASE("prove_resume__degrade_H_buffered__success", "[prove_resume]") {
   auto dir = td.path / "db";
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
@@ -714,7 +714,7 @@ TEST_CASE("prove_resume__degrade_H_buffered__success", "[prove_resume]") {
     CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.use_mmap = true, .use_write_buffer = true});
+  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.use_mmap = true});
 }
 
 TEST_CASE("prove_resume__degrade_H_buffered__file_creation_fails", "[prove_resume]") {
@@ -722,7 +722,7 @@ TEST_CASE("prove_resume__degrade_H_buffered__file_creation_fails", "[prove_resum
   auto dir = td.path / "db";
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
@@ -746,7 +746,7 @@ TEST_CASE("prove_resume__degrade_H_buffered__file_creation_fails", "[prove_resum
     CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.use_mmap = true, .use_write_buffer = true});
+  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.use_mmap = true});
 }
 
 TEST_CASE("prove_resume__degrade_H_buffered__double_resume", "[prove_resume]") {
@@ -754,7 +754,7 @@ TEST_CASE("prove_resume__degrade_H_buffered__double_resume", "[prove_resume]") {
   auto dir = td.path / "db";
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
@@ -778,7 +778,7 @@ TEST_CASE("prove_resume__degrade_H_buffered__double_resume", "[prove_resume]") {
     CHECK(db.contains_key({}, to_bytes("p0")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.use_mmap = true, .use_write_buffer = true});
+  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.use_mmap = true});
 }
 
 TEST_CASE("prove_resume__degrade_C_buffered__success", "[prove_resume]") {
@@ -788,7 +788,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__success", "[prove_resume]") {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
     // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::WritePlan plan;
@@ -809,7 +809,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__success", "[prove_resume]") {
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true, .use_write_buffer = true});
+  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true});
 }
 
 TEST_CASE("prove_resume__degrade_C_buffered__truncate_fails", "[prove_resume]") {
@@ -819,7 +819,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__truncate_fails", "[prove_resume]") 
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
     // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::WritePlan plan;
@@ -847,7 +847,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__truncate_fails", "[prove_resume]") 
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true, .use_write_buffer = true});
+  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true});
 }
 
 TEST_CASE("prove_resume__degrade_C_buffered__sync_fails", "[prove_resume]") {
@@ -857,7 +857,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__sync_fails", "[prove_resume]") {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
     // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::WritePlan plan;
@@ -885,7 +885,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__sync_fails", "[prove_resume]") {
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true, .use_write_buffer = true});
+  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true});
 }
 
 TEST_CASE("prove_resume__degrade_C_buffered__file_creation_fails", "[prove_resume]") {
@@ -895,7 +895,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__file_creation_fails", "[prove_resum
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
     // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::WritePlan plan;
@@ -923,7 +923,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__file_creation_fails", "[prove_resum
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true, .use_write_buffer = true});
+  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true});
 }
 
 TEST_CASE("prove_resume__degrade_C_buffered__double_resume", "[prove_resume]") {
@@ -933,7 +933,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__double_resume", "[prove_resume]") {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
     // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::WritePlan plan;
@@ -962,7 +962,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__double_resume", "[prove_resume]") {
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true, .use_write_buffer = true});
+  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true});
 }
 
 TEST_CASE("prove_resume__degrade_C_buffered__cascade_r2_r3", "[prove_resume]") {
@@ -972,7 +972,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__cascade_r2_r3", "[prove_resume]") {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
     // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
-    auto db = bytecask::DB::open(dir, {.use_mmap = true, .use_write_buffer = true});
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::WritePlan plan;
@@ -1007,5 +1007,5 @@ TEST_CASE("prove_resume__degrade_C_buffered__cascade_r2_r3", "[prove_resume]") {
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true, .use_write_buffer = true});
+  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true});
 }

@@ -17,7 +17,6 @@ class CompactStateShape:
     deleted_keys: List[str]
     max_file_bytes: int
     use_mmap: bool = False
-    use_write_buffer: bool = False
 
     @property
     def live_keys(self) -> List[str]:
@@ -55,7 +54,6 @@ COMPACT_STATE_SHAPES = [
         deleted_keys=["k1"],
         max_file_bytes=50,
         use_mmap=True,
-        use_write_buffer=True,
     ),
     CompactStateShape(
         "mostly_dead_buffered",
@@ -63,7 +61,6 @@ COMPACT_STATE_SHAPES = [
         deleted_keys=["k1", "k2", "k3", "k4", "k5"],
         max_file_bytes=150,
         use_mmap=True,
-        use_write_buffer=True,
     ),
 ]
 
