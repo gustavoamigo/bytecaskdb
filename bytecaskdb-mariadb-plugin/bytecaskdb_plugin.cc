@@ -49,15 +49,8 @@ static MYSQL_SYSVAR_BOOL(use_mmap, sysvar_use_mmap,
     "Use mmap for sealed data files (default OFF)",
     nullptr, nullptr, FALSE);
 
-static my_bool sysvar_use_write_buffer = FALSE;
-static MYSQL_SYSVAR_BOOL(use_write_buffer, sysvar_use_write_buffer,
-    PLUGIN_VAR_READONLY,
-    "Use write buffer for active data file (default OFF)",
-    nullptr, nullptr, FALSE);
-
 static struct st_mysql_sys_var *bytecaskdb_system_variables[] = {
     MYSQL_SYSVAR(use_mmap),
-    MYSQL_SYSVAR(use_write_buffer),
     nullptr,
 };
 #endif // !PLUGIN_TESTING
@@ -738,7 +731,6 @@ static int bytecaskdb_init(void *p) {
   opts.max_value_bytes = 16 * 1024 * 1024;  // MEDIUMBLOB (16 MiB)
   opts.max_key_bytes = 8192;  // secondary index key + PK suffix can exceed 4096
   opts.use_mmap = sysvar_use_mmap;
-  opts.use_write_buffer = sysvar_use_write_buffer;
 
   try {
     g_db_owner = std::make_unique<DBHolder>(db_path, opts);
@@ -758,9 +750,8 @@ static int bytecaskdb_init(void *p) {
 
   sql_print_information("ByteCaskDB: opened global DB at '%s'",
           db_path.c_str());
-  sql_print_information("ByteCaskDB: use_mmap=%s, use_write_buffer=%s",
-          sysvar_use_mmap ? "ON" : "OFF",
-          sysvar_use_write_buffer ? "ON" : "OFF");
+  sql_print_information("ByteCaskDB: use_mmap=%s",
+          sysvar_use_mmap ? "ON" : "OFF");
 
   s_vacuum_stop = false;
   s_vacuum_pause_count = 0;

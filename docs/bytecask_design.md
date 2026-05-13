@@ -189,7 +189,7 @@ All writes (`put`, `del`, `apply_batch`) route through a single coordinator: `DB
 
 **Routing**: a write goes to `SoloWriter` when `WriteOptions::solo` is set (benchmarking) or when the plan's byte size exceeds `kGroupWriteMaxBytes` (256 KiB). All other writes go to `WriteGroup`.
 
-**WriteGroup**: the first writer to arrive becomes the leader, drains the queue of pending slots, and executes them all under one lock hold. N concurrent sync writes share a single `fdatasync` instead of paying N separate calls. This is the dominant performance win — fdatasync is ~2 ms; writev is ~microseconds.
+**WriteGroup**: the first writer to arrive becomes the leader, drains the queue of pending slots, and executes them all under one lock hold. N concurrent sync writes share a single `fdatasync` instead of paying N separate calls. This is the dominant performance win — fdatasync is ~2 ms; pwritev is ~microseconds.
 
 **SoloWriter**: same `submit(Slot&)` interface, no internal batching. The executor acquires `write_mu_` and processes the single slot. Provides a uniform interface for routing.
 
@@ -212,7 +212,7 @@ Both executors follow a three-phase pattern:
   Phase 2: one I/O call
   ─────────────────────
   file.append_entries(all_entries)
-    └─ single writev for all entries across all slots in the batch
+    └─ single pwritev for all entries across all slots in the batch
 
   Phase 3: sync / rotate / publish
   ────────────────────────────────
@@ -276,13 +276,13 @@ Implementation: `degraded_` is an `atomic<bool>` (release on write, acquire on r
 
 ##### Runtime invariant enforcement
 
-The engine validates structural invariants at runtime before publishing state, not just in tests. `store_state` compares old and new `EngineState` on every publication: `next_seq`, `active_file_id`, `next_file_id`, and `durable_seq` must never regress. On violation the engine degrades (nothing published, writes blocked, reads remain available). Cost: four integer comparisons per write — unmeasurable against `writev` + `fdatasync`. Debug builds add a full `next_seq > max(key_dir sequences)` walk. When `durable_seq` advances, `store_state` notifies `durable_cv_` — the condvar used by `current_sequence(timeout)` for long-poll.
+The engine validates structural invariants at runtime before publishing state, not just in tests. `store_state` compares old and new `EngineState` on every publication: `next_seq`, `active_file_id`, `next_file_id`, and `durable_seq` must never regress. On violation the engine degrades (nothing published, writes blocked, reads remain available). Cost: four integer comparisons per write — unmeasurable against `pwritev` + `fdatasync`. Debug builds add a full `next_seq > max(key_dir sequences)` walk. When `durable_seq` advances, `store_state` notifies `durable_cv_` — the condvar used by `current_sequence(timeout)` for long-poll.
 
 On cold paths (`DB::open()`, `resume()`), `validate_state_consistency` runs the full O(n) structural check: active file in registry, no dangling file references, `next_seq` ahead of all sequences, `file_stats` covers all files, `live_bytes` matches `key_dir`. On violation it throws — the DB does not open or `resume()` fails.
 
 ##### Partial write detection (tainted file)
 
-If `writev` returns a short write (0 < written < total), `DataFile::append()` sets a `tainted_` flag before throwing. A tainted file has bytes on disk that `offset_` does not account for. The file is opened with `O_APPEND`, so the next `writev` would write at the kernel's true EOF (past the partial data), but `offset_` would still point to the old position — the offset returned by subsequent appends would be wrong.
+If `pwritev` returns a short write (0 < written < total), the append method sets a `tainted_` flag before throwing. A tainted file has bytes on disk that `offset_` does not account for. The next `pwritev` writes at the tracked `offset_` — past the partial data — so subsequent append offsets would be wrong if `offset_` were advanced.
 
 For multi-entry batches this is safe: the isolation rotation moves to a new file, abandoning the tainted one. For single-entry writes, the `apply_batch` catch block checks `file.is_tainted()` and degrades the DB if set. `resume()` then truncates the partial entry and restores a clean state.
 
@@ -737,23 +737,26 @@ Not yet implemented — callers currently provide the full file path.
 
 ### DataFile API
 
-`DataFile` (in `bytecask.data_file` module) is the primary storage-engine component. It owns a single data file and provides:
+`DataFile` (in `bytecask.data_file` module) is the abstract base for all data file types. It defines the read interface (`scan`, `read_value`, `read_entry`, `read_entry_unverified`, `size`). Concrete writable implementations extend `WritableDataFile`, which adds `append_entry`, `append_entries`, `sync`, and `truncate` as pure virtual methods. Two concrete writable implementations are provided:
 
-- **Constructor**: Takes a `std::filesystem::path`. Opens (or creates) the file via POSIX `open(O_WRONLY | O_CREAT | O_APPEND)`. Throws `std::system_error` on failure.
-- **`append(sequence, entry_type, key, value) -> Offset`**: Serializes a new entry with the given sequence number and `EntryType`, writes it to the OS page cache via `::writev()`, and returns the byte offset where the entry starts. `BulkBegin`/`BulkEnd` entries pass empty key and value spans. Does **not** guarantee durability on its own. The 15-byte header and 4-byte CRC are serialized into a fixed member buffer (`hdr_crc_buf_`); the key and value spans are passed directly as iovecs — no heap allocation and no copy of key/value data occurs on the write path.
-- **`sync()`**: Calls `::fdatasync()` to flush all pending writes to physical storage. Must be called explicitly to guarantee crash-safety. Decoupled from `append()` to enable Group Commit: callers can batch multiple `append()` calls before a single `sync()`.
+- **`WritableMmapDataFile`**: Pre-allocates the file to the rotation threshold via `ftruncate`, then maps it with `mmap(PROT_READ, MAP_SHARED)`. Reads within the mapped region are zero-syscall memcpy from the mmap region. Reads beyond the mmap region (rare: overflow past pre-allocated size) fall back to `pread`. Writes go through `pwritev` at a tracked `offset_`. MAP_SHARED is required so that `pwritev` writes through the fd are visible to mmap readers.
+- **`WritablePosixDataFile`**: Pure `pread`-based reads, `pwritev` writes. Uses `fallocate(FALLOC_FL_KEEP_SIZE)` in 4 MiB chunks for block preallocation. This is the fallback for platforms without mmap support (Emscripten/WASM).
+
+The factory function `openDataFileForWrite(path, capacity, use_mmap)` selects the implementation. Both implementations open the file with `O_RDWR | O_CREAT | O_CLOEXEC` — no `O_APPEND`, since pre-allocated files require positioned writes.
+
+- **`append_entry(sequence, entry_type, key, value) -> Offset`**: Serializes a new entry with the given sequence number and `EntryType`, writes it via `pwritev()` at the tracked `offset_`, and returns the byte offset where the entry starts. `BulkBegin`/`BulkEnd` entries pass empty key and value spans. Does **not** guarantee durability on its own. The 15-byte header and 4-byte CRC are serialized into a fixed member buffer (`hdr_crc_buf_`); the key and value spans are passed directly as iovecs — no heap allocation and no copy of key/value data occurs on the write path.
+- **`sync()`**: Calls `::fdatasync()` to flush all pending writes to physical storage. Must be called explicitly to guarantee crash-safety. Decoupled from `append_entry()` to enable Group Commit: callers can batch multiple `append_entry()` calls before a single `sync()`.
 - **`read_entry(offset, key_size, value_size, io_buf)`**: Single-pread read primitive. Resizes `io_buf` (reusing existing capacity) and preads the full entry into it. Callers then pass `io_buf` to `deserialize_entry()` (recovery, scan) depending on what they need. `scan()` uses this internally after its header pread.
 - **`read_value(offset, key_size, value_size, io_buf, out)`**: High-level read primitive. Calls `read_entry` then `extract_value_into` to pread, CRC-verify, and extract only the value into `out`. Both `io_buf` (scratch) and `out` reuse existing capacity across calls. Used by `Bytecask::get()` and `EntryIterator`.
-- **`read_value_into`** was removed — `read_entry` + `extract_value_into` replaced it; `read_value` now provides the combined convenience API.
 - Key and value are accepted as `std::span<const std::byte>` for binary safety.
 
 ### I/O Back-end Rationale
 
-- **POSIX over `std::ofstream`**: `::writev()` with `O_APPEND` issues a single syscall per entry using scatter-gather I/O, skipping the buffering layers and locale state overhead of C++ streams.
+- **POSIX over `std::ofstream`**: `::pwritev()` issues a single syscall per entry using scatter-gather I/O at a specified offset, skipping the buffering layers and locale state overhead of C++ streams.
 - **`fdatasync` over `fflush`/`flush()`**: `fdatasync` syncs data to physical media while skipping inode metadata updates (access time etc.), making it faster than `fsync` for a pure append-only log.
-- **Group Commit pattern**: Separating `append()` (writes to page cache) from `sync()` (forces to disk) lets future code batch hundreds of writes before a single expensive `fdatasync`, which is the primary lever for high write throughput on NVMe hardware (see `io_uring` paper reference).
-- **Zero-copy write path**: `append()` builds only the 15-byte header and 4-byte CRC in a fixed member buffer, then calls `::writev()` with four iovecs — `[header(15), key, value, crc(4)]`. The kernel gathers the scattered buffers into one atomic write without any intermediate heap allocation or memcpy of key/value data. For 1 KiB values this eliminates ~250 MB/s of unnecessary copying at 244k puts/s.
-- **Block preallocation**: On Linux, `DataFile` preallocates disk blocks in 4 MiB chunks using `fallocate(FALLOC_FL_KEEP_SIZE)` before each `writev()`. This eliminates per-write filesystem extent-allocation overhead without changing the file's logical size — `O_APPEND`, `offset_`, scanning, and recovery are all unaffected. The call is a no-op on filesystems that do not support it (tmpfs, NFS). On non-Linux platforms (macOS) the feature is compiled out.
+- **Group Commit pattern**: Separating `append_entry()` (writes to page cache) from `sync()` (forces to disk) lets future code batch hundreds of writes before a single expensive `fdatasync`, which is the primary lever for high write throughput on NVMe hardware (see `io_uring` paper reference).
+- **Zero-copy write path**: `append_entry()` builds only the 15-byte header and 4-byte CRC in a fixed member buffer, then calls `::pwritev()` with four iovecs — `[header(15), key, value, crc(4)]`. The kernel gathers the scattered buffers into one atomic write without any intermediate heap allocation or memcpy of key/value data. For 1 KiB values this eliminates ~250 MB/s of unnecessary copying at 244k puts/s.
+- **Block preallocation**: On Linux, `WritablePosixDataFile` preallocates disk blocks in 4 MiB chunks using `fallocate(FALLOC_FL_KEEP_SIZE)` before each `pwritev()`. This eliminates per-write filesystem extent-allocation overhead without changing the file's logical size — `offset_`, scanning, and recovery are all unaffected. The call is a no-op on filesystems that do not support it (tmpfs, NFS). On non-Linux platforms (macOS) the feature is compiled out. `WritableMmapDataFile` pre-allocates the full file via `ftruncate` instead.
 
 ### Source Code Module Architecture
 
@@ -761,7 +764,7 @@ We use fine-grained C++20 modules:
 - `bytecask.util`: CRC-32C accumulator (`Crc32`, backed by google/crc32c) and checked `narrow<To>(From)` conversion.
 - `bytecask.serialization`: Core serialization primitives (`ByteWriter`, `ByteReader`, `read_le`, `write_le`) and re-exports `bytecask.util`.
 - `bytecask.data_entry`: Logical entry definition, `write_header_and_crc()` (fills a fixed 19-byte buffer with LE header + CRC for zero-copy I/O), `serialize_entry()` (complete in-memory entry for tests/recovery), `parse_header_and_verify()` / `deserialize_entry()` / `extract_value_into()` — CRC verification is factored into `parse_header_and_verify()` and shared by both extraction functions.
-- `bytecask.data_file`: Disk I/O, writing streams sequentially to `.data` files.
+- `bytecask.data_file`: Disk I/O — `DataFile` (abstract base), `WritableDataFile` (pure interface), `WritableMmapDataFile`, `WritablePosixDataFile`, `ReadOnlyMmapDataFile`, `ReadOnlyPosixDataFile`, `Offset`.
 - `bytecask.hint_entry`: `HintEntry`, `serialize_entry()`, `deserialize_entry()` — symmetric read/write for hint entries.
 - `bytecask.hint_file`: Hint file writer and reader (`HintFile`).
 - `bytecask.persistent_ordered_map`: Immutable sorted map (`PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`) backed by `immer::flex_vector`; retained for benchmarking.
@@ -776,7 +779,7 @@ We use fine-grained C++20 modules:
 
 ### DataFile fd mode after rotation
 
-`DataFile` opens with `O_RDWR | O_CREAT | O_APPEND`. After a data file is rotated it is logically immutable — no new entries should be appended. The engine enforces this at a higher level; the fd mode is not downgraded to `O_RDONLY` after rotation. Rationale:
+Writable data files open with `O_RDWR | O_CREAT | O_CLOEXEC`. After a data file is rotated it is logically immutable — no new entries should be appended. The engine enforces this at a higher level; the fd mode is not downgraded to `O_RDONLY` after rotation. Rationale:
 
 - `DataFile` is an internal class; the engine exclusively controls when `append()` is called.
 - Re-opening the fd purely for semantic enforcement adds syscall overhead and complexity without improving correctness for the production path.
@@ -784,9 +787,13 @@ We use fine-grained C++20 modules:
 
 Contrast with `HintFile`, which uses `OpenForWrite` / `OpenForRead` factory functions. That split models externally visible, non-overlapping lifecycles at different call sites: one site writes during `flush_hints()`, a completely separate site reads during recovery. Encoding that distinction in the type prevents mixing them up. `DataFile` has no equivalent external semantic split.
 
-### DataFile mmap for sealed files
+### DataFile mmap
 
-When `seal()` is called, the file is memory-mapped with `mmap(PROT_READ, MAP_PRIVATE)` and `MADV_RANDOM`. Subsequent `read_entry()` and `read_value()` serve directly from the mapped region, eliminating `pread` syscalls on the hot read path. If `mmap` fails (e.g. address space exhaustion), the class silently falls back to `pread`. The mapping is released by `munmap` in the destructor and move-assignment operator.
+Two mmap strategies are used depending on the file's lifecycle:
+
+**Active (writable) file — `WritableMmapDataFile`**: When `Options::use_mmap` is set, the active file is pre-allocated to the rotation threshold via `ftruncate` and mapped with `mmap(PROT_READ, MAP_SHARED)`. MAP_SHARED is required so that `pwritev` writes through the fd update the same pages that mmap readers see. Reads within the mapped region are zero-syscall memcpy; reads beyond (rare: file grew past pre-allocated size) fall back to `pread`. On `truncate()` (called by `resume()`), the mapping is released via `munmap`, the file is truncated, and a new mapping is created — avoiding SIGBUS from accessing pages beyond the new EOF.
+
+**Sealed (read-only) files**: When `seal()` is called, the file is memory-mapped with `mmap(PROT_READ, MAP_PRIVATE)` and `MADV_RANDOM`. Subsequent `read_entry()` and `read_value()` serve directly from the mapped region, eliminating `pread` syscalls on the hot read path. If `mmap` fails (e.g. address space exhaustion), the class silently falls back to `pread`. The mapping is released by `munmap` in the destructor.
 
 On WASM/Emscripten builds, mmap is disabled (`#ifndef __EMSCRIPTEN__`). Emscripten's mmap emulation allocates a heap buffer and copies the file contents into it — functionally identical to `pread` but with doubled memory consumption. WASM builds use the `pread` fallback exclusively.
 
@@ -1336,7 +1343,7 @@ The seam is intentionally minimal:
 - `src/engine/util.cppm`: C++23 module (`bytecask.util`) — `Crc32` accumulator (google/crc32c), `narrow<To>(From)` checked conversion
 - `src/engine/serialization.cppm`: C++23 module (`bytecask.serialization`) — `ByteWriter`, `ByteReader`, `read_le`, `write_le`
 - `src/engine/data_entry.cppm`: C++23 module (`bytecask.data_entry`) — `EntryType`, `EntryHeader`, `DataEntry`, serialization helpers
-- `src/engine/data_file.cppm`: C++23 module (`bytecask.data_file`) — `DataFile` POSIX I/O, `Offset`
+- `src/engine/data_file.cppm`: C++23 module (`bytecask.data_file`) — `DataFile`, `WritableDataFile`, `WritableMmapDataFile`, `WritablePosixDataFile`, `ReadOnlyMmapDataFile`, `ReadOnlyPosixDataFile`, `Offset`
 - `src/engine/hint_entry.cppm`: C++23 module (`bytecask.hint_entry`) — `HintEntry`, `serialize_entry`, `deserialize_entry`
 - `src/engine/hint_file.cppm`: C++23 module (`bytecask.hint_file`) — `HintFile`, `OpenForWrite`/`OpenForRead`
 - `src/engine/radix_tree.cppm`: C++23 module (`bytecask.radix_tree`) — `PersistentRadixTree<V>`, `RadixTreeIterator<V>`
@@ -1501,7 +1508,7 @@ void ingest(std::span<const DataEntryView> entries);
 
 - **Idempotent**: entries with `sequence <= durable_seq` are silently skipped.
 - **Batch-safe rotation**: `BulkBegin`/`BulkEnd` pairs always land in the same data file. Rotation only occurs at boundaries where no batch is open.
-- **Chunked I/O**: entries are written in chunks separated by rotation boundaries — one `writev` + one `fdatasync` per chunk, mirroring the leader's group-commit batching.
+- **Chunked I/O**: entries are written in chunks separated by rotation boundaries — one `pwritev` + one `fdatasync` per chunk, mirroring the leader's group-commit batching.
 - **Durability before visibility**: `store_state` (publishing to readers) happens only after the final `fdatasync`.
 - **Degraded-state on failure**: same pattern as the normal write path — on I/O failure, the engine goes degraded and `resume()` recovers.
 

@@ -190,10 +190,6 @@ export struct Options {
   // When false (default), reads use pread(2), avoiding virtual address space
   // pressure under memory contention.
   bool use_mmap{false};
-  // When true, the active file maintains a heap buffer (sized to
-  // max_file_bytes) for fast reads without syscalls. When false (default),
-  // active-file reads use pread(2), saving one max_file_bytes allocation.
-  bool use_write_buffer{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -949,7 +945,6 @@ private:
   int lock_fd_{-1};  // flock() on dir_/.lock; released by close() in ~DB()
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
   bool use_mmap_{false};
-  bool use_write_buffer_{false};
   SizeLimits size_limits_;
   mutable Counters counters_;
   // All mutable state — SWMR. Writers publish via atomic_store()
@@ -1862,7 +1857,7 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
 // Throws std::system_error if the directory cannot be prepared.
 DB::DB(std::filesystem::path dir, Options opts)
     : dir_{std::move(dir)}, rotation_threshold_{opts.max_file_bytes},
-      use_mmap_{opts.use_mmap}, use_write_buffer_{opts.use_write_buffer},
+      use_mmap_{opts.use_mmap},
       size_limits_{std::min(opts.max_key_bytes, kMaxKeySize),
                    std::min(opts.max_value_bytes, kMaxValueSize)},
       state_{std::make_shared<EngineState>()} {
@@ -1908,9 +1903,8 @@ DB::DB(std::filesystem::path dir, Options opts)
     counters_.files_opened.store(file_count, std::memory_order_relaxed);
     s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
-    auto new_active = WritableDataFile::openForWrite(
-        dir_ / (stem + ".data"),
-        use_write_buffer_ ? rotation_threshold_ : 0);
+    auto new_active = openDataFileForWrite(
+        dir_ / (stem + ".data"), rotation_threshold_, use_mmap_);
     // +1 for the new active file.
     counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
     auto files_t = s.files.transient();
@@ -2423,9 +2417,8 @@ void DB::rotate_active_file(TransientEngineState &t,
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_rotate_file_creation);
 #endif
-  auto new_file = WritableDataFile::openForWrite(
-      dir_ / (stem + ".data"),
-      use_write_buffer_ ? rotation_threshold_ : 0);
+  auto new_file = openDataFileForWrite(
+      dir_ / (stem + ".data"), rotation_threshold_, use_mmap_);
   t.apply_rotate_file(read_only_old, std::move(new_file));
   auto dir = dir_;
   worker_.dispatch([f = std::move(read_only_old), d = std::move(dir)] {
@@ -2606,8 +2599,8 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_vacuum_compact_tmp_create);
 #endif
-    auto tmp_file = WritableDataFile::openForWrite(
-        tmp_data_path, use_write_buffer_ ? rotation_threshold_ : 0);
+    auto tmp_file = openDataFileForWrite(
+        tmp_data_path, rotation_threshold_, use_mmap_);
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id);
     tmp_file->sync();
   }
@@ -2782,9 +2775,8 @@ void DB::resume() {
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_resume_file_creation);
 #endif
-  auto new_file = WritableDataFile::openForWrite(
-      dir_ / (stem + ".data"),
-      use_write_buffer_ ? rotation_threshold_ : 0);
+  auto new_file = openDataFileForWrite(
+      dir_ / (stem + ".data"), rotation_threshold_, use_mmap_);
 
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.

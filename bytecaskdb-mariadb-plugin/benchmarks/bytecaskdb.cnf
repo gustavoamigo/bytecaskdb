@@ -1,3 +1,2 @@
 [mariadbd]
 bytecaskdb_use_mmap = ON
-bytecaskdb_use_write_buffer = ON

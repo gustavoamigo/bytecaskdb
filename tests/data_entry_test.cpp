@@ -118,7 +118,7 @@ TEST_CASE("DataFile appends two entries with correct offsets and sequences",
   std::filesystem::remove(tmp);
 
   {
-    auto df = bytecask::WritableDataFile::openForWrite(tmp);
+    auto df = bytecask::openDataFileForWrite(tmp, 0, false);
     const auto offset0 = df->append_entry(1, bytecask::EntryType::Put,
                                    to_bytes("key1"), to_bytes("val1"));
     const auto offset1 = df->append_entry(2, bytecask::EntryType::Put,
@@ -164,7 +164,7 @@ TEST_CASE("DataFile::read round-trips entries at recorded offsets",
   const auto tmp = std::filesystem::temp_directory_path() / "bc_test_read.data";
   std::filesystem::remove(tmp);
 
-  auto df = bytecask::WritableDataFile::openForWrite(tmp);
+  auto df = bytecask::openDataFileForWrite(tmp, 0, false);
   const auto off0 = df->append_entry(7, bytecask::EntryType::Put, to_bytes("hello"),
                               to_bytes("world"));
   const auto off1 =
@@ -208,7 +208,7 @@ TEST_CASE("DataFile::append byte layout matches serialize_entry", "[datafile]") 
 
   // DataFile::append via writev must produce identical bytes on disk.
   {
-    auto df = bytecask::WritableDataFile::openForWrite(tmp);
+    auto df = bytecask::openDataFileForWrite(tmp, 0, false);
     [[maybe_unused]] auto off =
         df->append_entry(seq, bytecask::EntryType::Put, to_bytes(key), to_bytes(value));
     df->sync();
