@@ -185,6 +185,8 @@ struct TABLE_SHARE {
 struct CHARSET_INFO {
   uint number{0};
   uint state{0};
+  uint mbminlen{1};
+  uint mbmaxlen{1};
 };
 
 struct Field {
@@ -198,8 +200,10 @@ struct Field {
   virtual bool is_null_in_record(const uchar *) const { return false; }
   virtual bool real_maybe_null() const { return false; }
   virtual bool is_unsigned() const { return false; }
+  virtual bool binary() const { return true; }
   virtual const CHARSET_INFO *charset() const { return nullptr; }
   virtual int64_t val_int() const { return 0; }
+  virtual uint pack_length() const { return field_length; }
   ptrdiff_t offset(const uchar *record) const {
     return ptr ? (ptr - record) : 0;
   }
@@ -207,12 +211,22 @@ struct Field {
 
 struct Field_long : public Field {
   enum_field_types type() const override { return MYSQL_TYPE_LONG; }
+  uint pack_length() const override { return 4; }
   int64_t val_int() const override {
     if (!ptr) return 0;
     int32_t v;
     std::memcpy(&v, ptr, sizeof(v));
     return v;
   }
+};
+
+struct Field_string : public Field {
+  const CHARSET_INFO *cs_{nullptr};
+
+  enum_field_types type() const override { return MYSQL_TYPE_STRING; }
+  bool binary() const override { return false; }
+  const CHARSET_INFO *charset() const override { return cs_; }
+  uint pack_length() const override { return field_length; }
 };
 
 struct Field_blob : public Field {
@@ -227,6 +241,7 @@ struct Field_blob : public Field {
   }
 
   uint32_t pack_length_no_ptr() const { return pack_len_no_ptr_; }
+  uint pack_length() const override { return pack_len_no_ptr_ + sizeof(uchar *); }
 };
 
 // MariaDB key_range used by records_in_range.
