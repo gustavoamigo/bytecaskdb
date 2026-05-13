@@ -952,14 +952,17 @@ public:
 
   [[nodiscard]] auto scan(Offset offset) const
       -> std::optional<std::pair<DataEntry, Offset>> override {
-    if (offset >= mmap_size_) {
+    if (offset + kHeaderSize > mmap_size_) {
       return std::nullopt;
     }
     const auto header = read_header(offset);
     if (header.sequence == 0) return std::nullopt;
-    auto view = read_entry_with_key_size(offset, header.key_size, header.value_size);
     const auto next =
         offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
+    if (next > mmap_size_) {
+      return std::nullopt;
+    }
+    auto view = read_entry_with_key_size(offset, header.key_size, header.value_size);
     return std::make_pair(
         DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
                   .key = {view.key.begin(), view.key.end()},
