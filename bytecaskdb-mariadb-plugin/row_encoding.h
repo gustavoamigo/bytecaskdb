@@ -3,13 +3,13 @@
 //
 // row_encoding.h — Row encoding for the ByteCaskDB / MariaDB plugin.
 //
-// Row values are stored with a 3-byte version envelope:
-//   byte 0:   format version (currently 0x01)
-//   bytes 1-2: schema_version (little-endian uint16)
-//   bytes 3+:  MariaDB raw internal row buffer (reclength bytes)
-//
-// Phase 4+ will introduce a compact custom encoding for schema evolution and
-// covering secondary indexes.
+// V2 compact format (sequential per-field):
+//   byte 0:      0x02 (format version)
+//   bytes 1-2:   schema_version (LE uint16)
+//   bytes 3+:    null bitmap (null_bytes), then each field sequentially:
+//     - compactable CHAR (multibyte charset): [actual_len: LE u16][data]
+//     - all others: [data: pack_length() bytes] verbatim from record offset
+//     - BLOB: inline data appended after all fields
 
 #pragma once
 
@@ -22,16 +22,15 @@
 namespace bytecaskdb {
 
 // Encodes the row in `buf` (table->record[0]) into a byte vector.
-// Prepends a 3-byte envelope: [format=0x01][schema_version LE u16].
+// Uses V2 compact format: strips trailing spaces from multi-byte CHAR fields.
 void encode_row_into(std::vector<uint8_t> &out, TABLE *table, const uchar *buf,
                      uint16_t schema_version);
 
 std::vector<uint8_t> encode_row(TABLE *table, const uchar *buf,
                                 uint16_t schema_version);
 
-// Decodes a previously encoded row value back into `buf` (table->record[0]).
-// Strips the 3-byte envelope, copies min(payload_len, reclength) bytes.
-// Pads remaining bytes with zeros if the stored value is short (defensive).
+// Decodes a V2-encoded row value back into `buf` (table->record[0]).
+// Fails (zeros buf) if the format byte is not 0x02.
 void decode_row(TABLE *table, const uint8_t *value, std::size_t value_len,
                 uchar *buf);
 

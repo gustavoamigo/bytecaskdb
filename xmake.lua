@@ -1,7 +1,7 @@
 add_rules("mode.debug", "mode.release", "mode.releasedbg")
 
 add_requires("crc32c")
-add_requires("jemalloc", {optional = true, configs = {prof = true}})
+add_requires("jemalloc 5.3.0", {optional = true})
 -- Test dependency — optional so `xmake build` (default targets)
 -- doesn't download/build it unless the consuming target is explicitly built.
 add_requires("catch2 3.x", {optional = true})

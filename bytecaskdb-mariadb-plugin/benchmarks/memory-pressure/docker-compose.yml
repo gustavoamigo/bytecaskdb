@@ -1,11 +1,14 @@
 services:
   innodb:
+    security_opt:
+      - seccomp:unconfined
     image: docker.io/library/mariadb:10.11
     mem_limit: 2g
-    memswap_limit: 4g
-    cpus: 4
+    memswap_limit: 2g
+    cpus: 8
     volumes:
       - ./innodb.cnf:/etc/mysql/mariadb.conf.d/90-benchmark.cnf:ro,Z
+      - innodb-data:/var/lib/mysql
     environment:
       MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: 1
       MARIADB_DATABASE: sbtest
@@ -16,15 +19,18 @@ services:
       retries: 30
 
   bytecaskdb:
+    security_opt:
+      - seccomp:unconfined  
     build:
       context: ../../..
       dockerfile: bytecaskdb-mariadb-plugin/Dockerfile
     mem_limit: 2g
-    memswap_limit: 4g
-    cpus: 4
+    memswap_limit: 2g
+    cpus: 8
     restart: on-failure:3
     volumes:
       - ./bytecaskdb.cnf:/etc/mysql/mariadb.conf.d/90-benchmark.cnf:ro,Z
+      - bytecaskdb-data:/var/lib/mysql
     environment:
       MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: 1
       MARIADB_DATABASE: sbtest
@@ -51,3 +57,7 @@ services:
     volumes:
       - ./run-benchmark.sh:/benchmark/run-benchmark.sh:ro,Z
       - ./results:/results:Z
+
+volumes:
+  innodb-data:
+  bytecaskdb-data:

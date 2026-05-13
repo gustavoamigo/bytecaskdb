@@ -85,6 +85,7 @@ log "Waiting for ByteCaskDB..."
 wait_for_db "$BYTECASKDB_HOST"
 log "Both databases ready."
 
+
 # ---------------------------------------------------------------------------
 # Prepare data (5M rows on each)
 # ---------------------------------------------------------------------------
@@ -130,6 +131,8 @@ while [ $inserted -lt $TABLE_SIZE ]; do
 done
 
 log "Data preparation complete."
+
+
 
 # ---------------------------------------------------------------------------
 # Run benchmarks

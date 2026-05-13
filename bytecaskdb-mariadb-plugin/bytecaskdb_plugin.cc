@@ -592,7 +592,7 @@ static void vacuum_loop() {
       s_vacuum_idle_cv.notify_all();
     }
     s_vacuum_cv.wait_for(lk, more_work ? kBusyInterval : kIdleInterval,
-                         [] { return s_vacuum_stop || s_vacuum_pause_count == 0; });
+                         [] { return s_vacuum_stop; });
   }
 }
 
