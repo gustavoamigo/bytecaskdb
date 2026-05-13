@@ -256,6 +256,34 @@ TEST_CASE("WritableDataFile::read_entry_unverified pread fallback",
   std::filesystem::remove(path);
 }
 
+TEST_CASE("WritablePosixDataFile::read_entry_unverified long key triggers retry",
+          "[data_file]") {
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_posix_wr_longkey.data";
+  std::filesystem::remove(path);
+
+  // Key > 256 bytes exceeds kKeyBudget, forcing the second pread.
+  const std::string long_key_str(300, 'L');
+  const auto key = to_bytes(long_key_str);
+  const auto val = to_bytes("lv");
+
+  auto file = bytecask::openDataFileForWrite(path, 0, false);
+  (void)file->append_entry(42, bytecask::EntryType::Put, key, val);
+
+  std::vector<std::byte> io_buf;
+  auto view = file->read_entry_unverified(
+      0, static_cast<std::uint32_t>(val.size()), io_buf);
+
+  CHECK(view.sequence == 42);
+  CHECK(view.entry_type == bytecask::EntryType::Put);
+  CHECK(view.key.size() == 300);
+  CHECK(std::equal(view.key.begin(), view.key.end(), key.begin()));
+  CHECK(std::equal(view.value.begin(), view.value.end(), val.begin()));
+  CHECK(!io_buf.empty());
+
+  std::filesystem::remove(path);
+}
+
 // ---------------------------------------------------------------------------
 // read_entry_unverified — ReadOnlyPosixDataFile
 // ---------------------------------------------------------------------------
