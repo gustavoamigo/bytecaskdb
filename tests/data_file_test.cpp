@@ -349,3 +349,138 @@ TEST_CASE("ReadOnlyMmapDataFile::read_entry_unverified",
 
   std::filesystem::remove(path);
 }
+
+// ---------------------------------------------------------------------------
+// WritableMmapDataFile — pread fallback (entry beyond mmap region)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("WritableMmapDataFile: read_header pread fallback beyond mmap",
+          "[data_file]") {
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_mmap_hdr_fallback.data";
+  std::filesystem::remove(path);
+
+  const auto key = to_bytes("k");
+  const auto val = to_bytes("v");
+
+  // capacity=16 — far too small for any entry, so all reads fall through to pread.
+  auto file = bytecask::openDataFileForWrite(path, 16, true);
+  (void)file->append_entry(10, bytecask::EntryType::Put, key, val);
+
+  // read_entry uses read_header internally — if header is beyond mmap, it uses pread.
+  std::vector<std::byte> io_buf;
+  auto view = file->read_entry_unverified(
+      0, static_cast<std::uint32_t>(val.size()), io_buf);
+
+  CHECK(view.sequence == 10);
+  CHECK(view.entry_type == bytecask::EntryType::Put);
+  CHECK(std::equal(view.key.begin(), view.key.end(), key.begin()));
+  CHECK(std::equal(view.value.begin(), view.value.end(), val.begin()));
+  // pread fallback uses io_buf.
+  CHECK(!io_buf.empty());
+
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("WritableMmapDataFile: read_value pread fallback beyond mmap",
+          "[data_file]") {
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_mmap_rv_fallback.data";
+  std::filesystem::remove(path);
+
+  const auto key = to_bytes("rk");
+  const auto val = to_bytes("read_value_test_payload");
+
+  // capacity=16 — entry written beyond mmap region.
+  auto file = bytecask::openDataFileForWrite(path, 16, true);
+  (void)file->append_entry(20, bytecask::EntryType::Put, key, val);
+
+  // read_value with verify=false exercises the pread fallback in read_value.
+  std::vector<std::byte> io_buf;
+  std::vector<std::byte> out;
+  file->read_value(0, static_cast<std::uint16_t>(key.size()),
+                   static_cast<std::uint32_t>(val.size()), false, io_buf, out);
+
+  CHECK(std::equal(out.begin(), out.end(), val.begin()));
+
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("WritableMmapDataFile: read_entry_with_key_size pread fallback",
+          "[data_file]") {
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_mmap_entry_fallback.data";
+  std::filesystem::remove(path);
+
+  const auto key = to_bytes("ekey");
+  const auto val = to_bytes("eval");
+
+  // capacity=16 — forces pread path for read_entry (verified).
+  auto file = bytecask::openDataFileForWrite(path, 16, true);
+  (void)file->append_entry(30, bytecask::EntryType::Put, key, val);
+
+  std::vector<std::byte> io_buf;
+  auto view = file->read_entry(0, static_cast<std::uint32_t>(val.size()), io_buf);
+
+  CHECK(view.sequence == 30);
+  CHECK(view.entry_type == bytecask::EntryType::Put);
+  CHECK(std::equal(view.key.begin(), view.key.end(), key.begin()));
+  CHECK(std::equal(view.value.begin(), view.value.end(), val.begin()));
+  CHECK(!io_buf.empty());
+
+  std::filesystem::remove(path);
+}
+
+// ---------------------------------------------------------------------------
+// ReadOnlyMmapDataFile::scan — truncated file handling
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ReadOnlyMmapDataFile::scan returns nullopt on truncated header",
+          "[data_file]") {
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_mmap_scan_trunc_hdr.data";
+  std::filesystem::remove(path);
+
+  const auto key = to_bytes("scankey");
+  const auto val = to_bytes("scanval");
+  {
+    auto w = bytecask::openDataFileForWrite(path, 0, false);
+    (void)w->append_entry(1, bytecask::EntryType::Put, key, val);
+    w->sync();
+  }
+
+  // Truncate to less than kHeaderSize bytes — scan at offset 0 should return nullopt.
+  std::filesystem::resize_file(path, bytecask::kHeaderSize - 1);
+
+  auto file = bytecask::ReadOnlyMmapDataFile::openForRead(path);
+  auto result = file->scan(0);
+  CHECK(!result.has_value());
+
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("ReadOnlyMmapDataFile::scan returns nullopt on truncated entry body",
+          "[data_file]") {
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_mmap_scan_trunc_body.data";
+  std::filesystem::remove(path);
+
+  const auto key = to_bytes("bkey");
+  const auto val = to_bytes("bodyval");
+  const auto full_size =
+      bytecask::kHeaderSize + key.size() + val.size() + bytecask::kCrcSize;
+  {
+    auto w = bytecask::openDataFileForWrite(path, 0, false);
+    (void)w->append_entry(2, bytecask::EntryType::Put, key, val);
+    w->sync();
+  }
+
+  // Truncate mid-entry: header is valid but body is incomplete.
+  std::filesystem::resize_file(path, full_size - 2);
+
+  auto file = bytecask::ReadOnlyMmapDataFile::openForRead(path);
+  auto result = file->scan(0);
+  CHECK(!result.has_value());
+
+  std::filesystem::remove(path);
+}
