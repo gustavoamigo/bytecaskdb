@@ -22,7 +22,8 @@ set -euo pipefail
 # Defaults
 # ---------------------------------------------------------------------------
 TABLE_SIZE=50000
-THREADS="1,16"
+THREADS
+THREADS="1,8,16"
 DURATION=10
 ENGINES="bytecaskdb,innodb,rocksdb"
 WORKLOADS="oltp_point_select oltp_read_only oltp_write_only oltp_insert oltp_read_write"
@@ -227,13 +228,7 @@ if engine_enabled innodb; then
     "$INNODB_PORT" \
     "$INNODB_DIR/mariadbd.pid" \
     "$INNODB_DIR/error.log" \
-    "" \
-    --innodb-buffer-pool-size=1G \
-    --innodb-log-file-size=256M \
-    --innodb-flush-log-at-trx-commit=1 \
-    --innodb-flush-method=O_DIRECT \
-    --innodb-io-capacity=2000 \
-    --innodb-io-capacity-max=4000
+    "$SCRIPT_DIR/innodb.cnf"
 fi
 
 if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
@@ -244,11 +239,9 @@ if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
     "$ROCKSDB_PORT" \
     "$ROCKSDB_DIR/mariadbd.pid" \
     "$ROCKSDB_DIR/error.log" \
-    "" \
+    "$SCRIPT_DIR/rocksdb.cnf" \
     --plugin-load-add=rocksdb=ha_rocksdb.so \
-    --plugin-dir="$ROCKSDB_PLUGIN_DIR" \
-    --rocksdb-block-cache-size=1G \
-    --rocksdb-max-background-jobs=4
+    --plugin-dir="$ROCKSDB_PLUGIN_DIR"
 fi
 
 # ---------------------------------------------------------------------------

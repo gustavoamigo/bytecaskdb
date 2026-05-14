@@ -1,0 +1,10 @@
+[mariadbd]
+rocksdb_block_cache_size       = 3G
+rocksdb_max_background_jobs    = 4
+
+performance_schema             = OFF
+skip-log-bin
+sync_binlog                    = 0
+table_open_cache               = 200
+thread_cache_size              = 8
+max_connections                = 64
