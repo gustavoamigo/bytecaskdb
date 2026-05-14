@@ -480,10 +480,17 @@ private:
 #endif
     ops_.offset_ = std::filesystem::file_size(path_);
     if (capacity > 0) {
+#ifdef __linux__
+      if (::fallocate(ops_.fd_, 0, 0, narrow<off_t>(capacity)) != 0) {
+        throw std::system_error{errno, std::generic_category(),
+                                "WritableMmapDataFile: fallocate failed"};
+      }
+#else
       if (::ftruncate(ops_.fd_, narrow<off_t>(capacity)) != 0) {
         throw std::system_error{errno, std::generic_category(),
                                 "WritableMmapDataFile: ftruncate failed"};
       }
+#endif
       // NOLINTNEXTLINE(performance-no-int-to-ptr)
       auto *ptr = ::mmap(nullptr, capacity, PROT_READ, MAP_SHARED, ops_.fd_, 0);
       if (ptr == MAP_FAILED) {
