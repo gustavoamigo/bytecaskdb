@@ -166,7 +166,7 @@ int bytecask_del(bytecask_db_t *db,
   try {
     bytecask::WriteOptions opts;
     opts.sync = (sync != 0);
-    bool existed = db->db.del(opts, to_view(key, key_len));
+    bool existed = db->db.del(opts, to_view(key, key_len)).has_value();
     return existed ? 1 : 0;
   } catch (const std::exception &e) {
     set_errmsg(e.what());
@@ -544,7 +544,7 @@ int bytecask_apply_batch(bytecask_db_t *db,
   try {
     bytecask::WriteOptions opts;
     opts.sync = (sync != 0);
-    bool committed = db->db.apply_batch(opts, std::move(plan->plan));
+    bool committed = db->db.apply_batch(opts, std::move(plan->plan)).has_value();
     delete plan;
     return committed ? 1 : 0;
   } catch (const std::exception &e) {

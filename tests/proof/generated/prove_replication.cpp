@@ -453,7 +453,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__success", "[prove_repl]") 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -506,7 +506,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__append_fails_nothing_writt
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -577,7 +577,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__append_fails_partial_write
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -649,7 +649,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__sync_fails", "[prove_repl]
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -695,11 +695,11 @@ TEST_CASE("prove_repl__single_key__duplicate_delivery__success", "[prove_repl]")
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
     follower.ingest(views);
-    auto seq_after = follower.current_sequence();
+    auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
     follower.ingest(views);
-    CHECK(follower.current_sequence() == seq_after);
+    CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
     assert_replication_recovery(follower_dir, leader_bl);
@@ -730,13 +730,13 @@ TEST_CASE("prove_repl__single_key__planned_promotion__success", "[prove_repl]") 
         bytecask::DbFollowerMode);
 
     follower.set_mode(bytecask::Mode::Leader);
-    auto seq_before = follower.current_sequence();
+    auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
-    CHECK(follower.current_sequence() == seq_before + 1);
+    CHECK(follower.durable_sequence() == seq_before + 1);
 
     // Backward sync: follower → leader.
     auto snap2 = follower.snapshot();
-    auto owned2 = collect_changes(follower.changes_since(snap2, leader.current_sequence()));
+    auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
     leader.ingest(views2);
 
@@ -1190,7 +1190,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__success", "[prove_repl]") {
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -1247,7 +1247,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__append_fails_nothing_writte
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -1322,7 +1322,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__append_fails_partial_write"
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -1398,7 +1398,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__sync_fails", "[prove_repl]"
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -1448,11 +1448,11 @@ TEST_CASE("prove_repl__multi_key__duplicate_delivery__success", "[prove_repl]") 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
     follower.ingest(views);
-    auto seq_after = follower.current_sequence();
+    auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
     follower.ingest(views);
-    CHECK(follower.current_sequence() == seq_after);
+    CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
     assert_replication_recovery(follower_dir, leader_bl);
@@ -1487,13 +1487,13 @@ TEST_CASE("prove_repl__multi_key__planned_promotion__success", "[prove_repl]") {
         bytecask::DbFollowerMode);
 
     follower.set_mode(bytecask::Mode::Leader);
-    auto seq_before = follower.current_sequence();
+    auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
-    CHECK(follower.current_sequence() == seq_before + 1);
+    CHECK(follower.durable_sequence() == seq_before + 1);
 
     // Backward sync: follower → leader.
     auto snap2 = follower.snapshot();
-    auto owned2 = collect_changes(follower.changes_since(snap2, leader.current_sequence()));
+    auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
     leader.ingest(views2);
 
@@ -1920,7 +1920,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__success", "[prove_repl]") 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -1974,7 +1974,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__append_fails_nothing_writt
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -2046,7 +2046,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__append_fails_partial_write
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -2119,7 +2119,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__sync_fails", "[prove_repl]
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -2166,11 +2166,11 @@ TEST_CASE("prove_repl__overwrites__duplicate_delivery__success", "[prove_repl]")
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
     follower.ingest(views);
-    auto seq_after = follower.current_sequence();
+    auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
     follower.ingest(views);
-    CHECK(follower.current_sequence() == seq_after);
+    CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
     assert_replication_recovery(follower_dir, leader_bl);
@@ -2202,13 +2202,13 @@ TEST_CASE("prove_repl__overwrites__planned_promotion__success", "[prove_repl]") 
         bytecask::DbFollowerMode);
 
     follower.set_mode(bytecask::Mode::Leader);
-    auto seq_before = follower.current_sequence();
+    auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
-    CHECK(follower.current_sequence() == seq_before + 1);
+    CHECK(follower.durable_sequence() == seq_before + 1);
 
     // Backward sync: follower → leader.
     auto snap2 = follower.snapshot();
-    auto owned2 = collect_changes(follower.changes_since(snap2, leader.current_sequence()));
+    auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
     leader.ingest(views2);
 
@@ -2635,7 +2635,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__success", "[prove_repl]") {
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -2689,7 +2689,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__append_fails_nothing_written"
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -2761,7 +2761,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__append_fails_partial_write", 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -2834,7 +2834,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__sync_fails", "[prove_repl]") 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -2881,11 +2881,11 @@ TEST_CASE("prove_repl__deletes__duplicate_delivery__success", "[prove_repl]") {
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
     follower.ingest(views);
-    auto seq_after = follower.current_sequence();
+    auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
     follower.ingest(views);
-    CHECK(follower.current_sequence() == seq_after);
+    CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
     assert_replication_recovery(follower_dir, leader_bl);
@@ -2917,13 +2917,13 @@ TEST_CASE("prove_repl__deletes__planned_promotion__success", "[prove_repl]") {
         bytecask::DbFollowerMode);
 
     follower.set_mode(bytecask::Mode::Leader);
-    auto seq_before = follower.current_sequence();
+    auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
-    CHECK(follower.current_sequence() == seq_before + 1);
+    CHECK(follower.durable_sequence() == seq_before + 1);
 
     // Backward sync: follower → leader.
     auto snap2 = follower.snapshot();
-    auto owned2 = collect_changes(follower.changes_since(snap2, leader.current_sequence()));
+    auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
     leader.ingest(views2);
 
@@ -3386,7 +3386,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__success", "[prove_repl]
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -3444,7 +3444,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__append_fails_nothing_wr
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -3520,7 +3520,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__append_fails_partial_wr
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -3597,7 +3597,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__sync_fails", "[prove_re
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -3648,11 +3648,11 @@ TEST_CASE("prove_repl__range_deletes__duplicate_delivery__success", "[prove_repl
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
     follower.ingest(views);
-    auto seq_after = follower.current_sequence();
+    auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
     follower.ingest(views);
-    CHECK(follower.current_sequence() == seq_after);
+    CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
     assert_replication_recovery(follower_dir, leader_bl);
@@ -3688,13 +3688,13 @@ TEST_CASE("prove_repl__range_deletes__planned_promotion__success", "[prove_repl]
         bytecask::DbFollowerMode);
 
     follower.set_mode(bytecask::Mode::Leader);
-    auto seq_before = follower.current_sequence();
+    auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
-    CHECK(follower.current_sequence() == seq_before + 1);
+    CHECK(follower.durable_sequence() == seq_before + 1);
 
     // Backward sync: follower → leader.
     auto snap2 = follower.snapshot();
-    auto owned2 = collect_changes(follower.changes_since(snap2, leader.current_sequence()));
+    auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
     leader.ingest(views2);
 
@@ -4277,7 +4277,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__success", "[prove_repl]") {
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -4336,7 +4336,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__append_fails_nothing_written"
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -4413,7 +4413,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__append_fails_partial_write", 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -4491,7 +4491,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__sync_fails", "[prove_repl]") 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -4566,7 +4566,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__crash_mid_batch", "[prove_rep
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -4620,11 +4620,11 @@ TEST_CASE("prove_repl__batches__duplicate_delivery__success", "[prove_repl]") {
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
     follower.ingest(views);
-    auto seq_after = follower.current_sequence();
+    auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
     follower.ingest(views);
-    CHECK(follower.current_sequence() == seq_after);
+    CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
     assert_replication_recovery(follower_dir, leader_bl);
@@ -4661,13 +4661,13 @@ TEST_CASE("prove_repl__batches__planned_promotion__success", "[prove_repl]") {
         bytecask::DbFollowerMode);
 
     follower.set_mode(bytecask::Mode::Leader);
-    auto seq_before = follower.current_sequence();
+    auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
-    CHECK(follower.current_sequence() == seq_before + 1);
+    CHECK(follower.durable_sequence() == seq_before + 1);
 
     // Backward sync: follower → leader.
     auto snap2 = follower.snapshot();
-    auto owned2 = collect_changes(follower.changes_since(snap2, leader.current_sequence()));
+    auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
     leader.ingest(views2);
 
@@ -5331,7 +5331,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__success", "[prove_repl]") 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -5388,7 +5388,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__append_fails_nothing_writt
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -5463,7 +5463,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__append_fails_partial_write
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -5539,7 +5539,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__sync_fails", "[prove_repl]
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -5612,7 +5612,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__rotation_sync_fails", "[pr
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -5685,7 +5685,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__rotation_file_creation_fai
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -5737,11 +5737,11 @@ TEST_CASE("prove_repl__multi_file__duplicate_delivery__success", "[prove_repl]")
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
     follower.ingest(views);
-    auto seq_after = follower.current_sequence();
+    auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
     follower.ingest(views);
-    CHECK(follower.current_sequence() == seq_after);
+    CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
     assert_replication_recovery(follower_dir, leader_bl);
@@ -5776,13 +5776,13 @@ TEST_CASE("prove_repl__multi_file__planned_promotion__success", "[prove_repl]") 
         bytecask::DbFollowerMode);
 
     follower.set_mode(bytecask::Mode::Leader);
-    auto seq_before = follower.current_sequence();
+    auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
-    CHECK(follower.current_sequence() == seq_before + 1);
+    CHECK(follower.durable_sequence() == seq_before + 1);
 
     // Backward sync: follower → leader.
     auto snap2 = follower.snapshot();
-    auto owned2 = collect_changes(follower.changes_since(snap2, leader.current_sequence()));
+    auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
     leader.ingest(views2);
 
@@ -6227,7 +6227,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__success", "[prove_r
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -6283,7 +6283,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__append_fails_nothin
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -6357,7 +6357,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__append_fails_partia
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -6432,7 +6432,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__sync_fails", "[prov
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -6481,11 +6481,11 @@ TEST_CASE("prove_repl__mixed_sync_nosync__duplicate_delivery__success", "[prove_
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
     follower.ingest(views);
-    auto seq_after = follower.current_sequence();
+    auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
     follower.ingest(views);
-    CHECK(follower.current_sequence() == seq_after);
+    CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
     assert_replication_recovery(follower_dir, leader_bl);
@@ -6529,13 +6529,13 @@ TEST_CASE("prove_repl__mixed_sync_nosync__planned_promotion__success", "[prove_r
         bytecask::DbFollowerMode);
 
     follower.set_mode(bytecask::Mode::Leader);
-    auto seq_before = follower.current_sequence();
+    auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
-    CHECK(follower.current_sequence() == seq_before + 1);
+    CHECK(follower.durable_sequence() == seq_before + 1);
 
     // Backward sync: follower → leader.
     auto snap2 = follower.snapshot();
-    auto owned2 = collect_changes(follower.changes_since(snap2, leader.current_sequence()));
+    auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
     leader.ingest(views2);
 
@@ -7199,7 +7199,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__success", "[prove_repl]")
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -7256,7 +7256,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__append_fails_nothing_writ
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -7331,7 +7331,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__append_fails_partial_writ
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -7407,7 +7407,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__sync_fails", "[prove_repl
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -7480,7 +7480,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__rotation_sync_fails", "[p
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -7553,7 +7553,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__rotation_file_creation_fa
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -7605,11 +7605,11 @@ TEST_CASE("prove_repl__nosync_only__duplicate_delivery__success", "[prove_repl]"
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
     follower.ingest(views);
-    auto seq_after = follower.current_sequence();
+    auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
     follower.ingest(views);
-    CHECK(follower.current_sequence() == seq_after);
+    CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
     assert_replication_recovery(follower_dir, leader_bl);
@@ -7654,13 +7654,13 @@ TEST_CASE("prove_repl__nosync_only__planned_promotion__success", "[prove_repl]")
         bytecask::DbFollowerMode);
 
     follower.set_mode(bytecask::Mode::Leader);
-    auto seq_before = follower.current_sequence();
+    auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
-    CHECK(follower.current_sequence() == seq_before + 1);
+    CHECK(follower.durable_sequence() == seq_before + 1);
 
     // Backward sync: follower → leader.
     auto snap2 = follower.snapshot();
-    auto owned2 = collect_changes(follower.changes_since(snap2, leader.current_sequence()));
+    auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
     leader.ingest(views2);
 
@@ -8105,7 +8105,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__success", "[prove_re
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -8161,7 +8161,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__append_fails_nothing
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -8235,7 +8235,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__append_fails_partial
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -8310,7 +8310,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__sync_fails", "[prove
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -8359,11 +8359,11 @@ TEST_CASE("prove_repl__nosync_then_sync__duplicate_delivery__success", "[prove_r
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
     follower.ingest(views);
-    auto seq_after = follower.current_sequence();
+    auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
     follower.ingest(views);
-    CHECK(follower.current_sequence() == seq_after);
+    CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
     assert_replication_recovery(follower_dir, leader_bl);
@@ -8407,13 +8407,13 @@ TEST_CASE("prove_repl__nosync_then_sync__planned_promotion__success", "[prove_re
         bytecask::DbFollowerMode);
 
     follower.set_mode(bytecask::Mode::Leader);
-    auto seq_before = follower.current_sequence();
+    auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
-    CHECK(follower.current_sequence() == seq_before + 1);
+    CHECK(follower.durable_sequence() == seq_before + 1);
 
     // Backward sync: follower → leader.
     auto snap2 = follower.snapshot();
-    auto owned2 = collect_changes(follower.changes_since(snap2, leader.current_sequence()));
+    auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
     leader.ingest(views2);
 
@@ -9349,7 +9349,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__success", "[prove_re
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -9417,7 +9417,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_nothing
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -9503,7 +9503,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_partial
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -9590,7 +9590,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__sync_fails", "[prove
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -9674,7 +9674,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__crash_mid_batch", "[
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -9760,7 +9760,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_sync_fails"
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -9844,7 +9844,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_file_creati
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      auto from_seq = follower.current_sequence();
+      auto from_seq = follower.durable_sequence();
       auto snap2 = leader.snapshot();
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
@@ -9907,11 +9907,11 @@ TEST_CASE("prove_repl__vacuumed_batches__duplicate_delivery__success", "[prove_r
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
     follower.ingest(views);
-    auto seq_after = follower.current_sequence();
+    auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
     follower.ingest(views);
-    CHECK(follower.current_sequence() == seq_after);
+    CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
     assert_replication_recovery(follower_dir, leader_bl);
@@ -9957,13 +9957,13 @@ TEST_CASE("prove_repl__vacuumed_batches__planned_promotion__success", "[prove_re
         bytecask::DbFollowerMode);
 
     follower.set_mode(bytecask::Mode::Leader);
-    auto seq_before = follower.current_sequence();
+    auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
-    CHECK(follower.current_sequence() == seq_before + 1);
+    CHECK(follower.durable_sequence() == seq_before + 1);
 
     // Backward sync: follower → leader.
     auto snap2 = follower.snapshot();
-    auto owned2 = collect_changes(follower.changes_since(snap2, leader.current_sequence()));
+    auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
     leader.ingest(views2);
 
@@ -9982,7 +9982,7 @@ TEST_CASE("prove_manifest__single_key__success", "[prove_manifest]") {
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
 
     auto manifest = leader.create_manifest();
-    CHECK(manifest.through_sequence == leader.current_sequence());
+    CHECK(manifest.through_sequence == leader.durable_sequence());
     CHECK_FALSE(manifest.files.empty());
 
     // Verify all files exist on disk.
@@ -10049,7 +10049,7 @@ TEST_CASE("prove_manifest__multi_key__success", "[prove_manifest]") {
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
 
     auto manifest = leader.create_manifest();
-    CHECK(manifest.through_sequence == leader.current_sequence());
+    CHECK(manifest.through_sequence == leader.durable_sequence());
     CHECK_FALSE(manifest.files.empty());
 
     // Verify all files exist on disk.
@@ -10121,7 +10121,7 @@ TEST_CASE("prove_manifest__overwrites__success", "[prove_manifest]") {
     leader.put({}, to_bytes("k1"), to_bytes("new"));
 
     auto manifest = leader.create_manifest();
-    CHECK(manifest.through_sequence == leader.current_sequence());
+    CHECK(manifest.through_sequence == leader.durable_sequence());
     CHECK_FALSE(manifest.files.empty());
 
     // Verify all files exist on disk.
@@ -10187,7 +10187,7 @@ TEST_CASE("prove_manifest__deletes__success", "[prove_manifest]") {
     (void)leader.del({}, to_bytes("k1"));
 
     auto manifest = leader.create_manifest();
-    CHECK(manifest.through_sequence == leader.current_sequence());
+    CHECK(manifest.through_sequence == leader.durable_sequence());
     CHECK_FALSE(manifest.files.empty());
 
     // Verify all files exist on disk.
@@ -10257,7 +10257,7 @@ TEST_CASE("prove_manifest__range_deletes__success", "[prove_manifest]") {
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
 
     auto manifest = leader.create_manifest();
-    CHECK(manifest.through_sequence == leader.current_sequence());
+    CHECK(manifest.through_sequence == leader.durable_sequence());
     CHECK_FALSE(manifest.files.empty());
 
     // Verify all files exist on disk.
@@ -10336,7 +10336,7 @@ TEST_CASE("prove_manifest__batches__success", "[prove_manifest]") {
     }
 
     auto manifest = leader.create_manifest();
-    CHECK(manifest.through_sequence == leader.current_sequence());
+    CHECK(manifest.through_sequence == leader.durable_sequence());
     CHECK_FALSE(manifest.files.empty());
 
     // Verify all files exist on disk.
@@ -10415,7 +10415,7 @@ TEST_CASE("prove_manifest__multi_file__success", "[prove_manifest]") {
     }
 
     auto manifest = leader.create_manifest();
-    CHECK(manifest.through_sequence == leader.current_sequence());
+    CHECK(manifest.through_sequence == leader.durable_sequence());
     CHECK_FALSE(manifest.files.empty());
 
     // Verify all files exist on disk.
@@ -10489,7 +10489,7 @@ TEST_CASE("prove_manifest__mixed_sync_nosync__success", "[prove_manifest]") {
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
 
     auto manifest = leader.create_manifest();
-    CHECK(manifest.through_sequence == leader.current_sequence());
+    CHECK(manifest.through_sequence == leader.durable_sequence());
     CHECK_FALSE(manifest.files.empty());
 
     // Verify all files exist on disk.
@@ -10562,7 +10562,7 @@ TEST_CASE("prove_manifest__nosync_only__success", "[prove_manifest]") {
     }
 
     auto manifest = leader.create_manifest();
-    CHECK(manifest.through_sequence == leader.current_sequence());
+    CHECK(manifest.through_sequence == leader.durable_sequence());
     CHECK_FALSE(manifest.files.empty());
 
     // Verify all files exist on disk.
@@ -10636,7 +10636,7 @@ TEST_CASE("prove_manifest__nosync_then_sync__success", "[prove_manifest]") {
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
 
     auto manifest = leader.create_manifest();
-    CHECK(manifest.through_sequence == leader.current_sequence());
+    CHECK(manifest.through_sequence == leader.durable_sequence());
     CHECK_FALSE(manifest.files.empty());
 
     // Verify all files exist on disk.
@@ -10720,7 +10720,7 @@ TEST_CASE("prove_manifest__vacuumed_batches__success", "[prove_manifest]") {
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
 
     auto manifest = leader.create_manifest();
-    CHECK(manifest.through_sequence == leader.current_sequence());
+    CHECK(manifest.through_sequence == leader.durable_sequence());
     CHECK_FALSE(manifest.files.empty());
 
     // Verify all files exist on disk.

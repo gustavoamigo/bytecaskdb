@@ -300,7 +300,7 @@ uint32_t catalog_alloc_table_id(bytecask::DB *db) {
     bool committed = false;
     try {
       committed = db->apply_batch(bytecask::WriteOptions{.sync = true},
-                                  std::move(plan));
+                                  std::move(plan)).has_value();
     } catch (const std::exception &e) {
       sql_print_error("ByteCaskDB: alloc_table_id apply failed: %s",
               e.what());
@@ -414,7 +414,7 @@ bool catalog_rename_table_meta(bytecask::DB *db,
   bool committed = false;
   try {
     committed = db->apply_batch(bytecask::WriteOptions{.sync = true},
-                                std::move(plan));
+                                std::move(plan)).has_value();
   } catch (const std::exception &e) {
     sql_print_error("ByteCaskDB: rename_table_meta apply failed: %s",
             e.what());

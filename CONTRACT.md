@@ -292,10 +292,28 @@ persistent → `store_state` path via `TransientEngineState::apply_sync`.
   occurs in `execute_slots`, the transient carries forward the previous
   `durable_seq` unchanged.
 
-`current_sequence(timeout)` exposes `durable_seq` to callers.
-`timeout=0` is a non-blocking load. `timeout>0` blocks on `durable_cv_`
-until `durable_seq` advances or timeout expires. The condvar notification
-is centralized in `store_state` — one place, one check.
+`durable_sequence(min_sequence, timeout)` exposes `durable_seq` to callers
+(renamed from `current_sequence` — BC-231; no compatibility alias remains).
+`min_sequence = 0`, an already-reached target, or a nonpositive `timeout`
+return the current watermark immediately without blocking. Otherwise it
+blocks on `durable_cv_` until `durable_seq >= min_sequence` or the timeout
+expires, then returns the watermark. The condvar notification is
+centralized in `store_state` — one place, one check.
+
+Every committed write (`put`, `del`, `del_range`, `apply_batch`) returns a
+`CommitResult{sequence, durable}` (`std::optional<CommitResult>` for `del`
+and `apply_batch`, which can report `nullopt` on an absent key or a
+conflict). `sequence` is the highest sequence assigned to the write (the
+`BulkEnd` marker's sequence for a multi-op batch); `0` means nothing was
+written (empty plan, guard-only plan, or empty-range `del_range`) —
+`durable` is always `true` in that case. `durable` reports whether
+`fdatasync` confirmed the write before return: always `true` for
+`sync=true`, and possibly `true` for `sync=false` writes coalesced with a
+sync writer in the same group-commit batch or a rotation sync. A reader —
+local or follower — whose `durable_sequence() >= sequence` is guaranteed to
+see every entry of that write. See
+[`docs/commit_result_api_design.md`](docs/commit_result_api_design.md) for
+the full contract.
 
 ---
 
@@ -552,7 +570,7 @@ Applies pre-sequenced entries from a leader to a follower's storage.
 | **Degraded on I/O failure** | Same pattern as `apply_batch`: on `writev`/`fdatasync` failure, advance sequence to prevent reuse, go degraded, rethrow. |
 | **Atomicity** | If ingest throws, no partial state is published to readers. |
 | **Causality** | Entries are applied in the sequence order provided by `changes_since`. If entry A has a lower sequence than entry B, A is applied before B. The follower's state reflects the same causal ordering as the leader's write history. |
-| **I/O failure safety** | If any I/O operation throws, the published key directory reflects zero entries from this call. The engine degrades; `resume()` restores normal operation. After resume, re-delivery from `follower.current_sequence()` proceeds normally. |
+| **I/O failure safety** | If any I/O operation throws, the published key directory reflects zero entries from this call. The engine degrades; `resume()` restores normal operation. After resume, re-delivery from `follower.durable_sequence()` proceeds normally. |
 
 ## `set_mode` / `mode`
 

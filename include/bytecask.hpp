@@ -29,6 +29,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <stdexcept>
@@ -68,6 +69,18 @@ enum class EntryType : std::uint8_t {
 struct WriteOptions {
   bool sync{true};
   bool solo{false};
+};
+
+// Outcome of a committed write. sequence is the highest sequence assigned to
+// the write (for a multi-op batch this is the BulkEnd marker's sequence). A
+// reader whose durable_sequence() >= sequence is guaranteed to see every
+// entry of this write.
+struct CommitResult {
+  // Highest sequence assigned to this write. 0 means nothing was written.
+  std::uint64_t sequence{0};
+
+  // True if fdatasync confirmed durability of this write before return.
+  bool durable{false};
 };
 
 struct ReadOptions {
@@ -415,12 +428,12 @@ public:
   [[nodiscard]] auto get(const ReadOptions& opts,
                          BytesView key,
                          Bytes& out) const -> bool;
-  void put(const WriteOptions& opts,
-           BytesView key, BytesView value);
+  auto put(const WriteOptions& opts,
+           BytesView key, BytesView value) -> CommitResult;
   [[nodiscard]] auto del(const WriteOptions& opts,
-                         BytesView key) -> bool;
-  void del_range(const WriteOptions& opts,
-                 BytesView from, BytesView to);
+                        BytesView key) -> std::optional<CommitResult>;
+  auto del_range(const WriteOptions& opts,
+                BytesView from, BytesView to) -> CommitResult;
   [[nodiscard]] auto contains_key(const ReadOptions& opts,
                                   BytesView key) const -> bool;
 
@@ -433,7 +446,7 @@ public:
 
   [[nodiscard]] auto snapshot() const -> Snapshot;
   [[nodiscard]] auto apply_batch(WriteOptions opts,
-                                 WritePlan plan) -> bool;
+                                 WritePlan plan) -> std::optional<CommitResult>;
 
   [[nodiscard]] auto iter_from(const ReadOptions& opts,
                                BytesView from = {}) const
@@ -450,7 +463,8 @@ public:
 
   [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
 
-  [[nodiscard]] auto current_sequence(
+  [[nodiscard]] auto durable_sequence(
+      std::uint64_t min_sequence = 0,
       std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
       -> std::uint64_t;
 
@@ -487,6 +501,7 @@ using BytesView            = internal::BytesView;
 using Mode                 = internal::Mode;
 using EntryType            = internal::EntryType;
 using WriteOptions         = internal::WriteOptions;
+using CommitResult         = internal::CommitResult;
 using ReadOptions          = internal::ReadOptions;
 using VacuumOptions        = internal::VacuumOptions;
 using Options              = internal::Options;

@@ -471,7 +471,7 @@ inline auto capture_replication_baseline(const DB &db) -> ReplicationBaseline {
 inline void assert_replication_match(const ReplicationBaseline &leader,
                                      const DB &follower) {
   // 1. Sequence continuity.
-  CHECK(follower.current_sequence() == leader.durable_seq);
+  CHECK(follower.durable_sequence() == leader.durable_seq);
 
   // 2. next_seq monotonicity.
   auto fstate = follower.engine_state();

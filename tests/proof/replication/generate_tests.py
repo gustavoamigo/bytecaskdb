@@ -486,7 +486,7 @@ def gen_restart_midstream_test(
         f"      auto follower = bytecask::DB::open(follower_dir,"
         f"\n          {{{follower_opts}.initial_mode = bytecask::Mode::Follower}});"
     )
-    parts.append("      auto from_seq = follower.current_sequence();")
+    parts.append("      auto from_seq = follower.durable_sequence();")
     parts.append("      auto snap2 = leader.snapshot();")
     parts.append(
         "      auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));"
@@ -555,11 +555,11 @@ def gen_duplicate_delivery_test(state: StateShape) -> str:
         f"\n        {{{follower_opts}.initial_mode = bytecask::Mode::Follower}});"
     )
     parts.append("    follower.ingest(views);")
-    parts.append("    auto seq_after = follower.current_sequence();")
+    parts.append("    auto seq_after = follower.durable_sequence();")
     parts.append("")
     parts.append("    // Re-deliver same entries — must be a no-op.")
     parts.append("    follower.ingest(views);")
-    parts.append("    CHECK(follower.current_sequence() == seq_after);")
+    parts.append("    CHECK(follower.durable_sequence() == seq_after);")
     parts.append("    assert_replication_match(leader_bl, follower);")
 
     return "\n".join(parts)
@@ -617,9 +617,9 @@ def gen_planned_promotion_test(state: StateShape) -> str:
     parts.append("        bytecask::DbFollowerMode);")
     parts.append("")
     parts.append("    follower.set_mode(bytecask::Mode::Leader);")
-    parts.append("    auto seq_before = follower.current_sequence();")
+    parts.append("    auto seq_before = follower.durable_sequence();")
     parts.append('    follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));')
-    parts.append("    CHECK(follower.current_sequence() == seq_before + 1);")
+    parts.append("    CHECK(follower.durable_sequence() == seq_before + 1);")
     parts.append("")
 
     # Backward sync: follower → leader.
@@ -627,7 +627,7 @@ def gen_planned_promotion_test(state: StateShape) -> str:
     parts.append("    auto snap2 = follower.snapshot();")
     parts.append(
         "    auto owned2 = collect_changes(follower.changes_since(snap2,"
-        " leader.current_sequence()));"
+        " leader.durable_sequence()));"
     )
     parts.append("    auto views2 = owned2.views();")
     parts.append("    leader.ingest(views2);")
@@ -704,7 +704,7 @@ def gen_manifest_test(state: StateShape, failure: ManifestFailureClass) -> str:
 
     if delta.manifest_produced:
         parts.append("    auto manifest = leader.create_manifest();")
-        parts.append("    CHECK(manifest.through_sequence == leader.current_sequence());")
+        parts.append("    CHECK(manifest.through_sequence == leader.durable_sequence());")
         parts.append("    CHECK_FALSE(manifest.files.empty());")
         parts.append("")
         parts.append("    // Verify all files exist on disk.")

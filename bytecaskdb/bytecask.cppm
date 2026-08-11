@@ -134,6 +134,23 @@ export struct WriteOptions {
   bool solo{false};
 };
 
+// Outcome of a committed write. sequence is the highest sequence assigned to
+// the write (for a multi-op batch this is the BulkEnd marker's sequence). A
+// reader — local or follower — whose durable_sequence() >= sequence is
+// guaranteed to see every entry of this write.
+export struct CommitResult {
+  // Highest sequence assigned to this write. 0 means nothing was written
+  // (empty plan, guard-only plan, or empty-range del_range) — there is
+  // nothing to wait for.
+  std::uint64_t sequence{0};
+
+  // True if fdatasync confirmed durability of this write before return.
+  // Always true for sync=true writes. May be true for sync=false writes
+  // that were coalesced into a group containing a sync writer, or that
+  // triggered a rotation sync.
+  bool durable{false};
+};
+
 // Controls consistency behaviour for read operations (get, contains_key).
 // Two modes:
 //   Session (default, staleness_tolerance = 0): read-your-writes guaranteed.
@@ -684,22 +701,27 @@ public:
   [[nodiscard]] auto get(const ReadOptions &opts, BytesView key,
                          Bytes &out) const -> bool;
 
-  // Writes key → value. Overwrites any existing value.
+  // Writes key → value. Overwrites any existing value. Cannot conflict.
   // Rotates the active file if it has reached the threshold.
   // opts.sync controls whether fdatasync is called after the write.
   // Throws std::system_error on I/O failure or lock contention (try_lock).
-  void put(const WriteOptions &opts, BytesView key, BytesView value);
+  auto put(const WriteOptions &opts, BytesView key,
+           BytesView value) -> CommitResult;
 
   // Writes a tombstone for key.
-  // Returns true if the key existed and was removed, false if it was absent.
-  // Rotates the active file if it has reached the threshold.
-  // opts.sync controls whether fdatasync is called after the write.
-  // Throws std::system_error on I/O failure or lock contention (try_lock).
-  [[nodiscard]] auto del(const WriteOptions &opts, BytesView key) -> bool;
+  // Returns nullopt if the key was absent — nothing was written, no
+  // sequence assigned. Rotates the active file if it has reached the
+  // threshold. opts.sync controls whether fdatasync is called after the
+  // write. Throws std::system_error on I/O failure or lock contention
+  // (try_lock).
+  [[nodiscard]] auto del(const WriteOptions &opts,
+                        BytesView key) -> std::optional<CommitResult>;
 
   // Deletes all keys in [from, to). One append to the data file, one
-  // optional fdatasync. No-op if from >= to.
-  void del_range(const WriteOptions &opts, BytesView from, BytesView to);
+  // optional fdatasync. Cannot conflict. Returns {sequence = 0, durable =
+  // true} without writing if from >= to.
+  auto del_range(const WriteOptions &opts, BytesView from,
+                BytesView to) -> CommitResult;
 
   // Returns true if key exists in the index (no disk I/O).
   [[nodiscard]] auto contains_key(const ReadOptions& opts,
@@ -752,12 +774,13 @@ public:
   [[nodiscard]] auto snapshot() const -> Snapshot;
 
   // Applies plan atomically iff all guards pass and no written key was
-  // modified since snap. Returns true if committed, false on conflict.
-  // A guardless, snapshot-less plan always commits (returns true).
+  // modified since snap. Returns nullopt on conflict (a guard failed or
+  // the implicit W-W check detected a conflict) — nothing was written.
+  // A guardless, snapshot-less plan always commits. An empty plan commits
+  // as a no-op, returning {sequence = 0, durable = true}.
   // Throws std::system_error on I/O failure or lock contention (try_lock).
-  // Returns true (no-op) if plan has no writes and no guards.
   [[nodiscard]] auto apply_batch(WriteOptions opts,
-                                 WritePlan plan) -> bool;
+                                 WritePlan plan) -> std::optional<CommitResult>;
 
   // Returns an input range of (key, value) pairs with keys >= from.
   // Pass an empty span to start from the first key. Each dereference reads
@@ -807,11 +830,13 @@ public:
   //   }
   [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
 
-  // Returns the highest sequence confirmed durable by fdatasync.
-  // timeout=0: non-blocking, returns current value.
-  // timeout>0: blocks until durable_seq advances past the baseline
-  // captured at entry, or timeout expires.
-  [[nodiscard]] auto current_sequence(
+  // Blocks until the durable sequence (highest sequence confirmed by
+  // fdatasync) is >= min_sequence or timeout expires; returns the durable
+  // sequence at return. min_sequence = 0, an already-reached target, or a
+  // nonpositive timeout returns immediately. Identical semantics in Leader
+  // and Follower mode (on a follower it reflects the last synced ingest).
+  [[nodiscard]] auto durable_sequence(
+      std::uint64_t min_sequence = 0,
       std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
       -> std::uint64_t;
 
@@ -1252,7 +1277,7 @@ private:
 export struct EngineSlot : Slot {
   WritePlan plan;
   WriteOptions opts;
-  bool result{true};
+  std::optional<CommitResult> result;
 };
 
 
@@ -1987,30 +2012,33 @@ auto DB::get(const ReadOptions &opts, BytesView key,
   return true;
 }
 
-// Writes key → value. Overwrites any existing value.
+// Writes key → value. Overwrites any existing value. Cannot conflict.
 // Rotates the active file if it has reached the threshold.
 // opts.sync controls whether fdatasync is called after the write.
 // Throws std::system_error on I/O failure or lock contention (try_lock).
-void DB::put(const WriteOptions &opts, BytesView key, BytesView value) {
+auto DB::put(const WriteOptions &opts, BytesView key,
+            BytesView value) -> CommitResult {
   WritePlan plan{size_limits_};
   plan.put(key, value);
-  (void)apply_batch(opts, std::move(plan));
+  return *apply_batch(opts, std::move(plan));
 }
 
-auto DB::del(const WriteOptions &opts, BytesView key) -> bool {
+auto DB::del(const WriteOptions &opts,
+            BytesView key) -> std::optional<CommitResult> {
   WritePlan plan{size_limits_};
   plan.ensure_present(key);
   plan.del(key);
   return apply_batch(opts, std::move(plan));
 }
 
-void DB::del_range(const WriteOptions &opts, BytesView from, BytesView to) {
+auto DB::del_range(const WriteOptions &opts, BytesView from,
+                  BytesView to) -> CommitResult {
   check_key_size(from.size(), size_limits_.max_key_bytes);
   check_key_size(to.size(), size_limits_.max_key_bytes);
-  if (Key{from} >= Key{to}) return;
+  if (Key{from} >= Key{to}) return CommitResult{.sequence = 0, .durable = true};
   WritePlan plan{size_limits_};
   plan.del_range(from, to);
-  (void)apply_batch(opts, std::move(plan));
+  return *apply_batch(opts, std::move(plan));
 }
 
 auto DB::contains_key(const ReadOptions& opts, BytesView key) const -> bool {
@@ -2031,12 +2059,12 @@ auto DB::snapshot() const -> Snapshot {
 // solo_writer_ depending on plan characteristics. put/del/apply_batch are
 // thin wrappers that construct a WritePlan and delegate here.
 auto DB::apply_batch(WriteOptions opts,
-                        WritePlan plan) -> bool {
+                     WritePlan plan) -> std::optional<CommitResult> {
   if (auto s = load_state(); !s->is_write_allowed()) {
     if (s->degraded) throw DbDegraded{s->degraded_reason};
     throw DbFollowerMode{"write rejected: engine is in follower mode"};
   }
-  if (plan.empty()) return true;
+  if (plan.empty()) return CommitResult{.sequence = 0, .durable = true};
 
   EngineSlot slot;
   slot.plan = std::move(plan);
@@ -2062,23 +2090,24 @@ auto DB::apply_batch(WriteOptions opts,
 // Prepares and applies one slot against the transient. Pure in-memory: no
 // I/O. Entries are appended to all_entries; running_offset is advanced by
 // the total byte size of entries produced. Returns false on validation
-// failure (slot.result set to false).
+// failure (slot.result set to nullopt). durable is left false on success;
+// execute_slots fills it in once the batch's durability is known.
 auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
                       std::vector<DataEntryView> &all_entries,
                       std::uint64_t &running_offset) -> bool {
   if (slot.plan.empty()) {
-    slot.result = true;
+    slot.result = CommitResult{};
     return true;
   }
 
   if (!t.validate_preconditions(slot.plan)) {
-    slot.result = false;
+    slot.result = std::nullopt;
     return false;
   }
 
   auto entries = t.prepare_write(slot.plan);
   if (entries.empty()) {
-    slot.result = true;
+    slot.result = CommitResult{};
     return true;
   }
 
@@ -2093,11 +2122,13 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
 
   t.apply_writes(slot.plan, offsets);
 
+  const auto committed_sequence = entries.back().sequence;
+
   all_entries.insert(all_entries.end(),
                      std::make_move_iterator(entries.begin()),
                      std::make_move_iterator(entries.end()));
 
-  slot.result = true;
+  slot.result = CommitResult{.sequence = committed_sequence};
   return true;
 }
 
@@ -2138,7 +2169,16 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     any_sync |= slot.opts.sync;
   }
 
-  if (all_entries.empty()) return;
+  if (all_entries.empty()) {
+    // No entry was appended by any slot (empty/guard-only plans only) —
+    // phase 3 never runs. Nothing was written, so every committed slot's
+    // {sequence = 0} result is trivially durable.
+    for (auto *s : batch) {
+      auto &slot = static_cast<EngineSlot &>(*s);
+      if (slot.result) slot.result->durable = true;
+    }
+    return;
+  }
 
   // Highest sequence in this batch — used to advance durable_seq after sync.
   const auto batch_max_seq = t.next_seq() - 1;
@@ -2227,7 +2267,12 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   }
 
   assert(t.active_file().size() <= rotation_threshold_);
+  const auto final_durable_seq = t.durable_seq();
   store_state(current, std::move(t).persistent());
+  for (auto *s : batch) {
+    auto &slot = static_cast<EngineSlot &>(*s);
+    if (slot.result) slot.result->durable = final_durable_seq >= slot.result->sequence;
+  }
 }
 
 #pragma endregion
@@ -2790,14 +2835,18 @@ void DB::resume() {
   store_state(current, std::move(resumed));
 }
 
-auto DB::current_sequence(std::chrono::milliseconds timeout) const
+auto DB::durable_sequence(std::uint64_t min_sequence,
+                         std::chrono::milliseconds timeout) const
     -> std::uint64_t {
   auto baseline = load_state()->durable_seq;
-  if (timeout <= std::chrono::milliseconds{0}) return baseline;
+  if (min_sequence == 0 || baseline >= min_sequence
+      || timeout <= std::chrono::milliseconds{0}) {
+    return baseline;
+  }
 
   std::unique_lock<std::mutex> lk{durable_mu_};
   durable_cv_.wait_for(lk, timeout, [&] {
-    return load_state()->durable_seq > baseline;
+    return load_state()->durable_seq >= min_sequence;
   });
   return load_state()->durable_seq;
 }
