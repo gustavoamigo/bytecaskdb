@@ -1,6 +1,7 @@
 # ByteCaskDB Replication Primitives Design
 
 > Implemented in BC-197. Proof test suite (211 tests) in BC-204.
+> `current_sequence(timeout)` renamed to the target-based `durable_sequence(min_sequence, timeout)` in BC-231 — see [`commit_result_api_design.md`](commit_result_api_design.md).
 
 ## Purpose
 
@@ -27,22 +28,23 @@ ByteCaskDB uses the term **sequence** for the globally monotonic `u64` counter a
 
 ## Primitives
 
-### 1. `current_sequence(timeout)`
+### 1. `durable_sequence(min_sequence, timeout)`
 
-Returns the current durable sequence — the highest sequence confirmed by `fdatasync`. With `timeout=0` it returns immediately (poll mode). With `timeout>0` it blocks until a new `fdatasync` completes or the timeout expires (long-poll mode).
+The single sequence primitive — target-based, not advance-based (BC-231; renamed from `current_sequence`). Blocks until the durable sequence (the highest sequence confirmed by `fdatasync`) reaches at least `min_sequence`, then returns it. `min_sequence = 0`, an already-reached target, or a nonpositive `timeout` all return immediately without blocking — this is the poll mode. Otherwise it blocks until a `fdatasync` advances the durable sequence to `min_sequence` or the timeout expires — this is the long-poll mode.
 
 Internally, the write path calls `cv.notify_all()` only when `durable_sequence` advances — that is, after a successful `fdatasync` (sync write, rotation sync, or resume). NoSync-only write batches publish state via `state_.store()` but do not notify — the replication loop stays asleep until durability is confirmed. The long-poll blocks on that condition variable — nanosecond overhead on the write path.
 
 ```cpp
-auto current_sequence(std::chrono::milliseconds timeout = 0ms) const -> uint64_t;
+auto durable_sequence(uint64_t min_sequence = 0,
+                      std::chrono::milliseconds timeout = 0ms) const -> uint64_t;
 ```
 
-**Use cases:**
-- Replication loop: sleep until there are durable entries to replicate.
-- Monitoring: check replication lag (leader durable sequence vs follower sequence).
-- Health checks: immediate poll with `timeout=0`.
+**Use cases (one primitive, three targets):**
+- Poll / lag monitoring: `min_sequence = 0` — always reached, returns immediately.
+- Replication loop wake-up: `min_sequence = follower.durable_sequence() + 1` — "the leader has something the follower lacks".
+- Read-your-own-writes: `min_sequence = r.sequence` from a `CommitResult` returned by a write — see [`commit_result_api_design.md`](commit_result_api_design.md).
 
-**Note:** on an idle leader with no writes, `current_sequence(timeout=30s)` blocks for the full timeout and returns the current sequence. The first replication loop iteration on a fresh or idle leader incurs this delay — subsequent iterations proceed immediately once writes begin.
+**Why target-based fixes the idle-leader wart:** the previous advance-based `current_sequence(timeout)` blocked until the sequence moved *past its value at call entry* — a proxy for "the leader has new data," but wrong when the leader is already ahead of the follower (e.g. right after bootstrap, or after a follower restart). On an idle leader, that first call would block for the full timeout even though the leader already had entries the follower lacked. The target-based form has no such wart: `leader.durable_sequence(follower.durable_sequence() + 1, timeout)` returns immediately whenever the leader is already ahead, and only blocks when there is genuinely nothing new to replicate.
 
 ### 2. `create_manifest()` — sealed file manifest
 
@@ -67,7 +69,7 @@ auto create_manifest() -> FileManifest;
 **Vacuum coordination:** the caller must not invoke `vacuum()` between `create_manifest()` and the completion of the file transfer/copy. Vacuum unlinks files from the filesystem; once unlinked, any external tool reading by path (`rsync`, `scp`, `cp`, a custom transfer loop) will see `ENOENT`. Since vacuum is caller-triggered, this is a simple serialization constraint — the coordinator driving the backup or bootstrap is the same code that decides when vacuum runs.
 
 **Use cases:**
-- **Bootstrap** — ship the manifest's files to a new follower, open them, run recovery, then start tailing from `follower.current_sequence()`.
+- **Bootstrap** — ship the manifest's files to a new follower, open them, run recovery, then start tailing from `follower.durable_sequence()`.
 - **Backup** — copy the manifest's files to durable storage for point-in-time restore.
 - **Federation** — publish a consistent snapshot of the database to an external system.
 
@@ -103,22 +105,22 @@ When the iterator is exhausted, all committed durable entries up to `min(snap.se
 
 Because entries are sequence-ordered, every prefix of the stream is a valid state. The follower can `ingest()` at any point — not just at iterator exhaustion — and the result is always a consistent, sequence-ordered prefix of the leader's history.
 
-**Failure handling:** on failure mid-iteration, restart Phase 2 with a fresh snapshot and iterator from `follower.current_sequence()`. Since entries are in sequence order, the follower's recovered state after a crash is a valid prefix — `current_sequence()` is trustworthy.
+**Failure handling:** on failure mid-iteration, restart Phase 2 with a fresh snapshot and iterator from `follower.durable_sequence()`. Since entries are in sequence order, the follower's recovered state after a crash is a valid prefix — `durable_sequence()` is trustworthy.
 
-### 5. `ingest(entries)` and `current_sequence()` on the follower
+### 5. `ingest(entries)` and `durable_sequence()` on the follower
 
 **`ingest(entries)`** applies raw entries to the key directory and publishes the updated state to readers immediately. Because `changes_since` delivers entries in ascending sequence order, every `ingest` call produces a valid, consistent prefix of the leader's history — no separate commit step is needed.
 
-**`current_sequence()`** returns the last ingested sequence — identical semantics on both leader and follower. On the leader it reflects the latest write; on the follower it reflects the last `ingest`. External code does not need to know which mode it's talking to. The orchestrator compares `leader.current_sequence()` and `follower.current_sequence()` to measure replication lag.
+**`durable_sequence()`** returns the last ingested sequence — identical semantics on both leader and follower. On the leader it reflects the latest write; on the follower it reflects the last `ingest`. External code does not need to know which mode it's talking to. The orchestrator compares `leader.durable_sequence()` and `follower.durable_sequence()` to measure replication lag.
 
 ```cpp
 void ingest(std::span<const DataEntryView> entries);  // applies and publishes
-auto current_sequence() const -> uint64_t;        // last committed sequence
+auto durable_sequence() const -> uint64_t;        // last committed sequence
 ```
 
 After each `ingest`, `next_sequence` reflects `max(next_sequence, max(ingested sequences) + 1)` — it never decreases, preserving the runtime invariant enforced by `store_state`.
 
-**Idempotency:** entries with `sequence <= current_sequence()` are silently skipped. This makes `ingest` safe for restart-on-failure semantics — the orchestrator restarting from `follower.current_sequence()` may occasionally re-deliver the boundary entry, and the follower handles it correctly.
+**Idempotency:** entries with `sequence <= durable_sequence()` are silently skipped. This makes `ingest` safe for restart-on-failure semantics — the orchestrator restarting from `follower.durable_sequence()` may occasionally re-deliver the boundary entry, and the follower handles it correctly.
 
 **Constraints:**
 - `ingest` is only callable in `Mode::Follower`.
@@ -169,7 +171,7 @@ Any future code that adds a new `file.sync()` call should also advance `durable_
 
 `changes_since(snap, from_sequence)` uses `min(snap.sequence(), durable_sequence)` as its upper bound. Entries with `sequence > durable_sequence` are excluded even if present in the snapshot's key directory.
 
-`current_sequence(timeout)` returns `durable_sequence`. The long-poll condition variable fires when `durable_sequence` advances. This ensures the replication loop only wakes up when there are durable entries to replicate.
+`durable_sequence(min_sequence, timeout)` exposes this field to callers. The long-poll condition variable fires when `durable_sequence` advances. This ensures the replication loop only wakes up when there are durable entries to replicate.
 
 ### Group commit interaction
 
@@ -221,25 +223,28 @@ This changes the on-disk layout of vacuumed files: they now contain `BulkBegin`/
 4. Follower opens ByteCaskDB with Mode::Follower over received files
    (DB::open() creates a new active file as usual — needed for ingest and eventual promotion)
 5. Recovery rebuilds key directory from hint files
-   (follower.current_sequence() == manifest.through_sequence after recovery)
+   (follower.durable_sequence() == manifest.through_sequence after recovery)
 6. Proceed to Phase 2
 ```
 
 ### Phase 2 — Replicate (loop forever, restart on any failure)
 
-Because `changes_since` delivers entries in sequence order, every prefix of the stream is a valid state. After a crash, `follower.current_sequence()` reflects a consistent prefix — it is trustworthy and the orchestrator does not need to persist its own `from_seq`.
+Because `changes_since` delivers entries in sequence order, every prefix of the stream is a valid state. After a crash, `follower.durable_sequence()` reflects a consistent prefix — it is trustworthy and the orchestrator does not need to persist its own `from_seq`.
 
 ```
 loop:
-    leader.current_sequence(timeout=30s)   — block until new commit or timeout
+    leader.durable_sequence(follower.durable_sequence() + 1, timeout=30s)
+        — target-based wake-up: returns immediately if the leader is
+          already ahead of the follower; blocks only when there is
+          genuinely nothing new to replicate
     snap = leader.snapshot()               — captures sequence boundary
-    it = leader.changes_since(snap, follower.current_sequence())
+    it = leader.changes_since(snap, follower.durable_sequence())
     for entry in it:
         follower.ingest(entry)
-    // on failure at any point: loop restarts from follower.current_sequence()
+    // on failure at any point: loop restarts from follower.durable_sequence()
 ```
 
-The snapshot determines the upper bound of the stream — `changes_since` yields entries up to `snap.sequence()`. No separate `current_sequence()` call is needed to define the target; the snapshot is the target. The leading `current_sequence(timeout)` serves only as a wake-up: it blocks until there is work to do, avoiding busy-waiting on idle leaders.
+The snapshot determines the upper bound of the stream — `changes_since` yields entries up to `snap.sequence()`. No separate call is needed to define that upper bound; the snapshot is the target. The leading `durable_sequence(min_sequence, timeout)` call serves only as a wake-up: unlike the old advance-based form, a leader that is already ahead of the follower wakes the loop immediately — blocking happens only when there is genuinely nothing to replicate (see the idle-leader note under [Primitive 1](#1-durable_sequencemin_sequence-timeout)).
 
 ### Follower Promotion (unplanned)
 
@@ -259,8 +264,8 @@ Graceful leadership transfer uses `set_mode(Mode::Follower)` on the old leader t
 
 ```
 1. old_leader.set_mode(Mode::Follower)        — writes stop immediately
-2. Replication loop continues                  — changes_since and current_sequence are reads
-3. Wait: follower.current_sequence() == old_leader.current_sequence()
+2. Replication loop continues                  — changes_since and durable_sequence are reads
+3. Wait: follower.durable_sequence() == old_leader.durable_sequence()
 4. follower.set_mode(Mode::Leader)             — writes resume on new leader
 5. Other followers re-target the new leader
 ```
@@ -298,7 +303,7 @@ Given:
 Validate:
   follower.state_after_ingest(I, FC) satisfies all invariants
   and follower.key_dir == leader.key_dir              (on SUCCESS)
-  and follower.current_sequence() == leader.current_sequence()  (on SUCCESS)
+  and follower.durable_sequence() == leader.durable_sequence()  (on SUCCESS)
 ```
 
 The binary question for every case is the same as the write-path model:
@@ -342,9 +347,9 @@ How entries are delivered to the follower. Each shape exercises a different prop
 | Shape | Description | What it tests |
 |-------|-------------|---------------|
 | `full_stream` | Ingest all entries from changes_since(snap, 0) in one call | Baseline correctness — full replication in a single pass |
-| `incremental` | Ingest in chunks, simulating the replication loop | Each chunk produces a valid prefix; follower.current_sequence() advances monotonically |
-| `restart_midstream` | Ingest some entries, close follower, reopen, restart from follower.current_sequence() | Recovery equivalence — reopened follower's current_sequence() is trustworthy and the next changes_since picks up without gaps |
-| `duplicate_delivery` | Re-deliver entries the follower already has | Idempotency — entries with sequence <= current_sequence() are silently skipped, no state change |
+| `incremental` | Ingest in chunks, simulating the replication loop | Each chunk produces a valid prefix; follower.durable_sequence() advances monotonically |
+| `restart_midstream` | Ingest some entries, close follower, reopen, restart from follower.durable_sequence() | Recovery equivalence — reopened follower's durable_sequence() is trustworthy and the next changes_since picks up without gaps |
+| `duplicate_delivery` | Re-deliver entries the follower already has | Idempotency — entries with sequence <= durable_sequence() are silently skipped, no state change |
 | `planned_promotion` | Replicate NodeA (Leader) → NodeB (Follower) fully, transfer leadership to NodeB, write new entries on NodeB, replicate NodeB → NodeA (backward sync) | Sequence continuity on promoted NodeB; NodeA rejects writes after demotion; NodeA catches up from NodeB and its key_dir matches NodeB's state |
 
 **Out of scope for the primitive proof:** unplanned promotion (old leader crashes, follower promotes, old leader later rejoins). A crashed leader may have locally-recovered entries past the follower's durable sequence, creating a log fork. Reconciling a fork is a coordinator-level concern, not a primitive-level guarantee. The required recovery protocol is simple: a crashed leader must be re-bootstrapped from the new leader via `create_manifest` before rejoining as a follower — never reopened in place.
@@ -374,7 +379,7 @@ class IngestFailureClass(Enum):
 | I_G | None visible | No (not published) | Yes (prevent reuse) | Yes |
 | I_H | Chunk that triggered rotation | Yes — partial delta | Yes | Yes |
 
-**next_seq advance on failure + idempotency — coordinator contract.** On I_B1/I_B2/I_F the follower advances `next_seq` past the failed entries and degrades. A naive re-deliver would hit the idempotency skip (`sequence <= current_sequence()`) and silently drop data. The coordinator must call `resume()` before retrying: `resume()` truncates the post-durable tail and rebuilds `next_seq` from the recovered state ([`bytecask.cpp` `DB::resume`](../bytecaskdb/bytecask.cpp)), restoring the invariant `next_seq == max(applied seq) + 1`. Re-delivery then proceeds normally.
+**next_seq advance on failure + idempotency — coordinator contract.** On I_B1/I_B2/I_F the follower advances `next_seq` past the failed entries and degrades. A naive re-deliver would hit the idempotency skip (`sequence <= durable_sequence()`) and silently drop data. The coordinator must call `resume()` before retrying: `resume()` truncates the post-durable tail and rebuilds `next_seq` from the recovered state ([`bytecask.cpp` `DB::resume`](../bytecaskdb/bytecask.cpp)), restoring the invariant `next_seq == max(applied seq) + 1`. Re-delivery then proceeds normally.
 
 Class C (orphaned `BulkBegin`) is reachable through the replication pipeline — `changes_since` preserves batch markers, so `ingest` writes `BulkBegin`...entries...`BulkEnd` as a `writev`. If the follower crashes mid-`ingest` after writing `BulkBegin` but before `BulkEnd`, recovery discards the incomplete batch (same as the leader's recovery behavior). Classes I_G and I_H (rotation failures) apply when `ingest` triggers file rotation on the follower because the active file exceeds the size threshold. I_G fails the pre-rotation sync; I_H succeeds on the sync but fails to create the new active file after sealing. I_H is notable: the chunk that triggered rotation is fully durable (the sync succeeded), so the follower's key_dir reflects a partial delta — the entries from that chunk are committed.
 
@@ -401,7 +406,7 @@ class ManifestFailureClass(Enum):
 
 | Class | Manifest produced | Leader state | Expected delta |
 |-------|-------------------|-------------|---------------|
-| SUCCESS | Yes | Continues accepting writes | manifest.through_sequence == leader.current_sequence() at rotation time; all sealed files listed |
+| SUCCESS | Yes | Continues accepting writes | manifest.through_sequence == leader.durable_sequence() at rotation time; all sealed files listed |
 | M_R | No — exception thrown | Unchanged, continues accepting writes | No state change — rotation is atomic |
 | M_H | No — exception or timeout | Active file was rotated (sealed) | Leader has a new active file but no manifest returned |
 
@@ -409,18 +414,18 @@ class ManifestFailureClass(Enum):
 
 Checked after every test case:
 
-1. **Sequence continuity**: `follower.current_sequence() == max(ingested sequences)` on SUCCESS; unchanged on failure.
+1. **Sequence continuity**: `follower.durable_sequence() == max(ingested sequences)` on SUCCESS; unchanged on failure.
 2. **next_seq monotonicity**: `follower.next_seq` never decreases, even after failed ingest.
 3. **Key-value equivalence** (SUCCESS): for every key in leader.key_dir at snapshot time, `follower.get(key)` returns the same value.
 4. **No extra keys**: follower.key_dir contains no keys absent from leader.key_dir at snapshot time.
 5. **Structural consistency**: same checks as `assert_consistent` in the write-path proof — live_bytes matches key_dir, no dangling file refs, next_seq ahead of all sequences.
 6. **Recovery equivalence**: close follower, reopen from disk, verify recovered state matches pre-close state. Proves `ingest` writes are durable and recoverable.
-7. **Idempotency**: re-ingesting entries with `sequence <= current_sequence()` produces no state change — no key_dir delta, no next_seq change.
+7. **Idempotency**: re-ingesting entries with `sequence <= durable_sequence()` produces no state change — no key_dir delta, no next_seq change.
 8. **Durable boundary**: `changes_since` never yields entries with `sequence > durable_sequence`. Validated by running a mixed sync/nosync workload on the leader, taking a snapshot (which includes unsync'd entries in the key directory), and verifying that `changes_since` excludes entries beyond the durable sequence.
 9. **Batch atomicity through vacuum**: for the `vacuumed_batches` state shape, `changes_since` over vacuumed files yields `BulkBegin`/`BulkEnd` markers framing the batch entries. `ingest` writes the batch as a single `writev` on the follower. After a simulated crash mid-ingest (Class I_C), recovery discards the incomplete batch — no partial batch is visible.
 9a. **Vacuum preserves original sequences**: for every entry in a vacuumed file, the sequence equals the entry's sequence in the pre-vacuum source file. Vacuum never re-numbers. This is load-bearing for replication (otherwise `changes_since` would yield inconsistent sequences after vacuum) and is currently incidental in [`vacuum_scan_and_copy`](../bytecaskdb/bytecask.cpp) — making it a test invariant prevents a future refactor from silently breaking it.
 9b. **Per-file sequence monotonicity and sequence-disjoint files**: within every data file (active or sealed, including compacted files), entries appear in strictly ascending sequence order. Additionally, all data files have non-overlapping sequence ranges — no two files contain entries with the same sequence number. This holds naturally: the write path assigns sequences monotonically to the active file, `vacuum_compact_file` scans sequentially and preserves order while maintaining disjoint ranges, and `vacuum_remove_file` deletes the file entirely. This invariant enables linear file scanning for `changes_since` without min-heap merge.
-10. **Sequence continuity after promotion**: after `set_mode(Leader)`, the first write on the promoted node gets `sequence == current_sequence() + 1`. No gap, no reuse of existing sequences.
+10. **Sequence continuity after promotion**: after `set_mode(Leader)`, the first write on the promoted node gets `sequence == durable_sequence() + 1`. No gap, no reuse of existing sequences.
 11. **Mode enforcement**: in `Mode::Follower`, `put`/`del`/`apply_batch` are rejected. In `Mode::Leader`, `ingest` is rejected. `set_mode` transitions are immediate — no in-flight writes straddle the boundary (writes are mutex-serialized).
 12. **Backward sync after promotion**: after planned promotion, NodeA (now Follower) replicating from NodeB (now Leader) produces a key_dir identical to NodeB's. The old leader's stale entries are superseded by the new leader's writes through normal sequence ordering.
 
@@ -444,7 +449,7 @@ create_manifest tests:
   1. Create leader DB, apply workload (StateShape)
   2. Inject fault per ManifestFailureClass
   3. leader.create_manifest() → manifest (or throws)
-  4. On SUCCESS: assert manifest.through_sequence == leader.current_sequence()
+  4. On SUCCESS: assert manifest.through_sequence == leader.durable_sequence()
   5. On SUCCESS: assert all sealed files present in manifest.files
   6. Assert leader continues accepting writes regardless of failure class
 
@@ -456,7 +461,7 @@ planned_promotion tests:
   5. assert NodeA rejects put/del/apply_batch
   6. NodeB.set_mode(Mode::Leader)
   7. Write new entries on NodeB
-  8. assert NodeB.current_sequence() continues without gap
+  8. assert NodeB.durable_sequence() continues without gap
   9. Replicate NodeB → NodeA: NodeB.changes_since → NodeA.ingest
   10. assert NodeA.key_dir == NodeB.key_dir (backward sync converged)
   11. Close both, reopen, assert_recovery_equivalent
@@ -495,4 +500,4 @@ Three edge cases required special handling in the test framework:
 - **Failure detection** — external coordinator.
 - **Network transport** — the replication loop is the user's code; ByteCaskDB provides the data.
 - **Conflict resolution on split-brain** — out of scope for single-leader replication.
-- **Synchronous replication** — not needed and not planned. The client decides whether to wait for follower convergence by polling `follower.current_sequence()` after a write — same pattern as Kafka's producer acks. The durability-vs-latency tradeoff belongs to the client, not the engine.
+- **Synchronous replication** — not needed and not planned. The client decides whether to wait for follower convergence by calling `follower.durable_sequence(r.sequence, timeout)` — where `r` is the `CommitResult` returned by the leader write — after a write, same pattern as Kafka's producer acks. The durability-vs-latency tradeoff belongs to the client, not the engine. See [`commit_result_api_design.md`](commit_result_api_design.md) for the full read-your-own-writes pattern.

@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <memory>
 #include <optional>
 #include <span>
@@ -403,6 +404,19 @@ NB_MODULE(_bytecaskdb, m) {
       .def_rw("solo", &bytecask::WriteOptions::solo,
               "If True, bypass group commit (for benchmarking).");
 
+  nb::class_<bytecask::CommitResult>(m, "CommitResult",
+      "Outcome of a committed write. sequence is the highest sequence "
+      "assigned to the write (0 = nothing written); durable is True iff "
+      "fdatasync confirmed it before return. Read-only.")
+      .def_ro("sequence", &bytecask::CommitResult::sequence,
+              "Highest sequence assigned to this write. 0 = nothing written.")
+      .def_ro("durable", &bytecask::CommitResult::durable,
+              "True if fdatasync confirmed durability before return.")
+      .def("__repr__", [](const bytecask::CommitResult &r) {
+        return std::format("CommitResult(sequence={}, durable={})",
+                           r.sequence, r.durable ? "True" : "False");
+      });
+
   nb::class_<bytecask::ReadOptions>(m, "ReadOptions",
       "Per-read options for get, iter_from, etc.")
       .def(nb::init<>())
@@ -651,37 +665,43 @@ NB_MODULE(_bytecaskdb, m) {
       .def(
           "put",
           [](PyDB &self, nb::bytes key, nb::bytes value,
-             std::optional<bytecask::WriteOptions> opts) {
+             std::optional<bytecask::WriteOptions> opts)
+              -> bytecask::CommitResult {
             auto k = to_view(key);
             auto v = to_view(value);
             auto wopts = opts.value_or(bytecask::WriteOptions{});
             BC_GIL_RELEASE;
-            self.db.put(wopts, k, v);
+            return self.db.put(wopts, k, v);
           },
-          "Write key -> value. Overwrites any existing value.",
+          "Write key -> value. Overwrites any existing value. Returns the "
+          "assigned CommitResult.",
           "key"_a, "value"_a, "opts"_a = nb::none())
       .def(
           "del_",
           [](PyDB &self, nb::bytes key,
-             std::optional<bytecask::WriteOptions> opts) -> bool {
+             std::optional<bytecask::WriteOptions> opts)
+              -> std::optional<bytecask::CommitResult> {
             auto k = to_view(key);
             auto wopts = opts.value_or(bytecask::WriteOptions{});
             BC_GIL_RELEASE;
             return self.db.del(wopts, k);
           },
-          "Delete key. Return True if it existed.",
+          "Delete key. Returns the CommitResult, or None if the key was "
+          "absent (nothing written).",
           "key"_a, "opts"_a = nb::none())
       .def(
           "del_range",
           [](PyDB &self, nb::bytes from_key, nb::bytes to_key,
-             std::optional<bytecask::WriteOptions> opts) {
+             std::optional<bytecask::WriteOptions> opts)
+              -> bytecask::CommitResult {
             auto f = to_view(from_key);
             auto t = to_view(to_key);
             auto wopts = opts.value_or(bytecask::WriteOptions{});
             BC_GIL_RELEASE;
-            self.db.del_range(wopts, f, t);
+            return self.db.del_range(wopts, f, t);
           },
-          "Delete all keys in [from_key, to_key) with a single disk append.",
+          "Delete all keys in [from_key, to_key) with a single disk append. "
+          "Returns the assigned CommitResult.",
           "from_key"_a, "to_key"_a, "opts"_a = nb::none())
       .def(
           "contains_key",
@@ -695,13 +715,15 @@ NB_MODULE(_bytecaskdb, m) {
       .def(
           "apply_batch",
           [](PyDB &self, PyWritePlan &plan,
-             std::optional<bytecask::WriteOptions> opts) -> bool {
+             std::optional<bytecask::WriteOptions> opts)
+              -> std::optional<bytecask::CommitResult> {
             auto p = plan.take();
             auto wopts = opts.value_or(bytecask::WriteOptions{});
             BC_GIL_RELEASE;
             return self.db.apply_batch(wopts, std::move(p));
           },
-          "Apply plan atomically. Return True if committed, False on conflict.",
+          "Apply plan atomically. Returns the CommitResult if committed, or "
+          "None on conflict.",
           "plan"_a, "opts"_a = nb::none())
       .def(
           "snapshot",
@@ -791,14 +813,17 @@ NB_MODULE(_bytecaskdb, m) {
           },
           "Switch engine mode.", "mode"_a)
       .def(
-          "current_sequence",
-          [](PyDB &self, std::uint64_t timeout_ms) -> std::uint64_t {
+          "durable_sequence",
+          [](PyDB &self, std::uint64_t min_sequence,
+             std::uint64_t timeout_ms) -> std::uint64_t {
             BC_GIL_RELEASE;
-            return self.db.current_sequence(
-                std::chrono::milliseconds{timeout_ms});
+            return self.db.durable_sequence(
+                min_sequence, std::chrono::milliseconds{timeout_ms});
           },
-          "Return the highest durable sequence number.",
-          "timeout_ms"_a = 0)
+          "Block until the durable sequence >= min_sequence or timeout_ms "
+          "expires; returns the durable sequence. min_sequence=0, an "
+          "already-reached target, or timeout_ms=0 return immediately.",
+          "min_sequence"_a = 0, "timeout_ms"_a = 0)
       .def(
           "create_manifest",
           [](PyDB &self) -> PyFileManifest * {

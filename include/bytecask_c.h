@@ -42,6 +42,21 @@ typedef struct bytecask_iter       bytecask_iter_t;
 typedef struct bytecask_snapshot   bytecask_snapshot_t;
 typedef struct bytecask_write_plan bytecask_write_plan_t;
 
+// Options for a write operation. Pass NULL to use defaults (sync=1, solo=0).
+typedef struct {
+  int sync;  // nonzero (default): fdatasync after the write.
+  int solo;  // nonzero: bypass the write group, execute alone. Default 0.
+} bytecask_write_options_t;
+
+// Outcome of a committed write. sequence == 0 means nothing was written
+// (empty plan, guard-only plan, or empty-range del_range) — durable is then
+// always nonzero. durable is nonzero iff fdatasync confirmed the write
+// before return.
+typedef struct {
+  uint64_t sequence;
+  int durable;
+} bytecask_commit_result_t;
+
 // ---------------------------------------------------------------------------
 // Open / close
 // ---------------------------------------------------------------------------
@@ -58,26 +73,35 @@ void bytecask_close(bytecask_db_t *db);
 
 // ---------------------------------------------------------------------------
 // Write operations
-// sync == 0: skip fdatasync (higher throughput, lower durability)
-// sync != 0: fdatasync after write (default)
+//
+// opts may be NULL to use defaults (sync=1, solo=0). out may be NULL if the
+// caller does not need the CommitResult; when non-null it is cleared to
+// {0, 0} on entry and filled in only when the status code indicates the
+// write committed (see each function's return-value doc below).
 // ---------------------------------------------------------------------------
 
-// Writes key → value.  Returns 0 on success, -1 on error.
+// Writes key → value. Cannot conflict. Returns 0 on success, -1 on error;
+// out is filled on 0.
 int bytecask_put(bytecask_db_t *db,
                  const uint8_t *key,  size_t key_len,
                  const uint8_t *val,  size_t val_len,
-                 int sync);
+                 const bytecask_write_options_t *opts,
+                 bytecask_commit_result_t *out);
 
-// Deletes key. Returns 1 if key existed, 0 if absent, -1 on error.
+// Deletes key. Returns 1 if key existed (out filled), 0 if absent (out not
+// filled), -1 on error.
 int bytecask_del(bytecask_db_t *db, const uint8_t *key, size_t key_len,
-                 int sync);
+                 const bytecask_write_options_t *opts,
+                 bytecask_commit_result_t *out);
 
-// Deletes all keys in [from, to).  No-op if from >= to.
-// Returns 0 on success, -1 on error.
+// Deletes all keys in [from, to). No-op if from >= to. Cannot conflict.
+// Returns 0 on success, -1 on error; out is filled on 0 (sequence == 0 if
+// from >= to, since nothing was written).
 int bytecask_del_range(bytecask_db_t *db,
                        const uint8_t *from, size_t from_len,
                        const uint8_t *to, size_t to_len,
-                       int sync);
+                       const bytecask_write_options_t *opts,
+                       bytecask_commit_result_t *out);
 
 // ---------------------------------------------------------------------------
 // Read operations
@@ -234,12 +258,26 @@ void bytecask_write_plan_free(bytecask_write_plan_t *plan);
 
 // Applies the plan atomically iff all guards hold and no written key was
 // modified since the plan's snapshot.
-// Returns 1 if committed, 0 on conflict, -1 on error.
-// The plan is consumed (freed) regardless of outcome — caller must not use
-// it after this call.
+// Returns 1 if committed (out filled), 0 on conflict (out not filled), -1 on
+// error. The plan is consumed (freed) regardless of outcome — caller must
+// not use it after this call.
 int bytecask_apply_batch(bytecask_db_t *db,
                          bytecask_write_plan_t *plan,
-                         int sync);
+                         const bytecask_write_options_t *opts,
+                         bytecask_commit_result_t *out);
+
+// ---------------------------------------------------------------------------
+// Durable sequence — the single sequence primitive.
+//
+// Returns the highest sequence confirmed durable by fdatasync. min_sequence
+// = 0, an already-reached target, or timeout_ms == 0 return immediately
+// without blocking. Otherwise blocks until the durable sequence reaches
+// min_sequence or timeout_ms expires, then returns the watermark.
+// On a null or errored db, returns 0 and sets the thread-local error.
+// ---------------------------------------------------------------------------
+uint64_t bytecask_durable_sequence(bytecask_db_t *db,
+                                   uint64_t min_sequence,
+                                   uint64_t timeout_ms);
 
 // ---------------------------------------------------------------------------
 // Vacuum

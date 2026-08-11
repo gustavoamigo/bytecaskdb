@@ -210,7 +210,7 @@ test('handles prefix relationship edge cases', async ({ db }) => {
   expect(decodeBytes(db.get(longKey)!)).toEqual(longValue)
 
   // Delete short key, long key should remain
-  expect(db.del(shortKey)).toBe(true)
+  expect(db.del(shortKey)).not.toBeNull()
   expect(db.get(shortKey)).toBeNull()
   expect(decodeBytes(db.get(longKey)!)).toEqual(longValue)
 })
@@ -231,7 +231,7 @@ test('handles rapid put/delete cycles', async ({ db }) => {
     expect(decodeBytes(db.get(key)!)).toEqual(value)
 
     if (cycle % 3 === 0) {
-      expect(db.del(key)).toBe(true)
+      expect(db.del(key)).not.toBeNull()
       expect(db.get(key)).toBeNull()
     }
   }

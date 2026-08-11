@@ -140,13 +140,15 @@ class Snapshot:
 class _Batch:
     """Accumulates writes/deletes for atomic commit.
 
-    Do not construct directly — use ``db.batch()``.
+    Do not construct directly — use ``db.batch()``. After the ``with`` block
+    exits successfully, ``result`` holds the committed ``CommitResult``.
     """
 
     def __init__(self, db: _bc.DB, write_opts: _bc.WriteOptions) -> None:
         self._db = db
         self._plan = _bc.WritePlan()
         self._write_opts = write_opts
+        self.result: _bc.CommitResult | None = None
 
     def __setitem__(self, key: bytes, value: bytes) -> None:
         self._plan.put(key, value)
@@ -163,8 +165,9 @@ class _Batch:
     def delete_range(self, from_key: bytes, to_key: bytes) -> None:
         self._plan.del_range(from_key, to_key)
 
-    def _commit(self) -> bool:
-        return self._db.apply_batch(self._plan, self._write_opts)
+    def _commit(self) -> _bc.CommitResult | None:
+        self.result = self._db.apply_batch(self._plan, self._write_opts)
+        return self.result
 
 
 class _BatchContext:
@@ -202,7 +205,10 @@ class _Transaction:
     write buffer first.  Iteration methods (``items``, ``keys``, etc.)
     read from the snapshot only — they do not reflect uncommitted writes.
 
-    Do not construct directly — use ``db.transaction()``.
+    Do not construct directly — use ``db.transaction()``. After the ``with``
+    block exits successfully, ``result`` holds the committed
+    ``CommitResult`` (never a conflict value, since conflict raises
+    ``ConflictError`` instead).
     """
 
     def __init__(self, db: _bc.DB, raw_snap: _bc.Snapshot,
@@ -213,6 +219,7 @@ class _Transaction:
         self._ops: list[tuple[str, tuple]] = []
         self._guards: list[tuple[str, tuple]] = []
         self._write_opts = write_opts
+        self.result: _bc.CommitResult | None = None
         # Write buffer for RYOW point reads. Values are bytes or _TOMBSTONE.
         # Range deletes are tracked separately.
         self._pending: dict[bytes, bytes | object] = {}
@@ -323,7 +330,7 @@ class _Transaction:
     def has_snapshot(self) -> bool:
         return True
 
-    def _commit(self) -> bool:
+    def _commit(self) -> _bc.CommitResult | None:
         plan = _bc.WritePlan(self._raw_snap)  # moves snapshot — reads are done
         for method, args in self._guards:
             getattr(plan, method)(*args)
@@ -352,7 +359,7 @@ class _TransactionContext:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if exc_type is None and self._txn is not None:
-            if not self._txn._commit():
+            if self._txn._commit() is None:
                 self._txn = None
                 raise ConflictError(
                     "Transaction aborted: concurrent modification detected"
@@ -432,9 +439,9 @@ class DB:
         *,
         sync: bool = True,
         solo: bool = False,
-    ) -> None:
-        """Write key → value."""
-        self._db.put(key, value, _write_opts(sync, solo))
+    ) -> _bc.CommitResult:
+        """Write key → value. Returns the assigned CommitResult."""
+        return self._db.put(key, value, _write_opts(sync, solo))
 
     def delete(
         self,
@@ -442,8 +449,8 @@ class DB:
         *,
         sync: bool = True,
         solo: bool = False,
-    ) -> bool:
-        """Delete *key*. Returns True if the key existed."""
+    ) -> _bc.CommitResult | None:
+        """Delete *key*. Returns the CommitResult, or None if absent."""
         return self._db.del_(key, _write_opts(sync, solo))
 
     def delete_range(
@@ -453,9 +460,10 @@ class DB:
         *,
         sync: bool = True,
         solo: bool = False,
-    ) -> None:
-        """Delete all keys in [from_key, to_key) with a single disk append."""
-        self._db.del_range(from_key, to_key, _write_opts(sync, solo))
+    ) -> _bc.CommitResult:
+        """Delete all keys in [from_key, to_key) with a single disk append.
+        Returns the assigned CommitResult."""
+        return self._db.del_range(from_key, to_key, _write_opts(sync, solo))
 
     # ── Iteration ─────────────────────────────────────────────────────────────
 

@@ -5,6 +5,7 @@ export type {
   ByteCaskDB,
   ByteCaskFactory,
   CloseableIterator,
+  CommitResult,
   Entry,
   OpenOptions,
   ReadOptions,

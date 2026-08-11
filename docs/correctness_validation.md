@@ -531,9 +531,9 @@ How entries are delivered to the follower:
 | Shape | What it tests |
 |-------|---------------|
 | `full_stream` | Baseline — full replication in a single ingest call |
-| `incremental` | Each chunk produces a valid prefix; follower.current_sequence() advances monotonically |
-| `restart_midstream` | Recovery equivalence — reopened follower's current_sequence() is trustworthy, next changes_since picks up without gaps |
-| `duplicate_delivery` | Idempotency — entries with sequence <= current_sequence() are silently skipped |
+| `incremental` | Each chunk produces a valid prefix; follower.durable_sequence() advances monotonically |
+| `restart_midstream` | Recovery equivalence — reopened follower's durable_sequence() is trustworthy, next changes_since picks up without gaps |
+| `duplicate_delivery` | Idempotency — entries with sequence <= durable_sequence() are silently skipped |
 | `planned_promotion` | Sequence continuity on promoted node; backward sync after leadership transfer converges |
 
 #### Ingest failure classes

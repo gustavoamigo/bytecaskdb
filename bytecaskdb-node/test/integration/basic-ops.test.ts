@@ -50,7 +50,7 @@ test('del returns true for existing keys', async ({ db }) => {
   expect(decodeBytes(db.get(key)!)).toBe(value)
 
   const deleted = db.del(key)
-  expect(deleted).toBe(true)
+  expect(deleted).not.toBeNull()
   expect(db.get(key)).toBeNull()
 })
 
@@ -58,7 +58,7 @@ test('del returns false for non-existent keys', async ({ db }) => {
   const key = 'delete-non-existent'
 
   const deleted = db.del(key)
-  expect(deleted).toBe(false)
+  expect(deleted).toBeNull()
 })
 
 test('containsKey works correctly for existing keys', async ({ db }) => {

@@ -9,6 +9,7 @@
 // Build note: compiled by xmake into libbytecask.a alongside the other
 // bytecaskdb/ sources. Contains no MariaDB headers.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -134,19 +135,39 @@ void bytecask_close(bytecask_db_t *db) {
 }
 
 // ---------------------------------------------------------------------------
+// Helper — convert C write options to bytecask::WriteOptions, and fill a
+// nullable CommitResult out-param from the module's result type.
+// ---------------------------------------------------------------------------
+static bytecask::WriteOptions to_write_options(const bytecask_write_options_t *opts) {
+  if (!opts) return {};
+  bytecask::WriteOptions wo;
+  wo.sync = (opts->sync != 0);
+  wo.solo = (opts->solo != 0);
+  return wo;
+}
+
+static void fill_result(bytecask_commit_result_t *out, const bytecask::CommitResult &r) {
+  if (!out) return;
+  out->sequence = r.sequence;
+  out->durable = r.durable ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
 // Put
 // ---------------------------------------------------------------------------
 
 int bytecask_put(bytecask_db_t *db,
                  const uint8_t *key, std::size_t key_len,
                  const uint8_t *val, std::size_t val_len,
-                 int sync) {
+                 const bytecask_write_options_t *opts,
+                 bytecask_commit_result_t *out) {
   clear_errmsg();
+  if (out) *out = {};
   if (!db) { set_errmsg("null db handle"); return -1; }
   try {
-    bytecask::WriteOptions opts;
-    opts.sync = (sync != 0);
-    db->db.put(opts, to_view(key, key_len), to_view(val, val_len));
+    auto result = db->db.put(to_write_options(opts), to_view(key, key_len),
+                             to_view(val, val_len));
+    fill_result(out, result);
     return 0;
   } catch (const std::exception &e) {
     set_errmsg(e.what());
@@ -160,14 +181,16 @@ int bytecask_put(bytecask_db_t *db,
 
 int bytecask_del(bytecask_db_t *db,
                  const uint8_t *key, std::size_t key_len,
-                 int sync) {
+                 const bytecask_write_options_t *opts,
+                 bytecask_commit_result_t *out) {
   clear_errmsg();
+  if (out) *out = {};
   if (!db) { set_errmsg("null db handle"); return -1; }
   try {
-    bytecask::WriteOptions opts;
-    opts.sync = (sync != 0);
-    bool existed = db->db.del(opts, to_view(key, key_len)).has_value();
-    return existed ? 1 : 0;
+    auto result = db->db.del(to_write_options(opts), to_view(key, key_len));
+    if (!result) return 0;
+    fill_result(out, *result);
+    return 1;
   } catch (const std::exception &e) {
     set_errmsg(e.what());
     return -1;
@@ -181,13 +204,15 @@ int bytecask_del(bytecask_db_t *db,
 int bytecask_del_range(bytecask_db_t *db,
                        const uint8_t *from, std::size_t from_len,
                        const uint8_t *to, std::size_t to_len,
-                       int sync) {
+                       const bytecask_write_options_t *opts,
+                       bytecask_commit_result_t *out) {
   clear_errmsg();
+  if (out) *out = {};
   if (!db) { set_errmsg("null db handle"); return -1; }
   try {
-    bytecask::WriteOptions opts;
-    opts.sync = (sync != 0);
-    db->db.del_range(opts, to_view(from, from_len), to_view(to, to_len));
+    auto result = db->db.del_range(to_write_options(opts), to_view(from, from_len),
+                                   to_view(to, to_len));
+    fill_result(out, result);
     return 0;
   } catch (const std::exception &e) {
     set_errmsg(e.what());
@@ -534,23 +559,43 @@ void bytecask_write_plan_free(bytecask_write_plan_t *plan) {
 
 int bytecask_apply_batch(bytecask_db_t *db,
                          bytecask_write_plan_t *plan,
-                         int sync) {
+                         const bytecask_write_options_t *opts,
+                         bytecask_commit_result_t *out) {
   clear_errmsg();
+  if (out) *out = {};
   if (!db || !plan) {
     set_errmsg(!db ? "null db handle" : "null plan handle");
     delete plan;
     return -1;
   }
   try {
-    bytecask::WriteOptions opts;
-    opts.sync = (sync != 0);
-    bool committed = db->db.apply_batch(opts, std::move(plan->plan)).has_value();
+    auto result = db->db.apply_batch(to_write_options(opts), std::move(plan->plan));
     delete plan;
-    return committed ? 1 : 0;
+    if (!result) return 0;
+    fill_result(out, *result);
+    return 1;
   } catch (const std::exception &e) {
     set_errmsg(e.what());
     delete plan;
     return -1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Durable sequence
+// ---------------------------------------------------------------------------
+
+uint64_t bytecask_durable_sequence(bytecask_db_t *db,
+                                   uint64_t min_sequence,
+                                   uint64_t timeout_ms) {
+  clear_errmsg();
+  if (!db) { set_errmsg("null db handle"); return 0; }
+  try {
+    return db->db.durable_sequence(min_sequence,
+                                   std::chrono::milliseconds{timeout_ms});
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return 0;
   }
 }
 

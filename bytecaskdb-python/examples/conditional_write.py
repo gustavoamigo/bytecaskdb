@@ -42,7 +42,7 @@ def main():
         plan1.put(b"stock:widget", str(stock1 - 1).encode())
 
         committed = db.apply_batch(plan1)
-        print(f"  Plan committed = {committed}")  # False — conflict
+        print(f"  Plan committed = {committed}")  # None — conflict
         print(f"  Stock unchanged at: {db.get(b'stock:widget')}")  # b'50'
 
         # --- Example 3: ensure_unchanged for read dependencies ---

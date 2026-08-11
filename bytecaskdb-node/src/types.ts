@@ -28,13 +28,22 @@ export interface ReadOptions {
   verifyChecksums?: boolean;
 }
 
+// Outcome of a committed write. sequence is the highest sequence assigned to
+// the write (0n = nothing written). durable is true iff fdatasync confirmed
+// it before return. sequence is an exact bigint end-to-end — never a lossy
+// double — since JS numbers cannot exactly represent every uint64_t value.
+export interface CommitResult {
+  sequence: bigint;
+  durable: boolean;
+}
+
 export interface Entry {
   key: Uint8Array;
   value: Uint8Array;
 }
 
 export interface DataEntry {
-  sequence: number;
+  sequence: bigint;
   entryType: EntryType;
   key: Uint8Array;
   value: Uint8Array;
@@ -49,7 +58,7 @@ export interface FileInfo {
 export interface FileManifest extends Disposable {
   getSnapshot(): Snapshot;
   getFiles(): FileInfo[];
-  getThroughSequence(): number;
+  getThroughSequence(): bigint;
   close(): void;
 }
 
@@ -83,12 +92,12 @@ export interface WritePlan extends Disposable {
 
 export interface ByteCaskDB extends Disposable {
   get(key: string, opts?: ReadOptions): Uint8Array | null;
-  put(key: string, value: string, opts?: WriteOptions): void;
-  del(key: string, opts?: WriteOptions): boolean;
-  delRange(from: string, to: string, opts?: WriteOptions): void;
+  put(key: string, value: string, opts?: WriteOptions): CommitResult;
+  del(key: string, opts?: WriteOptions): CommitResult | null;
+  delRange(from: string, to: string, opts?: WriteOptions): CommitResult;
   containsKey(key: string, opts?: ReadOptions): boolean;
   snapshot(): Snapshot;
-  applyBatch(plan: WritePlan, opts?: WriteOptions): boolean;
+  applyBatch(plan: WritePlan, opts?: WriteOptions): CommitResult | null;
   entries(from: string, opts?: ReadOptions): CloseableIterator<Entry>;
   keys(from: string, opts?: ReadOptions): CloseableIterator<Uint8Array>;
   entriesReverse(from: string, opts?: ReadOptions): CloseableIterator<Entry>;
@@ -99,9 +108,14 @@ export interface ByteCaskDB extends Disposable {
   resume(): void;
   mode(): Mode;
   setMode(mode: Mode): void;
-  currentSequence(timeoutMs?: number): number;
+  // The single sequence primitive — replaces currentSequence (removed, no
+  // alias). minSequence=0n, an already-reached target, or timeoutMs=0 all
+  // return immediately without blocking. A positive timeoutMs blocks the
+  // calling thread — in Node.js, the event loop — until the durable
+  // sequence reaches minSequence or the timeout expires.
+  durableSequence(minSequence?: bigint, timeoutMs?: number): bigint;
   createManifest(): FileManifest;
-  changesSince(snap: Snapshot, fromSeq: number): CloseableIterator<DataEntry>;
+  changesSince(snap: Snapshot, fromSeq: bigint): CloseableIterator<DataEntry>;
   ingest(entries: DataEntry[]): void;
   stats(): Record<string, number>;
   close(): void;

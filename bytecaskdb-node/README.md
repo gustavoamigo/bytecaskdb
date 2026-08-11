@@ -71,7 +71,7 @@ const val = db.get('hello');                 // Uint8Array | null
 Buffer.from(val).toString();                 // "world"
 
 db.containsKey('hello');                     // true
-db.del('hello');                             // returns true if key existed
+db.del('hello');                             // CommitResult, or null if key was absent
 
 // Range deletion — all keys in [from, to)
 db.delRange('session:', 'session:~');
@@ -94,7 +94,7 @@ const plan = new WritePlan();
 plan.put('a', '1');
 plan.put('b', '2');
 plan.del('c');
-db.applyBatch(plan);  // true (committed)
+db.applyBatch(plan);  // CommitResult (committed) or null (conflict)
 
 // Snapshot isolation
 const snap = db.snapshot();
@@ -108,7 +108,7 @@ const guarded = WritePlan.withSnapshot(snap2);
 guarded.ensureUnchanged('price');  // reject if price changed since snapshot
 guarded.put('order:99', 'total');
 if (!db.applyBatch(guarded)) {
-  // conflict — price changed, retry
+  // conflict (null) — price changed, retry
 }
 
 // Cleanup — call close() or use Symbol.dispose (Node.js 22+)

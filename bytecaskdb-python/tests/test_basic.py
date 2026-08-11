@@ -18,12 +18,12 @@ def test_put_overwrites(db):
 
 def test_del_returns_true_if_existed(db):
     db.put(b"k1", b"v1")
-    assert db.del_(b"k1") is True
+    assert db.del_(b"k1") is not None
     assert db.get(b"k1") is None
 
 
 def test_del_returns_false_if_absent(db):
-    assert db.del_(b"missing") is False
+    assert db.del_(b"missing") is None
 
 
 def test_contains_key(db):

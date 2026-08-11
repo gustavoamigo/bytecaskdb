@@ -79,6 +79,20 @@ class WriteOptions:
 
     def __init__(self) -> None: ...
 
+class CommitResult:
+    """Outcome of a committed write. Read-only.
+
+    ``sequence`` is the highest sequence assigned to the write (0 means
+    nothing was written: empty plan, guard-only plan, or empty-range
+    ``del_range``). ``durable`` is ``True`` iff fdatasync confirmed the
+    write before return.
+    """
+
+    @property
+    def sequence(self) -> int: ...
+    @property
+    def durable(self) -> bool: ...
+
 class ReadOptions:
     """Per-read options passed to ``get``, ``iter_from``, etc."""
 
@@ -327,14 +341,21 @@ class DB:
         key: bytes,
         value: bytes,
         opts: WriteOptions | None = None,
-    ) -> None:
-        """Write *key* -> *value*. Overwrites any existing value."""
+    ) -> CommitResult:
+        """Write *key* -> *value*. Overwrites any existing value.
+
+        Returns the assigned ``CommitResult``. Cannot conflict.
+        """
         ...
 
     def del_(
         self, key: bytes, opts: WriteOptions | None = None
-    ) -> bool:
-        """Delete *key*. Return ``True`` if it existed."""
+    ) -> CommitResult | None:
+        """Delete *key*.
+
+        Returns the assigned ``CommitResult``, or ``None`` if the key was
+        absent (nothing written).
+        """
         ...
 
     def del_range(
@@ -342,8 +363,12 @@ class DB:
         from_key: bytes,
         to_key: bytes,
         opts: WriteOptions | None = None,
-    ) -> None:
-        """Delete all keys in ``[from_key, to_key)`` with a single disk append."""
+    ) -> CommitResult:
+        """Delete all keys in ``[from_key, to_key)`` with a single disk append.
+
+        Returns the assigned ``CommitResult`` (``sequence == 0`` if
+        ``from_key >= to_key``, since nothing was written). Cannot conflict.
+        """
         ...
 
     def contains_key(self, key: bytes, opts: ReadOptions | None = None) -> bool:
@@ -352,10 +377,13 @@ class DB:
 
     def apply_batch(
         self, plan: WritePlan, opts: WriteOptions | None = None
-    ) -> bool:
+    ) -> CommitResult | None:
         """Atomically apply *plan*. Consumes *plan*.
 
-        Return ``True`` if committed, ``False`` on conflict.
+        Returns the assigned ``CommitResult`` if committed, or ``None`` on
+        conflict (a guard failed or the implicit write-write check detected
+        a conflict). An empty or guard-only plan that passes commits as a
+        no-op: ``CommitResult(sequence=0, durable=True)``.
         """
         ...
 
@@ -422,8 +450,13 @@ class DB:
         """Switch engine mode."""
         ...
 
-    def current_sequence(self, timeout_ms: int = 0) -> int:
-        """Return the highest durable sequence number."""
+    def durable_sequence(self, min_sequence: int = 0, timeout_ms: int = 0) -> int:
+        """Block until the durable sequence >= *min_sequence* or *timeout_ms*
+        expires; returns the durable sequence.
+
+        ``min_sequence == 0``, an already-reached target, or
+        ``timeout_ms == 0`` all return immediately without blocking.
+        """
         ...
 
     def create_manifest(self) -> FileManifest:

@@ -55,11 +55,12 @@ Read a value by key.
 
 ### `.put(key, value, opts?)`
 
-Write a key-value pair.
+Write a key-value pair. Cannot conflict.
 
 - **key** `string`
 - **value** `string`
 - **opts** `WriteOptions?`
+- **returns** `CommitResult` — the assigned sequence and whether it was durable before return
 - **throws** on I/O failure or `DbDegraded`
 
 **WriteOptions**
@@ -67,6 +68,13 @@ Write a key-value pair.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `sync` | `boolean` | `true` | Call `fdatasync` after write |
+
+**CommitResult**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sequence` | `bigint` | Highest sequence assigned to this write. `0n` means nothing was written. |
+| `durable` | `boolean` | `true` if `fdatasync` confirmed the write before return. |
 
 ---
 
@@ -76,18 +84,19 @@ Delete a key.
 
 - **key** `string`
 - **opts** `WriteOptions?`
-- **returns** `boolean` — `true` if the key existed
+- **returns** `CommitResult | null` — `null` if the key was absent (nothing written)
 - **throws** on I/O failure or `DbDegraded`
 
 ---
 
 ### `.delRange(from, to, opts?)`
 
-Delete all keys in `[from, to)` with a single disk append.
+Delete all keys in `[from, to)` with a single disk append. Cannot conflict.
 
 - **from** `string`
 - **to** `string`
 - **opts** `WriteOptions?`
+- **returns** `CommitResult` — `{ sequence: 0n, durable: true }` without writing if `from >= to`
 - **throws** on I/O failure or `DbDegraded`
 
 ---
@@ -111,11 +120,11 @@ Capture a frozen, read-only view of the database at this instant.
 
 ### `.applyBatch(plan, opts?)`
 
-Atomically apply all operations in a `WritePlan`. Returns `false` on conflict when the plan has a snapshot or guards.
+Atomically apply all operations in a `WritePlan`. Returns `null` on conflict when the plan has a snapshot or guards.
 
 - **plan** `WritePlan` — consumed by this call
 - **opts** `WriteOptions?`
-- **returns** `boolean`
+- **returns** `CommitResult | null` — `null` on conflict; an empty or guard-only plan that passes commits as a no-op (`{ sequence: 0n, durable: true }`)
 - **throws** on I/O failure or `DbDegraded`
 
 ---
@@ -212,12 +221,15 @@ Switch engine mode.
 
 ---
 
-### `.currentSequence(timeoutMs?)`
+### `.durableSequence(minSequence?, timeoutMs?)`
 
-Returns the highest sequence confirmed durable by fdatasync.
+The single sequence primitive — replaces `currentSequence` (removed, no alias). Returns the highest sequence confirmed durable by `fdatasync`.
 
-- **timeoutMs** `number?` — `0` (default): non-blocking. `> 0`: blocks until durable_seq advances or timeout expires.
-- **returns** `number`
+- **minSequence** `bigint?` — default `0n`. An already-reached target (or `0n`) returns immediately without blocking.
+- **timeoutMs** `number?` — `0` (default): non-blocking poll. `> 0`: blocks until the durable sequence reaches `minSequence` or the timeout expires. **A positive `timeoutMs` blocks the calling thread — in Node.js, the event loop — for the whole wait; nothing else on that event loop can run until it returns.**
+- **returns** `bigint` — the durable sequence at return (may be below `minSequence` if the timeout expired)
+
+Covers three use cases with one call: polling (`db.durableSequence()`), replication wake-up (`leader.durableSequence(follower.durableSequence() + 1n, timeoutMs)`), and read-your-own-writes waits (`follower.durableSequence(result.sequence, timeoutMs)` using a `CommitResult` from a leader write).
 
 ---
 

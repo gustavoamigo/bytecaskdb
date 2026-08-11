@@ -58,7 +58,7 @@ test('WritePlan delRange in batch operations works correctly', async ({ db, wasm
   plan.put('new:key', 'new-value')
 
   const success = db.applyBatch(plan)
-  expect(success).toBe(true)
+  expect(success).not.toBeNull()
 
   // Verify range deletion
   for (const { key } of rangeData) {
@@ -205,7 +205,7 @@ test('range deletion with WritePlan conflict detection', async ({ db, wasmBacken
 
   // Apply batch should detect conflict
   const success = db.applyBatch(plan)
-  expect(success).toBe(false)
+  expect(success).toBeNull()
 
   // Original modification should remain
   expect(decodeBytes(db.get(key1)!)).toBe(newValue)

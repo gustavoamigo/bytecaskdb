@@ -120,6 +120,7 @@ target("bytecask_tests")
     -- For VS Code / clangd support, run: scripts/gen_compile_commands.sh
     add_files("tests/*.cpp", "tests/proof/generated/*.cpp", "bytecaskdb/*.cppm")
     remove_files("tests/radix_tree_memory_test.cpp")
+    remove_files("tests/bytecask_c_test.cpp")
     add_includedirs("bytecaskdb", "tests")
     add_packages("catch2", "crc32c")
     add_defines("BYTECASK_TESTING")
@@ -230,6 +231,40 @@ target("bytecask_testing")
     on_config(function(t)
         add_native_syslinks(t)
         apply_sanitizer(t)
+    end)
+
+-- C API behavioral tests (Catch2, driven from C++) — exercises status codes,
+-- nullable write-options/result out-params, and CommitResult/durable_sequence
+-- semantics through the stable C ABI (include/bytecask_c.h). Links against
+-- the prebuilt "bytecask" static library rather than recompiling the module.
+target("bytecask_c_tests")
+    set_kind("binary")
+    set_default(false)
+    add_deps("bytecask")
+    add_files("tests/bytecask_c_test.cpp")
+    add_includedirs("include")
+    add_packages("catch2", "crc32c")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+
+-- Plain C11 compilation smoke test for include/bytecask_c.h — compiled with
+-- the C frontend (not C++) so header syntax/struct-layout mistakes that only
+-- a C compiler would reject are caught. Links against libbytecask.a, which
+-- requires the C++ standard library at link time even though this TU is C.
+target("bytecask_c_smoke")
+    set_kind("binary")
+    set_default(false)
+    set_languages("c11")
+    add_deps("bytecask")
+    add_files("tests/bytecask_c_smoke.c")
+    add_includedirs("include")
+    add_packages("crc32c")
+    add_syslinks("stdc++")
+    on_config(function(t)
+        add_native_syslinks(t)
     end)
 
 -- Python bindings via nanobind.
@@ -468,6 +503,10 @@ target("wasm_embind")
         t:add("ldflags",
             "-fwasm-exceptions",
             "-lembind",
+            -- Exact u64/i64 <-> JS BigInt marshalling for sequence numbers
+            -- (BC-231) — without this, Embind truncates 64-bit values to a
+            -- lossy double at the JS boundary.
+            "-sWASM_BIGINT",
             "-sNODERAWFS=1", "-sENVIRONMENT=node", "-lnoderawfs.js",
             "-sMALLOC=mimalloc", "-sALLOW_MEMORY_GROWTH",
             "-sMODULARIZE=1", "-sEXPORT_NAME=createByteCask",
@@ -518,6 +557,7 @@ target("wasm_tests")
     set_wasm_policies()
     add_wasm_sources()
     add_files("tests/*.cpp", "tests/proof/generated/*.cpp")
+    remove_files("tests/bytecask_c_test.cpp")
     add_files("bytecaskdb-node/wasm/catch2_stringmakers.cpp")
     add_includedirs("bytecaskdb", "tests")
     add_defines("BYTECASK_TESTING")

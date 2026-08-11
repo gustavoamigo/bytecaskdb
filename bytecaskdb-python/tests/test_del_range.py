@@ -77,7 +77,7 @@ def test_write_plan_del_range(db):
     plan.del_range(b"item:1", b"item:3")  # deletes item:1, item:2
     plan.put(b"summary", b"done")
 
-    assert db.apply_batch(plan) is True
+    assert db.apply_batch(plan) is not None
     assert db.get(b"item:1") is None
     assert db.get(b"item:2") is None
     assert db.get(b"item:3") == b"c"
@@ -88,5 +88,5 @@ def test_write_plan_del_range_no_snapshot(db):
     plan = bc.WritePlan()
     plan.del_range(b"a", b"z")
     plan.put(b"new", b"val")
-    assert db.apply_batch(plan) is True
+    assert db.apply_batch(plan) is not None
     assert db.get(b"new") == b"val"
