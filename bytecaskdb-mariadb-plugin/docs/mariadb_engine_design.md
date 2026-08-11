@@ -188,7 +188,7 @@ MariaDB's binlog group commit calls `prepare_ordered()` → binlog write + group
 
 **No write blocking between prepare and commit.** `BulkPrepare` closes the block, freeing the data file for other writers. Prepared entries already participate in W-W conflict detection — a concurrent writer touching the same keys gets rejected at prepare time, not after the binlog fsync.
 
-**Client-controlled replication ack (Kafka pattern):** synchronous replication is not built into the engine. After a write, the client decides whether to wait for follower convergence by polling `follower.current_sequence()`. The durability-vs-latency tradeoff belongs to the client, not the engine.
+**Client-controlled replication ack (Kafka pattern):** synchronous replication is not built into the engine. After a write, the client decides whether to wait for follower convergence by polling `follower.durable_sequence()`. The durability-vs-latency tradeoff belongs to the client, not the engine.
 
 ---
 

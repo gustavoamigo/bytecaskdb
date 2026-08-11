@@ -27,8 +27,8 @@ def main():
         # ── Named writes with options ─────────────────────────────────────────
         print("\n=== put / delete with keyword opts ===")
         db.put(b"fast", b"value", sync=False)
-        existed = db.delete(b"fast", sync=False)
-        print(f"  delete(fast) existed = {existed}")
+        result = db.delete(b"fast", sync=False)
+        print(f"  delete(fast) -> {result}")  # None if the key was absent
 
         # ── Forward iteration ─────────────────────────────────────────────────
         print("\n=== Forward iteration ===")

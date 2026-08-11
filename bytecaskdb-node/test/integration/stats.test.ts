@@ -141,11 +141,11 @@ test('vacuum operations work correctly', async ({ db }) => {
   }
 })
 
-test('currentSequence behavior works correctly', async ({ db }) => {
-  // Get current sequence (non-blocking)
-  const initialSeq = db.currentSequence()
-  expect(initialSeq).toBeTypeOf('number')
-  expect(initialSeq).toBeGreaterThanOrEqual(0)
+test('durableSequence behavior works correctly', async ({ db }) => {
+  // Get current durable sequence (non-blocking)
+  const initialSeq = db.durableSequence()
+  expect(initialSeq).toBeTypeOf('bigint')
+  expect(initialSeq).toBeGreaterThanOrEqual(0n)
 
   // Perform some operations
   const key = 'sequence-test'
@@ -154,18 +154,22 @@ test('currentSequence behavior works correctly', async ({ db }) => {
   db.put(key, value)
 
   // Sequence should advance
-  const afterPutSeq = db.currentSequence()
+  const afterPutSeq = db.durableSequence()
   expect(afterPutSeq).toBeGreaterThanOrEqual(initialSeq)
 
   // Another operation
   db.del(key)
 
-  const afterDelSeq = db.currentSequence()
+  const afterDelSeq = db.durableSequence()
   expect(afterDelSeq).toBeGreaterThanOrEqual(afterPutSeq)
 
   // Non-blocking call with timeout 0 should return immediately
-  const timeoutSeq = db.currentSequence(0)
-  expect(timeoutSeq).toBeTypeOf('number')
+  const timeoutSeq = db.durableSequence(0n, 0)
+  expect(timeoutSeq).toBeTypeOf('bigint')
+
+  // Target already reached returns immediately without blocking.
+  const reached = db.durableSequence(afterDelSeq, 5000)
+  expect(reached).toBe(afterDelSeq)
 })
 
 test('operational counter accuracy', async ({ db }) => {

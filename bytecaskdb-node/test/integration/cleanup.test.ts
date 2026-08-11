@@ -135,7 +135,7 @@ test('WritePlan cleanup works correctly', async ({ db, wasmBackend }) => {
       plan.put(encodeString(`plan-test-${i}`), encodeString(`value-${i}`))
 
       const success = db.applyBatch(plan)
-      expect(success).toBe(true)
+      expect(success).not.toBeNull()
 
       plan.close()
     }
@@ -148,7 +148,7 @@ test('WritePlan cleanup works correctly', async ({ db, wasmBackend }) => {
       plan.put(encodeString(`snap-plan-${i}`), encodeString(`snap-value-${i}`))
 
       const success = db.applyBatch(plan)
-      expect(success).toBe(true)
+      expect(success).not.toBeNull()
 
       plan.close()
       snapshot.close()
@@ -307,7 +307,7 @@ test('concurrent resource usage and cleanup', async ({ tmpDir, wasmBackend }) =>
 
     // Apply and close plans
     const success = db1.applyBatch(plans[i])
-    expect(success).toBe(true)
+    expect(success).not.toBeNull()
   }
 
   // Verify database is still functional

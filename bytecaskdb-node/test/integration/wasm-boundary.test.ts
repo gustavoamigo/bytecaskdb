@@ -84,7 +84,7 @@ test('concurrent operations do not interfere', async ({ db }) => {
   // Delete every other operation
   for (let i = 0; i < operations.length; i += 2) {
     const deleted = db.del(operations[i].key)
-    expect(deleted).toBe(true)
+    expect(deleted).not.toBeNull()
   }
 
   // Verify deletions and remaining data

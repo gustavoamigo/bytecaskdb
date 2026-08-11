@@ -76,11 +76,11 @@ def test_delta1_single_put(k, v):
         path = os.path.join(tmpdir, "db")
         db = bc.DB.open(path)
 
-        seq_before = db.current_sequence()
+        seq_before = db.durable_sequence()
         db.put(k, v, sync_opts())
 
         assert db.get(k) == v
-        assert db.current_sequence() - seq_before == 1
+        assert db.durable_sequence() - seq_before == 1
         assert not db.is_degraded
 
         del db
@@ -100,14 +100,14 @@ def test_delta2_causality_overwrite(k, v0, v1):
         path = os.path.join(tmpdir, "db")
         db = bc.DB.open(path)
 
-        seq_before = db.current_sequence()
+        seq_before = db.durable_sequence()
         plan = bc.WritePlan()
         plan.put(k, v0)
         plan.put(k, v1)
         assert db.apply_batch(plan, sync_opts())
 
         assert db.get(k) == v1
-        assert db.current_sequence() - seq_before == 4
+        assert db.durable_sequence() - seq_before == 4
         assert not db.is_degraded
 
         del db
@@ -127,7 +127,7 @@ def test_delta3_causality_put_del_put(k, v0, v1):
         path = os.path.join(tmpdir, "db")
         db = bc.DB.open(path)
 
-        seq_before = db.current_sequence()
+        seq_before = db.durable_sequence()
         plan = bc.WritePlan()
         plan.put(k, v0)
         plan.del_(k)
@@ -135,7 +135,7 @@ def test_delta3_causality_put_del_put(k, v0, v1):
         assert db.apply_batch(plan, sync_opts())
 
         assert db.get(k) == v1
-        assert db.current_sequence() - seq_before == 5
+        assert db.durable_sequence() - seq_before == 5
         assert not db.is_degraded
 
         del db
@@ -162,7 +162,7 @@ def test_delta4_mixed_batch(k_new, v_new, k_exist, v_exist):
         db = bc.DB.open(path)
 
         db.put(k_exist, v_exist, sync_opts())
-        seq_before = db.current_sequence()
+        seq_before = db.durable_sequence()
 
         plan = bc.WritePlan()
         plan.put(k_new, v_new)
@@ -171,7 +171,7 @@ def test_delta4_mixed_batch(k_new, v_new, k_exist, v_exist):
 
         assert db.get(k_new) == v_new
         assert db.get(k_exist) is None
-        assert db.current_sequence() - seq_before == 4
+        assert db.durable_sequence() - seq_before == 4
         assert not db.is_degraded
 
         del db
@@ -192,7 +192,7 @@ def test_delta5_multi_put(k0, v0, k1, v1):
         path = os.path.join(tmpdir, "db")
         db = bc.DB.open(path)
 
-        seq_before = db.current_sequence()
+        seq_before = db.durable_sequence()
         plan = bc.WritePlan()
         plan.put(k0, v0)
         plan.put(k1, v1)
@@ -200,7 +200,7 @@ def test_delta5_multi_put(k0, v0, k1, v1):
 
         assert db.get(k0) == v0
         assert db.get(k1) == v1
-        assert db.current_sequence() - seq_before == 4
+        assert db.durable_sequence() - seq_before == 4
         assert not db.is_degraded
 
         del db
@@ -228,7 +228,7 @@ def test_delta6_large_batch(k0, v0, k1, v1, k2, v2):
         path = os.path.join(tmpdir, "db")
         db = bc.DB.open(path)
 
-        seq_before = db.current_sequence()
+        seq_before = db.durable_sequence()
         plan = bc.WritePlan()
         plan.put(k0, v0)
         plan.put(k1, v1)
@@ -238,7 +238,7 @@ def test_delta6_large_batch(k0, v0, k1, v1, k2, v2):
         assert db.get(k0) == v0
         assert db.get(k1) == v1
         assert db.get(k2) == v2
-        assert db.current_sequence() - seq_before == 5
+        assert db.durable_sequence() - seq_before == 5
         assert not db.is_degraded
 
         del db
@@ -259,12 +259,12 @@ def test_delta7_single_delete(k, v):
         db = bc.DB.open(path)
 
         db.put(k, v, sync_opts())
-        seq_before = db.current_sequence()
+        seq_before = db.durable_sequence()
 
         assert db.del_(k, sync_opts())
 
         assert db.get(k) is None
-        assert db.current_sequence() - seq_before == 1
+        assert db.durable_sequence() - seq_before == 1
         assert not db.is_degraded
 
         del db
@@ -284,14 +284,14 @@ def test_delta8_causality_put_del(k, v):
         path = os.path.join(tmpdir, "db")
         db = bc.DB.open(path)
 
-        seq_before = db.current_sequence()
+        seq_before = db.durable_sequence()
         plan = bc.WritePlan()
         plan.put(k, v)
         plan.del_(k)
         assert db.apply_batch(plan, sync_opts())
 
         assert db.get(k) is None
-        assert db.current_sequence() - seq_before == 4
+        assert db.durable_sequence() - seq_before == 4
         assert not db.is_degraded
 
         del db

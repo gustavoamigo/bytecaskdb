@@ -81,6 +81,16 @@ static auto extract_read_options(const val &opts) -> bytecask::ReadOptions {
   return ro;
 }
 
+// Converts a CommitResult to a JS {sequence: bigint, durable: boolean} object.
+// sequence is bound as a plain uint64_t — with -sWASM_BIGINT this crosses
+// the JS boundary as an exact BigInt, never a lossy double.
+static auto commit_result_to_js(const bytecask::CommitResult &r) -> val {
+  auto obj = val::object();
+  obj.set("sequence", r.sequence);
+  obj.set("durable", r.durable);
+  return obj;
+}
+
 // ---------------------------------------------------------------------------
 // JsDB — non-copyable, non-moveable DB wrapper
 // ---------------------------------------------------------------------------
@@ -272,7 +282,7 @@ struct JsChangeIterator {
     }
     auto view = *it;
     auto entry = val::object();
-    entry.set("sequence", static_cast<double>(view.sequence));
+    entry.set("sequence", view.sequence);
     entry.set("entryType", std::string{entry_type_to_string(view.entry_type)});
     entry.set("key", span_to_js(view.key));
     entry.set("value", span_to_js(view.value));
@@ -290,7 +300,7 @@ struct JsChangeIterator {
 struct JsFileManifest {
   JsSnapshot *snapshot;
   val files;
-  double through_sequence;
+  std::uint64_t through_sequence;
 };
 
 // ---------------------------------------------------------------------------
@@ -321,21 +331,23 @@ static auto jsdb_get(JsDB &self, const std::string &key, val opts) -> val {
   return val::null();
 }
 
-static void jsdb_put(JsDB &self, const std::string &key,
-                     const std::string &value, val opts) {
+static auto jsdb_put(JsDB &self, const std::string &key,
+                     const std::string &value, val opts) -> val {
   auto wo = extract_write_options(opts);
-  self.db.put(wo, to_view(key), to_view(value));
+  return commit_result_to_js(self.db.put(wo, to_view(key), to_view(value)));
 }
 
-static auto jsdb_del(JsDB &self, const std::string &key, val opts) -> bool {
+static auto jsdb_del(JsDB &self, const std::string &key, val opts) -> val {
   auto wo = extract_write_options(opts);
-  return self.db.del(wo, to_view(key));
+  auto result = self.db.del(wo, to_view(key));
+  if (!result) return val::null();
+  return commit_result_to_js(*result);
 }
 
-static void jsdb_del_range(JsDB &self, const std::string &from,
-                           const std::string &to, val opts) {
+static auto jsdb_del_range(JsDB &self, const std::string &from,
+                           const std::string &to, val opts) -> val {
   auto wo = extract_write_options(opts);
-  self.db.del_range(wo, to_view(from), to_view(to));
+  return commit_result_to_js(self.db.del_range(wo, to_view(from), to_view(to)));
 }
 
 static auto jsdb_contains_key(JsDB &self, const std::string &key, val opts)
@@ -348,12 +360,13 @@ static auto jsdb_snapshot(JsDB &self) -> JsSnapshot * {
   return new JsSnapshot{self.db.snapshot()};
 }
 
-static auto jsdb_apply_batch(JsDB &self, JsWritePlan &plan, val opts) -> bool {
+static auto jsdb_apply_batch(JsDB &self, JsWritePlan &plan, val opts) -> val {
   plan.check();
   auto wo = extract_write_options(opts);
   auto result = self.db.apply_batch(wo, std::move(*plan.plan));
   plan.plan.reset();
-  return result;
+  if (!result) return val::null();
+  return commit_result_to_js(*result);
 }
 
 static auto jsdb_entries(JsDB &self, const std::string &from, val opts)
@@ -400,13 +413,23 @@ static void jsdb_set_mode(JsDB &self, const std::string &mode) {
   self.db.set_mode(string_to_mode(mode));
 }
 
-static auto jsdb_current_sequence(JsDB &self, val timeout_ms_val) -> double {
+// The single sequence primitive. minSequence/timeoutMs default to 0 (an
+// immediate, non-blocking poll) when omitted from JS — Embind has no
+// built-in default-argument support, so undefined/null is treated as 0.
+// Returns a bigint (uint64_t crosses the JS boundary as BigInt under
+// -sWASM_BIGINT, never a lossy double).
+static auto jsdb_durable_sequence(JsDB &self, val min_sequence_val,
+                                  val timeout_ms_val) -> std::uint64_t {
+  std::uint64_t min_sequence = 0;
+  if (!min_sequence_val.isUndefined() && !min_sequence_val.isNull()) {
+    min_sequence = min_sequence_val.as<std::uint64_t>();
+  }
   std::uint64_t timeout_ms = 0;
   if (!timeout_ms_val.isUndefined() && !timeout_ms_val.isNull()) {
     timeout_ms = timeout_ms_val.as<std::uint64_t>();
   }
-  return static_cast<double>(
-      self.db.current_sequence(std::chrono::milliseconds{timeout_ms}));
+  return self.db.durable_sequence(min_sequence,
+                                  std::chrono::milliseconds{timeout_ms});
 }
 
 static auto jsdb_create_manifest(JsDB &self) -> JsFileManifest * {
@@ -424,15 +447,13 @@ static auto jsdb_create_manifest(JsDB &self) -> JsFileManifest * {
   }
 
   return new JsFileManifest{
-      snap, std::move(js_files),
-      static_cast<double>(manifest.through_sequence)};
+      snap, std::move(js_files), manifest.through_sequence};
 }
 
 static auto jsdb_changes_since(JsDB &self, JsSnapshot &snap,
-                               double from_seq) -> JsChangeIterator * {
+                               std::uint64_t from_seq) -> JsChangeIterator * {
   snap.check();
-  auto range = self.db.changes_since(*snap.snap,
-                                     static_cast<std::uint64_t>(from_seq));
+  auto range = self.db.changes_since(*snap.snap, from_seq);
   return new JsChangeIterator{std::move(range)};
 }
 
@@ -449,7 +470,7 @@ static void jsdb_ingest(JsDB &self, val entries) {
 
   for (std::size_t i = 0; i < len; ++i) {
     auto e = entries[i];
-    auto seq = static_cast<std::uint64_t>(e["sequence"].as<double>());
+    auto seq = e["sequence"].as<std::uint64_t>();
     auto et_str = e["entryType"].as<std::string>();
 
     bytecask::EntryType et;
@@ -611,7 +632,7 @@ static auto js_file_manifest_get_snapshot(JsFileManifest &self) -> JsSnapshot * 
 static auto js_file_manifest_get_files(JsFileManifest &self) -> val {
   return self.files;
 }
-static auto js_file_manifest_get_through_sequence(JsFileManifest &self) -> double {
+static auto js_file_manifest_get_through_sequence(JsFileManifest &self) -> std::uint64_t {
   return self.through_sequence;
 }
 
@@ -648,7 +669,7 @@ EMSCRIPTEN_BINDINGS(bytecask) {
       .function("resume", &jsdb_resume)
       .function("mode", &jsdb_mode)
       .function("setMode", &jsdb_set_mode)
-      .function("currentSequence", &jsdb_current_sequence)
+      .function("durableSequence", &jsdb_durable_sequence)
       .function("createManifest", &jsdb_create_manifest, allow_raw_pointers())
       .function("changesSince", &jsdb_changes_since, allow_raw_pointers())
       .function("ingest", &jsdb_ingest)

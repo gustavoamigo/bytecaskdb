@@ -469,7 +469,7 @@ H.3 — Replication hooks:
 - **Client-controlled replication ack (Kafka pattern).**
   Synchronous replication is not built into the engine. After a write,
   the client decides whether to wait for follower convergence by
-  polling `follower.current_sequence()`. The durability-vs-latency
+  polling `follower.durable_sequence()`. The durability-vs-latency
   tradeoff belongs to the client, not the engine. See
   `docs/replication_primitives_design.md` for the primitive set.
 

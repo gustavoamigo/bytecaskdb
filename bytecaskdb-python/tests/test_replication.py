@@ -33,18 +33,18 @@ def test_set_mode_back_to_leader(db, nosync):
     assert db.get(b"k") == b"v"
 
 
-def test_current_sequence_empty(db):
-    assert db.current_sequence() == 0
+def test_durable_sequence_empty(db):
+    assert db.durable_sequence() == 0
 
 
-def test_current_sequence_increments(db):
+def test_durable_sequence_increments(db):
     opts = bc.WriteOptions()
     opts.sync = True
     db.put(b"a", b"1", opts)
-    seq1 = db.current_sequence()
+    seq1 = db.durable_sequence()
     assert seq1 > 0
     db.put(b"b", b"2", opts)
-    seq2 = db.current_sequence()
+    seq2 = db.durable_sequence()
     assert seq2 > seq1
 
 
@@ -89,7 +89,7 @@ def test_changes_since_from_sequence(db):
     opts = bc.WriteOptions()
     opts.sync = True
     db.put(b"a", b"1", opts)
-    seq_after_a = db.current_sequence()
+    seq_after_a = db.durable_sequence()
     db.put(b"b", b"2", opts)
 
     snap = db.snapshot()
@@ -188,7 +188,7 @@ def test_leader_to_follower_replication(tmp_path):
     snap = leader.snapshot()
     changes = list(leader.changes_since(snap, follower_seq))
     follower.ingest(changes)
-    follower_seq = follower.current_sequence()
+    follower_seq = follower.durable_sequence()
 
     assert follower.get(b"user:1") == b"alice"
     assert follower.get(b"user:2") == b"bob"

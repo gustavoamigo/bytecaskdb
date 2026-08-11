@@ -61,7 +61,7 @@ test('applyBatch with simple WritePlan works correctly', async ({ db, wasmBacken
 
   // Apply batch
   const success = db.applyBatch(plan)
-  expect(success).toBe(true)
+  expect(success).not.toBeNull()
 
   // Verify results
   expect(decodeBytes(db.get(key1)!)).toBe(value1)
@@ -88,7 +88,7 @@ test('applyBatch with snapshot detects conflicts', async ({ db, wasmBackend }) =
 
   // Apply batch should detect conflict and return false
   const success = db.applyBatch(plan)
-  expect(success).toBe(false)
+  expect(success).toBeNull()
 
   // Database should still have the conflict value
   expect(decodeBytes(db.get(key)!)).toBe(conflictValue)
@@ -115,7 +115,7 @@ test('applyBatch without conflicts succeeds', async ({ db, wasmBackend }) => {
 
   // Apply batch should succeed
   const success = db.applyBatch(plan)
-  expect(success).toBe(true)
+  expect(success).not.toBeNull()
 
   // Verify results
   expect(db.get(key1)).toBeNull()
@@ -140,7 +140,7 @@ test('ensurePresent guard works correctly', async ({ db, wasmBackend }) => {
     plan.put('test', 'value')
 
     const success = db.applyBatch(plan)
-    expect(success).toBe(true)
+    expect(success).not.toBeNull()
 
     plan.close()
     snapshot.close()
@@ -154,7 +154,7 @@ test('ensurePresent guard works correctly', async ({ db, wasmBackend }) => {
     plan.put('test2', 'value2')
 
     const success = db.applyBatch(plan)
-    expect(success).toBe(false)
+    expect(success).toBeNull()
 
     plan.close()
     snapshot.close()
@@ -176,7 +176,7 @@ test('ensureAbsent guard works correctly', async ({ db, wasmBackend }) => {
     plan.put('test', 'value')
 
     const success = db.applyBatch(plan)
-    expect(success).toBe(true)
+    expect(success).not.toBeNull()
 
     plan.close()
     snapshot.close()
@@ -190,7 +190,7 @@ test('ensureAbsent guard works correctly', async ({ db, wasmBackend }) => {
     plan.put('test2', 'value2')
 
     const success = db.applyBatch(plan)
-    expect(success).toBe(false)
+    expect(success).toBeNull()
 
     plan.close()
     snapshot.close()
@@ -212,7 +212,7 @@ test('ensureUnchanged guard works correctly', async ({ db, wasmBackend }) => {
     plan.put('other', 'value')
 
     const success = db.applyBatch(plan)
-    expect(success).toBe(true)
+    expect(success).not.toBeNull()
 
     plan.close()
     snapshot.close()
@@ -229,7 +229,7 @@ test('ensureUnchanged guard works correctly', async ({ db, wasmBackend }) => {
     db.put(key, changedValue)
 
     const success = db.applyBatch(plan)
-    expect(success).toBe(false)
+    expect(success).toBeNull()
 
     plan.close()
     snapshot.close()
@@ -253,7 +253,7 @@ test('ensureRangeUnchanged guard works correctly', async ({ db, wasmBackend }) =
     plan.put('other', 'value')
 
     const success = db.applyBatch(plan)
-    expect(success).toBe(true)
+    expect(success).not.toBeNull()
 
     plan.close()
     snapshot.close()
@@ -270,7 +270,7 @@ test('ensureRangeUnchanged guard works correctly', async ({ db, wasmBackend }) =
     db.put(keys[1], 'modified-value')
 
     const success = db.applyBatch(plan)
-    expect(success).toBe(false)
+    expect(success).toBeNull()
 
     plan.close()
     snapshot.close()
@@ -346,7 +346,7 @@ test('complex batch operations work correctly', async ({ db, wasmBackend }) => {
   // batch:3 remains unchanged
 
   const success = db.applyBatch(plan)
-  expect(success).toBe(true)
+  expect(success).not.toBeNull()
 
   // Verify results
   expect(decodeBytes(db.get('batch:1')!)).toBe('updated-1')
