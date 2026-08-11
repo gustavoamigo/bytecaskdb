@@ -256,7 +256,7 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
     }
 
     bool committed = db_->apply_batch(bytecask::WriteOptions{.sync = true},
-                                      std::move(plan));
+                                      std::move(plan)).has_value();
     if (!committed) {
       revert_row_count_deltas();
       reset();

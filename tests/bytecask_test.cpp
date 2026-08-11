@@ -200,7 +200,7 @@ TEST_CASE("DB del existing key", "[bytecask]") {
   auto db = bytecask::DB::open(td.path / "db");
 
   db.put({}, to_bytes("key1"), to_bytes("value1"));
-  const bool removed = db.del({}, to_bytes("key1"));
+  const bool removed = db.del({}, to_bytes("key1")).has_value();
 
   CHECK(removed);
   CHECK_FALSE(get_val(db, to_bytes("key1")).has_value());
@@ -470,7 +470,7 @@ TEST_CASE("DB WriteOptions sync=false del still removes key",
   db.put({}, to_bytes("k"), to_bytes("v"));
 
   const bytecask::WriteOptions no_sync{.sync = false};
-  const bool removed = db.del(no_sync, to_bytes("k"));
+  const bool removed = db.del(no_sync, to_bytes("k")).has_value();
 
   CHECK(removed);
   CHECK_FALSE(get_val(db, to_bytes("k")).has_value());
@@ -3130,8 +3130,8 @@ TEST_CASE("apply_batch group commit: second slot conflicts on existing key",
     db.test_write_group().wait_for_queue_size(2);
   };
 
-  bool resultA = false;
-  bool resultB = false;
+  std::optional<bytecask::CommitResult> resultA;
+  std::optional<bytecask::CommitResult> resultB;
 
   // Thread A becomes leader, blocks in hook until thread B enqueues.
   std::thread tA([&] {
@@ -3152,8 +3152,8 @@ TEST_CASE("apply_batch group commit: second slot conflicts on existing key",
 
   db.test_write_group().on_leader_start_ = nullptr;
 
-  CHECK(resultA == true);
-  CHECK(resultB == false);
+  CHECK(resultA.has_value());
+  CHECK_FALSE(resultB.has_value());
 
   auto val = get_val(db, to_bytes("a"));
   REQUIRE(val.has_value());
@@ -3188,8 +3188,8 @@ TEST_CASE("apply_batch group commit: second slot conflicts on new key",
     db.test_write_group().wait_for_queue_size(2);
   };
 
-  bool resultA = false;
-  bool resultB = false;
+  std::optional<bytecask::CommitResult> resultA;
+  std::optional<bytecask::CommitResult> resultB;
 
   std::thread tA([&] {
     resultA = db.apply_batch({.sync = false}, std::move(planA));
@@ -3208,8 +3208,8 @@ TEST_CASE("apply_batch group commit: second slot conflicts on new key",
 
   db.test_write_group().on_leader_start_ = nullptr;
 
-  CHECK(resultA == true);
-  CHECK(resultB == false);
+  CHECK(resultA.has_value());
+  CHECK_FALSE(resultB.has_value());
 
   auto val = get_val(db, to_bytes("a"));
   REQUIRE(val.has_value());
@@ -4735,31 +4735,31 @@ TEST_CASE("Recovery model-based: workload with range deletes",
 }
 
 // ---------------------------------------------------------------------------
-// durable_sequence: current_sequence reflects sync writes
+// durable_sequence: durable_sequence reflects sync writes
 // ---------------------------------------------------------------------------
-TEST_CASE("current_sequence reflects sync writes", "[durable_seq]") {
+TEST_CASE("durable_sequence reflects sync writes", "[durable_seq]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
 
   // Fresh DB with no writes: durable_seq == 0 (next_seq starts at 1,
   // no keys recovered, so durable_seq = next_seq - 1 = 0).
-  CHECK(db.current_sequence() == 0);
+  CHECK(db.durable_sequence() == 0);
 
   // NoSync write — must NOT advance durable_seq.
   db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
-  CHECK(db.current_sequence() == 0);
+  CHECK(db.durable_sequence() == 0);
 
   // Sync write — must advance durable_seq to cover both keys
   // (group commit: the sync also confirms the earlier nosync entry).
   db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
-  auto seq_after_sync = db.current_sequence();
+  auto seq_after_sync = db.durable_sequence();
   CHECK(seq_after_sync >= 2);
 }
 
 // ---------------------------------------------------------------------------
 // durable_sequence: nosync-only writes never advance durable_seq
 // ---------------------------------------------------------------------------
-TEST_CASE("current_sequence stays at zero for nosync-only writes",
+TEST_CASE("durable_sequence stays at zero for nosync-only writes",
           "[durable_seq]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
@@ -4768,27 +4768,48 @@ TEST_CASE("current_sequence stays at zero for nosync-only writes",
     db.put({.sync = false}, to_bytes(std::format("k{}", i)),
            to_bytes(std::format("v{}", i)));
   }
-  CHECK(db.current_sequence() == 0);
+  CHECK(db.durable_sequence() == 0);
 }
 
 // ---------------------------------------------------------------------------
-// durable_sequence: long-poll wakes on sync write
+// durable_sequence: target already reached / min_sequence=0 return immediately
 // ---------------------------------------------------------------------------
-TEST_CASE("current_sequence long-poll wakes on sync write", "[durable_seq][concurrency]") {
+TEST_CASE("durable_sequence returns immediately for reached targets",
+          "[durable_seq]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  auto baseline = db.durable_sequence();
+  REQUIRE(baseline >= 1);
+
+  auto start = std::chrono::steady_clock::now();
+  // min_sequence = 0: always trivially reached.
+  CHECK(db.durable_sequence(0, std::chrono::milliseconds{5000}) == baseline);
+  // Target already reached: returns without blocking on the long timeout.
+  CHECK(db.durable_sequence(baseline, std::chrono::milliseconds{5000}) == baseline);
+  auto elapsed = std::chrono::steady_clock::now() - start;
+  CHECK(elapsed < std::chrono::milliseconds{2000});
+}
+
+// ---------------------------------------------------------------------------
+// durable_sequence: long-poll wakes when a sync write reaches the target
+// ---------------------------------------------------------------------------
+TEST_CASE("durable_sequence long-poll wakes on sync write", "[durable_seq][concurrency]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
 
   std::atomic<std::uint64_t> polled_seq{0};
   std::thread poller{[&] {
     polled_seq.store(
-        db.current_sequence(std::chrono::milliseconds{5000}),
+        db.durable_sequence(1, std::chrono::milliseconds{5000}),
         std::memory_order_release);
   }};
 
   // Give poller time to block on the condvar.
   std::this_thread::sleep_for(std::chrono::milliseconds{50});
 
-  // Sync write wakes the poller.
+  // Sync write wakes the poller by reaching target sequence 1.
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
 
   poller.join();
@@ -4796,24 +4817,25 @@ TEST_CASE("current_sequence long-poll wakes on sync write", "[durable_seq][concu
 }
 
 // ---------------------------------------------------------------------------
-// durable_sequence: long-poll times out on idle DB
+// durable_sequence: long-poll times out when the target is never reached
 // ---------------------------------------------------------------------------
-TEST_CASE("current_sequence long-poll times out on idle DB", "[durable_seq]") {
+TEST_CASE("durable_sequence long-poll times out on idle DB", "[durable_seq]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
 
   auto start = std::chrono::steady_clock::now();
-  auto seq = db.current_sequence(std::chrono::milliseconds{50});
+  // Target 1 is never reached — nothing is written.
+  auto seq = db.durable_sequence(1, std::chrono::milliseconds{50});
   auto elapsed = std::chrono::steady_clock::now() - start;
 
-  CHECK(seq == 0);
+  CHECK(seq < 1);
   CHECK(elapsed >= std::chrono::milliseconds{40});
 }
 
 // ---------------------------------------------------------------------------
 // durable_sequence: correct after recovery
 // ---------------------------------------------------------------------------
-TEST_CASE("current_sequence correct after recovery", "[durable_seq]") {
+TEST_CASE("durable_sequence correct after recovery", "[durable_seq]") {
   TempDir td;
   auto db_path = td.path / "db";
 
@@ -4825,7 +4847,7 @@ TEST_CASE("current_sequence correct after recovery", "[durable_seq]") {
 
   // Reopen — all recovered entries were previously synced.
   auto db = bytecask::DB::open(db_path);
-  auto seq = db.current_sequence();
+  auto seq = db.durable_sequence();
   // durable_seq should equal next_seq - 1 after recovery.
   // We wrote 2 sync entries, so durable_seq >= 2.
   CHECK(seq >= 2);
@@ -4838,13 +4860,13 @@ TEST_CASE("current_sequence correct after recovery", "[durable_seq]") {
 // ---------------------------------------------------------------------------
 // durable_sequence: correct after resume
 // ---------------------------------------------------------------------------
-TEST_CASE("current_sequence correct after resume", "[durable_seq][resume]") {
+TEST_CASE("durable_sequence correct after resume", "[durable_seq][resume]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1'000'000});
 
   // Committed baseline.
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
-  auto seq_before = db.current_sequence();
+  auto seq_before = db.durable_sequence();
   CHECK(seq_before >= 1);
 
   // Degrade via sync failure.
@@ -4859,9 +4881,231 @@ TEST_CASE("current_sequence correct after resume", "[durable_seq][resume]") {
   REQUIRE_NOTHROW(db.resume());
   CHECK_FALSE(db.is_degraded());
 
-  auto seq_after = db.current_sequence();
+  auto seq_after = db.durable_sequence();
   // After resume, durable_seq should be >= what it was before the failure.
   CHECK(seq_after >= seq_before);
+}
+
+// ===========================================================================
+// CommitResult — sequence and durability reporting
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// CommitResult: sequence is monotonic across put/del/del_range/apply_batch
+// ---------------------------------------------------------------------------
+TEST_CASE("CommitResult sequence is monotonic across write operations",
+          "[commit_result]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto r1 = db.put({}, to_bytes("a"), to_bytes("v1"));
+  REQUIRE(r1.sequence > 0);
+
+  auto r2 = db.put({}, to_bytes("b"), to_bytes("v2"));
+  CHECK(r2.sequence > r1.sequence);
+
+  auto r3 = db.del_range({}, to_bytes("z0"), to_bytes("z9"));
+  CHECK(r3.sequence > r2.sequence);
+
+  auto r4 = db.del({}, to_bytes("a"));
+  REQUIRE(r4.has_value());
+  CHECK(r4->sequence > r3.sequence);
+
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("c"), to_bytes("v3"));
+  auto r5 = db.apply_batch({}, std::move(plan));
+  REQUIRE(r5.has_value());
+  CHECK(r5->sequence > r4->sequence);
+}
+
+// ---------------------------------------------------------------------------
+// CommitResult: multi-op batch result equals the BulkEnd marker's sequence
+// ---------------------------------------------------------------------------
+TEST_CASE("CommitResult sequence equals BulkEnd sequence for multi-op batch",
+          "[commit_result]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto from_seq = db.durable_sequence();
+
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("k1"), to_bytes("v1"));
+  plan.put(to_bytes("k2"), to_bytes("v2"));
+  plan.del_range(to_bytes("z0"), to_bytes("z1"));
+  auto result = db.apply_batch({}, std::move(plan));
+  REQUIRE(result.has_value());
+
+  auto snap = db.snapshot();
+  auto changes = db.changes_since(snap, from_seq);
+  bool found_bulk_end = false;
+  for (const auto &entry : changes) {
+    if (entry.entry_type == bytecask::EntryType::BulkEnd) {
+      found_bulk_end = true;
+      CHECK(entry.sequence == result->sequence);
+    }
+  }
+  CHECK(found_bulk_end);
+}
+
+// ---------------------------------------------------------------------------
+// CommitResult: del of an absent key returns nullopt (nothing written)
+// ---------------------------------------------------------------------------
+TEST_CASE("CommitResult del of absent key returns nullopt", "[commit_result]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto before = db.durable_sequence();
+  auto result = db.del({}, to_bytes("nonexistent"));
+  CHECK_FALSE(result.has_value());
+  CHECK(db.durable_sequence() == before);
+}
+
+// ---------------------------------------------------------------------------
+// CommitResult: apply_batch conflict returns nullopt, consumes no sequence
+// ---------------------------------------------------------------------------
+TEST_CASE("CommitResult apply_batch conflict returns nullopt",
+          "[commit_result]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("k"), to_bytes("v1"));  // Modifies "k" after snap.
+
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v2"));
+
+  auto before = db.durable_sequence();
+  auto result = db.apply_batch({}, std::move(plan));
+  CHECK_FALSE(result.has_value());
+  CHECK(db.durable_sequence() == before);
+}
+
+// ---------------------------------------------------------------------------
+// CommitResult: empty plan commits as a no-op — {sequence = 0, durable = true}
+// ---------------------------------------------------------------------------
+TEST_CASE("CommitResult empty plan returns durable zero sequence",
+          "[commit_result]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  bytecask::WritePlan plan;
+  auto result = db.apply_batch({}, std::move(plan));
+  REQUIRE(result.has_value());
+  CHECK(result->sequence == 0);
+  CHECK(result->durable);
+}
+
+// ---------------------------------------------------------------------------
+// CommitResult: a guard-only plan that passes returns {0, true}
+// ---------------------------------------------------------------------------
+TEST_CASE("CommitResult guard-only plan returns durable zero sequence",
+          "[commit_result]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("g"), to_bytes("v"));
+
+  bytecask::WritePlan plan;
+  plan.ensure_present(to_bytes("g"));
+  auto result = db.apply_batch({}, std::move(plan));
+  REQUIRE(result.has_value());
+  CHECK(result->sequence == 0);
+  CHECK(result->durable);
+}
+
+// ---------------------------------------------------------------------------
+// CommitResult: del_range with an empty range writes nothing
+// ---------------------------------------------------------------------------
+TEST_CASE("CommitResult del_range empty range returns durable zero sequence",
+          "[commit_result]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto result = db.del_range({}, to_bytes("z"), to_bytes("a"));  // from >= to
+  CHECK(result.sequence == 0);
+  CHECK(result.durable);
+}
+
+// ---------------------------------------------------------------------------
+// CommitResult: sync=true write is always durable
+// ---------------------------------------------------------------------------
+TEST_CASE("CommitResult sync write is durable", "[commit_result]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto result = db.put({.sync = true}, to_bytes("k"), to_bytes("v"));
+  CHECK(result.durable);
+}
+
+// ---------------------------------------------------------------------------
+// CommitResult: solo nosync write is not durable
+// ---------------------------------------------------------------------------
+TEST_CASE("CommitResult solo nosync write is not durable", "[commit_result]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  auto result = db.put({.sync = false, .solo = true}, to_bytes("k"), to_bytes("v"));
+  CHECK_FALSE(result.durable);
+}
+
+// ---------------------------------------------------------------------------
+// CommitResult: a nosync writer coalesced with a sync writer in the same
+// group-commit batch reports durable = true (deterministic via the
+// test_write_group() seam).
+// ---------------------------------------------------------------------------
+TEST_CASE("CommitResult nosync writer coalesced with sync writer is durable",
+          "[commit_result][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool leader_ready = false;
+
+  db.test_write_group().on_leader_start_ = [&] {
+    {
+      std::unique_lock<std::mutex> lk{mu};
+      leader_ready = true;
+      cv.notify_all();
+    }
+    db.test_write_group().wait_for_queue_size(2);
+  };
+
+  std::optional<bytecask::CommitResult> nosync_result;
+  std::optional<bytecask::CommitResult> sync_result;
+
+  // Thread A becomes leader with a nosync write, blocks until B enqueues.
+  std::thread tA([&] {
+    nosync_result = db.apply_batch({.sync = false}, [] {
+      bytecask::WritePlan p;
+      p.put(to_bytes("a"), to_bytes("va"));
+      return p;
+    }());
+  });
+
+  // Thread B enqueues a sync write into the same batch.
+  std::thread tB([&] {
+    {
+      std::unique_lock<std::mutex> lk{mu};
+      cv.wait(lk, [&] { return leader_ready; });
+    }
+    sync_result = db.apply_batch({.sync = true}, [] {
+      bytecask::WritePlan p;
+      p.put(to_bytes("b"), to_bytes("vb"));
+      return p;
+    }());
+  });
+
+  tA.join();
+  tB.join();
+
+  db.test_write_group().on_leader_start_ = nullptr;
+
+  REQUIRE(nosync_result.has_value());
+  REQUIRE(sync_result.has_value());
+  CHECK(sync_result->durable);
+  CHECK(nosync_result->durable);
 }
 
 // ---------------------------------------------------------------------------
@@ -5169,8 +5413,8 @@ TEST_CASE("writes continue after manifest", "[manifest]") {
   CHECK_FALSE(manifest.snap.get({}, to_bytes("k2"), out));
   CHECK_FALSE(manifest.snap.get({}, to_bytes("k3"), out));
 
-  // current_sequence advances beyond through_sequence.
-  CHECK(db.current_sequence() > manifest_seq);
+  // durable_sequence advances beyond through_sequence.
+  CHECK(db.durable_sequence() > manifest_seq);
 }
 
 TEST_CASE("through_sequence includes nosync entries", "[manifest]") {
@@ -5265,7 +5509,7 @@ TEST_CASE("changes_since iterator yields entries in sequence order", "[replicati
   db.put({}, to_bytes("key3"), to_bytes("value3"));
 
   // Get current sequence - this is the boundary
-  auto from_seq = db.current_sequence();
+  auto from_seq = db.durable_sequence();
 
   // Write more entries after the baseline (these should be yielded)
   db.put({}, to_bytes("key4"), to_bytes("value4"));
@@ -5289,7 +5533,7 @@ TEST_CASE("changes_since iterator yields entries in sequence order", "[replicati
 
   // Debug what we actually got
   INFO("from_seq: " << from_seq);
-  INFO("snap durable_seq: " << db.current_sequence());
+  INFO("snap durable_seq: " << db.durable_sequence());
   INFO("collected " << collected_sequences.size() << " entries");
   for (size_t i = 0; i < collected_sequences.size(); ++i) {
     INFO("Entry " << i << " seq=" << collected_sequences[i] << " key='" << collected_keys[i] << "' value='" << collected_values[i] << "'");
@@ -5316,7 +5560,7 @@ TEST_CASE("changes_since empty iterator when no new entries", "[replication]") {
   db.put({}, to_bytes("key1"), to_bytes("value1"));
   db.put({}, to_bytes("key2"), to_bytes("value2"));
 
-  auto from_seq = db.current_sequence();
+  auto from_seq = db.durable_sequence();
   auto snap = db.snapshot();
 
   // changes_since should be empty (no entries after from_seq)
@@ -5469,11 +5713,11 @@ TEST_CASE("ingest idempotency: re-ingesting is a no-op", "[replication]") {
   auto follower = bytecask::DB::open(td.path / "follower",
                                      {.initial_mode = bytecask::Mode::Follower});
   follower.ingest(views);
-  auto seq_after_first = follower.current_sequence();
+  auto seq_after_first = follower.durable_sequence();
 
   // Re-ingest same entries — should be a no-op.
   follower.ingest(views);
-  CHECK(follower.current_sequence() == seq_after_first);
+  CHECK(follower.durable_sequence() == seq_after_first);
 }
 
 TEST_CASE("ingest with batches: BulkBegin/BulkEnd preserved", "[replication]") {
@@ -5564,14 +5808,14 @@ TEST_CASE("ingest with range delete", "[replication]") {
   CHECK(follower.get({}, to_bytes("d"), out));
 }
 
-TEST_CASE("ingest sequence continuity: current_sequence matches max ingested",
+TEST_CASE("ingest sequence continuity: durable_sequence matches max ingested",
           "[replication]") {
   TempDir td;
 
   auto leader = bytecask::DB::open(td.path / "leader");
   leader.put({}, to_bytes("k1"), to_bytes("v1"));
   leader.put({}, to_bytes("k2"), to_bytes("v2"));
-  auto leader_seq = leader.current_sequence();
+  auto leader_seq = leader.durable_sequence();
 
   auto snap = leader.snapshot();
   auto changes = leader.changes_since(snap, 0);
@@ -5597,7 +5841,7 @@ TEST_CASE("ingest sequence continuity: current_sequence matches max ingested",
                                      {.initial_mode = bytecask::Mode::Follower});
   follower.ingest(views);
 
-  CHECK(follower.current_sequence() == leader_seq);
+  CHECK(follower.durable_sequence() == leader_seq);
 }
 
 TEST_CASE("ingest recovery equivalence: survives close and reopen",
@@ -5673,13 +5917,13 @@ TEST_CASE("promotion continuity: first put after ingest gets next sequence",
   auto follower = bytecask::DB::open(td.path / "follower",
                                      {.initial_mode = bytecask::Mode::Follower});
   follower.ingest(views);
-  auto seq_after_ingest = follower.current_sequence();
+  auto seq_after_ingest = follower.durable_sequence();
 
   // Promote to leader and write.
   follower.set_mode(bytecask::Mode::Leader);
   follower.put({}, to_bytes("k2"), to_bytes("v2"));
 
-  CHECK(follower.current_sequence() == seq_after_ingest + 1);
+  CHECK(follower.durable_sequence() == seq_after_ingest + 1);
 }
 
 TEST_CASE("ingest triggers file rotation", "[replication]") {
@@ -5919,7 +6163,7 @@ TEST_CASE("leader-to-follower replication round-trip", "[replication]") {
     }
   }
 
-  CHECK(follower.current_sequence() == leader.current_sequence());
+  CHECK(follower.durable_sequence() == leader.durable_sequence());
 }
 
 // ---------------------------------------------------------------------------

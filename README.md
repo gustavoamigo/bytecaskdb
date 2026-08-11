@@ -23,7 +23,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Ordered range iteration** — scan from any key prefix using the in-memory radix tree; no disk I/O for key enumeration. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
 - **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append. In-memory cleanup walks the radix tree; disk cost is O(1) regardless of how many keys fall in the range. Available on `DB` and `WritePlan`.
 - **Atomic writes** — every `put`, `del`, and `del_range` is atomic. `apply_batch` makes multiple puts, deletes, and range deletes atomic as a group.
-- **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `false` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
+- **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `nullopt` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory radix tree traversals — no disk I/O, no separate transaction type required.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 510 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex with group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost. On the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
@@ -140,12 +140,14 @@ db.put({}, to_bytes("user:1"), to_bytes("alice"));
 
 Bytes out;
 bool found = db.get({}, to_bytes("user:1"), out);   // true; value in out
-bool existed = db.del({}, to_bytes("user:1"));       // false if key was absent
+auto del_result = db.del({}, to_bytes("user:1"));    // nullopt if key was absent
 
 // Range deletion — delete all keys in [from, to) with a single disk append.
 db.del_range({}, to_bytes("session:"), to_bytes("session:~"));
 
-// Atomic batch — all operations land atomically.
+// Atomic batch — all operations land atomically. Every write returns a
+// CommitResult (or nullopt on conflict) carrying the assigned sequence and
+// whether fdatasync confirmed it durable before return.
 WritePlan plan;
 plan.put(to_bytes("user:2"), to_bytes("bob"));
 plan.put(to_bytes("user:3"), to_bytes("carol"));
@@ -230,6 +232,15 @@ struct ReadOptions {
 
 enum class Mode { Leader, Follower };
 
+// Outcome of a committed write: the highest sequence assigned (0 = nothing
+// written) and whether fdatasync confirmed it durable before return. A
+// reader — local or follower — whose durable_sequence() >= sequence is
+// guaranteed to see every entry of this write.
+struct CommitResult {
+    uint64_t sequence{0};
+    bool durable{false};
+};
+
 class DB {
 public:
     // DB is non-copyable and non-moveable; open() relies on mandatory copy elision.
@@ -242,27 +253,28 @@ public:
     [[nodiscard]] auto get(const ReadOptions& opts,
                            BytesView key, Bytes& out) const -> bool;
 
-    // Writes key → value. Overwrites any existing value.
+    // Writes key → value. Overwrites any existing value. Cannot conflict.
     // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
-    void put(const WriteOptions& opts, BytesView key, BytesView value);
+    auto put(const WriteOptions& opts, BytesView key, BytesView value) -> CommitResult;
 
-    // Writes a tombstone for key. Returns true if the key existed.
+    // Writes a tombstone for key. nullopt if the key was absent — nothing written.
     // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
-    [[nodiscard]] auto del(const WriteOptions& opts, BytesView key) -> bool;
+    [[nodiscard]] auto del(const WriteOptions& opts, BytesView key) -> std::optional<CommitResult>;
 
-    // Deletes all keys in [from, to) with a single data file append.
-    // No-op if from >= to. Throws std::system_error on I/O failure or DbDegraded.
-    void del_range(const WriteOptions& opts, BytesView from, BytesView to);
+    // Deletes all keys in [from, to) with a single data file append. Cannot conflict.
+    // Returns {sequence = 0, durable = true} without writing if from >= to.
+    // Throws std::system_error on I/O failure or DbDegraded.
+    auto del_range(const WriteOptions& opts, BytesView from, BytesView to) -> CommitResult;
 
     [[nodiscard]] auto contains_key(const ReadOptions& opts,
                                     BytesView key) const -> bool;
 
-    // Atomically applies all operations in plan. When the plan has a snapshot
-    // or explicit guards, returns false on conflict. A guardless, snapshot-less
-    // plan always returns true (no conflict possible).
+    // Atomically applies all operations in plan. nullopt on conflict (guard
+    // failure or implicit W-W check) — nothing was written. An empty or
+    // guard-only plan that passes commits as a no-op: {sequence = 0, durable = true}.
     // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
     [[nodiscard]] auto apply_batch(WriteOptions opts,
-                                   WritePlan plan) -> bool;
+                                   WritePlan plan) -> std::optional<CommitResult>;
 
     // Returns a frozen, move-only, read-only view of the DB at this instant.
     // Holds open referenced data files until destroyed — vacuum deferred automatically.
@@ -283,10 +295,15 @@ public:
     // Returns true if a file was vacuumed, false if no file qualified.
     [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
 
-    // Returns the highest sequence confirmed durable by fdatasync.
-    // timeout=0: non-blocking, returns current value.
-    // timeout>0: blocks until durable_seq advances or timeout expires.
-    [[nodiscard]] auto current_sequence(
+    // The single sequence primitive — returns the highest sequence confirmed
+    // durable by fdatasync. min_sequence = 0, an already-reached target, or a
+    // nonpositive timeout return immediately without blocking. Otherwise blocks
+    // until durable_seq >= min_sequence or timeout expires, then returns the
+    // watermark. Covers polling (default args), replication wake-up
+    // (follower.durable_sequence() + 1), and read-your-own-writes waits
+    // (a CommitResult's sequence).
+    [[nodiscard]] auto durable_sequence(
+        std::uint64_t min_sequence = 0,
         std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
         -> std::uint64_t;
 
@@ -302,7 +319,7 @@ public:
     void set_mode(Mode mode);
 
     // Applies pre-sequenced entries from a leader. Follower mode only.
-    // Idempotent: entries with sequence <= current_sequence() are skipped.
+    // Idempotent: entries with sequence <= durable_sequence() are skipped.
     // Throws std::logic_error if not in follower mode, DbDegraded if degraded.
     void ingest(std::span<const DataEntryView> entries);
 
@@ -404,7 +421,7 @@ class DbFollowerMode : public std::runtime_error { /* ... */ };
 } // namespace bytecask
 ```
 
-Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately); normal writes in follower mode throw `DbFollowerMode`. Key-not-found is signalled by `get` returning `false`; `apply_batch` returns `false` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors.
+Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately); normal writes in follower mode throw `DbFollowerMode`. Key-not-found is signalled by `get` returning `false`; `apply_batch` (and `del`) return `nullopt` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors. Every committed write returns a `CommitResult{sequence, durable}` — a wait-friendly token for read-your-own-writes across replication (see `durable_sequence` above).
 
 
 ## Architecture

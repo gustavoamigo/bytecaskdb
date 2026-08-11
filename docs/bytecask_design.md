@@ -187,6 +187,8 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
 
 All writes (`put`, `del`, `apply_batch`) route through a single coordinator: `DB::apply_batch`. The public methods `put` and `del` are thin wrappers that build a `WritePlan` and delegate. Each write is packaged into an `EngineSlot` and submitted to either `SoloWriter` (single-slot, no batching) or `WriteGroup` (leader-applies-all batching).
 
+`EngineSlot::result` is `std::optional<CommitResult>` (BC-231): `execute_slot` sets it to `nullopt` on a validation/conflict failure, or to `CommitResult{.sequence = entries.back().sequence}` on success (`{.sequence = 0}` for an empty or guard-only plan). `durable` is filled in at the end of Phase 3 once the batch's sync/rotation outcome is known: `slot->result->durable = (t.durable_seq() >= slot->result->sequence)` for every committed slot — this naturally covers group-coalesced and rotation syncs. A batch made of only empty/guard-only plans produces no entries at all and returns from `execute_slots` right after Phase 1, before Phase 3 ever runs; that early-return path explicitly sets `durable = true` on every committed slot, since a `{sequence = 0}` result has nothing to wait for and needed no I/O. See `docs/commit_result_api_design.md` for the full `CommitResult` contract, including the C/Python/Node bindings.
+
 **Routing**: a write goes to `SoloWriter` when `WriteOptions::solo` is set (benchmarking) or when the plan's byte size exceeds `kGroupWriteMaxBytes` (256 KiB). All other writes go to `WriteGroup`.
 
 **WriteGroup**: the first writer to arrive becomes the leader, drains the queue of pending slots, and executes them all under one lock hold. N concurrent sync writes share a single `fdatasync` instead of paying N separate calls. This is the dominant performance win — fdatasync is ~2 ms; pwritev is ~microseconds.
@@ -276,7 +278,7 @@ Implementation: `degraded_` is an `atomic<bool>` (release on write, acquire on r
 
 ##### Runtime invariant enforcement
 
-The engine validates structural invariants at runtime before publishing state, not just in tests. `store_state` compares old and new `EngineState` on every publication: `next_seq`, `active_file_id`, `next_file_id`, and `durable_seq` must never regress. On violation the engine degrades (nothing published, writes blocked, reads remain available). Cost: four integer comparisons per write — unmeasurable against `pwritev` + `fdatasync`. Debug builds add a full `next_seq > max(key_dir sequences)` walk. When `durable_seq` advances, `store_state` notifies `durable_cv_` — the condvar used by `current_sequence(timeout)` for long-poll.
+The engine validates structural invariants at runtime before publishing state, not just in tests. `store_state` compares old and new `EngineState` on every publication: `next_seq`, `active_file_id`, `next_file_id`, and `durable_seq` must never regress. On violation the engine degrades (nothing published, writes blocked, reads remain available). Cost: four integer comparisons per write — unmeasurable against `pwritev` + `fdatasync`. Debug builds add a full `next_seq > max(key_dir sequences)` walk. When `durable_seq` advances, `store_state` notifies `durable_cv_` — the condvar used by `durable_sequence(min_sequence, timeout)` for long-poll.
 
 On cold paths (`DB::open()`, `resume()`), `validate_state_consistency` runs the full O(n) structural check: active file in registry, no dangling file references, `next_seq` ahead of all sequences, `file_stats` covers all files, `live_bytes` matches `key_dir`. On violation it throws — the DB does not open or `resume()` fails.
 
@@ -292,7 +294,7 @@ For multi-entry batches this is safe: the isolation rotation moves to a new file
 
 In `execute_slots`, `batch_max_seq = next_seq - 1` is computed once after Phase 1. At each successful `file.sync()`, the transient calls `apply_sync(batch_max_seq)`. If sync fails, `apply_sync` is never called — the transient carries forward the previous `durable_seq` unchanged. The monotonicity guard in `apply_sync` ensures idempotent calls (rotation sync + commit sync on the same batch).
 
-`current_sequence(timeout)` exposes `durable_seq` to callers. `timeout=0` is a non-blocking load of the current `EngineState`. `timeout>0` blocks on `durable_cv_` (notified by `store_state` when `durable_seq` advances) until the value changes or timeout expires. The condvar notification is centralized in `store_state` — one place, one check.
+`durable_sequence(min_sequence, timeout)` exposes `durable_seq` to callers (renamed from `current_sequence` — BC-231, since "current" was ambiguous between the highest *allocated* and highest *durable* sequence). It is the single sequence primitive: `min_sequence = 0`, an already-reached target, or a nonpositive `timeout` all return the current watermark immediately without blocking. Otherwise it blocks on `durable_cv_` (notified by `store_state` when `durable_seq` advances) until `durable_seq >= min_sequence` or the timeout expires, then returns the current watermark. The condvar notification is centralized in `store_state` — one place, one check. This single target-based primitive covers polling (`min_sequence = 0`), the replication wake-up (`min_sequence = follower.durable_sequence() + 1`), and RYOW waits (`min_sequence = result.sequence` from a `CommitResult`) — see `docs/commit_result_api_design.md` and `docs/replication_primitives_design.md`.
 
 After recovery (`DB::open`, `resume`), `durable_seq` is set to `next_seq - 1` because all recovered entries were previously synced.
 
@@ -1396,7 +1398,7 @@ When a `WritePlan` carries a snapshot, `apply_batch` automatically checks every 
 
 ### Conflict signalling
 
-`apply_batch` returns `bool`: `true` if committed, `false` on conflict (W-W or guard violation). Conflicts are expected outcomes in concurrent workloads — not errors. I/O failures remain exceptions (`std::system_error`).
+`apply_batch` returns `std::optional<CommitResult>`: engaged with the assigned `CommitResult{sequence, durable}` if committed, `nullopt` on conflict (W-W or guard violation) — nothing was written, no sequence assigned. Conflicts are expected outcomes in concurrent workloads — not errors. I/O failures remain exceptions (`std::system_error`). `put` and `del_range` cannot conflict (no guards, no snapshot) and return `CommitResult` directly; `del` returns `nullopt` if the key was absent. See `docs/commit_result_api_design.md` for the full `CommitResult` contract (BC-231).
 
 ### Single-entry batch optimization
 
@@ -1492,9 +1494,9 @@ enum class Mode { Leader, Follower };
 
 `set_mode(Mode)` acquires the write mutex to ensure no in-flight write straddles the transition. `mode()` is a lock-free atomic read (acquire semantics), same pattern as `is_degraded()`.
 
-### Leader-side: `current_sequence`, `create_manifest`, `changes_since`
+### Leader-side: `durable_sequence`, `create_manifest`, `changes_since`
 
-- `current_sequence(timeout)` — returns the highest durable sequence number. With timeout > 0, blocks until the sequence advances (useful for polling replicas).
+- `durable_sequence(min_sequence, timeout)` — the single sequence primitive (renamed from `current_sequence` — BC-231). Blocks until the durable sequence reaches at least `min_sequence` or the timeout expires, then returns the durable sequence; `min_sequence = 0`/an already-reached target/a nonpositive timeout return immediately without blocking (useful for polling replicas or waking a replication loop only when the leader is genuinely ahead).
 - `create_manifest()` — rotates the active file, waits for all hint files, and returns a `FileManifest` of sealed files with a snapshot. Used for initial bootstrap.
 - `changes_since(seq, snap)` — returns a lazy `ChangeIterator` that walks sealed files in sequence order, yielding `DataEntryView` entries with `sequence > seq`. Constant memory — scans one entry at a time.
 

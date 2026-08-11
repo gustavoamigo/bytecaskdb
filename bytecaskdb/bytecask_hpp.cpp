@@ -109,6 +109,17 @@ auto from_module(const bytecask::DataEntryView& v) noexcept
   return {v.sequence, static_cast<bytecask::internal::EntryType>(v.entry_type), v.key, v.value};
 }
 
+auto from_module(bytecask::CommitResult r) noexcept
+    -> bytecask::internal::CommitResult {
+  return {r.sequence, r.durable};
+}
+
+auto from_module(std::optional<bytecask::CommitResult> r) noexcept
+    -> std::optional<bytecask::internal::CommitResult> {
+  if (!r) return std::nullopt;
+  return from_module(*r);
+}
+
 // Translate module-attached exception types to the header-defined internal types.
 // The module's bytecask::DbDegraded and bytecask::DbFollowerMode carry the
 // C++23 module attachment suffix in their mangled names, so they cannot be
@@ -524,24 +535,24 @@ auto DB::get(const ReadOptions& opts,
   });
 }
 
-void DB::put(const WriteOptions& opts,
-             BytesView key, BytesView value) {
-  translate_exceptions([&] {
-    impl_->db.put(to_module(opts), key, value);
+auto DB::put(const WriteOptions& opts,
+             BytesView key, BytesView value) -> CommitResult {
+  return translate_exceptions([&] {
+    return from_module(impl_->db.put(to_module(opts), key, value));
   });
 }
 
 auto DB::del(const WriteOptions& opts,
-             BytesView key) -> bool {
+             BytesView key) -> std::optional<CommitResult> {
   return translate_exceptions([&] {
-    return impl_->db.del(to_module(opts), key);
+    return from_module(impl_->db.del(to_module(opts), key));
   });
 }
 
-void DB::del_range(const WriteOptions& opts,
-                   BytesView from, BytesView to) {
-  translate_exceptions([&] {
-    impl_->db.del_range(to_module(opts), from, to);
+auto DB::del_range(const WriteOptions& opts,
+                   BytesView from, BytesView to) -> CommitResult {
+  return translate_exceptions([&] {
+    return from_module(impl_->db.del_range(to_module(opts), from, to));
   });
 }
 
@@ -574,9 +585,9 @@ auto DB::snapshot() const -> Snapshot {
   return Snapshot{std::make_unique<Snapshot::Impl>(impl_->db.snapshot())};
 }
 
-auto DB::apply_batch(WriteOptions opts, WritePlan plan) -> bool {
+auto DB::apply_batch(WriteOptions opts, WritePlan plan) -> std::optional<CommitResult> {
   return translate_exceptions([&] {
-    return impl_->db.apply_batch(to_module(opts), std::move(*plan.impl_->plan));
+    return from_module(impl_->db.apply_batch(to_module(opts), std::move(*plan.impl_->plan)));
   });
 }
 
@@ -620,9 +631,10 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   return impl_->db.vacuum(to_module(opts));
 }
 
-auto DB::current_sequence(std::chrono::milliseconds timeout) const
+auto DB::durable_sequence(std::uint64_t min_sequence,
+                         std::chrono::milliseconds timeout) const
     -> std::uint64_t {
-  return impl_->db.current_sequence(timeout);
+  return impl_->db.durable_sequence(min_sequence, timeout);
 }
 
 auto DB::create_manifest() -> FileManifest {
