@@ -692,6 +692,7 @@ TEST_CASE("prove_resume__degrade_G__cascade_r2_r3", "[prove_resume]") {
   assert_keys_recoverable(dir, {"k0", "p0"}, {});
 }
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_H_buffered__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -716,7 +717,9 @@ TEST_CASE("prove_resume__degrade_H_buffered__success", "[prove_resume]") {
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_H_buffered__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -748,7 +751,9 @@ TEST_CASE("prove_resume__degrade_H_buffered__file_creation_fails", "[prove_resum
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_H_buffered__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -780,7 +785,9 @@ TEST_CASE("prove_resume__degrade_H_buffered__double_resume", "[prove_resume]") {
   }
   assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_C_buffered__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -811,7 +818,9 @@ TEST_CASE("prove_resume__degrade_C_buffered__success", "[prove_resume]") {
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_C_buffered__truncate_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -849,7 +858,9 @@ TEST_CASE("prove_resume__degrade_C_buffered__truncate_fails", "[prove_resume]") 
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_C_buffered__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -887,7 +898,9 @@ TEST_CASE("prove_resume__degrade_C_buffered__sync_fails", "[prove_resume]") {
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_C_buffered__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -925,7 +938,9 @@ TEST_CASE("prove_resume__degrade_C_buffered__file_creation_fails", "[prove_resum
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_C_buffered__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -964,7 +979,9 @@ TEST_CASE("prove_resume__degrade_C_buffered__double_resume", "[prove_resume]") {
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_C_buffered__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -1009,3 +1026,4 @@ TEST_CASE("prove_resume__degrade_C_buffered__cascade_r2_r3", "[prove_resume]") {
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__

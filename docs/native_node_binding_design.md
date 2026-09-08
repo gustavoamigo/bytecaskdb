@@ -215,6 +215,13 @@ backends call, so disposal and iteration behave identically regardless of
 backend. `pre.js` is reduced to WASM-only concerns (env propagation, memory
 report).
 
+Embind retains ownership metadata in its JavaScript `ClassHandle`. Its `close()`
+therefore delegates to Embind's idempotent `delete()` method rather than deleting
+the C++ object from a bound method. Deleting from C++ leaves the live handle with
+a dangling pointer; a later explicit delete or finalizer can then double-delete
+it and corrupt the WASM runtime. N-API classes keep their native `close()`
+implementation because they do not use Embind `ClassHandle`s.
+
 ### `index.ts`
 
 Exports both factories. The default export can select a backend (native when the
@@ -362,6 +369,12 @@ All four phases are complete and merged on branch `bc-236-native-node-binding`.
   `result.constructor.name === 'Uint8Array'` (matching what Embind/WASM
   returns) fail against a `Buffer`. Input parsing uses `IsTypedArray()`
   (not `IsBuffer()`) so both `Buffer` and plain `Uint8Array` are accepted.
+- **Embind disposal must use `ClassHandle.delete()`.** The original bound
+  `close()` methods used `delete &self`. That freed C++ storage without marking
+  the owning JavaScript `ClassHandle` deleted, so later explicit disposal or
+  finalization double-deleted it and caused `table index is out of bounds` and
+  `memory access out of bounds` failures. The shared disposal helper now detects
+  Embind classes and implements idempotent `close()` through `delete()`.
 
 ## Non-goals (BC-236)
 

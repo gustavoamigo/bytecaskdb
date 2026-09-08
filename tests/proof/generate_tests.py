@@ -248,6 +248,10 @@ def gen_test(
     name = f"prove__{state.label}__{plan.label}__{failure.value}"
 
     parts: List[str] = []
+    if state.use_mmap:
+        # WASM/Emscripten builds reject Options::use_mmap outright (see
+        # DB::open); these buffered/mmap variants only make sense natively.
+        parts.append("#ifndef __EMSCRIPTEN__")
     parts.append(f'TEST_CASE("{name}", "[prove]") {{')
     parts.append("  TempDir td;")
     parts.append('  auto dir = td.path / "db";')
@@ -316,6 +320,8 @@ def gen_test(
             )
 
     parts.append("}")
+    if state.use_mmap:
+        parts.append("#endif  // __EMSCRIPTEN__")
     return "\n".join(parts)
 
 

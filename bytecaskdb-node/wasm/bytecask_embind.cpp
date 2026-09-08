@@ -494,8 +494,6 @@ static void jsdb_ingest(JsDB &self, val entries) {
   self.db.ingest(views);
 }
 
-static void jsdb_close(JsDB &self) { delete &self; }
-
 // ---------------------------------------------------------------------------
 // JsSnapshot bound methods
 // ---------------------------------------------------------------------------
@@ -545,8 +543,6 @@ static auto jssnap_keys_reverse(JsSnapshot &self, const std::string &from,
   auto ro = extract_read_options(opts);
   return new JsReverseKeyIterator{self.snap->rkeys_from(ro, to_view(from))};
 }
-
-static void jssnap_close(JsSnapshot &self) { delete &self; }
 
 // ---------------------------------------------------------------------------
 // JsWritePlan bound methods
@@ -606,26 +602,11 @@ static void jswp_ensure_range_unchanged(JsWritePlan &self,
   self.plan->ensure_range_unchanged(to_view(from), to_view(to));
 }
 
-static void jswp_close(JsWritePlan &self) { delete &self; }
-
 static auto jswp_has_snapshot(JsWritePlan &self) -> bool {
   self.check();
   return self.plan->has_snapshot();
 }
 
-// ---------------------------------------------------------------------------
-// Iterator close helpers
-// ---------------------------------------------------------------------------
-
-static void js_entry_iter_close(JsEntryIterator &self) { delete &self; }
-static void js_key_iter_close(JsKeyIterator &self) { delete &self; }
-static void js_rev_entry_iter_close(JsReverseEntryIterator &self) { delete &self; }
-static void js_rev_key_iter_close(JsReverseKeyIterator &self) { delete &self; }
-static void js_change_iter_close(JsChangeIterator &self) { delete &self; }
-static void js_file_manifest_close(JsFileManifest &self) {
-  // snapshot is owned separately, caller must close it.
-  delete &self;
-}
 static auto js_file_manifest_get_snapshot(JsFileManifest &self) -> JsSnapshot * {
   return self.snapshot;
 }
@@ -673,8 +654,7 @@ EMSCRIPTEN_BINDINGS(bytecask) {
       .function("createManifest", &jsdb_create_manifest, allow_raw_pointers())
       .function("changesSince", &jsdb_changes_since, allow_raw_pointers())
       .function("ingest", &jsdb_ingest)
-      .function("stats", &jsdb_stats)
-      .function("close", &jsdb_close);
+      .function("stats", &jsdb_stats);
 
   class_<JsSnapshot>("Snapshot")
       .function("get", &jssnap_get)
@@ -682,8 +662,7 @@ EMSCRIPTEN_BINDINGS(bytecask) {
       .function("entries", &jssnap_entries, allow_raw_pointers())
       .function("keys", &jssnap_keys, allow_raw_pointers())
       .function("entriesReverse", &jssnap_entries_reverse, allow_raw_pointers())
-      .function("keysReverse", &jssnap_keys_reverse, allow_raw_pointers())
-      .function("close", &jssnap_close);
+      .function("keysReverse", &jssnap_keys_reverse, allow_raw_pointers());
 
   class_<JsWritePlan>("WritePlan")
       .constructor<>()
@@ -697,32 +676,25 @@ EMSCRIPTEN_BINDINGS(bytecask) {
       .function("ensureAbsent", &jswp_ensure_absent)
       .function("ensureUnchanged", &jswp_ensure_unchanged)
       .function("ensureRangeUnchanged", &jswp_ensure_range_unchanged)
-      .function("hasSnapshot", &jswp_has_snapshot)
-      .function("close", &jswp_close);
+      .function("hasSnapshot", &jswp_has_snapshot);
 
   class_<JsEntryIterator>("EntryIterator")
-      .function("next", &JsEntryIterator::next)
-      .function("close", &js_entry_iter_close);
+      .function("next", &JsEntryIterator::next);
 
   class_<JsKeyIterator>("KeyIterator")
-      .function("next", &JsKeyIterator::next)
-      .function("close", &js_key_iter_close);
+      .function("next", &JsKeyIterator::next);
 
   class_<JsReverseEntryIterator>("ReverseEntryIterator")
-      .function("next", &JsReverseEntryIterator::next)
-      .function("close", &js_rev_entry_iter_close);
+      .function("next", &JsReverseEntryIterator::next);
 
   class_<JsReverseKeyIterator>("ReverseKeyIterator")
-      .function("next", &JsReverseKeyIterator::next)
-      .function("close", &js_rev_key_iter_close);
+      .function("next", &JsReverseKeyIterator::next);
 
   class_<JsChangeIterator>("ChangeIterator")
-      .function("next", &JsChangeIterator::next)
-      .function("close", &js_change_iter_close);
+      .function("next", &JsChangeIterator::next);
 
   class_<JsFileManifest>("FileManifest")
       .function("getSnapshot", &js_file_manifest_get_snapshot, allow_raw_pointers())
       .function("getFiles", &js_file_manifest_get_files)
-      .function("getThroughSequence", &js_file_manifest_get_through_sequence)
-      .function("close", &js_file_manifest_close);
+      .function("getThroughSequence", &js_file_manifest_get_through_sequence);
 }

@@ -30,6 +30,21 @@ const ITERATOR_CLASSES = [
 export function applyDisposeWiring(module: Record<string, any>): void {
   if (typeof Symbol === "undefined") return;
 
+  // Embind owns a ClassHandle's native pointer. Deleting it from a bound C++
+  // close() method leaves that handle live, so Embind later deletes the same
+  // pointer again. Give Embind classes a close() that delegates to their own
+  // idempotent delete() lifecycle API. N-API classes already expose close().
+  for (const name of DISPOSABLE_CLASSES) {
+    const cls = module[name];
+    if (typeof cls?.prototype?.delete === "function") {
+      cls.prototype.close = function () {
+        if (!this.isDeleted()) {
+          this.delete();
+        }
+      };
+    }
+  }
+
   if (Symbol.dispose) {
     for (const name of DISPOSABLE_CLASSES) {
       const cls = module[name];

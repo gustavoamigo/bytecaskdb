@@ -18247,6 +18247,7 @@ TEST_CASE("prove__deleted_key__solo_sequential_overwrite__commit_sync_fails", "[
   // the in-process recovery path.
 }
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18277,7 +18278,9 @@ TEST_CASE("prove__single_key_buffered__single_put__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18311,7 +18314,9 @@ TEST_CASE("prove__single_key_buffered__single_put__append_fails_nothing_written"
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18346,7 +18351,9 @@ TEST_CASE("prove__single_key_buffered__single_put__append_fails_partial_write", 
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18381,7 +18388,9 @@ TEST_CASE("prove__single_key_buffered__single_put__append_fails_after_full_write
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18417,7 +18426,9 @@ TEST_CASE("prove__single_key_buffered__single_put__commit_sync_fails", "[prove]"
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_delete__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18448,7 +18459,9 @@ TEST_CASE("prove__single_key_buffered__single_delete__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_delete__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18482,7 +18495,9 @@ TEST_CASE("prove__single_key_buffered__single_delete__append_fails_nothing_writt
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_delete__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18517,7 +18532,9 @@ TEST_CASE("prove__single_key_buffered__single_delete__append_fails_partial_write
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_delete__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18552,7 +18569,9 @@ TEST_CASE("prove__single_key_buffered__single_delete__append_fails_after_full_wr
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_delete__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18588,7 +18607,9 @@ TEST_CASE("prove__single_key_buffered__single_delete__commit_sync_fails", "[prov
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__multi_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18620,7 +18641,9 @@ TEST_CASE("prove__single_key_buffered__multi_put__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__multi_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18655,7 +18678,9 @@ TEST_CASE("prove__single_key_buffered__multi_put__append_fails_nothing_written",
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__multi_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18691,7 +18716,9 @@ TEST_CASE("prove__single_key_buffered__multi_put__append_fails_partial_write", "
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__multi_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18727,7 +18754,9 @@ TEST_CASE("prove__single_key_buffered__multi_put__append_fails_after_full_write"
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__multi_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18762,7 +18791,9 @@ TEST_CASE("prove__single_key_buffered__multi_put__on_bulk_end_append", "[prove]"
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18799,7 +18830,9 @@ TEST_CASE("prove__single_key_buffered__multi_put__commit_sync_fails", "[prove]")
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__mixed_batch__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18831,7 +18864,9 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18866,7 +18901,9 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_nothing_written
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18902,7 +18939,9 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_partial_write",
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18938,7 +18977,9 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__append_fails_after_full_writ
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__mixed_batch__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18973,7 +19014,9 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__on_bulk_end_append", "[prove
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__mixed_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19010,7 +19053,9 @@ TEST_CASE("prove__single_key_buffered__mixed_batch__commit_sync_fails", "[prove]
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__large_batch__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19043,7 +19088,9 @@ TEST_CASE("prove__single_key_buffered__large_batch__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__large_batch__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19079,7 +19126,9 @@ TEST_CASE("prove__single_key_buffered__large_batch__append_fails_nothing_written
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__large_batch__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19116,7 +19165,9 @@ TEST_CASE("prove__single_key_buffered__large_batch__append_fails_partial_write",
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__large_batch__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19153,7 +19204,9 @@ TEST_CASE("prove__single_key_buffered__large_batch__append_fails_after_full_writ
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__large_batch__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19189,7 +19242,9 @@ TEST_CASE("prove__single_key_buffered__large_batch__on_bulk_end_append", "[prove
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__large_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19227,7 +19282,9 @@ TEST_CASE("prove__single_key_buffered__large_batch__commit_sync_fails", "[prove]
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_put_with_guards__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19261,7 +19318,9 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__success", "[prove
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19298,7 +19357,9 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_noth
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19336,7 +19397,9 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_part
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19374,7 +19437,9 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__append_fails_afte
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__single_put_with_guards__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19413,7 +19478,9 @@ TEST_CASE("prove__single_key_buffered__single_put_with_guards__commit_sync_fails
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__conflicting_plan__before_any_io", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19448,7 +19515,9 @@ TEST_CASE("prove__single_key_buffered__conflicting_plan__before_any_io", "[prove
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19480,7 +19549,9 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__success", "[prove]")
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19515,7 +19586,9 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_nothing
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19551,7 +19624,9 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_partial
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19587,7 +19662,9 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__append_fails_after_f
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_overwrite__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19622,7 +19699,9 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__on_bulk_end_append",
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19659,7 +19738,9 @@ TEST_CASE("prove__single_key_buffered__causality_overwrite__commit_sync_fails", 
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_put_del__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19691,7 +19772,9 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19726,7 +19809,9 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_nothing_w
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19762,7 +19847,9 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_partial_w
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19798,7 +19885,9 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__append_fails_after_ful
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_put_del__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19833,7 +19922,9 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__on_bulk_end_append", "
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_put_del__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19870,7 +19961,9 @@ TEST_CASE("prove__single_key_buffered__causality_put_del__commit_sync_fails", "[
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_del_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19902,7 +19995,9 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19937,7 +20032,9 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_nothing_w
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -19973,7 +20070,9 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_partial_w
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20009,7 +20108,9 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__append_fails_after_ful
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_del_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20044,7 +20145,9 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__on_bulk_end_append", "
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20081,7 +20184,9 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__commit_sync_fails", "[
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_put_del_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20114,7 +20219,9 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__success", "[prove]
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20150,7 +20257,9 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_nothi
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20187,7 +20296,9 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_parti
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20224,7 +20335,9 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__append_fails_after
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_put_del_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20260,7 +20373,9 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__on_bulk_end_append
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_put_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20298,7 +20413,9 @@ TEST_CASE("prove__single_key_buffered__causality_put_del_put__commit_sync_fails"
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20330,7 +20447,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__success", "[pro
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20365,7 +20484,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_no
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20401,7 +20522,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_pa
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20437,7 +20560,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__append_fails_af
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20472,7 +20597,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__on_bulk_end_app
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20509,7 +20636,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_overwrite__commit_sync_fai
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20541,7 +20670,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__success", "[prove
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20576,7 +20707,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_noth
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20612,7 +20745,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_part
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20648,7 +20783,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__append_fails_afte
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20683,7 +20820,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__on_bulk_end_appen
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20720,7 +20859,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del__commit_sync_fails
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_del_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20752,7 +20893,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__success", "[prove
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20787,7 +20930,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_noth
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20823,7 +20968,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_part
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20859,7 +21006,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__append_fails_afte
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_del_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20894,7 +21043,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__on_bulk_end_appen
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20931,7 +21082,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_del_put__commit_sync_fails
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -20964,7 +21117,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__success", "[p
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21000,7 +21155,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21037,7 +21194,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21074,7 +21233,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__append_fails_
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21110,7 +21271,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__on_bulk_end_a
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21148,7 +21311,9 @@ TEST_CASE("prove__single_key_buffered__solo_causality_put_del_put__commit_sync_f
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__sequential_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21179,7 +21344,9 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__success", "[prove]"
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21213,7 +21380,9 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_nothin
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21248,7 +21417,9 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_partia
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21283,7 +21454,9 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_after_
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21319,7 +21492,9 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__commit_sync_fails",
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21350,7 +21525,9 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__success", "[pr
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21384,7 +21561,9 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_n
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21419,7 +21598,9 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_p
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21454,7 +21635,9 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__append_fails_a
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21490,7 +21673,9 @@ TEST_CASE("prove__single_key_buffered__solo_sequential_overwrite__commit_sync_fa
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21530,7 +21715,9 @@ TEST_CASE("prove__populated_db_buffered__single_put__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21573,7 +21760,9 @@ TEST_CASE("prove__populated_db_buffered__single_put__append_fails_nothing_writte
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21617,7 +21806,9 @@ TEST_CASE("prove__populated_db_buffered__single_put__append_fails_partial_write"
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21661,7 +21852,9 @@ TEST_CASE("prove__populated_db_buffered__single_put__append_fails_after_full_wri
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21706,7 +21899,9 @@ TEST_CASE("prove__populated_db_buffered__single_put__commit_sync_fails", "[prove
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_delete__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21746,7 +21941,9 @@ TEST_CASE("prove__populated_db_buffered__single_delete__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21789,7 +21986,9 @@ TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_nothing_wri
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21833,7 +22032,9 @@ TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_partial_wri
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21877,7 +22078,9 @@ TEST_CASE("prove__populated_db_buffered__single_delete__append_fails_after_full_
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_delete__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21922,7 +22125,9 @@ TEST_CASE("prove__populated_db_buffered__single_delete__commit_sync_fails", "[pr
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__multi_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21963,7 +22168,9 @@ TEST_CASE("prove__populated_db_buffered__multi_put__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22007,7 +22214,9 @@ TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_nothing_written
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22052,7 +22261,9 @@ TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_partial_write",
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22097,7 +22308,9 @@ TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_after_full_writ
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__multi_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22141,7 +22354,9 @@ TEST_CASE("prove__populated_db_buffered__multi_put__on_bulk_end_append", "[prove
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22187,7 +22402,9 @@ TEST_CASE("prove__populated_db_buffered__multi_put__commit_sync_fails", "[prove]
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__mixed_batch__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22228,7 +22445,9 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22272,7 +22491,9 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_nothing_writt
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22317,7 +22538,9 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_partial_write
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22362,7 +22585,9 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__append_fails_after_full_wr
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__mixed_batch__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22406,7 +22631,9 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__on_bulk_end_append", "[pro
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__mixed_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22452,7 +22679,9 @@ TEST_CASE("prove__populated_db_buffered__mixed_batch__commit_sync_fails", "[prov
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__large_batch__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22494,7 +22723,9 @@ TEST_CASE("prove__populated_db_buffered__large_batch__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22539,7 +22770,9 @@ TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_nothing_writt
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22585,7 +22818,9 @@ TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_partial_write
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22631,7 +22866,9 @@ TEST_CASE("prove__populated_db_buffered__large_batch__append_fails_after_full_wr
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__large_batch__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22676,7 +22913,9 @@ TEST_CASE("prove__populated_db_buffered__large_batch__on_bulk_end_append", "[pro
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__large_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22723,7 +22962,9 @@ TEST_CASE("prove__populated_db_buffered__large_batch__commit_sync_fails", "[prov
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_put_with_guards__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22766,7 +23007,9 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__success", "[pro
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22812,7 +23055,9 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_no
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22859,7 +23104,9 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_pa
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22906,7 +23153,9 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__append_fails_af
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__single_put_with_guards__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22954,7 +23203,9 @@ TEST_CASE("prove__populated_db_buffered__single_put_with_guards__commit_sync_fai
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__conflicting_plan__before_any_io", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22998,7 +23249,9 @@ TEST_CASE("prove__populated_db_buffered__conflicting_plan__before_any_io", "[pro
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23039,7 +23292,9 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__success", "[prove]
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23083,7 +23338,9 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_nothi
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23128,7 +23385,9 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_parti
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23173,7 +23432,9 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__append_fails_after
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_overwrite__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23217,7 +23478,9 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__on_bulk_end_append
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23263,7 +23526,9 @@ TEST_CASE("prove__populated_db_buffered__causality_overwrite__commit_sync_fails"
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_put_del__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23304,7 +23569,9 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__success", "[prove]")
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23348,7 +23615,9 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_nothing
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23393,7 +23662,9 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_partial
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23438,7 +23709,9 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__append_fails_after_f
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_put_del__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23482,7 +23755,9 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__on_bulk_end_append",
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_put_del__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23528,7 +23803,9 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del__commit_sync_fails", 
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_del_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23569,7 +23846,9 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__success", "[prove]")
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23613,7 +23892,9 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_nothing
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23658,7 +23939,9 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_partial
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23703,7 +23986,9 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__append_fails_after_f
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_del_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23747,7 +24032,9 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__on_bulk_end_append",
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23793,7 +24080,9 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__commit_sync_fails", 
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_put_del_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23835,7 +24124,9 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__success", "[prov
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23880,7 +24171,9 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_not
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23926,7 +24219,9 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_par
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -23972,7 +24267,9 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__append_fails_aft
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_put_del_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24017,7 +24314,9 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__on_bulk_end_appe
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_put_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24064,7 +24363,9 @@ TEST_CASE("prove__populated_db_buffered__causality_put_del_put__commit_sync_fail
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24105,7 +24406,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__success", "[p
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24149,7 +24452,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24194,7 +24499,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24239,7 +24546,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__append_fails_
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24283,7 +24592,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__on_bulk_end_a
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24329,7 +24640,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_overwrite__commit_sync_f
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24370,7 +24683,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__success", "[pro
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24414,7 +24729,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_no
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24459,7 +24776,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_pa
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24504,7 +24823,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__append_fails_af
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24548,7 +24869,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__on_bulk_end_app
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24594,7 +24917,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del__commit_sync_fai
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24635,7 +24960,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__success", "[pro
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24679,7 +25006,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_no
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24724,7 +25053,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_pa
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24769,7 +25100,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__append_fails_af
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24813,7 +25146,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__on_bulk_end_app
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24859,7 +25194,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_del_put__commit_sync_fai
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24901,7 +25238,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__success", "
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24946,7 +25285,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fail
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -24992,7 +25333,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fail
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25038,7 +25381,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__append_fail
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25083,7 +25428,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__on_bulk_end
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25130,7 +25477,9 @@ TEST_CASE("prove__populated_db_buffered__solo_causality_put_del_put__commit_sync
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__sequential_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25170,7 +25519,9 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__success", "[prove
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25213,7 +25564,9 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_noth
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25257,7 +25610,9 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_part
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25301,7 +25656,9 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_afte
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25346,7 +25703,9 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__commit_sync_fails
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25386,7 +25745,9 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__success", "[
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25429,7 +25790,9 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25473,7 +25836,9 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25517,7 +25882,9 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__append_fails
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25562,7 +25929,9 @@ TEST_CASE("prove__populated_db_buffered__solo_sequential_overwrite__commit_sync_
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25593,7 +25962,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__success", "[prove]") 
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25627,7 +25998,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_nothing_
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25662,7 +26035,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_partial_
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25697,7 +26072,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__append_fails_after_fu
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25733,7 +26110,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__commit_sync_fails", "
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25769,7 +26148,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__rotation_sync_fails",
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25803,7 +26184,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put__rotation_file_creatio
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_delete__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25834,7 +26217,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__success", "[prove]
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25868,7 +26253,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_nothi
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25903,7 +26290,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_parti
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25938,7 +26327,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__append_fails_after
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_delete__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25974,7 +26365,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__commit_sync_fails"
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_delete__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26010,7 +26403,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__rotation_sync_fail
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_delete__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26044,7 +26439,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_delete__rotation_file_crea
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26076,7 +26473,9 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__success", "[prove]") {
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26111,7 +26510,9 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_nothing_w
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26147,7 +26548,9 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_partial_w
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26183,7 +26586,9 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_after_ful
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26218,7 +26623,9 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__on_bulk_end_append", "
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26255,7 +26662,9 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__commit_sync_fails", "[
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26292,7 +26701,9 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_sync_fails", 
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26327,7 +26738,9 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_file_creation
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26359,7 +26772,9 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__success", "[prove]")
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26394,7 +26809,9 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_nothing
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26430,7 +26847,9 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_partial
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26466,7 +26885,9 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__append_fails_after_f
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26501,7 +26922,9 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__on_bulk_end_append",
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26538,7 +26961,9 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__commit_sync_fails", 
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26575,7 +27000,9 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__rotation_sync_fails"
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26610,7 +27037,9 @@ TEST_CASE("prove__rotation_threshold_buffered__mixed_batch__rotation_file_creati
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26643,7 +27072,9 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__success", "[prove]")
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26679,7 +27110,9 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_nothing
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26716,7 +27149,9 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_partial
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26753,7 +27188,9 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__append_fails_after_f
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26789,7 +27226,9 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__on_bulk_end_append",
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26827,7 +27266,9 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__commit_sync_fails", 
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26865,7 +27306,9 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__rotation_sync_fails"
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__large_batch__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26901,7 +27344,9 @@ TEST_CASE("prove__rotation_threshold_buffered__large_batch__rotation_file_creati
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26935,7 +27380,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__success",
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26972,7 +27419,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fa
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27010,7 +27459,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fa
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27048,7 +27499,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__append_fa
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27087,7 +27540,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__commit_sy
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27126,7 +27581,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__rotation_
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27163,7 +27620,9 @@ TEST_CASE("prove__rotation_threshold_buffered__single_put_with_guards__rotation_
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__conflicting_plan__before_any_io", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27198,7 +27657,9 @@ TEST_CASE("prove__rotation_threshold_buffered__conflicting_plan__before_any_io",
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27230,7 +27691,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__success", "[
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27265,7 +27728,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27301,7 +27766,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27337,7 +27804,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__append_fails
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27372,7 +27841,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__on_bulk_end_
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27409,7 +27880,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__commit_sync_
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27446,7 +27919,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__rotation_syn
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27481,7 +27956,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_overwrite__rotation_fil
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27513,7 +27990,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__success", "[pr
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27548,7 +28027,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_n
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27584,7 +28065,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_p
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27620,7 +28103,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__append_fails_a
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27655,7 +28140,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__on_bulk_end_ap
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27692,7 +28179,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__commit_sync_fa
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27729,7 +28218,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__rotation_sync_
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27764,7 +28255,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del__rotation_file_
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27796,7 +28289,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__success", "[pr
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27831,7 +28326,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_n
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27867,7 +28364,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_p
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27903,7 +28402,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__append_fails_a
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27938,7 +28439,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__on_bulk_end_ap
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -27975,7 +28478,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__commit_sync_fa
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28012,7 +28517,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__rotation_sync_
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28047,7 +28554,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__rotation_file_
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28080,7 +28589,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__success", 
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28116,7 +28627,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fai
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28153,7 +28666,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fai
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28190,7 +28705,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__append_fai
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28226,7 +28743,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__on_bulk_en
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28264,7 +28783,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__commit_syn
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28302,7 +28823,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__rotation_s
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28338,7 +28861,9 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_put_del_put__rotation_f
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28370,7 +28895,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__success
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28405,7 +28932,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28441,7 +28970,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28477,7 +29008,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__append_
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28512,7 +29045,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__on_bulk
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28549,7 +29084,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__commit_
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28586,7 +29123,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__rotatio
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28621,7 +29160,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_overwrite__rotatio
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28653,7 +29194,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__success",
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28688,7 +29231,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fa
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28724,7 +29269,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fa
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28760,7 +29307,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__append_fa
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28795,7 +29344,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__on_bulk_e
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28832,7 +29383,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__commit_sy
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28869,7 +29422,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__rotation_
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28904,7 +29459,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del__rotation_
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28936,7 +29493,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__success",
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28971,7 +29530,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fa
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29007,7 +29568,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fa
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29043,7 +29606,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__append_fa
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29078,7 +29643,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__on_bulk_e
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29115,7 +29682,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__commit_sy
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29152,7 +29721,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__rotation_
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29187,7 +29758,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_del_put__rotation_
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29220,7 +29793,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__succe
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29256,7 +29831,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__appen
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29293,7 +29870,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__appen
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29330,7 +29909,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__appen
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29366,7 +29947,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__on_bu
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29404,7 +29987,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__commi
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29442,7 +30027,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__rotat
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29478,7 +30065,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_causality_put_del_put__rotat
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29509,7 +30098,9 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__success", "
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29543,7 +30134,9 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fail
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29578,7 +30171,9 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fail
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29613,7 +30208,9 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fail
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29649,7 +30246,9 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__commit_sync
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29685,7 +30284,9 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_sy
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29719,7 +30320,9 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_fi
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29750,7 +30353,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__succes
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29784,7 +30389,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29819,7 +30426,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29854,7 +30463,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__append
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29890,7 +30501,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__commit
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__rotation_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29926,7 +30539,9 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__rotati
   // to resume() and be committed then. assert_resumable covers
   // the in-process recovery path.
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -29960,3 +30575,4 @@ TEST_CASE("prove__rotation_threshold_buffered__solo_sequential_overwrite__rotati
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__

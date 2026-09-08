@@ -1886,6 +1886,15 @@ DB::DB(std::filesystem::path dir, Options opts)
       size_limits_{std::min(opts.max_key_bytes, kMaxKeySize),
                    std::min(opts.max_value_bytes, kMaxValueSize)},
       state_{std::make_shared<EngineState>()} {
+#ifdef __EMSCRIPTEN__
+  if (opts.use_mmap) {
+    throw std::invalid_argument{
+        "Options::use_mmap is not supported on WASM/Emscripten builds: "
+        "mmap emulation would double-buffer the data file into the WASM "
+        "heap instead of avoiding a copy, so this build always uses the "
+        "pread-based data file regardless of this option"};
+  }
+#endif
   KeyDirEntry::check_file_offset(opts.max_file_bytes);
   std::filesystem::create_directories(dir_);
 
