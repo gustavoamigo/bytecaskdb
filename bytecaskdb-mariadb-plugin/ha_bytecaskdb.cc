@@ -19,6 +19,7 @@
 
 #ifndef PLUGIN_TESTING
 #undef WITH_WSREP
+#include <mysql/plugin.h>
 #include <mysql/server/private/sql_class.h>
 #include <mysql/server/private/sql_alter.h>
 #include <mysql/service_thd_alloc.h>
@@ -430,6 +431,26 @@ int ha_bytecaskdb::rename_table(const char *from, const char *to) {
 }
 
 // ---------------------------------------------------------------------------
+// is_alter_copy_target() — true when this handler is the hidden destination
+// table of an ALTER TABLE ... ALGORITHM=COPY (incl. CREATE/DROP INDEX, which
+// the parser rewrites to ALTER). write_row batches its buffered writes in
+// that case; see MariaDBTxn::begin_bulk_copy.
+// ---------------------------------------------------------------------------
+
+bool ha_bytecaskdb::is_alter_copy_target() const {
+#ifdef PLUGIN_TESTING
+  return false;
+#else
+  if (!table || !table->s || !table->s->path.str) { return false; }
+  if (!strstr(table->s->path.str, tmp_file_prefix)) { return false; }
+  const int cmd = thd_sql_command(ha_thd());
+  return cmd == SQLCOM_ALTER_TABLE ||
+         cmd == SQLCOM_CREATE_INDEX ||
+         cmd == SQLCOM_DROP_INDEX;
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // write_row() — INSERT with duplicate PK detection
 // ---------------------------------------------------------------------------
 
@@ -438,6 +459,14 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
 
   auto *txn = txn_cached_;
   if (!txn) { return HA_ERR_GENERIC; }
+
+  // Enter batched bulk-copy mode on the first row of an ALTER-copy loop.
+  if (!txn->in_bulk_copy() && is_alter_copy_target()) {
+    txn->begin_bulk_copy(catalog_bulk_copy_flush_bytes());
+  }
+  if (txn->in_bulk_copy()) {
+    return bulk_copy_write_row(buf);
+  }
 
   // MariaDB 10.11 does not call update_auto_increment() from ha_write_row;
   // each engine is responsible for calling it inside write_row.
@@ -526,6 +555,103 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
 
   FAULT_INJECTION(plugin_after_row_count_update);
   return 0;
+}
+// ---------------------------------------------------------------------------
+// bulk_copy_write_row() — write_row on the ALTER-copy path.
+//
+// Same row/index encoding as write_row, but the puts land in the txn's
+// batched bulk buffer (flushed every catalog_bulk_copy_flush_bytes) instead
+// of ops_/lookup_, and duplicate probes consult the current batch + the DB
+// directly rather than the snapshot. This leaves the source table's
+// in-flight MergeIterator (same per-THD txn) untouched.
+// ---------------------------------------------------------------------------
+
+int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
+  auto *txn = txn_cached_;
+
+  if (table->next_number_field && buf == table->record[0]) {
+    int err = update_auto_increment();
+    if (err) { return err; }
+  }
+
+  const bool no_pk = (table->s->primary_key == MAX_KEY);
+  const uint64_t rowid = no_pk ? catalog_alloc_rowid(table_id_) : 0;
+
+  auto &key = encode_pk_buf_;
+  encode_pk_into(key, table, buf, table_id_, rowid);
+  auto &val = encode_row_buf_;
+  encode_row_into(val, table, buf, schema_version_);
+
+  if (!no_pk && txn->bulk_pk_exists(key.data(), key.size())) {
+    errkey = saved_errkey_ = table->s->primary_key;
+    return HA_ERR_FOUND_DUPP_KEY;
+  }
+
+  const TableMeta *meta = catalog_lookup_meta(table_id_);
+  if (meta) {
+    for (const auto &index : meta->indexes) {
+      if (!index.is_unique) { continue; }
+      const KEY &ki = table->key_info[index.index_id];
+      bool has_null = false;
+      for (uint p = 0; p < ki.user_defined_key_parts; ++p) {
+        Field *f = table->field[ki.key_part[p].fieldnr - 1];
+        if (f->is_null_in_record(buf)) { has_null = true; break; }
+      }
+      if (has_null) { continue; }
+
+      auto &unique_prefix = encode_unique_sec_key_buf_;
+      encode_unique_sec_key_into(unique_prefix, table, buf, table_id_,
+                                 index.index_id, index.index_id);
+      if (txn->bulk_unique_prefix_exists(unique_prefix.data(),
+                                         unique_prefix.size())) {
+        errkey = saved_errkey_ = static_cast<uint>(index.index_id);
+        return HA_ERR_FOUND_DUPP_KEY;
+      }
+      txn->bulk_note_key(unique_prefix.data(), unique_prefix.size());
+    }
+  }
+
+  txn->bulk_buffer_put(key.data(), key.size(), val.data(), val.size());
+  if (!no_pk) { txn->bulk_note_key(key.data(), key.size()); }
+
+  FAULT_INJECTION(plugin_after_pk_buffer);
+
+  if (meta) {
+    for (const auto &index : meta->indexes) {
+      auto &sec_key = encode_sec_key_buf_;
+      encode_sec_key_into(sec_key, table, buf, table_id_,
+                          index.index_id, index.index_id, rowid);
+      txn->bulk_buffer_put(sec_key.data(), sec_key.size(), nullptr, 0);
+    }
+  }
+
+  if (table->next_number_field && buf == table->record[0]) {
+    uint64_t fv = static_cast<uint64_t>(table->next_number_field->val_int());
+    if (fv > 0) { catalog_seed_autoinc(table_id_, fv); }
+  }
+
+  txn->track_row_count_delta(table_id_, 1);
+
+  if (txn->bulk_should_flush()) {
+    int e = txn->bulk_flush(false);
+    FAULT_INJECTION(plugin_after_bulk_flush);
+    if (e) { return e; }
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// end_bulk_insert() — final flush + durability barrier for the ALTER-copy
+// path. For every other bulk-insert context this is a no-op.
+// ---------------------------------------------------------------------------
+
+int ha_bytecaskdb::end_bulk_insert() {
+  auto *txn = txn_cached_;
+  if (!txn || !txn->in_bulk_copy()) { return 0; }
+  int e = txn->bulk_flush(true);
+  FAULT_INJECTION(plugin_after_bulk_flush);
+  txn->end_bulk_copy();
+  return e;
 }
 // ---------------------------------------------------------------------------
 
@@ -802,6 +928,17 @@ int ha_bytecaskdb::extra(enum ha_extra_function operation) {
       break;
     case HA_EXTRA_NO_KEYREAD:
       keyread_only_ = false;
+      break;
+    case HA_EXTRA_END_COPY:
+      // Belt-and-suspenders: end_bulk_insert normally does the final flush.
+      if (txn_cached_ && txn_cached_->in_bulk_copy()) {
+        int e = txn_cached_->bulk_flush(true);
+        txn_cached_->end_bulk_copy();
+        if (e) { return e; }
+      }
+      break;
+    case HA_EXTRA_ABORT_COPY:
+      if (txn_cached_) { txn_cached_->abort_bulk_copy(); }
       break;
     default:
       break;

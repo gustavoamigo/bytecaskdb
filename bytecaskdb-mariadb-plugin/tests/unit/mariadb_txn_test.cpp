@@ -366,3 +366,121 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn edge cases", "[txn][edge]") {
     REQUIRE(std::memcmp(out_val.data(), val3.data(), val3.size()) == 0);
   }
 }
+// =========================================================================
+// Bulk-copy mode — batched writes for ALTER TABLE ... ALGORITHM=COPY
+// =========================================================================
+
+TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn bulk copy mode", "[txn][bulk]") {
+  auto txn = create_txn();
+  THD thd{};
+
+  auto db_has = [&](const std::vector<uint8_t> &k) {
+    auto snap = temp_db_.db()->snapshot();
+    return snap.contains_key({}, as_view(k.data(), k.size()));
+  };
+  auto db_key_count = [&]() {
+    size_t n = 0;
+    for (auto &k : temp_db_.db()->keys_from({})) { (void)k; ++n; }
+    return n;
+  };
+
+  SECTION("flush persists to DB before any commit; buffer stays bounded") {
+    txn->begin_bulk_copy(256);
+    REQUIRE(txn->in_bulk_copy());
+
+    // First key: below threshold, not flushed yet.
+    auto k0 = make_key("row:0000");
+    auto v0 = make_value(std::string(64, 'a').c_str());
+    txn->bulk_buffer_put(k0.data(), k0.size(), v0.data(), v0.size());
+    txn->bulk_note_key(k0.data(), k0.size());
+    REQUIRE_FALSE(txn->bulk_should_flush());
+    REQUIRE_FALSE(db_has(k0));
+
+    // Pile on until the byte threshold trips, then flush.
+    for (int i = 1; i < 8; ++i) {
+      auto k = make_key(("row:000" + std::to_string(i)).c_str());
+      txn->bulk_buffer_put(k.data(), k.size(), v0.data(), v0.size());
+      txn->bulk_note_key(k.data(), k.size());
+    }
+    REQUIRE(txn->bulk_should_flush());
+    REQUIRE(txn->bulk_flush(false) == 0);
+
+    // Flushed rows are durable in the DB even though nothing committed.
+    REQUIRE(db_has(k0));
+    REQUIRE(db_key_count() == 8);
+    // Threshold counter reset; snapshot/ops untouched (txn still "inactive").
+    REQUIRE_FALSE(txn->bulk_should_flush());
+    REQUIRE_FALSE(txn->is_active());
+    REQUIRE(txn->in_bulk_copy());
+  }
+
+  SECTION("duplicate detection within a batch and across a flush") {
+    txn->begin_bulk_copy(1 << 20);  // large — no auto-flush
+
+    // Unique-index probe key is the value prefix; the stored secondary key
+    // has the PK appended. Mirror that: note the prefix, store prefix+pk.
+    auto uprefix = make_key("uk:\x01""alice");
+    auto skey    = make_key("uk:\x01""alice\x01pk42");
+    auto pk      = make_key("pk:42");
+
+    REQUIRE_FALSE(txn->bulk_unique_prefix_exists(uprefix.data(), uprefix.size()));
+    txn->bulk_note_key(uprefix.data(), uprefix.size());
+    // Same value again in the same unflushed batch -> caught.
+    REQUIRE(txn->bulk_unique_prefix_exists(uprefix.data(), uprefix.size()));
+
+    txn->bulk_buffer_put(pk.data(), pk.size(), nullptr, 0);
+    txn->bulk_note_key(pk.data(), pk.size());
+    txn->bulk_buffer_put(skey.data(), skey.size(), nullptr, 0);
+    REQUIRE(txn->bulk_flush(true) == 0);
+
+    // After the flush, bulk_seen_ is cleared but the DB probe still catches it.
+    REQUIRE(txn->bulk_pk_exists(pk.data(), pk.size()));
+    auto prefix = make_key("uk:\x01""ali");
+    REQUIRE(txn->bulk_unique_prefix_exists(prefix.data(), prefix.size()));
+    auto absent = make_key("uk:\x01""zzz");
+    REQUIRE_FALSE(txn->bulk_unique_prefix_exists(absent.data(), absent.size()));
+  }
+
+  SECTION("empty flush is a no-op") {
+    txn->begin_bulk_copy(256);
+    REQUIRE(txn->bulk_flush(true) == 0);
+    REQUIRE(db_key_count() == 0);
+  }
+
+  SECTION("rollback drops the pending batch and leaves bulk mode") {
+    txn->begin_bulk_copy(1 << 20);
+    auto k = make_key("row:pending");
+    txn->bulk_buffer_put(k.data(), k.size(), nullptr, 0);
+    txn->rollback(&thd, true);
+    REQUIRE_FALSE(txn->in_bulk_copy());
+    REQUIRE_FALSE(db_has(k));  // never flushed
+  }
+
+  SECTION("abort_bulk_copy discards batch; mode can be re-entered") {
+    txn->begin_bulk_copy(1 << 20);
+    auto k = make_key("row:aborted");
+    txn->bulk_buffer_put(k.data(), k.size(), nullptr, 0);
+    txn->abort_bulk_copy();
+    REQUIRE_FALSE(txn->in_bulk_copy());
+
+    txn->begin_bulk_copy(256);
+    auto k2 = make_key("row:after");
+    txn->bulk_buffer_put(k2.data(), k2.size(), nullptr, 0);
+    REQUIRE(txn->bulk_flush(true) == 0);
+    REQUIRE(db_has(k2));
+    REQUIRE_FALSE(db_has(k));
+  }
+
+  SECTION("commit flushes the tail of the batch") {
+    txn->begin_bulk_copy(1 << 20);  // no auto-flush; all rows are "tail"
+    for (int i = 0; i < 5; ++i) {
+      auto k = make_key(("tail:" + std::to_string(i)).c_str());
+      txn->bulk_buffer_put(k.data(), k.size(), nullptr, 0);
+      txn->bulk_note_key(k.data(), k.size());
+    }
+    REQUIRE(db_key_count() == 0);
+    REQUIRE(txn->commit(&thd, true) == 0);
+    REQUIRE(db_key_count() == 5);
+    REQUIRE_FALSE(txn->in_bulk_copy());
+  }
+}

@@ -38,6 +38,14 @@
 #include <string>
 #include <thread>
 
+namespace bytecaskdb {
+// Backing store for the bulk_copy_flush_bytes system variable. Defined ahead
+// of the MYSQL_SYSVAR block (which needs its address) and outside the
+// !PLUGIN_TESTING guard so catalog_bulk_copy_flush_bytes() links in test
+// builds too.
+std::size_t sysvar_bulk_copy_flush_bytes = 64ULL * 1024 * 1024;
+}  // namespace bytecaskdb
+
 #ifndef PLUGIN_TESTING
 // ---------------------------------------------------------------------------
 // System variables (global scope — MariaDB plugin API requirement)
@@ -49,8 +57,21 @@ static MYSQL_SYSVAR_BOOL(use_mmap, sysvar_use_mmap,
     "Use mmap for sealed data files (default OFF)",
     nullptr, nullptr, FALSE);
 
+static MYSQL_SYSVAR_SIZE_T(bulk_copy_flush_bytes,
+    bytecaskdb::sysvar_bulk_copy_flush_bytes,
+    PLUGIN_VAR_RQCMDARG,
+    "Max buffered bytes before a batch flush during ALTER TABLE ... "
+    "ALGORITHM=COPY (index builds). Bounds plugin memory and per-batch "
+    "latency when reindexing large tables.",
+    nullptr, nullptr,
+    64ULL * 1024 * 1024,          // default 64 MiB
+    4096,                         // min 4 KiB (small values are for testing)
+    4ULL * 1024 * 1024 * 1024,    // max 4 GiB
+    0);
+
 static struct st_mysql_sys_var *bytecaskdb_system_variables[] = {
     MYSQL_SYSVAR(use_mmap),
+    MYSQL_SYSVAR(bulk_copy_flush_bytes),
     nullptr,
 };
 #endif // !PLUGIN_TESTING
@@ -72,6 +93,11 @@ struct DBHolder {
 std::unique_ptr<DBHolder>      g_db_owner;
 bytecask::DB                  *g_db           = nullptr;
 handlerton                    *bytecaskdb_hton = nullptr;
+
+std::size_t catalog_bulk_copy_flush_bytes() {
+  std::size_t v = sysvar_bulk_copy_flush_bytes;
+  return v ? v : (64ULL * 1024 * 1024);
+}
 
 // ---------------------------------------------------------------------------
 // Persistent catalog — in-memory caches rebuilt at startup.

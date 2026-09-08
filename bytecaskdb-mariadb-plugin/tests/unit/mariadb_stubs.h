@@ -85,6 +85,8 @@ enum ha_extra_function {
   HA_EXTRA_NO_READCHECK = 0,
   HA_EXTRA_KEYREAD = 1,
   HA_EXTRA_NO_KEYREAD = 2,
+  HA_EXTRA_END_COPY = 3,
+  HA_EXTRA_ABORT_COPY = 4,
 };
 
 // MariaDB key read functions.
@@ -447,6 +449,8 @@ public:
                                      enum thr_lock_type) { return to; }
   virtual int extra(enum ha_extra_function) { return 0; }
   virtual int check(THD *, HA_CHECK_OPT *) { return 0; }
+  virtual void start_bulk_insert(ha_rows, uint) {}
+  virtual int end_bulk_insert() { return 0; }
 
   virtual enum_alter_inplace_result check_if_supported_inplace_alter(
       TABLE *, Alter_inplace_info *) { return HA_ALTER_INPLACE_NOT_SUPPORTED; }
