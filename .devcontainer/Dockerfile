@@ -30,6 +30,7 @@ RUN dnf install -y \
     sudo \
     python3-pip \
     python3-devel \
+    npm \
     && dnf clean all
 
 # Keep devcontainer behavior aligned with wheel/manylinux builds:

@@ -13,7 +13,9 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 ## In Progress
 
-No active tasks.
+| ID | Title | Note |
+| --- | --- | --- |
+| BC-240 | Fix devcontainer graft install permissions | The devcontainer post-create step was installing `@nanonets/graft` into the system npm prefix (`/usr/local`), which fails under a non-root devcontainer user with `EACCES`. Redirect the install into `${HOME}/.npm-global` and export that bin dir before invoking `graft init`. |
 
 ## Done — recent
 
