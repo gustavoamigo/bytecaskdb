@@ -468,6 +468,10 @@ struct WritePlan::Impl {
 
 WritePlan::WritePlan() : impl_{std::make_unique<Impl>()} {}
 
+WritePlan::WritePlan(SizeLimits limits)
+    : impl_{std::make_unique<Impl>(bytecask::WritePlan{
+          bytecask::SizeLimits{limits.max_key_bytes, limits.max_value_bytes}})} {}
+
 WritePlan::WritePlan(Snapshot snap)
     : impl_{std::make_unique<Impl>(
           bytecask::WritePlan{std::move(snap.impl_->snap)})} {}

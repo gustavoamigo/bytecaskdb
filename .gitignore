@@ -5,6 +5,9 @@ build/
 # Node.js dependencies
 node_modules/
 
+# Compiled native addon (built via xmake bytecaskdb_node target)
+bytecaskdb-node/native/bytecask.node
+
 # MacOS Cache
 .DS_Store
 
@@ -68,3 +71,6 @@ bytecaskdb-mariadb-plugin/tests/sysbench_results.csv
 # Local tools (e.g. nektos/act)
 bin/
 
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

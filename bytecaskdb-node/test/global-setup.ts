@@ -1,17 +1,20 @@
-// Global setup for Vitest - validates WASM module before tests run
+// Global setup for Vitest - validates the selected backend before tests run
 export async function setup() {
-  // Validate the WASM binary can be loaded before any tests run
-  // This gives a clean error message rather than 1000 test failures
+  const backendName = process.env.BC_TEST_BACKEND === 'native' ? 'native' : 'wasm'
   try {
-    const { createWasmBackend } = await import('../src/wasm-backend.js')
-    const backend = await createWasmBackend()
-    console.log('✓ WASM module validated successfully')
+    const mod = backendName === 'native'
+      ? await import('../src/native-backend.js')
+      : await import('../src/wasm-backend.js')
+    const backend = backendName === 'native'
+      ? await mod.createNativeBackend()
+      : await mod.createWasmBackend()
+    console.log(`✓ ${backendName} module validated successfully`)
     // Test basic factory functionality
     if (!backend.open || !backend.WritePlan) {
-      throw new Error('WASM backend missing expected exports')
+      throw new Error(`${backendName} backend missing expected exports`)
     }
   } catch (e) {
-    throw new Error(`WASM failed to load before tests: ${e}`)
+    throw new Error(`${backendName} backend failed to load before tests: ${e}`)
   }
 }
 

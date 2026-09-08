@@ -1,29 +1,77 @@
 # ByteCaskDB for Node.js
 
-ByteCaskDB embedded key-value store for Node.js. Currently ships a WASM backend (Emscripten + Embind); a native N-API backend is planned.
+ByteCaskDB embedded key-value store for Node.js. Ships two backends behind the
+identical TypeScript API: a **WASM backend** (Emscripten + Embind, single-threaded)
+and a **native backend** (node-addon-api, links the real multi-threaded engine).
+Both implement the same `ByteCaskFactory` contract — pick a backend and the rest
+of your code is unchanged.
 
 ## Install (from source)
 
 ```bash
 cd bytecaskdb-node
 npm install
-npm run build
+npm run build          # builds both backends (build:wasm + build:native)
 ```
 
 ## Usage
 
 ```js
-import createByteCask from 'bytecaskdb';
+import { createWasmBackend, createNativeBackend } from 'bytecaskdb';
 
-const bc = await createByteCask();
-const db = bc.open('/tmp/mydb');
+// WASM backend (portable, single-threaded, sandboxed via NODEFS)
+const wasm = await createWasmBackend();
 
+// Native backend (multi-threaded engine, direct syscalls)
+const native = await createNativeBackend();
+
+const db = native.open('/tmp/mydb');
 db.put('hello', 'world');
 const val = db.get('hello');   // Uint8Array | null
 db.close();
 ```
 
-See [`wasm/API.md`](wasm/API.md) for the full JavaScript API specification.
+See [`wasm/API.md`](wasm/API.md) for the full JavaScript API specification —
+it applies identically to both backends.
+
+## Choosing a backend
+
+| | Native (N-API) | WASM (Embind) |
+|---|---|---|
+| Threads | Multi-threaded (group commit, parallel recovery) | Single-threaded (`BYTECASK_SINGLE_THREADED`) |
+| I/O | Direct syscalls | NODEFS (Node.js fs passthrough) |
+| Build requirement | Clang + xmake (see [Building](../README.md#building)) | Emscripten SDK |
+| Portability | Platform-specific native addon | Runs anywhere Node.js runs, including sandboxed environments without a native toolchain |
+| Exceptions | Native C++ | WASM exceptions (`-fwasm-exceptions`) |
+| Return type for `get()`/iterators | `Uint8Array` | `Uint8Array` |
+
+Both backends default write methods to `sync: true` and accept `{ sync: false }`
+for unsynced writes. Async (non-blocking) variants of fsync-bound calls are not
+yet implemented on either backend — see `docs/native_node_binding_design.md`
+for the design and follow-up plan.
+
+## Native Backend
+
+Links the real ByteCaskDB engine directly through
+[node-addon-api](https://github.com/nodejs/node-addon-api) — no WASM sandbox,
+full multi-threaded recovery and group commit.
+
+### Build
+
+```bash
+cd bytecaskdb-node && npm run build:native
+```
+
+Builds the `bytecaskdb_node` xmake target (a shared library linking the
+prebuilt `libbytecask.a` engine) and copies the resulting `.node` file to
+`native/bytecask.node`. Requires the same Clang/xmake toolchain used to build
+the core engine — no Emscripten SDK needed.
+
+### Smoke test
+
+```bash
+npm run test:smoke:native
+```
 
 ## WASM Backend
 
@@ -39,6 +87,7 @@ Cross-compiles ByteCaskDB to WebAssembly and runs under Node.js using NODEFS for
 ```bash
 cd bytecaskdb-node/wasm && bash build.sh
 ```
+
 
 The build script:
 
@@ -150,13 +199,13 @@ node wasm/build/engine_bench_nodefs.js --benchmark_filter="ByteCaskDB/Get"
 node wasm/build/bytecask_node.js
 ```
 
-## What's different from the native build
+## Benchmark coverage differences (native vs WASM)
 
-| | Native | WASM |
+The `engine_bench` benchmarks (C++, not the Node bindings) compare backends —
+this table describes those, not the Node.js `createNativeBackend`/`createWasmBackend` split above.
+
+| | Native benchmark build | WASM benchmark build |
 |---|---|---|
-| Threads | Multi-threaded (group commit, parallel recovery) | Single-threaded (`BYTECASK_SINGLE_THREADED`) |
-| I/O | Direct syscalls | NODEFS (Node.js fs passthrough) |
-| Exceptions | Native C++ | WASM exceptions (`-fwasm-exceptions`) |
 | Benchmarked engines | ByteCaskDB, RocksDB | ByteCaskDB only |
 | Multi-threaded benchmarks | Yes | Disabled (`BENCH_NO_MT`) |
 
@@ -164,14 +213,18 @@ node wasm/build/bytecask_node.js
 
 | File | Description |
 |------|-------------|
+| `native/bytecask_napi.cpp` | N-API binding layer — exposes DB, Snapshot, WritePlan, iterators, FileManifest to JS |
+| `native/smoke_test.cjs` | Minimal Node.js smoke test for the compiled native addon |
 | `wasm/build.sh` | Build script — compiles dependencies, modules, and links all targets |
 | `wasm/bytecask_embind.cpp` | Embind binding layer — exposes DB, Snapshot, WritePlan, iterators to JS |
 | `wasm/test_node.cpp` | Minimal C++ smoke test: write, read, recovery |
-| `wasm/pre.js` | Emscripten pre-run hook: env propagation, Symbol.dispose, Symbol.iterator wiring |
+| `wasm/pre.js` | Emscripten pre-run hook: env propagation, memory-usage reporting |
 | `wasm/run.sh` | Helper to run built binaries with env propagation |
 | `wasm/API.md` | Full JavaScript API specification |
 | `src/types.ts` | Shared TypeScript interfaces (ByteCaskDB, Snapshot, WritePlan, iterators) |
 | `src/wasm-backend.ts` | WASM backend factory |
+| `src/native-backend.ts` | Native backend factory |
+| `src/dispose.ts` | Shared `Symbol.dispose`/`Symbol.iterator` wiring used by both backends |
 | `src/index.ts` | Package entry point |
 
 ## Clean rebuild

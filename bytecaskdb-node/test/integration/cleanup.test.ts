@@ -92,8 +92,8 @@ test('iterator resource cleanup works correctly', async ({ db }) => {
 test('snapshot cleanup works correctly', async ({ db, wasmBackend }) => {
   // Setup initial data
   const key = encodeString('snapshot-cleanup-test')
-  const value = encodeString('snapshot-value')
-  db.put(key, value)
+  let currentValue = encodeString('snapshot-value')
+  db.put(key, currentValue)
 
   const iterations = 30
 
@@ -101,8 +101,9 @@ test('snapshot cleanup works correctly', async ({ db, wasmBackend }) => {
     // Create snapshot
     const snapshot = db.snapshot()
 
-    // Use snapshot
-    expect(decodeBytes(snapshot.get(key)!)).toEqual(value)
+    // Use snapshot — must reflect the key's value as of *this* iteration,
+    // not the initial value, since previous iterations already overwrote it.
+    expect(decodeBytes(snapshot.get(key)!)).toEqual(currentValue)
     expect(snapshot.containsKey(key)).toBe(true)
 
     // Create iterator from snapshot
@@ -120,8 +121,8 @@ test('snapshot cleanup works correctly', async ({ db, wasmBackend }) => {
     snapshot.close()
 
     // Modify database after snapshot is closed
-    const newValue = encodeString(`modified-${i}`)
-    db.put(key, newValue)
+    currentValue = encodeString(`modified-${i}`)
+    db.put(key, currentValue)
   }
 })
 
@@ -192,7 +193,7 @@ test('exception safety during resource cleanup', async ({ db, wasmBackend }) => 
 
     try {
       const result = snapshot.get(key)
-      expect(result).toEqual(value)
+      expect(decodeBytes(result!)).toEqual(value)
       throw new Error('Simulated snapshot exception')
     } catch (error) {
       expect(error.message).toBe('Simulated snapshot exception')
@@ -225,16 +226,6 @@ test('exception safety during resource cleanup', async ({ db, wasmBackend }) => 
 })
 
 test('Symbol.dispose resource cleanup', async ({ db, wasmBackend }) => {
-  // Test database Symbol.dispose (if available)
-  if (Symbol.dispose in db) {
-    const key = encodeString('dispose-test')
-    const value = encodeString('dispose-value')
-    db.put(key, value)
-
-    // Symbol.dispose should not throw
-    expect(() => db[Symbol.dispose]()).not.toThrow()
-  }
-
   // Test iterator Symbol.dispose
   {
     const entries = db.entries('')
@@ -260,6 +251,17 @@ test('Symbol.dispose resource cleanup', async ({ db, wasmBackend }) => {
       expect(() => plan[Symbol.dispose]()).not.toThrow()
     }
     plan.close() // Ensure cleanup
+  }
+
+  // Test database Symbol.dispose last — disposing the db closes it, so no
+  // further db operations may follow this block.
+  if (Symbol.dispose in db) {
+    const key = encodeString('dispose-test')
+    const value = encodeString('dispose-value')
+    db.put(key, value)
+
+    // Symbol.dispose should not throw
+    expect(() => db[Symbol.dispose]()).not.toThrow()
   }
 })
 
