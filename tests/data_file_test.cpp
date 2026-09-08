@@ -160,7 +160,7 @@ TEST_CASE("WritableDataFile constructor: fresh file with no buffer",
   std::filesystem::remove(path);
 }
 
-TEST_CASE("WritableDataFile constructor: reopens existing file with mmap pre-mapped",
+TEST_CASE("WritableDataFile constructor: reopens existing file",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_ctor_reopen_buf.data";
@@ -178,19 +178,22 @@ TEST_CASE("WritableDataFile constructor: reopens existing file with mmap pre-map
     file->sync();
   }
 
-  // Re-open with mmap capacity covering the file.
+  // Native builds request mmap; Emscripten always uses pread.
   auto file = bytecask::openDataFileForWrite(path, 4096, true);
   CHECK(file->size() == entry_size);
 
-  // mmap is pre-mapped: read_entry_unverified serves from mmap.
   std::vector<std::byte> io_buf;
   auto view = file->read_entry_unverified(0, static_cast<std::uint32_t>(val.size()), io_buf);
   CHECK(view.sequence == 1);
   CHECK(view.entry_type == bytecask::EntryType::Put);
   CHECK(std::equal(view.key.begin(), view.key.end(), key.begin()));
   CHECK(std::equal(view.value.begin(), view.value.end(), val.begin()));
-  // Fast path: io_buf not used.
+  // mmap lends a file-backed view; Emscripten's pread fallback owns it in io_buf.
+#ifdef __EMSCRIPTEN__
+  CHECK(!io_buf.empty());
+#else
   CHECK(io_buf.empty());
+#endif
 
   std::filesystem::remove(path);
 }
@@ -206,7 +209,7 @@ TEST_CASE("WritableDataFile constructor: throws on invalid path",
 // read_entry_unverified — WritableDataFile
 // ---------------------------------------------------------------------------
 
-TEST_CASE("WritableDataFile::read_entry_unverified buffer fast path",
+TEST_CASE("WritableDataFile::read_entry_unverified with mmap request",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_unverified_buf.data";
@@ -225,7 +228,11 @@ TEST_CASE("WritableDataFile::read_entry_unverified buffer fast path",
   CHECK(view.entry_type == bytecask::EntryType::Put);
   CHECK(std::equal(view.key.begin(), view.key.end(), key.begin()));
   CHECK(std::equal(view.value.begin(), view.value.end(), val.begin()));
+#ifdef __EMSCRIPTEN__
+  CHECK(!io_buf.empty());
+#else
   CHECK(io_buf.empty());
+#endif
 
   std::filesystem::remove(path);
 }
