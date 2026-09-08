@@ -201,6 +201,10 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     name = f"prove_resume__{degrade.label}__{failure.value}"
 
     parts: List[str] = []
+    if degrade.use_mmap:
+        # WASM/Emscripten builds reject Options::use_mmap outright (see
+        # DB::open); these buffered/mmap variants only make sense natively.
+        parts.append("#ifndef __EMSCRIPTEN__")
     parts.append(f'TEST_CASE("{name}", "[prove_resume]") {{')
     parts.append("  TempDir td;")
     parts.append('  auto dir = td.path / "db";')
@@ -224,6 +228,8 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     parts.append("  }")
     parts.append(gen_recovery_check(degrade, delta))
     parts.append("}")
+    if degrade.use_mmap:
+        parts.append("#endif  // __EMSCRIPTEN__")
     return "\n".join(parts)
 
 

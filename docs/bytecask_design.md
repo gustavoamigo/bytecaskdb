@@ -797,7 +797,7 @@ Two mmap strategies are used depending on the file's lifecycle:
 
 **Sealed (read-only) files**: When `seal()` is called, the file is memory-mapped with `mmap(PROT_READ, MAP_PRIVATE)` and `MADV_RANDOM`. Subsequent `read_entry()` and `read_value()` serve directly from the mapped region, eliminating `pread` syscalls on the hot read path. If `mmap` fails (e.g. address space exhaustion), the class silently falls back to `pread`. The mapping is released by `munmap` in the destructor.
 
-On WASM/Emscripten builds, mmap is disabled (`#ifndef __EMSCRIPTEN__`). Emscripten's mmap emulation allocates a heap buffer and copies the file contents into it — functionally identical to `pread` but with doubled memory consumption. WASM builds use the `pread` fallback exclusively; tests that request mmap assert that fallback rather than treating it as a failed fast path.
+On WASM/Emscripten builds, mmap is disabled (`#ifndef __EMSCRIPTEN__`). Emscripten's mmap emulation allocates a heap buffer and copies the file contents into it — functionally identical to `pread` but with doubled memory consumption. WASM builds use the `pread` fallback exclusively; tests that request mmap assert that fallback rather than treating it as a failed fast path. `DB::open` rejects `Options::use_mmap = true` outright on Emscripten builds (throws `std::invalid_argument`), rather than silently ignoring the option — the sealed-file read path and the active-file write path never take the mmap branch on this platform, so an accepted-but-ignored option would be a silent behavior mismatch with native. Correctness proof tests generated with `use_mmap = true` (in `tests/proof/generated/`) are compiled out under `#ifndef __EMSCRIPTEN__` for the same reason.
 
 ### HintFile I/O model
 

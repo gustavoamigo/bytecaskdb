@@ -349,6 +349,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__rename_fails", "[prove_vacuum_comp
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
 }
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__success", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -371,7 +372,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__success", "[prove_v
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__tmp_create_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -397,7 +400,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__tmp_create_fails", 
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__append_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -423,7 +428,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__append_fails", "[pr
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__sync_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -449,7 +456,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__sync_fails", "[prov
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__rename_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -478,7 +487,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__rename_fails", "[pr
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__success", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -509,7 +520,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__success", "[prove_vacuum_
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__tmp_create_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -543,7 +556,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__tmp_create_fails", "[prov
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__append_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -577,7 +592,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__append_fails", "[prove_va
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__sync_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -611,7 +628,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__sync_fails", "[prove_vacu
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__
 
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__rename_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -648,3 +667,4 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__rename_fails", "[prove_va
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .use_mmap = true});
 }
+#endif  // __EMSCRIPTEN__

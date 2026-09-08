@@ -6659,6 +6659,13 @@ TEST_CASE("use_mmap=false: put/get with file rotation",
 TEST_CASE("use_mmap=true: put/get round-trip",
           "[bytecask][mmap]") {
   TempDir td;
+#ifdef __EMSCRIPTEN__
+  // WASM/Emscripten builds never support mmap: mmap emulation would
+  // double-buffer the data file into the WASM heap rather than avoiding a
+  // copy, so DB::open rejects the option instead of silently ignoring it.
+  CHECK_THROWS_AS(bytecask::DB::open(td.path, {.use_mmap = true}),
+                  std::invalid_argument);
+#else
   auto db = bytecask::DB::open(td.path, {.use_mmap = true});
   constexpr int kCount = 20;
   for (int i = 0; i < kCount; ++i) {
@@ -6673,6 +6680,7 @@ TEST_CASE("use_mmap=true: put/get round-trip",
     REQUIRE(db.get({}, to_bytes(key), out));
     CHECK(to_string(out) == val);
   }
+#endif
 }
 
 TEST_CASE("use_mmap=false: full pread mode",
