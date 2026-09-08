@@ -359,14 +359,28 @@ target("bytecaskdb_node")
     -- Resolve Node/node-addon-api include paths at configure time, the way
     -- the Python target resolves nanobind/Python paths — here using npm
     -- packages installed under bytecaskdb-node/node_modules.
+    --
+    -- on_load runs for every target during `xmake f`/`xmake config`, even
+    -- ones that are never built (this target is set_default(false)) — so it
+    -- must not hard-error when `npm install` hasn't been run yet in
+    -- bytecaskdb-node/ (e.g. a fresh checkout, or CI jobs that only build the
+    -- C++/Python targets). Skip gracefully in that case; an actual attempt
+    -- to build this target will then fail later with a clear missing-header
+    -- error instead of breaking `xmake f` for the whole repository.
     on_load(function(t)
-        local node = os.getenv("BYTECASK_NODE") or "node"
         local node_dir = path.join(os.projectdir(), "bytecaskdb-node")
+        local node_addon_api_dir = path.join(node_dir, "node_modules", "node-addon-api")
+        if not os.isdir(node_addon_api_dir) then
+            cprint("${yellow}warning: ${clear}bytecaskdb-node/node_modules not found — " ..
+                   "run 'npm install' in bytecaskdb-node/ before building bytecaskdb_node")
+            return
+        end
+        local node = os.getenv("BYTECASK_NODE") or "node"
         -- node-addon-api headers (napi.h, napi-inl.h). Resolve as an
         -- absolute path directly (rather than via the package's
         -- cwd-relative include_dir helper) so it is correct regardless of
         -- xmake's own working directory.
-        t:add("includedirs", path.join(node_dir, "node_modules", "node-addon-api"))
+        t:add("includedirs", node_addon_api_dir)
         -- node-api-headers headers (node_api.h, js_native_api.h, ...) —
         -- npm-installable, so the build does not depend on headers bundled
         -- with a specific Node distribution (e.g. the EMSDK-vendored Node).
