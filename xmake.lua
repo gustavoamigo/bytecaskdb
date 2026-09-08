@@ -342,6 +342,80 @@ target("bytecaskdb_python")
         add_release_opts(t)
     end)
 
+-- Native Node.js addon via node-addon-api (N-API). Wraps the public PIMPL
+-- header (include/bytecask.hpp) and links against the bytecask static
+-- library — no C++23 module compilation here. Mirrors bytecaskdb_python.
+-- Prerequisites: cd bytecaskdb-node && npm install (installs node-addon-api,
+-- node-api-headers)
+-- Build: xmake build bytecaskdb_node
+-- Usage: require("bytecaskdb-node/native/bytecask.node")
+target("bytecaskdb_node")
+    set_kind("shared")
+    set_default(false)
+    add_deps("bytecask")
+    add_files("bytecaskdb-node/native/bytecask_napi.cpp")
+    add_includedirs("include")
+    add_packages("crc32c")
+    -- Resolve Node/node-addon-api include paths at configure time, the way
+    -- the Python target resolves nanobind/Python paths — here using npm
+    -- packages installed under bytecaskdb-node/node_modules.
+    on_load(function(t)
+        local node = os.getenv("BYTECASK_NODE") or "node"
+        local node_dir = path.join(os.projectdir(), "bytecaskdb-node")
+        -- node-addon-api headers (napi.h, napi-inl.h). Resolve as an
+        -- absolute path directly (rather than via the package's
+        -- cwd-relative include_dir helper) so it is correct regardless of
+        -- xmake's own working directory.
+        t:add("includedirs", path.join(node_dir, "node_modules", "node-addon-api"))
+        -- node-api-headers headers (node_api.h, js_native_api.h, ...) —
+        -- npm-installable, so the build does not depend on headers bundled
+        -- with a specific Node distribution (e.g. the EMSDK-vendored Node).
+        local api_headers_inc = os.iorunv(node,
+            {"-p", "require.resolve('node-api-headers/include/node_api.h')"},
+            {curdir = node_dir})
+        t:add("includedirs", path.directory(api_headers_inc:trim()))
+        -- Output naming: bytecaskdb-node/native/bytecask.node
+        t:set("basename", "bytecask")
+        t:set("prefixname", "")
+        t:set("extension", ".node")
+        t:set("targetdir", path.join(node_dir, "native"))
+    end)
+    -- Third-party warning suppressions for node-addon-api headers under
+    -- -Weverything, mirroring the Python target's -Wno-* block.
+    add_cxxflags("-Wno-old-style-cast", "-Wno-extra-semi-stmt", "-Wno-shadow",
+                 "-Wno-covered-switch-default", "-Wno-cast-function-type-strict",
+                 "-Wno-sign-conversion", "-Wno-double-promotion", "-Wno-shadow-field",
+                 "-Wno-cast-qual", "-Wno-zero-as-null-pointer-constant",
+                 "-Wno-missing-field-initializers", "-Wno-float-equal",
+                 "-Wno-deprecated-declarations", "-Wno-nested-anon-types",
+                 "-Wno-gnu-anonymous-struct", "-Wno-unused-function",
+                 "-Wno-disabled-macro-expansion", "-Wno-exit-time-destructors",
+                 "-Wno-global-constructors", "-Wno-missing-noreturn",
+                 {force = true})
+    add_cxxflags("-fPIC", {force = true})
+    -- Enable node-addon-api's C++ exception mode: methods that throw C++
+    -- exceptions have them automatically caught and rethrown as JS Errors by
+    -- the generated wrapper, matching the WASM/Embind behavior described in
+    -- docs/native_node_binding_design.md ("Error translation").
+    -- NODE_ADDON_API_CPP_EXCEPTIONS_ALL (not just NAPI_CPP_EXCEPTIONS) is
+    -- required so WrapCallback also catches plain std::exception (the
+    -- engine throws std::system_error / std::runtime_error / invalid_argument,
+    -- not Napi::Error) and rethrows it as a JS Error rather than letting it
+    -- escape the N-API boundary and terminate the process.
+    add_defines("NAPI_CPP_EXCEPTIONS")
+    add_defines("NODE_ADDON_API_CPP_EXCEPTIONS_ALL")
+    -- Undefined N-API symbols are resolved by the host Node process at load
+    -- time — the same "unresolved host symbols" pattern the Python target
+    -- uses for the Python C API. Do NOT pass -Wl,--no-undefined.
+    if is_host("macosx") then
+        add_shflags("-undefined", "dynamic_lookup", {force = true})
+    end
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+
 -- Fuzz targets — buffer-level parser harnesses using libFuzzer + ASan.
 -- Build: CLANG_TARGET_TRIPLE=$(clang --print-target-triple) xmake f --sanitizer=fuzzer,address -m debug -y
 --        xmake build fuzz_data_entry   (or fuzz_hint_entry)

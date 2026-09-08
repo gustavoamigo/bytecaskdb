@@ -16,5 +16,6 @@ export type {
 } from "./types.js";
 
 export { createWasmBackend } from "./wasm-backend.js";
+export { createNativeBackend } from "./native-backend.js";
 
 export { createWasmBackend as default } from "./wasm-backend.js";

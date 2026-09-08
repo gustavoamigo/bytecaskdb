@@ -9,8 +9,10 @@ Module.preRun.push(function () {
   }
 });
 
-// Wire up Symbol.dispose and Symbol.iterator on Embind classes.
 // Print memory usage after the program exits.
+// Symbol.dispose / Symbol.iterator wiring lives in src/dispose.ts and is
+// applied by src/wasm-backend.ts once the module has finished loading —
+// shared with the native (N-API) backend so both behave identically.
 Module.postRun = Module.postRun || [];
 Module.postRun.push(function () {
   if (typeof process !== 'undefined' && process.memoryUsage) {
@@ -25,28 +27,3 @@ Module.postRun.push(function () {
   }
 });
 
-Module.onRuntimeInitialized = Module.onRuntimeInitialized || function () {};
-var origInit = Module.onRuntimeInitialized;
-Module.onRuntimeInitialized = function () {
-  origInit.call(this);
-
-  // Symbol.dispose — explicit resource management (Node.js 22+, TC39)
-  var disposableClasses = ['ByteCaskDB', 'Snapshot', 'WritePlan',
-      'EntryIterator', 'KeyIterator', 'ReverseEntryIterator', 'ReverseKeyIterator'];
-  for (var i = 0; i < disposableClasses.length; i++) {
-    var cls = Module[disposableClasses[i]];
-    if (cls && cls.prototype && typeof Symbol !== 'undefined' && Symbol.dispose) {
-      cls.prototype[Symbol.dispose] = cls.prototype.close || cls.prototype.delete;
-    }
-  }
-
-  // Symbol.iterator — JS iterator protocol for scan classes
-  var iteratorClasses = ['EntryIterator', 'KeyIterator',
-      'ReverseEntryIterator', 'ReverseKeyIterator'];
-  for (var i = 0; i < iteratorClasses.length; i++) {
-    var cls = Module[iteratorClasses[i]];
-    if (cls && cls.prototype && typeof Symbol !== 'undefined' && Symbol.iterator) {
-      cls.prototype[Symbol.iterator] = function () { return this; };
-    }
-  }
-};

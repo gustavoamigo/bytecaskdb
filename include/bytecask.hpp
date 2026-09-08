@@ -384,6 +384,7 @@ public:
   struct Impl;
 
   WritePlan();
+  explicit WritePlan(SizeLimits limits);
   explicit WritePlan(Snapshot snap);
   ~WritePlan();
   WritePlan(const WritePlan&) = delete;

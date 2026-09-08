@@ -8,27 +8,32 @@
   "scripts": {
     "build:wasm": "cd .. && xmake build wasm_embind",
     "build:wasm:all": "cd .. && xmake build wasm_embind wasm_smoke_test wasm_engine_bench wasm_memory_profile wasm_tests",
+    "build:native": "cd .. && xmake build bytecaskdb_node",
     "build:ts": "tsc",
-    "build": "npm run build:wasm && npm run build:ts",
+    "build": "npm run build:wasm && npm run build:native && npm run build:ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:ui": "vitest --ui",
     "test:smoke": "cd .. && xmake build wasm_smoke_test && node bytecaskdb-node/wasm/build/bytecask_node.js",
+    "test:smoke:native": "npm run build:native && node native/smoke_test.cjs",
     "test:wasm": "cd .. && xmake build wasm_tests && node bytecaskdb-node/wasm/build/bytecask_tests.js '~[concurrency]' '~[lock]'",
     "bench:wasm": "cd .. && xmake build wasm_engine_bench && BC_DATASET_SIZE=100000 node bytecaskdb-node/wasm/build/engine_bench_nodefs.js"
   },
   "files": [
     "dist/",
     "wasm/build/bytecask.mjs",
-    "wasm/build/bytecask.wasm"
+    "wasm/build/bytecask.wasm",
+    "native/bytecask.node"
   ],
   "license": "MIT",
   "devDependencies": {
-    "typescript": "^5.4",
-    "vitest": "^4.1.5",
+    "@types/node": "^20.0.0",
     "@vitest/coverage-v8": "^4.1.5",
     "@vitest/ui": "^4.1.5",
-    "@types/node": "^20.0.0"
+    "node-addon-api": "^8.9.2",
+    "node-api-headers": "^1.9.0",
+    "typescript": "^5.4",
+    "vitest": "^4.1.5"
   }
 }

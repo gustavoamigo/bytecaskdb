@@ -238,9 +238,9 @@ test('concurrent iterator usage works correctly', async ({ db }) => {
   }
 
   // Create multiple iterators simultaneously
-  const entries1 = db.entries()
-  const entries2 = db.entries()
-  const keys1 = db.keys()
+  const entries1 = db.entries('')
+  const entries2 = db.entries('')
+  const keys1 = db.keys('')
 
   const collected1 = []
   const collected2 = []

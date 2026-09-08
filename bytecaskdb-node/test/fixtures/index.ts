@@ -4,7 +4,15 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createWasmBackend } from '../../src/wasm-backend.js'
+import { createNativeBackend } from '../../src/native-backend.js'
 import type { ByteCaskDB, ByteCaskFactory } from '../../src/index.js'
+
+// Backend selection: BC_TEST_BACKEND=native runs the suite against the
+// native N-API addon instead of the default WASM backend. Both backends
+// implement the same ByteCaskFactory contract, so the fixtures and tests
+// are shared verbatim.
+const BACKEND = process.env.BC_TEST_BACKEND === 'native' ? 'native' : 'wasm'
+const createBackend = BACKEND === 'native' ? createNativeBackend : createWasmBackend
 
 // Fixture interface definitions
 interface WasmFixtures {
@@ -18,11 +26,11 @@ interface DBFixtures extends WasmFixtures {
 
 // Extended test with fixtures
 export const test = base.extend<DBFixtures>({
-  // WASM backend: expensive initialization, shared across all tests in a worker
+  // Backend (WASM or native): expensive initialization, shared across all tests in a worker
   wasmBackend: [async ({}, use) => {
-    const backend = await createWasmBackend()
+    const backend = await createBackend()
     await use(backend)
-    // No explicit cleanup needed for WASM backend
+    // No explicit cleanup needed for either backend
   }, { scope: 'worker' }],
 
   // Temporary directory: created once per test file, cleaned up after
