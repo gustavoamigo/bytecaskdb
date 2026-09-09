@@ -302,9 +302,12 @@ run_bench() {
   # Cleanup (skip — keep data for EXPLAIN)
   # sysbench "$base_workload" $args cleanup >/dev/null 2>&1
 
-  # Extract metrics (sysbench 1.0 outputs only one percentile: 95th by default)
+  # Extract metrics (sysbench 1.0 outputs only one percentile: 95th by default).
+  # The "transactions:" line is "transactions:  <total count>  (<rate> per sec.)" —
+  # field $3 is the raw total event count over the whole run, not a rate; field $4
+  # is the "X per sec." throughput we actually want.
   local tps avg_lat p95
-  tps="$(echo "$output" | grep "transactions:" | awk -F'[( ]+' '{print $3}')"
+  tps="$(echo "$output" | grep "transactions:" | awk -F'[( ]+' '{print $4}')"
   avg_lat="$(echo "$output" | grep "avg:" | tail -1 | awk '{print $2}')"
   p95="$(echo "$output" | grep "95th percentile:" | awk '{print $NF}')"
 
