@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -214,7 +215,9 @@ public:
 
   // Row count tracking — called by write_row/delete_row to record the
   // delta so it can be reverted on rollback or commit failure.
-  void track_row_count_delta(uint32_t table_id, int64_t delta);
+  void track_row_count_delta(uint32_t table_id,
+                             std::atomic<int64_t> *row_count,
+                             int64_t delta);
 
   // -------------------------------------------------------------------
   // Bulk-copy mode — batched writes for ALTER TABLE ... ALGORITHM=COPY
@@ -272,9 +275,14 @@ private:
   // RYOW overlay — fast lookups by key.  nullopt = tombstone.
   LookupMap lookup_;
 
+  struct RowCountDelta {
+    int64_t delta{0};
+    std::atomic<int64_t> *counter{nullptr};
+  };
+
   // Per-table row count deltas accumulated during this transaction.
   // Reverted on rollback or commit failure.
-  std::map<uint32_t, int64_t> row_count_deltas_;
+  std::map<uint32_t, RowCountDelta> row_count_deltas_;
 
   bool registered_stmt_{false};
   bool registered_all_{false};

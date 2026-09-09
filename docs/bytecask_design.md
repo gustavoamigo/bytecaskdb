@@ -42,6 +42,13 @@ ByteCaskDB is being integrated as a MariaDB pluggable storage engine (`ha_byteca
 
 The plugin consumes the engine through the PIMPL C++ header `include/bytecask.hpp` (typed `bytecask::DB`, `Snapshot`, `WritePlan`, RAII iterators, throwing errors). The implementation lives in `bytecaskdb/bytecask_hpp.cpp` and is compiled into `libbytecask.a`, which the plugin links statically.
 
+The MariaDB handler keeps per-open-table hot-path state local to the handler:
+the schema version, secondary-index metadata, row-count counter, and
+AUTO_INCREMENT counter. `write_row()` and ALTER-copy `write_row()` reuse that
+cached state instead of resolving catalog maps per row. Row-count deltas are
+still tracked in the per-THD transaction object so rollback and failed commit
+can restore the counters exactly.
+
 ### C API / Shared Library Boundary
 
 ByteCaskDB uses C++23 modules internally, which are not portable across compilation unit boundaries when linking external code. To cross this boundary (e.g. the MariaDB plugin), a stable `extern "C"` API is provided:
@@ -1474,6 +1481,7 @@ Counters are per-DB instance (`Counters` struct owned by `DB`). Two open databas
 | D16 | **MariaDB plugin header ordering**: Server-internal headers require `server/my_global.h` before `handler.h`. The client-side stub does not define `MY_GLOBAL_INCLUDED`/`uchar`/`unlikely()`. Fedora layout: base `/usr/include/mysql`, server `/usr/include/mysql/server`, private `/usr/include/mysql/server/private`. CMake include order must be `server/private` → `server` → base. `-DMYSQL_SERVER` is required. `handlerton::state` does not exist in this MariaDB ABI; use `PLUGIN_LICENSE_GPL` (no MIT constant). |
 | D17 | **Directory locking**: One process per directory, enforced by `flock()` on `dir/.lock`. Advisory only — does not protect against uncooperative processes that bypass `DB::open()`. |
 | D18 | **Sequence-disjoint files**: All data files must have non-overlapping sequence ranges — no two files contain entries with the same sequence number. Active file rotation naturally preserves this (sealed files have contiguous sequence ranges). Vacuum compact must ensure compacted files maintain disjoint ranges. This invariant enables efficient replication (linear scan instead of min-heap merge), supports future file merging operations, and allows skipping entire files based on sequence bounds. |
+| D19 | **MariaDB insert hot path**: Handler-open state caches secondary-index metadata and direct catalog counter pointers. Per-row INSERT processing must not take catalog map locks for stable table metadata, row-count increments, or AUTO_INCREMENT reservations once the handler has opened the table. |
 
 ## Replication Primitives
 

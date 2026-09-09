@@ -314,15 +314,30 @@ void MariaDBTxn::reset() {
   bulk_reset();
 }
 
-void MariaDBTxn::track_row_count_delta(uint32_t table_id, int64_t delta) {
-  catalog_row_count_add(table_id, delta);
-  row_count_deltas_[table_id] += delta;
+void MariaDBTxn::track_row_count_delta(uint32_t table_id,
+                                       std::atomic<int64_t> *row_count,
+                                       int64_t delta) {
+  if (row_count) {
+    row_count->fetch_add(delta);
+  } else {
+    catalog_row_count_add(table_id, delta);
+  }
+
+  auto &entry = row_count_deltas_[table_id];
+  entry.delta += delta;
+  if (!entry.counter) {
+    entry.counter = row_count;
+  }
 }
 
 void MariaDBTxn::revert_row_count_deltas() {
-  for (auto &[table_id, delta] : row_count_deltas_) {
-    if (delta != 0) {
-      catalog_row_count_add(table_id, -delta);
+  for (auto &[table_id, entry] : row_count_deltas_) {
+    if (entry.delta != 0) {
+      if (entry.counter) {
+        entry.counter->fetch_add(-entry.delta);
+      } else {
+        catalog_row_count_add(table_id, -entry.delta);
+      }
     }
   }
   row_count_deltas_.clear();

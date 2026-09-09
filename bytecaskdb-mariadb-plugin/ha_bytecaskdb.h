@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
@@ -228,9 +229,11 @@ private:
   void seed_rowid_counter_if_needed() const;
   // Seeds autoinc counter on first open of a table with AUTO_INCREMENT.
   void seed_autoinc_counter_if_needed() const;
+  void seed_cached_autoinc(uint64_t high_water) const;
 
   uint32_t table_id_{0};
   uint16_t schema_version_{1};
+  std::vector<IndexMeta> indexes_;
 
   std::unique_ptr<MariaDBTxn::MergeIterator> merge_scan_;
   std::unique_ptr<MariaDBTxn::MergeIterator> merge_index_;
