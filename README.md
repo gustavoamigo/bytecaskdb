@@ -464,6 +464,10 @@ xmake run bytecask_tests
 
 # Build benchmarks (optional; requires RocksDB).
 python ./scripts/run_engine_bench.py
+
+# Benchmark the MariaDB plugin with a selected sysbench workload.
+./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh \
+  --engines=bytecaskdb,innodb --workloads=oltp_insert --threads=1,16
 ```
 
 A ready-to-use development environment is provided via the included [Dev Container](.devcontainer) (Fedora 43, Clang, xmake, LLVM tooling, and `nanobind` pre-installed).

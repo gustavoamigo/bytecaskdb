@@ -11,10 +11,12 @@
 #   - sysbench installed
 #
 # Usage:
-#   ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh [--table-size=N] [--threads=LIST] [--time=S] [--engines=LIST]
+#   ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh [--table-size=N] [--threads=LIST] [--time=S] [--engines=LIST] [--workloads=LIST]
 #
 #   --engines: comma-separated list of engines to benchmark (default: bytecaskdb,innodb,rocksdb)
 #              e.g. --engines=bytecaskdb or --engines=bytecaskdb,innodb
+#   --workloads: comma-separated list of sysbench workloads (default: common OLTP mix)
+#                e.g. --workloads=oltp_insert
 
 set -euo pipefail
 
@@ -22,7 +24,6 @@ set -euo pipefail
 # Defaults
 # ---------------------------------------------------------------------------
 TABLE_SIZE=50000
-THREADS
 THREADS="1,8,16"
 DURATION=10
 ENGINES="bytecaskdb,innodb,rocksdb"
@@ -42,8 +43,9 @@ for arg in "$@"; do
     --threads=*)    THREADS="${arg#*=}" ;;
     --time=*)       DURATION="${arg#*=}" ;;
     --engines=*)    ENGINES="${arg#*=}" ;;
+    --workloads=*)  WORKLOADS="${arg#*=}" ;;
     --help|-h)
-      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--engines=bytecaskdb,innodb,rocksdb]"
+      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--engines=bytecaskdb,innodb,rocksdb] [--workloads=oltp_insert]"
       exit 0
       ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -52,6 +54,7 @@ done
 
 IFS=',' read -ra THREAD_LIST <<< "$THREADS"
 IFS=',' read -ra ENGINE_LIST <<< "$ENGINES"
+WORKLOADS="${WORKLOADS//,/ }"
 
 # Helper to check if an engine is enabled
 engine_enabled() { for e in "${ENGINE_LIST[@]}"; do [[ "$e" == "$1" ]] && return 0; done; return 1; }
@@ -143,7 +146,10 @@ start_mariadbd() {
 
   local defaults_arg=()
   if [[ -n "$defaults_file" ]]; then
-    defaults_arg=("--defaults-extra-file=$defaults_file")
+    local defaults_copy
+    defaults_copy="$(dirname "$data_dir")/$(basename "$defaults_file")"
+    install -m 0644 "$defaults_file" "$defaults_copy"
+    defaults_arg=("--defaults-extra-file=$defaults_copy")
   fi
 
   mariadbd \

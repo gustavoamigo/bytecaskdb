@@ -225,6 +225,9 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
   const auto *meta = catalog_lookup_meta(table_id_);
   if (meta) {
     schema_version_ = static_cast<uint16_t>(meta->schema_version);
+    indexes_ = meta->indexes;
+  } else {
+    indexes_.clear();
   }
 
   // ref_length: 5-byte prefix (1 ns + 4 tid) + PK key length (or 8-byte
@@ -312,12 +315,21 @@ void ha_bytecaskdb::get_auto_increment(ulonglong /*offset*/,
   if (nb_desired_values == 0) { nb_desired_values = 1; }
   // For per-row calls (composite PK), allocate only 1 to avoid gaps.
   ulonglong alloc = (table->s->next_number_keypart > 0) ? 1 : nb_desired_values;
-  *first_value = catalog_alloc_autoinc_range(table_id_, static_cast<uint64_t>(alloc));
+  if (autoinc_atomic_) {
+    *first_value = autoinc_atomic_->fetch_add(static_cast<uint64_t>(alloc)) + 1;
+  } else {
+    *first_value = catalog_alloc_autoinc_range(table_id_, static_cast<uint64_t>(alloc));
+  }
   *nb_reserved_values = alloc;
 }
 
 int ha_bytecaskdb::reset_auto_increment(ulonglong value) {
-  catalog_reset_autoinc(table_id_, value > 0 ? value - 1 : 0);
+  const uint64_t reset_value = value > 0 ? value - 1 : 0;
+  if (autoinc_atomic_) {
+    autoinc_atomic_->store(reset_value);
+  } else {
+    catalog_reset_autoinc(table_id_, reset_value);
+  }
   return 0;
 }
 
@@ -326,11 +338,25 @@ void ha_bytecaskdb::update_create_info(HA_CREATE_INFO *create_info) {
     create_info->auto_increment_value = catalog_peek_autoinc(table_id_) + 1;
   }
 }
+
+void ha_bytecaskdb::seed_cached_autoinc(uint64_t high_water) const {
+  if (!autoinc_atomic_) {
+    catalog_seed_autoinc(table_id_, high_water);
+    return;
+  }
+
+  uint64_t expected = autoinc_atomic_->load();
+  while (high_water > expected &&
+         !autoinc_atomic_->compare_exchange_weak(expected, high_water)) {
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 int ha_bytecaskdb::close() {
   merge_scan_.reset();
   merge_index_.reset();
+  indexes_.clear();
   return 0;
 }
 
@@ -492,9 +518,8 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   }
 
   // Check unique secondary index constraints.
-  const TableMeta *meta = catalog_lookup_meta(table_id_);
-  if (meta) {
-    for (const auto &index : meta->indexes) {
+  if (!indexes_.empty()) {
+    for (const auto &index : indexes_) {
       if (index.is_unique) {
         // SQL standard: NULL != NULL — skip dup check if any key part is NULL.
         const KEY &ki = table->key_info[index.index_id];
@@ -529,8 +554,8 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   FAULT_INJECTION(plugin_after_pk_buffer);
 
   // Buffer secondary index operations.
-  if (meta) {
-    for (const auto &index : meta->indexes) {
+  if (!indexes_.empty()) {
+    for (const auto &index : indexes_) {
       auto &sec_key = encode_sec_key_buf_;
       encode_sec_key_into(sec_key, table, buf, table_id_,
                            index.index_id, index.index_id, rowid);
@@ -547,11 +572,11 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   if (table->next_number_field && buf == table->record[0]) {
     uint64_t val = static_cast<uint64_t>(table->next_number_field->val_int());
     if (val > 0) {
-      catalog_seed_autoinc(table_id_, val);
+      seed_cached_autoinc(val);
     }
   }
 
-  txn->track_row_count_delta(table_id_, 1);
+  txn->track_row_count_delta(table_id_, row_count_atomic_, 1);
 
   FAULT_INJECTION(plugin_after_row_count_update);
   return 0;
@@ -587,9 +612,8 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
     return HA_ERR_FOUND_DUPP_KEY;
   }
 
-  const TableMeta *meta = catalog_lookup_meta(table_id_);
-  if (meta) {
-    for (const auto &index : meta->indexes) {
+  if (!indexes_.empty()) {
+    for (const auto &index : indexes_) {
       if (!index.is_unique) { continue; }
       const KEY &ki = table->key_info[index.index_id];
       bool has_null = false;
@@ -616,8 +640,8 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
 
   FAULT_INJECTION(plugin_after_pk_buffer);
 
-  if (meta) {
-    for (const auto &index : meta->indexes) {
+  if (!indexes_.empty()) {
+    for (const auto &index : indexes_) {
       auto &sec_key = encode_sec_key_buf_;
       encode_sec_key_into(sec_key, table, buf, table_id_,
                           index.index_id, index.index_id, rowid);
@@ -627,10 +651,10 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
 
   if (table->next_number_field && buf == table->record[0]) {
     uint64_t fv = static_cast<uint64_t>(table->next_number_field->val_int());
-    if (fv > 0) { catalog_seed_autoinc(table_id_, fv); }
+    if (fv > 0) { seed_cached_autoinc(fv); }
   }
 
-  txn->track_row_count_delta(table_id_, 1);
+  txn->track_row_count_delta(table_id_, row_count_atomic_, 1);
 
   if (txn->bulk_should_flush()) {
     int e = txn->bulk_flush(false);
@@ -817,7 +841,7 @@ int ha_bytecaskdb::delete_row(const uchar *buf) {
 
   // Buffer primary key deletion.
   txn->buffer_del(key.data(), key.size());
-  txn->track_row_count_delta(table_id_, -1);
+  txn->track_row_count_delta(table_id_, row_count_atomic_, -1);
   return 0;
 }
 // ---------------------------------------------------------------------------

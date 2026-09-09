@@ -15,6 +15,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-241 | MariaDB `oltp_insert` hot-path tuning | Cache handler-local index metadata, use direct row-count/AUTO_INCREMENT atomics in insert paths, and add `--workloads` plus private config copies to the sysbench harness. Validate with plugin tests and `oltp_insert` before/after runs. |
 | BC-240 | Fix devcontainer graft install permissions | The devcontainer post-create step was installing `@nanonets/graft` into the system npm prefix (`/usr/local`), which fails under a non-root devcontainer user with `EACCES`. Redirect the install into `${HOME}/.npm-global` and export that bin dir before invoking `graft init`. |
 
 ## Done — recent
