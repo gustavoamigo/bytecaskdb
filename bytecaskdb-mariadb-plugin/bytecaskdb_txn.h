@@ -19,11 +19,13 @@
 #include "bytecask.hpp"
 #include "bytecask_view.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <vector>
 
 // Forward declarations for MariaDB types.
@@ -214,9 +216,52 @@ public:
   // delta so it can be reverted on rollback or commit failure.
   void track_row_count_delta(uint32_t table_id, int64_t delta);
 
+  // -------------------------------------------------------------------
+  // Bulk-copy mode — batched writes for ALTER TABLE ... ALGORITHM=COPY
+  //
+  // The copy loop targets a hidden #sql-xxx table whose keyspace no other
+  // transaction can see until the final catalog rename. In this mode
+  // write_row's puts bypass ops_/lookup_/snap_ entirely (leaving the
+  // concurrently-running source-table MergeIterator untouched) and land in
+  // bulk_plan_, which is flushed to the DB in fixed-size batches. Each flush
+  // is its own atomic apply_batch; a crash mid-copy leaves an invisible
+  // orphan keyspace that MariaDB's ddl_log reclaims via delete_table.
+  // -------------------------------------------------------------------
+
+  void begin_bulk_copy(std::size_t flush_threshold_bytes);
+  bool in_bulk_copy() const { return bulk_copy_mode_; }
+  void end_bulk_copy() { bulk_copy_mode_ = false; }
+
+  // Drop the pending batch and leave bulk-copy mode. Rows already flushed to
+  // the #sql-xxx keyspace are reclaimed when MariaDB drops the temp table.
+  void abort_bulk_copy() { bulk_reset(); }
+
+  // Appends a put to the pending batch and tracks its size.
+  void bulk_buffer_put(const uint8_t *key, std::size_t klen,
+                       const uint8_t *val, std::size_t vlen);
+
+  // Records a key (PK key or unique-index prefix) for within-batch
+  // duplicate detection. Cleared on every flush.
+  void bulk_note_key(const uint8_t *key, std::size_t klen);
+
+  bool bulk_should_flush() const {
+    return bulk_bytes_ >= bulk_flush_threshold_;
+  }
+
+  // Commits the pending batch. Returns 0, or HA_ERR_INTERNAL_ERROR on
+  // engine failure. Resets the batch and clears bulk_seen_.
+  int bulk_flush(bool sync);
+
+  // Duplicate probes for bulk mode: check the current unflushed batch, then
+  // the DB directly (already-flushed batches). No snapshot — the #sql-xxx
+  // keyspace is exclusive for the duration of the ALTER.
+  bool bulk_pk_exists(const uint8_t *key, std::size_t klen);
+  bool bulk_unique_prefix_exists(const uint8_t *prefix, std::size_t plen);
+
 private:
   void reset();
   void revert_row_count_deltas();
+  void bulk_reset();
 
   bytecask::DB *db_;
   std::optional<bytecask::Snapshot> snap_;
@@ -233,6 +278,13 @@ private:
 
   bool registered_stmt_{false};
   bool registered_all_{false};
+
+  // Bulk-copy mode state (see begin_bulk_copy). Isolated from ops_/lookup_.
+  bool bulk_copy_mode_{false};
+  bytecask::WritePlan bulk_plan_{};
+  std::size_t bulk_bytes_{0};
+  std::size_t bulk_flush_threshold_{0};
+  std::set<std::vector<uint8_t>> bulk_seen_;
 };
 
 } // namespace bytecaskdb

@@ -163,6 +163,39 @@ The dual-structure buffer (`ops_` ordered log + `lookup_` sorted map) is
 the core of `bytecaskdb_txn.h`. `ops_` preserves causality for commit;
 `lookup_` gives O(log n) RYOW lookups.
 
+#### Bulk-copy mode (large ALTER / CREATE INDEX)
+
+`ALTER TABLE ... ALGORITHM=COPY` — which is how `CREATE INDEX`, `DROP INDEX`,
+add/change column, and any non-inplace ALTER run — copies every row into a
+hidden `#sql-xxx` table row by row. Buffering all of that in `ops_`/`lookup_`
+and committing it in one `apply_batch` costs ~1 GB of RAM per million rows and
+one enormous `fdatasync`.
+
+The `#sql-xxx` keyspace is invisible to every other transaction until the final
+catalog rename (under an exclusive metadata lock), so it is safe to commit it
+in pieces. When `write_row` detects it is the destination of such a copy
+(`is_alter_copy_target()` — a `#sql-` table path plus an ALTER/CREATE INDEX/DROP
+INDEX statement), the txn enters **bulk-copy mode**:
+
+- Puts go to a dedicated `bulk_plan_` (a snapshot-less `WritePlan`), **never**
+  `ops_`/`lookup_`/`snap_` — the source-table scan runs on the *same per-THD
+  txn* and holds a live `MergeIterator` over `snap_`+`lookup_` that must not be
+  disturbed.
+- Every `bytecaskdb_bulk_copy_flush_bytes` (system variable, default 64 MiB) the
+  batch is flushed with one `apply_batch({.sync=false})` and `bulk_plan_` is
+  reset. `end_bulk_insert` does the final flush with `sync=true`.
+- Duplicate probes (`bulk_pk_exists`, `bulk_unique_prefix_exists`) check the
+  current unflushed batch (`bulk_seen_`) plus the DB directly — the stale
+  pre-ALTER snapshot would miss rows flushed by earlier batches.
+
+Peak plugin memory during a copy-ALTER is therefore ~2× the flush threshold,
+independent of table size. There is no separate "activation" step: the existing
+`rename_table` + `delete_table` swap that `mysql_alter_table` performs is the
+activation. A crash mid-copy leaves an invisible orphan `#sql-` keyspace;
+MariaDB's `ddl_log` reclaims it on restart via `delete_table` → O(1)
+`del_range`. On an in-process ALTER failure the same `delete_table` runs, and
+`MariaDBTxn::rollback` discards any unflushed batch.
+
 ---
 
 ## Request traces
@@ -335,6 +368,7 @@ See `SMOKE_TEST.md` for the end-to-end MariaDB test procedure.
 | Negative integer ordering | Done | Sign-bit flip (XOR 0x80) on MSB after BE conversion |
 | FLOAT/DOUBLE index ordering | Done | IEEE 754 mem-comparable encoding (LE→BE + sign transform) |
 | `HA_READ_AFTER_KEY` (loose index scan) | Done | Used by SELECT DISTINCT / GROUP BY on secondary indexes |
+| Batched ALTER / CREATE INDEX on large tables | Done | Bulk-copy mode flushes the copy in `bytecaskdb_bulk_copy_flush_bytes` batches (default 64 MiB); bounded memory regardless of row count |
 
 ### Supported data types in indexes
 

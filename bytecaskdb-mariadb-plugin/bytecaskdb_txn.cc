@@ -227,6 +227,19 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
 // ---------------------------------------------------------------------------
 
 int MariaDBTxn::commit(THD * /*thd*/, bool all) {
+  if (bulk_copy_mode_ && (all || !registered_all_)) {
+    // Flush any tail rows the copy loop left buffered, then fall through.
+    // end_bulk_insert normally does this already; this covers paths that
+    // reach commit without it (e.g. an ALTER with zero source rows).
+    int e = bulk_flush(true);
+    bulk_reset();
+    if (e) {
+      revert_row_count_deltas();
+      reset();
+      return e;
+    }
+  }
+
   if (!all && registered_all_) {
     // Statement commit within a multi-statement session txn.
     // Buffer stays for the session-level commit.
@@ -274,6 +287,11 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
 }
 
 void MariaDBTxn::rollback(THD * /*thd*/, bool all) {
+  // Discard any pending bulk-copy batch. Rows already flushed to the
+  // #sql-xxx keyspace are reclaimed when MariaDB drops the temp table
+  // (delete_table → del_range), on this path or via ddl_log after a crash.
+  bulk_reset();
+
   if (!all && registered_all_) {
     // Statement rollback within session txn — clear buffer (conservative).
     revert_row_count_deltas();
@@ -293,6 +311,7 @@ void MariaDBTxn::reset() {
   row_count_deltas_.clear();
   registered_stmt_ = false;
   registered_all_ = false;
+  bulk_reset();
 }
 
 void MariaDBTxn::track_row_count_delta(uint32_t table_id, int64_t delta) {
@@ -307,6 +326,92 @@ void MariaDBTxn::revert_row_count_deltas() {
     }
   }
   row_count_deltas_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Bulk-copy mode
+// ---------------------------------------------------------------------------
+
+void MariaDBTxn::begin_bulk_copy(std::size_t flush_threshold_bytes) {
+  bulk_copy_mode_ = true;
+  bulk_flush_threshold_ = flush_threshold_bytes;
+  bulk_plan_ = bytecask::WritePlan{};
+  bulk_bytes_ = 0;
+  bulk_seen_.clear();
+}
+
+void MariaDBTxn::bulk_reset() {
+  bulk_copy_mode_ = false;
+  bulk_plan_ = bytecask::WritePlan{};
+  bulk_bytes_ = 0;
+  bulk_flush_threshold_ = 0;
+  bulk_seen_.clear();
+}
+
+void MariaDBTxn::bulk_buffer_put(const uint8_t *key, std::size_t klen,
+                                 const uint8_t *val, std::size_t vlen) {
+  static constexpr uint8_t kEmpty[1] = {0};
+  const uint8_t *vp = (val && vlen > 0) ? val : kEmpty;
+  const std::size_t vl = (val && vlen > 0) ? vlen : 0;
+  bulk_plan_.put(as_view(key, klen), as_view(vp, vl));
+  bulk_bytes_ += klen + vlen;
+}
+
+void MariaDBTxn::bulk_note_key(const uint8_t *key, std::size_t klen) {
+  bulk_seen_.emplace(key, key + klen);
+}
+
+int MariaDBTxn::bulk_flush(bool sync) {
+  if (bulk_bytes_ == 0 && bulk_seen_.empty()) {
+    return 0;
+  }
+  try {
+    bool committed =
+        db_->apply_batch(bytecask::WriteOptions{.sync = sync},
+                         std::move(bulk_plan_)).has_value();
+    bulk_plan_ = bytecask::WritePlan{};
+    bulk_bytes_ = 0;
+    bulk_seen_.clear();
+    if (!committed) {
+      // A snapshot-less plan cannot conflict; a false here is an engine fault.
+      return HA_ERR_INTERNAL_ERROR;
+    }
+    return 0;
+  } catch (const std::exception &e) {
+    fprintf(stderr, "[bytecaskdb] bulk flush failed: %s\n", e.what());
+    bulk_plan_ = bytecask::WritePlan{};
+    bulk_bytes_ = 0;
+    bulk_seen_.clear();
+    return HA_ERR_INTERNAL_ERROR;
+  }
+}
+
+bool MariaDBTxn::bulk_pk_exists(const uint8_t *key, std::size_t klen) {
+  if (bulk_seen_.find(std::vector<uint8_t>(key, key + klen)) != bulk_seen_.end()) {
+    return true;
+  }
+  try {
+    return db_->contains_key({}, as_view(key, klen));
+  } catch (...) {
+    return false;
+  }
+}
+
+bool MariaDBTxn::bulk_unique_prefix_exists(const uint8_t *prefix,
+                                          std::size_t plen) {
+  if (bulk_seen_.find(std::vector<uint8_t>(prefix, prefix + plen)) !=
+      bulk_seen_.end()) {
+    return true;
+  }
+  try {
+    for (auto &k : db_->keys_from({}, as_view(prefix, plen))) {
+      return k.size() >= plen &&
+             std::memcmp(u8_data(k), prefix, plen) == 0;
+    }
+  } catch (...) {
+    return false;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------

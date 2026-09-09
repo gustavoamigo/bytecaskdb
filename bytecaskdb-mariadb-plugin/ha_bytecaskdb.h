@@ -8,6 +8,7 @@
 #include "my_global.h"
 #include "handler.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -58,6 +59,9 @@ void             catalog_seed_autoinc(uint32_t table_id, uint64_t high_water);
 void             catalog_reset_autoinc(uint32_t table_id, uint64_t value);
 void             catalog_drop_autoinc(uint32_t table_id);
 
+// Current value of the bulk_copy_flush_bytes system variable (never 0).
+std::size_t      catalog_bulk_copy_flush_bytes();
+
 int64_t          catalog_row_count(uint32_t table_id);
 std::atomic<int64_t> *catalog_row_count_ptr(uint32_t table_id);
 void             catalog_row_count_add(uint32_t table_id, int64_t delta);
@@ -92,6 +96,10 @@ public:
   int write_row(const uchar *buf) override;
   int update_row(const uchar *old_data, const uchar *new_data) override;
   int delete_row(const uchar *buf) override;
+
+  // Bulk copy (ALTER TABLE ... ALGORITHM=COPY) — flush the pending batch
+  // with a durability barrier before the ALTER proceeds to the rename.
+  int end_bulk_insert() override;
 
   // -------------------------------------------------------------------
   // Full table scan
@@ -205,6 +213,15 @@ private:
   // Saves `current_row_key_` from a slice the iterator gave us.
   void save_current_row_key(const uint8_t *data, std::size_t len);
   int index_read_current(uchar *buf);
+
+  // True when this handler is the destination of an ALTER TABLE copy into a
+  // hidden #sql-xxx table — the case where write_row switches to batched
+  // (bulk-copy) buffering. Always false under PLUGIN_TESTING.
+  bool is_alter_copy_target() const;
+
+  // write_row on the ALTER-copy path: batched buffering via MariaDBTxn's
+  // bulk buffer. Entered from write_row once bulk-copy mode is active.
+  int bulk_copy_write_row(const uchar *buf);
 
   // Lazily seeds the per-table synthetic rowid counter on first open of
   // a PK-less table by scanning for the largest existing key.

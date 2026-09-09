@@ -79,3 +79,43 @@
   teardown:
     - DROP DATABASE IF EXISTS ddl5
 
+
+- name: Batched CREATE INDEX on a large table (bulk-copy flush)
+  setup:
+    - DROP DATABASE IF EXISTS ddl_bulk
+    - CREATE DATABASE ddl_bulk
+    - SET GLOBAL bytecaskdb_bulk_copy_flush_bytes = 4096
+    - CREATE TABLE ddl_bulk.t (id INT PRIMARY KEY, cat INT NOT NULL, pad VARCHAR(60) NOT NULL) ENGINE=bytecaskdb
+    - "INSERT INTO ddl_bulk.t (id, cat, pad) WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 800) SELECT n, n MOD 5, REPEAT('x', 50) FROM s"
+    - CREATE INDEX idx_cat ON ddl_bulk.t(cat)
+  steps:
+    - sql: SELECT COUNT(*) FROM ddl_bulk.t
+      expected: [['800']]
+    - sql: SELECT COUNT(*) FROM ddl_bulk.t USE INDEX (idx_cat) WHERE cat = 3
+      expected: [['160']]
+    - sql: SELECT id FROM ddl_bulk.t USE INDEX (idx_cat) WHERE cat = 0 ORDER BY id LIMIT 3
+      expected: [['5'], ['10'], ['15']]
+    - sql: CHECK TABLE ddl_bulk.t
+      expected: [['ddl_bulk.t', 'check', 'status', 'OK']]
+  teardown:
+    - SET GLOBAL bytecaskdb_bulk_copy_flush_bytes = DEFAULT
+    - DROP DATABASE IF EXISTS ddl_bulk
+
+- name: Batched ADD UNIQUE INDEX rejects a duplicate spanning a flush boundary
+  setup:
+    - DROP DATABASE IF EXISTS ddl_bulk_u
+    - CREATE DATABASE ddl_bulk_u
+    - SET GLOBAL bytecaskdb_bulk_copy_flush_bytes = 4096
+    - CREATE TABLE ddl_bulk_u.t (id INT PRIMARY KEY, email INT NOT NULL, pad VARCHAR(60) NOT NULL) ENGINE=bytecaskdb
+    - "INSERT INTO ddl_bulk_u.t (id, email, pad) WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 800) SELECT n, n, REPEAT('x', 50) FROM s"
+    - UPDATE ddl_bulk_u.t SET email = 5 WHERE id = 780
+  steps:
+    - sql: ALTER TABLE ddl_bulk_u.t ADD UNIQUE INDEX uq_email (email)
+      error: 1062
+    - sql: SELECT COUNT(*) FROM ddl_bulk_u.t
+      expected: [['800']]
+    - sql: SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = 'ddl_bulk_u' AND index_name = 'uq_email'
+      expected: [['0']]
+  teardown:
+    - SET GLOBAL bytecaskdb_bulk_copy_flush_bytes = DEFAULT
+    - DROP DATABASE IF EXISTS ddl_bulk_u
