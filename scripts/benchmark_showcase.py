@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -41,7 +42,19 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 REPO_ROOT    = Path(__file__).resolve().parent.parent
-BENCH_BINARY = REPO_ROOT / "build/linux/x86_64/release/engine_bench"
+
+
+def _xmake_arch() -> str:
+    """Return the xmake architecture directory for the current host."""
+    arch = platform.machine().lower()
+    if arch in {"aarch64", "arm64"}:
+        return "arm64"
+    if arch in {"x86_64", "amd64"}:
+        return "x86_64"
+    raise RuntimeError(f"Unsupported host architecture for xmake output: {arch}")
+
+
+BENCH_BINARY = REPO_ROOT / f"build/linux/{_xmake_arch()}/release/engine_bench"
 TMPDIR       = REPO_ROOT / ".tmp"
 
 FULL_REGULAR_SIZES   = [50_000, 500_000, 1_000_000]

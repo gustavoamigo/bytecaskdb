@@ -45,10 +45,20 @@ if(NOT DEFINED BYTECASK_ROOT)
   set(BYTECASK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 endif()
 
+# xmake names its output arch dir "x86_64" or "arm64", matching uname -m
+# except aarch64 -> arm64.
+if(NOT DEFINED BYTECASK_ARCH)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(BYTECASK_ARCH "arm64")
+  else()
+    set(BYTECASK_ARCH "x86_64")
+  endif()
+endif()
+
 # Location of the prebuilt static archive.
 if(NOT DEFINED BYTECASK_LIB)
   set(BYTECASK_LIB
-      "${BYTECASK_ROOT}/build/linux/x86_64/release/libbytecask.a")
+      "${BYTECASK_ROOT}/build/linux/${BYTECASK_ARCH}/release/libbytecask.a")
 endif()
 
 if(NOT EXISTS "${BYTECASK_LIB}")
@@ -62,7 +72,7 @@ set(BYTECASK_INCLUDE_DIR "${BYTECASK_ROOT}/include")
 
 # Location of the testing archive (with BYTECASK_TESTING defined).
 set(BYTECASK_TESTING_LIB
-    "${BYTECASK_ROOT}/build/linux/x86_64/release/libbytecask_testing.a")
+    "${BYTECASK_ROOT}/build/linux/${BYTECASK_ARCH}/release/libbytecask_testing.a")
 
 # MariaDB include directory.  Try to find it automatically or accept override.
 if(NOT DEFINED MARIADB_INCLUDE_DIR)
