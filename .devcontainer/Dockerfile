@@ -53,7 +53,7 @@ RUN cd /opt && git clone --depth 1 https://github.com/emscripten-core/emsdk.git 
 
 ENV EMSDK=/opt/emsdk
 ENV EM_CONFIG=/opt/emsdk/.emscripten
-ENV PATH="/opt/emsdk:/opt/emsdk/upstream/emscripten:/opt/emsdk/upstream/bin:${PATH}"
+ENV PATH="${PATH}:/opt/emsdk:/opt/emsdk/upstream/emscripten:/opt/emsdk/upstream/bin"
 
 ARG USERNAME=gustavoamigo
 RUN useradd -m $USERNAME || echo "User already exists"

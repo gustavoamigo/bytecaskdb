@@ -8,8 +8,11 @@ cp -n .claude.defaults/settings.json .claude/settings.json
 
 python3 -c "import nanobind; print(nanobind.include_dir())"
 
-RESOURCE_DIR=$(clang --print-resource-dir)
-xmake f --toolchain=clang --cxflags="-resource-dir=${RESOURCE_DIR}" -y
+RESOURCE_DIR=$(/usr/bin/clang --print-resource-dir)
+# Pin cc/cxx to the system clang: emsdk's clang (also named "clang") is
+# prepended to PATH below for the wasm build and would otherwise be picked up
+# by xmake's "clang" toolchain, breaking native builds ("unknown target triple").
+xmake f --toolchain=clang --cc=/usr/bin/clang --cxx=/usr/bin/clang++ --cxflags="-resource-dir=${RESOURCE_DIR}" -y
 
 # graft — repo context graph (see .github/copilot-instructions.md).
 # Install under the devcontainer user's home so the post-create step does not
