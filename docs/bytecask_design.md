@@ -387,6 +387,15 @@ The two modes follow the same naming conventions used by Azure Cosmos DB and dis
 
 This is analogous to RocksDB's built-in `SuperVersion` thread-local caching, which always provides session consistency with no user-facing knob. ByteCaskDB adds bounded staleness as an opt-in for write-heavy workloads where read throughput matters more than freshness.
 
+The thread-local cache is keyed by the owning `DB` instance (a raw pointer
+comparison), not just by write timestamp. A thread that reads from more than
+one `DB` in the same process switches cache targets transparently — the
+first read against a different instance always refreshes, regardless of
+`staleness_tolerance` (BC-243). This costs one pointer compare on the hot
+path and only matters in practice for processes that open multiple `DB`s
+and read from them on the same thread (e.g. tests, or a service that shards
+across directories).
+
 ##### Session consistency (`staleness_tolerance = 0`, default)
 
 The default mode. The thread-local snapshot is refreshed whenever any write has occurred — the reader compares the writer's timestamp against its cached timestamp and refreshes if they differ. This guarantees **read-your-writes** on the same thread: a `put()` followed by a `get()` always observes the put.

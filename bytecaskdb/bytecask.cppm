@@ -2913,15 +2913,22 @@ auto DB::create_manifest() -> FileManifest {
 }
 
 // Returns the engine state from a thread-local cache (read path only).
-// The hot path is a single relaxed load of state_time_ (plain MOV on x86).
-// The snapshot is refreshed only when the last write timestamp exceeds
-// staleness_tolerance (session mode: tolerance=0, refreshes on every write).
-// Returns a reference to the thread-local snapshot. The snapshot stays
-// alive until the same thread calls load_state_for_read again, so callers must
-// not stash the reference across a second load_state_for_read call.
+// The hot path is a single relaxed load of state_time_ (plain MOV on x86)
+// plus an owner-pointer compare. The snapshot is refreshed only when the
+// last write timestamp exceeds staleness_tolerance (session mode:
+// tolerance=0, refreshes on every write), or when this thread's cache
+// currently holds a different DB instance's generation. Returns a
+// reference to the thread-local snapshot. The snapshot stays alive until
+// the same thread calls load_state_for_read again, so callers must not
+// stash the reference across a second load_state_for_read call.
 auto DB::load_state_for_read(const ReadOptions &opts) const
     -> const std::shared_ptr<const EngineState> & {
   struct TlState {
+    // Identifies which DB instance snapshot belongs to. The cache is a
+    // single function-local thread_local shared by every DB the calling
+    // thread touches, so without this a thread that reads from two DBs
+    // could see one DB's generation while querying the other.
+    const DB *owner{nullptr};
     std::shared_ptr<const EngineState> snapshot;
     std::int64_t last_write_time{0};
   };
@@ -2930,6 +2937,14 @@ auto DB::load_state_for_read(const ReadOptions &opts) const
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   thread_local TlState tl;
 #pragma clang diagnostic pop
+  if (tl.owner != this) {
+    // Cache holds another DB's generation (or is empty): drop it and
+    // force a refresh below. Freed inline — this DB's reclaimer (if any)
+    // must never take ownership of another DB's state.
+    tl.snapshot.reset();
+    tl.owner = this;
+    tl.last_write_time = 0;
+  }
   const auto wt = state_time_.load(std::memory_order_relaxed);
   const auto tolerance =
       std::chrono::duration_cast<std::chrono::nanoseconds>(

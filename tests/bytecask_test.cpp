@@ -6748,3 +6748,40 @@ TEST_CASE("use_mmap=false: vacuum reclaims space",
     CHECK(to_string(out) == "updated");
   }
 }
+
+// BC-243: DB::load_state_for_read cached the current generation in a
+// function-local thread_local keyed by nothing, so a thread reading from
+// two different DB instances could see one DB's generation while querying
+// the other. Interleave reads on two DBs from the same thread and confirm
+// each DB reports only its own data.
+TEST_CASE("BC-243: thread-local read cache does not leak across DB instances",
+          "[bytecask][tl-cache]") {
+  TempDir td_a;
+  TempDir td_b;
+  auto a = bytecask::DB::open(td_a.path);
+  auto b = bytecask::DB::open(td_b.path);
+
+  a.put({.sync = false}, to_bytes("shared"), to_bytes("from_a"));
+  // Ensure b's publish timestamp is strictly newer than a's, which is the
+  // condition that made the stale-owner check in load_state_for_read pass
+  // incorrectly.
+  std::this_thread::sleep_for(std::chrono::milliseconds{2});
+  b.put({.sync = false}, to_bytes("shared"), to_bytes("from_b"));
+  b.put({.sync = false}, to_bytes("only_in_b"), to_bytes("x"));
+
+  bytecask::Bytes out;
+
+  // Read b first so its generation is cached on this thread ...
+  REQUIRE(b.get({}, to_bytes("shared"), out));
+  CHECK(to_string(out) == "from_b");
+
+  // ... then read a: must see a's own data, not b's cached generation.
+  REQUIRE(a.get({}, to_bytes("shared"), out));
+  CHECK(to_string(out) == "from_a");
+  CHECK_FALSE(a.contains_key({}, to_bytes("only_in_b")));
+
+  // Flip back to b to confirm the cache correctly re-targets both ways.
+  REQUIRE(b.get({}, to_bytes("shared"), out));
+  CHECK(to_string(out) == "from_b");
+  CHECK(b.contains_key({}, to_bytes("only_in_b")));
+}
