@@ -7,9 +7,11 @@
 module;
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
@@ -292,6 +294,114 @@ private:
   std::thread thread_;
 };
 
+#endif
+
+// ---------------------------------------------------------------------------
+// StateReclaimer — bounded, typed destruction queue for immutable states.
+//
+// Unlike BackgroundWorker this queue has a fixed capacity and never stores
+// type-erased callables. When the queue is full, the caller destroys its
+// state inline rather than allowing deferred memory to grow without bound.
+// ---------------------------------------------------------------------------
+#ifdef BYTECASK_SINGLE_THREADED
+export template <typename T> class StateReclaimer {
+public:
+  StateReclaimer() = default;
+  ~StateReclaimer() = default;
+
+  StateReclaimer(const StateReclaimer &) = delete;
+  StateReclaimer &operator=(const StateReclaimer &) = delete;
+
+  [[nodiscard]] auto retire(std::shared_ptr<const T> dead) noexcept -> bool {
+    dead.reset();
+    return false;
+  }
+
+  void drain() {}
+};
+#else
+export template <typename T> class StateReclaimer {
+public:
+  StateReclaimer() : thread_{[this] { run(); }} {}
+
+  ~StateReclaimer() {
+    {
+      std::lock_guard<std::mutex> lk{mu_};
+      stop_ = true;
+    }
+    cv_task_.notify_one();
+    thread_.join();
+  }
+
+  StateReclaimer(const StateReclaimer &) = delete;
+  StateReclaimer &operator=(const StateReclaimer &) = delete;
+
+  [[nodiscard]] auto retire(std::shared_ptr<const T> dead) noexcept -> bool {
+    bool notify = false;
+    bool deferred = false;
+    {
+      std::lock_guard<std::mutex> lk{mu_};
+      if (!stop_ && queue_.size() < kMaxQueue) {
+        try {
+          queue_.push_back(std::move(dead));
+          notify = sleeping_;
+          deferred = true;
+        } catch (const std::bad_alloc &) {
+          // The queue cannot grow without bound; reclaim inline if a queue
+          // block cannot be allocated.
+        }
+      }
+    }
+    if (!deferred) {
+      dead.reset();
+      return false;
+    }
+    if (notify) cv_task_.notify_one();
+    return true;
+  }
+
+  void drain() {
+    std::unique_lock<std::mutex> lk{mu_};
+    cv_idle_.wait(lk, [this] { return queue_.empty() && !busy_; });
+  }
+
+private:
+  void run() {
+    while (true) {
+      std::shared_ptr<const T> dead;
+      {
+        std::unique_lock<std::mutex> lk{mu_};
+        while (queue_.empty() && !stop_) {
+          sleeping_ = true;
+          cv_task_.wait(lk);
+          sleeping_ = false;
+        }
+        if (queue_.empty() && stop_) return;
+        dead = std::move(queue_.front());
+        queue_.pop_front();
+        busy_ = true;
+      }
+
+      dead.reset();
+
+      {
+        std::lock_guard<std::mutex> lk{mu_};
+        busy_ = false;
+      }
+      cv_idle_.notify_all();
+    }
+  }
+
+  static constexpr std::size_t kMaxQueue = 256;
+  std::mutex mu_;
+  std::condition_variable cv_task_;
+  std::condition_variable cv_idle_;
+  std::deque<std::shared_ptr<const T>> queue_;
+  bool sleeping_{false};
+  bool busy_{false};
+  bool stop_{false};
+  std::thread thread_;
+};
 #endif
 
 } // namespace bytecask

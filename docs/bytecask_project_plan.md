@@ -15,6 +15,7 @@ Canonical location: `docs/bytecask_project_plan.md`.
 
 | ID | Title | Note |
 | --- | --- | --- |
+| BC-244 | Deferred `EngineState` reclamation | Design finalized in `docs/defered_state_reclaim.md`. BC-243 prerequisite and D11 publish-point refactor are complete. `StateReclaimer`, publish/read hooks, counters, RYOW/RWW benchmark cases, and focused tests are implemented. RYOW reports zero stale reads; the initial 2-vCPU RWW before/after sample is noisy and inconclusive. ASan/TSan full-suite runs remain blocked by the pre-existing resume-test hang/resource termination. |
 | BC-241 | MariaDB `oltp_insert` hot-path tuning | Cache handler-local index metadata, use direct row-count/AUTO_INCREMENT atomics in insert paths, and add `--workloads` plus private config copies to the sysbench harness. Validate with plugin tests and `oltp_insert` before/after runs. |
 | BC-240 | Fix devcontainer graft install permissions | The devcontainer post-create step was installing `@nanonets/graft` into the system npm prefix (`/usr/local`), which fails under a non-root devcontainer user with `EACCES`. Redirect the install into `${HOME}/.npm-global` and export that bin dir before invoking `graft init`. |
 

@@ -52,6 +52,10 @@ export struct Counters {
   std::atomic<std::int64_t> crc_failures{0};
   std::atomic<std::int64_t> io_errors{0};
   std::atomic<std::int64_t> degraded_transitions{0};
+
+  // -- State reclamation --
+  std::atomic<std::int64_t> states_retired{0};
+  std::atomic<std::int64_t> states_retired_inline{0};
 };
 
 } // namespace bytecask

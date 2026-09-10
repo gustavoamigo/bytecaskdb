@@ -28,7 +28,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex with group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost. On the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
 - **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a degraded state: reads remain available, all writes throw `DbDegraded`, and the service calls `resume()` to recover without a restart.
-- **Operational counters** — `stats()` returns a flat `map<string, int64_t>` of monotonic counters (bytes written, fsyncs, group writer batches, vacuum bytes reclaimed, CRC failures, I/O errors, degraded transitions) and gauges (degraded state, open files). Designed for pull-based scraping (Prometheus, logging). Counters only track what the engine can see internally — request counts and latency are the caller's responsibility.
+- **Operational counters** — `stats()` returns a flat `map<string, int64_t>` of monotonic counters (bytes written, fsyncs, group writer batches, vacuum bytes reclaimed, CRC failures, I/O errors, degraded transitions, and deferred state generations reclaimed or reclaimed inline under backpressure) and gauges (degraded state, open files). Designed for pull-based scraping (Prometheus, logging). Counters only track what the engine can see internally — request counts and latency are the caller's responsibility.
 - **Replication transport in Python** — Python bindings expose a `DataEntry(sequence, entry_type, key, value)` constructor accepting bytes-like payloads, so `changes_since()` output can be serialized over the wire and reconstructed before `ingest()`.
 
 ## Performance
@@ -336,7 +336,7 @@ public:
     void resume();
 
     // Returns all operational counters and gauges as a flat map.
-    // Monotonic counters (bytes_written, fsyncs, …) and current-state
+    // Monotonic counters (bytes_written, fsyncs, states_retired, …) and current-state
     // gauges (degraded, open_files). Designed for pull-based scraping.
     [[nodiscard]] auto stats() const -> std::map<std::string, std::int64_t>;
 };

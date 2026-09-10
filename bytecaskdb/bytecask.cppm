@@ -914,9 +914,13 @@ private:
   // Write path: authoritative load, always current. Caller must hold write_mu_.
   [[nodiscard]] auto load_state_for_write() const
       -> std::shared_ptr<EngineState>;
-  // Publish new state + bump timestamp. Caller must hold write_mu_.
-  // Runs O(1) invariant checks comparing old vs new; degrades on violation.
-  void store_state(const std::shared_ptr<const EngineState> &old_state,
+  void retire_state(std::shared_ptr<const EngineState> dead) const noexcept;
+  // Sole publish point. Caller must hold write_mu_ and pass its own
+  // (sole) reference to the outgoing state via std::move — this is what
+  // lets the outgoing generation be retired as soon as the new one is
+  // visible, rather than at the caller's own scope exit. Runs O(1)
+  // invariant checks comparing old vs new; degrades on violation.
+  void store_state(std::shared_ptr<const EngineState> &&old_state,
                    std::shared_ptr<EngineState> new_state);
   // Publish initial state during construction (no previous state to compare).
   void store_initial_state(std::shared_ptr<EngineState> s);
@@ -960,7 +964,11 @@ private:
   auto load_state() const -> std::shared_ptr<EngineState> {
     return std::atomic_load(&state_);
   }
-  void store_state(std::shared_ptr<EngineState> s) {
+  // Raw atomic swap — the only place state_ is actually written. Private
+  // to store_state() and store_initial_state(); nothing else may call it,
+  // so the two-arg store_state() remains the sole externally-visible
+  // publish point (with its invariant checks and retire hook).
+  void raw_store_state(std::shared_ptr<EngineState> s) {
     std::atomic_store(&state_, std::move(s));
   }
 #pragma clang diagnostic pop
@@ -1000,6 +1008,7 @@ private:
   // Declared last so it destructs first, joining the background thread before
   // any other member is destroyed.
   mutable BackgroundWorker worker_;
+  mutable StateReclaimer<EngineState> reclaimer_;
 
 #ifdef BYTECASK_TESTING
 public:
@@ -1979,6 +1988,7 @@ DB::~DB() {
   try {
     flush_hints();
   } catch (...) {}
+  reclaimer_.drain();
   if (lock_fd_ != -1) {
     ::close(lock_fd_);
     lock_fd_ = -1;
@@ -2204,7 +2214,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
         "append IO error on '{}': call resume() to recover.",
         file.path().string()));
     counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-    store_state(std::move(err_t).persistent());
+    store_state(std::move(current), std::move(err_t).persistent());
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
@@ -2229,7 +2239,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
           "durability not confirmed. Call resume() to recover.",
           file.path().string()));
       counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-      store_state(std::move(err_t).persistent());
+      store_state(std::move(current), std::move(err_t).persistent());
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
       }
@@ -2246,7 +2256,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
           "but new file could not be created. Call resume() to recover.",
           file.path().string()));
       counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-      store_state(current, std::move(t).persistent());
+      store_state(std::move(current), std::move(t).persistent());
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
       }
@@ -2267,7 +2277,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
           "durability not confirmed. Call resume() to recover.",
           file.path().string()));
       counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-      store_state(std::move(err_t).persistent());
+      store_state(std::move(current), std::move(err_t).persistent());
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
       }
@@ -2277,7 +2287,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
 
   assert(t.active_file().size() <= rotation_threshold_);
   const auto final_durable_seq = t.durable_seq();
-  store_state(current, std::move(t).persistent());
+  store_state(std::move(current), std::move(t).persistent());
   for (auto *s : batch) {
     auto &slot = static_cast<EngineSlot &>(*s);
     if (slot.result) slot.result->durable = final_durable_seq >= slot.result->sequence;
@@ -2621,7 +2631,7 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
   auto t = current->transient();
   t.apply_vacuum(old_file_id, scan, std::move(new_sealed_file));
 
-  store_state(current, std::move(t).persistent());
+  store_state(std::move(current), std::move(t).persistent());
 }
 
 // Unlinks the old data and hint files from the filesystem. Existing readers
@@ -2745,6 +2755,10 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.io_errors.load(std::memory_order_relaxed)},
       {"bytecask.degraded_transitions",
        counters_.degraded_transitions.load(std::memory_order_relaxed)},
+      {"bytecask.states_retired",
+       counters_.states_retired.load(std::memory_order_relaxed)},
+      {"bytecask.states_retired_inline",
+       counters_.states_retired_inline.load(std::memory_order_relaxed)},
       // Gauges — current state, not monotonic.
       {"bytecask.degraded", s->degraded ? 1 : 0},
       {"bytecask.open_files", open_files},
@@ -2756,14 +2770,14 @@ void DB::set_mode(Mode mode) {
   auto current = load_state_for_write();
   auto t = current->transient();
   t.apply_set_mode(mode);
-  store_state(current, std::move(t).persistent());
+  store_state(std::move(current), std::move(t).persistent());
 }
 
 void DB::deem_as_degraded(std::string reason) {
   auto current = load_state_for_write();
   auto t = current->transient();
   t.apply_degrade(std::move(reason));
-  store_state(std::move(t).persistent());
+  store_state(std::move(current), std::move(t).persistent());
 }
 
 void DB::resume() {
@@ -2841,7 +2855,7 @@ void DB::resume() {
   t.apply_clear_degraded();
   auto resumed = std::move(t).persistent();
   validate_state_consistency(*resumed);
-  store_state(current, std::move(resumed));
+  store_state(std::move(current), std::move(resumed));
 }
 
 auto DB::durable_sequence(std::uint64_t min_sequence,
@@ -2884,12 +2898,12 @@ auto DB::create_manifest() -> FileManifest {
       t.apply_degrade(
           "create_manifest rotation failed: active file is sealed "
           "but new file could not be created. Call resume() to recover.");
-      store_state(current, std::move(t).persistent());
+      store_state(std::move(current), std::move(t).persistent());
       throw;
     }
 
     through_seq = max_seq;
-    store_state(current, std::move(t).persistent());
+    store_state(std::move(current), std::move(t).persistent());
 
     // Capture state under write_mu_ — a concurrent write after
     // store_state but before load_state would produce a snapshot
@@ -2951,8 +2965,9 @@ auto DB::load_state_for_read(const ReadOptions &opts) const
           opts.staleness_tolerance)
           .count();
   if (wt - tl.last_write_time > tolerance) {
-    tl.snapshot = load_state();
+    auto dead = std::exchange(tl.snapshot, load_state());
     tl.last_write_time = wt;
+    retire_state(std::move(dead));
   }
   return tl.snapshot;
 }
@@ -2961,7 +2976,16 @@ auto DB::load_state_for_write() const -> std::shared_ptr<EngineState> {
   return load_state();
 }
 
-void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
+void DB::retire_state(std::shared_ptr<const EngineState> dead) const noexcept {
+  if (!dead || dead.use_count() != 1) return;
+  if (reclaimer_.retire(std::move(dead))) {
+    counters_.states_retired.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    counters_.states_retired_inline.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void DB::store_state(std::shared_ptr<const EngineState> &&old_state,
                      std::shared_ptr<EngineState> new_state) {
   // O(1) invariant checks — always on, even in release.
   if (new_state->next_seq < old_state->next_seq) {
@@ -3009,7 +3033,9 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
   }
 #endif
 
-  store_state(std::move(new_state));
+  assert(old_state == std::atomic_load(&state_) &&
+         "store_state: old_state is not the live generation");
+  raw_store_state(std::move(new_state));
   state_time_.store(now_ns(), std::memory_order_release);
 
   if (became_degraded) {
@@ -3019,10 +3045,12 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
     { std::lock_guard<std::mutex> lk{durable_mu_}; }
     durable_cv_.notify_all();
   }
+
+  retire_state(std::move(old_state));
 }
 
 void DB::store_initial_state(std::shared_ptr<EngineState> s) {
-  store_state(std::move(s));
+  raw_store_state(std::move(s));
   state_time_.store(now_ns(), std::memory_order_release);
 }
 
@@ -3694,7 +3722,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
       auto err_t = current->transient();
       err_t.apply_degrade(
           "ingest append IO error: call resume() to recover.");
-      store_state(std::move(err_t).persistent());
+      store_state(std::move(current), std::move(err_t).persistent());
       std::rethrow_exception(ex);
     }
 
@@ -3707,7 +3735,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
         auto err_t = current->transient();
         err_t.apply_degrade(
             "ingest rotation fdatasync failed: call resume() to recover.");
-        store_state(std::move(err_t).persistent());
+        store_state(std::move(current), std::move(err_t).persistent());
         throw;
       }
       try {
@@ -3715,7 +3743,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
       } catch (...) {
         t.apply_degrade(
             "ingest post-rotation file creation failed: call resume().");
-        store_state(current, std::move(t).persistent());
+        store_state(std::move(current), std::move(t).persistent());
         throw;
       }
     }
@@ -3733,7 +3761,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
       auto err_t = current->transient();
       err_t.apply_degrade(
           "ingest rotation fdatasync failed: call resume() to recover.");
-      store_state(std::move(err_t).persistent());
+      store_state(std::move(current), std::move(err_t).persistent());
       throw;
     }
     try {
@@ -3741,7 +3769,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     } catch (...) {
       t.apply_degrade(
           "ingest post-rotation file creation failed: call resume().");
-      store_state(current, std::move(t).persistent());
+      store_state(std::move(current), std::move(t).persistent());
       throw;
     }
   }
@@ -3754,12 +3782,12 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     auto err_t = current->transient();
     err_t.apply_degrade(
         "ingest fdatasync failed: call resume() to recover.");
-    store_state(std::move(err_t).persistent());
+    store_state(std::move(current), std::move(err_t).persistent());
     throw;
   }
 
   assert(t.active_file().size() <= rotation_threshold_);
-  store_state(current, std::move(t).persistent());
+  store_state(std::move(current), std::move(t).persistent());
 }
 
 #pragma endregion

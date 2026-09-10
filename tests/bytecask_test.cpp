@@ -6590,6 +6590,8 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.crc_failures",
       "bytecask.io_errors",
       "bytecask.degraded_transitions",
+      "bytecask.states_retired",
+      "bytecask.states_retired_inline",
       "bytecask.degraded",
       "bytecask.open_files",
   };
@@ -6784,4 +6786,17 @@ TEST_CASE("BC-243: thread-local read cache does not leak across DB instances",
   REQUIRE(b.get({}, to_bytes("shared"), out));
   CHECK(to_string(out) == "from_b");
   CHECK(b.contains_key({}, to_bytes("only_in_b")));
+}
+
+TEST_CASE("deferred state reclamation records retired generations",
+          "[bytecask][reclaimer]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+
+  db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+
+  const auto stats = db.stats();
+  CHECK(stats.at("bytecask.states_retired") >= 2);
+  CHECK(stats.at("bytecask.states_retired_inline") == 0);
 }

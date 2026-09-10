@@ -266,18 +266,47 @@ No `atomic_exchange` is needed: under `write_mu_` the caller's `old_state`
 no `Snapshot` or thread-local cache holds it. This also removes the open
 question about a new deprecated-API surface.
 
-Every call site becomes `store_state(std::move(current), …)`. Sites:
-`execute_slots` (success and the three error paths), `vacuum_commit`,
-`set_mode`, `deem_as_degraded`, `resume`, `create_manifest` (both),
-`ingest` (error paths and final). The one-arg `store_state(new)` overload is
-deleted; the error paths that used it with `err_t = current->transient()`
-pass `std::move(current)` like everyone else (their invariant checks pass
-trivially — the degraded state copies every checked field). `deem_as_degraded`
-is invoked from inside `store_state` on invariant failure; it loads its own
-`current` and publishes through the same function, with the outer frame's
-`old_state` still alive → the inner retire skips (`use_count() > 1`) and the
-outer `old_state` frees inline. That is a cold path and acceptable.
-`store_initial_state` stays as is (no previous generation).
+Every call site becomes `store_state(std::move(current), …)`. Sites (23
+call sites, verified against the current source, none of which touch
+`current` again after the call — each either `return`s, `throw`s, or is the
+last statement before the function returns): `execute_slots` (the success
+path plus its three IO/fdatasync/rotation error paths), `vacuum_commit`,
+`set_mode`, `deem_as_degraded`, `resume`, `create_manifest` (normal publish
+and its rotation-failure path), `ingest` (the four in-loop and post-loop
+error paths, the loop's rotation-failure path, and the final publish —
+`current` is read many times across loop iterations via
+`rotate_active_file(t, current)`, which takes it by `const&` and never
+consumes it, so it stays valid until whichever single terminal
+`store_state` call fires). The private raw one-arg `store_state(shared_ptr)`
+(the `atomic_store` primitive) is kept, but only as an internal detail
+called from the checked two-arg `store_state` and from
+`store_initial_state`; nothing outside those two calls it directly anymore
+— this is what makes the two-arg function the *sole* externally-visible
+publish point. The several direct one-arg calls in today's `execute_slots`
+/ `ingest` error paths (`store_state(std::move(err_t).persistent())`,
+bypassing invariant checks) are changed to go through the checked two-arg
+form instead — `current` is already live at each of those sites, and their
+invariant checks pass trivially since `err_t = current->transient()` +
+`apply_degrade(...)` only flips `degraded`, leaving every checked field
+unchanged.
+
+`deem_as_degraded` is the one reentrant case: it runs *from inside* the
+two-arg `store_state`, on invariant failure, before that outer call's
+`old_state` has been moved anywhere. It loads its own `current` (the same
+generation as the outer `old_state` — nothing else could have published
+between the failed check and this call, since both run under `write_mu_`)
+and publishes through that same two-arg function recursively. That inner
+call's invariant checks pass trivially (a degrade transition changes only
+`degraded`/`degraded_reason`), so it is not a special case at the type
+level — it is simply a second, nested call to the one publish function.
+Its own `old_state` parameter (deem_as_degraded's local `current`) has
+`use_count() == 2` at that point (the outer frame's `old_state` plus this
+one), so `retire_state` skips it and it frees when deem_as_degraded's frame
+unwinds. Control then returns to the outer invariant check, which
+`return`s immediately — the outer `old_state` was never moved, so it frees
+inline at the outer function's return. Both frees are inline, on the
+writer thread, for what is already a cold path (an invariant violation).
+`store_initial_state` stays as is (no previous generation to retire).
 
 **Hook 2 — thread-local refresh** (on top of the BC-243 fix):
 
@@ -398,7 +427,10 @@ into `benchmarks/engine_bench_results.csv`.
 | `ByteCaskDB/Put/Sync` | hook 1 under real fsync | small win or neutral |
 | `ByteCaskDB/PutMT/Sync` @ 2–64T | write saturation; reclaimer competes for a core | neutral low/mid T; 64T within noise (±3%) |
 | `ByteCaskDB/Del/Sync`, `ByteCaskDB/MixedBatch/Sync` | other publishers | no regression |
-| `ByteCaskDB/MixedMT`, `ByteCaskDB/ReadAndWriteLoad` | **hook 2** on reader threads | possible read win; no regression |
+| `ByteCaskDB/ReadAndWriteLoad/Sync` @ 2–32T | **hook 2** on reader threads while a sync writer runs; reports writer operations and reclamation counters | possible read win; no regression |
+| `ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness` @ 2–32T | bounded-staleness readers, where refresh handoffs are less frequent | should avoid refresh overhead; no regression |
+| `ByteCaskDB/RYOW/NoSync` | same-thread write publication followed immediately by a read-cache refresh | zero stale reads; measure publish + refresh cost |
+| `ByteCaskDB/RYOW/Sync` | same-thread RYOW after durable publication | zero stale reads; fsync dominates |
 
 Then re-run the `oltp_insert` `perf` profile with the plugin unchanged to
 see how much of the ~34% left the client thread.
@@ -410,6 +442,30 @@ the free on x86: try the D10 alternative (timed wait) once; if it still
 regresses, revert the reclaimer (keep BC-243 and D11 — both are
 improvements on their own) and pursue the ChildStore/refcount rework
 instead.
+
+### Initial RYOW/RWW measurement
+
+The focused benchmark subset was run on the 2-vCPU codespace with
+`--benchmark_min_time=0.2s`, 50,000 keys, and one repetition. RYOW correctness
+passed in both modes: `stale_reads=0` for `NoSync` and `Sync`. The NoSync RYOW
+case recorded inline fallback under this short, highly write-heavy run
+(`states_retired_inline=553`), while Sync recorded zero inline fallbacks.
+
+The following direct RWW comparison is directional only; CPU scaling was
+enabled and the host was shared, so it is not a benchmark-gate decision:
+
+| Readers | Baseline RWW Sync | Reclaimer RWW Sync | Change |
+|---:|---:|---:|---:|
+| 2 | 1.598 Mops/s | 1.656 Mops/s | +3.6% |
+| 4 | 1.155 Mops/s | 1.910 Mops/s | +65.4% |
+| 8 | 1.821 Mops/s | 2.462 Mops/s | +35.2% |
+| 16 | 2.513 Mops/s | 2.041 Mops/s | −18.8% |
+| 32 | 3.653 Mops/s | 2.740 Mops/s | −25.0% |
+
+The spread is too large and inconsistent to establish a performance gain.
+The benchmark gate remains open until repeated, controlled before/after runs
+can be completed. The new counters show `states_retired_inline=0` for the
+reported RWW Sync rows.
 
 ## Resolved questions
 
@@ -448,8 +504,8 @@ worthwhile independently of the outcome of step 4.
 |---|---|---|
 | 0 | **Baseline.** `python3 scripts/run_engine_bench.py --full` on this x86_64 codespace; `oltp_insert` sysbench run + `perf` profile with the current plugin. | Rows in `benchmarks/engine_bench_results.csv`; profile saved alongside the gap analysis. |
 | 1 | **BC-243** — owner-keyed thread-local cache in `load_state_for_read`; `[tl-cache]` test. | ✅ **Done.** New test fails before, passes after; full `bytecask_tests` green (1,445 cases, 19,777,209 assertions). |
-| 2 | **D11** — `store_state(&&old, new)` as the sole publish point; delete the one-arg overload; `std::move(current)` at every site; debug `assert(old_state == atomic_load(&state_))`. Pure refactor, no behaviour change. | Compiles with `-Weverything`; full tests + `[model]` green. |
-| 3 | **BC-244** — `StateReclaimer` (D1–D5, D10) in `bytecask.concurrency` with the `BYTECASK_SINGLE_THREADED` variant; counters (D12) in `Counters` and `stats()`; `retire_state` + hooks 1 and 2; `reclaimer_` member after `worker_`; `[reclaimer]` unit tests; engine integration tests; `[model]` suites; TSan + ASan runs. | All tests green under release, TSan, ASan. `states_retired_inline == 0` in the single-writer integration test. |
-| 4 | **Benchmark gate.** Re-run step 0; apply the decision rule. | Before/after CSV rows shown; `oltp_insert` profile re-taken. |
+| 2 | **D11** — `store_state(&&old, new)` as the sole publish point; replace the raw one-arg helper with a private `raw_store_state`; `std::move(current)` at every site; debug `assert(old_state == atomic_load(&state_))`. Pure refactor, no behaviour change. | ✅ **Implemented.** Builds cleanly; `[model]` (25,495 assertions) and `[invariants]` (113 assertions) pass. The full suite was also attempted, but an existing `resume() discards pending batch on CRC error in active file` test hangs identically on the pre-refactor baseline and is unrelated to D11. |
+| 3 | **BC-244** — `StateReclaimer` (D1–D5, D10) in `bytecask.concurrency` with the `BYTECASK_SINGLE_THREADED` variant; counters (D12) in `Counters` and `stats()`; `retire_state` + hooks 1 and 2; `reclaimer_` member after `worker_`; `[reclaimer]` unit tests; engine integration tests; `[model]` suites; TSan + ASan runs. | **Implementation complete.** Release build, `[reclaimer]`, `[concurrency]`, `[model]`, `[invariants]`, radix-tree, and unordered-view tests pass. TSan/ASan and benchmark gates remain. |
+| 4 | **Benchmark gate.** Re-run step 0; apply the decision rule. | **In progress.** Focused RYOW/RWW runs pass the zero-stale-read check, but the first 2-vCPU before/after RWW sample is noisy and inconclusive; full CSV comparison remains blocked by the long scripted run. |
 | 5 | **Docs** (with step 3 or 4): `docs/bytecask_design.md` (state publication, reclaimer, shutdown ordering, counters), `README.md` (counter list under Operational counters), `docs/bytecask_project_plan.md` (BC-243/BC-244 to Done; follow-ups to Backlog). | Docs match shipped behaviour. |
 | 6 | **Follow-ups → Backlog.** Right-size the plugin change (P3) from the new profile; ChildStore/refcount rework; byte-based queue bound if warranted; `~Snapshot` hook if a read-heavy profile shows it. | Entries in `docs/bytecask_project_plan.md`. |

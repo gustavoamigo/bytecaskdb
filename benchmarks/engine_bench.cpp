@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <memory>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -339,6 +340,25 @@ struct BcAdapterBase {
     auto found = db.engine.get(ro, bc_key(k), value);
     benchmark::DoNotOptimize(found);
     benchmark::DoNotOptimize(value.data());
+  }
+
+  static auto ryow(Db &db, const std::string &k, std::uint64_t token,
+                   bool sync) -> bool {
+    thread_local auto value = make_value();
+    std::memcpy(value.data(), &token, sizeof(token));
+    bytecask::WriteOptions wo;
+    wo.sync = sync;
+    db.engine.put(wo, bc_key(k), bc_val(value));
+
+    bytecask::ReadOptions ro;
+    ro.verify_checksums = false;
+    bytecask::Bytes read_value;
+    const auto found = db.engine.get(ro, bc_key(k), read_value);
+    return found && read_value == value;
+  }
+
+  static auto stats(Db &db) -> std::map<std::string, std::int64_t> {
+    return db.engine.stats();
   }
 
   static void del(Db &db, const std::string &k, bool sync) {
@@ -1174,16 +1194,19 @@ void BM_ReadWhileWriting(benchmark::State &state) {
   static auto shared_db = std::make_unique<typename A::Db>(
       "rww", &shared_keys, &shared_val);
   static std::atomic<bool> writer_stop{false};
+  static std::atomic<std::int64_t> writer_ops{0};
   static std::thread writer_thread;
 
   // Start background writer per benchmark invocation (thread 0 only).
   if (state.thread_index() == 0) {
     writer_stop.store(false, std::memory_order_relaxed);
+    writer_ops.store(0, std::memory_order_relaxed);
     writer_thread = std::thread([] {
       std::size_t wi = 0;
       while (!writer_stop.load(std::memory_order_relaxed)) {
         const auto &k = shared_keys[wi % shared_keys.size()];
         A::put(*shared_db, k, shared_val, Sync);
+        writer_ops.fetch_add(1, std::memory_order_relaxed);
         ++wi;
       }
     });
@@ -1216,6 +1239,56 @@ void BM_ReadWhileWriting(benchmark::State &state) {
   if (state.thread_index() == 0) {
     writer_stop.store(true, std::memory_order_relaxed);
     writer_thread.join();
+    state.counters["writer_ops"] = benchmark::Counter(
+        static_cast<double>(writer_ops.load(std::memory_order_relaxed)));
+    if constexpr (requires { A::stats(*shared_db); }) {
+      const auto stats = A::stats(*shared_db);
+      state.counters["states_retired"] = benchmark::Counter(
+          static_cast<double>(stats.at("bytecask.states_retired")));
+      state.counters["states_retired_inline"] = benchmark::Counter(
+          static_cast<double>(stats.at("bytecask.states_retired_inline")));
+    }
+  }
+}
+
+template <bool Sync>
+void BM_Ryow(benchmark::State &state) {
+  static auto shared_keys = BcAdapter::generate_keys(kDatasetSize);
+  static auto shared_val = make_value();
+  static auto shared_db = std::make_unique<BcAdapter::Db>(
+      Sync ? "ryow_sync" : "ryow_nosync", &shared_keys, &shared_val);
+
+  std::size_t idx = static_cast<std::size_t>(state.thread_index());
+  std::int64_t stale_reads = 0;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+  for (auto _ : state) {
+    const auto &key = shared_keys[idx % shared_keys.size()];
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    const auto current =
+        BcAdapter::ryow(*shared_db, key, static_cast<std::uint64_t>(idx), Sync);
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (!current) ++stale_reads;
+    benchmark::DoNotOptimize(current);
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    ++idx;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.counters["ops_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  state.counters["stale_reads"] = benchmark::Counter(
+      static_cast<double>(stale_reads));
+  attach_jitter(state, samples);
+  if (state.thread_index() == 0) {
+    const auto stats = BcAdapter::stats(*shared_db);
+    state.counters["states_retired"] = benchmark::Counter(
+        static_cast<double>(stats.at("bytecask.states_retired")));
+    state.counters["states_retired_inline"] = benchmark::Counter(
+        static_cast<double>(stats.at("bytecask.states_retired_inline")));
   }
 }
 
@@ -1379,6 +1452,8 @@ BENCH(BM_Del<Bc, true>)           ->Name("ByteCaskDB/Del/Sync");
 BENCH(BM_Get<Bc>)                 ->Name("ByteCaskDB/Get");
 BENCH(BM_Range<Bc, kRangeLen>)    ->Name("ByteCaskDB/Range50");
 BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCaskDB/MixedBatch/Sync");
+BENCH(BM_Ryow<false>)              ->Name("ByteCaskDB/RYOW/NoSync");
+BENCH(BM_Ryow<true>)               ->Name("ByteCaskDB/RYOW/Sync");
 
 // --- UnorderedView ---
 BENCH(BM_Put<BcUV, false>)          ->Name("ByteCaskDB_UnorderedView/Put/NoSync")->Iterations(kDatasetSize);

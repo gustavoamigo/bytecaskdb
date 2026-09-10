@@ -163,6 +163,20 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
 
 `Bytecask` uses `std::atomic<std::shared_ptr<EngineState>>` for its published state. The `write_mu_` mutex serialises writers; `state_.load()` is the readers' only access point.
 
+Every replacement publish goes through one checked `store_state(old_state,
+new_state)` path. Writers move their reference to the outgoing generation into
+this function after constructing the replacement, so the publication path can
+verify monotonic state invariants before making the new generation visible.
+The low-level atomic store is private to that path (and initial construction);
+error transitions therefore receive the same invariant checks as normal
+commits. Deferred reclamation is specified separately in
+[`defered_state_reclaim.md`](./defered_state_reclaim.md) and will replace that
+final release only after its benchmark and sanitizer gates pass. The
+implementation now hands sole-owned superseded generations to a bounded,
+per-DB `StateReclaimer`; a full queue falls back to inline destruction. Read
+cache refreshes use the same handoff, while snapshots retain their existing
+ownership semantics.
+
 ##### Shared state layout
 
 ```

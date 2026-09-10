@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -19,6 +20,18 @@
 import bytecask.concurrency;
 
 using namespace std::chrono_literals;
+
+namespace {
+
+struct ReclaimProbe {
+  explicit ReclaimProbe(std::atomic<int> &destroyed)
+      : destroyed_{destroyed} {}
+  ~ReclaimProbe() { ++destroyed_; }
+
+  std::atomic<int> &destroyed_;
+};
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // BackgroundWorker
@@ -83,6 +96,17 @@ TEST_CASE("BackgroundWorker can dispatch after drain", "[concurrency]") {
   w.dispatch([&] { ++count; });
   w.drain();
   CHECK(count.load() == 2);
+}
+
+TEST_CASE("StateReclaimer destroys deferred states after drain", "[concurrency]") {
+  std::atomic<int> destroyed{0};
+  bytecask::StateReclaimer<ReclaimProbe> reclaimer;
+
+  CHECK(reclaimer.retire(
+      std::make_shared<const ReclaimProbe>(destroyed)));
+  CHECK(destroyed.load() == 0);
+  reclaimer.drain();
+  CHECK(destroyed.load() == 1);
 }
 
 // ---------------------------------------------------------------------------
