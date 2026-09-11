@@ -916,6 +916,79 @@ TEST_CASE("RadixTree wide fanout", "[radix_tree]") {
 }
 
 // ---------------------------------------------------------------------------
+// Node4 <-> Large tier boundary: exercise the exact 4/5-child promotion and
+// demotion transitions on both the persistent and transient paths. This is
+// a pure internal-representation change (Node4 vs the ChildStore-backed
+// Large tier) — correctness here means the tree's observable behavior
+// (get/contains/iteration order/size) is identical across the boundary.
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree Node4/Large boundary persistent", "[radix_tree]") {
+  auto t = Tree{};
+  // Single-byte transitions from a shared root: insert one at a time through
+  // the 4 -> 5 child promotion, checking every key remains reachable at each
+  // step (not just after the fact).
+  for (int i = 0; i < 8; ++i) {
+    std::string key(1, static_cast<char>('a' + i));
+    t = t.set(to_bytes(key), i);
+    CHECK(t.size() == static_cast<std::size_t>(i + 1));
+    for (int j = 0; j <= i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+
+  // Iteration order must stay sorted across the promotion.
+  std::vector<std::string> keys;
+  for (auto it = t.begin(); it != t.end(); ++it) {
+    auto [k, v] = *it;
+    keys.push_back(to_string(k));
+  }
+  CHECK(std::is_sorted(keys.begin(), keys.end()));
+  CHECK(keys.size() == 8U);
+
+  // Erase one at a time back down through the 5 -> 4 demotion to empty,
+  // checking survivors remain reachable at every step.
+  for (int i = 7; i >= 0; --i) {
+    std::string key(1, static_cast<char>('a' + i));
+    t = t.erase(to_bytes(key));
+    CHECK(t.size() == static_cast<std::size_t>(i));
+    CHECK_FALSE(t.contains(to_bytes(key)));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+  CHECK(t.empty());
+}
+
+TEST_CASE("RadixTree Node4/Large boundary transient", "[radix_tree]") {
+  auto tr = Tree{}.transient();
+  for (int i = 0; i < 8; ++i) {
+    std::string key(1, static_cast<char>('a' + i));
+    tr.set(to_bytes(key), i);
+    for (int j = 0; j <= i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(tr.contains(to_bytes(k)));
+      CHECK(*tr.get(to_bytes(k)) == j);
+    }
+  }
+  for (int i = 7; i >= 0; --i) {
+    std::string key(1, static_cast<char>('a' + i));
+    CHECK(tr.erase(to_bytes(key)));
+    CHECK_FALSE(tr.contains(to_bytes(key)));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(tr.contains(to_bytes(k)));
+      CHECK(*tr.get(to_bytes(k)) == j);
+    }
+  }
+  auto t = std::move(tr).persistent();
+  CHECK(t.empty());
+}
+
+// ---------------------------------------------------------------------------
 // Transient: overwrite existing key (no size change, in-place mutation)
 // ---------------------------------------------------------------------------
 TEST_CASE("RadixTree transient overwrite", "[radix_tree]") {
