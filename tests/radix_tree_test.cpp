@@ -922,7 +922,7 @@ TEST_CASE("RadixTree wide fanout", "[radix_tree]") {
 // Large tier) — correctness here means the tree's observable behavior
 // (get/contains/iteration order/size) is identical across the boundary.
 // ---------------------------------------------------------------------------
-TEST_CASE("RadixTree Node4/Large boundary persistent", "[radix_tree]") {
+TEST_CASE("RadixTree Node4/Node16 boundary persistent", "[radix_tree]") {
   auto t = Tree{};
   // Single-byte transitions from a shared root: insert one at a time through
   // the 4 -> 5 child promotion, checking every key remains reachable at each
@@ -963,7 +963,7 @@ TEST_CASE("RadixTree Node4/Large boundary persistent", "[radix_tree]") {
   CHECK(t.empty());
 }
 
-TEST_CASE("RadixTree Node4/Large boundary transient", "[radix_tree]") {
+TEST_CASE("RadixTree Node4/Node16 boundary transient", "[radix_tree]") {
   auto tr = Tree{}.transient();
   for (int i = 0; i < 8; ++i) {
     std::string key(1, static_cast<char>('a' + i));
@@ -998,7 +998,7 @@ TEST_CASE("RadixTree Node4/Large boundary transient", "[radix_tree]") {
 // specifically, and for Node4 -> Node16 (as opposed to Node4 -> Large
 // directly, which is what happened before Node16 existed).
 // ---------------------------------------------------------------------------
-TEST_CASE("RadixTree Node16/Large boundary persistent", "[radix_tree]") {
+TEST_CASE("RadixTree Node16/Node48 boundary persistent", "[radix_tree]") {
   auto t = Tree{};
   for (int i = 0; i < 20; ++i) {
     std::string key(1, static_cast<char>('a' + i));
@@ -1033,7 +1033,7 @@ TEST_CASE("RadixTree Node16/Large boundary persistent", "[radix_tree]") {
   CHECK(t.empty());
 }
 
-TEST_CASE("RadixTree Node16/Large boundary transient", "[radix_tree]") {
+TEST_CASE("RadixTree Node16/Node48 boundary transient", "[radix_tree]") {
   auto tr = Tree{}.transient();
   for (int i = 0; i < 20; ++i) {
     std::string key(1, static_cast<char>('a' + i));
@@ -1058,7 +1058,7 @@ TEST_CASE("RadixTree Node16/Large boundary transient", "[radix_tree]") {
   CHECK(t.empty());
 }
 
-TEST_CASE("RadixTree Node48/Large boundary persistent", "[radix_tree]") {
+TEST_CASE("RadixTree Node48/Node256 boundary persistent", "[radix_tree]") {
   auto t = Tree{};
   constexpr int kKeys = 55; // crosses 4/5, 16/17, and 48/49 boundaries
   for (int i = 0; i < kKeys; ++i) {
@@ -1094,7 +1094,7 @@ TEST_CASE("RadixTree Node48/Large boundary persistent", "[radix_tree]") {
   CHECK(t.empty());
 }
 
-TEST_CASE("RadixTree Node48/Large boundary transient", "[radix_tree]") {
+TEST_CASE("RadixTree Node48/Node256 boundary transient", "[radix_tree]") {
   auto tr = Tree{}.transient();
   constexpr int kKeys = 55;
   for (int i = 0; i < kKeys; ++i) {
@@ -1149,6 +1149,117 @@ TEST_CASE("RadixTree Node48 demotion hysteresis persistent", "[radix_tree]") {
 
   // Cross the actual demotion threshold and continue to empty.
   for (int i = 12; i >= 0; --i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.erase(to_bytes(key));
+    CHECK(t.size() == static_cast<std::size_t>(i));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>(j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+  CHECK(t.empty());
+}
+
+TEST_CASE("RadixTree Node256 boundary persistent", "[radix_tree]") {
+  auto t = Tree{};
+  constexpr int kKeys = 256; // every possible single-byte key — crosses
+                             // 4/5, 16/17, 48/49, and the 256-slot ceiling
+  for (int i = 0; i < kKeys; ++i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.set(to_bytes(key), i);
+    CHECK(t.size() == static_cast<std::size_t>(i + 1));
+    // Sparse verification (every key at small i, every 7th beyond) — a
+    // full O(n) re-verification per insert would make this O(n^2) at
+    // n=256, unlike the 55-key Node48 test.
+    if (i < 20 || i % 7 == 0) {
+      for (int j = 0; j <= i; ++j) {
+        std::string k(1, static_cast<char>(j));
+        REQUIRE(t.contains(to_bytes(k)));
+        CHECK(*t.get(to_bytes(k)) == j);
+      }
+    }
+  }
+  for (int j = 0; j < kKeys; ++j) {
+    std::string k(1, static_cast<char>(j));
+    REQUIRE(t.contains(to_bytes(k)));
+    CHECK(*t.get(to_bytes(k)) == j);
+  }
+
+  std::vector<std::string> keys;
+  for (auto it = t.begin(); it != t.end(); ++it) {
+    auto [k, v] = *it;
+    keys.push_back(to_string(k));
+  }
+  CHECK(std::is_sorted(keys.begin(), keys.end()));
+  CHECK(keys.size() == static_cast<std::size_t>(kKeys));
+
+  for (int i = kKeys - 1; i >= 0; --i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.erase(to_bytes(key));
+    CHECK(t.size() == static_cast<std::size_t>(i));
+    CHECK_FALSE(t.contains(to_bytes(key)));
+    if (i < 20 || i % 7 == 0) {
+      for (int j = 0; j < i; ++j) {
+        std::string k(1, static_cast<char>(j));
+        REQUIRE(t.contains(to_bytes(k)));
+        CHECK(*t.get(to_bytes(k)) == j);
+      }
+    }
+  }
+  CHECK(t.empty());
+}
+
+TEST_CASE("RadixTree Node256 boundary transient", "[radix_tree]") {
+  auto tr = Tree{}.transient();
+  constexpr int kKeys = 256;
+  for (int i = 0; i < kKeys; ++i) {
+    std::string key(1, static_cast<char>(i));
+    tr.set(to_bytes(key), i);
+  }
+  for (int j = 0; j < kKeys; ++j) {
+    std::string k(1, static_cast<char>(j));
+    REQUIRE(tr.contains(to_bytes(k)));
+    CHECK(*tr.get(to_bytes(k)) == j);
+  }
+  for (int i = kKeys - 1; i >= 0; --i) {
+    std::string key(1, static_cast<char>(i));
+    CHECK(tr.erase(to_bytes(key)));
+    CHECK_FALSE(tr.contains(to_bytes(key)));
+  }
+  auto t = std::move(tr).persistent();
+  CHECK(t.empty());
+}
+
+// Exercises the Node256 -> Node48 demotion hysteresis: promote to Node256
+// (49 children), then remove down into the Node48-capacity range (48..37)
+// without dropping to kShrinkThreshold (36), verifying the node stays
+// functionally correct as an under-populated Node256 the whole time, then
+// finish removing through the actual demotion.
+TEST_CASE("RadixTree Node256 demotion hysteresis persistent", "[radix_tree]") {
+  auto t = Tree{};
+  constexpr int kKeys = 52; // a few past the 49-child Node256 promotion point
+  for (int i = 0; i < kKeys; ++i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.set(to_bytes(key), i);
+  }
+  CHECK(t.size() == static_cast<std::size_t>(kKeys));
+
+  // Remove down to 37 children — above kShrinkThreshold (36), so the node
+  // should remain a (now under-populated) Node256, not demote yet.
+  for (int i = kKeys - 1; i >= 37; --i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.erase(to_bytes(key));
+  }
+  CHECK(t.size() == 37U);
+  for (int j = 0; j < 37; ++j) {
+    std::string k(1, static_cast<char>(j));
+    REQUIRE(t.contains(to_bytes(k)));
+    CHECK(*t.get(to_bytes(k)) == j);
+  }
+
+  // Cross the actual demotion threshold and continue to empty.
+  for (int i = 36; i >= 0; --i) {
     std::string key(1, static_cast<char>(i));
     t = t.erase(to_bytes(key));
     CHECK(t.size() == static_cast<std::size_t>(i));
