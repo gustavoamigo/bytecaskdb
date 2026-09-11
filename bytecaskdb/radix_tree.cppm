@@ -190,7 +190,7 @@ inline std::atomic<std::uint64_t> next_edit_tag{1};
 // Node<V> — base type for all radix tree nodes (leaf and internal).
 //
 // packed_tag_ bit layout:
-//   [31: has_value] [30-29: node_type] [28:0: edit_tag]
+//   [31: has_value] [30-28: node_type] [27:0: edit_tag]
 //
 // Internal nodes are tiered by fanout to avoid dynamic-vector allocation
 // overhead at the low fanout where most internal nodes actually live
@@ -200,17 +200,25 @@ inline std::atomic<std::uint64_t> next_edit_tag{1};
 //     allocation, no separate heap-allocated child store.
 //   - Node16: up to 16 children, same shape as Node4 (sorted inline array,
 //     linear scan) but a bigger inline array — still a single allocation.
+//   - Node48: up to 48 children. Same sorted inline array as Node4/Node16
+//     (so child_at(i) stays O(1), not a rescan), plus a 256-byte
+//     byte->slot index (`child_index_`) that makes find_child(b) O(1)
+//     instead of an O(n) scan — the point where a direct lookup starts to
+//     matter more than the array's fixed cost. Still a single allocation.
 //   - InternalNode (the "Large" tier): unbounded fanout via a heap-allocated
 //     ChildStore (struct-of-arrays of sorted transition bytes + children).
-//     Used once fanout exceeds Node16's capacity.
+//     Used once fanout exceeds Node48's capacity.
 //
-// A Node4 promotes to Node16 on its 5th child; a Node16 promotes to Large
-// on its 17th. A Large node demotes to Node16 when its count drops to <=
-// 16; a Node16 demotes to Node4 at <= 4 (see Node::insert_child /
-// Node::remove_child). 94% of nodes overall are leaves, which carry no
-// children field at all — sizeof(Node) = 40 bytes (glibc usable=40) for
-// KeyDirEntry, instead of 48 bytes (glibc usable=56) if every node paid for
-// a children field it never used.
+// A Node4 promotes to Node16 on its 5th child; Node16 promotes to Node48 on
+// its 17th; Node48 promotes to Large on its 49th. Demotion uses proportional
+// hysteresis on the Node48/Node16 boundary (matching DuckDB's ART: demote to
+// Node16 once Node48's count drops to <= 12, i.e. 75% of Node16's capacity,
+// not <= 16) to avoid promote/demote thrashing right at the 16/17 boundary;
+// Large demotes to Node48 at <= 48 and Node16 demotes to Node4 at <= 4 (see
+// Node::insert_child / Node::remove_child). 94% of nodes overall are
+// leaves, which carry no children field at all — sizeof(Node) = 40 bytes
+// (glibc usable=40) for KeyDirEntry, instead of 48 bytes (glibc usable=56)
+// if every node paid for a children field it never used.
 //
 // Safety: children storage does not exist on Node — accessing a derived
 // tier's fields through a Node* is a compile error. Child accessor methods
@@ -220,17 +228,24 @@ inline std::atomic<std::uint64_t> next_edit_tag{1};
 template <typename V> struct InternalNode; // forward declaration (Large tier)
 template <typename V> struct Node4;        // forward declaration (4-slot tier)
 template <typename V> struct Node16;       // forward declaration (16-slot tier)
+template <typename V> struct Node48;       // forward declaration (48-slot tier)
 
 template <typename V> struct Node {
   mutable std::atomic<std::uint32_t> refcount_{1};
 
-  enum class NodeType : std::uint32_t { Leaf = 0, Node4 = 1, Large = 2, Node16 = 3 };
+  enum class NodeType : std::uint32_t {
+    Leaf = 0,
+    Node4 = 1,
+    Large = 2,
+    Node16 = 3,
+    Node48 = 4,
+  };
 
   static constexpr std::uint32_t kHasValueBit = 0x8000'0000u;
-  static constexpr std::uint32_t kNodeTypeShift = 29u;
-  static constexpr std::uint32_t kNodeTypeMask = 0x6000'0000u;
+  static constexpr std::uint32_t kNodeTypeShift = 28u;
+  static constexpr std::uint32_t kNodeTypeMask = 0x7000'0000u;
   static constexpr std::uint32_t kFlagBits = kHasValueBit | kNodeTypeMask;
-  static constexpr std::uint32_t kTagMask = 0x1FFF'FFFFu;
+  static constexpr std::uint32_t kTagMask = 0x0FFF'FFFFu;
 
   std::uint32_t packed_tag_{0};
   V value_{};
@@ -274,7 +289,16 @@ template <typename V> struct Node {
     while (cur->refcount_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       auto* mut = const_cast<Node*>(cur);
 
-      std::array<Node*, 16> inline_kids{};
+      // Deliberately not value-initialized: every element ever read (indices
+      // [0, inline_count)) is always written first by the switch below, and
+      // nothing reads past inline_count. Zero-initializing the full array
+      // here would cost real time on every single node release (this loop
+      // runs once per node in the tree) for no observed benefit — this is
+      // exactly the class of latent, capacity-proportional-not-work-
+      // proportional cost that caused Node48 (and likely the stashed
+      // Node256 attempt) to regress RadixTree/MergeOverlapping /
+      // RadixTree/Iterate until found and removed.
+      std::array<Node*, 48> inline_kids;
       std::size_t inline_count = 0;
       std::unique_ptr<ChildStore> large_kids;
 
@@ -296,6 +320,14 @@ template <typename V> struct Node {
         for (std::size_t i = 0; i < inline_count; ++i)
           inline_kids[i] = n16->children_[i].detach();
         delete n16;
+        break;
+      }
+      case NodeType::Node48: {
+        auto* n48 = static_cast<Node48<V>*>(mut);
+        inline_count = n48->count_;
+        for (std::size_t i = 0; i < inline_count; ++i)
+          inline_kids[i] = n48->children_[i].detach();
+        delete n48;
         break;
       }
       case NodeType::Large: {
@@ -373,6 +405,16 @@ template <typename V> struct Node {
       return nullptr;
     return static_cast<const Node16<V> *>(this);
   }
+  [[nodiscard]] auto as_node48() noexcept -> Node48<V> * {
+    if (node_type() != NodeType::Node48)
+      return nullptr;
+    return static_cast<Node48<V> *>(this);
+  }
+  [[nodiscard]] auto as_node48() const noexcept -> const Node48<V> * {
+    if (node_type() != NodeType::Node48)
+      return nullptr;
+    return static_cast<const Node48<V> *>(this);
+  }
   [[nodiscard]] auto internal_node() noexcept -> InternalNode<V> * {
     if (node_type() != NodeType::Large)
       return nullptr;
@@ -404,6 +446,8 @@ template <typename V> struct Node {
       return n4->count_;
     if (auto *n16 = as_node16())
       return n16->count_;
+    if (auto *n48 = as_node48())
+      return n48->count_;
     auto *kids = child_store_or_null();
     return kids ? kids->size() : 0;
   }
@@ -412,6 +456,8 @@ template <typename V> struct Node {
       return n4->count_ != 0;
     if (auto *n16 = as_node16())
       return n16->count_ != 0;
+    if (auto *n48 = as_node48())
+      return n48->count_ != 0;
     auto *kids = child_store_or_null();
     return kids && !kids->empty();
   }
@@ -423,6 +469,10 @@ template <typename V> struct Node {
     if (auto *n16 = as_node16()) {
       assert(i < n16->count_);
       return {n16->keys_[i], n16->children_[i]};
+    }
+    if (auto *n48 = as_node48()) {
+      assert(i < n48->count_);
+      return {n48->keys_[i], n48->children_[i]};
     }
     auto *kids = child_store_or_null();
     assert(kids != nullptr);
@@ -437,6 +487,10 @@ template <typename V> struct Node {
     if (auto *n16 = as_node16()) {
       assert(i < n16->count_);
       return {n16->keys_[i], n16->children_[i]};
+    }
+    if (auto *n48 = as_node48()) {
+      assert(i < n48->count_);
+      return {n48->keys_[i], n48->children_[i]};
     }
     auto *kids = child_store_or_null();
     assert(kids != nullptr);
@@ -457,6 +511,12 @@ template <typename V> struct Node {
         if (n16->keys_[i] == b)
           return ConstChildRef{n16->keys_[i], n16->children_[i]};
       return std::nullopt;
+    }
+    if (auto *n48 = as_node48()) {
+      auto pos = n48->child_index_[std::to_integer<std::uint8_t>(b)];
+      if (pos == Node48<V>::kEmptyMarker)
+        return std::nullopt;
+      return ConstChildRef{n48->keys_[pos], n48->children_[pos]};
     }
     auto *kids = child_store_or_null();
     if (!kids)
@@ -480,6 +540,12 @@ template <typename V> struct Node {
         if (n16->keys_[i] == b)
           return ChildRef{n16->keys_[i], n16->children_[i]};
       return std::nullopt;
+    }
+    if (auto *n48 = as_node48()) {
+      auto pos = n48->child_index_[std::to_integer<std::uint8_t>(b)];
+      if (pos == Node48<V>::kEmptyMarker)
+        return std::nullopt;
+      return ChildRef{n48->keys_[pos], n48->children_[pos]};
     }
     auto *kids = child_store_or_null();
     if (!kids)
@@ -513,9 +579,20 @@ template <typename V> struct Node {
     n->prefix = src.prefix;
     return n;
   }
+  // Allocates an (empty) Node48 node carrying src's value/prefix (tag-free —
+  // see make_node4_like). Shared by insert_child's Node16 -> Node48
+  // promotion and remove_child's Large -> Node48 demotion. child_index_ is
+  // default-constructed to all-kEmptyMarker by Node48's constructor.
+  [[nodiscard]] static auto make_node48_like(const Node &src) -> Node48<V> * {
+    auto *n = new Node48<V>();
+    n->packed_tag_ |= src.packed_tag_ & kHasValueBit;
+    n->value_ = src.value_;
+    n->prefix = src.prefix;
+    return n;
+  }
   // Allocates an (empty) Large node carrying src's value/prefix (tag-free —
   // see make_node4_like). Shared by clone()'s Large-tier branch and by
-  // insert_child's Node16 -> Large promotion.
+  // insert_child's Node48 -> Large promotion.
   [[nodiscard]] static auto make_large_like(const Node &src)
       -> InternalNode<V> * {
     auto *n = new InternalNode<V>();
@@ -527,9 +604,10 @@ template <typename V> struct Node {
 
   // Insert a child under transition byte b. Handles every promotion: a Leaf
   // promotes to Node4 for its first child; a Node4 at capacity promotes to
-  // Node16 on its 5th; a Node16 at capacity promotes to the Large tier on
-  // its 17th. Takes ownership of `node` and returns the resulting node,
-  // which may be a different underlying allocation.
+  // Node16 on its 5th; a Node16 at capacity promotes to Node48 on its
+  // 17th; a Node48 at capacity promotes to the Large tier on its 49th.
+  // Takes ownership of `node` and returns the resulting node, which may be
+  // a different underlying allocation.
   [[nodiscard]] static auto insert_child(IntrusivePtr<Node> node,
                                          std::byte b,
                                          IntrusivePtr<Node> child)
@@ -580,16 +658,51 @@ template <typename V> struct Node {
         ++n16->count_;
         return node;
       }
-      // Node16 at capacity — promote to the Large (ChildStore-backed)
+      // Node16 at capacity — promote to Node48. Preserve edit_tag (see the
+      // Node4 -> Node16 branch above). child_index_ starts all-empty (set
+      // by Node48's constructor) and is filled in below alongside keys_.
+      auto *n48 = make_node48_like(*node);
+      n48->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n48->count_ = n16->count_;
+      for (std::size_t i = 0; i < n16->count_; ++i) {
+        n48->keys_[i] = n16->keys_[i];
+        n48->children_[i] = std::move(n16->children_[i]);
+        n48->child_index_[std::to_integer<std::uint8_t>(n16->keys_[i])] =
+            static_cast<std::uint8_t>(i);
+      }
+      return insert_child(IntrusivePtr<Node>::adopt(n48), b, std::move(child));
+    }
+
+    if (auto *n48 = node->as_node48()) {
+      if (n48->count_ < Node48<V>::kCapacity) {
+        std::size_t pos = 0;
+        while (pos < n48->count_ && n48->keys_[pos] < b)
+          ++pos;
+        assert((pos == n48->count_ || n48->keys_[pos] != b) &&
+               "duplicate transition byte");
+        for (std::size_t i = n48->count_; i > pos; --i) {
+          n48->keys_[i] = n48->keys_[i - 1];
+          n48->children_[i] = std::move(n48->children_[i - 1]);
+          n48->child_index_[std::to_integer<std::uint8_t>(n48->keys_[i])] =
+              static_cast<std::uint8_t>(i);
+        }
+        n48->keys_[pos] = b;
+        n48->children_[pos] = std::move(child);
+        n48->child_index_[std::to_integer<std::uint8_t>(b)] =
+            static_cast<std::uint8_t>(pos);
+        ++n48->count_;
+        return node;
+      }
+      // Node48 at capacity — promote to the Large (ChildStore-backed)
       // tier. Preserve edit_tag (see the Node4 -> Node16 branch above).
       auto *large = make_large_like(*node);
       large->packed_tag_ |= node->packed_tag_ & kTagMask;
       large->children_ = std::make_unique<ChildStore>();
-      large->children_->transition_bytes.reserve(Node16<V>::kCapacity + 1);
-      large->children_->ptrs.reserve(Node16<V>::kCapacity + 1);
-      for (std::size_t i = 0; i < n16->count_; ++i) {
-        large->children_->transition_bytes.push_back(n16->keys_[i]);
-        large->children_->ptrs.push_back(std::move(n16->children_[i]));
+      large->children_->transition_bytes.reserve(Node48<V>::kCapacity + 1);
+      large->children_->ptrs.reserve(Node48<V>::kCapacity + 1);
+      for (std::size_t i = 0; i < n48->count_; ++i) {
+        large->children_->transition_bytes.push_back(n48->keys_[i]);
+        large->children_->ptrs.push_back(std::move(n48->children_[i]));
       }
       return insert_child(IntrusivePtr<Node>::adopt(large), b,
                           std::move(child));
@@ -625,10 +738,12 @@ template <typename V> struct Node {
   }
 
   // Remove the child under transition byte b. If this is the Large tier and
-  // removing drops its count to <= Node16<V>::kCapacity, demotes to Node16;
-  // if this is Node16 and its count drops to <= Node4<V>::kCapacity,
-  // demotes to Node4. Takes ownership of `node` and returns the resulting
-  // node.
+  // removing drops its count to <= Node48<V>::kCapacity, demotes to Node48;
+  // if this is Node48 and its count drops to <= Node48<V>::kShrinkThreshold
+  // (75% of Node16's capacity, matching DuckDB's ART — hysteresis to avoid
+  // thrashing right at the 16/17 promotion boundary), demotes to Node16; if
+  // this is Node16 and its count drops to <= Node4<V>::kCapacity, demotes
+  // to Node4. Takes ownership of `node` and returns the resulting node.
   [[nodiscard]] static auto remove_child(IntrusivePtr<Node> node,
                                          std::byte b) -> IntrusivePtr<Node> {
     if (auto *n4 = node->as_node4()) {
@@ -673,6 +788,34 @@ template <typename V> struct Node {
       return IntrusivePtr<Node>::adopt(n4);
     }
 
+    if (auto *n48 = node->as_node48()) {
+      auto pos = n48->child_index_[std::to_integer<std::uint8_t>(b)];
+      if (pos != Node48<V>::kEmptyMarker) {
+        for (std::size_t j = pos; j + 1 < n48->count_; ++j) {
+          n48->keys_[j] = n48->keys_[j + 1];
+          n48->children_[j] = std::move(n48->children_[j + 1]);
+          n48->child_index_[std::to_integer<std::uint8_t>(n48->keys_[j])] =
+              static_cast<std::uint8_t>(j);
+        }
+        --n48->count_;
+        n48->children_[n48->count_] = IntrusivePtr<Node>{};
+        n48->child_index_[std::to_integer<std::uint8_t>(b)] =
+            Node48<V>::kEmptyMarker;
+      }
+      if (n48->count_ > Node48<V>::kShrinkThreshold)
+        return node;
+      // Demote back to Node16 — see the comment above remove_child for the
+      // hysteresis rationale.
+      auto *n16 = make_node16_like(*node);
+      n16->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n16->count_ = static_cast<std::uint8_t>(n48->count_);
+      for (std::size_t i = 0; i < n48->count_; ++i) {
+        n16->keys_[i] = n48->keys_[i];
+        n16->children_[i] = std::move(n48->children_[i]);
+      }
+      return IntrusivePtr<Node>::adopt(n16);
+    }
+
     auto *internal = node->internal_node();
     if (!internal || !internal->children_)
       return node;
@@ -687,20 +830,22 @@ template <typename V> struct Node {
         break;
       }
     }
-    if (kids.size() > Node16<V>::kCapacity)
+    if (kids.size() > Node48<V>::kCapacity)
       return node;
 
-    // Demote back to Node16 — the Large tier's per-slot cost only pays off
+    // Demote back to Node48 — the Large tier's per-slot cost only pays off
     // above this fanout. Preserve edit_tag (see insert_child's Node4 ->
     // Node16 branch for why).
-    auto *n16 = make_node16_like(*node);
-    n16->packed_tag_ |= node->packed_tag_ & kTagMask;
-    n16->count_ = static_cast<std::uint8_t>(kids.size());
+    auto *n48 = make_node48_like(*node);
+    n48->packed_tag_ |= node->packed_tag_ & kTagMask;
+    n48->count_ = static_cast<std::uint8_t>(kids.size());
     for (std::size_t i = 0; i < kids.size(); ++i) {
-      n16->keys_[i] = kids.transition_bytes[i];
-      n16->children_[i] = std::move(kids.ptrs[i]);
+      n48->keys_[i] = kids.transition_bytes[i];
+      n48->children_[i] = std::move(kids.ptrs[i]);
+      n48->child_index_[std::to_integer<std::uint8_t>(kids.transition_bytes[i])] =
+          static_cast<std::uint8_t>(i);
     }
-    return IntrusivePtr<Node>::adopt(n16);
+    return IntrusivePtr<Node>::adopt(n48);
   }
 
   // Deep clone of this node (not recursive — children are shared).
@@ -723,6 +868,17 @@ template <typename V> struct Node {
       n->count_ = self->count_;
       n->keys_ = self->keys_;
       n->children_ = self->children_; // IntrusivePtr copies -> addref each
+      return IntrusivePtr<Node>::adopt(n);
+    }
+    if (auto *self = as_node48()) {
+      auto *n = new Node48<V>();
+      n->packed_tag_ |= packed_tag_ & kHasValueBit;
+      n->value_ = value_;
+      n->prefix = prefix;
+      n->count_ = self->count_;
+      n->keys_ = self->keys_;
+      n->children_ = self->children_; // IntrusivePtr copies -> addref each
+      n->child_index_ = self->child_index_;
       return IntrusivePtr<Node>::adopt(n);
     }
     if (auto *self = internal_node()) {
@@ -790,8 +946,36 @@ template <typename V> struct Node16 : Node<V> {
 };
 
 // ---------------------------------------------------------------------------
+// Node48<V> — fixed 48-slot internal node. Keeps the same sorted inline
+// array as Node4/Node16 (keys_/children_) so child_at(i) stays an O(1)
+// ordinal lookup — no rescan — plus a 256-byte child_index_ that maps a
+// transition byte directly to its slot, making find_child(b) O(1) instead
+// of Node16's O(count) linear scan. kEmptyMarker (== kCapacity, an
+// otherwise-unused slot value) marks a byte with no child, mirroring
+// DuckDB's ART Node48::EMPTY_MARKER. Promotes to InternalNode (the Large
+// tier) on its 49th child; demotes back to Node16 when its count drops to
+// <= kShrinkThreshold (see Node::insert_child / Node::remove_child).
+// ---------------------------------------------------------------------------
+template <typename V> struct Node48 : Node<V> {
+  static constexpr std::uint8_t kCapacity = 48;
+  static constexpr std::uint8_t kEmptyMarker = kCapacity;
+  // 75% of Node16::kCapacity — DuckDB's proportional hysteresis, avoids
+  // promote/demote thrashing right at the 16/17 boundary.
+  static constexpr std::uint8_t kShrinkThreshold = 12;
+
+  Node48() {
+    Node<V>::set_node_type(Node<V>::NodeType::Node48);
+    child_index_.fill(kEmptyMarker);
+  }
+  std::uint8_t count_{0};
+  std::array<std::uint8_t, 256> child_index_{};
+  std::array<std::byte, kCapacity> keys_{};
+  std::array<IntrusivePtr<Node<V>>, kCapacity> children_{};
+};
+
+// ---------------------------------------------------------------------------
 // InternalNode<V> — extends Node with unbounded children storage (the
-// "Large" tier — used once a node's fanout exceeds Node16's capacity).
+// "Large" tier — used once a node's fanout exceeds Node48's capacity).
 // sizeof(InternalNode<KeyDirEntry>) == 48, glibc usable=56.
 // ---------------------------------------------------------------------------
 template <typename V> struct InternalNode : Node<V> {
@@ -805,6 +989,9 @@ static_assert(sizeof(Node<std::uint64_t>) == 24);
 static_assert(sizeof(Node4<std::uint64_t>) == 64);
 // Node16<uint64_t>: 24 + 1(count) + 16(keys) + 7(pad) + 128(16 children) = 176.
 static_assert(sizeof(Node16<std::uint64_t>) == 176);
+// Node48<uint64_t>: 24 + 1(count) + 256(child_index) + 48(keys) + 7(pad) +
+// 384(48 children) = 720.
+static_assert(sizeof(Node48<std::uint64_t>) == 720);
 // InternalNode<uint64_t>: 24+8 = 32.
 static_assert(sizeof(InternalNode<std::uint64_t>) == 32);
 
@@ -812,7 +999,8 @@ static_assert(sizeof(InternalNode<std::uint64_t>) == 32);
 // make_leaf: allocates Node (24B for uint64_t value), no children.
 // make_internal: allocates a fresh Node4 (the entry tier for any node that
 // will receive children — routing/split nodes) — promotes to Node16, then
-// the Large tier, automatically via Node::insert_child as fanout grows.
+// Node48, then the Large tier, automatically via Node::insert_child as
+// fanout grows.
 template <typename V>
 auto make_leaf() -> IntrusivePtr<Node<V>> {
   return IntrusivePtr<Node<V>>::adopt(new Node<V>());

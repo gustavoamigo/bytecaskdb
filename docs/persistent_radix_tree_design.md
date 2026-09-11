@@ -532,14 +532,28 @@ Internal nodes needing more than 4 children heap-allocate a `ChildStore` (struct
 | `children_` | `array<IntrusivePtr<Node>, 16>` | 128 |
 | **Node16 struct total** | | **~184–192 bytes, one allocation** |
 
+**`Node48<V>` (17–48 children, added in the Node48 tiering — see §7.9):**
+
+| Field | Type | Bytes |
+|---|---|---|
+| (inherits `Node<V>`) | | 40 |
+| `count_` | `uint8_t` | 1 |
+| `child_index_` | `array<uint8_t, 256>` (byte → slot, `find_child` in O(1)) | 256 |
+| `keys_` | `array<byte, 48>` | 48 |
+| `children_` | `array<IntrusivePtr<Node>, 48>` (7 B pad before this) | 384 |
+| **Node48 struct total** | | **~720–736 bytes, one allocation** |
+
+`Node48` keeps the same sorted `keys_`/`children_` array as `Node4`/`Node16` (so `child_at(i)` stays an O(1) ordinal lookup, not a rescan of `child_index_`) and adds `child_index_` purely to make `find_child(b)` O(1) instead of a linear scan — costing 48 more bytes than a `child_index_`-only design (e.g. DuckDB's, ~672 B) but avoiding the O(n) rescan class of bug described in §7.8. See §7.9 for why this tier's fixed cost measured flat rather than negative on every shape tested.
+
 | Node type | Fraction | Struct + children | Allocations | Total |
 |---|---|---|---|---|
 | Leaf (0 children) | ~94% | 40 B | 1 | **40 B** |
 | Internal, ≤4 children | most of the remaining ~6% | Node4, ~72–80 B | 1 | **~72–80 B** |
 | Internal, 5–16 children | a slice of ~6% | Node16, ~184–192 B | 1 | **~184–192 B** |
-| Internal, >16 children | the smallest slice of ~6% | 48 B struct + ChildStore | 3+ | 48 B + ~48 B header + N×9 B |
+| Internal, 17–48 children | a smaller slice of ~6% | Node48, ~720–736 B | 1 | **~720–736 B** |
+| Internal, >48 children | the smallest slice of ~6% | 48 B struct + ChildStore | 3+ | 48 B + ~48 B header + N×9 B |
 
-The old single "internal node" row (48 B struct + heap `ChildStore`, ~114 B weighted average at 2 children) no longer applies uniformly — see §7.7 for the measured effect of splitting it into the rows above.
+The old single "internal node" row (48 B struct + heap `ChildStore`, ~114 B weighted average at 2 children) no longer applies uniformly — see §7.7–§7.9 for the measured effect of splitting it into the rows above.
 
 ### 7.2. Node distribution
 
@@ -780,6 +794,87 @@ demotion threshold. `Node256` stays stashed and is not re-attempted until
 unstash) using the byte-cursor traversal pattern and the corrected 49–256
 range, and the `Iterate` regression gets another look with a narrower
 diff to bisect against.
+
+### 7.9. Node48 tiering, and finding the actual cause of the tiering regressions
+
+`Node48` fills the 17–48 range: `Node16` now promotes to it on its 17th
+child instead of straight to `InternalNode`/`ChildStore` ("Large"), and
+`Node48` promotes to Large on its 49th. Layout is the hybrid described in
+§7.1: the same sorted `keys_`/`children_` array as `Node4`/`Node16` (so
+`child_at(i)` stays O(1) — no rescan of a sparse structure, which is the
+class of bug §7.8 flagged as a likely contributor to the `Node256`
+regression), plus a 256-byte `child_index_` that maps a transition byte
+directly to its slot, making `find_child(b)` O(1) instead of `Node16`'s
+O(count) scan. Demotion back to `Node16` uses DuckDB's proportional
+hysteresis — `Node48::kShrinkThreshold = 12` (75% of `Node16`'s capacity)
+rather than a symmetric 16 — so a node fluctuating between roughly 13 and
+17 children doesn't thrash between tiers on every insert/remove; a
+dedicated test (`RadixTree Node48 demotion hysteresis persistent`) removes
+a `Node48` down to 13 children and confirms it stays a `Node48` (not yet
+demoted) before crossing the actual threshold at 12.
+
+**Memory: flat everywhere, not the win `Node4`/`Node16` were.** Measured
+at 100k keys with the same `alloc_tracker`-based method as §7.7/§7.8, on
+top of `Node4` + `Node16`:
+
+| Shape | Node4+Node16 | +Node48 | Change |
+|---|---:|---:|---:|
+| `uniform` (map_bench, official) | 47.20 | 47.20 | flat |
+| `prefixed` (map_bench, official) | 44.29 | 44.29 | flat |
+| `sha256_hex` | 568.60 | 568.60 | flat |
+| `uuidv4_binary` | 132.60 | 132.60 | flat |
+| `binary` | 62.96 | 62.96 | flat |
+| `zipfian` | 52.20 | 52.20 | flat |
+
+Never worse (satisfies the project's binding "memory cannot increase"
+constraint) but no shape showed a measurable improvement either, at 1k,
+10k, or 100k keys. `sha256_hex` is explained structurally: hex keys only
+have 16 possible byte values at any position, so no node in that tree can
+ever exceed `Node16`'s capacity — `Node48` is provably unreachable for
+that shape. For the full-byte-range shapes (`binary`, `uuidv4_binary`),
+root-adjacent nodes see wide enough fanout to jump straight past 48 into
+Large territory (100k random samples into 256 buckets fills nearly all of
+them), while nodes further down the tree mostly fall to single-digit or
+`Node16`-range fanout once the key space is partitioned — the 17–48 band
+this tier targets turned out to be numerically thin for every shape
+measured, not just the sequential ones. This is a legitimate outcome per
+the project's own gate criteria (§7.7's Phase 1): report it honestly
+rather than claim a win the data doesn't show.
+
+**A real timing regression was found — and, unlike `Node256`, root-caused
+and fixed.** The first `Node48` + `child_index_` implementation reproduced
+a smaller version of §7.8's mystery: `RadixTree/MergeOverlapping/100000`
+went from a stable ~5.30M ns baseline to a stable ~5.71–5.86M ns (+7–11%,
+confirmed reproducible across repeated back-to-back stash/pop runs to rule
+out the environmental drift noted in §7.8). The cause this time was found:
+`Node::release()`'s tail-release loop declares `std::array<Node*, N>
+inline_kids{}` — value-initialized — *inside* the per-node `while` loop,
+so every single node release (leaf or internal, whichever tier) pays to
+zero-initialize the full array, not just the `inline_count` slots it
+actually uses. Growing that array from 16 to 48 `Node*` slots (128 B →
+384 B) tripled that per-release cost on the hottest path in the entire
+tree — every node destruction, leaves included. Dropping the `{}`
+(nothing reads past `inline_count`, and every element up to it is always
+written first by the switch above) recovered `MergeOverlapping` to
+5.19–5.37M ns, matching the pre-`Node48` baseline. This almost certainly
+explains some or all of `Node256`'s much larger ~65–70% `Iterate`
+regression too — that attempt grew the same array from 4 to 256 slots (a
+64× jump vs. `Node48`'s 3×), and none of the four fix attempts recorded in
+§7.8 touched this code path. Revisiting the stashed `Node256` branch with
+this fix in hand is now the first thing to try, before any new approach.
+
+Full correctness suite green: 8,324,455 assertions / 1,452 test cases,
+including two new `Node48`/Large boundary tests (mirroring `Node4`'s and
+`Node16`'s, 55 keys to cross the 4/5, 16/17, and 48/49 boundaries in one
+pass) and the demotion-hysteresis test described above.
+
+**Outcome:** `Node48` is memory-neutral (never worse, per the project's
+hard constraint) but not a proven memory win on any shape tested — its
+value going forward is the O(1) `find_child` and, per the timing fix
+above, unblocking `Node256` from the same class of regression that
+stalled it. `Node256` is next: a fresh implementation using the
+byte-cursor traversal pattern from §7.8, the corrected 49–256 range now
+that `Node48` absorbs 17–48, and the `inline_kids` fix from day one.
 
 ---
 
