@@ -198,29 +198,33 @@ inline std::atomic<std::uint64_t> next_edit_tag{1};
 //
 //   - Node4: up to 4 children embedded inline in the node itself — a single
 //     allocation, no separate heap-allocated child store.
+//   - Node16: up to 16 children, same shape as Node4 (sorted inline array,
+//     linear scan) but a bigger inline array — still a single allocation.
 //   - InternalNode (the "Large" tier): unbounded fanout via a heap-allocated
 //     ChildStore (struct-of-arrays of sorted transition bytes + children).
-//     Used once fanout exceeds Node4's capacity.
+//     Used once fanout exceeds Node16's capacity.
 //
-// A Node4 promotes to Large on its 5th child; a Large node demotes back to
-// Node4 when its count drops to <= 4 (see Node::insert_child /
+// A Node4 promotes to Node16 on its 5th child; a Node16 promotes to Large
+// on its 17th. A Large node demotes to Node16 when its count drops to <=
+// 16; a Node16 demotes to Node4 at <= 4 (see Node::insert_child /
 // Node::remove_child). 94% of nodes overall are leaves, which carry no
 // children field at all — sizeof(Node) = 40 bytes (glibc usable=40) for
 // KeyDirEntry, instead of 48 bytes (glibc usable=56) if every node paid for
 // a children field it never used.
 //
-// Safety: children storage does not exist on Node — accessing Node4's or
-// InternalNode's fields through a Node* is a compile error. Child accessor
-// methods check node_type() before downcasting; an unexpected type returns
-// a safe default ("no children"), never memory corruption.
+// Safety: children storage does not exist on Node — accessing a derived
+// tier's fields through a Node* is a compile error. Child accessor methods
+// check node_type() before downcasting; an unexpected type returns a safe
+// default ("no children"), never memory corruption.
 // ---------------------------------------------------------------------------
 template <typename V> struct InternalNode; // forward declaration (Large tier)
 template <typename V> struct Node4;        // forward declaration (4-slot tier)
+template <typename V> struct Node16;       // forward declaration (16-slot tier)
 
 template <typename V> struct Node {
   mutable std::atomic<std::uint32_t> refcount_{1};
 
-  enum class NodeType : std::uint32_t { Leaf = 0, Node4 = 1, Large = 2 };
+  enum class NodeType : std::uint32_t { Leaf = 0, Node4 = 1, Large = 2, Node16 = 3 };
 
   static constexpr std::uint32_t kHasValueBit = 0x8000'0000u;
   static constexpr std::uint32_t kNodeTypeShift = 29u;
@@ -270,7 +274,7 @@ template <typename V> struct Node {
     while (cur->refcount_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       auto* mut = const_cast<Node*>(cur);
 
-      std::array<Node*, 4> inline_kids{};
+      std::array<Node*, 16> inline_kids{};
       std::size_t inline_count = 0;
       std::unique_ptr<ChildStore> large_kids;
 
@@ -284,6 +288,14 @@ template <typename V> struct Node {
         for (std::size_t i = 0; i < inline_count; ++i)
           inline_kids[i] = n4->children_[i].detach();
         delete n4;
+        break;
+      }
+      case NodeType::Node16: {
+        auto* n16 = static_cast<Node16<V>*>(mut);
+        inline_count = n16->count_;
+        for (std::size_t i = 0; i < inline_count; ++i)
+          inline_kids[i] = n16->children_[i].detach();
+        delete n16;
         break;
       }
       case NodeType::Large: {
@@ -351,6 +363,16 @@ template <typename V> struct Node {
       return nullptr;
     return static_cast<const Node4<V> *>(this);
   }
+  [[nodiscard]] auto as_node16() noexcept -> Node16<V> * {
+    if (node_type() != NodeType::Node16)
+      return nullptr;
+    return static_cast<Node16<V> *>(this);
+  }
+  [[nodiscard]] auto as_node16() const noexcept -> const Node16<V> * {
+    if (node_type() != NodeType::Node16)
+      return nullptr;
+    return static_cast<const Node16<V> *>(this);
+  }
   [[nodiscard]] auto internal_node() noexcept -> InternalNode<V> * {
     if (node_type() != NodeType::Large)
       return nullptr;
@@ -380,12 +402,16 @@ template <typename V> struct Node {
   [[nodiscard]] auto child_count() const noexcept -> std::size_t {
     if (auto *n4 = as_node4())
       return n4->count_;
+    if (auto *n16 = as_node16())
+      return n16->count_;
     auto *kids = child_store_or_null();
     return kids ? kids->size() : 0;
   }
   [[nodiscard]] auto has_children() const noexcept -> bool {
     if (auto *n4 = as_node4())
       return n4->count_ != 0;
+    if (auto *n16 = as_node16())
+      return n16->count_ != 0;
     auto *kids = child_store_or_null();
     return kids && !kids->empty();
   }
@@ -393,6 +419,10 @@ template <typename V> struct Node {
     if (auto *n4 = as_node4()) {
       assert(i < n4->count_);
       return {n4->keys_[i], n4->children_[i]};
+    }
+    if (auto *n16 = as_node16()) {
+      assert(i < n16->count_);
+      return {n16->keys_[i], n16->children_[i]};
     }
     auto *kids = child_store_or_null();
     assert(kids != nullptr);
@@ -403,6 +433,10 @@ template <typename V> struct Node {
     if (auto *n4 = as_node4()) {
       assert(i < n4->count_);
       return {n4->keys_[i], n4->children_[i]};
+    }
+    if (auto *n16 = as_node16()) {
+      assert(i < n16->count_);
+      return {n16->keys_[i], n16->children_[i]};
     }
     auto *kids = child_store_or_null();
     assert(kids != nullptr);
@@ -416,6 +450,12 @@ template <typename V> struct Node {
       for (std::size_t i = 0; i < n4->count_; ++i)
         if (n4->keys_[i] == b)
           return ConstChildRef{n4->keys_[i], n4->children_[i]};
+      return std::nullopt;
+    }
+    if (auto *n16 = as_node16()) {
+      for (std::size_t i = 0; i < n16->count_; ++i)
+        if (n16->keys_[i] == b)
+          return ConstChildRef{n16->keys_[i], n16->children_[i]};
       return std::nullopt;
     }
     auto *kids = child_store_or_null();
@@ -433,6 +473,12 @@ template <typename V> struct Node {
       for (std::size_t i = 0; i < n4->count_; ++i)
         if (n4->keys_[i] == b)
           return ChildRef{n4->keys_[i], n4->children_[i]};
+      return std::nullopt;
+    }
+    if (auto *n16 = as_node16()) {
+      for (std::size_t i = 0; i < n16->count_; ++i)
+        if (n16->keys_[i] == b)
+          return ChildRef{n16->keys_[i], n16->children_[i]};
       return std::nullopt;
     }
     auto *kids = child_store_or_null();
@@ -457,9 +503,19 @@ template <typename V> struct Node {
     n->prefix = src.prefix;
     return n;
   }
+  // Allocates an (empty) Node16 node carrying src's value/prefix (tag-free
+  // — see make_node4_like). Shared by insert_child's Node4 -> Node16
+  // promotion and remove_child's Large -> Node16 demotion.
+  [[nodiscard]] static auto make_node16_like(const Node &src) -> Node16<V> * {
+    auto *n = new Node16<V>();
+    n->packed_tag_ |= src.packed_tag_ & kHasValueBit;
+    n->value_ = src.value_;
+    n->prefix = src.prefix;
+    return n;
+  }
   // Allocates an (empty) Large node carrying src's value/prefix (tag-free —
   // see make_node4_like). Shared by clone()'s Large-tier branch and by
-  // insert_child's Node4 -> Large promotion.
+  // insert_child's Node16 -> Large promotion.
   [[nodiscard]] static auto make_large_like(const Node &src)
       -> InternalNode<V> * {
     auto *n = new InternalNode<V>();
@@ -471,8 +527,9 @@ template <typename V> struct Node {
 
   // Insert a child under transition byte b. Handles every promotion: a Leaf
   // promotes to Node4 for its first child; a Node4 at capacity promotes to
-  // the Large tier on its 5th. Takes ownership of `node` and returns the
-  // resulting node, which may be a different underlying allocation.
+  // Node16 on its 5th; a Node16 at capacity promotes to the Large tier on
+  // its 17th. Takes ownership of `node` and returns the resulting node,
+  // which may be a different underlying allocation.
   [[nodiscard]] static auto insert_child(IntrusivePtr<Node> node,
                                          std::byte b,
                                          IntrusivePtr<Node> child)
@@ -493,18 +550,46 @@ template <typename V> struct Node {
         ++n4->count_;
         return node;
       }
-      // Node4 at capacity — promote to the Large (ChildStore-backed) tier.
-      // Unlike clone(), a tier transition must preserve the source node's
-      // edit_tag: for a transient node, `node` was already claimed by the
-      // current session (via ensure_mutable) before insert_child was called.
+      // Node4 at capacity — promote to Node16. Unlike clone(), a tier
+      // transition must preserve the source node's edit_tag: for a
+      // transient node, `node` was already claimed by the current session
+      // (via ensure_mutable) before insert_child was called.
+      auto *n16 = make_node16_like(*node);
+      n16->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n16->count_ = n4->count_;
+      for (std::size_t i = 0; i < n4->count_; ++i) {
+        n16->keys_[i] = n4->keys_[i];
+        n16->children_[i] = std::move(n4->children_[i]);
+      }
+      return insert_child(IntrusivePtr<Node>::adopt(n16), b, std::move(child));
+    }
+
+    if (auto *n16 = node->as_node16()) {
+      if (n16->count_ < Node16<V>::kCapacity) {
+        std::size_t pos = 0;
+        while (pos < n16->count_ && n16->keys_[pos] < b)
+          ++pos;
+        assert((pos == n16->count_ || n16->keys_[pos] != b) &&
+               "duplicate transition byte");
+        for (std::size_t i = n16->count_; i > pos; --i) {
+          n16->keys_[i] = n16->keys_[i - 1];
+          n16->children_[i] = std::move(n16->children_[i - 1]);
+        }
+        n16->keys_[pos] = b;
+        n16->children_[pos] = std::move(child);
+        ++n16->count_;
+        return node;
+      }
+      // Node16 at capacity — promote to the Large (ChildStore-backed)
+      // tier. Preserve edit_tag (see the Node4 -> Node16 branch above).
       auto *large = make_large_like(*node);
       large->packed_tag_ |= node->packed_tag_ & kTagMask;
       large->children_ = std::make_unique<ChildStore>();
-      large->children_->transition_bytes.reserve(Node4<V>::kCapacity + 1);
-      large->children_->ptrs.reserve(Node4<V>::kCapacity + 1);
-      for (std::size_t i = 0; i < n4->count_; ++i) {
-        large->children_->transition_bytes.push_back(n4->keys_[i]);
-        large->children_->ptrs.push_back(std::move(n4->children_[i]));
+      large->children_->transition_bytes.reserve(Node16<V>::kCapacity + 1);
+      large->children_->ptrs.reserve(Node16<V>::kCapacity + 1);
+      for (std::size_t i = 0; i < n16->count_; ++i) {
+        large->children_->transition_bytes.push_back(n16->keys_[i]);
+        large->children_->ptrs.push_back(std::move(n16->children_[i]));
       }
       return insert_child(IntrusivePtr<Node>::adopt(large), b,
                           std::move(child));
@@ -512,7 +597,7 @@ template <typename V> struct Node {
 
     if (node->node_type() == NodeType::Leaf) {
       // First child — promote leaf to Node4, preserving edit_tag (see the
-      // Node4 -> Large branch above for why).
+      // Node4 -> Node16 branch above for why).
       auto *n4 = make_node4_like(*node);
       n4->packed_tag_ |= node->packed_tag_ & kTagMask;
       return insert_child(IntrusivePtr<Node>::adopt(n4), b, std::move(child));
@@ -540,8 +625,10 @@ template <typename V> struct Node {
   }
 
   // Remove the child under transition byte b. If this is the Large tier and
-  // removing drops its count to <= Node4<V>::kCapacity, demotes back to
-  // Node4. Takes ownership of `node` and returns the resulting node.
+  // removing drops its count to <= Node16<V>::kCapacity, demotes to Node16;
+  // if this is Node16 and its count drops to <= Node4<V>::kCapacity,
+  // demotes to Node4. Takes ownership of `node` and returns the resulting
+  // node.
   [[nodiscard]] static auto remove_child(IntrusivePtr<Node> node,
                                          std::byte b) -> IntrusivePtr<Node> {
     if (auto *n4 = node->as_node4()) {
@@ -559,6 +646,33 @@ template <typename V> struct Node {
       return node;
     }
 
+    if (auto *n16 = node->as_node16()) {
+      for (std::size_t i = 0; i < n16->count_; ++i) {
+        if (n16->keys_[i] == b) {
+          for (std::size_t j = i; j + 1 < n16->count_; ++j) {
+            n16->keys_[j] = n16->keys_[j + 1];
+            n16->children_[j] = std::move(n16->children_[j + 1]);
+          }
+          --n16->count_;
+          n16->children_[n16->count_] = IntrusivePtr<Node>{};
+          break;
+        }
+      }
+      if (n16->count_ > Node4<V>::kCapacity)
+        return node;
+      // Demote back to Node4 — Node16's per-slot cost only pays off above
+      // this fanout. Preserve edit_tag (see insert_child's Node4 -> Node16
+      // branch for why).
+      auto *n4 = make_node4_like(*node);
+      n4->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n4->count_ = static_cast<std::uint8_t>(n16->count_);
+      for (std::size_t i = 0; i < n16->count_; ++i) {
+        n4->keys_[i] = n16->keys_[i];
+        n4->children_[i] = std::move(n16->children_[i]);
+      }
+      return IntrusivePtr<Node>::adopt(n4);
+    }
+
     auto *internal = node->internal_node();
     if (!internal || !internal->children_)
       return node;
@@ -573,26 +687,36 @@ template <typename V> struct Node {
         break;
       }
     }
-    if (kids.size() > Node4<V>::kCapacity)
+    if (kids.size() > Node16<V>::kCapacity)
       return node;
 
-    // Demote back to Node4 — the Large tier's per-slot cost only pays off
+    // Demote back to Node16 — the Large tier's per-slot cost only pays off
     // above this fanout. Preserve edit_tag (see insert_child's Node4 ->
-    // Large branch for why).
-    auto *n4 = make_node4_like(*node);
-    n4->packed_tag_ |= node->packed_tag_ & kTagMask;
-    n4->count_ = static_cast<std::uint8_t>(kids.size());
+    // Node16 branch for why).
+    auto *n16 = make_node16_like(*node);
+    n16->packed_tag_ |= node->packed_tag_ & kTagMask;
+    n16->count_ = static_cast<std::uint8_t>(kids.size());
     for (std::size_t i = 0; i < kids.size(); ++i) {
-      n4->keys_[i] = kids.transition_bytes[i];
-      n4->children_[i] = std::move(kids.ptrs[i]);
+      n16->keys_[i] = kids.transition_bytes[i];
+      n16->children_[i] = std::move(kids.ptrs[i]);
     }
-    return IntrusivePtr<Node>::adopt(n4);
+    return IntrusivePtr<Node>::adopt(n16);
   }
 
   // Deep clone of this node (not recursive — children are shared).
   [[nodiscard]] auto clone() const -> IntrusivePtr<Node> {
     if (auto *self = as_node4()) {
       auto *n = new Node4<V>();
+      n->packed_tag_ |= packed_tag_ & kHasValueBit;
+      n->value_ = value_;
+      n->prefix = prefix;
+      n->count_ = self->count_;
+      n->keys_ = self->keys_;
+      n->children_ = self->children_; // IntrusivePtr copies -> addref each
+      return IntrusivePtr<Node>::adopt(n);
+    }
+    if (auto *self = as_node16()) {
+      auto *n = new Node16<V>();
       n->packed_tag_ |= packed_tag_ & kHasValueBit;
       n->value_ = value_;
       n->prefix = prefix;
@@ -637,9 +761,8 @@ template <typename V> struct Node {
 // common low-fanout case: chain-compression routing nodes have exactly 1
 // child, and prefix splits start at 2. Transition bytes are kept sorted;
 // lookup is a short linear scan (never more than 4 comparisons). Promotes
-// to InternalNode (the Large tier) on its 5th child; Large demotes back to
-// Node4 when its count drops to <= kCapacity (see Node::insert_child /
-// Node::remove_child).
+// to Node16 on its 5th child; Node16 demotes back to Node4 when its count
+// drops to <= kCapacity (see Node::insert_child / Node::remove_child).
 // ---------------------------------------------------------------------------
 template <typename V> struct Node4 : Node<V> {
   static constexpr std::uint8_t kCapacity = 4;
@@ -651,8 +774,24 @@ template <typename V> struct Node4 : Node<V> {
 };
 
 // ---------------------------------------------------------------------------
+// Node16<V> — fixed 16-slot internal node, same shape as Node4 (sorted
+// inline array, linear scan) but a bigger array. Still a single
+// allocation. Promotes to InternalNode (the Large tier) on its 17th
+// child; Large demotes back to Node16 when its count drops to <=
+// kCapacity (see Node::insert_child / Node::remove_child).
+// ---------------------------------------------------------------------------
+template <typename V> struct Node16 : Node<V> {
+  static constexpr std::uint8_t kCapacity = 16;
+
+  Node16() { Node<V>::set_node_type(Node<V>::NodeType::Node16); }
+  std::uint8_t count_{0};
+  std::array<std::byte, kCapacity> keys_{};
+  std::array<IntrusivePtr<Node<V>>, kCapacity> children_{};
+};
+
+// ---------------------------------------------------------------------------
 // InternalNode<V> — extends Node with unbounded children storage (the
-// "Large" tier — used once a node's fanout exceeds Node4's capacity).
+// "Large" tier — used once a node's fanout exceeds Node16's capacity).
 // sizeof(InternalNode<KeyDirEntry>) == 48, glibc usable=56.
 // ---------------------------------------------------------------------------
 template <typename V> struct InternalNode : Node<V> {
@@ -664,14 +803,16 @@ template <typename V> struct InternalNode : Node<V> {
 static_assert(sizeof(Node<std::uint64_t>) == 24);
 // Node4<uint64_t>: 24 + 1(count) + 4(keys, padded) + 32(4 children) = 64.
 static_assert(sizeof(Node4<std::uint64_t>) == 64);
+// Node16<uint64_t>: 24 + 1(count) + 16(keys) + 7(pad) + 128(16 children) = 176.
+static_assert(sizeof(Node16<std::uint64_t>) == 176);
 // InternalNode<uint64_t>: 24+8 = 32.
 static_assert(sizeof(InternalNode<std::uint64_t>) == 32);
 
 // Factory functions for node allocation.
 // make_leaf: allocates Node (24B for uint64_t value), no children.
 // make_internal: allocates a fresh Node4 (the entry tier for any node that
-// will receive children — routing/split nodes) — promotes to the Large
-// tier automatically via Node::insert_child once it exceeds 4 children.
+// will receive children — routing/split nodes) — promotes to Node16, then
+// the Large tier, automatically via Node::insert_child as fanout grows.
 template <typename V>
 auto make_leaf() -> IntrusivePtr<Node<V>> {
   return IntrusivePtr<Node<V>>::adopt(new Node<V>());

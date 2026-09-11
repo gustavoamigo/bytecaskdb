@@ -989,6 +989,76 @@ TEST_CASE("RadixTree Node4/Large boundary transient", "[radix_tree]") {
 }
 
 // ---------------------------------------------------------------------------
+// Node16 tier boundary: drive a single root node through every tier —
+// Leaf -> Node4 -> Node16 -> Large on insert (20 single-byte transitions,
+// crossing both the 4/5 and 16/17 boundaries), then Large -> Node16 ->
+// Node4 -> empty on erase. No existing test reaches 17+ children on one
+// node without also reaching Node256's territory (the 256-key test), so
+// this is the only coverage for the Node16 <-> Large transition
+// specifically, and for Node4 -> Node16 (as opposed to Node4 -> Large
+// directly, which is what happened before Node16 existed).
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree Node16/Large boundary persistent", "[radix_tree]") {
+  auto t = Tree{};
+  for (int i = 0; i < 20; ++i) {
+    std::string key(1, static_cast<char>('a' + i));
+    t = t.set(to_bytes(key), i);
+    CHECK(t.size() == static_cast<std::size_t>(i + 1));
+    for (int j = 0; j <= i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+
+  std::vector<std::string> keys;
+  for (auto it = t.begin(); it != t.end(); ++it) {
+    auto [k, v] = *it;
+    keys.push_back(to_string(k));
+  }
+  CHECK(std::is_sorted(keys.begin(), keys.end()));
+  CHECK(keys.size() == 20U);
+
+  for (int i = 19; i >= 0; --i) {
+    std::string key(1, static_cast<char>('a' + i));
+    t = t.erase(to_bytes(key));
+    CHECK(t.size() == static_cast<std::size_t>(i));
+    CHECK_FALSE(t.contains(to_bytes(key)));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+  CHECK(t.empty());
+}
+
+TEST_CASE("RadixTree Node16/Large boundary transient", "[radix_tree]") {
+  auto tr = Tree{}.transient();
+  for (int i = 0; i < 20; ++i) {
+    std::string key(1, static_cast<char>('a' + i));
+    tr.set(to_bytes(key), i);
+    for (int j = 0; j <= i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(tr.contains(to_bytes(k)));
+      CHECK(*tr.get(to_bytes(k)) == j);
+    }
+  }
+  for (int i = 19; i >= 0; --i) {
+    std::string key(1, static_cast<char>('a' + i));
+    CHECK(tr.erase(to_bytes(key)));
+    CHECK_FALSE(tr.contains(to_bytes(key)));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(tr.contains(to_bytes(k)));
+      CHECK(*tr.get(to_bytes(k)) == j);
+    }
+  }
+  auto t = std::move(tr).persistent();
+  CHECK(t.empty());
+}
+
+// ---------------------------------------------------------------------------
 // Transient: overwrite existing key (no size change, in-place mutation)
 // ---------------------------------------------------------------------------
 TEST_CASE("RadixTree transient overwrite", "[radix_tree]") {
