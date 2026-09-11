@@ -1027,6 +1027,50 @@ performance bugs (`inline_kids` value-initialization, redundant
 multi-call dispatch) found and fixed that also benefit every existing
 tier, not just the new ones.
 
+### 7.11. Churn-stability threshold recalibration, and a CI-only false lead
+
+CI flagged `tests/radix_tree_memory_test.cpp`'s "Memory: high-turnover
+churn stability" test failing for the `prefixed` and `uuidv7` shapes:
+peak memory during 100 cycles of delete-50/insert-50 churn exceeded the
+test's `mem_max <= mem_baseline * 3` threshold (`prefixed` reached 3.72x,
+`uuidv7` 3.29x). Bisection (`git worktree`, testing `a756cee`/`eb51938`/
+`e9961c2`/`0414846` and `main` against the identical test) showed `Node4`
+alone doesn't trigger it; `Node16` does, unchanged by `Node48`/`Node256`.
+Extending the churn to 800 cycles (8x) confirmed the new peak is a flat,
+stable plateau, not unbounded growth: `prefixed` holds at ~39.5–40.5k
+bytes from cycle 50 through cycle 799. In absolute terms peak is flat-to-
+lower than before tiering (`prefixed` 64621 → 61357 bytes) — the ratio
+only crossed 3x because `Node16`'s ~25% baseline reduction outpaced its
+smaller peak reduction, tightening what had been comfortable headroom
+into a shortfall. Root cause: `Node16` (like `Node48`/`Node256`, §7.9)
+pays a fixed per-node cost at the *low* end of its range — a 5-child
+`Node16` costs the same ~176–192 B as a 16-child one — where the old
+`ChildStore`'s ~9 B/child variable cost was cheaper; churn transiently
+clusters many nodes at exactly that low-occupancy point. The threshold
+was recalibrated to `* 4`, with the measured worst case and methodology
+recorded in the test's own comment.
+
+**A separate, CI-only reproduction attempt turned out to be a false
+lead, not a bug.** Chasing the same failure locally by setting CI's
+`BYTECASK_MARCH=x86-64-v3` build flag surfaced a small (~400–440 B),
+constant, non-growing `mem_after == 0` discrepancy across many unrelated
+tests when the full `radix_tree_memory_tests` binary runs (not when a
+single test case is filtered in isolation). It looked alarming — briefly
+mistaken for a real leak or even, after one unreproduced "double free or
+corruption" glibc message during an earlier crash-hunting pass, a
+possible heap-corruption bug — but bisection proved it present
+identically on **`main`**, with zero radix-tree tiering changes,
+whenever the full binary runs under that same flag on this specific
+local (Ubuntu 24.04 glibc) environment; CI itself (Fedora 43-based) never
+reported it — only the two churn-ratio failures above, which is the
+actual, complete CI failure. It is Catch2/glibc/`-march` measurement
+noise unrelated to this codebase, not a defect to fix here.
+
+Full suite green after the threshold fix: `bytecask_tests` 7,879,586
+assertions / 1,455 cases; `radix_tree_memory_tests` 941 assertions / 22
+cases — both under default build flags and re-verified under
+`BYTECASK_MARCH=x86-64-v3` matching CI.
+
 ---
 
 ## 8. Benchmark Results

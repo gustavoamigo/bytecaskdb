@@ -445,7 +445,12 @@ template <typename V> struct Node {
     case NodeType::Node256:
       return static_cast<const Node256<V> *>(this)->count_;
     }
-    __builtin_unreachable();
+    // NodeType is exhaustively covered above; this is reachable only if
+    // packed_tag_'s node-type bits are somehow corrupted to a stray value
+    // outside the 5 declared enumerators. A safe default ("no children")
+    // is a wrong-but-safe answer, not silent corruption — see the
+    // Runtime safety guidance in .github/copilot-instructions.md.
+    return 0;
   }
   [[nodiscard]] auto has_children() const noexcept -> bool {
     return child_count() != 0;
@@ -567,7 +572,8 @@ template <typename V> struct Node {
       return ConstChildRef{b, n256->children_[idx]};
     }
     }
-    __builtin_unreachable();
+    // See child_count()'s trailing comment — safe default, not UB.
+    return std::nullopt;
   }
 
   [[nodiscard]] auto find_child_mut(std::byte b) -> std::optional<ChildRef> {
@@ -603,7 +609,8 @@ template <typename V> struct Node {
       return ChildRef{b, n256->children_[idx]};
     }
     }
-    __builtin_unreachable();
+    // See child_count()'s trailing comment — safe default, not UB.
+    return std::nullopt;
   }
 
   // Allocates a Node4 carrying src's value/prefix (not its children — src

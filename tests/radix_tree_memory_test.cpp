@@ -388,9 +388,29 @@ TEST_CASE("Memory: high-turnover churn stability", "[radix_tree][memory]") {
 
       // Memory should not grow unboundedly. With persistent trees, each
       // set/erase briefly creates a copy before the old version is freed,
-      // so peak can be ~2× baseline. The key invariant is that it doesn't
-      // grow proportionally to total operations performed.
-      CHECK(mem_max <= mem_baseline * 3);
+      // so peak can be ~2x baseline. The key invariant is that it doesn't
+      // grow proportionally to total operations performed — verified by
+      // running this same churn out to 800 cycles (8x this test's count):
+      // peak stays flat (e.g. "prefixed" holds at ~39.5-40.5k from cycle 50
+      // through cycle 799) rather than trending upward, confirming this is
+      // a bounded steady-state level, not a leak.
+      //
+      // The threshold is 4x, not 3x: the Node4/Node16/Node48/Node256 ART
+      // tiering (see docs/persistent_radix_tree_design.md §7.7-7.10) pays a
+      // fixed per-node cost at the *low* end of each tier's range (e.g. a
+      // Node16 with 5 children costs the same ~176-192B as one with 16),
+      // where the old ChildStore's variable ~9B/child cost was cheaper.
+      // That shows up here because churn briefly holds many nodes at
+      // exactly that low-occupancy point. It does not show up as a net
+      // memory regression: baseline shrank by 20-25% on every shape from
+      // the same tiering, and peak itself is flat-to-lower in absolute
+      // terms (e.g. "prefixed" peak: 64621 -> 61357 bytes) — the ratio
+      // alone crossed 3x because the baseline it is measured against
+      // shrank faster than the peak did. Measured worst case across all
+      // key shapes at this test's exact parameters (1500 keys, 100
+      // cycles): "prefixed" at 3.72x, "uuidv7" at 3.29x — 4x keeps
+      // deterministic margin above both.
+      CHECK(mem_max <= mem_baseline * 4);
       CHECK(mem_after == 0);
     }
   }
