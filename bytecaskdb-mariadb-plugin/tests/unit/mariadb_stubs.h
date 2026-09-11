@@ -350,13 +350,18 @@ inline void thd_set_ha_data(THD *thd, handlerton *hton, void *data) {
   thd->ha_data[hton->slot] = data;
 }
 
-// Stub: my_error / MYF — no-op in tests.
+// Stub: my_error / MYF — records the last error code (no message formatting)
+// so tests can assert on which ER_* a code path actually raised.
 #define MYF(x) (x)
-inline void my_error(int /*error*/, unsigned long /*flags*/, ...) {}
+inline int g_stub_last_my_error_code = 0;
+inline void my_error(int error, unsigned long /*flags*/, ...) {
+  g_stub_last_my_error_code = error;
+}
 
 // MariaDB error codes.
 #define ER_LOCK_DEADLOCK 1213
 #define ER_DUP_ENTRY 1062
+#define ER_DUP_ENTRY_WITH_KEY_NAME 1586
 
 // Stubs for key_copy / key_restore — these are MariaDB server functions.
 // For proof tests, key_copy must actually copy field data into the key buffer

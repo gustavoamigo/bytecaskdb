@@ -288,8 +288,12 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
       reset();
       if (deferred) {
         // Snapshot-less plan: the only precondition is ensure_absent, so a
-        // conflict is a duplicate primary key.
-        my_error(ER_DUP_ENTRY, MYF(0), "", "PRIMARY");
+        // conflict is a duplicate primary key. ER_DUP_ENTRY_WITH_KEY_NAME
+        // (not ER_DUP_ENTRY) takes two strings — "Duplicate entry '%s' for
+        // key '%s'" — matching the (value, key-name) args passed here.
+        // ER_DUP_ENTRY's second placeholder is an integer key index, so
+        // passing "PRIMARY" there is undefined behavior on the varargs call.
+        my_error(ER_DUP_ENTRY_WITH_KEY_NAME, MYF(0), "", "PRIMARY");
         return HA_ERR_FOUND_DUPP_KEY;
       }
       my_error(ER_LOCK_DEADLOCK, MYF(0));
