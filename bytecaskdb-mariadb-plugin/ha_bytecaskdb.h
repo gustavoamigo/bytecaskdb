@@ -44,7 +44,10 @@ bool             catalog_rename_table_meta(bytecask::DB *db,
                                            const char *from,
                                            const char *to);
 std::optional<uint32_t> catalog_lookup_table_id(const char *name);
-const TableMeta *catalog_lookup_meta(uint32_t table_id);
+// Copies the table's metadata out under the catalog lock. Returns false if
+// the table is unknown. Handlers cache what they need at open(); DDL paths
+// take a fresh copy. No reference into the catalog cache is ever handed out.
+bool             catalog_copy_meta(uint32_t table_id, TableMeta &out);
 
 uint64_t         catalog_alloc_rowid(uint32_t table_id);
 uint64_t         catalog_alloc_rowid_range(uint32_t table_id, uint64_t count);

@@ -223,10 +223,10 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
   }
   table_id_ = tid.value();
 
-  const auto *meta = catalog_lookup_meta(table_id_);
-  if (meta) {
-    schema_version_ = static_cast<uint16_t>(meta->schema_version);
-    indexes_ = meta->indexes;
+  TableMeta meta;
+  if (catalog_copy_meta(table_id_, meta)) {
+    schema_version_ = static_cast<uint16_t>(meta.schema_version);
+    indexes_ = std::move(meta.indexes);
   } else {
     indexes_.clear();
   }
@@ -374,8 +374,9 @@ int ha_bytecaskdb::delete_table(const char *name) {
     return 0;  // Nothing to delete.
   }
 
-  // Get table metadata to find secondary indexes to clean up.
-  const TableMeta *meta = catalog_lookup_meta(tid.value());
+  // Table metadata, for the secondary index ranges to clean up.
+  TableMeta meta;
+  const bool have_meta = catalog_copy_meta(tid.value(), meta);
 
   // Atomic del_range of all row keys + secondary index keys + catalog entry.
   auto lower = table_id_prefix(tid.value());
@@ -388,9 +389,8 @@ int ha_bytecaskdb::delete_table(const char *name) {
   plan.del_range(as_view(lower), as_view(upper));
 
   // Delete all secondary index ranges [0x03 | table_id | index_id].
-  // Schema v2 always has indexes (may be empty)
-  if (meta) {
-    for (const auto &index : meta->indexes) {
+  if (have_meta) {
+    for (const auto &index : meta.indexes) {
       auto idx_lower = index_id_prefix(tid.value(), index.index_id);
       auto idx_upper = index_id_upper_bound(tid.value(), index.index_id);
       plan.del_range(as_view(idx_lower), as_view(idx_upper));
@@ -417,20 +417,16 @@ int ha_bytecaskdb::delete_table(const char *name) {
 int ha_bytecaskdb::delete_all_rows() {
   if (!g_db) { return HA_ERR_GENERIC; }
 
-  const TableMeta *meta = catalog_lookup_meta(table_id_);
-
   auto lower = table_id_prefix(table_id_);
   auto upper = table_id_upper_bound(table_id_);
 
   bytecask::WritePlan plan;
   plan.del_range(as_view(lower), as_view(upper));
 
-  if (meta) {
-    for (const auto &index : meta->indexes) {
-      auto idx_lower = index_id_prefix(table_id_, index.index_id);
-      auto idx_upper = index_id_upper_bound(table_id_, index.index_id);
-      plan.del_range(as_view(idx_lower), as_view(idx_upper));
-    }
+  for (const auto &index : indexes_) {
+    auto idx_lower = index_id_prefix(table_id_, index.index_id);
+    auto idx_upper = index_id_upper_bound(table_id_, index.index_id);
+    plan.del_range(as_view(idx_lower), as_view(idx_upper));
   }
 
   try {
@@ -790,8 +786,7 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
   encode_row_into(new_val, table, new_data, schema_version_);
 
   // Handle secondary indexes.
-  const TableMeta *meta = catalog_lookup_meta(table_id_);
-  if (meta) {
+  if (!indexes_.empty()) {
     const uint8_t *pk_bytes     = old_pk.data() + 5;
     const size_t   pk_bytes_len = old_pk.size() - 5;
 
@@ -810,7 +805,7 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
       return false;
     };
 
-    for (const auto &index : meta->indexes) {
+    for (const auto &index : indexes_) {
       const KEY &ki = table->key_info[index.index_id];
       if (!pk_changing && !index_in_write_set(ki)) continue;
 
@@ -908,13 +903,11 @@ int ha_bytecaskdb::delete_row(const uchar *buf) {
   }
 
   // Buffer secondary index deletions first.
-  const TableMeta *meta = catalog_lookup_meta(table_id_);
-  if (meta) {
-    for (const auto &index : meta->indexes) {
-      auto sec_key = encode_sec_key(table, buf, table_id_,
-                                     index.index_id, index.index_id, rowid);
-      txn->buffer_del(sec_key.data(), sec_key.size());
-    }
+  for (const auto &index : indexes_) {
+    auto &sec_key = encode_sec_key_buf_;
+    encode_sec_key_into(sec_key, table, buf, table_id_,
+                        index.index_id, index.index_id, rowid);
+    txn->buffer_del(sec_key.data(), sec_key.size());
   }
 
   FAULT_INJECTION(plugin_after_pk_buffer);
@@ -973,8 +966,7 @@ int ha_bytecaskdb::rnd_end() {
 int ha_bytecaskdb::check(THD * /*thd*/, HA_CHECK_OPT * /*check_opt*/) {
   if (!g_db) return HA_ADMIN_FAILED;
 
-  const TableMeta *meta = catalog_lookup_meta(table_id_);
-  if (!meta || meta->indexes.empty())
+  if (indexes_.empty())
     return HA_ADMIN_OK;
 
   auto *txn = txn_cached_;
@@ -987,7 +979,7 @@ int ha_bytecaskdb::check(THD * /*thd*/, HA_CHECK_OPT * /*check_opt*/) {
   bool corrupt = false;
 
   while ((rc = rnd_next(buf)) == 0) {
-    for (const auto &index : meta->indexes) {
+    for (const auto &index : indexes_) {
       // Build the full secondary key (including PK suffix) for this row.
       // For PK-less tables, extract the synthetic rowid from current_row_key_.
       uint64_t rowid = 0;
@@ -1516,17 +1508,16 @@ bool ha_bytecaskdb::inplace_alter_table(TABLE * /*altered_table*/,
                                          Alter_inplace_info *ha_alter_info) {
   if (!g_db) { return true; }
 
-  const TableMeta *meta = catalog_lookup_meta(table_id_);
-  if (!meta) { return false; }
+  TableMeta updated;
+  if (!catalog_copy_meta(table_id_, updated)) { return false; }
 
   bool has_drop_fk = (ha_alter_info->handler_flags & ALTER_DROP_FOREIGN_KEY) != 0;
   bool has_rename  = (ha_alter_info->handler_flags & ALTER_COLUMN_NAME) != 0;
 
-  if (meta->fks.empty() && !has_drop_fk) {
+  if (updated.fks.empty() && !has_drop_fk) {
     return false;
   }
 
-  TableMeta updated = *meta;
   pre_alter_fks_ = updated.fks;
 
   // Handle DROP FOREIGN KEY
@@ -1593,10 +1584,8 @@ bool ha_bytecaskdb::commit_inplace_alter_table(TABLE * /*altered_table*/,
   }
 
   // Rollback: restore the original FK list.
-  const TableMeta *meta = catalog_lookup_meta(table_id_);
-  if (!meta) { return true; }
-
-  TableMeta restored = *meta;
+  TableMeta restored;
+  if (!catalog_copy_meta(table_id_, restored)) { return true; }
   restored.fks = std::move(pre_alter_fks_);
   restored.schema_version = restored.fks.empty() ? 2 : 3;
 
@@ -1613,10 +1602,10 @@ bool ha_bytecaskdb::commit_inplace_alter_table(TABLE * /*altered_table*/,
 
 int ha_bytecaskdb::get_foreign_key_list(THD *thd,
                                          List<FOREIGN_KEY_INFO> *f_key_list) {
-  const TableMeta *meta = catalog_lookup_meta(table_id_);
-  if (!meta) { return 0; }
+  TableMeta meta;
+  if (!catalog_copy_meta(table_id_, meta)) { return 0; }
 
-  for (const auto &fk : meta->fks) {
+  for (const auto &fk : meta.fks) {
     auto *fk_info = static_cast<FOREIGN_KEY_INFO *>(
         thd_alloc(thd, sizeof(FOREIGN_KEY_INFO)));
     new (fk_info) FOREIGN_KEY_INFO();

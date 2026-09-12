@@ -474,13 +474,14 @@ std::optional<uint32_t> catalog_lookup_table_id(const char *name) {
   return std::nullopt;
 }
 
-const TableMeta *catalog_lookup_meta(uint32_t table_id) {
+bool catalog_copy_meta(uint32_t table_id, TableMeta &out) {
   std::lock_guard<std::mutex> lk{s_catalog_mu};
   auto it = s_id_to_meta.find(table_id);
-  if (it != s_id_to_meta.end()) {
-    return &it->second;
+  if (it == s_id_to_meta.end()) {
+    return false;
   }
-  return nullptr;
+  out = it->second;
+  return true;
 }
 
 } // namespace bytecaskdb
