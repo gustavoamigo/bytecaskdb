@@ -635,3 +635,48 @@ TEST_CASE("createDataFileForWrite accepts an unused stem", "[data_file]") {
 
   std::filesystem::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// renameDataFileExclusive — final placement claims the name atomically
+//
+// Vacuum stages its compacted copy under .data.tmp holding only vacuum_mu_,
+// so a rotation can mint the same stem before the copy finishes. Checking the
+// target and then renaming loses that race; refusing inside the placement
+// itself does not.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("renameDataFileExclusive places a staged file", "[data_file]") {
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_place_ok";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto from = dir / "staged.data.tmp";
+  const auto to = dir / "staged.data";
+  { std::ofstream f{from}; f << "compacted"; }
+
+  bytecask::renameDataFileExclusive(from, to);
+
+  CHECK(std::filesystem::exists(to));
+  CHECK_FALSE(std::filesystem::exists(from));  // staged copy is consumed
+  CHECK(std::filesystem::file_size(to) == 9);
+
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("renameDataFileExclusive panics rather than replacing a live file",
+          "[data_file][panic]") {
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_place_bad";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto from = dir / "staged.data.tmp";
+  const auto to = dir / "staged.data";
+  { std::ofstream f{from}; f << "compacted"; }
+  { std::ofstream f{to}; f << "live data that must survive"; }
+
+  CHECK(dies_by_panic([&] { bytecask::renameDataFileExclusive(from, to); }));
+
+  // The panicking child must not have touched either file.
+  CHECK(std::filesystem::file_size(to) == 27);
+  CHECK(std::filesystem::exists(from));
+
+  std::filesystem::remove_all(dir);
+}

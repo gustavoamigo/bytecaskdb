@@ -555,6 +555,28 @@ On violation: throws `std::runtime_error`. The DB does not open or
 `resume()` fails. This is intentional — if recovery produces
 inconsistent state, the engine should not run.
 
+### Fatal invariants (always on, in release builds too)
+
+**A writable data file must never be created under a name this database
+has already used**, either as `<stem>.data` or as `<stem>.hint`. Reusing
+one would append past a sealed file's end, and those entries would be
+invisible to recovery, because hint generation skips a file whose hint
+already exists. The engine checks this on every data file creation
+(`O_EXCL`) and on vacuum's final placement (which claims the name
+atomically rather than replacing it).
+
+A violation is not an I/O failure and is not degradable: it aborts the
+process rather than degrading. Degrading would be caught by the write
+path, which calls `resume()`, which mints a fresh stem and continues —
+recovering from the symptom while the broken generator that caused it
+stays broken. It is also not reachable by chance: stems carry a 64-bit
+salt drawn per file, so a repeat within one timestamp second is ~1e-13
+at 2,000 files. Reaching this check means the generator itself is
+broken, which no retry fixes.
+
+This is the only class of failure that terminates the process. Every
+other failure either throws or degrades, per the sections above.
+
 ## `ingest`
 
 Applies pre-sequenced entries from a leader to a follower's storage.

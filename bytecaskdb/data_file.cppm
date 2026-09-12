@@ -22,6 +22,7 @@ module;
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdio.h>
 #include <string>
 #include <string_view>
 #include <sys/uio.h>
@@ -1128,7 +1129,10 @@ export [[nodiscard]] inline auto createDataFileForWrite(
     std::string_view suffix, std::size_t capacity, bool use_mmap)
     -> std::shared_ptr<WritableDataFile> {
   const auto hint_path = dir / (stem + ".hint");
-  if (std::filesystem::exists(hint_path)) {
+  // error_code overload: the question is "is this stem taken", and a stat
+  // failure is not an answer to it — only an existing hint is.
+  std::error_code hint_ec;
+  if (std::filesystem::exists(hint_path, hint_ec)) {
     panic(std::format(
         "data file stem '{}' is already sealed: '{}' exists. Hint generation "
         "skips a file whose hint is already written, so every entry appended "
@@ -1143,6 +1147,52 @@ export [[nodiscard]] inline auto createDataFileForWrite(
   }
 #endif
   return WritablePosixDataFile::create(std::move(path), /*exclusive=*/true);
+}
+
+// Moves a staged data file onto its final name, refusing to replace an
+// existing target. std::filesystem::rename replaces silently, and the target
+// is minted by the same stem generator as every other data file — so the
+// replacement it would perform is a stem reuse destroying a live file.
+//
+// Checking the target first and then renaming is not equivalent: vacuum stages
+// its copy while writers keep rotating, so a stem can appear in that window.
+// The refusal has to be part of the placement itself.
+//
+// Panics on a name already in use, for the same reason createDataFileForWrite
+// does; any other failure is an ordinary I/O error and throws.
+export void renameDataFileExclusive(const std::filesystem::path &from,
+                                    const std::filesystem::path &to) {
+#if defined(__linux__) && defined(RENAME_NOREPLACE)
+  if (::renameat2(AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(),
+                  RENAME_NOREPLACE) == 0) {
+    return;
+  }
+  if (errno == EEXIST) panic_on_reused_path(to);
+  // Filesystems that do not implement the flag report EINVAL or ENOSYS; those
+  // fall through to the portable path below. Anything else is a real error.
+  if (errno != EINVAL && errno != ENOSYS) {
+    throw std::system_error{
+        errno, std::generic_category(),
+        std::format("renameDataFileExclusive: cannot rename '{}' to '{}'",
+                    from.string(), to.string())};
+  }
+#endif
+  // link() fails with EEXIST instead of replacing, so the target is claimed
+  // atomically. A crash between link and unlink leaves the staged file behind;
+  // recovery removes stale .tmp files at open.
+  if (::link(from.c_str(), to.c_str()) != 0) {
+    if (errno == EEXIST) panic_on_reused_path(to);
+    throw std::system_error{
+        errno, std::generic_category(),
+        std::format("renameDataFileExclusive: cannot link '{}' to '{}'",
+                    from.string(), to.string())};
+  }
+  if (::unlink(from.c_str()) != 0) {
+    throw std::system_error{
+        errno, std::generic_category(),
+        std::format("renameDataFileExclusive: cannot unlink '{}'",
+                    from.string())};
+  }
 }
 
 // Forward-only iterator over raw entries in a DataFile.

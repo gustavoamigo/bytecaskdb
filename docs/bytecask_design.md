@@ -741,42 +741,62 @@ The sequence is a **globally monotonic** counter across all data files and all e
 ### Log-Structured Naming Convention
 
 `make_data_file_stem()` builds the stem `data_{YYYYMMDDHHmmss}_{salt}_V01`: a UTC
-timestamp at second precision, a 32-bit random salt in hex, and the file format
+timestamp at second precision, a 64-bit random salt in hex, and the file format
 version. The full layout is in [`file_format.md`](file_format.md). The timestamp
 is a debug aid — entry sequence numbers, not filenames, are the authoritative
 ordering. File IDs are a separate monotonic `std::uint32_t` assigned at
 rotation, not derived from the name.
 
-**A stem is used once, and reuse is fatal.** The salt makes reuse unlikely, not
-impossible: the timestamp is only second-granular, so a small
-`Options::max_file_bytes` mints thousands of files per second into one
-directory, and a 32-bit salt is a birthday collision away from repeating —
-about 1 in 2,400 for 1,800 files inside one second. Reusing a stem used to be
-silent: `open(O_CREAT)` without `O_EXCL` reopened the sealed file and adopted
-its length, so the "new" active file started non-empty, and every entry
-appended to it was invisible to recovery, because `flush_hints_for` skips a
-file whose `.hint` already exists.
+**A stem is used once, and reuse is fatal.** Reusing one used to be silent:
+`open(O_CREAT)` without `O_EXCL` reopened the sealed file and adopted its
+length, so the "new" active file started non-empty, and every entry appended to
+it was invisible to recovery, because `flush_hints_for` skips a file whose
+`.hint` already exists.
 
-`createDataFileForWrite(dir, stem, suffix, capacity, use_mmap)` is now the only
-way the engine creates a data file — `DB::open`, `rotate_active_file`,
-`resume()`, and vacuum's staging copy all route through it. It refuses a stem
-that is already in use on either half of the name:
+Two independent things keep that from happening, and the split matters: the
+salt makes a reuse negligible, and the guards make it fatal rather than silent
+if one ever occurs.
+
+The timestamp is only second-granular, so within one second the salt separates
+every file alone, and the collision rate grows with the square of how many are
+minted in that second. A small `Options::max_file_bytes` mints thousands: at
+2,000 files a 32-bit salt repeats about once in 2,100 runs, which is frequent
+enough to have surfaced on `main`. A 64-bit salt puts the same case at ~1e-13.
+The salt is drawn per file from `std::random_device` rather than from a seeded
+PRNG — seeding `mt19937` from one 32-bit draw would leave a process only 2^32
+possible salt sequences however wide each output was, which is the property
+that had to improve.
+
+`createDataFileForWrite(dir, stem, suffix, capacity, use_mmap)` is the only way
+the engine creates a data file — `DB::open`, `rotate_active_file`, `resume()`,
+and vacuum's staging copy all route through it. It refuses a stem that is
+already in use on either half of the name:
 
 - `<stem><suffix>` exists — rejected by `O_EXCL`, which is race-free against a
   concurrent creator.
 - `<stem>.hint` exists — the stem is sealed, even if the data file itself was
   vacuumed away.
 
-Vacuum additionally checks its rename target, since `std::filesystem::rename`
-replaces an existing file silently and would unlink a live data file.
+Vacuum's final placement goes through `renameDataFileExclusive`, which claims
+the target name atomically (`renameat2(RENAME_NOREPLACE)`, falling back to
+`link` + `unlink`) instead of replacing it. Checking the target and then calling
+`std::filesystem::rename` is not equivalent, and was the first form of this
+guard: vacuum stages its compacted copy holding only `vacuum_mu_`, so a
+concurrent rotation can mint the same stem in the window between the check and
+the rename — its own `O_EXCL` succeeds, because vacuum holds only
+`<stem>.data.tmp` and has not written a `.hint` yet — and the rename then
+replaces a live active file. A crash between `link` and `unlink` leaves a
+`.data.tmp` behind, which `recovery_prepare_files` removes at open.
 
-Both checks `panic()` — they abort the process rather than throw. An exception
-would be caught by the write path's `catch (...)`, turned into a degraded
-state, and cleared by `resume()` minting a fresh stem, which masks the bug
-while the corrupted state persists. The two guards are a pair, so they live in
-one function that a caller cannot half-apply. `openDataFileForWrite` keeps the
-open-or-adopt behaviour for tests and tooling that deliberately reopen a file
-they wrote; the engine does not use it.
+All three checks `panic()` — they abort the process rather than throw. An
+exception would be caught by the write path's `catch (...)`, turned into a
+degraded state, and cleared by `resume()` minting a fresh stem: recovery from
+the symptom, while the broken generator that caused it stays broken. Given the
+salt width above, reaching any of these checks means exactly that. See *Fatal
+invariants* in [`CONTRACT.md`](../CONTRACT.md).
+
+`openDataFileForWrite` keeps the open-or-adopt behaviour for tests and tooling
+that deliberately reopen a file they wrote; the engine does not use it.
 
 ### DataFile API
 
@@ -785,7 +805,7 @@ they wrote; the engine does not use it.
 - **`WritableMmapDataFile`**: Pre-allocates the file to the rotation threshold via `ftruncate`, then maps it with `mmap(PROT_READ, MAP_SHARED)`. Reads within the mapped region are zero-syscall memcpy from the mmap region. Reads beyond the mmap region (rare: overflow past pre-allocated size) fall back to `pread`. Writes go through `pwritev` at a tracked `offset_`. MAP_SHARED is required so that `pwritev` writes through the fd are visible to mmap readers.
 - **`WritablePosixDataFile`**: Pure `pread`-based reads, `pwritev` writes. Uses `fallocate(FALLOC_FL_KEEP_SIZE)` in 4 MiB chunks for block preallocation. This is the fallback for platforms without mmap support (Emscripten/WASM).
 
-Two factory functions select the implementation. `createDataFileForWrite(dir, stem, suffix, capacity, use_mmap)` creates a file that must not already exist and is what the engine uses; it adds `O_EXCL` and panics on a reused stem (see *Log-Structured Naming Convention*). `openDataFileForWrite(path, capacity, use_mmap)` opens or creates, adopting the file's current length — for tests and tooling that reopen a file they wrote. Both open with `O_RDWR | O_CREAT | O_CLOEXEC` — no `O_APPEND`, since pre-allocated files require positioned writes.
+Two factory functions select the implementation. `createDataFileForWrite(dir, stem, suffix, capacity, use_mmap)` creates a file that must not already exist and is what the engine uses; it adds `O_EXCL` and panics on a reused stem (see *Log-Structured Naming Convention*). `openDataFileForWrite(path, capacity, use_mmap)` opens or creates, adopting the file's current length — for tests and tooling that reopen a file they wrote. Both open with `O_RDWR | O_CREAT | O_CLOEXEC` — no `O_APPEND`, since pre-allocated files require positioned writes. `renameDataFileExclusive(from, to)` completes the set: it moves a staged file onto its final name without replacing an existing target, and is how vacuum publishes a compacted file.
 
 - **`append_entry(sequence, entry_type, key, value) -> Offset`**: Serializes a new entry with the given sequence number and `EntryType`, writes it via `pwritev()` at the tracked `offset_`, and returns the byte offset where the entry starts. `BulkBegin`/`BulkEnd` entries pass empty key and value spans. Does **not** guarantee durability on its own. The 15-byte header and 4-byte CRC are serialized into a fixed member buffer (`hdr_crc_buf_`); the key and value spans are passed directly as iovecs — no heap allocation and no copy of key/value data occurs on the write path.
 - **`sync()`**: Calls `::fdatasync()` to flush all pending writes to physical storage. Must be called explicitly to guarantee crash-safety. Decoupled from `append_entry()` to enable Group Commit: callers can batch multiple `append_entry()` calls before a single `sync()`.
