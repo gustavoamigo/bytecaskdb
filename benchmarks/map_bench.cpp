@@ -19,6 +19,7 @@ namespace {
 
 using key_generators::generate_uniform_keys;
 using key_generators::generate_prefixed_keys;
+using key_generators::generate_binary_keys;
 
 auto to_bytes(const std::string &s) -> std::span<const std::byte> {
   return std::as_bytes(std::span{s.data(), s.size()});
@@ -250,6 +251,36 @@ template <typename A> void BM_UpperBound(benchmark::State &state) {
 }
 
 // ---------------------------------------------------------------------------
+// Binary-key variants of the ordered-access benchmarks.
+//
+// The uniform/prefixed shapes above are generated from a sequential numeric
+// index, so their branching is digit-driven and bounded (<= 10-way): they
+// never build a node with wide fanout. generate_binary_keys varies byte 0
+// over the full 0x00-0xFF range, so the root becomes a full 256-child node
+// past 256 keys. That is the only shape here that exercises the widest
+// tier's ordinal-to-byte mapping, which is what descent (lower_bound) and
+// ordered traversal (iterate) depend on.
+// ---------------------------------------------------------------------------
+template <typename A> void BM_LowerBoundBinary(benchmark::State &state) {
+  auto keys =
+      A::make_keys(generate_binary_keys(static_cast<std::size_t>(state.range(0))));
+  auto m = A::build(keys);
+  std::size_t idx = 0;
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(A::lower_bound(m, keys[idx % keys.size()]));
+    ++idx;
+  }
+}
+
+template <typename A> void BM_IterateBinary(benchmark::State &state) {
+  auto keys =
+      A::make_keys(generate_binary_keys(static_cast<std::size_t>(state.range(0))));
+  auto m = A::build(keys);
+  for (auto _ : state)
+    benchmark::DoNotOptimize(A::iterate_sum(m));
+}
+
+// ---------------------------------------------------------------------------
 // Memory footprint: measures net heap bytes after building a container of N
 // keys.  Reports bytes/key via a custom counter.
 // ---------------------------------------------------------------------------
@@ -326,6 +357,24 @@ void BM_MergeDisjoint(benchmark::State &state) {
 void BM_MergeOverlapping(benchmark::State &state) {
   auto n = static_cast<std::size_t>(state.range(0));
   auto all = generate_uniform_keys(n);
+  auto quarter = std::ssize(all) / 4;
+  std::vector<std::string> ka(all.begin(), all.begin() + quarter * 3);
+  std::vector<std::string> kb(all.begin() + quarter, all.end());
+  auto ta = RTreeAdapter::transient_build(ka);
+  auto tb = RTreeAdapter::transient_build(kb);
+  auto resolve = [](const bytecask::KeyDirEntry &,
+                    const bytecask::KeyDirEntry &b) { return b; };
+  for (auto _ : state)
+    benchmark::DoNotOptimize(RTree::merge(ta, tb, resolve));
+}
+
+// Merge-only on binary keys — same ~50% overlap as BM_MergeOverlapping, but
+// on the one shape that produces a full 256-child node (see the binary-key
+// note above). merge_impl walks the right-hand node's children in order, so
+// this is the merge-path counterpart to BM_LowerBoundBinary.
+void BM_MergeOverlappingBinary(benchmark::State &state) {
+  auto n = static_cast<std::size_t>(state.range(0));
+  auto all = generate_binary_keys(n);
   auto quarter = std::ssize(all) / 4;
   std::vector<std::string> ka(all.begin(), all.begin() + quarter * 3);
   std::vector<std::string> kb(all.begin() + quarter, all.end());
@@ -431,6 +480,12 @@ BENCHMARK(BM_LowerBound<StdMapAdapter>)   ->Name("StdMap/LowerBound")        SIZ
 BENCHMARK(BM_UpperBound<RTreeAdapter>)    ->Name("RadixTree/UpperBound")     SIZES;
 BENCHMARK(BM_UpperBound<StdMapAdapter>)   ->Name("StdMap/UpperBound")        SIZES;
 
+// Binary keys — the only shape that builds a full 256-child node
+BENCHMARK(BM_LowerBoundBinary<RTreeAdapter>) ->Name("RadixTree/LowerBoundBinary") SIZES;
+BENCHMARK(BM_LowerBoundBinary<StdMapAdapter>)->Name("StdMap/LowerBoundBinary")    SIZES;
+BENCHMARK(BM_IterateBinary<RTreeAdapter>)    ->Name("RadixTree/IterateBinary")    ITER_SIZES;
+BENCHMARK(BM_IterateBinary<StdMapAdapter>)   ->Name("StdMap/IterateBinary")       ITER_SIZES;
+
 // Reverse iteration
 BENCHMARK(BM_ReverseIterate<RTreeAdapter>)->Name("RadixTree/ReverseIterate") ITER_SIZES;
 BENCHMARK(BM_ReverseIterate<StdMapAdapter>)->Name("StdMap/ReverseIterate")   ITER_SIZES;
@@ -442,6 +497,7 @@ BENCHMARK(BM_PrefixedMemory<StdMapAdapter>)  ->Name("StdMap/PrefixedMemory")    
 // Merge
 BENCHMARK(BM_MergeDisjoint)                  ->Name("RadixTree/MergeDisjoint")           SIZES;
 BENCHMARK(BM_MergeOverlapping)               ->Name("RadixTree/MergeOverlapping")        SIZES;
+BENCHMARK(BM_MergeOverlappingBinary)         ->Name("RadixTree/MergeOverlappingBinary")  SIZES;
 BENCHMARK(BM_SplitBuildMerge)                ->Name("RadixTree/SplitBuildMerge")              SIZES;
 BENCHMARK(BM_SplitBuildMergeOverlapping)     ->Name("RadixTree/SplitBuildMergeOverlapping")   SIZES;
 BENCHMARK(BM_SplitBuildMergePrefixed)        ->Name("RadixTree/SplitBuildMergePrefixed")      SIZES;

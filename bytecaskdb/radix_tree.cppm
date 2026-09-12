@@ -283,7 +283,7 @@ template <typename V> struct Node {
   }
   // Iterative tail-release avoids the O(depth) recursive destructor chain
   // that otherwise occurs via ~IntrusivePtr → release → delete → ~Node →
-  // ~ChildStore → ~IntrusivePtr → … .
+  // ~IntrusivePtr (the freed node's own child slots) → … .
   //
   // Profiling (perf record, MergeOverlapping/100K) showed this cascade as
   // 29% of total merge time. Converting the last-child release to a loop
@@ -607,6 +607,75 @@ template <typename V> struct Node {
       if (!n256->children_[idx])
         return std::nullopt;
       return ChildRef{b, n256->children_[idx]};
+    }
+    }
+    // See child_count()'s trailing comment — safe default, not UB.
+    return std::nullopt;
+  }
+
+  // Cursor for an ascending walk over one node's children. Each tier reads
+  // whichever field is O(1) for its own layout — the packed tiers index
+  // keys_/children_ by `ordinal`, Node256 scans its direct-mapped slots
+  // from `probe` — and only next_child() ever writes either, so the two
+  // cannot drift out of step.
+  struct ChildCursor {
+    std::size_t ordinal{0};
+    unsigned probe{0};
+  };
+
+  // Next child in ascending transition-byte order, advancing the cursor past
+  // it; nullopt once the children are exhausted. On return, cursor.ordinal
+  // is the ordinal *after* the child yielded, so the ordinal of that child
+  // is the value read from the cursor before the call.
+  //
+  // Prefer this over child_at(i) for any in-order traversal of a node's
+  // children. A full walk here costs O(count) on the packed tiers and
+  // O(256) on Node256; the same walk driven by child_at(i) is quadratic in
+  // fanout on Node256, which has no packed key array and so has to rescan
+  // its slots from zero on every call to turn an ordinal into a byte. That
+  // cost is real and was measured, not theoretical: moving these walks off
+  // child_at(i) made a single lower_bound() on a full-byte-range key shape
+  // ~9x faster (9.8 us -> 1.0 us at 100k keys) and MergeOverlapping on that
+  // shape ~18% faster, while leaving the packed tiers slightly faster too
+  // (see §7.12). child_at(i) remains for random ordinal access — the
+  // iterators' frames index by ordinal in both directions.
+  [[nodiscard]] auto next_child(ChildCursor &cursor) const
+      -> std::optional<ConstChildRef> {
+    switch (node_type()) {
+    case NodeType::Leaf:
+      return std::nullopt;
+    case NodeType::Node4: {
+      auto *n4 = static_cast<const Node4<V> *>(this);
+      if (cursor.ordinal >= n4->count_)
+        return std::nullopt;
+      auto i = cursor.ordinal++;
+      return ConstChildRef{n4->keys_[i], n4->children_[i]};
+    }
+    case NodeType::Node16: {
+      auto *n16 = static_cast<const Node16<V> *>(this);
+      if (cursor.ordinal >= n16->count_)
+        return std::nullopt;
+      auto i = cursor.ordinal++;
+      return ConstChildRef{n16->keys_[i], n16->children_[i]};
+    }
+    case NodeType::Node48: {
+      auto *n48 = static_cast<const Node48<V> *>(this);
+      if (cursor.ordinal >= n48->count_)
+        return std::nullopt;
+      auto i = cursor.ordinal++;
+      return ConstChildRef{n48->keys_[i], n48->children_[i]};
+    }
+    case NodeType::Node256: {
+      auto *n256 = static_cast<const Node256<V> *>(this);
+      while (cursor.probe < 256) {
+        auto slot = cursor.probe++;
+        if (!n256->children_[slot])
+          continue;
+        ++cursor.ordinal;
+        return ConstChildRef{static_cast<std::byte>(slot),
+                             n256->children_[slot]};
+      }
+      return std::nullopt;
     }
     }
     // See child_count()'s trailing comment — safe default, not UB.
@@ -1402,7 +1471,7 @@ private:
       return {std::move(new_node), inserted};
     }
     // No child for this transition — create a leaf. insert_child promotes
-    // new_node (leaf -> Node4 -> Large) as needed.
+    // new_node (leaf -> Node4 -> Node16 -> Node48 -> Node256) as needed.
     auto chain = build_leaf_chain(child_key, std::move(val));
     new_node = Node<V>::insert_child(std::move(new_node), transition,
                                      std::move(chain));
@@ -1623,18 +1692,22 @@ private:
     }
 
     if (b->has_children()) {
-      for (std::size_t i = 0; i < b->child_count(); ++i) {
-        auto b_slot = b->child_at(i);
-        auto slot = merged->find_child_mut(b_slot.transition);
+      // Cursor walk rather than child_at(i) per ordinal: b's children are
+      // visited in full here, and on a Node256 the ordinal accessor rescans
+      // the direct-mapped slots on every call, making the walk quadratic in
+      // fanout (see Node::next_child).
+      typename Node<V>::ChildCursor cursor;
+      while (auto b_slot = b->next_child(cursor)) {
+        auto slot = merged->find_child_mut(b_slot->transition);
         if (slot) {
           auto [child, child_overlaps] =
-              merge_impl(slot->ptr, b_slot.ptr, resolve);
+              merge_impl(slot->ptr, b_slot->ptr, resolve);
           slot->ptr = std::move(child);
           overlaps += child_overlaps;
         } else {
           // Disjoint subtree — share it in O(1), no clone needed.
-          merged = Node<V>::insert_child(std::move(merged), b_slot.transition,
-                                         b_slot.ptr);
+          merged = Node<V>::insert_child(std::move(merged),
+                                         b_slot->transition, b_slot->ptr);
         }
       }
     }
@@ -1755,9 +1828,18 @@ private:
 
   // Ensure a node is owned by this transient session.
   // Requires both matching edit tag AND unique ownership (refcount == 1)
-  // to allow in-place mutation. The refcount check defends against tag
-  // wraparound after 2^31 transient sessions: even if an old node
-  // happens to carry the same 31-bit tag, it will be cloned if shared.
+  // to allow in-place mutation.
+  //
+  // The refcount is the load-bearing half of that test, not the tag. Edit
+  // tags are 28 bits (bits 30:28 of packed_tag_ hold the node type), so they
+  // wrap after 2^28 sessions — reachable in well under an hour of sustained
+  // writes at one session per batch, so a stale node carrying this session's
+  // tag must be assumed to exist. It is still safe to mutate only what
+  // refcount == 1 admits: any node another holder can reach is either shared
+  // directly (refcount >= 2) or sits under a shared ancestor, and cloning
+  // that ancestor addrefs its children before this session descends into
+  // them. The tag is therefore a cheap filter that keeps clones rare, not
+  // the ownership proof.
   using Ops = PersistentRadixTree<V>;
 
   static auto ensure_mutable(const IntrusivePtr<Node<V>> &node,
@@ -1830,7 +1912,8 @@ private:
       existing_child->ptr = std::move(new_child);
       return {std::move(mutable_node), inserted};
     }
-    // insert_child promotes mutable_node (leaf -> Node4 -> Large) as needed.
+    // insert_child promotes mutable_node (leaf -> Node4 -> Node16 ->
+    // Node48 -> Node256) as needed.
     auto chain = Ops::build_leaf_chain(child_key, std::move(val), tag);
     mutable_node = Node<V>::insert_child(std::move(mutable_node), transition,
                                          std::move(chain));
@@ -1906,7 +1989,8 @@ private:
       existing_child->ptr = std::move(new_child);
       return {std::move(mutable_node), std::move(displaced), inserted};
     }
-    // insert_child promotes mutable_node (leaf -> Node4 -> Large) as needed.
+    // insert_child promotes mutable_node (leaf -> Node4 -> Node16 ->
+    // Node48 -> Node256) as needed.
     auto chain = Ops::build_leaf_chain(child_key, std::move(val), tag);
     mutable_node = Node<V>::insert_child(std::move(mutable_node), transition,
                                          std::move(chain));
@@ -2025,8 +2109,9 @@ template <typename V>
 auto PersistentRadixTree<V>::transient() const -> TransientRadixTree<V> {
   // Relaxed ordering: only uniqueness is required, not inter-thread visibility
   // ordering. Each transient session gets a distinct tag via fetch_add.
-  // Truncate to 30 bits — tag 0 is reserved for "immutable" sentinel.
-  // Bit 31 = has_value, bit 30 = has_children, bits 29:0 = edit_tag.
+  // Truncate to the tag field — tag 0 is reserved for the "immutable"
+  // sentinel. packed_tag_ layout: bit 31 = has_value, bits 30:28 = node
+  // type, bits 27:0 = edit_tag.
   auto raw = detail::next_edit_tag.fetch_add(1, std::memory_order_relaxed);
   auto tag = static_cast<std::uint32_t>(raw & Node<V>::kTagMask);
   if (tag == 0) [[unlikely]]
@@ -2285,33 +2370,34 @@ private:
       auto target_byte = remaining[0];
       auto child_remaining = remaining.subspan(1);
 
-      bool descended = false;
-      for (std::size_t i = 0; i < cur->child_count(); ++i) {
-        auto cb = cur->child_at(i).transition;
-        if (cb < target_byte)
+      // Walk children in order with a cursor rather than calling child_at(i)
+      // per candidate: on a Node256 child_at(i) costs O(i), which would make
+      // this descent quadratic in the node's fanout (see Node::next_child).
+      typename Node<V>::ChildCursor cursor;
+      for (;;) {
+        auto ordinal = cursor.ordinal;
+        auto slot = cur->next_child(cursor);
+
+        if (!slot || slot->transition > target_byte) {
+          // Either every child sorts below the target (walk exhausted) or
+          // the first one at/after it is strictly greater, so all remaining
+          // children are > target. Either way `ordinal` is where advance()
+          // must resume: one past the last child for the exhausted case,
+          // the greater child itself otherwise.
+          stack_.push_back({cur, ordinal, klb});
+          return false;
+        }
+        if (slot->transition < target_byte)
           continue;
 
-        if (cb == target_byte) {
-          // Exact match — push parent frame, descend into child.
-          stack_.push_back({cur, i + 1, klb});
-          klb = current_key_.size();
-          current_key_.push_back(cb);
-          cur = cur->child_at(i).ptr;
-          remaining = child_remaining;
-          descended = true;
-          break;
-        }
-
-        // cb > target_byte — children from here onward are all > target.
-        // Push frame so advance() picks up children[i].
-        stack_.push_back({cur, i, klb});
-        return false;
-      }
-
-      if (!descended) {
-        // All children < target_byte. Push exhausted frame for backtracking.
-        stack_.push_back({cur, cur->child_count(), klb});
-        return false;
+        // Exact match — push parent frame positioned past this child, then
+        // descend into it.
+        stack_.push_back({cur, ordinal + 1, klb});
+        klb = current_key_.size();
+        current_key_.push_back(target_byte);
+        cur = slot->ptr;
+        remaining = child_remaining;
+        break;
       }
     }
     return false;
@@ -2588,27 +2674,23 @@ private:
       auto target_byte = remaining[0];
       auto child_remaining = remaining.subspan(1);
 
-      bool descended = false;
-      for (std::size_t i = 0; i < cur->child_count(); ++i) {
-        auto cb = cur->child_at(i).transition;
-        if (cb < target_byte)
+      // Cursor walk — same reasoning as RadixTreeIterator::seek.
+      typename Node<V>::ChildCursor cursor;
+      for (;;) {
+        auto ordinal = cursor.ordinal;
+        auto slot = cur->next_child(cursor);
+
+        if (!slot || slot->transition > target_byte) {
+          stack_.push_back({cur, ordinal});
+          return false;
+        }
+        if (slot->transition < target_byte)
           continue;
 
-        if (cb == target_byte) {
-          stack_.push_back({cur, i + 1});
-          cur = cur->child_at(i).ptr;
-          remaining = child_remaining;
-          descended = true;
-          break;
-        }
-
-        stack_.push_back({cur, i});
-        return false;
-      }
-
-      if (!descended) {
-        stack_.push_back({cur, cur->child_count()});
-        return false;
+        stack_.push_back({cur, ordinal + 1});
+        cur = slot->ptr;
+        remaining = child_remaining;
+        break;
       }
     }
     return false;

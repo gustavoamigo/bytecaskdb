@@ -1071,6 +1071,125 @@ assertions / 1,455 cases; `radix_tree_memory_tests` 941 assertions / 22
 cases — both under default build flags and re-verified under
 `BYTECASK_MARCH=x86-64-v3` matching CI.
 
+### 7.12. Ordered access on the widest tier: cursor walks instead of ordinals
+
+Completing the 4-tier ART left one defect behind, found by reviewing
+`radix_tree.cppm` after the fact rather than by a failing test: the ordinal
+child accessor `child_at(i)` is O(1) on the packed tiers but O(i) on
+`Node256`, which keeps no packed key array and so has to rescan its
+direct-mapped slots to turn an ordinal into a transition byte. Three call
+sites walked a node's children by ordinal, making each walk quadratic in
+that node's fanout:
+
+- `RadixTreeIterator::seek` and `ValueIterator::seek` — the descent that
+  backs `lower_bound`, `upper_bound`, `iter_from`, `keys_from`,
+  `riter_from`, `rkeys_from` and both value-iterator entry points. Paid
+  once per call, with nothing to amortise it against.
+- `PersistentRadixTree::merge_impl` — the fan-in merge used by parallel
+  recovery.
+
+None of this was visible in the tracked benchmarks, because `uniform` and
+`prefixed` are generated from a sequential numeric index: their branching
+is digit-driven and bounded, so they never build a node wide enough to
+reach the top tier. `map_bench` gained `LowerBoundBinary`, `IterateBinary`
+and `MergeOverlappingBinary` on the `binary` shape, whose first byte covers
+the full `0x00`–`0xFF` range, to close that gap. The cost was large:
+
+| Benchmark | Ordinal walk | Cursor walk | Change |
+|---|---:|---:|---:|
+| `LowerBoundBinary/1000` | 5631 ns | 636 ns | **−88.7%** |
+| `LowerBoundBinary/10000` | 5923 ns | 677 ns | **−88.6%** |
+| `LowerBoundBinary/100000` | 9761 ns | 1037 ns | **−89.4%** |
+| `MergeOverlappingBinary/1000` | 96.3 µs | 76.2 µs | **−20.8%** |
+| `MergeOverlappingBinary/10000` | 800 µs | 769 µs | −3.8% |
+| `MergeOverlappingBinary/100000` | 31.13 ms | 25.49 ms | **−18.1%** |
+| `LowerBound/100000` (uniform) | 403.5 ns | 374.7 ns | −7.1% |
+| `UpperBound/100000` (uniform) | 437.4 ns | 413.3 ns | −5.5% |
+| `MergeOverlapping/100000` (uniform) | 7.353 ms | 7.281 ms | −1.0% |
+| `MergeDisjoint/100000` (uniform) | 2.409 ms | 2.415 ms | +0.3% |
+| `IterateBinary/10000` | 404.4 µs | 404.2 µs | −0.1% |
+
+A single `lower_bound` on the `binary` shape cost 9.8 µs before the fix and
+1.0 µs after. Mean of 7 repetitions each, measured back-to-back on the same
+binary and machine. The `binary`-shape seek and merge gains and the
+sequential-shape `lower_bound`/`upper_bound` gains are all beyond 2 standard
+deviations; the remaining rows (uniform-key merge, `IterateBinary`) are flat
+within noise. Nothing regressed beyond 2 standard deviations. Recorded
+memory per key is byte-for-byte identical to the previous commit on both
+tracked shapes (`Memory` 47.232/47.2032/47.20032, `PrefixedMemory`
+46.864/44.512/44.2948 at 1k/10k/100k) — the cursor adds no node fields.
+
+At the DB level (`engine_bench`, 200k keys, mean of 5 reps, RocksDB built
+from source for the harness) the effect appears exactly where the mechanism
+predicts and nowhere else:
+
+| Benchmark | Ordinal walk | Cursor walk | Change |
+|---|---:|---:|---:|
+| `ByteCaskDB/Range50` | 28839 ns | 27331 ns | **−5.2%** |
+| `ByteCaskDB/Get` | 820.1 ns | 805.0 ns | −1.8% (within 2 sd) |
+| `ByteCaskDB_UUIDv4/Get` | 1235.7 ns | 1240.5 ns | +0.4% (within 2 sd) |
+| `ByteCaskDB/Recovery` (4 threads) | 59.15 ms | 54.99 ms | −7.0% (within 2 sd) |
+
+Only `Range50` moves beyond noise: a range scan performs one `iter_from`
+descent, so it pays `seek` once per scan. `Get` resolves through
+`find_child`, which is a direct index on the widest tier and was never
+affected. Recovery's fan-in merge benefits in principle but its variance
+here (±3–10 ms) is far wider than the effect. Note these keys are
+sequential, so they never build a node wide enough to reach `Node256` —
+what `Range50` is showing is the packed-tier gain alone.
+
+**The fix.** `Node::next_child(ChildCursor&)` yields children in ascending
+transition order, and the cursor carries both an `ordinal` and a `probe`
+so each tier reads whichever field is O(1) for its own layout: the packed
+tiers index `keys_`/`children_` by ordinal, `Node256` scans its slots
+forward from `probe`. A full walk is therefore O(count) on the packed tiers
+and O(256) on `Node256`. Only `next_child` writes either field, so the two
+cannot drift out of step — the alternative, passing both as arguments,
+would have made correctness depend on the caller keeping them consistent.
+
+This also explains the −5% to −7% on the *sequential* shapes' `lower_bound`
+and `upper_bound`: the old loop called `child_at(i)` twice on the matching
+child (once for the transition, once for the pointer) and `child_count()`
+on every iteration; the cursor does one dispatch per child.
+
+Two alternatives were considered and rejected. A byte cursor alone
+(DuckDB's `GetNextChildNode` shape, no ordinal) would have pessimised the
+packed tiers, turning their O(1)-per-step walk into an O(count) key scan —
+the common case made worse to fix the rare one. An occupancy bitmap on
+`Node256` (four `uint64_t`, `popcount` for rank plus bit-select for
+ordinal→byte) would have fixed every call site including the iterators'
+frame-indexed `advance`/`retreat`, with no call-site changes at all, but it
+costs 32 B per `Node256` node against a hard "memory must not increase"
+constraint. `Node256` has only 6 bytes of padding to reclaim, so the cost
+is real. Measurement did not justify paying it: `IterateBinary` is flat,
+because `advance` rescans slots once per child yielded and so is bounded
+and amortised over a full traversal, unlike `seek`, which pays the whole
+rescan per call. The bitmap stays available if a future workload makes
+ordinal-indexed traversal hot.
+
+**Correctness.** `tests/radix_tree_test.cpp` gained "RadixTree seek
+descends a 256-child node" (8,649 assertions) — two-byte keys so the
+descent passes *through* the widest tier rather than terminating on it,
+run both with all 256 transitions live and with 128 live and a gap between
+every pair, checking `lower_bound`, `upper_bound`, `value_lower_bound`,
+`value_rlower_bound`, tail iteration from a `lower_bound` and reverse
+iteration from an `upper_bound` against a `std::map` model at every one of
+the 256 probe bytes — and "RadixTree merge walks a 256-child node"
+covering disjoint, fully overlapping, and wide-into-narrow merges. Both
+were mutation-tested: dropping `Node256`'s ordinal bookkeeping fails 699
+assertions, and making the walk skip every other slot fails the merge
+case. Full suite green (6,748,017 assertions / 1,457 cases),
+`radix_tree_memory_tests` green (941 assertions / 22 cases), and
+`[radix_tree]` green under AddressSanitizer — the last one mattering
+because `seek` assigns a child slot reference into the iterator's own
+`cur` (`cur = slot->ptr`), the sub-object aliasing case
+`IntrusivePtr::operator=` is explicitly hardened for.
+
+**Left as is.** `advance`, `retreat` and `descend_rightmost` still index by
+ordinal, because `RadixTreeIterator::Frame` stores an ordinal and uses it
+in both directions; replacing it with a cursor would rewrite the trickiest
+code in the file for a benchmark that shows no gain.
+
 ---
 
 ## 8. Benchmark Results

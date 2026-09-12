@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -2048,4 +2049,228 @@ TEST_CASE("value_rlower_bound deep tree", "[radix_tree]") {
   auto it = t.value_rlower_bound(to_bytes("z"));
   REQUIRE(it != std::default_sentinel);
   CHECK(*it == 4);
+}
+
+// ---------------------------------------------------------------------------
+// Descent and in-order walks through a full 256-child node.
+//
+// The widest tier is direct-mapped by transition byte and keeps no packed key
+// array, so converting an ordinal into a byte means scanning its slots.
+// seek() and merge_impl() therefore walk children with a cursor
+// (Node::next_child) rather than by ordinal. These cases pin that behaviour
+// at every byte, including the gaps a sparse wide node has, and check it
+// against a std::map model. std::char_traits<char> compares as unsigned char,
+// so the model orders keys exactly as the tree does.
+// ---------------------------------------------------------------------------
+namespace {
+
+auto collect_entries(const Tree &t)
+    -> std::vector<std::pair<std::string, int>> {
+  std::vector<std::pair<std::string, int>> out;
+  for (auto it = t.begin(); it != t.end(); ++it) {
+    auto [k, v] = *it;
+    out.emplace_back(to_string(k), v);
+  }
+  return out;
+}
+
+// std::map's value_type holds a const key, so its pairs are not directly
+// comparable with the collected ones.
+auto same_entries(const std::vector<std::pair<std::string, int>> &got,
+                  const std::map<std::string, int> &want) -> bool {
+  return got.size() == want.size() &&
+         std::equal(got.begin(), got.end(), want.begin(),
+                    [](const auto &l, const auto &r) {
+                      return l.first == r.first && l.second == r.second;
+                    });
+}
+
+// Two-byte keys: the root fans out over all 256 first bytes and each child
+// fans out again, so a descent must pass *through* the widest tier rather
+// than terminating on it.
+auto build_wide_tree(int first_byte_step)
+    -> std::pair<Tree, std::map<std::string, int>> {
+  auto t = Tree{};
+  std::map<std::string, int> model;
+  int v = 0;
+  for (int b = 0; b < 256; b += first_byte_step) {
+    for (int c : {0x00, 0x7F, 0xFF}) {
+      std::string key{static_cast<char>(b), static_cast<char>(c)};
+      t = t.set(to_bytes(key), v);
+      model[key] = v;
+      ++v;
+    }
+  }
+  return {std::move(t), std::move(model)};
+}
+
+} // namespace
+
+TEST_CASE("RadixTree seek descends a 256-child node", "[radix_tree]") {
+  // step 1 → all 256 transitions live; step 2 → 128 live with a gap between
+  // every pair, so every probe on an odd byte must skip forward.
+  auto step = GENERATE(1, 2);
+  auto [t, model] = build_wide_tree(step);
+  REQUIRE(t.size() == model.size());
+
+  SECTION("forward iteration matches the model") {
+    CHECK(same_entries(collect_entries(t), model));
+  }
+
+  SECTION("lower_bound finds every present key") {
+    for (const auto &[key, val] : model) {
+      auto it = t.lower_bound(to_bytes(key));
+      REQUIRE(it != t.end());
+      auto [k, got] = *it;
+      CHECK(to_string(k) == key);
+      CHECK(got == val);
+    }
+  }
+
+  SECTION("lower_bound/upper_bound match the model at every byte") {
+    for (int b = 0; b < 256; ++b) {
+      // A one-byte probe sorts before every two-byte key sharing that first
+      // byte, so this also covers absent bytes and both range ends.
+      std::string probe(1, static_cast<char>(b));
+
+      auto want_lb = model.lower_bound(probe);
+      auto lb = t.lower_bound(to_bytes(probe));
+      REQUIRE((lb == t.end()) == (want_lb == model.end()));
+      if (want_lb != model.end()) {
+        auto [k, v] = *lb;
+        CHECK(to_string(k) == want_lb->first);
+        CHECK(v == want_lb->second);
+      }
+
+      auto want_ub = model.upper_bound(probe);
+      auto ub = t.upper_bound(to_bytes(probe));
+      REQUIRE((ub == t.end()) == (want_ub == model.end()));
+      if (want_ub != model.end()) {
+        auto [k, v] = *ub;
+        CHECK(to_string(k) == want_ub->first);
+        CHECK(v == want_ub->second);
+      }
+    }
+  }
+
+  SECTION("iteration from a lower_bound yields the whole tail in order") {
+    for (int b = 0; b < 256; b += 17) {
+      std::string probe(1, static_cast<char>(b));
+      std::vector<std::string> got;
+      for (auto it = t.lower_bound(to_bytes(probe)); it != t.end(); ++it)
+        got.push_back(to_string((*it).first));
+
+      std::vector<std::string> want;
+      for (auto m = model.lower_bound(probe); m != model.end(); ++m)
+        want.push_back(m->first);
+      CHECK(got == want);
+    }
+  }
+
+  SECTION("value_lower_bound matches the model at every byte") {
+    for (int b = 0; b < 256; ++b) {
+      std::string probe(1, static_cast<char>(b));
+      auto want = model.lower_bound(probe);
+      auto it = t.value_lower_bound(to_bytes(probe));
+      REQUIRE((it == std::default_sentinel) == (want == model.end()));
+      if (want != model.end())
+        CHECK(*it == want->second);
+    }
+  }
+
+  SECTION("value_rlower_bound matches the model at every byte") {
+    for (int b = 0; b < 256; ++b) {
+      std::string probe(1, static_cast<char>(b));
+      // Largest key <= probe: first key greater than it, stepped back one.
+      auto want = model.upper_bound(probe);
+      bool have = want != model.begin();
+      if (have)
+        --want;
+      auto it = t.value_rlower_bound(to_bytes(probe));
+      REQUIRE((it != std::default_sentinel) == have);
+      if (have)
+        CHECK(*it == want->second);
+    }
+  }
+
+  SECTION("reverse iteration from upper_bound walks back in order") {
+    for (int b = 0; b < 256; b += 17) {
+      std::string probe(1, static_cast<char>(b));
+      auto it = t.upper_bound(to_bytes(probe));
+      std::vector<std::string> got;
+      while (it != t.begin()) {
+        --it;
+        got.push_back(to_string((*it).first));
+      }
+
+      std::vector<std::string> want;
+      for (auto m = model.upper_bound(probe); m != model.begin();) {
+        --m;
+        want.push_back(m->first);
+      }
+      CHECK(got == want);
+    }
+  }
+}
+
+TEST_CASE("RadixTree merge walks a 256-child node", "[radix_tree][merge]") {
+  auto resolve = [](int, int r) { return r; };
+
+  SECTION("disjoint wide nodes on both sides") {
+    // Even first bytes on the left, odd on the right: both roots reach the
+    // widest tier (128 children each) and every child of b is disjoint, so
+    // the merge walk must visit all 128 and adopt each subtree.
+    auto a = Tree{};
+    auto b = Tree{};
+    std::map<std::string, int> model;
+    for (int i = 0; i < 256; ++i) {
+      std::string key{static_cast<char>(i), '\x2A'};
+      if (i % 2 == 0)
+        a = a.set(to_bytes(key), i);
+      else
+        b = b.set(to_bytes(key), i);
+      model[key] = i;
+    }
+
+    auto merged = Tree::merge(a, b, resolve);
+    REQUIRE(merged.size() == model.size());
+    CHECK(same_entries(collect_entries(merged), model));
+  }
+
+  SECTION("fully overlapping wide nodes resolve to the right-hand value") {
+    auto a = Tree{};
+    auto b = Tree{};
+    std::map<std::string, int> model;
+    for (int i = 0; i < 256; ++i) {
+      std::string key{static_cast<char>(i), '\x2A'};
+      a = a.set(to_bytes(key), i);
+      b = b.set(to_bytes(key), i + 1000);
+      model[key] = i + 1000;
+    }
+
+    auto merged = Tree::merge(a, b, resolve);
+    REQUIRE(merged.size() == model.size());
+    CHECK(same_entries(collect_entries(merged), model));
+  }
+
+  SECTION("wide node merged into a narrow one") {
+    // b is wide (256 children), a has only three: the merge must adopt the
+    // subtrees b holds while resolving the three it shares with a.
+    auto a = Tree{};
+    auto b = Tree{};
+    std::map<std::string, int> model;
+    for (int i = 0; i < 256; ++i) {
+      std::string key{static_cast<char>(i), '\x2A'};
+      b = b.set(to_bytes(key), i + 1000);
+      model[key] = i + 1000;
+    }
+    for (int i : {0, 128, 255}) {
+      std::string key{static_cast<char>(i), '\x2A'};
+      a = a.set(to_bytes(key), i);
+    }
+
+    auto merged = Tree::merge(a, b, resolve);
+    REQUIRE(merged.size() == model.size());
+    CHECK(same_entries(collect_entries(merged), model));
+  }
 }
