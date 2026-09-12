@@ -554,6 +554,15 @@ void MariaDBTxn::savepoint_release(void *sv) {
   if (idx < savepoints_.size()) { savepoints_.resize(idx); }
 }
 
+namespace {
+// Lexicographic byte compare; a proper prefix sorts first.
+int lex_compare(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
+  const int c = std::memcmp(a, b, std::min(alen, blen));
+  if (c != 0) return c;
+  return (alen < blen) ? -1 : (alen > blen) ? 1 : 0;
+}
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // MergeIterator
 //
@@ -711,11 +720,9 @@ void MariaDBTxn::MergeIterator::load_snap_current() {
     }
   }
 
-  if (!reverse_ && !bound_.empty()) {
-    if (klen >= bound_.size() &&
-        std::memcmp(kp, bound_.data(), bound_.size()) >= 0) {
-      return;
-    }
+  if (!reverse_ && !bound_.empty() &&
+      lex_compare(kp, klen, bound_.data(), bound_.size()) >= 0) {
+    return;
   }
 
   snap_key_ptr_ = kp;
@@ -739,8 +746,7 @@ bool MariaDBTxn::MergeIterator::buf_candidate_valid() const {
   if (buf_it_ == buf_end_) return false;
   const auto &bk = buf_it_->first;
   if (!reverse_ && !bound_.empty() &&
-      bk.size() >= bound_.size() &&
-      std::memcmp(bk.data(), bound_.data(), bound_.size()) >= 0) {
+      lex_compare(bk.data(), bk.size(), bound_.data(), bound_.size()) >= 0) {
     return false;
   }
   if (use_index_filter_) {
@@ -785,14 +791,9 @@ void MariaDBTxn::MergeIterator::advance() {
       return;
     }
 
-    // Both sides have a candidate: lexicographic compare, shorter-is-less.
+    // Both sides have a candidate.
     const auto &bk = buf_it_->first;
-    const size_t n = std::min(bk.size(), snap_key_len_);
-    int cmp = std::memcmp(bk.data(), snap_key_ptr_, n);
-    if (cmp == 0) {
-      cmp = (bk.size() < snap_key_len_) ? -1
-          : (bk.size() > snap_key_len_) ?  1 : 0;
-    }
+    const int cmp = lex_compare(bk.data(), bk.size(), snap_key_ptr_, snap_key_len_);
 
     if (cmp == 0) {
       // Same key on both sides: the buffer's version wins; a tombstone

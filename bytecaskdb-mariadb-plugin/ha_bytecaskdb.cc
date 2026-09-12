@@ -26,6 +26,7 @@
 #include <private/service_versions.h>
 #endif
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <exception>
@@ -1099,14 +1100,15 @@ bool key_has_prefix(const MariaDBTxn::MergeIterator &it,
 // then the unsupplied remainder padded in *transformed* space — 0x00 sorts
 // before every stored key sharing the prefix, 0xFF after every one. (Padding
 // before the transform would be wrong: 0xFF bytes through the signed-integer
-// transform encode -1, not the maximum.) For a secondary index padded high
-// the PK suffix is padded with 0xFF as well.
+// transform encode -1, not the maximum.) A high-padded key is extended past
+// any stored key sharing the prefix, so it also sorts after the exact key
+// when the whole key was supplied.
 // Returns the length of namespace + transformed prefix, i.e. the bytes a
 // stored key must share to "have the prefix".
-std::size_t ha_bytecaskdb::build_search_key(const uchar *key, uint prefix_len,
-                                            bool pad_high) {
-  const bool on_pk = (active_index == table->s->primary_key);
-  const KEY &key_info = table->key_info[active_index];
+std::size_t ha_bytecaskdb::build_search_key(uint idx, const uchar *key,
+                                            uint prefix_len, bool pad_high) {
+  const bool on_pk = (idx == table->s->primary_key);
+  const KEY &key_info = table->key_info[idx];
   const uint key_len = key_info.key_length;
   const std::size_t ns_len = on_pk ? 5 : 7;
 
@@ -1115,8 +1117,8 @@ std::size_t ha_bytecaskdb::build_search_key(const uchar *key, uint prefix_len,
   p[0] = on_pk ? kNsRow : kNsIndex;
   write_table_id_prefix(p + 1, table_id_);
   if (!on_pk) {
-    p[5] = static_cast<uint8_t>((active_index >> 8) & 0xFF);
-    p[6] = static_cast<uint8_t>( active_index       & 0xFF);
+    p[5] = static_cast<uint8_t>((idx >> 8) & 0xFF);
+    p[6] = static_cast<uint8_t>( idx       & 0xFF);
   }
 
   uint8_t *kp = p + ns_len;
@@ -1128,15 +1130,17 @@ std::size_t ha_bytecaskdb::build_search_key(const uchar *key, uint prefix_len,
   if (on_pk) {
     normalize_padspace_pk(kp, &key_info);
   } else {
-    fix_varchar_key_encoding(kp, table, active_index);
+    fix_varchar_key_encoding(kp, table, idx);
   }
   make_mem_comparable(kp, &key_info, prefix_len);
 
   if (pad_high) {
     std::memset(kp + prefix_len, 0xFF, key_len - prefix_len);
-    if (!on_pk) {
-      search_key_buf_.resize(ns_len + key_len + pk_suffix_length(table), 0xFF);
-    }
+    // Sort after every stored key carrying the prefix, including the key
+    // itself when the whole key was supplied: a secondary entry continues
+    // with its PK suffix, a PK key with nothing, so extend past both.
+    const std::size_t tail = on_pk ? 1 : pk_suffix_length(table);
+    search_key_buf_.resize(ns_len + key_len + tail, 0xFF);
   }
   return ns_len + prefix_len;
 }
@@ -1162,7 +1166,7 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
 
   const SeekMode mode = seek_mode_for(find_flag);
   const std::size_t ns_prefix_len =
-      build_search_key(key, prefix_len, mode.pad_high);
+      build_search_key(active_index, key, prefix_len, mode.pad_high);
 
   // Transformed prefix, used by index_next_same and the prefix rules below.
   sec_search_key_.assign(search_key_buf_.begin(),
@@ -1461,13 +1465,75 @@ int ha_bytecaskdb::info(uint flag) {
 }
 
 // ---------------------------------------------------------------------------
-// records_in_range() — estimate rows in key range for optimizer
+// records_in_range() — row estimate for the optimizer.
+//
+// Key enumeration is an in-memory tree walk, so a selective range is
+// counted exactly (merged with this transaction's buffered writes) up to
+// kRangeCountCap keys. Above the cap the walk stops and the estimate falls
+// back to a fixed fraction of the table, which is all the optimizer needs
+// to rank a wide range against a narrow one. Never returns 0: the server
+// treats 0 as an exact "empty" answer.
 // ---------------------------------------------------------------------------
 
-ha_rows ha_bytecaskdb::records_in_range(uint /*index*/, const key_range */*min_key*/,
-                                         const key_range */*max_key*/,
-                                         page_range */*pages*/) {
-  return stats.records > 0 ? std::max(ha_rows(2), stats.records / 10) : 2;
+namespace {
+constexpr ha_rows kRangeCountCap = 1024;
+
+// Number of supplied bytes in a key_range: keypart_map marks whole leading
+// parts, the same way index_read_map interprets it.
+uint supplied_key_bytes(const KEY &key_info, const key_range *r) {
+  uint len = 0;
+  for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
+    if (!(r->keypart_map & (key_part_map(1) << i))) break;
+    len += key_info.key_part[i].store_length;
+  }
+  return len;
+}
+}  // namespace
+
+ha_rows ha_bytecaskdb::records_in_range(uint index, const key_range *min_key,
+                                         const key_range *max_key,
+                                         page_range * /*pages*/) {
+  const ha_rows fallback =
+      stats.records > 0 ? std::max(ha_rows(2), stats.records / 10) : 2;
+  auto *txn = txn_cached_;
+  if (!g_db || !txn) { return fallback; }
+
+  const bool on_pk = (index == table->s->primary_key);
+  const KEY &key_info = table->key_info[index];
+  const auto idx = static_cast<uint16_t>(index);
+
+  // Lower bound: >= key (KEY_EXACT / KEY_OR_NEXT) pads low, > key
+  // (AFTER_KEY) pads high so every key carrying the prefix sorts before it.
+  std::vector<uint8_t> lo;
+  if (min_key) {
+    build_search_key(index, min_key->key, supplied_key_bytes(key_info, min_key),
+                     min_key->flag == HA_READ_AFTER_KEY);
+    lo = search_key_buf_;
+  } else {
+    lo = on_pk ? table_id_prefix(table_id_) : index_id_prefix(table_id_, idx);
+  }
+  // Upper bound (exclusive in the scan): <= key (AFTER_KEY) pads high so
+  // the prefix's keys stay below it, < key (BEFORE_KEY) pads low.
+  std::vector<uint8_t> hi;
+  if (max_key) {
+    build_search_key(index, max_key->key, supplied_key_bytes(key_info, max_key),
+                     max_key->flag == HA_READ_AFTER_KEY);
+    hi = search_key_buf_;
+  } else {
+    hi = on_pk ? table_id_upper_bound(table_id_)
+               : index_id_upper_bound(table_id_, idx);
+  }
+
+  auto it = on_pk
+      ? txn->iter_prefix(lo.data(), lo.size(), hi.data(), hi.size(), table_id_)
+      : txn->iter_index_prefix(lo.data(), lo.size(), hi.data(), hi.size(),
+                               table_id_, idx);
+  if (!it) { return fallback; }
+
+  ha_rows n = 0;
+  for (; it->valid() && n < kRangeCountCap; it->next()) { ++n; }
+  if (n >= kRangeCountCap) { return std::max(kRangeCountCap, fallback); }
+  return std::max(ha_rows(1), n);
 }
 
 // ---------------------------------------------------------------------------
