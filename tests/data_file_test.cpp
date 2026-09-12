@@ -8,12 +8,19 @@
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
 #include <array>
+#include <csignal>
 #include <cstddef>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <sys/wait.h>
 #include <system_error>
+#include <tuple>
+#include <unistd.h>
 #include <vector>
 
 #ifdef BYTECASK_TESTING
@@ -28,6 +35,36 @@ namespace {
 
 auto to_bytes(std::string_view sv) -> std::span<const std::byte> {
   return std::as_bytes(std::span{sv.data(), sv.size()});
+}
+
+// Runs fn in a forked child and reports whether it died on SIGABRT.
+// panic() aborts by design — it must not be catchable — so proving it fires
+// needs a separate process rather than a REQUIRE_THROWS. The child's stderr is
+// silenced so the expected panic message does not look like a test failure.
+auto dies_by_panic(const std::function<void()> &fn) -> bool {
+  const auto pid = ::fork();
+  if (pid == 0) {
+    // Catch2 traps SIGABRT and finishes the run from its handler, writing its
+    // report on the way out. In a forked child that report lands in the same
+    // --out file the parent will write, leaving two XML documents in it. Take
+    // the handler back so abort() terminates the child immediately, and leave
+    // the child no other route into Catch2's reporting.
+    std::signal(SIGABRT, SIG_DFL);
+    // A child forked from a multi-threaded parent can deadlock on a lock held
+    // at fork time; fail the check instead of hanging CI.
+    ::alarm(30);
+    std::ignore = std::freopen("/dev/null", "w", stderr);
+    try {
+      fn();
+    } catch (...) {
+      ::_exit(2);  // threw instead of panicking
+    }
+    ::_exit(0);  // returned: no panic
+  }
+  REQUIRE(pid != -1);
+  int status = 0;
+  REQUIRE(::waitpid(pid, &status, 0) == pid);
+  return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
 }
 
 } // namespace
@@ -518,4 +555,128 @@ TEST_CASE("ReadOnlyMmapDataFile::scan returns nullopt on truncated entry body",
   CHECK(!result.has_value());
 
   std::filesystem::remove(path);
+}
+
+// ---------------------------------------------------------------------------
+// createDataFileForWrite — a stem is never reused
+//
+// make_data_file_stem names files <UTC second>_<32-bit salt>. The salt is a
+// birthday collision away from repeating within a directory, and a rotation
+// threshold of a few bytes mints thousands of files per second. Reusing a stem
+// used to open the sealed file for write and adopt its length: the assert in
+// execute_slots caught it in debug, and in release the appended entries were
+// lost at recovery, because hint generation skips a file that already has one.
+// Both halves of the name must now be refused outright.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("createDataFileForWrite panics when the data file already exists",
+          "[data_file][panic]") {
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_stem_data";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string stem = "data_20260912164544_deadbeef_V01";
+
+  // A sealed file from an earlier rotation, with content past the threshold.
+  {
+    auto sealed = bytecask::openDataFileForWrite(dir / (stem + ".data"), 0,
+                                                 false);
+    (void)sealed->append_entry(1, bytecask::EntryType::Put, to_bytes("k"),
+                               to_bytes("v"));
+    sealed->sync();
+  }
+  REQUIRE(std::filesystem::file_size(dir / (stem + ".data")) > 0);
+
+  CHECK(dies_by_panic([&] {
+    (void)bytecask::createDataFileForWrite(dir, stem, ".data", 0, false);
+  }));
+
+  // mmap-backed files take a separate open() path — guard both.
+  CHECK(dies_by_panic([&] {
+    (void)bytecask::createDataFileForWrite(dir, stem, ".data", 4096, true);
+  }));
+
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("createDataFileForWrite panics when the stem was already hinted",
+          "[data_file][panic]") {
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_stem_hint";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string stem = "data_20260912164544_cafebabe_V01";
+
+  // The data file is gone (vacuumed), but its hint marks the stem as sealed.
+  { std::ofstream hint{dir / (stem + ".hint")}; }
+  REQUIRE(std::filesystem::exists(dir / (stem + ".hint")));
+  REQUIRE_FALSE(std::filesystem::exists(dir / (stem + ".data")));
+
+  CHECK(dies_by_panic([&] {
+    (void)bytecask::createDataFileForWrite(dir, stem, ".data", 0, false);
+  }));
+
+  // Vacuum stages under .data.tmp; a hinted stem is off limits there too.
+  CHECK(dies_by_panic([&] {
+    (void)bytecask::createDataFileForWrite(dir, stem, ".data.tmp", 0, false);
+  }));
+
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("createDataFileForWrite accepts an unused stem", "[data_file]") {
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_stem_ok";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string stem = "data_20260912164544_00000001_V01";
+
+  auto file = bytecask::createDataFileForWrite(dir, stem, ".data", 0, false);
+  CHECK(file->size() == 0);
+  CHECK(file->path() == dir / (stem + ".data"));
+  CHECK(std::filesystem::exists(dir / (stem + ".data")));
+
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// renameDataFileExclusive — final placement claims the name atomically
+//
+// Vacuum stages its compacted copy under .data.tmp holding only vacuum_mu_,
+// so a rotation can mint the same stem before the copy finishes. Checking the
+// target and then renaming loses that race; refusing inside the placement
+// itself does not.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("renameDataFileExclusive places a staged file", "[data_file]") {
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_place_ok";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto from = dir / "staged.data.tmp";
+  const auto to = dir / "staged.data";
+  { std::ofstream f{from}; f << "compacted"; }
+
+  bytecask::renameDataFileExclusive(from, to);
+
+  CHECK(std::filesystem::exists(to));
+  CHECK_FALSE(std::filesystem::exists(from));  // staged copy is consumed
+  CHECK(std::filesystem::file_size(to) == 9);
+
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("renameDataFileExclusive panics rather than replacing a live file",
+          "[data_file][panic]") {
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_place_bad";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto from = dir / "staged.data.tmp";
+  const auto to = dir / "staged.data";
+  { std::ofstream f{from}; f << "compacted"; }
+  { std::ofstream f{to}; f << "live data that must survive"; }
+
+  CHECK(dies_by_panic([&] { bytecask::renameDataFileExclusive(from, to); }));
+
+  // The panicking child must not have touched either file.
+  CHECK(std::filesystem::file_size(to) == 27);
+  CHECK(std::filesystem::exists(from));
+
+  std::filesystem::remove_all(dir);
 }

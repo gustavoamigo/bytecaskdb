@@ -1289,24 +1289,34 @@ DbFollowerMode::~DbFollowerMode() = default;
 namespace {
 
 // Generates a unique data file stem.
-// Format: "data_{YYYYMMDDHHmmss}_{RRRRRRRR}_V01"
+// Format: "data_{YYYYMMDDHHmmss}_{RRRRRRRRRRRRRRRR}_V01"
 //   - Timestamp: UTC second precision, human-readable creation time (debug hint
 //     only — does not reflect content age after compaction).
-//   - RRRRRRRR: 4-byte random hex salt for collision avoidance.
-//   - V01: file format version.
+//   - R...: 8-byte random hex salt. The timestamp only separates files by the
+//     second, so the salt alone separates every file minted inside one — with
+//     a small max_file_bytes that is thousands of files, and the collision rate
+//     grows with the square of that count. 64 bits keeps it negligible
+//     (~1e-13/second at 2,000 files) where 32 bits did not (~5e-4).
+//   - V01: file format version. Nothing parses the stem's interior; recovery
+//     keys on this suffix, so salt width can change without breaking old files.
+//
+// Drawn from random_device per call rather than from a seeded PRNG: seeding
+// mt19937 with one 32-bit draw would give a process only 2^32 possible salt
+// sequences however wide each output was, which is the property that has to
+// improve. Two reads per rotation, and rotation is per max_file_bytes.
 auto make_data_file_stem() -> std::string {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-  static thread_local std::mt19937 rng{std::random_device{}()};
+  static thread_local std::random_device rd;
 #pragma clang diagnostic pop
-  const auto salt = std::uniform_int_distribution<std::uint32_t>{0, 0xFFFF'FFFF}(rng);
+  const auto salt = (static_cast<std::uint64_t>(rd()) << 32) | rd();
 
   const auto now = std::chrono::system_clock::now();
   const auto tt = std::chrono::system_clock::to_time_t(now);
   std::tm tm_buf{};
   ::gmtime_r(&tt, &tm_buf);
 
-  return std::format("data_{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}_{:08x}_V01",
+  return std::format("data_{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}_{:016x}_V01",
                      tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
                      tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, salt);
 }
@@ -1937,8 +1947,8 @@ DB::DB(std::filesystem::path dir, Options opts)
     counters_.files_opened.store(file_count, std::memory_order_relaxed);
     s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
-    auto new_active = openDataFileForWrite(
-        dir_ / (stem + ".data"), rotation_threshold_, use_mmap_);
+    auto new_active = createDataFileForWrite(
+        dir_, stem, ".data", rotation_threshold_, use_mmap_);
     // +1 for the new active file.
     counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
     auto files_t = s.files.transient();
@@ -2471,8 +2481,8 @@ void DB::rotate_active_file(TransientEngineState &t,
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_rotate_file_creation);
 #endif
-  auto new_file = openDataFileForWrite(
-      dir_ / (stem + ".data"), rotation_threshold_, use_mmap_);
+  auto new_file = createDataFileForWrite(
+      dir_, stem, ".data", rotation_threshold_, use_mmap_);
   t.apply_rotate_file(read_only_old, std::move(new_file));
   auto dir = dir_;
   worker_.dispatch([f = std::move(read_only_old), d = std::move(dir)] {
@@ -2653,8 +2663,8 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_vacuum_compact_tmp_create);
 #endif
-    auto tmp_file = openDataFileForWrite(
-        tmp_data_path, rotation_threshold_, use_mmap_);
+    auto tmp_file = createDataFileForWrite(
+        dir_, stem, ".data.tmp", rotation_threshold_, use_mmap_);
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id);
     tmp_file->sync();
   }
@@ -2662,7 +2672,11 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_vacuum_compact_rename);
 #endif
-  std::filesystem::rename(tmp_data_path, final_data_path);
+  // Exclusive placement, not std::filesystem::rename: vacuum stages its copy
+  // holding only vacuum_mu_, so a concurrent rotation can mint this stem
+  // between here and the staging create. renameDataFileExclusive refuses the
+  // target instead of replacing it.
+  renameDataFileExclusive(tmp_data_path, final_data_path);
   auto new_file = openDataFileForRead(final_data_path, use_mmap_);
   flush_hints_for(new_file, dir_);
 
@@ -2829,8 +2843,8 @@ void DB::resume() {
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_resume_file_creation);
 #endif
-  auto new_file = openDataFileForWrite(
-      dir_ / (stem + ".data"), rotation_threshold_, use_mmap_);
+  auto new_file = createDataFileForWrite(
+      dir_, stem, ".data", rotation_threshold_, use_mmap_);
 
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.

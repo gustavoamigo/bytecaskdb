@@ -11,11 +11,11 @@ stem:
 
 ```
 my_db/
-├── data_20260407123456_a7f2b31e_V01.data   ← active data file (append-only)
-├── data_20260407123455_3b1e04c9_V01.data   ← sealed data file (read-only)
-├── data_20260407123455_3b1e04c9_V01.hint   ← companion hint file (read-only)
-├── data_20260407123454_c904f182_V01.data
-├── data_20260407123454_c904f182_V01.hint
+├── data_20260407123456_a7f2b31e6c04d915_V01.data   ← active data file (append-only)
+├── data_20260407123455_3b1e04c9f7a2e8b0_V01.data   ← sealed data file (read-only)
+├── data_20260407123455_3b1e04c9f7a2e8b0_V01.hint   ← companion hint file (read-only)
+├── data_20260407123454_c904f18255de7a63_V01.data
+├── data_20260407123454_c904f18255de7a63_V01.hint
 └── ...
 ```
 
@@ -29,13 +29,13 @@ my_db/
 ### File Naming
 
 ```
-data_{YYYYMMDDHHmmss}_{RRRR}_V{XX}
+data_{YYYYMMDDHHmmss}_{RRRRRRRRRRRRRRRR}_V{XX}
 ```
 
 | Field              | Description |
 |--------------------|-------------|
 | `YYYYMMDDHHmmss`   | UTC timestamp at second precision. Records when the file was created on disk — **not** the age of its content. After vacuum, a file may contain entries much older than its timestamp. |
-| `RRRRRRRR`           | 4-byte random hex salt (8 characters, `00000000`–`ffffffff`). Prevents collisions when multiple files are created within the same second. |
+| `RRRRRRRRRRRRRRRR`   | 8-byte random hex salt (16 characters). The timestamp only separates files by the second, so within one second the salt separates them alone; 64 bits keeps a repeat negligible (~1e-13 at 2,000 files in one second). Drawn per file from the system entropy source, not from a seeded PRNG. |
 | `V{XX}`            | File format version. `V01` is the initial version. The engine uses this to select the correct parser at open time. |
 
 The timestamp is a human-readable debug hint. Filename ordering carries no
@@ -43,9 +43,22 @@ semantic meaning for content ordering — entry sequence numbers inside the file
 are the authoritative ordering mechanism. Each data file has at most one
 companion hint file with the same stem.
 
+A stem is never reused. Reusing one would reopen a sealed file for write, and
+entries appended past its end are invisible to recovery, because a file that
+already has a `.hint` is skipped by hint generation. The salt makes a repeat
+negligible; the engine does not rely on that alone, and refuses the name
+outright: every data file is created with `O_EXCL`, any stem with an existing
+`.hint` is rejected, and vacuum claims its final name atomically rather than
+replacing whatever is there. Any of those firing aborts the process — see
+*Fatal invariants* in [`CONTRACT.md`](../CONTRACT.md).
+
+Salt width is not part of the parsing contract. Recovery keys on the `V{XX}`
+suffix and never parses the stem's interior, so files written by older versions
+with an 8-character salt remain readable.
+
 Examples:
-- `data_20260407123456_a7f2b31e_V01.data`
-- `data_20260407123456_a7f2b31e_V01.hint`
+- `data_20260407123456_a7f2b31e6c04d915_V01.data`
+- `data_20260407123456_a7f2b31e6c04d915_V01.hint`
 
 ---
 

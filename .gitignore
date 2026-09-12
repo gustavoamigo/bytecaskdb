@@ -13,7 +13,6 @@ bytecaskdb-node/native/bytecask.node
 
 # Editor / LSP caches
 .cache/
-.claude/
 .vscode/
 compile_commands.json
 
@@ -65,8 +64,15 @@ bytecaskdb-mariadb-plugin/tests/sysbench_results.csv
 
 .notes
 
-# Claude Code local state
-.claude/
+# Claude Code local state — except the SessionStart hook and its registration,
+# which provision the toolchain for Claude Code on the web (see CONTRIBUTING.md).
+# Re-inclusion has to walk down one directory at a time: git will not re-include
+# a path whose parent directory is itself excluded.
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+.claude/hooks/*
+!.claude/hooks/session-start.sh
 
 # Local tools (e.g. nektos/act)
 bin/

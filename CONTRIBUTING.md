@@ -18,6 +18,17 @@ xmake run bytecask_tests
 
 That's it. If the tests pass, you're in good shape.
 
+Sessions in [Claude Code on the web](https://code.claude.com/docs/en/claude-code-on-the-web)
+start from a bare Ubuntu container with none of this installed, so
+`.claude/hooks/session-start.sh` provisions it on session start: it builds xmake
+from source, installs `clang` and `nanobind`, and runs `xmake f` once so the
+dependency packages land in the cached container state. Two constraints in that
+environment shape the script — Ubuntu's packaged xmake (2.8.7) is too old to
+load the current xmake-repo, and the egress policy blocks `xmake.io` and GitHub
+archive downloads while allowing git, which is why xmake is cloned and built
+rather than installed. The hook is a no-op everywhere else: local checkouts, the
+Dev Container, and Codespaces already have the toolchain.
+
 ## Making a change
 
 1. Open an issue or comment on an existing one before starting significant work, so we can discuss direction.

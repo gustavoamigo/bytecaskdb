@@ -19,6 +19,7 @@
 #include <mutex>
 #include <random>
 #include <ranges>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -336,6 +337,55 @@ TEST_CASE("DB rotation creates new data file", "[bytecask][rotation]") {
     }
   }
   CHECK(data_file_count == 2);
+}
+
+// ---------------------------------------------------------------------------
+// Data file stems carry a 64-bit salt
+//
+// The timestamp only separates files by the second, so within one second the
+// salt separates them alone. A 32-bit salt repeated often enough to be hit in
+// CI (~5e-4 per 2,000-file test run); 64 bits puts that at ~1e-13. Recovery
+// keys on the V01 suffix and never parses the stem's interior, so widening it
+// leaves older files readable — "DB recovery: incomplete batch is discarded"
+// below still hand-writes an 8-hex-salt name and recovers from it.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB data file stems carry a 64-bit salt", "[bytecask][rotation]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+  for (int i = 0; i < 8; ++i) {
+    db.put({}, to_bytes("k" + std::to_string(i)), to_bytes("v"));
+  }
+
+  // data_<14 digits>_<16 lowercase hex>_V01
+  auto well_formed = [](std::string_view stem) {
+    if (!stem.starts_with("data_") || !stem.ends_with("_V01")) return false;
+    if (stem.size() != 5 + 14 + 1 + 16 + 4) return false;
+    for (std::size_t i = 5; i < 19; ++i) {
+      if (stem[i] < '0' || stem[i] > '9') return false;
+    }
+    if (stem[19] != '_') return false;
+    for (std::size_t i = 20; i < 36; ++i) {
+      const auto c = stem[i];
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+  };
+
+  std::set<std::string> salts;
+  int checked = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() != ".data") continue;
+    const auto stem = e.path().stem().string();
+    INFO("stem=\"" << stem << "\"");
+    CHECK(well_formed(stem));
+    salts.insert(stem.substr(20, 16));
+    ++checked;
+  }
+  REQUIRE(checked > 1);
+  // Every file drew its own salt — the old generator was seeded once per
+  // thread, which is the property that had to change.
+  CHECK(salts.size() == static_cast<std::size_t>(checked));
 }
 
 // ---------------------------------------------------------------------------
