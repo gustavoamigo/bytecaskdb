@@ -214,6 +214,10 @@ private:
   // Saves `current_row_key_` from a slice the iterator gave us.
   void save_current_row_key(const uint8_t *data, std::size_t len);
   int index_read_current(uchar *buf);
+  // Encodes the optimizer's (partial) key for the active index into
+  // search_key_buf_, padding unsupplied parts low or high. Returns the
+  // length of namespace + supplied prefix. See index_read_map.
+  std::size_t build_search_key(const uchar *key, uint prefix_len, bool pad_high);
 
   // True when this handler is the destination of an ALTER TABLE copy into a
   // hidden #sql-xxx table — the case where write_row switches to batched
