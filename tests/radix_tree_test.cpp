@@ -2052,7 +2052,7 @@ TEST_CASE("value_rlower_bound deep tree", "[radix_tree]") {
 }
 
 // ---------------------------------------------------------------------------
-// Descent and in-order walks through a full 256-child node.
+// Descent and in-order walks over a node at every tier.
 //
 // The widest tier is direct-mapped by transition byte and keeps no packed key
 // array, so converting an ordinal into a byte means scanning its slots.
@@ -2106,10 +2106,17 @@ auto build_wide_tree(int first_byte_step)
 
 } // namespace
 
-TEST_CASE("RadixTree seek descends a 256-child node", "[radix_tree]") {
-  // step 1 → all 256 transitions live; step 2 → 128 live with a gap between
-  // every pair, so every probe on an odd byte must skip forward.
-  auto step = GENERATE(1, 2);
+TEST_CASE("RadixTree seek descends a wide node", "[radix_tree]") {
+  // The step sets the root's fanout (256 / step), which selects the tier
+  // next_child has to serve, and every step > 1 leaves gaps so probes on a
+  // missing byte must skip forward:
+  //   step 1  → 256 children, the widest tier, fully dense
+  //   step 2  → 128 children, still the widest tier, every other byte live
+  //   step 8  →  32 children, the 48-slot tier
+  //   step 32 →   8 children, the 16-slot tier
+  // Each child then fans out over three second bytes (the 4-slot tier), so
+  // one run covers all four tiers.
+  auto step = GENERATE(1, 2, 8, 32);
   auto [t, model] = build_wide_tree(step);
   REQUIRE(t.size() == model.size());
 
@@ -2213,7 +2220,7 @@ TEST_CASE("RadixTree seek descends a 256-child node", "[radix_tree]") {
   }
 }
 
-TEST_CASE("RadixTree merge walks a 256-child node", "[radix_tree][merge]") {
+TEST_CASE("RadixTree merge walks a wide node", "[radix_tree][merge]") {
   auto resolve = [](int, int r) { return r; };
 
   SECTION("disjoint wide nodes on both sides") {

@@ -1168,14 +1168,16 @@ rescan per call. The bitmap stays available if a future workload makes
 ordinal-indexed traversal hot.
 
 **Correctness.** `tests/radix_tree_test.cpp` gained "RadixTree seek
-descends a 256-child node" (8,649 assertions) — two-byte keys so the
-descent passes *through* the widest tier rather than terminating on it,
-run both with all 256 transitions live and with 128 live and a gap between
-every pair, checking `lower_bound`, `upper_bound`, `value_lower_bound`,
-`value_rlower_bound`, tail iteration from a `lower_bound` and reverse
-iteration from an `upper_bound` against a `std::map` model at every one of
-the 256 probe bytes — and "RadixTree merge walks a 256-child node"
-covering disjoint, fully overlapping, and wide-into-narrow merges. Both
+descends a wide node" — two-byte keys so the descent passes *through* the
+wide node rather than terminating on it, checking `lower_bound`,
+`upper_bound`, `value_lower_bound`, `value_rlower_bound`, tail iteration
+from a `lower_bound` and reverse iteration from an `upper_bound` against a
+`std::map` model at every one of the 256 probe bytes. The root's fanout is
+parameterised over 256, 128, 32 and 8 children so one run drives
+`next_child` through all four tiers, with every case below 256 leaving gaps
+so a probe on a missing byte must skip forward. A companion case, "RadixTree
+merge walks a wide node", covers disjoint, fully overlapping, and
+wide-into-narrow merges. Both
 were mutation-tested: dropping `Node256`'s ordinal bookkeeping fails 699
 assertions, and making the walk skip every other slot fails the merge
 case. Full suite green (6,748,017 assertions / 1,457 cases),
