@@ -245,3 +245,62 @@ def test_high_concurrency_inserts(make_connection):
 
     assert not errors, f"Insert errors: {errors}"
     assert total == 1600, f"Expected 1600 rows, got {total}"
+
+
+# ---------------------------------------------------------------------------
+# Test 5 — Autocommit read-modify-write must not lose updates
+# ---------------------------------------------------------------------------
+
+def test_autocommit_increment_no_lost_update(make_connection):
+    """
+    8 connections each run `UPDATE ... SET v = v + 1` 100 times in autocommit,
+    retrying on 1213. Every increment must land: the statement's read and its
+    write must be checked against the same snapshot, so a concurrent commit
+    between the two surfaces as a conflict rather than being overwritten.
+    """
+    n_threads, n_iters = 8, 100
+    _setup(
+        make_connection,
+        "DROP DATABASE IF EXISTS conc_rmw",
+        "CREATE DATABASE conc_rmw",
+        "CREATE TABLE conc_rmw.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb",
+        "INSERT INTO conc_rmw.t VALUES (1, 0)",
+    )
+
+    errors = []
+    barrier = threading.Barrier(n_threads)
+
+    def incrementer():
+        conn = make_connection()
+        try:
+            with conn.cursor() as cur:
+                barrier.wait()
+                for _ in range(n_iters):
+                    while True:
+                        try:
+                            cur.execute("UPDATE conc_rmw.t SET v = v + 1 WHERE id = 1")
+                            break
+                        except pymysql.err.OperationalError as e:
+                            if e.args[0] not in (1180, 1213):
+                                raise
+        except Exception as e:
+            errors.append(e)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=incrementer) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    conn = make_connection()
+    with conn.cursor() as cur:
+        cur.execute("SELECT v FROM conc_rmw.t WHERE id = 1")
+        (v,) = cur.fetchone()
+    conn.close()
+
+    _teardown(make_connection, "DROP DATABASE IF EXISTS conc_rmw")
+
+    assert not errors, f"Unexpected errors: {errors}"
+    assert v == n_threads * n_iters, f"Lost updates: expected {n_threads * n_iters}, got {v}"

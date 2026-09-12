@@ -4,6 +4,18 @@
 
 A MariaDB storage engine plugin that exposes ByteCaskDB as a SQL-accessible table engine. Supports full DML (INSERT, UPDATE, DELETE, SELECT), secondary indexes, transactions with savepoints, and bulk loading.
 
+## Differences from InnoDB
+
+Read this before pointing an application written for InnoDB at the engine.
+
+- **Optimistic concurrency, not locking.** Nothing blocks. A transaction reads from a snapshot taken at its first read or write and buffers its writes in memory. At `COMMIT`, a write to a row that another transaction changed since that snapshot fails the whole transaction with error 1213 (`ER_LOCK_DEADLOCK`). The server does not retry it; the application must re-read and redo the transaction. Under contention on hot rows, expect 1213 as a normal outcome rather than waiting.
+- **`SELECT ... FOR UPDATE` and `LOCK IN SHARE MODE` are plain snapshot reads.** They take no locks and register no conflict guard, so a read-then-write pattern that relies on `FOR UPDATE` to serialise is only protected for rows the transaction actually writes. Write skew between two transactions that read overlapping rows and write disjoint ones is possible.
+- **Foreign keys are not enforced.** `FOREIGN KEY` clauses are accepted, stored, and listed in `information_schema`, so DDL round-trips through dump and restore, but no referential check runs on `INSERT`, `UPDATE` or `DELETE`, and there are no cascades.
+- **Transactions are buffered in RAM until commit.** A transaction that modifies millions of rows holds all of them in memory. `ALTER TABLE ... ALGORITHM=COPY` and `CREATE INDEX` are exempt: they flush in batches.
+- **Long-lived snapshots defer vacuum.** `mysqldump --single-transaction` and any long transaction pin the data files they can see; space from overwritten or deleted rows is reclaimed only after they finish.
+- **Every table's key directory lives in memory.** Budget roughly 50 bytes per row per index (primary and secondary) of resident memory, in addition to MariaDB's own.
+- **Not supported:** `FULLTEXT` and `SPATIAL` indexes, `LOCK TABLES` blocking semantics, `HANDLER`, `INSERT DELAYED`, table-level lock priorities, `CHECKSUM TABLE ... QUICK`.
+
 ## Examples
 
 Ready-to-run Docker Compose setups demonstrating ByteCaskDB as a drop-in storage engine:

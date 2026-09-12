@@ -51,3 +51,90 @@
       expected: [['1','2'],['2','3'],['3','4'],['4','5'],['5','6'],['5','100'],['10','11'],['101','102'],['1000','100'],['10001','103']]
   teardown:
     - DROP DATABASE IF EXISTS isc4
+
+- name: Descending PK range inside a transaction merges uncommitted rows (BC-250)
+  setup:
+    - DROP DATABASE IF EXISTS isc_rev1
+    - CREATE DATABASE isc_rev1
+    - CREATE TABLE isc_rev1.t (id INT PRIMARY KEY, v INT) ENGINE=bytecaskdb
+    - INSERT INTO isc_rev1.t VALUES (1,10),(3,30),(5,50),(7,70),(12,120)
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO isc_rev1.t VALUES (2,20),(8,80),(11,110)
+    - sql: DELETE FROM isc_rev1.t WHERE id = 5
+    - sql: UPDATE isc_rev1.t SET v = 33 WHERE id = 3
+    - sql: SELECT id, v FROM isc_rev1.t WHERE id < 10 ORDER BY id DESC
+      expected: [['8','80'],['7','70'],['3','33'],['2','20'],['1','10']]
+    - sql: SELECT id, v FROM isc_rev1.t WHERE id <= 8 ORDER BY id DESC
+      expected: [['8','80'],['7','70'],['3','33'],['2','20'],['1','10']]
+    - sql: SELECT id FROM isc_rev1.t WHERE id > 3 ORDER BY id
+      expected: [['7'],['8'],['11'],['12']]
+    - sql: SELECT id FROM isc_rev1.t ORDER BY id DESC
+      expected: [['12'],['11'],['8'],['7'],['3'],['2'],['1']]
+    - sql: COMMIT
+    - sql: SELECT id FROM isc_rev1.t WHERE id < 10 ORDER BY id DESC
+      expected: [['8'],['7'],['3'],['2'],['1']]
+  teardown:
+    - DROP DATABASE IF EXISTS isc_rev1
+
+- name: Descending secondary-index range inside a transaction merges uncommitted rows (BC-250)
+  setup:
+    - DROP DATABASE IF EXISTS isc_rev2
+    - CREATE DATABASE isc_rev2
+    - CREATE TABLE isc_rev2.t (id INT PRIMARY KEY, k INT NOT NULL, INDEX idx_k(k)) ENGINE=bytecaskdb
+    - INSERT INTO isc_rev2.t VALUES (1,10),(2,30),(3,50),(4,70),(5,120)
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO isc_rev2.t VALUES (6,20),(7,80),(8,110)
+    - sql: DELETE FROM isc_rev2.t WHERE id = 3
+    - sql: SELECT k FROM isc_rev2.t FORCE INDEX (idx_k) WHERE k < 100 ORDER BY k DESC
+      expected: [['80'],['70'],['30'],['20'],['10']]
+    - sql: SELECT k FROM isc_rev2.t FORCE INDEX (idx_k) WHERE k <= 80 ORDER BY k DESC
+      expected: [['80'],['70'],['30'],['20'],['10']]
+    - sql: SELECT k FROM isc_rev2.t FORCE INDEX (idx_k) WHERE k > 30 ORDER BY k
+      expected: [['70'],['80'],['110'],['120']]
+    - sql: SELECT k FROM isc_rev2.t FORCE INDEX (idx_k) WHERE k >= 30 ORDER BY k DESC LIMIT 2
+      expected: [['120'],['110']]
+    - sql: COMMIT
+  teardown:
+    - DROP DATABASE IF EXISTS isc_rev2
+
+- name: Composite PK prefix lookups (exact prefix, last in prefix) (BC-250)
+  setup:
+    - DROP DATABASE IF EXISTS isc_cpk
+    - CREATE DATABASE isc_cpk
+    - CREATE TABLE isc_cpk.t (a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY (a, b)) ENGINE=bytecaskdb
+    - INSERT INTO isc_cpk.t VALUES (1,1,11),(1,2,12),(1,3,13),(2,1,21),(2,5,25),(3,1,31)
+  steps:
+    - sql: SELECT b FROM isc_cpk.t WHERE a = 2 ORDER BY b
+      expected: [['1'],['5']]
+    - sql: SELECT b FROM isc_cpk.t WHERE a = 1 ORDER BY b DESC LIMIT 1
+      expected: [['3']]
+    - sql: SELECT a, b FROM isc_cpk.t WHERE a = 2 ORDER BY b DESC
+      expected: [['2','5'],['2','1']]
+    - sql: SELECT a, b FROM isc_cpk.t WHERE a < 3 ORDER BY a DESC, b DESC
+      expected: [['2','5'],['2','1'],['1','3'],['1','2'],['1','1']]
+    - sql: SELECT a, b FROM isc_cpk.t WHERE a > 1 ORDER BY a, b
+      expected: [['2','1'],['2','5'],['3','1']]
+    - sql: SELECT COUNT(*) FROM isc_cpk.t WHERE a = 4
+      expected: [['0']]
+  teardown:
+    - DROP DATABASE IF EXISTS isc_cpk
+
+- name: Descending PK scan is complete when the neighbouring table id has rows (engine riter_from fix)
+  setup:
+    - DROP DATABASE IF EXISTS isc_nb
+    - CREATE DATABASE isc_nb
+    - CREATE TABLE isc_nb.first (id INT PRIMARY KEY) ENGINE=bytecaskdb
+    - CREATE TABLE isc_nb.second (id INT PRIMARY KEY) ENGINE=bytecaskdb
+    - INSERT INTO isc_nb.first VALUES (1),(2),(3)
+    - INSERT INTO isc_nb.second VALUES (1),(2),(3)
+  steps:
+    - sql: SELECT id FROM isc_nb.first ORDER BY id DESC
+      expected: [['3'],['2'],['1']]
+    - sql: SELECT id FROM isc_nb.first ORDER BY id DESC LIMIT 1
+      expected: [['3']]
+    - sql: SELECT MAX(id) FROM isc_nb.first
+      expected: [['3']]
+  teardown:
+    - DROP DATABASE IF EXISTS isc_nb

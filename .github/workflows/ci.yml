@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Main CI pipeline: build, test, sanitizers, and fuzz testing (Linux only).
+# Main CI pipeline: build, test, sanitizers, fuzz testing, and the MariaDB
+# plugin suites (Linux only).
 # macOS coverage is handled by build-wheels.yml.
 
 name: CI
@@ -103,6 +104,107 @@ jobs:
           report_type: test_results
           flags: cpp
           name: bytecask-cpp-tests
+          slug: gustavoamigo/bytecaskdb
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+          use_oidc: true
+
+  # ---------------------------------------------------------------------------
+  # MariaDB storage engine plugin: unit + proof tests (Catch2/ctest) and the
+  # functional suite against a live mariadbd (pytest).
+  # ---------------------------------------------------------------------------
+  mariadb-plugin:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    permissions:
+      contents: read
+      checks: write
+      id-token: write
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel \
+            gcc gcc-c++ cmake \
+            xmake \
+            python3-pip python3-devel \
+            git ninja-build \
+            mariadb mariadb-server mariadb-devel \
+            google-crc32c-devel
+          pip3 install nanobind
+          pip3 install -r bytecaskdb-mariadb-plugin/tests/functional/requirements.txt
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            -y
+
+      - name: Build engine static libraries
+        run: |
+          xmake build bytecask
+          xmake build bytecask_testing
+
+      - name: Build plugin and test binaries
+        run: |
+          cmake -S bytecaskdb-mariadb-plugin -B bytecaskdb-mariadb-plugin/build \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build bytecaskdb-mariadb-plugin/build --parallel
+
+      - name: Run unit and proof tests
+        run: |
+          mkdir -p test-results
+          cd bytecaskdb-mariadb-plugin/build
+          ctest --output-on-failure \
+            --output-junit "${GITHUB_WORKSPACE}/test-results/mariadb_plugin_ctest.xml"
+
+      - name: Run functional tests against mariadbd
+        run: |
+          python3 -m pytest bytecaskdb-mariadb-plugin/tests/functional \
+            -v -p no:cacheprovider \
+            --junitxml=test-results/mariadb_plugin_functional.xml
+
+      - name: Upload mariadbd log on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mariadb-plugin-server-log
+          path: .mariadb_functional_test/error.log
+          if-no-files-found: ignore
+
+      - name: Publish test results in GitHub Checks
+        if: ${{ always() && !cancelled() }}
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: test-results/mariadb_plugin_*.xml
+          check_name: MariaDB Plugin Test Results
+          comment_mode: off
+
+      - name: Upload JUnit reports artifact
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-mariadb-plugin-results
+          path: test-results/mariadb_plugin_*.xml
+
+      - name: Upload test results to Codecov
+        if: ${{ always() && !cancelled() }}
+        uses: codecov/codecov-action@v5
+        with:
+          files: |
+            ./test-results/mariadb_plugin_ctest.xml
+            ./test-results/mariadb_plugin_functional.xml
+          report_type: test_results
+          flags: mariadb-plugin
+          name: mariadb-plugin-tests
           slug: gustavoamigo/bytecaskdb
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false

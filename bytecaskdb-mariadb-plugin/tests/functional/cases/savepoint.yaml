@@ -77,3 +77,23 @@
         - [3, 30]
   teardown:
     - DROP DATABASE IF EXISTS sp4
+
+- name: ROLLBACK TO SAVEPOINT restores the table row count (BC-253)
+  setup:
+    - DROP DATABASE IF EXISTS sp5
+    - CREATE DATABASE sp5
+    - CREATE TABLE sp5.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO sp5.t VALUES (1, 10)
+    - sql: SAVEPOINT s1
+    - sql: INSERT INTO sp5.t VALUES (2, 20), (3, 30)
+    - sql: ROLLBACK TO SAVEPOINT s1
+    - sql: INSERT INTO sp5.t VALUES (4, 40)
+    - sql: COMMIT
+    - sql: SELECT COUNT(*) FROM sp5.t
+      expected: [['2']]
+    - sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'sp5' AND TABLE_NAME = 't'
+      expected: [['2']]
+  teardown:
+    - DROP DATABASE IF EXISTS sp5

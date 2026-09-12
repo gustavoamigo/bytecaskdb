@@ -49,6 +49,11 @@ def _symlink_provider_plugins(plugin_dir):
         break
 
 
+def root_user_args():
+    """mariadbd refuses to run as root unless told to; CI containers are root."""
+    return ["--user=root"] if os.geteuid() == 0 else []
+
+
 class MariaDBServer:
     def __init__(self):
         self.root = _find_bytecask_root()
@@ -71,11 +76,14 @@ class MariaDBServer:
                 f"Plugin not found: {self.plugin_dir}/ha_bytecaskdb.so — run cmake --build first"
             )
 
+        as_root = root_user_args()
+
         subprocess.run(
             [
                 "mariadb-install-db",
                 f"--datadir={self.data_dir}",
                 "--auth-root-authentication-method=normal",
+                *as_root,
             ],
             check=True,
             stdout=subprocess.DEVNULL,
@@ -96,6 +104,7 @@ class MariaDBServer:
                 f"--plugin-dir={self.plugin_dir}",
                 f"--plugin-load-add=bytecaskdb=ha_bytecaskdb.so",
                 f"--log-error={self.log_file}",
+                *as_root,
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

@@ -55,6 +55,10 @@ def _execute_step(cur, step, case_name):
         )
 
     cur.execute(sql)
+    if step.get("expected") == "discard":
+        # Statement must succeed; its rows are not compared (EXPLAIN output).
+        cur.fetchall()
+        return
     if "expected" in step:
         actual = _rows_to_str(cur.fetchall())
         expected = [["NULL" if v is None else str(v) for v in row] for row in step["expected"]]

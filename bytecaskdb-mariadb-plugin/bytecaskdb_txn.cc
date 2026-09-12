@@ -13,6 +13,7 @@
 #include "sql_priv.h"
 #include "mysqld_error.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 
@@ -35,6 +36,8 @@ void MariaDBTxn::begin_if_needed(THD *thd, handlerton *hton) {
   if (!registered_stmt_) {
     trans_register_ha(thd, false, hton, 0);
     registered_stmt_ = true;
+    stmt_ops_mark_ = ops_.size();
+    stmt_row_count_deltas_ = row_count_deltas_;
   }
 }
 
@@ -42,12 +45,24 @@ void MariaDBTxn::begin_if_needed(THD *thd, handlerton *hton) {
 // Write buffering
 // ---------------------------------------------------------------------------
 
-void MariaDBTxn::buffer_put(const uint8_t *key, size_t klen,
-                            const uint8_t *val, size_t vlen,
-                            bool guard_absent) {
+// Pins the OCC snapshot for this statement/transaction on first use. Every
+// read and every buffered write goes through here so that the snapshot
+// predates any value the statement acts on: the engine's commit-time
+// write-write check compares against this snapshot, and a key that another
+// transaction committed after it counts as a conflict. Taking the snapshot
+// later (at the first write) would let an autocommit read-modify-write
+// silently overwrite a concurrent commit. Skipped in deferred-INSERT mode,
+// whose commit is snapshot-less by design (see begin_deferred_insert).
+void MariaDBTxn::ensure_snapshot() {
   if (!snap_ && !deferred_insert_) {
     snap_.emplace(db_->snapshot());
   }
+}
+
+void MariaDBTxn::buffer_put(const uint8_t *key, size_t klen,
+                            const uint8_t *val, size_t vlen,
+                            bool guard_absent) {
+  ensure_snapshot();
 
   std::vector<uint8_t> k(key, key + klen);
   std::vector<uint8_t> v;
@@ -63,9 +78,7 @@ void MariaDBTxn::buffer_put(const uint8_t *key, size_t klen,
 }
 
 void MariaDBTxn::buffer_del(const uint8_t *key, size_t klen) {
-  if (!snap_ && !deferred_insert_) {
-    snap_.emplace(db_->snapshot());
-  }
+  ensure_snapshot();
 
   std::vector<uint8_t> k(key, key + klen);
 
@@ -101,6 +114,7 @@ int MariaDBTxn::get(const uint8_t *key, size_t klen, bytecask::Bytes &out) {
     }
   }
 
+  ensure_snapshot();
   try {
     if (snap_) {
       return snap_->get({}, as_view(key, klen), out) ? 1 : 0;
@@ -120,6 +134,7 @@ bool MariaDBTxn::exists(const uint8_t *key, size_t klen) {
     }
   }
 
+  ensure_snapshot();
   try {
     if (snap_) {
       return snap_->contains_key({}, as_view(key, klen));
@@ -194,14 +209,11 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_index_prefix(
 
   std::vector<uint8_t> lo_vec(lo, lo + lo_len);
   std::vector<uint8_t> hi_vec(hi, hi + hi_len);
-  auto buf_it = lookup_.upper_bound(hi_vec);
-  if (buf_it != lookup_.begin()) {
-    --buf_it;
-  }
+  auto buf_it = reverse_buffer_start(hi_vec);
 
   return std::make_unique<MergeIterator>(
-      std::move(snap_it), buf_it, lookup_.end(), std::move(lo_vec),
-      table_id, index_id);
+      std::move(snap_it), buf_it, lookup_.begin(), lookup_.end(),
+      std::move(lo_vec), table_id, index_id);
 }
 
 std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
@@ -220,13 +232,20 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
 
   std::vector<uint8_t> lo_vec(lo, lo + lo_len);
   std::vector<uint8_t> hi_vec(hi, hi + hi_len);
-  auto buf_it = lookup_.upper_bound(hi_vec);
-  if (buf_it != lookup_.begin()) {
-    --buf_it;
-  }
+  auto buf_it = reverse_buffer_start(hi_vec);
 
   return std::make_unique<MergeIterator>(
-      std::move(snap_it), buf_it, lookup_.end(), std::move(lo_vec), table_id);
+      std::move(snap_it), buf_it, lookup_.begin(), lookup_.end(),
+      std::move(lo_vec), table_id);
+}
+
+// Largest buffered key <= hi, or end() when every buffered key is above hi.
+// Mirrors rkeys_from(hi) on the snapshot side.
+MariaDBTxn::LookupMap::const_iterator
+MariaDBTxn::reverse_buffer_start(const std::vector<uint8_t> &hi) const {
+  auto it = lookup_.upper_bound(hi);
+  if (it == lookup_.begin()) { return lookup_.end(); }
+  return --it;
 }
 
 // ---------------------------------------------------------------------------
@@ -284,18 +303,16 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
     bool committed = db_->apply_batch(bytecask::WriteOptions{.sync = true},
                                       std::move(plan)).has_value();
     if (!committed) {
-      revert_row_count_deltas();
-      reset();
       if (deferred) {
         // Snapshot-less plan: the only precondition is ensure_absent, so a
-        // conflict is a duplicate primary key. ER_DUP_ENTRY_WITH_KEY_NAME
-        // (not ER_DUP_ENTRY) takes two strings — "Duplicate entry '%s' for
-        // key '%s'" — matching the (value, key-name) args passed here.
-        // ER_DUP_ENTRY's second placeholder is an integer key index, so
-        // passing "PRIMARY" there is undefined behavior on the varargs call.
-        my_error(ER_DUP_ENTRY_WITH_KEY_NAME, MYF(0), "", "PRIMARY");
+        // conflict is a duplicate primary key.
+        report_deferred_dup_key();
+        revert_row_count_deltas();
+        reset();
         return HA_ERR_FOUND_DUPP_KEY;
       }
+      revert_row_count_deltas();
+      reset();
       my_error(ER_LOCK_DEADLOCK, MYF(0));
       return HA_ERR_LOCK_DEADLOCK;
     }
@@ -316,11 +333,13 @@ void MariaDBTxn::rollback(THD * /*thd*/, bool all) {
   bulk_reset();
 
   if (!all && registered_all_) {
-    // Statement rollback within session txn — clear buffer (conservative).
-    revert_row_count_deltas();
-    ops_.clear();
-    lookup_.clear();
+    // Statement rollback within a session transaction: undo only this
+    // statement. Earlier statements stay buffered for the session commit.
+    restore_row_count_deltas(stmt_row_count_deltas_);
+    truncate_ops(stmt_ops_mark_);
     deferred_insert_ = false;
+    deferred_handler_ = nullptr;
+    deferred_reporter_ = nullptr;
     registered_stmt_ = false;
     return;
   }
@@ -328,12 +347,74 @@ void MariaDBTxn::rollback(THD * /*thd*/, bool all) {
   reset();
 }
 
+void MariaDBTxn::truncate_ops(std::size_t mark) {
+  if (mark > ops_.size()) { mark = ops_.size(); }
+  ops_.resize(mark);
+  lookup_.clear();
+  for (const auto &op : ops_) {
+    if (op.kind == Op::Put)
+      lookup_[op.key] = op.val;
+    else
+      lookup_[op.key] = std::nullopt;
+  }
+}
+
+void MariaDBTxn::restore_row_count_deltas(const RowCountDeltas &saved) {
+  for (auto &[table_id, entry] : row_count_deltas_) {
+    int64_t saved_delta = 0;
+    if (auto it = saved.find(table_id); it != saved.end()) {
+      saved_delta = it->second.delta;
+    }
+    const int64_t undo = entry.delta - saved_delta;
+    if (undo == 0) { continue; }
+    if (entry.counter) {
+      entry.counter->fetch_add(-undo);
+    } else {
+      catalog_row_count_add(table_id, -undo);
+    }
+  }
+  row_count_deltas_ = saved;
+}
+
+void MariaDBTxn::report_deferred_dup_key() {
+  // ops_ is still intact here; the first guarded key that exists in the
+  // live DB is the one the ensure_absent guard rejected.
+  const std::vector<uint8_t> *dup = nullptr;
+  for (const auto &op : ops_) {
+    if (op.kind != Op::Put || !op.guard_absent) { continue; }
+    bool present = false;
+    try {
+      present = db_->contains_key({}, as_view(op.key));
+    } catch (...) {
+      present = false;
+    }
+    if (present) { dup = &op.key; break; }
+  }
+  if (deferred_reporter_ && dup && deferred_reporter_(*dup)) {
+    return;
+  }
+  // No handler (or no identifiable key): same error code the server uses,
+  // with the WITH_KEY_NAME wording and no rendered value. The format is a
+  // literal on purpose: the server's message table is reached through THD
+  // members, and this plugin's view of THD (sql_class.h without WITH_WSREP)
+  // does not match the server's layout, so only exported functions may take
+  // a THD. ER_DUP_ENTRY's own format takes a key *index*, so it cannot be
+  // paired with a key name.
+  my_printf_error(ER_DUP_ENTRY, "Duplicate entry '%-.192s' for key '%-.192s'",
+                  MYF(0), "", "PRIMARY");
+}
+
 void MariaDBTxn::reset() {
   snap_.reset();
   ops_.clear();
   lookup_.clear();
   row_count_deltas_.clear();
+  stmt_ops_mark_ = 0;
+  stmt_row_count_deltas_.clear();
+  savepoints_.clear();
   deferred_insert_ = false;
+  deferred_handler_ = nullptr;
+  deferred_reporter_ = nullptr;
   registered_stmt_ = false;
   registered_all_ = false;
   bulk_reset();
@@ -356,16 +437,7 @@ void MariaDBTxn::track_row_count_delta(uint32_t table_id,
 }
 
 void MariaDBTxn::revert_row_count_deltas() {
-  for (auto &[table_id, entry] : row_count_deltas_) {
-    if (entry.delta != 0) {
-      if (entry.counter) {
-        entry.counter->fetch_add(-entry.delta);
-      } else {
-        catalog_row_count_add(table_id, -entry.delta);
-      }
-    }
-  }
-  row_count_deltas_.clear();
+  restore_row_count_deltas({});
 }
 
 // ---------------------------------------------------------------------------
@@ -458,24 +530,38 @@ bool MariaDBTxn::bulk_unique_prefix_exists(const uint8_t *prefix,
 // Savepoints
 // ---------------------------------------------------------------------------
 
+// The server hands each savepoint a hton-sized slot (savepoint_offset =
+// sizeof(uint32_t)); it holds an index into savepoints_, whose entry
+// records where the op log stood and what the row counters were.
+
 void MariaDBTxn::savepoint_set(void *sv) {
-  *static_cast<uint32_t *>(sv) = static_cast<uint32_t>(ops_.size());
+  savepoints_.push_back({ops_.size(), row_count_deltas_});
+  *static_cast<uint32_t *>(sv) = static_cast<uint32_t>(savepoints_.size() - 1);
 }
 
 void MariaDBTxn::savepoint_rollback(void *sv) {
-  uint32_t mark = *static_cast<const uint32_t *>(sv);
-  ops_.resize(mark);
-  lookup_.clear();
-  for (const auto &op : ops_) {
-    if (op.kind == Op::Put)
-      lookup_[op.key] = op.val;
-    else
-      lookup_[op.key] = std::nullopt;
-  }
+  const auto idx = *static_cast<const uint32_t *>(sv);
+  if (idx >= savepoints_.size()) { return; }
+  const auto &sp = savepoints_[idx];
+  restore_row_count_deltas(sp.row_count_deltas);
+  truncate_ops(sp.ops_mark);
+  // The savepoint itself survives ROLLBACK TO; later ones are gone.
+  savepoints_.resize(idx + 1);
 }
 
-void MariaDBTxn::savepoint_release(void * /*sv*/) {
+void MariaDBTxn::savepoint_release(void *sv) {
+  const auto idx = *static_cast<const uint32_t *>(sv);
+  if (idx < savepoints_.size()) { savepoints_.resize(idx); }
 }
+
+namespace {
+// Lexicographic byte compare; a proper prefix sorts first.
+int lex_compare(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
+  const int c = std::memcmp(a, b, std::min(alen, blen));
+  if (c != 0) return c;
+  return (alen < blen) ? -1 : (alen > blen) ? 1 : 0;
+}
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // MergeIterator
@@ -494,6 +580,7 @@ MariaDBTxn::MergeIterator::MergeIterator(
     : snap_fwd_(std::move(snap_it)),
       reverse_(false),
       buf_it_(buf_it),
+      buf_begin_(buf_it),
       buf_end_(buf_end),
       bound_(std::move(hi)),
       table_id_(table_id) {
@@ -510,6 +597,7 @@ MariaDBTxn::MergeIterator::MergeIterator(
     : snap_key_fwd_(std::move(snap_it)),
       reverse_(false),
       buf_it_(buf_it),
+      buf_begin_(buf_it),
       buf_end_(buf_end),
       bound_(std::move(hi)),
       table_id_(table_id),
@@ -522,12 +610,14 @@ MariaDBTxn::MergeIterator::MergeIterator(
 MariaDBTxn::MergeIterator::MergeIterator(
     std::optional<bytecask::ReverseEntryIterator> snap_it,
     LookupMap::const_iterator buf_it,
+    LookupMap::const_iterator buf_begin,
     LookupMap::const_iterator buf_end,
     std::vector<uint8_t> lo,
     uint32_t table_id)
     : snap_rev_(std::move(snap_it)),
       reverse_(true),
       buf_it_(buf_it),
+      buf_begin_(buf_begin),
       buf_end_(buf_end),
       bound_(std::move(lo)),
       table_id_(table_id) {
@@ -538,12 +628,14 @@ MariaDBTxn::MergeIterator::MergeIterator(
 MariaDBTxn::MergeIterator::MergeIterator(
     std::optional<bytecask::ReverseKeyIterator> snap_it,
     LookupMap::const_iterator buf_it,
+    LookupMap::const_iterator buf_begin,
     LookupMap::const_iterator buf_end,
     std::vector<uint8_t> lo,
     uint32_t table_id, uint16_t index_id)
     : snap_key_rev_(std::move(snap_it)),
       reverse_(true),
       buf_it_(buf_it),
+      buf_begin_(buf_begin),
       buf_end_(buf_end),
       bound_(std::move(lo)),
       table_id_(table_id),
@@ -628,11 +720,9 @@ void MariaDBTxn::MergeIterator::load_snap_current() {
     }
   }
 
-  if (!reverse_ && !bound_.empty()) {
-    if (klen >= bound_.size() &&
-        std::memcmp(kp, bound_.data(), bound_.size()) >= 0) {
-      return;
-    }
+  if (!reverse_ && !bound_.empty() &&
+      lex_compare(kp, klen, bound_.data(), bound_.size()) >= 0) {
+    return;
   }
 
   snap_key_ptr_ = kp;
@@ -640,105 +730,94 @@ void MariaDBTxn::MergeIterator::load_snap_current() {
   snap_valid_ = true;
 }
 
+void MariaDBTxn::MergeIterator::buf_step() {
+  if (!reverse_) {
+    ++buf_it_;
+    return;
+  }
+  if (buf_it_ == buf_begin_) {
+    buf_it_ = buf_end_;
+  } else {
+    --buf_it_;
+  }
+}
+
+bool MariaDBTxn::MergeIterator::buf_candidate_valid() const {
+  if (buf_it_ == buf_end_) return false;
+  const auto &bk = buf_it_->first;
+  if (!reverse_ && !bound_.empty() &&
+      lex_compare(bk.data(), bk.size(), bound_.data(), bound_.size()) >= 0) {
+    return false;
+  }
+  if (use_index_filter_) {
+    return key_belongs_to_index(bk.data(), bk.size(), table_id_, index_id_);
+  }
+  return key_belongs_to_table(bk.data(), bk.size(), table_id_);
+}
+
+void MariaDBTxn::MergeIterator::emit_buf() {
+  cur_key_ = buf_it_->first;
+  assign_bytes(cur_val_, buf_it_->second.value());
+  buf_step();
+  valid_ = true;
+}
+
+void MariaDBTxn::MergeIterator::emit_snap() {
+  cur_key_.assign(snap_key_ptr_, snap_key_ptr_ + snap_key_len_);
+  assign_bytes(cur_val_, snap_val_ptr_, snap_val_len_);
+  snap_step();
+  load_snap_current();
+  valid_ = true;
+}
+
 void MariaDBTxn::MergeIterator::advance() {
   valid_ = false;
 
   for (;;) {
-    bool buf_valid = (buf_it_ != buf_end_);
-    if (buf_valid && !reverse_ && !bound_.empty()) {
-      const auto &bk = buf_it_->first;
-      if (bk.size() >= bound_.size() &&
-          std::memcmp(bk.data(), bound_.data(), bound_.size()) >= 0) {
-        buf_valid = false;
-      }
-    }
-    if (buf_valid) {
-      if (use_index_filter_) {
-        if (!key_belongs_to_index(buf_it_->first.data(),
-                                  buf_it_->first.size(),
-                                  table_id_, index_id_)) {
-          buf_valid = false;
-        }
-      } else {
-        if (!key_belongs_to_table(buf_it_->first.data(),
-                                  buf_it_->first.size(), table_id_)) {
-          buf_valid = false;
-        }
-      }
-    }
+    const bool buf_valid = buf_candidate_valid();
 
     if (!snap_valid_ && !buf_valid) {
       return;
     }
 
-    if (!snap_valid_ && buf_valid) {
-      if (buf_it_->second.has_value()) {
-        cur_key_ = buf_it_->first;
-        assign_bytes(cur_val_, buf_it_->second.value());
-        ++buf_it_;
-        valid_ = true;
-        return;
-      }
-      ++buf_it_;
+    if (!snap_valid_) {
+      if (buf_it_->second.has_value()) { emit_buf(); return; }
+      buf_step();  // tombstone with nothing to suppress
       continue;
     }
 
-    if (snap_valid_ && !buf_valid) {
-      cur_key_.assign(snap_key_ptr_, snap_key_ptr_ + snap_key_len_);
-      assign_bytes(cur_val_, snap_val_ptr_, snap_val_len_);
-      snap_step();
-      load_snap_current();
-      valid_ = true;
+    if (!buf_valid) {
+      emit_snap();
       return;
     }
 
-    // Both have data — compare keys.
+    // Both sides have a candidate.
     const auto &bk = buf_it_->first;
-    int cmp;
-    if (bk.size() == snap_key_len_) {
-      cmp = std::memcmp(bk.data(), snap_key_ptr_, bk.size());
-    } else if (bk.size() < snap_key_len_) {
-      cmp = std::memcmp(bk.data(), snap_key_ptr_, bk.size());
-      if (cmp == 0) cmp = -1;
-    } else {
-      cmp = std::memcmp(bk.data(), snap_key_ptr_, snap_key_len_);
-      if (cmp == 0) cmp = 1;
-    }
-
-    if (cmp < 0) {
-      if (buf_it_->second.has_value()) {
-        cur_key_ = bk;
-        assign_bytes(cur_val_, buf_it_->second.value());
-        ++buf_it_;
-        valid_ = true;
-        return;
-      }
-      ++buf_it_;
-      continue;
-    }
+    const int cmp = lex_compare(bk.data(), bk.size(), snap_key_ptr_, snap_key_len_);
 
     if (cmp == 0) {
-      bool has_val = buf_it_->second.has_value();
+      // Same key on both sides: the buffer's version wins; a tombstone
+      // hides the snapshot entry.
+      const bool has_val = buf_it_->second.has_value();
       if (has_val) {
         cur_key_ = bk;
         assign_bytes(cur_val_, buf_it_->second.value());
       }
-      ++buf_it_;
+      buf_step();
       snap_step();
       load_snap_current();
-      if (has_val) {
-        valid_ = true;
-        return;
-      }
+      if (has_val) { valid_ = true; return; }
       continue;
     }
 
-    // cmp > 0
-    cur_key_.assign(snap_key_ptr_, snap_key_ptr_ + snap_key_len_);
-    assign_bytes(cur_val_, snap_val_ptr_, snap_val_len_);
-    snap_step();
-    load_snap_current();
-    valid_ = true;
+    // Forward emits the smaller key first; reverse emits the larger.
+    const bool buf_first = reverse_ ? (cmp > 0) : (cmp < 0);
+    if (buf_first) {
+      if (buf_it_->second.has_value()) { emit_buf(); return; }
+      buf_step();
+      continue;
+    }
+    emit_snap();
     return;
   }
 }
