@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$SCRIPT_DIR/build"
 
 if [ ! -f "$BUILD/bytecask_tests.js" ]; then
-  echo "Error: $BUILD/bytecask_tests.js not found. Run build.sh first." >&2
+  echo "Error: $BUILD/bytecask_tests.js not found. Run 'xmake build wasm_tests' from the repo root first." >&2
   exit 1
 fi
 
