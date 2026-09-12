@@ -732,3 +732,67 @@ TEST_CASE_METHOD(MariaDBTxnFixture,
     REQUIRE(collect_keys(*it) == std::vector<uint8_t>{3, 1});
   }
 }
+
+// =========================================================================
+// Savepoints restore the row counters, not only the op log
+// =========================================================================
+
+TEST_CASE_METHOD(MariaDBTxnFixture,
+                 "MariaDBTxn savepoint rollback restores row counts",
+                 "[txn][savepoint]") {
+  auto k1 = make_key("r:1");
+  auto k2 = make_key("r:2");
+  auto k3 = make_key("r:3");
+  auto v = make_value("x");
+  THD thd{};
+  std::atomic<int64_t> rows{0};
+  uint32_t sp1 = 0, sp2 = 0;
+
+  auto txn = create_txn();
+  txn->buffer_put(k1.data(), k1.size(), v.data(), v.size());
+  txn->track_row_count_delta(1, &rows, 1);
+
+  txn->savepoint_set(&sp1);
+  txn->buffer_put(k2.data(), k2.size(), v.data(), v.size());
+  txn->track_row_count_delta(1, &rows, 1);
+
+  txn->savepoint_set(&sp2);
+  txn->buffer_put(k3.data(), k3.size(), v.data(), v.size());
+  txn->track_row_count_delta(1, &rows, 1);
+  REQUIRE(rows.load() == 3);
+
+  SECTION("rollback to the inner savepoint") {
+    txn->savepoint_rollback(&sp2);
+    REQUIRE(rows.load() == 2);
+    REQUIRE(txn->exists(k2.data(), k2.size()));
+    REQUIRE_FALSE(txn->exists(k3.data(), k3.size()));
+  }
+
+  SECTION("rollback to the outer savepoint, then keep working") {
+    txn->savepoint_rollback(&sp1);
+    REQUIRE(rows.load() == 1);
+    REQUIRE_FALSE(txn->exists(k2.data(), k2.size()));
+
+    txn->buffer_put(k3.data(), k3.size(), v.data(), v.size());
+    txn->track_row_count_delta(1, &rows, 1);
+    REQUIRE(rows.load() == 2);
+
+    // The savepoint survives ROLLBACK TO and can be rolled back to again.
+    txn->savepoint_rollback(&sp1);
+    REQUIRE(rows.load() == 1);
+    REQUIRE_FALSE(txn->exists(k3.data(), k3.size()));
+  }
+
+  SECTION("release keeps the work and the counters") {
+    txn->savepoint_release(&sp1);
+    REQUIRE(rows.load() == 3);
+    REQUIRE(txn->commit(&thd, true) == 0);
+    REQUIRE(rows.load() == 3);
+  }
+
+  SECTION("full rollback after a savepoint rollback reverts everything") {
+    txn->savepoint_rollback(&sp2);
+    txn->rollback(&thd, true);
+    REQUIRE(rows.load() == 0);
+  }
+}

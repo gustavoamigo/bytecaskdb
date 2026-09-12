@@ -411,6 +411,7 @@ void MariaDBTxn::reset() {
   row_count_deltas_.clear();
   stmt_ops_mark_ = 0;
   stmt_row_count_deltas_.clear();
+  savepoints_.clear();
   deferred_insert_ = false;
   deferred_handler_ = nullptr;
   deferred_reporter_ = nullptr;
@@ -529,15 +530,28 @@ bool MariaDBTxn::bulk_unique_prefix_exists(const uint8_t *prefix,
 // Savepoints
 // ---------------------------------------------------------------------------
 
+// The server hands each savepoint a hton-sized slot (savepoint_offset =
+// sizeof(uint32_t)); it holds an index into savepoints_, whose entry
+// records where the op log stood and what the row counters were.
+
 void MariaDBTxn::savepoint_set(void *sv) {
-  *static_cast<uint32_t *>(sv) = static_cast<uint32_t>(ops_.size());
+  savepoints_.push_back({ops_.size(), row_count_deltas_});
+  *static_cast<uint32_t *>(sv) = static_cast<uint32_t>(savepoints_.size() - 1);
 }
 
 void MariaDBTxn::savepoint_rollback(void *sv) {
-  truncate_ops(*static_cast<const uint32_t *>(sv));
+  const auto idx = *static_cast<const uint32_t *>(sv);
+  if (idx >= savepoints_.size()) { return; }
+  const auto &sp = savepoints_[idx];
+  restore_row_count_deltas(sp.row_count_deltas);
+  truncate_ops(sp.ops_mark);
+  // The savepoint itself survives ROLLBACK TO; later ones are gone.
+  savepoints_.resize(idx + 1);
 }
 
-void MariaDBTxn::savepoint_release(void * /*sv*/) {
+void MariaDBTxn::savepoint_release(void *sv) {
+  const auto idx = *static_cast<const uint32_t *>(sv);
+  if (idx < savepoints_.size()) { savepoints_.resize(idx); }
 }
 
 // ---------------------------------------------------------------------------

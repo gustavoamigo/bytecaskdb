@@ -358,6 +358,12 @@ private:
   std::size_t stmt_ops_mark_{0};
   RowCountDeltas stmt_row_count_deltas_;
 
+  struct Savepoint {
+    std::size_t ops_mark;
+    RowCountDeltas row_count_deltas;
+  };
+  std::vector<Savepoint> savepoints_;
+
   bool registered_stmt_{false};
   bool registered_all_{false};
 
