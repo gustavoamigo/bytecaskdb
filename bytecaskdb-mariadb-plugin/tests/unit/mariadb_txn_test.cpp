@@ -16,6 +16,7 @@
 #include "bytecask.hpp"
 #include "bytecaskdb_txn.h"
 #include "catalog.h"
+#include "key_encoding.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -647,4 +648,88 @@ TEST_CASE_METHOD(MariaDBTxnFixture,
   }
 
   g_stub_thd_options = 0;
+}
+
+// =========================================================================
+// MergeIterator direction (BC-250): buffered writes merged in scan order
+// =========================================================================
+
+namespace {
+
+// Row key for table `tid` with a one-byte suffix: [0x02 | tid BE4 | c].
+std::vector<uint8_t> row_key(uint32_t tid, uint8_t c) {
+  auto k = table_id_prefix(tid);
+  k.push_back(c);
+  return k;
+}
+
+std::vector<uint8_t> collect_keys(MariaDBTxn::MergeIterator &it) {
+  std::vector<uint8_t> out;
+  for (; it.valid(); it.next()) {
+    out.push_back(it.key_data()[it.key_len() - 1]);
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(MariaDBTxnFixture,
+                 "MariaDBTxn MergeIterator honours scan direction",
+                 "[txn][merge][reverse]") {
+  constexpr uint32_t kTid = 42;
+  auto v = make_value("v");
+  THD thd{};
+
+  // Committed rows: 1, 3, 5, 7. Another table's row must never appear.
+  {
+    auto seed = create_txn();
+    for (uint8_t c : {1, 3, 5, 7}) {
+      auto k = row_key(kTid, c);
+      seed->buffer_put(k.data(), k.size(), v.data(), v.size());
+    }
+    auto other = row_key(kTid + 1, 0);
+    seed->buffer_put(other.data(), other.size(), v.data(), v.size());
+    REQUIRE(seed->commit(&thd, true) == 0);
+  }
+
+  auto txn = create_txn();
+  // Buffered: insert 2 and 8, delete 5, overwrite 3.
+  for (uint8_t c : {2, 8, 3}) {
+    auto k = row_key(kTid, c);
+    txn->buffer_put(k.data(), k.size(), v.data(), v.size());
+  }
+  {
+    auto k = row_key(kTid, 5);
+    txn->buffer_del(k.data(), k.size());
+  }
+
+  auto lo = table_id_prefix(kTid);
+  auto hi = table_id_upper_bound(kTid);
+
+  SECTION("forward scan is ascending with buffer merged") {
+    auto it = txn->iter_prefix(lo.data(), lo.size(), hi.data(), hi.size(), kTid);
+    REQUIRE(collect_keys(*it) == std::vector<uint8_t>{1, 2, 3, 7, 8});
+  }
+
+  SECTION("reverse scan is descending with buffer merged") {
+    auto it = txn->riter_prefix(hi.data(), hi.size(), lo.data(), lo.size(), kTid);
+    REQUIRE(collect_keys(*it) == std::vector<uint8_t>{8, 7, 3, 2, 1});
+  }
+
+  SECTION("reverse scan from a mid-range bound") {
+    auto mid = row_key(kTid, 4);
+    auto it = txn->riter_prefix(mid.data(), mid.size(), lo.data(), lo.size(), kTid);
+    REQUIRE(collect_keys(*it) == std::vector<uint8_t>{3, 2, 1});
+  }
+
+  SECTION("reverse scan when every buffered key is above the bound") {
+    // Only buffered keys 2, 3, 8 exist for this table; bound below all of
+    // them must not surface any of them.
+    auto txn2 = create_txn();
+    auto k = row_key(kTid, 9);
+    txn2->buffer_put(k.data(), k.size(), v.data(), v.size());
+    auto bound = row_key(kTid, 4);
+    auto it = txn2->riter_prefix(bound.data(), bound.size(), lo.data(), lo.size(), kTid);
+    REQUIRE(collect_keys(*it) == std::vector<uint8_t>{3, 1});
+  }
 }

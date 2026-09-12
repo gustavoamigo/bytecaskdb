@@ -57,8 +57,10 @@ public:
   //
   // The snapshot iterator is one of bytecask::EntryIterator (forward) or
   // bytecask::ReverseEntryIterator (reverse). Stored as optionals; at most
-  // one is engaged. The buffer side is always walked forward (matching the
-  // pre-migration C-API behavior).
+  // one is engaged. The buffer side walks in the same direction as the
+  // snapshot side, and on each step the smaller (forward) or larger
+  // (reverse) key is emitted; on a tie the buffer wins and a tombstone
+  // suppresses the snapshot key.
   // -------------------------------------------------------------------
 
   class MergeIterator {
@@ -77,9 +79,11 @@ public:
                   std::vector<uint8_t> hi,
                   uint32_t table_id, uint16_t index_id);
 
-    // Reverse construction (full table).
+    // Reverse construction (full table). buf_it is the largest buffered key
+    // <= hi, or buf_end when there is none.
     MergeIterator(std::optional<bytecask::ReverseEntryIterator> snap_it,
                   LookupMap::const_iterator buf_it,
+                  LookupMap::const_iterator buf_begin,
                   LookupMap::const_iterator buf_end,
                   std::vector<uint8_t> lo,
                   uint32_t table_id);
@@ -87,6 +91,7 @@ public:
     // Reverse construction (secondary index — key-only snapshot).
     MergeIterator(std::optional<bytecask::ReverseKeyIterator> snap_it,
                   LookupMap::const_iterator buf_it,
+                  LookupMap::const_iterator buf_begin,
                   LookupMap::const_iterator buf_end,
                   std::vector<uint8_t> lo,
                   uint32_t table_id, uint16_t index_id);
@@ -120,6 +125,12 @@ public:
     void load_snap_current();
     bool snap_at_end() const;
     void snap_step();
+    void buf_step();
+    // True when the buffer cursor holds a candidate inside this scan's
+    // table/index namespace and, for forward scans, below the hi bound.
+    bool buf_candidate_valid() const;
+    void emit_buf();
+    void emit_snap();
 
     // At most one of these is engaged.
     std::optional<bytecask::EntryIterator>        snap_fwd_;
@@ -128,7 +139,11 @@ public:
     std::optional<bytecask::ReverseKeyIterator>   snap_key_rev_;
     bool reverse_{false};
 
+    // Buffer cursor. Forward: buf_it_ walks [buf_it_, buf_end_). Reverse:
+    // buf_it_ is the current candidate and steps toward buf_begin_;
+    // buf_end_ marks exhaustion in both directions.
     LookupMap::const_iterator buf_it_;
+    LookupMap::const_iterator buf_begin_;
     LookupMap::const_iterator buf_end_;
     std::vector<uint8_t> bound_;            // forward: hi (exclusive); reverse: lo (informational only)
     uint32_t table_id_;
@@ -279,6 +294,8 @@ public:
 
 private:
   void ensure_snapshot();
+  LookupMap::const_iterator
+  reverse_buffer_start(const std::vector<uint8_t> &hi) const;
   void reset();
   void revert_row_count_deltas();
   void bulk_reset();

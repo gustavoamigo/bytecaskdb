@@ -13,6 +13,7 @@
 #include "sql_priv.h"
 #include "mysqld_error.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 
@@ -208,14 +209,11 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_index_prefix(
 
   std::vector<uint8_t> lo_vec(lo, lo + lo_len);
   std::vector<uint8_t> hi_vec(hi, hi + hi_len);
-  auto buf_it = lookup_.upper_bound(hi_vec);
-  if (buf_it != lookup_.begin()) {
-    --buf_it;
-  }
+  auto buf_it = reverse_buffer_start(hi_vec);
 
   return std::make_unique<MergeIterator>(
-      std::move(snap_it), buf_it, lookup_.end(), std::move(lo_vec),
-      table_id, index_id);
+      std::move(snap_it), buf_it, lookup_.begin(), lookup_.end(),
+      std::move(lo_vec), table_id, index_id);
 }
 
 std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
@@ -234,13 +232,20 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
 
   std::vector<uint8_t> lo_vec(lo, lo + lo_len);
   std::vector<uint8_t> hi_vec(hi, hi + hi_len);
-  auto buf_it = lookup_.upper_bound(hi_vec);
-  if (buf_it != lookup_.begin()) {
-    --buf_it;
-  }
+  auto buf_it = reverse_buffer_start(hi_vec);
 
   return std::make_unique<MergeIterator>(
-      std::move(snap_it), buf_it, lookup_.end(), std::move(lo_vec), table_id);
+      std::move(snap_it), buf_it, lookup_.begin(), lookup_.end(),
+      std::move(lo_vec), table_id);
+}
+
+// Largest buffered key <= hi, or end() when every buffered key is above hi.
+// Mirrors rkeys_from(hi) on the snapshot side.
+MariaDBTxn::LookupMap::const_iterator
+MariaDBTxn::reverse_buffer_start(const std::vector<uint8_t> &hi) const {
+  auto it = lookup_.upper_bound(hi);
+  if (it == lookup_.begin()) { return lookup_.end(); }
+  return --it;
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +527,7 @@ MariaDBTxn::MergeIterator::MergeIterator(
     : snap_fwd_(std::move(snap_it)),
       reverse_(false),
       buf_it_(buf_it),
+      buf_begin_(buf_it),
       buf_end_(buf_end),
       bound_(std::move(hi)),
       table_id_(table_id) {
@@ -538,6 +544,7 @@ MariaDBTxn::MergeIterator::MergeIterator(
     : snap_key_fwd_(std::move(snap_it)),
       reverse_(false),
       buf_it_(buf_it),
+      buf_begin_(buf_it),
       buf_end_(buf_end),
       bound_(std::move(hi)),
       table_id_(table_id),
@@ -550,12 +557,14 @@ MariaDBTxn::MergeIterator::MergeIterator(
 MariaDBTxn::MergeIterator::MergeIterator(
     std::optional<bytecask::ReverseEntryIterator> snap_it,
     LookupMap::const_iterator buf_it,
+    LookupMap::const_iterator buf_begin,
     LookupMap::const_iterator buf_end,
     std::vector<uint8_t> lo,
     uint32_t table_id)
     : snap_rev_(std::move(snap_it)),
       reverse_(true),
       buf_it_(buf_it),
+      buf_begin_(buf_begin),
       buf_end_(buf_end),
       bound_(std::move(lo)),
       table_id_(table_id) {
@@ -566,12 +575,14 @@ MariaDBTxn::MergeIterator::MergeIterator(
 MariaDBTxn::MergeIterator::MergeIterator(
     std::optional<bytecask::ReverseKeyIterator> snap_it,
     LookupMap::const_iterator buf_it,
+    LookupMap::const_iterator buf_begin,
     LookupMap::const_iterator buf_end,
     std::vector<uint8_t> lo,
     uint32_t table_id, uint16_t index_id)
     : snap_key_rev_(std::move(snap_it)),
       reverse_(true),
       buf_it_(buf_it),
+      buf_begin_(buf_begin),
       buf_end_(buf_end),
       bound_(std::move(lo)),
       table_id_(table_id),
@@ -668,105 +679,100 @@ void MariaDBTxn::MergeIterator::load_snap_current() {
   snap_valid_ = true;
 }
 
+void MariaDBTxn::MergeIterator::buf_step() {
+  if (!reverse_) {
+    ++buf_it_;
+    return;
+  }
+  if (buf_it_ == buf_begin_) {
+    buf_it_ = buf_end_;
+  } else {
+    --buf_it_;
+  }
+}
+
+bool MariaDBTxn::MergeIterator::buf_candidate_valid() const {
+  if (buf_it_ == buf_end_) return false;
+  const auto &bk = buf_it_->first;
+  if (!reverse_ && !bound_.empty() &&
+      bk.size() >= bound_.size() &&
+      std::memcmp(bk.data(), bound_.data(), bound_.size()) >= 0) {
+    return false;
+  }
+  if (use_index_filter_) {
+    return key_belongs_to_index(bk.data(), bk.size(), table_id_, index_id_);
+  }
+  return key_belongs_to_table(bk.data(), bk.size(), table_id_);
+}
+
+void MariaDBTxn::MergeIterator::emit_buf() {
+  cur_key_ = buf_it_->first;
+  assign_bytes(cur_val_, buf_it_->second.value());
+  buf_step();
+  valid_ = true;
+}
+
+void MariaDBTxn::MergeIterator::emit_snap() {
+  cur_key_.assign(snap_key_ptr_, snap_key_ptr_ + snap_key_len_);
+  assign_bytes(cur_val_, snap_val_ptr_, snap_val_len_);
+  snap_step();
+  load_snap_current();
+  valid_ = true;
+}
+
 void MariaDBTxn::MergeIterator::advance() {
   valid_ = false;
 
   for (;;) {
-    bool buf_valid = (buf_it_ != buf_end_);
-    if (buf_valid && !reverse_ && !bound_.empty()) {
-      const auto &bk = buf_it_->first;
-      if (bk.size() >= bound_.size() &&
-          std::memcmp(bk.data(), bound_.data(), bound_.size()) >= 0) {
-        buf_valid = false;
-      }
-    }
-    if (buf_valid) {
-      if (use_index_filter_) {
-        if (!key_belongs_to_index(buf_it_->first.data(),
-                                  buf_it_->first.size(),
-                                  table_id_, index_id_)) {
-          buf_valid = false;
-        }
-      } else {
-        if (!key_belongs_to_table(buf_it_->first.data(),
-                                  buf_it_->first.size(), table_id_)) {
-          buf_valid = false;
-        }
-      }
-    }
+    const bool buf_valid = buf_candidate_valid();
 
     if (!snap_valid_ && !buf_valid) {
       return;
     }
 
-    if (!snap_valid_ && buf_valid) {
-      if (buf_it_->second.has_value()) {
-        cur_key_ = buf_it_->first;
-        assign_bytes(cur_val_, buf_it_->second.value());
-        ++buf_it_;
-        valid_ = true;
-        return;
-      }
-      ++buf_it_;
+    if (!snap_valid_) {
+      if (buf_it_->second.has_value()) { emit_buf(); return; }
+      buf_step();  // tombstone with nothing to suppress
       continue;
     }
 
-    if (snap_valid_ && !buf_valid) {
-      cur_key_.assign(snap_key_ptr_, snap_key_ptr_ + snap_key_len_);
-      assign_bytes(cur_val_, snap_val_ptr_, snap_val_len_);
-      snap_step();
-      load_snap_current();
-      valid_ = true;
+    if (!buf_valid) {
+      emit_snap();
       return;
     }
 
-    // Both have data — compare keys.
+    // Both sides have a candidate: lexicographic compare, shorter-is-less.
     const auto &bk = buf_it_->first;
-    int cmp;
-    if (bk.size() == snap_key_len_) {
-      cmp = std::memcmp(bk.data(), snap_key_ptr_, bk.size());
-    } else if (bk.size() < snap_key_len_) {
-      cmp = std::memcmp(bk.data(), snap_key_ptr_, bk.size());
-      if (cmp == 0) cmp = -1;
-    } else {
-      cmp = std::memcmp(bk.data(), snap_key_ptr_, snap_key_len_);
-      if (cmp == 0) cmp = 1;
-    }
-
-    if (cmp < 0) {
-      if (buf_it_->second.has_value()) {
-        cur_key_ = bk;
-        assign_bytes(cur_val_, buf_it_->second.value());
-        ++buf_it_;
-        valid_ = true;
-        return;
-      }
-      ++buf_it_;
-      continue;
+    const size_t n = std::min(bk.size(), snap_key_len_);
+    int cmp = std::memcmp(bk.data(), snap_key_ptr_, n);
+    if (cmp == 0) {
+      cmp = (bk.size() < snap_key_len_) ? -1
+          : (bk.size() > snap_key_len_) ?  1 : 0;
     }
 
     if (cmp == 0) {
-      bool has_val = buf_it_->second.has_value();
+      // Same key on both sides: the buffer's version wins; a tombstone
+      // hides the snapshot entry.
+      const bool has_val = buf_it_->second.has_value();
       if (has_val) {
         cur_key_ = bk;
         assign_bytes(cur_val_, buf_it_->second.value());
       }
-      ++buf_it_;
+      buf_step();
       snap_step();
       load_snap_current();
-      if (has_val) {
-        valid_ = true;
-        return;
-      }
+      if (has_val) { valid_ = true; return; }
       continue;
     }
 
-    // cmp > 0
-    cur_key_.assign(snap_key_ptr_, snap_key_ptr_ + snap_key_len_);
-    assign_bytes(cur_val_, snap_val_ptr_, snap_val_len_);
-    snap_step();
-    load_snap_current();
-    valid_ = true;
+    // Forward emits the smaller key first; reverse emits the larger.
+    const bool buf_first = reverse_ ? (cmp > 0) : (cmp < 0);
+    if (buf_first) {
+      if (buf_it_->second.has_value()) { emit_buf(); return; }
+      buf_step();
+      continue;
+    }
+    emit_snap();
     return;
   }
 }
