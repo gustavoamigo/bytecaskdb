@@ -309,6 +309,62 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn commit rollback", "[txn][commit]
 }
 
 // =========================================================================
+// Autocommit read-modify-write: the snapshot must predate the read
+// =========================================================================
+
+TEST_CASE_METHOD(MariaDBTxnFixture,
+                 "MariaDBTxn autocommit read pins the OCC snapshot",
+                 "[txn][occ][autocommit]") {
+  auto key = make_key("counter:1");
+  auto v0 = make_value("0");
+  auto v1 = make_value("1");
+  THD thd{};
+
+  // Seed the row.
+  {
+    auto seed = create_txn();
+    seed->buffer_put(key.data(), key.size(), v0.data(), v0.size());
+    REQUIRE(seed->commit(&thd, true) == 0);
+  }
+
+  // No begin_if_needed: this is autocommit, where the handler's first call
+  // on the statement is the point read (index_read_map -> get).
+  auto a = create_txn();
+  auto b = create_txn();
+
+  SECTION("get() then concurrent commit then write conflicts") {
+    bytecask::Bytes out;
+    REQUIRE(a->get(key.data(), key.size(), out) == 1);
+    REQUIRE(a->is_active());  // snapshot taken by the read, not the write
+
+    b->buffer_put(key.data(), key.size(), v1.data(), v1.size());
+    REQUIRE(b->commit(&thd, true) == 0);
+
+    // A computes its new value from the stale read and writes it back.
+    a->buffer_put(key.data(), key.size(), v1.data(), v1.size());
+    REQUIRE(a->commit(&thd, true) == HA_ERR_LOCK_DEADLOCK);
+  }
+
+  SECTION("exists() then concurrent commit then write conflicts") {
+    REQUIRE(a->exists(key.data(), key.size()));
+    REQUIRE(a->is_active());
+
+    b->buffer_put(key.data(), key.size(), v1.data(), v1.size());
+    REQUIRE(b->commit(&thd, true) == 0);
+
+    a->buffer_put(key.data(), key.size(), v1.data(), v1.size());
+    REQUIRE(a->commit(&thd, true) == HA_ERR_LOCK_DEADLOCK);
+  }
+
+  SECTION("read-only statement releases the snapshot at commit") {
+    bytecask::Bytes out;
+    REQUIRE(a->get(key.data(), key.size(), out) == 1);
+    REQUIRE(a->commit(&thd, true) == 0);
+    REQUIRE_FALSE(a->is_active());
+  }
+}
+
+// =========================================================================
 // Deferred INSERT dup-check (P3): commit-time ensure_absent conflict
 // =========================================================================
 

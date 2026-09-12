@@ -42,12 +42,24 @@ void MariaDBTxn::begin_if_needed(THD *thd, handlerton *hton) {
 // Write buffering
 // ---------------------------------------------------------------------------
 
-void MariaDBTxn::buffer_put(const uint8_t *key, size_t klen,
-                            const uint8_t *val, size_t vlen,
-                            bool guard_absent) {
+// Pins the OCC snapshot for this statement/transaction on first use. Every
+// read and every buffered write goes through here so that the snapshot
+// predates any value the statement acts on: the engine's commit-time
+// write-write check compares against this snapshot, and a key that another
+// transaction committed after it counts as a conflict. Taking the snapshot
+// later (at the first write) would let an autocommit read-modify-write
+// silently overwrite a concurrent commit. Skipped in deferred-INSERT mode,
+// whose commit is snapshot-less by design (see begin_deferred_insert).
+void MariaDBTxn::ensure_snapshot() {
   if (!snap_ && !deferred_insert_) {
     snap_.emplace(db_->snapshot());
   }
+}
+
+void MariaDBTxn::buffer_put(const uint8_t *key, size_t klen,
+                            const uint8_t *val, size_t vlen,
+                            bool guard_absent) {
+  ensure_snapshot();
 
   std::vector<uint8_t> k(key, key + klen);
   std::vector<uint8_t> v;
@@ -63,9 +75,7 @@ void MariaDBTxn::buffer_put(const uint8_t *key, size_t klen,
 }
 
 void MariaDBTxn::buffer_del(const uint8_t *key, size_t klen) {
-  if (!snap_ && !deferred_insert_) {
-    snap_.emplace(db_->snapshot());
-  }
+  ensure_snapshot();
 
   std::vector<uint8_t> k(key, key + klen);
 
@@ -101,6 +111,7 @@ int MariaDBTxn::get(const uint8_t *key, size_t klen, bytecask::Bytes &out) {
     }
   }
 
+  ensure_snapshot();
   try {
     if (snap_) {
       return snap_->get({}, as_view(key, klen), out) ? 1 : 0;
@@ -120,6 +131,7 @@ bool MariaDBTxn::exists(const uint8_t *key, size_t klen) {
     }
   }
 
+  ensure_snapshot();
   try {
     if (snap_) {
       return snap_->contains_key({}, as_view(key, klen));

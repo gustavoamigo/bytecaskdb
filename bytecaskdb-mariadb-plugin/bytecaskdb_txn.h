@@ -278,6 +278,7 @@ public:
   bool bulk_unique_prefix_exists(const uint8_t *prefix, std::size_t plen);
 
 private:
+  void ensure_snapshot();
   void reset();
   void revert_row_count_deltas();
   void bulk_reset();
