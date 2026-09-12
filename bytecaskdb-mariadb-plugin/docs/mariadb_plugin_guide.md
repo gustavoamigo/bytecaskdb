@@ -147,17 +147,31 @@ MariaDB calls `external_lock(F_WRLCK)` when a statement begins and
 `MariaDBTxn` sits in the per-THD slot (`thd_get_ha_data` / `thd_set_ha_data`)
 and handles all of this:
 
-- **Snapshot** — captured once at `begin_if_needed()`, held for the life of
-  the statement (READ COMMITTED) or the transaction (REPEATABLE READ).
+- **Snapshot** — taken at the first read or write of the statement (or at
+  `begin_if_needed()` for an explicit transaction) and held to its end.
+  Reads and the commit-time conflict check use the same snapshot, so an
+  autocommit read-modify-write cannot overwrite a concurrent commit.
+  The exception is the deferred-INSERT path (`begin_deferred_insert`):
+  a plain autocommit INSERT on a table whose only unique constraint is
+  the PK takes no snapshot and carries an `ensure_absent` guard per row
+  instead.
 - **Write buffer** — `write_row`, `update_row`, `delete_row` all call
   `buffer_put` / `buffer_del` rather than writing directly to the DB.
 - **Read-your-own-writes** — `get()` checks the buffer first, then the
   snapshot. `MergeIterator` merge-walks buffer + snapshot so scans also
   see buffered writes.
 - **Commit** — builds a `WritePlan` from the buffer in insertion order and
-  calls `db->apply_batch()`. If that returns `false` (W-W conflict), commit
-  returns `HA_ERR_LOCK_DEADLOCK` and MariaDB retries the statement.
-- **Rollback** — discards the buffer; snapshot released.
+  calls `db->apply_batch()`. If that returns `nullopt` (W-W conflict),
+  commit returns `HA_ERR_LOCK_DEADLOCK`; the client sees error 1213 and
+  must redo the transaction. The server does not retry.
+- **Rollback** — a session rollback discards the buffer and releases the
+  snapshot. A statement rollback inside a transaction (a failed statement
+  after `BEGIN`) rewinds only that statement: the op log is truncated to
+  the mark recorded when the statement was registered, and the row
+  counters are restored to the checkpoint taken at the same time.
+- **Savepoints** — each `SAVEPOINT` records the op-log mark and a
+  row-counter checkpoint on a stack in `MariaDBTxn`; the server's
+  savepoint slot holds the stack index. `ROLLBACK TO` restores both.
 
 The dual-structure buffer (`ops_` ordered log + `lookup_` sorted map) is
 the core of `bytecaskdb_txn.h`. `ops_` preserves causality for commit;
@@ -280,14 +294,18 @@ handler can call them from `create()`, `delete_table()`, `rename_table()`.
 
 ## Row format
 
-Rows are stored as a 3-byte envelope followed by the raw MariaDB record
-buffer (`table->s->reclength` bytes), optionally followed by BLOB data:
+Rows are stored as a 3-byte envelope followed by the fields in table
+order, optionally followed by BLOB data:
 
 ```
-byte 0:     format version (currently 0x01)
+byte 0:     format version (currently 0x02)
 byte 1-2:   schema_version LE u16  (bumped on ALTER TABLE)
-byte 3..N:  raw MariaDB record buffer (reclength bytes)
-byte N+1..: concatenated BLOB field data (if any)
+byte 3..:   null bitmap, then each field:
+              multi-byte-charset CHAR:  [actual_len LE u16][data] (trailing
+                                        spaces stripped)
+              everything else:          pack_length() bytes as in record[0]
+              BLOB:                     the length/pointer slot; data follows
+then:       concatenated BLOB field data (if any)
 ```
 
 The schema version lets the decoder apply defaults for added columns or skip
@@ -400,11 +418,15 @@ features) is the remaining gap before production use.
   is taken once in `begin_if_needed()`. All reads in that statement see the
   same consistent state.
 
-- **`apply_batch` returning false is not a fatal error.** It means W-W
+- **`apply_batch` returning `nullopt` is not a fatal error.** It means W-W
   conflict: two transactions modified the same key concurrently. The commit
   path maps it to `HA_ERR_LOCK_DEADLOCK`. The application must re-read the
   affected data and rebuild the transaction from scratch — a plain retry of
   the same writes will conflict again.
+
+- **No pointer into the catalog cache escapes `s_catalog_mu`.**
+  `catalog_copy_meta` copies `TableMeta` out under the lock; handlers cache
+  the index list at `open()` and DML paths use that copy.
 
 - **The catalog in-memory cache is the source of truth for reads; the DB is
   the source of truth for recovery.** At startup, `catalog_init()` rebuilds

@@ -738,7 +738,9 @@ static int bytecaskdb_init(void *p) {
   hton->close_connection         = bytecaskdb_close_connection;
   hton->start_consistent_snapshot = bytecaskdb_start_consistent_snapshot;
   hton->show_status              = bytecaskdb_show_status;
-  hton->flags                    = HTON_SUPPORTS_FOREIGN_KEYS;
+  // No HTON_SUPPORTS_FOREIGN_KEYS: FOREIGN KEY clauses are recorded in the
+  // catalog for DDL round-trips but nothing is enforced (see README).
+  hton->flags                    = 0;
   hton->savepoint_offset         = sizeof(uint32_t);
   hton->savepoint_set            = bytecaskdb_savepoint_set;
   hton->savepoint_rollback       = bytecaskdb_savepoint_rollback;
