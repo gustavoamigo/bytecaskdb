@@ -35,13 +35,21 @@ data_{YYYYMMDDHHmmss}_{RRRR}_V{XX}
 | Field              | Description |
 |--------------------|-------------|
 | `YYYYMMDDHHmmss`   | UTC timestamp at second precision. Records when the file was created on disk — **not** the age of its content. After vacuum, a file may contain entries much older than its timestamp. |
-| `RRRRRRRR`           | 4-byte random hex salt (8 characters, `00000000`–`ffffffff`). Prevents collisions when multiple files are created within the same second. |
+| `RRRRRRRR`           | 4-byte random hex salt (8 characters, `00000000`–`ffffffff`). Separates files created within the same second. |
 | `V{XX}`            | File format version. `V01` is the initial version. The engine uses this to select the correct parser at open time. |
 
 The timestamp is a human-readable debug hint. Filename ordering carries no
 semantic meaning for content ordering — entry sequence numbers inside the files
 are the authoritative ordering mechanism. Each data file has at most one
 companion hint file with the same stem.
+
+A stem is never reused. The salt makes a repeat within the same second unlikely
+but not impossible, and reusing one would reopen a sealed file for write:
+entries appended past its end are invisible to recovery, because a file that
+already has a `.hint` is skipped by hint generation. The engine creates every
+data file with `O_EXCL` and additionally refuses any stem for which a `.hint`
+already exists; either condition aborts the process rather than being worked
+around. Vacuum checks its rename target for the same reason.
 
 Examples:
 - `data_20260407123456_a7f2b31e_V01.data`

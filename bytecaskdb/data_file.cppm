@@ -22,6 +22,8 @@ module;
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <sys/uio.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -49,6 +51,20 @@ namespace bytecask {
 
 // Byte offset into a data file, as returned by append() and consumed by read().
 export using Offset = std::uint64_t;
+
+// Reached only when an exclusive create loses to an existing file, which means
+// the caller handed back a name the database already used. Opening it for write
+// would silently adopt the sealed file's length and append past its end; those
+// entries are then invisible to recovery, because hint generation skips any
+// file whose hint already exists. Aborts rather than throws — see panic().
+[[noreturn]] inline void panic_on_reused_path(
+    const std::filesystem::path &path) {
+  panic(std::format(
+      "data file '{}' already exists. A new writable data file must never "
+      "reuse a name; appending to an already-sealed file loses every appended "
+      "entry at recovery.",
+      path.string()));
+}
 
 // ---------------------------------------------------------------------------
 // DataFile — abstract base for all data file implementations.
@@ -348,10 +364,11 @@ private:
 export class WritableMmapDataFile : public WritableDataFile {
 public:
   [[nodiscard]] static auto create(std::filesystem::path path,
-                                   std::size_t capacity)
+                                   std::size_t capacity,
+                                   bool exclusive = false)
       -> std::shared_ptr<WritableDataFile> {
     return std::shared_ptr<WritableDataFile>(
-        new WritableMmapDataFile{std::move(path), capacity});
+        new WritableMmapDataFile{std::move(path), capacity, exclusive});
   }
 
   ~WritableMmapDataFile() override;
@@ -467,10 +484,14 @@ public:
   }
 
 private:
-  WritableMmapDataFile(std::filesystem::path path, std::size_t capacity)
+  WritableMmapDataFile(std::filesystem::path path, std::size_t capacity,
+                       bool exclusive)
       : WritableDataFile{std::move(path)} {
-    ops_.fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    ops_.fd_ = ::open(path_.c_str(),
+                      O_RDWR | O_CREAT | O_CLOEXEC | (exclusive ? O_EXCL : 0),
+                      0644);
     if (ops_.fd_ == -1) {
+      if (exclusive && errno == EEXIST) panic_on_reused_path(path_);
       throw std::system_error{
           errno, std::generic_category(),
           std::format("WritableMmapDataFile: cannot open '{}'", path_.string())};
@@ -574,10 +595,11 @@ WritableMmapDataFile::~WritableMmapDataFile() {
 // key directory after pwritev + fdatasync.
 export class WritablePosixDataFile : public WritableDataFile {
 public:
-  [[nodiscard]] static auto create(std::filesystem::path path)
+  [[nodiscard]] static auto create(std::filesystem::path path,
+                                   bool exclusive = false)
       -> std::shared_ptr<WritableDataFile> {
     return std::shared_ptr<WritableDataFile>(
-        new WritablePosixDataFile{std::move(path)});
+        new WritablePosixDataFile{std::move(path), exclusive});
   }
 
   ~WritablePosixDataFile() override;
@@ -680,10 +702,13 @@ public:
   }
 
 private:
-  explicit WritablePosixDataFile(std::filesystem::path path)
+  WritablePosixDataFile(std::filesystem::path path, bool exclusive)
       : WritableDataFile{std::move(path)} {
-    ops_.fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    ops_.fd_ = ::open(path_.c_str(),
+                      O_RDWR | O_CREAT | O_CLOEXEC | (exclusive ? O_EXCL : 0),
+                      0644);
     if (ops_.fd_ == -1) {
+      if (exclusive && errno == EEXIST) panic_on_reused_path(path_);
       throw std::system_error{
           errno, std::generic_category(),
           std::format("WritablePosixDataFile: cannot open '{}'", path_.string())};
@@ -1074,6 +1099,9 @@ export [[nodiscard]] inline auto openDataFileForRead(
 }
 
 // Factory for writable data files: mmap-backed when requested, pread-based otherwise.
+// Opens path for write, creating it if absent and adopting its current length
+// if present. The engine never uses this to create a new file — see
+// createDataFileForWrite — but tests and tooling reopen a file they wrote.
 export [[nodiscard]] inline auto openDataFileForWrite(
     std::filesystem::path path, std::size_t capacity, bool use_mmap)
     -> std::shared_ptr<WritableDataFile> {
@@ -1083,6 +1111,38 @@ export [[nodiscard]] inline auto openDataFileForWrite(
   }
 #endif
   return WritablePosixDataFile::create(std::move(path));
+}
+
+// Creates the one writable data file for stem in dir: "<stem>.data", or
+// "<stem>.data.tmp" for vacuum's staging copy. This is how the engine creates
+// every data file it writes to.
+//
+// Panics if the name is already in use — either "<stem><suffix>" exists
+// (rejected by O_EXCL, race-free against a concurrent creator) or a
+// "<stem>.hint" was already written, which marks the stem as sealed. Both mean
+// the stem generator returned a name this database already used. Neither is
+// recoverable: the two guards are a pair, so they live in one function that a
+// caller cannot half-apply.
+export [[nodiscard]] inline auto createDataFileForWrite(
+    const std::filesystem::path &dir, const std::string &stem,
+    std::string_view suffix, std::size_t capacity, bool use_mmap)
+    -> std::shared_ptr<WritableDataFile> {
+  const auto hint_path = dir / (stem + ".hint");
+  if (std::filesystem::exists(hint_path)) {
+    panic(std::format(
+        "data file stem '{}' is already sealed: '{}' exists. Hint generation "
+        "skips a file whose hint is already written, so every entry appended "
+        "to it would be lost at recovery.",
+        stem, hint_path.string()));
+  }
+  auto path = dir / (stem + std::string{suffix});
+#ifndef __EMSCRIPTEN__
+  if (use_mmap && capacity > 0) {
+    return WritableMmapDataFile::create(std::move(path), capacity,
+                                        /*exclusive=*/true);
+  }
+#endif
+  return WritablePosixDataFile::create(std::move(path), /*exclusive=*/true);
 }
 
 // Forward-only iterator over raw entries in a DataFile.

@@ -1937,8 +1937,8 @@ DB::DB(std::filesystem::path dir, Options opts)
     counters_.files_opened.store(file_count, std::memory_order_relaxed);
     s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
-    auto new_active = openDataFileForWrite(
-        dir_ / (stem + ".data"), rotation_threshold_, use_mmap_);
+    auto new_active = createDataFileForWrite(
+        dir_, stem, ".data", rotation_threshold_, use_mmap_);
     // +1 for the new active file.
     counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
     auto files_t = s.files.transient();
@@ -2471,8 +2471,8 @@ void DB::rotate_active_file(TransientEngineState &t,
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_rotate_file_creation);
 #endif
-  auto new_file = openDataFileForWrite(
-      dir_ / (stem + ".data"), rotation_threshold_, use_mmap_);
+  auto new_file = createDataFileForWrite(
+      dir_, stem, ".data", rotation_threshold_, use_mmap_);
   t.apply_rotate_file(read_only_old, std::move(new_file));
   auto dir = dir_;
   worker_.dispatch([f = std::move(read_only_old), d = std::move(dir)] {
@@ -2647,14 +2647,23 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
   const auto stem = make_data_file_stem();
   const auto tmp_data_path = dir_ / (stem + ".data.tmp");
   const auto final_data_path = dir_ / (stem + ".data");
+  // createDataFileForWrite guards the staging copy, but the rename below
+  // replaces its target silently — so the compacted file's final name has to
+  // be checked too, or a reused stem would unlink a live data file.
+  if (std::filesystem::exists(final_data_path)) {
+    panic(std::format(
+        "vacuum would overwrite existing data file '{}': the stem generator "
+        "reused a name.",
+        final_data_path.string()));
+  }
 
   VacuumScanResult scan;
   {
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_vacuum_compact_tmp_create);
 #endif
-    auto tmp_file = openDataFileForWrite(
-        tmp_data_path, rotation_threshold_, use_mmap_);
+    auto tmp_file = createDataFileForWrite(
+        dir_, stem, ".data.tmp", rotation_threshold_, use_mmap_);
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id);
     tmp_file->sync();
   }
@@ -2829,8 +2838,8 @@ void DB::resume() {
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_resume_file_creation);
 #endif
-  auto new_file = openDataFileForWrite(
-      dir_ / (stem + ".data"), rotation_threshold_, use_mmap_);
+  auto new_file = createDataFileForWrite(
+      dir_, stem, ".data", rotation_threshold_, use_mmap_);
 
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.

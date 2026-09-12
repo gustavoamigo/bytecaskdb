@@ -6,9 +6,12 @@
 module;
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <crc32c/crc32c.h>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 export module bytecask.util;
@@ -23,6 +26,21 @@ constexpr auto narrow(From value) -> To {
     throw std::runtime_error{"narrowing conversion out of range"};
   }
   return static_cast<To>(value);
+}
+
+// Unrecoverable invariant violation: prints msg to stderr and aborts.
+//
+// Deliberately not an exception. The write path wraps its I/O in catch (...)
+// and turns any failure into a degraded state that resume() clears, so a
+// thrown invariant violation would be swallowed and retried — masking the bug
+// it is meant to expose. Active in release builds: the conditions that reach
+// it risk silent data loss, which NDEBUG must not disable.
+export [[noreturn]] inline void panic(std::string_view msg) {
+  std::fputs("bytecask: PANIC: ", stderr);
+  std::fwrite(msg.data(), 1, msg.size(), stderr);
+  std::fputc('\n', stderr);
+  std::fflush(stderr);
+  std::abort();
 }
 
 // ---------------------------------------------------------------------------
