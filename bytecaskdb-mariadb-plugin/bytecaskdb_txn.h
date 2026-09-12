@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -34,6 +35,8 @@ struct THD;
 struct handlerton;
 
 namespace bytecaskdb {
+
+class ha_bytecaskdb;
 
 class MariaDBTxn {
 public:
@@ -189,9 +192,25 @@ public:
   // Enter deferred-dup-check mode for a plain autocommit INSERT: no snapshot
   // is acquired, and commit() builds a snapshot-less WritePlan whose
   // ensure_absent guards (see Op::guard_absent) carry the PK dup check.
-  // A commit conflict on such a plan is reported as HA_ERR_FOUND_DUPP_KEY.
-  // Cleared by reset() at commit/rollback.
-  void begin_deferred_insert() { deferred_insert_ = true; }
+  // A commit conflict on such a plan is reported as HA_ERR_FOUND_DUPP_KEY,
+  // with the duplicate's key value rendered by `handler`, which owns the
+  // TABLE the server's formatter needs. The handler stays registered for
+  // the rest of the statement: commit runs before the statement's tables
+  // are unlocked, and the handler deregisters itself on unlock/close in
+  // case that order is ever different. Cleared by reset().
+  using DupKeyReporter = std::function<void(const std::vector<uint8_t> &pk)>;
+  void begin_deferred_insert(const ha_bytecaskdb *handler,
+                             DupKeyReporter reporter) {
+    deferred_insert_ = true;
+    deferred_handler_ = handler;
+    deferred_reporter_ = std::move(reporter);
+  }
+  void forget_deferred_handler(const ha_bytecaskdb *handler) {
+    if (deferred_handler_ == handler) {
+      deferred_handler_ = nullptr;
+      deferred_reporter_ = nullptr;
+    }
+  }
 
   // In-memory presence probe against the write buffer only (no snapshot, no
   // DB access). Used by the deferred INSERT path to catch duplicates within
@@ -338,6 +357,14 @@ private:
 
   // Set by begin_deferred_insert(); see that method. Reset by reset().
   bool deferred_insert_{false};
+  const ha_bytecaskdb *deferred_handler_{nullptr};  // identity only
+  DupKeyReporter deferred_reporter_;
+
+  // Reports a deferred-INSERT commit conflict as a duplicate primary key:
+  // finds the first guarded key that now exists, and raises ER_DUP_ENTRY
+  // through the registered handler (with the key value) or, without one,
+  // with an empty value.
+  void report_deferred_dup_key(THD *thd);
 
   // Bulk-copy mode state (see begin_bulk_copy). Isolated from ops_/lookup_.
   bool bulk_copy_mode_{false};

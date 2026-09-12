@@ -95,6 +95,7 @@ int ha_bytecaskdb::external_lock(THD *thd, int lock_type) {
     txn->begin_if_needed(thd, bytecaskdb_hton);
     txn_cached_ = txn;
   } else {
+    if (txn_cached_) { txn_cached_->forget_deferred_handler(this); }
     txn_cached_ = nullptr;
   }
   return 0;
@@ -354,6 +355,7 @@ void ha_bytecaskdb::seed_cached_autoinc(uint64_t high_water) const {
 // ---------------------------------------------------------------------------
 
 int ha_bytecaskdb::close() {
+  if (txn_cached_) { txn_cached_->forget_deferred_handler(this); }
   merge_scan_.reset();
   merge_index_.reset();
   indexes_.clear();
@@ -554,7 +556,10 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
       return HA_ERR_FOUND_DUPP_KEY;
     }
   }
-  if (defer_dup) { txn->begin_deferred_insert(); }
+  if (defer_dup) {
+    txn->begin_deferred_insert(
+        this, [this](const std::vector<uint8_t> &pk) { report_dup_pk(pk); });
+  }
 
   // Check unique secondary index constraints.
   if (!indexes_.empty()) {
@@ -703,6 +708,26 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
     if (e) { return e; }
   }
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// report_dup_pk() — deferred-INSERT duplicate, reported at commit time.
+//
+// The statement has already failed, so record[0] is free to receive the
+// duplicate's key columns; print_keydup_error renders them exactly as the
+// eager write_row path would have (code ER_DUP_ENTRY, "Duplicate entry
+// '...' for key 'PRIMARY'").
+// ---------------------------------------------------------------------------
+
+void ha_bytecaskdb::report_dup_pk(const std::vector<uint8_t> &pk) {
+  const uint pk_idx = table->s->primary_key;
+  errkey = saved_errkey_ = pk_idx;
+#ifndef PLUGIN_TESTING
+  decode_pk(table, pk.data(), pk.size(), table->record[0], decode_pk_scratch_);
+  print_keydup_error(table, &table->key_info[pk_idx], MYF(0));
+#else
+  my_error(ER_DUP_ENTRY, MYF(0), "", "PRIMARY");
+#endif
 }
 
 // ---------------------------------------------------------------------------

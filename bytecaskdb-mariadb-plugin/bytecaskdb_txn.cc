@@ -12,6 +12,10 @@
 #include "mysql/plugin.h"
 #include "sql_priv.h"
 #include "mysqld_error.h"
+#ifndef PLUGIN_TESTING
+#undef WITH_WSREP
+#include <mysql/server/private/sql_class.h>  // ER_THD_OR_DEFAULT
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -252,7 +256,7 @@ MariaDBTxn::reverse_buffer_start(const std::vector<uint8_t> &hi) const {
 // Commit / rollback
 // ---------------------------------------------------------------------------
 
-int MariaDBTxn::commit(THD * /*thd*/, bool all) {
+int MariaDBTxn::commit(THD *thd, bool all) {
   if (bulk_copy_mode_ && (all || !registered_all_)) {
     // Flush any tail rows the copy loop left buffered, then fall through.
     // end_bulk_insert normally does this already; this covers paths that
@@ -303,18 +307,16 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
     bool committed = db_->apply_batch(bytecask::WriteOptions{.sync = true},
                                       std::move(plan)).has_value();
     if (!committed) {
-      revert_row_count_deltas();
-      reset();
       if (deferred) {
         // Snapshot-less plan: the only precondition is ensure_absent, so a
-        // conflict is a duplicate primary key. ER_DUP_ENTRY_WITH_KEY_NAME
-        // (not ER_DUP_ENTRY) takes two strings — "Duplicate entry '%s' for
-        // key '%s'" — matching the (value, key-name) args passed here.
-        // ER_DUP_ENTRY's second placeholder is an integer key index, so
-        // passing "PRIMARY" there is undefined behavior on the varargs call.
-        my_error(ER_DUP_ENTRY_WITH_KEY_NAME, MYF(0), "", "PRIMARY");
+        // conflict is a duplicate primary key.
+        report_deferred_dup_key(thd);
+        revert_row_count_deltas();
+        reset();
         return HA_ERR_FOUND_DUPP_KEY;
       }
+      revert_row_count_deltas();
+      reset();
       my_error(ER_LOCK_DEADLOCK, MYF(0));
       return HA_ERR_LOCK_DEADLOCK;
     }
@@ -340,6 +342,8 @@ void MariaDBTxn::rollback(THD * /*thd*/, bool all) {
     restore_row_count_deltas(stmt_row_count_deltas_);
     truncate_ops(stmt_ops_mark_);
     deferred_insert_ = false;
+    deferred_handler_ = nullptr;
+    deferred_reporter_ = nullptr;
     registered_stmt_ = false;
     return;
   }
@@ -376,6 +380,32 @@ void MariaDBTxn::restore_row_count_deltas(const RowCountDeltas &saved) {
   row_count_deltas_ = saved;
 }
 
+void MariaDBTxn::report_deferred_dup_key(THD *thd) {
+  // ops_ is still intact here; the first guarded key that exists in the
+  // live DB is the one the ensure_absent guard rejected.
+  const std::vector<uint8_t> *dup = nullptr;
+  for (const auto &op : ops_) {
+    if (op.kind != Op::Put || !op.guard_absent) { continue; }
+    bool present = false;
+    try {
+      present = db_->contains_key({}, as_view(op.key));
+    } catch (...) {
+      present = false;
+    }
+    if (present) { dup = &op.key; break; }
+  }
+  if (deferred_reporter_ && dup) {
+    deferred_reporter_(*dup);
+    return;
+  }
+  // No handler (or no identifiable key): same error code and format the
+  // server uses, without a rendered value. ER_DUP_ENTRY's own format takes
+  // a key *index* as its second argument; the server pairs the ER_DUP_ENTRY
+  // code with the WITH_KEY_NAME format for named keys, and so do we.
+  my_printf_error(ER_DUP_ENTRY, ER_THD_OR_DEFAULT(thd, ER_DUP_ENTRY_WITH_KEY_NAME),
+                  MYF(0), "", "PRIMARY");
+}
+
 void MariaDBTxn::reset() {
   snap_.reset();
   ops_.clear();
@@ -384,6 +414,8 @@ void MariaDBTxn::reset() {
   stmt_ops_mark_ = 0;
   stmt_row_count_deltas_.clear();
   deferred_insert_ = false;
+  deferred_handler_ = nullptr;
+  deferred_reporter_ = nullptr;
   registered_stmt_ = false;
   registered_all_ = false;
   bulk_reset();

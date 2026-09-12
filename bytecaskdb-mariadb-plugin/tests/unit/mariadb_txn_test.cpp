@@ -386,25 +386,24 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn deferred insert dup check",
   }
 
   SECTION("commit-time conflict returns HA_ERR_FOUND_DUPP_KEY and raises "
-          "ER_DUP_ENTRY_WITH_KEY_NAME") {
+          "ER_DUP_ENTRY (1062), the code clients check for") {
     auto txn = create_txn();
     THD thd{};
 
     g_stub_last_my_error_code = 0;
 
-    txn->begin_deferred_insert();
+    txn->begin_deferred_insert(nullptr, nullptr);
     txn->buffer_put(pk.data(), pk.size(), val2.data(), val2.size(),
                     /*guard_absent=*/true);
 
     int rc = txn->commit(&thd, true);
 
     REQUIRE(rc == HA_ERR_FOUND_DUPP_KEY);
-    // ER_DUP_ENTRY's second format placeholder is an integer key index, not
-    // a string — passing a key name there is undefined behavior on the
-    // varargs call and produces a garbled message at runtime. Regression
-    // coverage for that bug: assert the code actually raised is the
-    // two-string variant the (value, key-name) args match.
-    REQUIRE(g_stub_last_my_error_code == ER_DUP_ENTRY_WITH_KEY_NAME);
+    // The server pairs code ER_DUP_ENTRY with the WITH_KEY_NAME message
+    // format; the code must stay 1062 because drivers and ORMs key their
+    // duplicate-key handling on it. (Using ER_DUP_ENTRY's *own* format with
+    // a key-name string is UB: its second placeholder is an integer.)
+    REQUIRE(g_stub_last_my_error_code == ER_DUP_ENTRY);
   }
 }
 

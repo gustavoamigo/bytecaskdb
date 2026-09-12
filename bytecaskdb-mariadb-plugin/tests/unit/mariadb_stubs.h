@@ -358,6 +358,13 @@ inline void my_error(int error, unsigned long /*flags*/, ...) {
   g_stub_last_my_error_code = error;
 }
 
+// Stub: my_printf_error — records the code like my_error; format ignored.
+inline void my_printf_error(int error, const char * /*format*/,
+                            unsigned long /*flags*/, ...) {
+  g_stub_last_my_error_code = error;
+}
+#define ER_THD_OR_DEFAULT(thd, X) ""
+
 // MariaDB error codes.
 #define ER_LOCK_DEADLOCK 1213
 #define ER_DUP_ENTRY 1062
