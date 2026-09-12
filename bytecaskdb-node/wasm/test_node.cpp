@@ -1,12 +1,12 @@
 // Minimal smoke test: open DB, write, read, close, reopen (recovery), verify.
-import bytecask;
-
 #include <cassert>
 #include <cstdio>
 #include <filesystem>
 #include <span>
 #include <string>
 #include <string_view>
+
+import bytecask;
 
 using namespace bytecask;
 

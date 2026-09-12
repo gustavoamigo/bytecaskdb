@@ -7,7 +7,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build:wasm": "cd .. && xmake build wasm_embind",
-    "build:wasm:all": "cd .. && xmake build wasm_embind wasm_smoke_test wasm_engine_bench wasm_memory_profile wasm_tests",
+    "build:wasm:all": "cd .. && xmake build wasm_embind && xmake build wasm_smoke_test && xmake build wasm_engine_bench && xmake build wasm_memory_profile && xmake build wasm_tests",
     "build:native": "cd .. && xmake build bytecaskdb_node",
     "build:ts": "tsc",
     "build": "npm run build:wasm && npm run build:native && npm run build:ts",
@@ -15,10 +15,11 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:ui": "vitest --ui",
-    "test:smoke": "cd .. && xmake build wasm_smoke_test && node bytecaskdb-node/wasm/build/bytecask_node.js",
+    "test:smoke": "cd .. && xmake build wasm_smoke_test && node bytecaskdb-node/wasm/build/wasm_smoke_test.js",
     "test:smoke:native": "npm run build:native && node native/smoke_test.cjs",
     "test:wasm": "cd .. && xmake build wasm_tests && node bytecaskdb-node/wasm/build/bytecask_tests.js '~[concurrency]' '~[lock]'",
-    "bench:wasm": "cd .. && xmake build wasm_engine_bench && BC_DATASET_SIZE=100000 node bytecaskdb-node/wasm/build/engine_bench_nodefs.js"
+    "bench:wasm": "cd .. && xmake build wasm_engine_bench && BC_DATASET_SIZE=100000 node bytecaskdb-node/wasm/build/engine_bench_nodefs.js",
+    "bench": "vitest bench"
   },
   "files": [
     "dist/",

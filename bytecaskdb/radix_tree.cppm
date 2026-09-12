@@ -1117,17 +1117,31 @@ template <typename V> struct Node256 : Node<V> {
   std::array<IntrusivePtr<Node<V>>, kCapacity> children_{};
 };
 
-// Node<uint64_t>: 4+4+8+8 = 24 (no children field).
+// Node<uint64_t>: 4+4+8+8 = 24 (no children field; no pointers, so this
+// holds regardless of IntrusivePtr's underlying pointer size).
 static_assert(sizeof(Node<std::uint64_t>) == 24);
-// Node4<uint64_t>: 24 + 1(count) + 4(keys, padded) + 32(4 children) = 64.
-static_assert(sizeof(Node4<std::uint64_t>) == 64);
-// Node16<uint64_t>: 24 + 1(count) + 16(keys) + 7(pad) + 128(16 children) = 176.
-static_assert(sizeof(Node16<std::uint64_t>) == 176);
-// Node48<uint64_t>: 24 + 1(count) + 256(child_index) + 48(keys) + 7(pad) +
-// 384(48 children) = 720.
-static_assert(sizeof(Node48<std::uint64_t>) == 720);
-// Node256<uint64_t>: 24 + 2(count) + 6(pad) + 2048(256 children) = 2080.
-static_assert(sizeof(Node256<std::uint64_t>) == 2080);
+
+// The four tiers below embed IntrusivePtr<Node> child arrays, so their sizes
+// scale with the target's pointer width: 8 bytes/child on 64-bit hosts
+// (native, MariaDB plugin, Python bindings), 4 bytes/child on wasm32 (the
+// Node.js WASM backend, built with -DBYTECASK_SINGLE_THREADED). Both are
+// asserted explicitly rather than skipping the check on non-64-bit targets.
+//
+// Node4<uint64_t>: 24 + 1(count) + 4(keys, padded) + 4*children = 64 (8B
+// children) or 48 (4B children).
+static_assert(sizeof(Node4<std::uint64_t>) == (sizeof(void *) == 8 ? 64 : 48));
+// Node16<uint64_t>: 24 + 1(count) + 16(keys) + pad + 16*children = 176 (8B
+// children) or 112 (4B children).
+static_assert(sizeof(Node16<std::uint64_t>) ==
+              (sizeof(void *) == 8 ? 176 : 112));
+// Node48<uint64_t>: 24 + 1(count) + 256(child_index) + 48(keys) + pad +
+// 48*children = 720 (8B children) or 528 (4B children).
+static_assert(sizeof(Node48<std::uint64_t>) ==
+              (sizeof(void *) == 8 ? 720 : 528));
+// Node256<uint64_t>: 24 + 2(count) + pad + 256*children = 2080 (8B children)
+// or 1056 (4B children).
+static_assert(sizeof(Node256<std::uint64_t>) ==
+              (sizeof(void *) == 8 ? 2080 : 1056));
 
 // Factory functions for node allocation.
 // make_leaf: allocates Node (24B for uint64_t value), no children.
