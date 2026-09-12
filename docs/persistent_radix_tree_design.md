@@ -186,11 +186,18 @@ This component inherits the ByteCaskDB design tenets in order of priority:
 ## 3. Architectural Design
 
 ### 3.1. Node Layout
+
+Internal (non-leaf) nodes are tiered by fanout rather than using one
+one-size-fits-all representation — four fixed-capacity size classes
+(`Node4`/`Node16`/`Node48`/`Node256`), following the design introduced by
+the Adaptive Radix Tree (Leis, Kemper & Neumann, ICDE 2013 — see
+Appendix B):
+
 ```cpp
 // Base node — 94% of all nodes are leaves and use only this struct.
 struct Node {
     mutable std::atomic<uint32_t> refcount; // intrusive reference count
-    uint32_t packed_tag; // high bit = has_value, bit 30 = has_children, low 30 bits = edit tag
+    uint32_t packed_tag; // high bit = has_value, next 3 bits = node_type, low 28 bits = edit tag
 
     V value;
 
@@ -201,28 +208,82 @@ struct Node {
     CompactPrefix prefix;  // 8 bytes (1-byte size + 7 inline bytes)
 };
 
-// Derived node for the ~6% of nodes that have children.
-struct InternalNode : Node {
-    // Struct-of-arrays layout: parallel vectors of transition bytes and
-    // node pointers. Eliminates the 7 bytes of alignment padding that
-    // pair<byte, IntrusivePtr> would waste per child slot (16 → 9 B/slot).
-    struct ChildStore {
-        std::vector<std::byte> transition_bytes;
-        std::vector<IntrusivePtr<Node>> ptrs;
-    };
-    std::unique_ptr<ChildStore> children_;
+// Node4 — the entry tier for any node that has 1–4 children. Chain-
+// compression routing nodes (created whenever a key segment exceeds
+// CompactPrefix's 7-byte cap) always have exactly 1 child; prefix splits
+// start at 2. Children are embedded inline: a single allocation, no
+// separate child-store object or backing buffers.
+struct Node4 : Node {
+    static constexpr uint8_t kCapacity = 4;
+    uint8_t count;
+    std::array<std::byte, kCapacity> keys;
+    std::array<IntrusivePtr<Node>, kCapacity> children;
+};
+
+// Node16 — same shape as Node4 (sorted inline array, linear scan) but a
+// bigger array, for nodes with 5–16 children. Still a single allocation.
+struct Node16 : Node {
+    static constexpr uint8_t kCapacity = 16;
+    uint8_t count;
+    std::array<std::byte, kCapacity> keys;
+    std::array<IntrusivePtr<Node>, kCapacity> children;
+};
+
+// Node48 — same sorted keys/children array as Node4/Node16 (so ordinal
+// child_at(i) stays O(1)), plus a 256-byte byte->slot index that makes
+// find_child(b) O(1) instead of a linear scan. kEmptyMarker (== kCapacity)
+// marks an unused byte, mirroring DuckDB's ART Node48::EMPTY_MARKER.
+struct Node48 : Node {
+    static constexpr uint8_t kCapacity = 48;
+    static constexpr uint8_t kEmptyMarker = kCapacity;
+    uint8_t count;
+    std::array<uint8_t, 256> child_index;  // byte -> slot, or kEmptyMarker
+    std::array<std::byte, kCapacity> keys;
+    std::array<IntrusivePtr<Node>, kCapacity> children;
+};
+
+// Node256 — the terminal tier: 256 slots is the ceiling on fanout for a
+// single byte transition, so there is nothing above it. Direct-mapped —
+// children[b] is the child for byte b, no stored key array needed, so
+// find_child/insert/remove are O(1). count is uint16_t because a full
+// node holds 256 children, which does not fit in 8 bits.
+struct Node256 : Node {
+    static constexpr uint16_t kCapacity = 256;
+    uint16_t count;
+    std::array<IntrusivePtr<Node>, kCapacity> children;
 };
 ```
 
+A `Node4` promotes to `Node16` on its 5th child; `Node16` promotes to
+`Node48` on its 17th; `Node48` promotes to `Node256` on its 49th.
+`Node256` is the ceiling — a transition is a single byte, so 256 slots is
+the most any node can ever need, and there is no tier above it. Demotion
+uses proportional hysteresis on the two upper boundaries, following
+DuckDB's ART (Appendix B) rather than a symmetric threshold: `Node48`
+demotes to `Node16` once its count drops to ≤12
+(75% of `Node16`'s capacity, not ≤16), and `Node256` demotes to `Node48`
+once its count drops to ≤36 (75% of `Node48`'s capacity, not ≤48) — both
+avoid promote/demote thrashing right at the tier boundary. `Node16`
+demotes to `Node4` at ≤4, symmetrically (no hysteresis needed at this
+boundary — see §7.7). All eight transitions are owned by exactly two
+functions — `Node::insert_child` and `Node::remove_child` — which take
+the node by `IntrusivePtr` and return the (possibly reallocated) result;
+every other call site (the persistent and transient `set`/`erase`/`merge`
+paths) just reassigns its local pointer to whatever comes back, the same
+pattern the leaf → internal promotion already used before this tiering
+existed. See §7.7 for the measured memory impact of each tier by key
+shape, and §7.8 for the ordered-traversal design each tier's `child_at`
+accessor has to support.
+
 `IntrusivePtr<T>` is a lightweight single-pointer (8 bytes) smart pointer. It calls `addref()` on copy and `release()` on destruction; when the count reaches zero, the node is deleted. Copy assignment uses addref-before-release sequencing to prevent use-after-free when the source is a sub-object of the destination (e.g., reassigning a root to one of its own children). Move assignment detaches the source pointer before releasing the old destination for the same reason. This eliminates the ~32-byte `make_shared` control block per node and halves the pointer size in every child slot from 16 bytes (`shared_ptr`) to 8 bytes (`IntrusivePtr`).
 
-`Node::release()` uses an **iterative tail-release** to avoid the O(depth) recursive destructor chain that would otherwise result from `~IntrusivePtr → release → delete → ~Node → ~ChildStore → ~IntrusivePtr → …`. When the last reference to a node is dropped, the implementation detaches all children from their `IntrusivePtr`s before calling `delete`, then loops over those children releasing each one in turn — converting the last-child release into a loop. For chains of single-child nodes (the dominant pattern in prefix-compressed trees), this eliminates the recursive call overhead entirely. Profiling showed the naive recursive approach consuming 29% of total merge time at 100k keys.
+`Node::release()` uses an **iterative tail-release** to avoid the O(depth) recursive destructor chain that would otherwise result from chained `~IntrusivePtr → release → delete → ~Node → …` calls down a path of single-child nodes. When the last reference to a node is dropped, the implementation detaches all children — from whichever tier's array the node is (`Node4`/`Node16`/`Node48`'s packed prefix, or a full scan of `Node256`'s 256 direct-mapped slots) — before calling `delete`, then loops over those children releasing each one in turn, converting the last-child release into a loop. For chains of single-child nodes (the dominant pattern in prefix-compressed trees), this eliminates the recursive call overhead entirely. Profiling showed the naive recursive approach consuming 29% of total merge time at 100k keys. The detach buffer is *not* value-initialized — every slot it can ever read is written first by the switch above it, and nothing reads past the actual count — because zero-initializing it unconditionally on every single node release, regardless of that node's tier, was itself a measured performance bug — see §7.7.
 
 `PersistentRadixTree` and `TransientRadixTree` use explicit move constructors/assignments that reset the source's `size_` (and `tag_` for transient) to zero via `std::exchange`. This ensures a moved-from tree is in a valid empty state (`size() == 0`, `empty() == true`) rather than carrying stale metadata while the root pointer has been transferred.
 
-Leaf nodes use `Node` directly (no `children_` field — accessing it through a `Node*` is a compile error). Internal nodes use `InternalNode`, which adds a `unique_ptr<ChildStore>`. Child accessors on `Node` check a tag bit (`kHasChildrenBit`) before downcasting and return safe defaults ("no children") when the flag is absent. This makes incorrect access a compile-time error for leaves and a safe no-op for base-pointer dispatch.
+Leaf nodes use `Node` directly (no children field — accessing one through a `Node*` is a compile error). Internal nodes use `Node4`, `Node16`, `Node48`, or `Node256` depending on tier. Child accessors on `Node` (`as_node4()`, `as_node16()`, `as_node48()`, `as_node256()`) read `node_type()` once and dispatch on it — rather than each independently re-deriving the type from `packed_tag_`, which would mean every accessor call pays for every check up to and including its own tier, a real, measured cost on the hot iteration path (see §7.7). An unexpected type on a leaf returns a safe default ("no children") rather than accessing a nonexistent field, making incorrect access a compile-time error for leaves and a safe no-op for base-pointer dispatch.
 
-Children use a struct-of-arrays layout (`ChildStore`): parallel vectors of transition bytes and node pointers. This eliminates the 7 bytes of alignment padding per child slot that `pair<byte, IntrusivePtr>` would waste (16 → 9 bytes per slot).
+`Node4` and `Node16` and `Node48` all keep value/prefix/children in one allocation — the property that made them win at low-to-moderate fanout over the earlier design's separately-heap-allocated child store (a struct-of-arrays `ChildStore`, since removed — see §7.7). `Node256` is also one allocation, but its cost (2080 bytes) is fixed regardless of occupancy, so it only pays off once a node's fanout is genuinely large; see §7.7 for the measured range where each tier actually wins.
 
 `CompactPrefix` is a fixed 8-byte container (1-byte size + 7 inline bytes, `alignof == 1`). Prefixes up to 7 bytes are stored inline with no heap allocation. Key segments longer than 7 bytes are split into a chain of routing nodes: each hop stores 7 prefix bytes plus 1 transition byte to the next node. This eliminates the heap spill path entirely — no heap allocation is ever needed for prefixes.
 
@@ -231,7 +292,7 @@ The `transient()` / `persistent()` API pattern — a mutable builder that freeze
 *   A global `std::atomic<uint64_t>` generates unique edit tags for Transient sessions.
 *   During a transient mutation, if the traversed node's `edit_tag` matches the session's tag **and** the node's reference count is 1 (uniquely owned), the node is mutated **in-place**.
 *   If the tag differs (e.g., `0` or an older session) or the node is shared (refcount > 1), the node is **copied**, the copy is tagged with the current session ID, and the mutation applies to the copy.
-*   The refcount guard defends against edit-tag wraparound: after 2^31 `transient()` calls the 31-bit tag space can repeat, but a shared node will never be mutated in place regardless of its tag.
+*   The refcount guard is what actually makes this safe, not the tag width: edit tags are 28 bits (`packed_tag_`'s remaining 3 bits hold the node type), so the tag space repeats after 2^28 `transient()` calls — reachable well within a single day of sustained writes — but a shared node is never mutated in place regardless of its tag, since any node another holder can reach is either shared directly (refcount > 1) or sits under a shared ancestor that gets cloned (and its children addref'd) before this session descends into it.
 *   A transient is single-use. `persistent() &&` retires the session tag, and any later operation on a consumed or moved-from builder throws `std::logic_error` in release builds instead of depending on debug-only assertions.
 
 ---
@@ -449,7 +510,7 @@ Hint files are assigned to workers round-robin. Each worker builds a `TransientR
 
 ### 7.1. Node layout breakdown
 
-Nodes are allocated via `new` and managed by `IntrusivePtr<Node>`, which embeds the reference count inside the node itself. No separate control block is allocated. Leaf nodes (94% of all nodes) use the base `Node<V>` struct; the remaining ~6% use `InternalNode<V>` which adds a `children_` pointer.
+Nodes are allocated via `new` and managed by `IntrusivePtr<Node>`, which embeds the reference count inside the node itself. No separate control block is allocated. Leaf nodes (94% of all nodes) use the base `Node<V>` struct; the remaining ~6% use one of four fixed-capacity tiers (`Node4`, `Node16`, `Node48`, `Node256`) by fanout — there is no unbounded fallback: `Node256`'s 256 slots is the ceiling on fanout for a single byte transition, so every possible child count has a tier. (An `InternalNode`/`ChildStore` "Large" tier filled this role before `Node256` existed; it has since been removed — see §7.7.)
 
 **`Node<V>` (base — used for leaves):**
 
@@ -461,36 +522,67 @@ Nodes are allocated via `new` and managed by `IntrusivePtr<Node>`, which embeds 
 | `prefix` | `CompactPrefix` (7 inline bytes, alignof 1) | 8 |
 | **Node struct total** | | **40 bytes** |
 
-**`InternalNode<V>` (derived — used for routing nodes with children):**
+**`Node4<V>` (1–4 children):**
 
 | Field | Type | Bytes |
 |---|---|---|
 | (inherits `Node<V>`) | | 40 |
-| `children_` | `unique_ptr<ChildStore>` | 8 |
-| **InternalNode struct total** | | **48 bytes** |
+| `count_` | `uint8_t` | 1 (+ padding) |
+| `keys_` | `array<byte, 4>` | 4 |
+| `children_` | `array<IntrusivePtr<Node>, 4>` | 32 |
+| **Node4 struct total** | | **~72–80 bytes, one allocation** |
 
-Internal nodes heap-allocate a `ChildStore` (struct-of-arrays: two `std::vector`s, ~48 B header + N × 9 B per child slot). One child slot is 1 byte (transition) + 8 bytes (`IntrusivePtr`) = **9 bytes** — no alignment padding thanks to the struct-of-arrays split.
+**`Node16<V>` (5–16 children):**
 
-| Node type | Fraction | Struct | Heap children | Total |
+| Field | Type | Bytes |
+|---|---|---|
+| (inherits `Node<V>`) | | 40 |
+| `count_` | `uint8_t` | 1 (+ padding) |
+| `keys_` | `array<byte, 16>` | 16 |
+| `children_` | `array<IntrusivePtr<Node>, 16>` | 128 |
+| **Node16 struct total** | | **~184–192 bytes, one allocation** |
+
+**`Node48<V>` (17–48 children):**
+
+| Field | Type | Bytes |
+|---|---|---|
+| (inherits `Node<V>`) | | 40 |
+| `count_` | `uint8_t` | 1 |
+| `child_index_` | `array<uint8_t, 256>` (byte → slot, `find_child` in O(1)) | 256 |
+| `keys_` | `array<byte, 48>` | 48 |
+| `children_` | `array<IntrusivePtr<Node>, 48>` (7 B pad before this) | 384 |
+| **Node48 struct total** | | **~720–736 bytes, one allocation** |
+
+`Node48` keeps the same sorted `keys_`/`children_` array as `Node4`/`Node16` (so `child_at(i)` stays an O(1) ordinal lookup, not a rescan of `child_index_`) and adds `child_index_` purely to make `find_child(b)` O(1) instead of a linear scan — costing 48 more bytes than a `child_index_`-only design (e.g. DuckDB's, ~672 B) but avoiding the O(n) rescan that ordinal traversal pays on `Node256` (§7.8). See §7.7 for why this tier's fixed cost measured flat rather than negative on every shape tested.
+
+**`Node256<V>` (49–256 children; the terminal tier):**
+
+| Field | Type | Bytes |
+|---|---|---|
+| (inherits `Node<V>`) | | 40 |
+| `count_` | `uint16_t` (not `uint8_t` — 256 doesn't fit in 8 bits) | 2 (+ 6 pad) |
+| `children_` | `array<IntrusivePtr<Node>, 256>` | 2048 |
+| **Node256 struct total** | | **2080 bytes, one allocation** |
+
+`Node256` is direct-mapped: `children_[b]` is the child for transition byte `b`, so there is no stored key array (the byte value is the index) and `find_child`/insertion/removal are O(1). `child_at(i)` — the ordinal accessor the shared iterator code uses — has no packed array to index into, so it scans `children_` for the `i`-th occupied slot; see §7.8 for the ordered-traversal cost this creates and the cursor that avoids it on the hot paths.
+
+| Node type | Fraction | Struct + children | Allocations | Total |
 |---|---|---|---|---|
-| Leaf (0 children) | ~94% | 40 B | 0 | **40 B** |
-| Internal (2 children avg) | ~6% | 48 B | ~66 B | ~114 B |
-| **Weighted average** | | | | **~44 B** |
+| Leaf (0 children) | ~94% | 40 B | 1 | **40 B** |
+| Internal, ≤4 children | most of the remaining ~6% | Node4, ~72–80 B | 1 | **~72–80 B** |
+| Internal, 5–16 children | a slice of ~6% | Node16, ~184–192 B | 1 | **~184–192 B** |
+| Internal, 17–48 children | a smaller slice of ~6% | Node48, ~720–736 B | 1 | **~720–736 B** |
+| Internal, 49–256 children | the smallest slice of ~6% | Node256, 2080 B | 1 | **2080 B** |
 
-The ~44 B weighted average is the per-node cost. Measured per-key overhead is higher (~61–69 B/key) because prefix chain-splitting for long keys creates additional routing nodes, pushing the nodes-per-key ratio above 1.07.
+The old single "internal node" row (48 B struct + heap `ChildStore`, ~114 B weighted average at 2 children) no longer applies uniformly — see §7.7 for the measured effect of splitting it into the rows above. There is no ">256 children" row: a single byte has exactly 256 possible values, so `Node256` covers every fanout a byte-keyed radix tree node can have.
 
 ### 7.2. Node distribution
 
-For a typical key set with reasonable prefix compression the tree has approximately 1.07 nodes per key (a small constant overhead for routing nodes at split points). Leaf nodes (0 children) make up ~94% of nodes; internal routing nodes (~6%) spill their `children` vector to the heap because they fan out over many transition bytes (e.g. the 16 hex-digit branches of a UUID segment).
-
-| Node type | Fraction | Children storage |
-|---|---|---|
-| Leaf (0 children) | ~94% | `nullptr` (0 B) |
-| Internal (2+ children) | ~6% | heap `ChildStore` (~48 B header + N × 9 B) |
+For a typical key set with reasonable prefix compression the tree has approximately 1.07 nodes per key (a small constant overhead for routing nodes at split points). Leaf nodes make up ~94% of nodes; the remaining ~6% are internal nodes distributed across the four tiers in §7.1 by fanout, skewed heavily toward the low end — chain-compression routing nodes (exactly 1 child) and small prefix splits (2–4 children) dominate, which is why `Node4` alone absorbs most of the internal-node population (§7.7).
 
 ### 7.3. Measured footprint
 
-Values from `BM_MemoryFootprint` at 100k keys with `KeyDirEntry` value type (measured with the global allocator tracker):
+Values from `BM_MemoryFootprint` at 100k keys with `KeyDirEntry` value type (measured with the global allocator tracker), from before the node tiering in §7.7 existed — kept as the baseline that section's per-shape deltas are measured against:
 
 | Container | Key type | B/key (generic) | B/key (prefixed UUIDv7) | Key-length sensitivity |
 |---|---|---|---|---|
@@ -519,7 +611,7 @@ The original `shared_ptr`-based design measured 129 B/key (generic) and 139 B/ke
 
 ### 7.6. Memory footprint by key shape
 
-Measured at 1M keys using RSS-based profiling (`memory_profile.cpp`) with 245-byte values and `KeyDirEntry` (16 B). **B/key** is total DB RSS overhead divided by key count. **Overhead** subtracts the average key length — the structural cost the tree adds beyond the raw key bytes.
+Measured at 1M keys using RSS-based profiling (`memory_profile.cpp`) with 245-byte values and `KeyDirEntry` (16 B), from before the node tiering in §7.7 existed. **B/key** is total DB RSS overhead divided by key count. **Overhead** subtracts the average key length — the structural cost the tree adds beyond the raw key bytes. §7.7 gives the per-shape memory delta the tiering work measured on top of this baseline; this table has not been re-run since, so treat the *relative* ranking across shapes as current and the absolute B/key figures as somewhat conservative for shapes §7.7 improved.
 
 | Key shape | Avg key size | B/key | Overhead | Description |
 |---|---|---|---|---|
@@ -546,6 +638,220 @@ Three tiers emerge:
 3. **~180–880 B/key** — random keys (UUIDv4, SHA-256). The radix tree cannot compress what has no structure. Each key byte that diverges from its neighbours creates a separate routing node. At 1M SHA-256 hex keys the tree uses ~840 MB of RSS.
 
 For production workloads, prefer time-ordered (UUIDv7) or prefix-structured keys. If keys are inherently random (content-addressed hashes), store the binary form (32-byte SHA-256 binary = 409 B/key) rather than hex (64-byte SHA-256 hex = 881 B/key) — the 2× key length reduction yields a 2× memory reduction.
+
+### 7.7. Node tiering: rationale and memory impact by key shape
+
+The four tiers in §3.1 replace a single `InternalNode` + heap-allocated
+`ChildStore` design (48 B struct, plus a separate struct-of-arrays object
+holding two `std::vector`s — three heap allocations for any node with at
+least one child). That design's O(n) `find_child` and fixed per-node
+allocation overhead paid roughly the same cost whether a node had 1 child
+or 100, which is a poor match for a tree where internal nodes skew
+heavily toward low fanout (§7.2). Splitting it into size classes follows
+the Adaptive Radix Tree (Appendix B): `Node4` and `Node16` cost one
+allocation instead of three; `Node48` adds an O(1) byte→slot index at the
+fanout where a linear scan starts to matter; `Node256` is direct-mapped
+and has no tier above it, since a transition byte has exactly 256
+possible values.
+
+**Memory impact, net heap bytes per key at 100k keys, against the
+pre-tiering `InternalNode`/`ChildStore` design (§7.3 baseline). Never
+worse on any shape at any tier:**
+
+| Shape | Pre-tiering | 4-tier ART | Change | Tier that moved it |
+|---|---:|---:|---:|---|
+| `sha256_hex` | 758.46 | 568.60 | **−25.0%** | `Node4` |
+| `uuidv4_binary` | 169.71 | 132.22 | **−22.1%** | `Node4`, then `Node256` |
+| `binary` | 74.68 | 62.18 | **−16.7%** | `Node4`, then `Node256` |
+| `prefixed` (official) | 54.88 | 44.29 | **−19.3%** | `Node16` |
+| `uniform` (official) | 53.08 | 47.20 | **−11.1%** | `Node16` |
+| `zipfian` | 58.02 | 52.20 | **−10.0%** | `Node16` |
+
+`Node48` measured flat on every shape at every size tested; it earns its
+place by making the `Node16`→`Node256` promotion continuous rather than
+by reducing memory. The pattern above follows directly from what each
+shape's tree looks like:
+
+- **`Node4` wins on random-content shapes** (`sha256_hex`, `uuidv4_binary`,
+  `binary`). Chain-compression routing nodes — created whenever a key
+  segment exceeds `CompactPrefix`'s 7-byte inline cap — have exactly one
+  child, and these shapes are dominated by such nodes since nothing in
+  the key is shared structure. A single allocation instead of three is a
+  large win at exactly this fanout.
+- **`Node16` wins on the sequential shapes** (`uniform`, `prefixed`,
+  `zipfian`). These keys are generated from a numeric index or a small
+  set of hot prefixes, so their internal branch points cluster in the
+  5–16-child range rather than the 1-child range `Node4` targets.
+- **`Node48` is flat everywhere measured.** `sha256_hex` cannot reach it
+  at all — hex digits are only 16 possible byte values per position, so
+  no node in that tree can exceed `Node16`'s capacity. The full-byte-range
+  shapes (`binary`, `uuidv4_binary`) mostly either stay well under 48
+  (once the key space partitions below the root) or jump straight past it
+  into `Node256` territory; the 17–48 band is numerically thin for every
+  shape tested, sequential or random.
+- **`Node256` wins only on full-byte-range shapes** (`uuidv4_binary`,
+  `binary`, a further −0.3% and −1.2% respectively on top of `Node4`'s
+  gain), where some root-adjacent nodes genuinely approach full 256-way
+  occupancy. At that occupancy `Node256`'s fixed 2080-byte, one-allocation
+  cost beats the old `ChildStore`'s ~9 B/child variable cost plus its own
+  allocation overhead.
+
+An earlier attempt to add `Node256` directly on top of `Node4` — skipping
+`Node16` and `Node48` — caused an unrelated ~65–70% regression on full
+tree iteration, including on trees that never construct a `Node256` node
+at all, which ruled out `Node256`-specific logic as the cause. Building
+the tiers incrementally isolated two real bugs that were the actual
+source, both fixed and both benefiting every tier, not just the new ones:
+
+1. `Node::release()`'s tail-release loop (§3.1) declared its child-detach
+   buffer with value initialization inside the per-node release loop, so
+   every node release — leaf or internal, any tier — paid to zero a
+   fixed-size array regardless of how many slots it actually used.
+   Growing that array for a wider tier multiplied the cost without adding
+   proportional work. Dropping the initializer (nothing reads past the
+   node's actual child count, and every slot up to it is always written
+   first) removed the regression entirely.
+2. The `as_node4()`/`as_node16()`/`as_node48()`/`as_node256()` accessor
+   chain (§3.1) had each accessor independently re-derive `node_type()`
+   from `packed_tag_`, so the common case (a low tier) paid for every
+   check up to and including its own. Collapsing `child_count`,
+   `child_at`, `find_child` and `find_child_mut` into a single
+   `node_type()` read plus a `switch` removed the remaining gap.
+
+`Node256` was then rebuilt cleanly with both fixes in place from the
+start, and did not reproduce the regression.
+
+**Churn stability.** `tests/radix_tree_memory_test.cpp`'s high-turnover
+churn test — repeated cycles of deleting and re-inserting half a working
+set — bounds peak memory during churn to `mem_baseline * 4`. `Node16`
+(like `Node48`/`Node256`) pays a fixed per-node cost at the low end of
+its range — a 5-child `Node16` costs the same ~176–192 B as a 16-child
+one — where the old `ChildStore`'s variable ~9 B/child cost was cheaper,
+and churn transiently clusters many nodes at exactly that low-occupancy
+point. Extended runs (800 cycles, 8× the test's default) confirm this
+peak is a flat, stable plateau rather than unbounded growth, and the
+absolute peak is flat-to-lower than before tiering — the threshold moved
+because `Node16`'s baseline reduction outpaced its smaller peak
+reduction, not because churn behavior regressed.
+
+### 7.8. Ordered traversal: `child_at` versus the `next_child` cursor
+
+`child_at(i)` — the ordinal accessor `RadixTreeIterator`, `ValueIterator`
+and `merge_impl` all use — is O(1) on the three packed tiers, which keep a
+sorted key array to index into. `Node256` has no such array (the
+transition byte *is* the index), so turning an ordinal into a byte means
+scanning its 256 slots from the start on every call. Two call sites drove
+a full ordinal walk over a node's children and were therefore quadratic
+in that node's fanout on `Node256`:
+
+- `RadixTreeIterator::seek` and `ValueIterator::seek` — the descent behind
+  `lower_bound`, `upper_bound`, `iter_from`, `keys_from`, `riter_from`,
+  `rkeys_from` and both value-iterator entry points. Paid once per call,
+  with nothing to amortize it against.
+- `PersistentRadixTree::merge_impl` — the fan-in merge parallel recovery
+  uses.
+
+None of this shows up on `uniform` or `prefixed`, `map_bench`'s two
+officially tracked shapes: both are generated from a sequential numeric
+index, so their branching is digit-driven and bounded, and neither ever
+builds a node wide enough to reach `Node256`. `map_bench` gained
+`LowerBoundBinary`, `IterateBinary` and `MergeOverlappingBinary` on the
+`binary` shape — whose first key byte covers the full `0x00`–`0xFF`
+range — to measure it.
+
+**The fix.** `Node::next_child(ChildCursor&)` yields a node's children in
+ascending transition order. The cursor carries both an `ordinal` and a
+slot `probe`, so each tier reads whichever field is O(1) for its layout:
+the packed tiers index `keys_`/`children_` by ordinal, `Node256` scans
+its slots forward from `probe`. A full walk is therefore O(count) on the
+packed tiers and O(256) on `Node256`. Only `next_child` writes either
+field, so the two cannot drift out of step — passing both as separate
+arguments would have made correctness depend on the caller keeping them
+consistent.
+
+Two alternatives were considered and rejected:
+
+- **A byte cursor alone** (DuckDB's `GetNextChildNode` shape, Appendix B
+  — no ordinal, just a byte the caller advances) would have pessimized
+  the packed tiers, turning their O(1)-per-step walk into an O(count) key
+  scan to find the next byte — fixing the rare case by making the common
+  one worse.
+- **An occupancy bitmap on `Node256`** (four `uint64_t`, `popcount` for
+  rank plus bit-select for ordinal→byte) would have fixed every call
+  site, including the iterators' frame-indexed `advance`/`retreat`, with
+  no call-site changes at all. It was not adopted: it costs 32 B per
+  `Node256` node against this design's "memory must not increase"
+  constraint (`Node256` has only 6 bytes of padding to reclaim), and
+  `IterateBinary`'s measurement below shows `advance`'s existing rescan
+  is already amortized over a full traversal rather than paid per call,
+  so the 32 B would have bought nothing `next_child` didn't already
+  provide for the cases that mattered. It remains available if a future
+  workload makes ordinal-indexed traversal hot.
+
+**Measured effect**, `map_bench`, mean of 7 repetitions each, measured
+back-to-back on the same binary and machine — every change here is
+beyond 2 standard deviations except where marked, and nothing regressed
+beyond 2 standard deviations:
+
+| Benchmark | Ordinal walk | Cursor walk | Change |
+|---|---:|---:|---:|
+| `LowerBoundBinary/1000` | 5631 ns | 636 ns | **−88.7%** |
+| `LowerBoundBinary/10000` | 5923 ns | 677 ns | **−88.6%** |
+| `LowerBoundBinary/100000` | 9761 ns | 1037 ns | **−89.4%** |
+| `MergeOverlappingBinary/1000` | 96.3 µs | 76.2 µs | **−20.8%** |
+| `MergeOverlappingBinary/10000` | 800 µs | 769 µs | −3.8% |
+| `MergeOverlappingBinary/100000` | 31.13 ms | 25.49 ms | **−18.1%** |
+| `LowerBound/100000` (uniform) | 403.5 ns | 374.7 ns | −7.1% |
+| `UpperBound/100000` (uniform) | 437.4 ns | 413.3 ns | −5.5% |
+| `MergeOverlapping/100000` (uniform) | 7.353 ms | 7.281 ms | −1.0% (noise) |
+| `MergeDisjoint/100000` (uniform) | 2.409 ms | 2.415 ms | +0.3% (noise) |
+| `IterateBinary/10000` | 404.4 µs | 404.2 µs | −0.1% (noise) |
+
+A single `lower_bound` on the `binary` shape went from 9.8 µs to 1.0 µs.
+The sequential shapes' `lower_bound`/`upper_bound` improved too, because
+the old loop called `child_at(i)` twice on the matching child (once for
+the transition byte, once for the pointer) and `child_count()` once per
+iteration; the cursor does one dispatch per child regardless of tier.
+Recorded memory per key is unchanged — the cursor adds no node fields.
+
+At the DB level (`engine_bench`, 200k keys, mean of 5 repetitions), the
+effect appears exactly where the mechanism predicts and nowhere else:
+
+| Benchmark | Ordinal walk | Cursor walk | Change |
+|---|---:|---:|---:|
+| `ByteCaskDB/Range50` | 28839 ns | 27331 ns | **−5.2%** |
+| `ByteCaskDB/Get` | 820.1 ns | 805.0 ns | −1.8% (noise) |
+| `ByteCaskDB_UUIDv4/Get` | 1235.7 ns | 1240.5 ns | +0.4% (noise) |
+| `ByteCaskDB/Recovery` (4 threads) | 59.15 ms | 54.99 ms | −7.0% (noise) |
+
+Only `Range50` moves beyond noise: a range scan performs one `iter_from`
+descent, so it pays `seek` once per scan. `Get` resolves through
+`find_child`, a direct index on `Node256` that was never affected by this
+change. These engine-level keys are sequential, so they never reach
+`Node256` either — `Range50`'s improvement is the packed-tier gain alone.
+
+**Correctness.** `tests/radix_tree_test.cpp`'s "RadixTree seek descends a
+wide node" drives two-byte keys through a node whose root fanout is
+parameterized over 256, 128, 32 and 8 children, so `next_child` is
+exercised on all four tiers in one run, with every case below 256 leaving
+gaps so a probe on a missing byte must skip forward; it checks
+`lower_bound`, `upper_bound`, `value_lower_bound`, `value_rlower_bound`,
+tail iteration from a `lower_bound`, and reverse iteration from an
+`upper_bound`, against a `std::map` model at every one of the 256 probe
+bytes. A companion case, "RadixTree merge walks a wide node", covers
+disjoint, fully overlapping, and wide-into-narrow merges. Both are
+mutation-tested: dropping `Node256`'s ordinal bookkeeping in `next_child`
+fails 699 assertions, and making the walk skip every other slot fails the
+merge case. The full `[radix_tree]` suite passes under AddressSanitizer,
+which matters here specifically because `seek` assigns a child slot
+reference into the iterator's own traversal pointer (`cur = slot->ptr`) —
+the sub-object aliasing case `IntrusivePtr::operator=` is hardened for.
+
+**Left as is.** `advance`, `retreat` and `descend_rightmost` still index
+by ordinal, because `RadixTreeIterator::Frame` stores an ordinal and uses
+it in both directions; replacing it with a cursor would rewrite the
+trickiest code in the file for a benchmark (`IterateBinary`, above) that
+shows no gain.
 
 ---
 
@@ -749,3 +1055,6 @@ Listed as a matter of good faith — this design builds on established ideas fro
 | Persistent data structures (accessible introduction) | Okasaki, *Purely Functional Data Structures*, Cambridge University Press, 1998 | [book](https://www.cambridge.org/9780521663502) · [OCaml source](https://github.com/mmottl/pure-fun) |
 | Transient/persistent duality | Rich Hickey, Clojure (transients added in Clojure 1.1, ~2009) | https://clojure.org/reference/transients |
 | Persistent C++ containers (benchmark baseline) | immer — Juan Pedro Bolívar Puente (arximboldi) | https://github.com/arximboldi/immer |
+| Adaptive Radix Tree (ART) — origin of the `Node4`/`Node16`/`Node48`/`Node256` fixed-size-class design (§3.1, §7.7) | Leis, Kemper & Neumann, *ARTful Indexing for Main-Memory Databases*, ICDE 2013 | https://db.in.tum.de/~leis/papers/ART.pdf |
+| DuckDB's ART implementation — source for the proportional demotion hysteresis (§3.1) and the `GetNextChildNode` byte-cursor pattern this design's `next_child` was weighed against (§7.8) | DuckDB, `v2.0-cyanoptera`, `src/execution/index/art/` | https://github.com/duckdb/duckdb/tree/v2.0-cyanoptera/src/execution/index/art |
+| DuckDB's ART as an on-disk storage format | DuckDB Blog, 2022-07-27 | https://duckdb.org/2022/07/27/art-storage |

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -916,6 +917,363 @@ TEST_CASE("RadixTree wide fanout", "[radix_tree]") {
 }
 
 // ---------------------------------------------------------------------------
+// Node4 <-> Large tier boundary: exercise the exact 4/5-child promotion and
+// demotion transitions on both the persistent and transient paths. This is
+// a pure internal-representation change (Node4 vs the ChildStore-backed
+// Large tier) — correctness here means the tree's observable behavior
+// (get/contains/iteration order/size) is identical across the boundary.
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree Node4/Node16 boundary persistent", "[radix_tree]") {
+  auto t = Tree{};
+  // Single-byte transitions from a shared root: insert one at a time through
+  // the 4 -> 5 child promotion, checking every key remains reachable at each
+  // step (not just after the fact).
+  for (int i = 0; i < 8; ++i) {
+    std::string key(1, static_cast<char>('a' + i));
+    t = t.set(to_bytes(key), i);
+    CHECK(t.size() == static_cast<std::size_t>(i + 1));
+    for (int j = 0; j <= i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+
+  // Iteration order must stay sorted across the promotion.
+  std::vector<std::string> keys;
+  for (auto it = t.begin(); it != t.end(); ++it) {
+    auto [k, v] = *it;
+    keys.push_back(to_string(k));
+  }
+  CHECK(std::is_sorted(keys.begin(), keys.end()));
+  CHECK(keys.size() == 8U);
+
+  // Erase one at a time back down through the 5 -> 4 demotion to empty,
+  // checking survivors remain reachable at every step.
+  for (int i = 7; i >= 0; --i) {
+    std::string key(1, static_cast<char>('a' + i));
+    t = t.erase(to_bytes(key));
+    CHECK(t.size() == static_cast<std::size_t>(i));
+    CHECK_FALSE(t.contains(to_bytes(key)));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+  CHECK(t.empty());
+}
+
+TEST_CASE("RadixTree Node4/Node16 boundary transient", "[radix_tree]") {
+  auto tr = Tree{}.transient();
+  for (int i = 0; i < 8; ++i) {
+    std::string key(1, static_cast<char>('a' + i));
+    tr.set(to_bytes(key), i);
+    for (int j = 0; j <= i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(tr.contains(to_bytes(k)));
+      CHECK(*tr.get(to_bytes(k)) == j);
+    }
+  }
+  for (int i = 7; i >= 0; --i) {
+    std::string key(1, static_cast<char>('a' + i));
+    CHECK(tr.erase(to_bytes(key)));
+    CHECK_FALSE(tr.contains(to_bytes(key)));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(tr.contains(to_bytes(k)));
+      CHECK(*tr.get(to_bytes(k)) == j);
+    }
+  }
+  auto t = std::move(tr).persistent();
+  CHECK(t.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Node16 tier boundary: drive a single root node through every tier —
+// Leaf -> Node4 -> Node16 -> Large on insert (20 single-byte transitions,
+// crossing both the 4/5 and 16/17 boundaries), then Large -> Node16 ->
+// Node4 -> empty on erase. No existing test reaches 17+ children on one
+// node without also reaching Node256's territory (the 256-key test), so
+// this is the only coverage for the Node16 <-> Large transition
+// specifically, and for Node4 -> Node16 (as opposed to Node4 -> Large
+// directly, which is what happened before Node16 existed).
+// ---------------------------------------------------------------------------
+TEST_CASE("RadixTree Node16/Node48 boundary persistent", "[radix_tree]") {
+  auto t = Tree{};
+  for (int i = 0; i < 20; ++i) {
+    std::string key(1, static_cast<char>('a' + i));
+    t = t.set(to_bytes(key), i);
+    CHECK(t.size() == static_cast<std::size_t>(i + 1));
+    for (int j = 0; j <= i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+
+  std::vector<std::string> keys;
+  for (auto it = t.begin(); it != t.end(); ++it) {
+    auto [k, v] = *it;
+    keys.push_back(to_string(k));
+  }
+  CHECK(std::is_sorted(keys.begin(), keys.end()));
+  CHECK(keys.size() == 20U);
+
+  for (int i = 19; i >= 0; --i) {
+    std::string key(1, static_cast<char>('a' + i));
+    t = t.erase(to_bytes(key));
+    CHECK(t.size() == static_cast<std::size_t>(i));
+    CHECK_FALSE(t.contains(to_bytes(key)));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+  CHECK(t.empty());
+}
+
+TEST_CASE("RadixTree Node16/Node48 boundary transient", "[radix_tree]") {
+  auto tr = Tree{}.transient();
+  for (int i = 0; i < 20; ++i) {
+    std::string key(1, static_cast<char>('a' + i));
+    tr.set(to_bytes(key), i);
+    for (int j = 0; j <= i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(tr.contains(to_bytes(k)));
+      CHECK(*tr.get(to_bytes(k)) == j);
+    }
+  }
+  for (int i = 19; i >= 0; --i) {
+    std::string key(1, static_cast<char>('a' + i));
+    CHECK(tr.erase(to_bytes(key)));
+    CHECK_FALSE(tr.contains(to_bytes(key)));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>('a' + j));
+      REQUIRE(tr.contains(to_bytes(k)));
+      CHECK(*tr.get(to_bytes(k)) == j);
+    }
+  }
+  auto t = std::move(tr).persistent();
+  CHECK(t.empty());
+}
+
+TEST_CASE("RadixTree Node48/Node256 boundary persistent", "[radix_tree]") {
+  auto t = Tree{};
+  constexpr int kKeys = 55; // crosses 4/5, 16/17, and 48/49 boundaries
+  for (int i = 0; i < kKeys; ++i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.set(to_bytes(key), i);
+    CHECK(t.size() == static_cast<std::size_t>(i + 1));
+    for (int j = 0; j <= i; ++j) {
+      std::string k(1, static_cast<char>(j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+
+  std::vector<std::string> keys;
+  for (auto it = t.begin(); it != t.end(); ++it) {
+    auto [k, v] = *it;
+    keys.push_back(to_string(k));
+  }
+  CHECK(std::is_sorted(keys.begin(), keys.end()));
+  CHECK(keys.size() == static_cast<std::size_t>(kKeys));
+
+  for (int i = kKeys - 1; i >= 0; --i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.erase(to_bytes(key));
+    CHECK(t.size() == static_cast<std::size_t>(i));
+    CHECK_FALSE(t.contains(to_bytes(key)));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>(j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+  CHECK(t.empty());
+}
+
+TEST_CASE("RadixTree Node48/Node256 boundary transient", "[radix_tree]") {
+  auto tr = Tree{}.transient();
+  constexpr int kKeys = 55;
+  for (int i = 0; i < kKeys; ++i) {
+    std::string key(1, static_cast<char>(i));
+    tr.set(to_bytes(key), i);
+    for (int j = 0; j <= i; ++j) {
+      std::string k(1, static_cast<char>(j));
+      REQUIRE(tr.contains(to_bytes(k)));
+      CHECK(*tr.get(to_bytes(k)) == j);
+    }
+  }
+  for (int i = kKeys - 1; i >= 0; --i) {
+    std::string key(1, static_cast<char>(i));
+    CHECK(tr.erase(to_bytes(key)));
+    CHECK_FALSE(tr.contains(to_bytes(key)));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>(j));
+      REQUIRE(tr.contains(to_bytes(k)));
+      CHECK(*tr.get(to_bytes(k)) == j);
+    }
+  }
+  auto t = std::move(tr).persistent();
+  CHECK(t.empty());
+}
+
+// Exercises the Node48 -> Node16 demotion hysteresis: insert enough keys to
+// promote to Node48 (17), then remove down into the Node16-capacity range
+// (16..13) without dropping to the kShrinkThreshold (12) demotion point,
+// verifying the node stays functionally correct as an under-populated
+// Node48 the whole time, then finish removing through the actual demotion.
+TEST_CASE("RadixTree Node48 demotion hysteresis persistent", "[radix_tree]") {
+  auto t = Tree{};
+  constexpr int kKeys = 20; // one past the 17-child Node48 promotion point
+  for (int i = 0; i < kKeys; ++i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.set(to_bytes(key), i);
+  }
+  CHECK(t.size() == static_cast<std::size_t>(kKeys));
+
+  // Remove down to 13 children — above kShrinkThreshold (12), so the node
+  // should remain a (now under-populated) Node48, not demote yet.
+  for (int i = kKeys - 1; i >= 13; --i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.erase(to_bytes(key));
+  }
+  CHECK(t.size() == 13U);
+  for (int j = 0; j < 13; ++j) {
+    std::string k(1, static_cast<char>(j));
+    REQUIRE(t.contains(to_bytes(k)));
+    CHECK(*t.get(to_bytes(k)) == j);
+  }
+
+  // Cross the actual demotion threshold and continue to empty.
+  for (int i = 12; i >= 0; --i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.erase(to_bytes(key));
+    CHECK(t.size() == static_cast<std::size_t>(i));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>(j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+  CHECK(t.empty());
+}
+
+TEST_CASE("RadixTree Node256 boundary persistent", "[radix_tree]") {
+  auto t = Tree{};
+  constexpr int kKeys = 256; // every possible single-byte key — crosses
+                             // 4/5, 16/17, 48/49, and the 256-slot ceiling
+  for (int i = 0; i < kKeys; ++i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.set(to_bytes(key), i);
+    CHECK(t.size() == static_cast<std::size_t>(i + 1));
+    // Sparse verification (every key at small i, every 7th beyond) — a
+    // full O(n) re-verification per insert would make this O(n^2) at
+    // n=256, unlike the 55-key Node48 test.
+    if (i < 20 || i % 7 == 0) {
+      for (int j = 0; j <= i; ++j) {
+        std::string k(1, static_cast<char>(j));
+        REQUIRE(t.contains(to_bytes(k)));
+        CHECK(*t.get(to_bytes(k)) == j);
+      }
+    }
+  }
+  for (int j = 0; j < kKeys; ++j) {
+    std::string k(1, static_cast<char>(j));
+    REQUIRE(t.contains(to_bytes(k)));
+    CHECK(*t.get(to_bytes(k)) == j);
+  }
+
+  std::vector<std::string> keys;
+  for (auto it = t.begin(); it != t.end(); ++it) {
+    auto [k, v] = *it;
+    keys.push_back(to_string(k));
+  }
+  CHECK(std::is_sorted(keys.begin(), keys.end()));
+  CHECK(keys.size() == static_cast<std::size_t>(kKeys));
+
+  for (int i = kKeys - 1; i >= 0; --i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.erase(to_bytes(key));
+    CHECK(t.size() == static_cast<std::size_t>(i));
+    CHECK_FALSE(t.contains(to_bytes(key)));
+    if (i < 20 || i % 7 == 0) {
+      for (int j = 0; j < i; ++j) {
+        std::string k(1, static_cast<char>(j));
+        REQUIRE(t.contains(to_bytes(k)));
+        CHECK(*t.get(to_bytes(k)) == j);
+      }
+    }
+  }
+  CHECK(t.empty());
+}
+
+TEST_CASE("RadixTree Node256 boundary transient", "[radix_tree]") {
+  auto tr = Tree{}.transient();
+  constexpr int kKeys = 256;
+  for (int i = 0; i < kKeys; ++i) {
+    std::string key(1, static_cast<char>(i));
+    tr.set(to_bytes(key), i);
+  }
+  for (int j = 0; j < kKeys; ++j) {
+    std::string k(1, static_cast<char>(j));
+    REQUIRE(tr.contains(to_bytes(k)));
+    CHECK(*tr.get(to_bytes(k)) == j);
+  }
+  for (int i = kKeys - 1; i >= 0; --i) {
+    std::string key(1, static_cast<char>(i));
+    CHECK(tr.erase(to_bytes(key)));
+    CHECK_FALSE(tr.contains(to_bytes(key)));
+  }
+  auto t = std::move(tr).persistent();
+  CHECK(t.empty());
+}
+
+// Exercises the Node256 -> Node48 demotion hysteresis: promote to Node256
+// (49 children), then remove down into the Node48-capacity range (48..37)
+// without dropping to kShrinkThreshold (36), verifying the node stays
+// functionally correct as an under-populated Node256 the whole time, then
+// finish removing through the actual demotion.
+TEST_CASE("RadixTree Node256 demotion hysteresis persistent", "[radix_tree]") {
+  auto t = Tree{};
+  constexpr int kKeys = 52; // a few past the 49-child Node256 promotion point
+  for (int i = 0; i < kKeys; ++i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.set(to_bytes(key), i);
+  }
+  CHECK(t.size() == static_cast<std::size_t>(kKeys));
+
+  // Remove down to 37 children — above kShrinkThreshold (36), so the node
+  // should remain a (now under-populated) Node256, not demote yet.
+  for (int i = kKeys - 1; i >= 37; --i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.erase(to_bytes(key));
+  }
+  CHECK(t.size() == 37U);
+  for (int j = 0; j < 37; ++j) {
+    std::string k(1, static_cast<char>(j));
+    REQUIRE(t.contains(to_bytes(k)));
+    CHECK(*t.get(to_bytes(k)) == j);
+  }
+
+  // Cross the actual demotion threshold and continue to empty.
+  for (int i = 36; i >= 0; --i) {
+    std::string key(1, static_cast<char>(i));
+    t = t.erase(to_bytes(key));
+    CHECK(t.size() == static_cast<std::size_t>(i));
+    for (int j = 0; j < i; ++j) {
+      std::string k(1, static_cast<char>(j));
+      REQUIRE(t.contains(to_bytes(k)));
+      CHECK(*t.get(to_bytes(k)) == j);
+    }
+  }
+  CHECK(t.empty());
+}
+
+// ---------------------------------------------------------------------------
 // Transient: overwrite existing key (no size change, in-place mutation)
 // ---------------------------------------------------------------------------
 TEST_CASE("RadixTree transient overwrite", "[radix_tree]") {
@@ -1691,4 +2049,235 @@ TEST_CASE("value_rlower_bound deep tree", "[radix_tree]") {
   auto it = t.value_rlower_bound(to_bytes("z"));
   REQUIRE(it != std::default_sentinel);
   CHECK(*it == 4);
+}
+
+// ---------------------------------------------------------------------------
+// Descent and in-order walks over a node at every tier.
+//
+// The widest tier is direct-mapped by transition byte and keeps no packed key
+// array, so converting an ordinal into a byte means scanning its slots.
+// seek() and merge_impl() therefore walk children with a cursor
+// (Node::next_child) rather than by ordinal. These cases pin that behaviour
+// at every byte, including the gaps a sparse wide node has, and check it
+// against a std::map model. std::char_traits<char> compares as unsigned char,
+// so the model orders keys exactly as the tree does.
+// ---------------------------------------------------------------------------
+namespace {
+
+auto collect_entries(const Tree &t)
+    -> std::vector<std::pair<std::string, int>> {
+  std::vector<std::pair<std::string, int>> out;
+  for (auto it = t.begin(); it != t.end(); ++it) {
+    auto [k, v] = *it;
+    out.emplace_back(to_string(k), v);
+  }
+  return out;
+}
+
+// std::map's value_type holds a const key, so its pairs are not directly
+// comparable with the collected ones.
+auto same_entries(const std::vector<std::pair<std::string, int>> &got,
+                  const std::map<std::string, int> &want) -> bool {
+  return got.size() == want.size() &&
+         std::equal(got.begin(), got.end(), want.begin(),
+                    [](const auto &l, const auto &r) {
+                      return l.first == r.first && l.second == r.second;
+                    });
+}
+
+// Two-byte keys: the root fans out over all 256 first bytes and each child
+// fans out again, so a descent must pass *through* the widest tier rather
+// than terminating on it.
+auto build_wide_tree(int first_byte_step)
+    -> std::pair<Tree, std::map<std::string, int>> {
+  auto t = Tree{};
+  std::map<std::string, int> model;
+  int v = 0;
+  for (int b = 0; b < 256; b += first_byte_step) {
+    for (int c : {0x00, 0x7F, 0xFF}) {
+      std::string key{static_cast<char>(b), static_cast<char>(c)};
+      t = t.set(to_bytes(key), v);
+      model[key] = v;
+      ++v;
+    }
+  }
+  return {std::move(t), std::move(model)};
+}
+
+} // namespace
+
+TEST_CASE("RadixTree seek descends a wide node", "[radix_tree]") {
+  // The step sets the root's fanout (256 / step), which selects the tier
+  // next_child has to serve, and every step > 1 leaves gaps so probes on a
+  // missing byte must skip forward:
+  //   step 1  → 256 children, the widest tier, fully dense
+  //   step 2  → 128 children, still the widest tier, every other byte live
+  //   step 8  →  32 children, the 48-slot tier
+  //   step 32 →   8 children, the 16-slot tier
+  // Each child then fans out over three second bytes (the 4-slot tier), so
+  // one run covers all four tiers.
+  auto step = GENERATE(1, 2, 8, 32);
+  auto [t, model] = build_wide_tree(step);
+  REQUIRE(t.size() == model.size());
+
+  SECTION("forward iteration matches the model") {
+    CHECK(same_entries(collect_entries(t), model));
+  }
+
+  SECTION("lower_bound finds every present key") {
+    for (const auto &[key, val] : model) {
+      auto it = t.lower_bound(to_bytes(key));
+      REQUIRE(it != t.end());
+      auto [k, got] = *it;
+      CHECK(to_string(k) == key);
+      CHECK(got == val);
+    }
+  }
+
+  SECTION("lower_bound/upper_bound match the model at every byte") {
+    for (int b = 0; b < 256; ++b) {
+      // A one-byte probe sorts before every two-byte key sharing that first
+      // byte, so this also covers absent bytes and both range ends.
+      std::string probe(1, static_cast<char>(b));
+
+      auto want_lb = model.lower_bound(probe);
+      auto lb = t.lower_bound(to_bytes(probe));
+      REQUIRE((lb == t.end()) == (want_lb == model.end()));
+      if (want_lb != model.end()) {
+        auto [k, v] = *lb;
+        CHECK(to_string(k) == want_lb->first);
+        CHECK(v == want_lb->second);
+      }
+
+      auto want_ub = model.upper_bound(probe);
+      auto ub = t.upper_bound(to_bytes(probe));
+      REQUIRE((ub == t.end()) == (want_ub == model.end()));
+      if (want_ub != model.end()) {
+        auto [k, v] = *ub;
+        CHECK(to_string(k) == want_ub->first);
+        CHECK(v == want_ub->second);
+      }
+    }
+  }
+
+  SECTION("iteration from a lower_bound yields the whole tail in order") {
+    for (int b = 0; b < 256; b += 17) {
+      std::string probe(1, static_cast<char>(b));
+      std::vector<std::string> got;
+      for (auto it = t.lower_bound(to_bytes(probe)); it != t.end(); ++it)
+        got.push_back(to_string((*it).first));
+
+      std::vector<std::string> want;
+      for (auto m = model.lower_bound(probe); m != model.end(); ++m)
+        want.push_back(m->first);
+      CHECK(got == want);
+    }
+  }
+
+  SECTION("value_lower_bound matches the model at every byte") {
+    for (int b = 0; b < 256; ++b) {
+      std::string probe(1, static_cast<char>(b));
+      auto want = model.lower_bound(probe);
+      auto it = t.value_lower_bound(to_bytes(probe));
+      REQUIRE((it == std::default_sentinel) == (want == model.end()));
+      if (want != model.end())
+        CHECK(*it == want->second);
+    }
+  }
+
+  SECTION("value_rlower_bound matches the model at every byte") {
+    for (int b = 0; b < 256; ++b) {
+      std::string probe(1, static_cast<char>(b));
+      // Largest key <= probe: first key greater than it, stepped back one.
+      auto want = model.upper_bound(probe);
+      bool have = want != model.begin();
+      if (have)
+        --want;
+      auto it = t.value_rlower_bound(to_bytes(probe));
+      REQUIRE((it != std::default_sentinel) == have);
+      if (have)
+        CHECK(*it == want->second);
+    }
+  }
+
+  SECTION("reverse iteration from upper_bound walks back in order") {
+    for (int b = 0; b < 256; b += 17) {
+      std::string probe(1, static_cast<char>(b));
+      auto it = t.upper_bound(to_bytes(probe));
+      std::vector<std::string> got;
+      while (it != t.begin()) {
+        --it;
+        got.push_back(to_string((*it).first));
+      }
+
+      std::vector<std::string> want;
+      for (auto m = model.upper_bound(probe); m != model.begin();) {
+        --m;
+        want.push_back(m->first);
+      }
+      CHECK(got == want);
+    }
+  }
+}
+
+TEST_CASE("RadixTree merge walks a wide node", "[radix_tree][merge]") {
+  auto resolve = [](int, int r) { return r; };
+
+  SECTION("disjoint wide nodes on both sides") {
+    // Even first bytes on the left, odd on the right: both roots reach the
+    // widest tier (128 children each) and every child of b is disjoint, so
+    // the merge walk must visit all 128 and adopt each subtree.
+    auto a = Tree{};
+    auto b = Tree{};
+    std::map<std::string, int> model;
+    for (int i = 0; i < 256; ++i) {
+      std::string key{static_cast<char>(i), '\x2A'};
+      if (i % 2 == 0)
+        a = a.set(to_bytes(key), i);
+      else
+        b = b.set(to_bytes(key), i);
+      model[key] = i;
+    }
+
+    auto merged = Tree::merge(a, b, resolve);
+    REQUIRE(merged.size() == model.size());
+    CHECK(same_entries(collect_entries(merged), model));
+  }
+
+  SECTION("fully overlapping wide nodes resolve to the right-hand value") {
+    auto a = Tree{};
+    auto b = Tree{};
+    std::map<std::string, int> model;
+    for (int i = 0; i < 256; ++i) {
+      std::string key{static_cast<char>(i), '\x2A'};
+      a = a.set(to_bytes(key), i);
+      b = b.set(to_bytes(key), i + 1000);
+      model[key] = i + 1000;
+    }
+
+    auto merged = Tree::merge(a, b, resolve);
+    REQUIRE(merged.size() == model.size());
+    CHECK(same_entries(collect_entries(merged), model));
+  }
+
+  SECTION("wide node merged into a narrow one") {
+    // b is wide (256 children), a has only three: the merge must adopt the
+    // subtrees b holds while resolving the three it shares with a.
+    auto a = Tree{};
+    auto b = Tree{};
+    std::map<std::string, int> model;
+    for (int i = 0; i < 256; ++i) {
+      std::string key{static_cast<char>(i), '\x2A'};
+      b = b.set(to_bytes(key), i + 1000);
+      model[key] = i + 1000;
+    }
+    for (int i : {0, 128, 255}) {
+      std::string key{static_cast<char>(i), '\x2A'};
+      a = a.set(to_bytes(key), i);
+    }
+
+    auto merged = Tree::merge(a, b, resolve);
+    REQUIRE(merged.size() == model.size());
+    CHECK(same_entries(collect_entries(merged), model));
+  }
 }

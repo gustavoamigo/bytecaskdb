@@ -5,6 +5,7 @@
 
 module;
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -189,27 +190,67 @@ inline std::atomic<std::uint64_t> next_edit_tag{1};
 // Node<V> — base type for all radix tree nodes (leaf and internal).
 //
 // packed_tag_ bit layout:
-//   [31: has_value] [30: has_children] [29:0: edit_tag]
+//   [31: has_value] [30-28: node_type] [27:0: edit_tag]
 //
-// 94% of nodes are leaves that never acquire children. By splitting the
-// children_ field into a derived InternalNode<V>, leaf nodes are allocated
-// at sizeof(Node) = 40 bytes (glibc usable=40) instead of 48 bytes
-// (glibc usable=56), saving 16 bytes per leaf.
+// Internal nodes are tiered by fanout to avoid dynamic-vector allocation
+// overhead at the low fanout where most internal nodes actually live
+// (routing/chain-compression nodes have exactly 1 child; splits start at 2),
+// and to give a fixed, direct-mapped representation at the high end where a
+// byte value maps directly onto a slot:
 //
-// Safety: children_ does not exist on Node — accessing it through a Node*
-// is a compile error. Child accessor methods check has_children_flag()
-// before downcasting to InternalNode; a missing flag returns a safe default
-// ("no children"), never memory corruption.
+//   - Node4: up to 4 children embedded inline in the node itself — a single
+//     allocation, no separate heap-allocated child store.
+//   - Node16: up to 16 children, same shape as Node4 (sorted inline array,
+//     linear scan) but a bigger inline array — still a single allocation.
+//   - Node48: up to 48 children. Same sorted inline array as Node4/Node16
+//     (so child_at(i) stays O(1), not a rescan), plus a 256-byte
+//     byte->slot index (`child_index_`) that makes find_child(b) O(1)
+//     instead of an O(n) scan — the point where a direct lookup starts to
+//     matter more than the array's fixed cost. Still a single allocation.
+//   - Node256: up to 256 children, direct-mapped by transition byte — no
+//     stored key array (the byte value is the index). This is the terminal
+//     tier: a transition is a single byte, so 256 slots is the ceiling on
+//     fanout for any node, and there is no tier above it.
+//
+// A Node4 promotes to Node16 on its 5th child; Node16 promotes to Node48 on
+// its 17th; Node48 promotes to Node256 on its 49th. Demotion uses
+// proportional hysteresis on the two upper boundaries (matching DuckDB's
+// ART): Node48 demotes to Node16 once its count drops to <= 12 (75% of
+// Node16's capacity, not <= 16), and Node256 demotes to Node48 once its
+// count drops to <= 36 (75% of Node48's capacity, not <= 48) — both avoid
+// promote/demote thrashing right at the tier boundary. Node16 demotes to
+// Node4 at <= 4, symmetrically (see Node::insert_child /
+// Node::remove_child). 94% of nodes overall are leaves, which carry no
+// children field at all — sizeof(Node) = 40 bytes (glibc usable=40) for
+// KeyDirEntry, instead of 48 bytes (glibc usable=56) if every node paid for
+// a children field it never used.
+//
+// Safety: children storage does not exist on Node — accessing a derived
+// tier's fields through a Node* is a compile error. Child accessor methods
+// check node_type() before downcasting; an unexpected type returns a safe
+// default ("no children"), never memory corruption.
 // ---------------------------------------------------------------------------
-template <typename V> struct InternalNode; // forward declaration
+template <typename V> struct Node4;        // forward declaration (4-slot tier)
+template <typename V> struct Node16;       // forward declaration (16-slot tier)
+template <typename V> struct Node48;       // forward declaration (48-slot tier)
+template <typename V> struct Node256;      // forward declaration (256-slot tier)
 
 template <typename V> struct Node {
   mutable std::atomic<std::uint32_t> refcount_{1};
 
+  enum class NodeType : std::uint32_t {
+    Leaf = 0,
+    Node4 = 1,
+    Node256 = 2,
+    Node16 = 3,
+    Node48 = 4,
+  };
+
   static constexpr std::uint32_t kHasValueBit = 0x8000'0000u;
-  static constexpr std::uint32_t kHasChildrenBit = 0x4000'0000u;
-  static constexpr std::uint32_t kFlagBits = kHasValueBit | kHasChildrenBit;
-  static constexpr std::uint32_t kTagMask = 0x3FFF'FFFFu;
+  static constexpr std::uint32_t kNodeTypeShift = 28u;
+  static constexpr std::uint32_t kNodeTypeMask = 0x7000'0000u;
+  static constexpr std::uint32_t kFlagBits = kHasValueBit | kNodeTypeMask;
+  static constexpr std::uint32_t kTagMask = 0x0FFF'FFFFu;
 
   std::uint32_t packed_tag_{0};
   V value_{};
@@ -217,24 +258,24 @@ template <typename V> struct Node {
   using Prefix = CompactPrefix;
   Prefix prefix;
 
-  // -- Child nested types (used by InternalNode, exposed here for callers) --
+  // -- Child nested types (returned by child_at/find_child) --
+  //
+  // `transition` is a value, not a reference: Node256 has no stored key
+  // array (the transition byte *is* the index into children_), so there is
+  // no lvalue byte to bind a reference to for that tier. Every existing
+  // caller only reads `.transition` (never assigns through it), so this
+  // costs nothing at the other tiers, where it was previously a reference
+  // into keys_[i] and is now just a copy of the same byte. `ptr` stays a
+  // real reference — callers do assign through `.ptr` (e.g. splicing in a
+  // merged child) — and every tier has an actual IntrusivePtr<Node> slot
+  // to bind it to.
   struct ChildRef {
-    std::byte &transition;
+    std::byte transition;
     IntrusivePtr<Node> &ptr;
   };
   struct ConstChildRef {
-    const std::byte &transition;
+    std::byte transition;
     const IntrusivePtr<Node> &ptr;
-  };
-  struct ChildStore {
-    std::vector<std::byte> transition_bytes;
-    std::vector<IntrusivePtr<Node>> ptrs;
-    [[nodiscard]] auto size() const noexcept -> std::size_t {
-      return transition_bytes.size();
-    }
-    [[nodiscard]] auto empty() const noexcept -> bool {
-      return transition_bytes.empty();
-    }
   };
 
   void addref() const noexcept {
@@ -242,7 +283,7 @@ template <typename V> struct Node {
   }
   // Iterative tail-release avoids the O(depth) recursive destructor chain
   // that otherwise occurs via ~IntrusivePtr → release → delete → ~Node →
-  // ~ChildStore → ~IntrusivePtr → … .
+  // ~IntrusivePtr (the freed node's own child slots) → … .
   //
   // Profiling (perf record, MergeOverlapping/100K) showed this cascade as
   // 29% of total merge time. Converting the last-child release to a loop
@@ -252,25 +293,68 @@ template <typename V> struct Node {
     const Node* cur = this;
     while (cur->refcount_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       auto* mut = const_cast<Node*>(cur);
-      bool has_kids = mut->has_children_flag();
 
-      std::unique_ptr<ChildStore> kids;
-      if (has_kids) {
-        // Raw cast: internal_node() would re-check the flag we just read.
-        // Safe because has_kids is true and mut points to an InternalNode.
-        auto* internal = static_cast<InternalNode<V>*>(mut);
-        kids = std::move(internal->children_);
-        delete internal;
-      } else {
+      // Deliberately not value-initialized: every element ever read (indices
+      // [0, inline_count)) is always written first by the switch below, and
+      // nothing reads past inline_count. Zero-initializing the full array
+      // here would cost real time on every single node release (this loop
+      // runs once per node in the tree) for no observed benefit — this is
+      // exactly the class of latent, capacity-proportional-not-work-
+      // proportional cost that caused Node48 (and, most likely, the earlier
+      // stashed Node256 attempt) to regress RadixTree/MergeOverlapping /
+      // RadixTree/Iterate before it was found and removed.
+      std::array<Node*, 256> inline_kids;
+      std::size_t inline_count = 0;
+
+      switch (mut->node_type()) {
+      case NodeType::Leaf:
         delete mut;
+        break;
+      case NodeType::Node4: {
+        auto* n4 = static_cast<Node4<V>*>(mut);
+        inline_count = n4->count_;
+        for (std::size_t i = 0; i < inline_count; ++i)
+          inline_kids[i] = n4->children_[i].detach();
+        delete n4;
+        break;
+      }
+      case NodeType::Node16: {
+        auto* n16 = static_cast<Node16<V>*>(mut);
+        inline_count = n16->count_;
+        for (std::size_t i = 0; i < inline_count; ++i)
+          inline_kids[i] = n16->children_[i].detach();
+        delete n16;
+        break;
+      }
+      case NodeType::Node48: {
+        auto* n48 = static_cast<Node48<V>*>(mut);
+        inline_count = n48->count_;
+        for (std::size_t i = 0; i < inline_count; ++i)
+          inline_kids[i] = n48->children_[i].detach();
+        delete n48;
+        break;
+      }
+      case NodeType::Node256: {
+        // No count-sized prefix to walk — children are scattered across
+        // all 256 direct-mapped slots by transition byte, not packed at
+        // the front, so every slot is checked. This scan is bounded (256
+        // iterations) and paid only when releasing an actual Node256 node
+        // (rare — see §7.9), unlike the value-init cost above, which used
+        // to run on every node release regardless of tier.
+        auto* n256 = static_cast<Node256<V>*>(mut);
+        for (std::size_t i = 0; i < 256; ++i) {
+          auto* raw = n256->children_[i].detach();
+          if (raw)
+            inline_kids[inline_count++] = raw;
+        }
+        delete n256;
+        break;
+      }
       }
 
-      if (!kids || kids->empty())
-        return;
-
       const Node* tail = nullptr;
-      for (std::size_t i = 0; i < kids->size(); ++i) {
-        auto* raw = kids->ptrs[i].detach();
+      for (std::size_t i = 0; i < inline_count; ++i) {
+        auto* raw = inline_kids[i];
         if (!raw) continue;
         if (tail)
           tail->release();
@@ -286,8 +370,13 @@ template <typename V> struct Node {
   [[nodiscard]] auto has_value() const noexcept -> bool {
     return (packed_tag_ & kHasValueBit) != 0;
   }
-  [[nodiscard]] auto has_children_flag() const noexcept -> bool {
-    return (packed_tag_ & kHasChildrenBit) != 0;
+  [[nodiscard]] auto node_type() const noexcept -> NodeType {
+    return static_cast<NodeType>((packed_tag_ & kNodeTypeMask) >>
+                                  kNodeTypeShift);
+  }
+  void set_node_type(NodeType t) noexcept {
+    packed_tag_ = (packed_tag_ & ~kNodeTypeMask) |
+                  (static_cast<std::uint32_t>(t) << kNodeTypeShift);
   }
   [[nodiscard]] auto edit_tag() const noexcept -> std::uint32_t {
     return packed_tag_ & kTagMask;
@@ -301,123 +390,622 @@ template <typename V> struct Node {
   }
   void clear_value() noexcept { packed_tag_ &= ~kHasValueBit; }
 
-  [[nodiscard]] auto internal_node() noexcept -> InternalNode<V> * {
-    if (!has_children_flag())
+  [[nodiscard]] auto as_node4() noexcept -> Node4<V> * {
+    if (node_type() != NodeType::Node4)
       return nullptr;
-    return static_cast<InternalNode<V> *>(this);
+    return static_cast<Node4<V> *>(this);
   }
-  [[nodiscard]] auto internal_node() const noexcept
-      -> const InternalNode<V> * {
-    if (!has_children_flag())
+  [[nodiscard]] auto as_node4() const noexcept -> const Node4<V> * {
+    if (node_type() != NodeType::Node4)
       return nullptr;
-    return static_cast<const InternalNode<V> *>(this);
+    return static_cast<const Node4<V> *>(this);
   }
-  [[nodiscard]] auto child_store_or_null() noexcept -> ChildStore * {
-    auto *internal = internal_node();
-    if (!internal)
+  [[nodiscard]] auto as_node16() noexcept -> Node16<V> * {
+    if (node_type() != NodeType::Node16)
       return nullptr;
-    return internal->children_.get();
+    return static_cast<Node16<V> *>(this);
   }
-  [[nodiscard]] auto child_store_or_null() const noexcept
-      -> const ChildStore * {
-    auto *internal = internal_node();
-    if (!internal)
+  [[nodiscard]] auto as_node16() const noexcept -> const Node16<V> * {
+    if (node_type() != NodeType::Node16)
       return nullptr;
-    return internal->children_.get();
+    return static_cast<const Node16<V> *>(this);
+  }
+  [[nodiscard]] auto as_node48() noexcept -> Node48<V> * {
+    if (node_type() != NodeType::Node48)
+      return nullptr;
+    return static_cast<Node48<V> *>(this);
+  }
+  [[nodiscard]] auto as_node48() const noexcept -> const Node48<V> * {
+    if (node_type() != NodeType::Node48)
+      return nullptr;
+    return static_cast<const Node48<V> *>(this);
+  }
+  [[nodiscard]] auto as_node256() noexcept -> Node256<V> * {
+    if (node_type() != NodeType::Node256)
+      return nullptr;
+    return static_cast<Node256<V> *>(this);
+  }
+  [[nodiscard]] auto as_node256() const noexcept -> const Node256<V> * {
+    if (node_type() != NodeType::Node256)
+      return nullptr;
+    return static_cast<const Node256<V> *>(this);
   }
 
-  // -- Children accessors (delegate to InternalNode via checked cast) -------
+  // -- Children accessors (dispatch on node_type()) --------------------------
   [[nodiscard]] auto child_count() const noexcept -> std::size_t {
-    auto *kids = child_store_or_null();
-    return kids ? kids->size() : 0;
+    switch (node_type()) {
+    case NodeType::Leaf:
+      return 0;
+    case NodeType::Node4:
+      return static_cast<const Node4<V> *>(this)->count_;
+    case NodeType::Node16:
+      return static_cast<const Node16<V> *>(this)->count_;
+    case NodeType::Node48:
+      return static_cast<const Node48<V> *>(this)->count_;
+    case NodeType::Node256:
+      return static_cast<const Node256<V> *>(this)->count_;
+    }
+    // NodeType is exhaustively covered above; this is reachable only if
+    // packed_tag_'s node-type bits are somehow corrupted to a stray value
+    // outside the 5 declared enumerators. A safe default ("no children")
+    // is a wrong-but-safe answer, not silent corruption — see the
+    // Runtime safety guidance in .github/copilot-instructions.md.
+    return 0;
   }
   [[nodiscard]] auto has_children() const noexcept -> bool {
-    auto *kids = child_store_or_null();
-    return kids && !kids->empty();
+    return child_count() != 0;
   }
+  // Both child_at overloads and find_child/find_child_mut read node_type()
+  // once and switch on it, rather than chaining as_node4()/as_node16()/
+  // as_node48()/as_node256() — each of those independently re-derives
+  // node_type() from packed_tag_, so chaining them means the common case
+  // (a low tier) still pays for every check up to and including its own.
+  // This redundant-dispatch pattern was flagged as a possible contributor
+  // to Node256's original regression; folding it into one switch removed
+  // a measurable few percent off RadixTree/Iterate here, though the
+  // dominant cause of that regression was the inline_kids issue (see
+  // Node::release() and §7.9).
   [[nodiscard]] auto child_at(std::size_t i) const -> ConstChildRef {
-    auto *kids = child_store_or_null();
-    assert(kids != nullptr);
-    assert(i < kids->size());
-    return {kids->transition_bytes[i], kids->ptrs[i]};
+    switch (node_type()) {
+    case NodeType::Leaf:
+      assert(false && "child_at on a leaf");
+      __builtin_unreachable();
+    case NodeType::Node4: {
+      auto *n4 = static_cast<const Node4<V> *>(this);
+      assert(i < n4->count_);
+      return {n4->keys_[i], n4->children_[i]};
+    }
+    case NodeType::Node16: {
+      auto *n16 = static_cast<const Node16<V> *>(this);
+      assert(i < n16->count_);
+      return {n16->keys_[i], n16->children_[i]};
+    }
+    case NodeType::Node48: {
+      auto *n48 = static_cast<const Node48<V> *>(this);
+      assert(i < n48->count_);
+      return {n48->keys_[i], n48->children_[i]};
+    }
+    case NodeType::Node256: {
+      auto *n256 = static_cast<const Node256<V> *>(this);
+      assert(i < n256->count_);
+      for (std::size_t b = 0, seen = 0; b < 256; ++b) {
+        if (!n256->children_[b])
+          continue;
+        if (seen == i)
+          return {static_cast<std::byte>(b), n256->children_[b]};
+        ++seen;
+      }
+      assert(false && "child_at(i) with i >= count_ on a Node256");
+      __builtin_unreachable();
+    }
+    }
+    __builtin_unreachable();
   }
   [[nodiscard]] auto child_at(std::size_t i) -> ChildRef {
-    auto *kids = child_store_or_null();
-    assert(kids != nullptr);
-    assert(i < kids->size());
-    return {kids->transition_bytes[i], kids->ptrs[i]};
+    switch (node_type()) {
+    case NodeType::Leaf:
+      assert(false && "child_at on a leaf");
+      __builtin_unreachable();
+    case NodeType::Node4: {
+      auto *n4 = static_cast<Node4<V> *>(this);
+      assert(i < n4->count_);
+      return {n4->keys_[i], n4->children_[i]};
+    }
+    case NodeType::Node16: {
+      auto *n16 = static_cast<Node16<V> *>(this);
+      assert(i < n16->count_);
+      return {n16->keys_[i], n16->children_[i]};
+    }
+    case NodeType::Node48: {
+      auto *n48 = static_cast<Node48<V> *>(this);
+      assert(i < n48->count_);
+      return {n48->keys_[i], n48->children_[i]};
+    }
+    case NodeType::Node256: {
+      auto *n256 = static_cast<Node256<V> *>(this);
+      assert(i < n256->count_);
+      for (std::size_t b = 0, seen = 0; b < 256; ++b) {
+        if (!n256->children_[b])
+          continue;
+        if (seen == i)
+          return {static_cast<std::byte>(b), n256->children_[b]};
+        ++seen;
+      }
+      assert(false && "child_at(i) with i >= count_ on a Node256");
+      __builtin_unreachable();
+    }
+    }
+    __builtin_unreachable();
   }
 
   [[nodiscard]] auto find_child(std::byte b) const
       -> std::optional<ConstChildRef> {
-    auto *kids = child_store_or_null();
-    if (!kids)
+    switch (node_type()) {
+    case NodeType::Leaf:
       return std::nullopt;
-    for (std::size_t i = 0; i < kids->size(); ++i) {
-      if (kids->transition_bytes[i] == b)
-        return ConstChildRef{kids->transition_bytes[i], kids->ptrs[i]};
+    case NodeType::Node4: {
+      auto *n4 = static_cast<const Node4<V> *>(this);
+      for (std::size_t i = 0; i < n4->count_; ++i)
+        if (n4->keys_[i] == b)
+          return ConstChildRef{n4->keys_[i], n4->children_[i]};
+      return std::nullopt;
     }
+    case NodeType::Node16: {
+      auto *n16 = static_cast<const Node16<V> *>(this);
+      for (std::size_t i = 0; i < n16->count_; ++i)
+        if (n16->keys_[i] == b)
+          return ConstChildRef{n16->keys_[i], n16->children_[i]};
+      return std::nullopt;
+    }
+    case NodeType::Node48: {
+      auto *n48 = static_cast<const Node48<V> *>(this);
+      auto pos = n48->child_index_[std::to_integer<std::uint8_t>(b)];
+      if (pos == Node48<V>::kEmptyMarker)
+        return std::nullopt;
+      return ConstChildRef{n48->keys_[pos], n48->children_[pos]};
+    }
+    case NodeType::Node256: {
+      auto *n256 = static_cast<const Node256<V> *>(this);
+      auto idx = std::to_integer<std::uint8_t>(b);
+      if (!n256->children_[idx])
+        return std::nullopt;
+      return ConstChildRef{b, n256->children_[idx]};
+    }
+    }
+    // See child_count()'s trailing comment — safe default, not UB.
     return std::nullopt;
   }
 
   [[nodiscard]] auto find_child_mut(std::byte b) -> std::optional<ChildRef> {
-    auto *kids = child_store_or_null();
-    if (!kids)
+    switch (node_type()) {
+    case NodeType::Leaf:
       return std::nullopt;
-    for (std::size_t i = 0; i < kids->size(); ++i) {
-      if (kids->transition_bytes[i] == b)
-        return ChildRef{kids->transition_bytes[i], kids->ptrs[i]};
+    case NodeType::Node4: {
+      auto *n4 = static_cast<Node4<V> *>(this);
+      for (std::size_t i = 0; i < n4->count_; ++i)
+        if (n4->keys_[i] == b)
+          return ChildRef{n4->keys_[i], n4->children_[i]};
+      return std::nullopt;
     }
+    case NodeType::Node16: {
+      auto *n16 = static_cast<Node16<V> *>(this);
+      for (std::size_t i = 0; i < n16->count_; ++i)
+        if (n16->keys_[i] == b)
+          return ChildRef{n16->keys_[i], n16->children_[i]};
+      return std::nullopt;
+    }
+    case NodeType::Node48: {
+      auto *n48 = static_cast<Node48<V> *>(this);
+      auto pos = n48->child_index_[std::to_integer<std::uint8_t>(b)];
+      if (pos == Node48<V>::kEmptyMarker)
+        return std::nullopt;
+      return ChildRef{n48->keys_[pos], n48->children_[pos]};
+    }
+    case NodeType::Node256: {
+      auto *n256 = static_cast<Node256<V> *>(this);
+      auto idx = std::to_integer<std::uint8_t>(b);
+      if (!n256->children_[idx])
+        return std::nullopt;
+      return ChildRef{b, n256->children_[idx]};
+    }
+    }
+    // See child_count()'s trailing comment — safe default, not UB.
     return std::nullopt;
   }
 
-  void insert_child(std::byte b, IntrusivePtr<Node> child) {
-    auto *internal = internal_node();
-    assert(internal != nullptr);
-    if (!internal->children_)
-      internal->children_ = std::make_unique<ChildStore>();
-    auto &kids = *internal->children_;
-    std::size_t pos = 0;
-    while (pos < kids.size() && kids.transition_bytes[pos] < b)
-      ++pos;
-    assert((pos == kids.size() || kids.transition_bytes[pos] != b) &&
-           "duplicate transition byte");
-    kids.transition_bytes.insert(
-      kids.transition_bytes.begin() +
-            static_cast<std::ptrdiff_t>(pos),
-        b);
-    kids.ptrs.insert(
-      kids.ptrs.begin() + static_cast<std::ptrdiff_t>(pos),
-        std::move(child));
+  // Cursor for an ascending walk over one node's children. Each tier reads
+  // whichever field is O(1) for its own layout — the packed tiers index
+  // keys_/children_ by `ordinal`, Node256 scans its direct-mapped slots
+  // from `probe` — and only next_child() ever writes either, so the two
+  // cannot drift out of step.
+  struct ChildCursor {
+    std::size_t ordinal{0};
+    unsigned probe{0};
+  };
+
+  // Next child in ascending transition-byte order, advancing the cursor past
+  // it; nullopt once the children are exhausted. On return, cursor.ordinal
+  // is the ordinal *after* the child yielded, so the ordinal of that child
+  // is the value read from the cursor before the call.
+  //
+  // Prefer this over child_at(i) for any in-order traversal of a node's
+  // children. A full walk here costs O(count) on the packed tiers and
+  // O(256) on Node256; the same walk driven by child_at(i) is quadratic in
+  // fanout on Node256, which has no packed key array and so has to rescan
+  // its slots from zero on every call to turn an ordinal into a byte. That
+  // cost is real and was measured, not theoretical: moving these walks off
+  // child_at(i) made a single lower_bound() on a full-byte-range key shape
+  // ~9x faster (9.8 us -> 1.0 us at 100k keys) and MergeOverlapping on that
+  // shape ~18% faster, while leaving the packed tiers slightly faster too
+  // (see §7.12). child_at(i) remains for random ordinal access — the
+  // iterators' frames index by ordinal in both directions.
+  [[nodiscard]] auto next_child(ChildCursor &cursor) const
+      -> std::optional<ConstChildRef> {
+    switch (node_type()) {
+    case NodeType::Leaf:
+      return std::nullopt;
+    case NodeType::Node4: {
+      auto *n4 = static_cast<const Node4<V> *>(this);
+      if (cursor.ordinal >= n4->count_)
+        return std::nullopt;
+      auto i = cursor.ordinal++;
+      return ConstChildRef{n4->keys_[i], n4->children_[i]};
+    }
+    case NodeType::Node16: {
+      auto *n16 = static_cast<const Node16<V> *>(this);
+      if (cursor.ordinal >= n16->count_)
+        return std::nullopt;
+      auto i = cursor.ordinal++;
+      return ConstChildRef{n16->keys_[i], n16->children_[i]};
+    }
+    case NodeType::Node48: {
+      auto *n48 = static_cast<const Node48<V> *>(this);
+      if (cursor.ordinal >= n48->count_)
+        return std::nullopt;
+      auto i = cursor.ordinal++;
+      return ConstChildRef{n48->keys_[i], n48->children_[i]};
+    }
+    case NodeType::Node256: {
+      auto *n256 = static_cast<const Node256<V> *>(this);
+      while (cursor.probe < 256) {
+        auto slot = cursor.probe++;
+        if (!n256->children_[slot])
+          continue;
+        ++cursor.ordinal;
+        return ConstChildRef{static_cast<std::byte>(slot),
+                             n256->children_[slot]};
+      }
+      return std::nullopt;
+    }
+    }
+    // See child_count()'s trailing comment — safe default, not UB.
+    return std::nullopt;
   }
 
-  void remove_child(std::byte b) {
-    auto *kids = child_store_or_null();
-    if (!kids)
-      return;
-    for (std::size_t i = 0; i < kids->size(); ++i) {
-      if (kids->transition_bytes[i] == b) {
-        kids->transition_bytes.erase(
-            kids->transition_bytes.begin() +
-                static_cast<std::ptrdiff_t>(i));
-        kids->ptrs.erase(kids->ptrs.begin() +
-                              static_cast<std::ptrdiff_t>(i));
-        return;
+  // Allocates a Node4 carrying src's value/prefix (not its children — src
+  // is assumed to have none, and not its edit_tag — matches clone()'s
+  // tag-free contract). Shared by clone_as_internal() and by
+  // insert_child/remove_child's tier transitions, which OR the tag back in
+  // themselves since (unlike clone()) they must preserve it.
+  [[nodiscard]] static auto make_node4_like(const Node &src) -> Node4<V> * {
+    auto *n = new Node4<V>();
+    n->packed_tag_ |= src.packed_tag_ & kHasValueBit;
+    n->value_ = src.value_;
+    n->prefix = src.prefix;
+    return n;
+  }
+  // Allocates an (empty) Node16 node carrying src's value/prefix (tag-free
+  // — see make_node4_like). Shared by insert_child's Node4 -> Node16
+  // promotion and remove_child's Node48 -> Node16 demotion.
+  [[nodiscard]] static auto make_node16_like(const Node &src) -> Node16<V> * {
+    auto *n = new Node16<V>();
+    n->packed_tag_ |= src.packed_tag_ & kHasValueBit;
+    n->value_ = src.value_;
+    n->prefix = src.prefix;
+    return n;
+  }
+  // Allocates an (empty) Node48 node carrying src's value/prefix (tag-free —
+  // see make_node4_like). Shared by insert_child's Node16 -> Node48
+  // promotion and remove_child's Node256 -> Node48 demotion. child_index_
+  // is default-constructed to all-kEmptyMarker by Node48's constructor.
+  [[nodiscard]] static auto make_node48_like(const Node &src) -> Node48<V> * {
+    auto *n = new Node48<V>();
+    n->packed_tag_ |= src.packed_tag_ & kHasValueBit;
+    n->value_ = src.value_;
+    n->prefix = src.prefix;
+    return n;
+  }
+  // Allocates an (empty) Node256 node carrying src's value/prefix (tag-free
+  // — see make_node4_like). Shared by insert_child's Node48 -> Node256
+  // promotion. children_ is default-constructed to all-null IntrusivePtrs.
+  [[nodiscard]] static auto make_node256_like(const Node &src)
+      -> Node256<V> * {
+    auto *n = new Node256<V>();
+    n->packed_tag_ |= src.packed_tag_ & kHasValueBit;
+    n->value_ = src.value_;
+    n->prefix = src.prefix;
+    return n;
+  }
+
+  // Insert a child under transition byte b. Handles every promotion: a Leaf
+  // promotes to Node4 for its first child; a Node4 at capacity promotes to
+  // Node16 on its 5th; a Node16 at capacity promotes to Node48 on its
+  // 17th; a Node48 at capacity promotes to Node256 on its 49th. Node256 is
+  // the terminal tier — 256 slots is the ceiling on fanout for a single
+  // byte transition, so it never promotes further. Takes ownership of
+  // `node` and returns the resulting node, which may be a different
+  // underlying allocation.
+  [[nodiscard]] static auto insert_child(IntrusivePtr<Node> node,
+                                         std::byte b,
+                                         IntrusivePtr<Node> child)
+      -> IntrusivePtr<Node> {
+    if (auto *n4 = node->as_node4()) {
+      if (n4->count_ < Node4<V>::kCapacity) {
+        std::size_t pos = 0;
+        while (pos < n4->count_ && n4->keys_[pos] < b)
+          ++pos;
+        assert((pos == n4->count_ || n4->keys_[pos] != b) &&
+               "duplicate transition byte");
+        for (std::size_t i = n4->count_; i > pos; --i) {
+          n4->keys_[i] = n4->keys_[i - 1];
+          n4->children_[i] = std::move(n4->children_[i - 1]);
+        }
+        n4->keys_[pos] = b;
+        n4->children_[pos] = std::move(child);
+        ++n4->count_;
+        return node;
       }
+      // Node4 at capacity — promote to Node16. Unlike clone(), a tier
+      // transition must preserve the source node's edit_tag: for a
+      // transient node, `node` was already claimed by the current session
+      // (via ensure_mutable) before insert_child was called.
+      auto *n16 = make_node16_like(*node);
+      n16->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n16->count_ = n4->count_;
+      for (std::size_t i = 0; i < n4->count_; ++i) {
+        n16->keys_[i] = n4->keys_[i];
+        n16->children_[i] = std::move(n4->children_[i]);
+      }
+      return insert_child(IntrusivePtr<Node>::adopt(n16), b, std::move(child));
     }
+
+    if (auto *n16 = node->as_node16()) {
+      if (n16->count_ < Node16<V>::kCapacity) {
+        std::size_t pos = 0;
+        while (pos < n16->count_ && n16->keys_[pos] < b)
+          ++pos;
+        assert((pos == n16->count_ || n16->keys_[pos] != b) &&
+               "duplicate transition byte");
+        for (std::size_t i = n16->count_; i > pos; --i) {
+          n16->keys_[i] = n16->keys_[i - 1];
+          n16->children_[i] = std::move(n16->children_[i - 1]);
+        }
+        n16->keys_[pos] = b;
+        n16->children_[pos] = std::move(child);
+        ++n16->count_;
+        return node;
+      }
+      // Node16 at capacity — promote to Node48. Preserve edit_tag (see the
+      // Node4 -> Node16 branch above). child_index_ starts all-empty (set
+      // by Node48's constructor) and is filled in below alongside keys_.
+      auto *n48 = make_node48_like(*node);
+      n48->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n48->count_ = n16->count_;
+      for (std::size_t i = 0; i < n16->count_; ++i) {
+        n48->keys_[i] = n16->keys_[i];
+        n48->children_[i] = std::move(n16->children_[i]);
+        n48->child_index_[std::to_integer<std::uint8_t>(n16->keys_[i])] =
+            static_cast<std::uint8_t>(i);
+      }
+      return insert_child(IntrusivePtr<Node>::adopt(n48), b, std::move(child));
+    }
+
+    if (auto *n48 = node->as_node48()) {
+      if (n48->count_ < Node48<V>::kCapacity) {
+        std::size_t pos = 0;
+        while (pos < n48->count_ && n48->keys_[pos] < b)
+          ++pos;
+        assert((pos == n48->count_ || n48->keys_[pos] != b) &&
+               "duplicate transition byte");
+        for (std::size_t i = n48->count_; i > pos; --i) {
+          n48->keys_[i] = n48->keys_[i - 1];
+          n48->children_[i] = std::move(n48->children_[i - 1]);
+          n48->child_index_[std::to_integer<std::uint8_t>(n48->keys_[i])] =
+              static_cast<std::uint8_t>(i);
+        }
+        n48->keys_[pos] = b;
+        n48->children_[pos] = std::move(child);
+        n48->child_index_[std::to_integer<std::uint8_t>(b)] =
+            static_cast<std::uint8_t>(pos);
+        ++n48->count_;
+        return node;
+      }
+      // Node48 at capacity — promote to Node256. Preserve edit_tag (see the
+      // Node4 -> Node16 branch above). children_ starts all-null (set by
+      // Node256's constructor) and is filled in below by transition byte.
+      auto *n256 = make_node256_like(*node);
+      n256->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n256->count_ = n48->count_;
+      for (std::size_t i = 0; i < n48->count_; ++i) {
+        n256->children_[std::to_integer<std::uint8_t>(n48->keys_[i])] =
+            std::move(n48->children_[i]);
+      }
+      return insert_child(IntrusivePtr<Node>::adopt(n256), b,
+                          std::move(child));
+    }
+
+    if (node->node_type() == NodeType::Leaf) {
+      // First child — promote leaf to Node4, preserving edit_tag (see the
+      // Node4 -> Node16 branch above for why).
+      auto *n4 = make_node4_like(*node);
+      n4->packed_tag_ |= node->packed_tag_ & kTagMask;
+      return insert_child(IntrusivePtr<Node>::adopt(n4), b, std::move(child));
+    }
+
+    // Node256 — the terminal tier. Direct-mapped by transition byte, so
+    // insertion is O(1) with no shifting and no further promotion.
+    auto *n256 = node->as_node256();
+    assert(n256 != nullptr);
+    assert(!n256->children_[std::to_integer<std::uint8_t>(b)] &&
+           "duplicate transition byte");
+    n256->children_[std::to_integer<std::uint8_t>(b)] = std::move(child);
+    ++n256->count_;
+    return node;
+  }
+
+  // Remove the child under transition byte b. If this is Node256 and
+  // removing drops its count to <= Node256<V>::kShrinkThreshold (75% of
+  // Node48's capacity, matching DuckDB's ART — hysteresis to avoid
+  // thrashing right at the 48/49 promotion boundary), demotes to Node48;
+  // if this is Node48 and its count drops to <= Node48<V>::kShrinkThreshold
+  // (75% of Node16's capacity, same rationale, for the 16/17 boundary),
+  // demotes to Node16; if this is Node16 and its count drops to <=
+  // Node4<V>::kCapacity, demotes to Node4 (symmetric — no hysteresis needed
+  // at this boundary, see §7.7). Takes ownership of `node` and returns the
+  // resulting node.
+  [[nodiscard]] static auto remove_child(IntrusivePtr<Node> node,
+                                         std::byte b) -> IntrusivePtr<Node> {
+    if (auto *n4 = node->as_node4()) {
+      for (std::size_t i = 0; i < n4->count_; ++i) {
+        if (n4->keys_[i] == b) {
+          for (std::size_t j = i; j + 1 < n4->count_; ++j) {
+            n4->keys_[j] = n4->keys_[j + 1];
+            n4->children_[j] = std::move(n4->children_[j + 1]);
+          }
+          --n4->count_;
+          n4->children_[n4->count_] = IntrusivePtr<Node>{};
+          return node;
+        }
+      }
+      return node;
+    }
+
+    if (auto *n16 = node->as_node16()) {
+      for (std::size_t i = 0; i < n16->count_; ++i) {
+        if (n16->keys_[i] == b) {
+          for (std::size_t j = i; j + 1 < n16->count_; ++j) {
+            n16->keys_[j] = n16->keys_[j + 1];
+            n16->children_[j] = std::move(n16->children_[j + 1]);
+          }
+          --n16->count_;
+          n16->children_[n16->count_] = IntrusivePtr<Node>{};
+          break;
+        }
+      }
+      if (n16->count_ > Node4<V>::kCapacity)
+        return node;
+      // Demote back to Node4 — Node16's per-slot cost only pays off above
+      // this fanout. Preserve edit_tag (see insert_child's Node4 -> Node16
+      // branch for why).
+      auto *n4 = make_node4_like(*node);
+      n4->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n4->count_ = static_cast<std::uint8_t>(n16->count_);
+      for (std::size_t i = 0; i < n16->count_; ++i) {
+        n4->keys_[i] = n16->keys_[i];
+        n4->children_[i] = std::move(n16->children_[i]);
+      }
+      return IntrusivePtr<Node>::adopt(n4);
+    }
+
+    if (auto *n48 = node->as_node48()) {
+      auto pos = n48->child_index_[std::to_integer<std::uint8_t>(b)];
+      if (pos != Node48<V>::kEmptyMarker) {
+        for (std::size_t j = pos; j + 1 < n48->count_; ++j) {
+          n48->keys_[j] = n48->keys_[j + 1];
+          n48->children_[j] = std::move(n48->children_[j + 1]);
+          n48->child_index_[std::to_integer<std::uint8_t>(n48->keys_[j])] =
+              static_cast<std::uint8_t>(j);
+        }
+        --n48->count_;
+        n48->children_[n48->count_] = IntrusivePtr<Node>{};
+        n48->child_index_[std::to_integer<std::uint8_t>(b)] =
+            Node48<V>::kEmptyMarker;
+      }
+      if (n48->count_ > Node48<V>::kShrinkThreshold)
+        return node;
+      // Demote back to Node16 — see the comment above remove_child for the
+      // hysteresis rationale.
+      auto *n16 = make_node16_like(*node);
+      n16->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n16->count_ = static_cast<std::uint8_t>(n48->count_);
+      for (std::size_t i = 0; i < n48->count_; ++i) {
+        n16->keys_[i] = n48->keys_[i];
+        n16->children_[i] = std::move(n48->children_[i]);
+      }
+      return IntrusivePtr<Node>::adopt(n16);
+    }
+
+    // Node256 — direct-mapped, so removal is just clearing the slot; no
+    // shifting, unlike the packed lower tiers.
+    auto *n256 = node->as_node256();
+    if (!n256)
+      return node;
+    auto idx = std::to_integer<std::uint8_t>(b);
+    if (n256->children_[idx]) {
+      n256->children_[idx] = IntrusivePtr<Node>{};
+      --n256->count_;
+    }
+    // 75% of Node48's capacity — DuckDB's proportional hysteresis, mirrors
+    // Node48's own demotion threshold (see the comment above remove_child).
+    if (n256->count_ > Node256<V>::kShrinkThreshold)
+      return node;
+
+    // Demote back to Node48.
+    auto *n48 = make_node48_like(*node);
+    n48->packed_tag_ |= node->packed_tag_ & kTagMask;
+    std::uint8_t pos = 0;
+    for (std::size_t i = 0; i < 256; ++i) {
+      if (!n256->children_[i])
+        continue;
+      n48->keys_[pos] = static_cast<std::byte>(i);
+      n48->children_[pos] = std::move(n256->children_[i]);
+      n48->child_index_[i] = pos;
+      ++pos;
+    }
+    n48->count_ = pos;
+    return IntrusivePtr<Node>::adopt(n48);
   }
 
   // Deep clone of this node (not recursive — children are shared).
   [[nodiscard]] auto clone() const -> IntrusivePtr<Node> {
-    if (has_children_flag()) {
-      auto *self = internal_node();
-      assert(self != nullptr);
-      auto* n = new InternalNode<V>();
+    if (auto *self = as_node4()) {
+      auto *n = new Node4<V>();
       n->packed_tag_ |= packed_tag_ & kHasValueBit;
       n->value_ = value_;
       n->prefix = prefix;
-      if (self->children_)
-        n->children_ = std::make_unique<ChildStore>(*self->children_);
+      n->count_ = self->count_;
+      n->keys_ = self->keys_;
+      n->children_ = self->children_; // IntrusivePtr copies -> addref each
+      return IntrusivePtr<Node>::adopt(n);
+    }
+    if (auto *self = as_node16()) {
+      auto *n = new Node16<V>();
+      n->packed_tag_ |= packed_tag_ & kHasValueBit;
+      n->value_ = value_;
+      n->prefix = prefix;
+      n->count_ = self->count_;
+      n->keys_ = self->keys_;
+      n->children_ = self->children_; // IntrusivePtr copies -> addref each
+      return IntrusivePtr<Node>::adopt(n);
+    }
+    if (auto *self = as_node48()) {
+      auto *n = new Node48<V>();
+      n->packed_tag_ |= packed_tag_ & kHasValueBit;
+      n->value_ = value_;
+      n->prefix = prefix;
+      n->count_ = self->count_;
+      n->keys_ = self->keys_;
+      n->children_ = self->children_; // IntrusivePtr copies -> addref each
+      n->child_index_ = self->child_index_;
+      return IntrusivePtr<Node>::adopt(n);
+    }
+    if (auto *self = as_node256()) {
+      auto *n = new Node256<V>();
+      n->packed_tag_ |= packed_tag_ & kHasValueBit;
+      n->value_ = value_;
+      n->prefix = prefix;
+      n->count_ = self->count_;
+      n->children_ = self->children_; // IntrusivePtr copies -> addref each
       return IntrusivePtr<Node>::adopt(n);
     }
     auto* n = new Node();
@@ -434,42 +1022,119 @@ template <typename V> struct Node {
     return n;
   }
 
-  // Clone, promoting to InternalNode if this is a leaf.
+  // Clone, promoting to Node4 if this is a leaf.
   // Used when the caller will insert children into the clone.
   [[nodiscard]] auto clone_as_internal() const -> IntrusivePtr<Node> {
-    auto* n = new InternalNode<V>();
-    n->packed_tag_ |= packed_tag_ & kHasValueBit;
-    n->value_ = value_;
-    n->prefix = prefix;
-    if (has_children_flag()) {
-      auto *src = child_store_or_null();
-      if (src)
-        n->children_ = std::make_unique<ChildStore>(*src);
-    }
-    return IntrusivePtr<Node>::adopt(n);
+    if (node_type() != NodeType::Leaf)
+      return clone();
+    return IntrusivePtr<Node>::adopt(make_node4_like(*this));
   }
 };
 
 // ---------------------------------------------------------------------------
-// InternalNode<V> — extends Node with children storage.
+// Node4<V> — fixed 4-slot internal node, children embedded inline.
 //
-// Allocated only for nodes that will have children (routing/split nodes).
-// sizeof(InternalNode<KeyDirEntry>) == 48, glibc usable=56.
+// Single allocation (no separate ChildStore heap object or buffers) for the
+// common low-fanout case: chain-compression routing nodes have exactly 1
+// child, and prefix splits start at 2. Transition bytes are kept sorted;
+// lookup is a short linear scan (never more than 4 comparisons). Promotes
+// to Node16 on its 5th child; Node16 demotes back to Node4 when its count
+// drops to <= kCapacity (see Node::insert_child / Node::remove_child).
 // ---------------------------------------------------------------------------
-template <typename V> struct InternalNode : Node<V> {
-  InternalNode() { Node<V>::packed_tag_ |= Node<V>::kHasChildrenBit; }
-  std::unique_ptr<typename Node<V>::ChildStore> children_;
+template <typename V> struct Node4 : Node<V> {
+  static constexpr std::uint8_t kCapacity = 4;
+
+  Node4() { Node<V>::set_node_type(Node<V>::NodeType::Node4); }
+  std::uint8_t count_{0};
+  std::array<std::byte, kCapacity> keys_{};
+  std::array<IntrusivePtr<Node<V>>, kCapacity> children_{};
 };
 
-// Node<uint64_t>: 4+4+8+8 = 24 (no children_ field).
+// ---------------------------------------------------------------------------
+// Node16<V> — fixed 16-slot internal node, same shape as Node4 (sorted
+// inline array, linear scan) but a bigger array. Still a single
+// allocation. Promotes to Node48 on its 17th child; Node48 demotes back to
+// Node16 when its count drops to <= kShrinkThreshold (see
+// Node::insert_child / Node::remove_child).
+// ---------------------------------------------------------------------------
+template <typename V> struct Node16 : Node<V> {
+  static constexpr std::uint8_t kCapacity = 16;
+
+  Node16() { Node<V>::set_node_type(Node<V>::NodeType::Node16); }
+  std::uint8_t count_{0};
+  std::array<std::byte, kCapacity> keys_{};
+  std::array<IntrusivePtr<Node<V>>, kCapacity> children_{};
+};
+
+// ---------------------------------------------------------------------------
+// Node48<V> — fixed 48-slot internal node. Keeps the same sorted inline
+// array as Node4/Node16 (keys_/children_) so child_at(i) stays an O(1)
+// ordinal lookup — no rescan — plus a 256-byte child_index_ that maps a
+// transition byte directly to its slot, making find_child(b) O(1) instead
+// of Node16's O(count) linear scan. kEmptyMarker (== kCapacity, an
+// otherwise-unused slot value) marks a byte with no child, mirroring
+// DuckDB's ART Node48::EMPTY_MARKER. Promotes to Node256 on its 49th
+// child; demotes back to Node16 when its count drops to <=
+// kShrinkThreshold (see Node::insert_child / Node::remove_child).
+// ---------------------------------------------------------------------------
+template <typename V> struct Node48 : Node<V> {
+  static constexpr std::uint8_t kCapacity = 48;
+  static constexpr std::uint8_t kEmptyMarker = kCapacity;
+  // 75% of Node16::kCapacity — DuckDB's proportional hysteresis, avoids
+  // promote/demote thrashing right at the 16/17 boundary.
+  static constexpr std::uint8_t kShrinkThreshold = 12;
+
+  Node48() {
+    Node<V>::set_node_type(Node<V>::NodeType::Node48);
+    child_index_.fill(kEmptyMarker);
+  }
+  std::uint8_t count_{0};
+  std::array<std::uint8_t, 256> child_index_{};
+  std::array<std::byte, kCapacity> keys_{};
+  std::array<IntrusivePtr<Node<V>>, kCapacity> children_{};
+};
+
+// ---------------------------------------------------------------------------
+// Node256<V> — fixed 256-slot internal node, direct-mapped by transition
+// byte: children_[b] is the child for byte b, no stored key array (the
+// byte value *is* the index), so find_child(b) and insertion/removal are
+// O(1). child_at(i) — the ordinal accessor iteration uses — has no packed
+// array to index into and scans children_ for the i-th occupied slot; this
+// is the terminal tier (256 slots is the ceiling on fanout for a single
+// byte transition), so there is no tier above it to promote to.
+// count_ is uint16_t, not uint8_t: a full node holds 256 children, which
+// does not fit in 8 bits. Demotes to Node48 when its count drops to <=
+// kShrinkThreshold (see Node::insert_child / Node::remove_child).
+// ---------------------------------------------------------------------------
+template <typename V> struct Node256 : Node<V> {
+  static constexpr std::uint16_t kCapacity = 256;
+  // 75% of Node48::kCapacity — DuckDB's proportional hysteresis, avoids
+  // promote/demote thrashing right at the 48/49 boundary.
+  static constexpr std::uint16_t kShrinkThreshold = 36;
+
+  Node256() { Node<V>::set_node_type(Node<V>::NodeType::Node256); }
+  std::uint16_t count_{0};
+  std::array<IntrusivePtr<Node<V>>, kCapacity> children_{};
+};
+
+// Node<uint64_t>: 4+4+8+8 = 24 (no children field).
 static_assert(sizeof(Node<std::uint64_t>) == 24);
-// InternalNode<uint64_t>: 24+8 = 32.
-static_assert(sizeof(InternalNode<std::uint64_t>) == 32);
+// Node4<uint64_t>: 24 + 1(count) + 4(keys, padded) + 32(4 children) = 64.
+static_assert(sizeof(Node4<std::uint64_t>) == 64);
+// Node16<uint64_t>: 24 + 1(count) + 16(keys) + 7(pad) + 128(16 children) = 176.
+static_assert(sizeof(Node16<std::uint64_t>) == 176);
+// Node48<uint64_t>: 24 + 1(count) + 256(child_index) + 48(keys) + 7(pad) +
+// 384(48 children) = 720.
+static_assert(sizeof(Node48<std::uint64_t>) == 720);
+// Node256<uint64_t>: 24 + 2(count) + 6(pad) + 2048(256 children) = 2080.
+static_assert(sizeof(Node256<std::uint64_t>) == 2080);
 
 // Factory functions for node allocation.
-// make_leaf: allocates Node (40B for KeyDirEntry), no children.
-// make_internal: allocates InternalNode (48B for KeyDirEntry), with
-// has_children flag set.
+// make_leaf: allocates Node (24B for uint64_t value), no children.
+// make_internal: allocates a fresh Node4 (the entry tier for any node that
+// will receive children — routing/split nodes) — promotes to Node16, then
+// Node48, then Node256, automatically via Node::insert_child as fanout
+// grows.
 template <typename V>
 auto make_leaf() -> IntrusivePtr<Node<V>> {
   return IntrusivePtr<Node<V>>::adopt(new Node<V>());
@@ -477,22 +1142,7 @@ auto make_leaf() -> IntrusivePtr<Node<V>> {
 
 template <typename V>
 auto make_internal() -> IntrusivePtr<Node<V>> {
-  return IntrusivePtr<Node<V>>::adopt(new InternalNode<V>());
-}
-
-// Promote a leaf node to internal. Returns a new InternalNode with the
-// same fields (value, prefix, edit_tag) plus has_children set.
-// The original node is not modified — callers replace their pointer.
-template <typename V>
-auto promote_to_internal(const IntrusivePtr<Node<V>> &node)
-    -> IntrusivePtr<Node<V>> {
-  assert(!node->has_children_flag());
-  auto* n = new InternalNode<V>();
-  n->packed_tag_ |= (node->packed_tag_ & Node<V>::kHasValueBit) |
-                    (node->packed_tag_ & Node<V>::kTagMask);
-  n->value_ = node->value_;
-  n->prefix = node->prefix;
-  return IntrusivePtr<Node<V>>::adopt(n);
+  return IntrusivePtr<Node<V>>::adopt(new Node4<V>());
 }
 
 // ---------------------------------------------------------------------------
@@ -701,7 +1351,8 @@ private:
         routing->set_edit_tag(tag);
       for (std::size_t i = 0; i < it->prefix_len; ++i)
         routing->prefix.push_back(key[it->prefix_start + i]);
-      routing->insert_child(key[it->transition_idx], std::move(cur));
+      routing = Node<V>::insert_child(std::move(routing),
+                                      key[it->transition_idx], std::move(cur));
       cur = std::move(routing);
     }
     return cur;
@@ -748,7 +1399,8 @@ private:
         routing->set_edit_tag(tag);
       for (std::size_t i = 0; i < it->prefix_len; ++i)
         routing->prefix.push_back(merged[it->prefix_start + i]);
-      routing->insert_child(merged[it->transition_idx], std::move(cur));
+      routing = Node<V>::insert_child(
+          std::move(routing), merged[it->transition_idx], std::move(cur));
       cur = std::move(routing);
     }
     return cur;
@@ -782,7 +1434,8 @@ private:
       for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
         old_suffix.push_back(prefix_span[i]);
       existing_child->prefix = std::move(old_suffix);
-      split->insert_child(old_transition, std::move(existing_child));
+      split = Node<V>::insert_child(std::move(split), old_transition,
+                                    std::move(existing_child));
 
       auto remaining = key.subspan(cpl);
       if (remaining.empty()) {
@@ -792,7 +1445,8 @@ private:
       } else {
         auto new_transition = remaining[0];
         auto chain = build_leaf_chain(remaining.subspan(1), std::move(val));
-        split->insert_child(new_transition, std::move(chain));
+        split = Node<V>::insert_child(std::move(split), new_transition,
+                                      std::move(chain));
       }
       return {std::move(split), true};
     }
@@ -816,13 +1470,11 @@ private:
       existing_child->ptr = std::move(new_child);
       return {std::move(new_node), inserted};
     }
-    // No child for this transition — create a leaf.
-    // Promote to internal if the clone is a leaf (the node previously
-    // had no children but now needs one).
+    // No child for this transition — create a leaf. insert_child promotes
+    // new_node (leaf -> Node4 -> Node16 -> Node48 -> Node256) as needed.
     auto chain = build_leaf_chain(child_key, std::move(val));
-    if (!new_node->has_children_flag())
-      new_node = promote_to_internal(new_node);
-    new_node->insert_child(transition, std::move(chain));
+    new_node = Node<V>::insert_child(std::move(new_node), transition,
+                                     std::move(chain));
     return {std::move(new_node), true};
   }
 
@@ -878,7 +1530,7 @@ private:
     auto new_node = node->clone();
     if (!new_child) {
       // Child was deleted entirely.
-      new_node->remove_child(transition);
+      new_node = Node<V>::remove_child(std::move(new_node), transition);
       // Path compression: if this node is now a routing node with 1 child and
       // no value, merge.
       if (!new_node->has_value() && new_node->child_count() == 1) {
@@ -963,14 +1615,16 @@ private:
       for (std::size_t i = cpl + 1; i < pa.size(); ++i)
         a_suffix.push_back(pa[i]);
       a_trimmed->prefix = std::move(a_suffix);
-      split->insert_child(pa[cpl], std::move(a_trimmed));
+      split = Node<V>::insert_child(std::move(split), pa[cpl],
+                                    std::move(a_trimmed));
 
       auto b_trimmed = b->clone();
       typename Node<V>::Prefix b_suffix;
       for (std::size_t i = cpl + 1; i < pb.size(); ++i)
         b_suffix.push_back(pb[i]);
       b_trimmed->prefix = std::move(b_suffix);
-      split->insert_child(pb[cpl], std::move(b_trimmed));
+      split = Node<V>::insert_child(std::move(split), pb[cpl],
+                                    std::move(b_trimmed));
 
       return {std::move(split), 0};
     }
@@ -993,7 +1647,8 @@ private:
         existing->ptr = std::move(child);
         overlaps = child_overlaps;
       } else {
-        new_b->insert_child(pa[cpl], std::move(a_trimmed));
+        new_b = Node<V>::insert_child(std::move(new_b), pa[cpl],
+                                      std::move(a_trimmed));
       }
       return {std::move(new_b), overlaps};
     }
@@ -1016,7 +1671,8 @@ private:
         existing->ptr = std::move(child);
         overlaps = child_overlaps;
       } else {
-        new_a->insert_child(pb[cpl], std::move(b_trimmed));
+        new_a = Node<V>::insert_child(std::move(new_a), pb[cpl],
+                                      std::move(b_trimmed));
       }
       return {std::move(new_a), overlaps};
     }
@@ -1036,17 +1692,22 @@ private:
     }
 
     if (b->has_children()) {
-      for (std::size_t i = 0; i < b->child_count(); ++i) {
-        auto b_slot = b->child_at(i);
-        auto slot = merged->find_child_mut(b_slot.transition);
+      // Cursor walk rather than child_at(i) per ordinal: b's children are
+      // visited in full here, and on a Node256 the ordinal accessor rescans
+      // the direct-mapped slots on every call, making the walk quadratic in
+      // fanout (see Node::next_child).
+      typename Node<V>::ChildCursor cursor;
+      while (auto b_slot = b->next_child(cursor)) {
+        auto slot = merged->find_child_mut(b_slot->transition);
         if (slot) {
           auto [child, child_overlaps] =
-              merge_impl(slot->ptr, b_slot.ptr, resolve);
+              merge_impl(slot->ptr, b_slot->ptr, resolve);
           slot->ptr = std::move(child);
           overlaps += child_overlaps;
         } else {
           // Disjoint subtree — share it in O(1), no clone needed.
-          merged->insert_child(b_slot.transition, b_slot.ptr);
+          merged = Node<V>::insert_child(std::move(merged),
+                                         b_slot->transition, b_slot->ptr);
         }
       }
     }
@@ -1167,9 +1828,18 @@ private:
 
   // Ensure a node is owned by this transient session.
   // Requires both matching edit tag AND unique ownership (refcount == 1)
-  // to allow in-place mutation. The refcount check defends against tag
-  // wraparound after 2^31 transient sessions: even if an old node
-  // happens to carry the same 31-bit tag, it will be cloned if shared.
+  // to allow in-place mutation.
+  //
+  // The refcount is the load-bearing half of that test, not the tag. Edit
+  // tags are 28 bits (bits 30:28 of packed_tag_ hold the node type), so they
+  // wrap after 2^28 sessions — reachable in well under an hour of sustained
+  // writes at one session per batch, so a stale node carrying this session's
+  // tag must be assumed to exist. It is still safe to mutate only what
+  // refcount == 1 admits: any node another holder can reach is either shared
+  // directly (refcount >= 2) or sits under a shared ancestor, and cloning
+  // that ancestor addrefs its children before this session descends into
+  // them. The tag is therefore a cheap filter that keeps clones rare, not
+  // the ownership proof.
   using Ops = PersistentRadixTree<V>;
 
   static auto ensure_mutable(const IntrusivePtr<Node<V>> &node,
@@ -1211,7 +1881,8 @@ private:
       for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
         old_suffix.push_back(prefix_span[i]);
       mutable_node->prefix = std::move(old_suffix);
-      split->insert_child(old_transition, std::move(mutable_node));
+      split = Node<V>::insert_child(std::move(split), old_transition,
+                                    std::move(mutable_node));
 
       auto remaining = key.subspan(cpl);
       if (remaining.empty()) {
@@ -1219,7 +1890,8 @@ private:
       } else {
         auto new_transition = remaining[0];
         auto chain = Ops::build_leaf_chain(remaining.subspan(1), std::move(val), tag);
-        split->insert_child(new_transition, std::move(chain));
+        split = Node<V>::insert_child(std::move(split), new_transition,
+                                      std::move(chain));
       }
       return {std::move(split), true};
     }
@@ -1240,10 +1912,11 @@ private:
       existing_child->ptr = std::move(new_child);
       return {std::move(mutable_node), inserted};
     }
+    // insert_child promotes mutable_node (leaf -> Node4 -> Node16 ->
+    // Node48 -> Node256) as needed.
     auto chain = Ops::build_leaf_chain(child_key, std::move(val), tag);
-    if (!mutable_node->has_children_flag())
-      mutable_node = promote_to_internal(mutable_node);
-    mutable_node->insert_child(transition, std::move(chain));
+    mutable_node = Node<V>::insert_child(std::move(mutable_node), transition,
+                                         std::move(chain));
     return {std::move(mutable_node), true};
   }
 
@@ -1277,7 +1950,8 @@ private:
       for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
         old_suffix.push_back(prefix_span[i]);
       mutable_node->prefix = std::move(old_suffix);
-      split->insert_child(old_transition, std::move(mutable_node));
+      split = Node<V>::insert_child(std::move(split), old_transition,
+                                    std::move(mutable_node));
 
       auto remaining = key.subspan(cpl);
       if (remaining.empty()) {
@@ -1285,7 +1959,8 @@ private:
       } else {
         auto new_transition = remaining[0];
         auto chain = Ops::build_leaf_chain(remaining.subspan(1), std::move(val), tag);
-        split->insert_child(new_transition, std::move(chain));
+        split = Node<V>::insert_child(std::move(split), new_transition,
+                                      std::move(chain));
       }
       return {std::move(split), std::nullopt, true};
     }
@@ -1314,10 +1989,11 @@ private:
       existing_child->ptr = std::move(new_child);
       return {std::move(mutable_node), std::move(displaced), inserted};
     }
+    // insert_child promotes mutable_node (leaf -> Node4 -> Node16 ->
+    // Node48 -> Node256) as needed.
     auto chain = Ops::build_leaf_chain(child_key, std::move(val), tag);
-    if (!mutable_node->has_children_flag())
-      mutable_node = promote_to_internal(mutable_node);
-    mutable_node->insert_child(transition, std::move(chain));
+    mutable_node = Node<V>::insert_child(std::move(mutable_node), transition,
+                                         std::move(chain));
     return {std::move(mutable_node), std::nullopt, true};
   }
 
@@ -1364,7 +2040,7 @@ private:
 
     auto mutable_node = ensure_mutable(node, tag);
     if (!new_child) {
-      mutable_node->remove_child(transition);
+      mutable_node = Node<V>::remove_child(std::move(mutable_node), transition);
       if (!mutable_node->has_value() && mutable_node->child_count() == 1) {
         return {merge_with_child_transient(std::move(mutable_node), tag), true};
       }
@@ -1433,8 +2109,9 @@ template <typename V>
 auto PersistentRadixTree<V>::transient() const -> TransientRadixTree<V> {
   // Relaxed ordering: only uniqueness is required, not inter-thread visibility
   // ordering. Each transient session gets a distinct tag via fetch_add.
-  // Truncate to 30 bits — tag 0 is reserved for "immutable" sentinel.
-  // Bit 31 = has_value, bit 30 = has_children, bits 29:0 = edit_tag.
+  // Truncate to the tag field — tag 0 is reserved for the "immutable"
+  // sentinel. packed_tag_ layout: bit 31 = has_value, bits 30:28 = node
+  // type, bits 27:0 = edit_tag.
   auto raw = detail::next_edit_tag.fetch_add(1, std::memory_order_relaxed);
   auto tag = static_cast<std::uint32_t>(raw & Node<V>::kTagMask);
   if (tag == 0) [[unlikely]]
@@ -1693,33 +2370,34 @@ private:
       auto target_byte = remaining[0];
       auto child_remaining = remaining.subspan(1);
 
-      bool descended = false;
-      for (std::size_t i = 0; i < cur->child_count(); ++i) {
-        auto cb = cur->child_at(i).transition;
-        if (cb < target_byte)
+      // Walk children in order with a cursor rather than calling child_at(i)
+      // per candidate: on a Node256 child_at(i) costs O(i), which would make
+      // this descent quadratic in the node's fanout (see Node::next_child).
+      typename Node<V>::ChildCursor cursor;
+      for (;;) {
+        auto ordinal = cursor.ordinal;
+        auto slot = cur->next_child(cursor);
+
+        if (!slot || slot->transition > target_byte) {
+          // Either every child sorts below the target (walk exhausted) or
+          // the first one at/after it is strictly greater, so all remaining
+          // children are > target. Either way `ordinal` is where advance()
+          // must resume: one past the last child for the exhausted case,
+          // the greater child itself otherwise.
+          stack_.push_back({cur, ordinal, klb});
+          return false;
+        }
+        if (slot->transition < target_byte)
           continue;
 
-        if (cb == target_byte) {
-          // Exact match — push parent frame, descend into child.
-          stack_.push_back({cur, i + 1, klb});
-          klb = current_key_.size();
-          current_key_.push_back(cb);
-          cur = cur->child_at(i).ptr;
-          remaining = child_remaining;
-          descended = true;
-          break;
-        }
-
-        // cb > target_byte — children from here onward are all > target.
-        // Push frame so advance() picks up children[i].
-        stack_.push_back({cur, i, klb});
-        return false;
-      }
-
-      if (!descended) {
-        // All children < target_byte. Push exhausted frame for backtracking.
-        stack_.push_back({cur, cur->child_count(), klb});
-        return false;
+        // Exact match — push parent frame positioned past this child, then
+        // descend into it.
+        stack_.push_back({cur, ordinal + 1, klb});
+        klb = current_key_.size();
+        current_key_.push_back(target_byte);
+        cur = slot->ptr;
+        remaining = child_remaining;
+        break;
       }
     }
     return false;
@@ -1996,27 +2674,23 @@ private:
       auto target_byte = remaining[0];
       auto child_remaining = remaining.subspan(1);
 
-      bool descended = false;
-      for (std::size_t i = 0; i < cur->child_count(); ++i) {
-        auto cb = cur->child_at(i).transition;
-        if (cb < target_byte)
+      // Cursor walk — same reasoning as RadixTreeIterator::seek.
+      typename Node<V>::ChildCursor cursor;
+      for (;;) {
+        auto ordinal = cursor.ordinal;
+        auto slot = cur->next_child(cursor);
+
+        if (!slot || slot->transition > target_byte) {
+          stack_.push_back({cur, ordinal});
+          return false;
+        }
+        if (slot->transition < target_byte)
           continue;
 
-        if (cb == target_byte) {
-          stack_.push_back({cur, i + 1});
-          cur = cur->child_at(i).ptr;
-          remaining = child_remaining;
-          descended = true;
-          break;
-        }
-
-        stack_.push_back({cur, i});
-        return false;
-      }
-
-      if (!descended) {
-        stack_.push_back({cur, cur->child_count()});
-        return false;
+        stack_.push_back({cur, ordinal + 1});
+        cur = slot->ptr;
+        remaining = child_remaining;
+        break;
       }
     }
     return false;
