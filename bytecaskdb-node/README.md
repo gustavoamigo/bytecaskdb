@@ -208,20 +208,24 @@ it says nothing about JS-facing call overhead.
 
 ### Comparing the native and WASM backends from JS
 
-`test/bench/backends.bench.ts` drives both backends through the identical
+`scripts/bench.mjs` drives both backends through the identical
 `ByteCaskFactory` interface — the one benchmark that actually measures the
 N-API vs. Embind call overhead as seen from JS, not just the underlying
-engine.
+engine. Uses [tinybench](https://github.com/tinylibs/tinybench) directly
+(Vitest wrapped this same library as `bench()` up through v4, but removed
+that in-file API entirely in v5 with no replacement).
 
 ```bash
-npm run bench                              # both backends, all operations
-npx vitest bench -t Get                    # filter to one operation
-BC_BENCH_DATASET_SIZE=100000 npm run bench # custom dataset size (default 20k)
+npm run bench                                 # both backends, all operations
+node scripts/bench.mjs --filter=Get           # filter to one operation
+BC_BENCH_DATASET_SIZE=100000 npm run bench    # custom dataset size (default 20k)
+BC_BENCH_TIME_MS=5000 npm run bench           # run each benchmark longer
+                                               # (tinybench default: 500ms)
 ```
 
 Each operation (`Put/NoSync`, `Put/Sync`, `Get`, `Del/Sync`, `Range50`,
 `MixedBatch/Sync`) reports both backends side by side plus a relative
-speedup, using [Vitest's built-in `bench()`](https://vitest.dev/guide/features.html#benchmarking).
+speedup.
 
 ## Smoke test
 
