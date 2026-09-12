@@ -43,15 +43,25 @@ auto to_bytes(std::string_view sv) -> std::span<const std::byte> {
 // silenced so the expected panic message does not look like a test failure.
 auto dies_by_panic(const std::function<void()> &fn) -> bool {
   const auto pid = ::fork();
-  REQUIRE(pid != -1);
   if (pid == 0) {
+    // Catch2 traps SIGABRT and finishes the run from its handler, writing its
+    // report on the way out. In a forked child that report lands in the same
+    // --out file the parent will write, leaving two XML documents in it. Take
+    // the handler back so abort() terminates the child immediately, and leave
+    // the child no other route into Catch2's reporting.
+    std::signal(SIGABRT, SIG_DFL);
     // A child forked from a multi-threaded parent can deadlock on a lock held
     // at fork time; fail the check instead of hanging CI.
     ::alarm(30);
     std::ignore = std::freopen("/dev/null", "w", stderr);
-    fn();
-    ::_exit(0);  // fn returned: no panic
+    try {
+      fn();
+    } catch (...) {
+      ::_exit(2);  // threw instead of panicking
+    }
+    ::_exit(0);  // returned: no panic
   }
+  REQUIRE(pid != -1);
   int status = 0;
   REQUIRE(::waitpid(pid, &status, 0) == pid);
   return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
