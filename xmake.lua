@@ -1,4 +1,5 @@
 add_rules("mode.debug", "mode.release", "mode.releasedbg")
+set_version("0.1.0")
 
 add_requires("crc32c")
 add_requires("jemalloc 5.3.0", {optional = true})
