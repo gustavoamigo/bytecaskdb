@@ -85,18 +85,22 @@ Cross-compiles ByteCaskDB to WebAssembly and runs under Node.js using NODEFS for
 ## Build
 
 ```bash
-cd bytecaskdb-node/wasm && bash build.sh
+cd bytecaskdb-node/wasm && bash build.sh   # first run only — builds WASM deps
+cd ../..
+xmake build wasm_embind
 ```
 
+`build.sh` cross-compiles **crc32c**, **Google Benchmark**, and **Catch2** to
+WASM (cached after first run — a no-op on subsequent runs). It does not build
+ByteCaskDB itself; the actual WASM targets are xmake targets, built from the
+repository root:
 
-The build script:
-
-1. Cross-compiles **crc32c** and **Google Benchmark** to WASM (cached after first run)
-2. Precompiles all C++23 modules in dependency order
-3. Compiles and links three targets:
-   - `build/bytecask_node.js` — smoke test
-   - `build/engine_bench_nodefs.js` — engine benchmarks
-   - `build/bytecask.mjs` — Embind JS module
+| Target | Output | Description |
+|--------|--------|--------------|
+| `wasm_embind` | `build/bytecask.mjs` | Embind JS module |
+| `wasm_smoke_test` | `build/wasm_smoke_test.js` | smoke test |
+| `wasm_engine_bench` | `build/engine_bench_nodefs.js` | engine benchmarks |
+| `wasm_tests` | `build/bytecask_tests.js` | Catch2 test suite |
 
 ## JavaScript API
 
@@ -104,8 +108,13 @@ The Embind module exposes ByteCaskDB as a JS-callable API. See [`wasm/API.md`](w
 
 ```js
 import createByteCask from './build/bytecask.mjs';
+import { applyDisposeWiring } from '../dist/dispose.js';
 
 const Module = await createByteCask();
+// Wires Symbol.dispose/Symbol.iterator onto the raw Embind classes below —
+// createWasmBackend() does this for you; needed here only for direct use of
+// the raw module.
+applyDisposeWiring(Module);
 const { ByteCaskDB, WritePlan } = Module;
 
 // Open a database (creates the directory if needed)
@@ -193,10 +202,35 @@ BC_DATASET_SIZE=100000 node wasm/build/engine_bench_nodefs.js
 node wasm/build/engine_bench_nodefs.js --benchmark_filter="ByteCaskDB/Get"
 ```
 
+`engine_bench_nodefs.js` benchmarks the core C++ engine cross-compiled to
+WASM and run under NODEFS — it never calls into the Embind binding layer, so
+it says nothing about JS-facing call overhead.
+
+### Comparing the native and WASM backends from JS
+
+`scripts/bench.mjs` drives both backends through the identical
+`ByteCaskFactory` interface — the one benchmark that actually measures the
+N-API vs. Embind call overhead as seen from JS, not just the underlying
+engine. Uses [tinybench](https://github.com/tinylibs/tinybench) directly
+(Vitest wrapped this same library as `bench()` up through v4, but removed
+that in-file API entirely in v5 with no replacement).
+
+```bash
+npm run bench                                 # both backends, all operations
+node scripts/bench.mjs --filter=Get           # filter to one operation
+BC_BENCH_DATASET_SIZE=100000 npm run bench    # custom dataset size (default 20k)
+BC_BENCH_TIME_MS=5000 npm run bench           # run each benchmark longer
+                                               # (tinybench default: 500ms)
+```
+
+Each operation (`Put/NoSync`, `Put/Sync`, `Get`, `Del/Sync`, `Range50`,
+`MixedBatch/Sync`) reports both backends side by side plus a relative
+speedup.
+
 ## Smoke test
 
 ```bash
-node wasm/build/bytecask_node.js
+node wasm/build/wasm_smoke_test.js
 ```
 
 ## Benchmark coverage differences (native vs WASM)
@@ -215,7 +249,7 @@ this table describes those, not the Node.js `createNativeBackend`/`createWasmBac
 |------|-------------|
 | `native/bytecask_napi.cpp` | N-API binding layer — exposes DB, Snapshot, WritePlan, iterators, FileManifest to JS |
 | `native/smoke_test.cjs` | Minimal Node.js smoke test for the compiled native addon |
-| `wasm/build.sh` | Build script — compiles dependencies, modules, and links all targets |
+| `wasm/build.sh` | Cross-compiles WASM dependencies (crc32c, Google Benchmark, Catch2); the WASM targets themselves are built by xmake — see the WASM Backend "Build" section above |
 | `wasm/bytecask_embind.cpp` | Embind binding layer — exposes DB, Snapshot, WritePlan, iterators to JS |
 | `wasm/test_node.cpp` | Minimal C++ smoke test: write, read, recovery |
 | `wasm/pre.js` | Emscripten pre-run hook: env propagation, memory-usage reporting |
@@ -230,5 +264,7 @@ this table describes those, not the Node.js `createNativeBackend`/`createWasmBac
 ## Clean rebuild
 
 ```bash
-rm -rf wasm/build && cd wasm && bash build.sh
+rm -rf wasm/build && cd wasm && bash build.sh   # rebuilds WASM deps from scratch
+cd ../..
+xmake build wasm_embind
 ```

@@ -6,10 +6,18 @@ API for the ByteCaskDB WebAssembly module. All methods accept an optional option
 
 ```js
 import createByteCask from './build/bytecask.mjs';
+import { applyDisposeWiring } from '../dist/dispose.js';
 
 const Module = await createByteCask();
+applyDisposeWiring(Module); // wires Symbol.dispose / Symbol.iterator (see below)
 const { ByteCaskDB, WritePlan } = Module;
 ```
+
+`applyDisposeWiring` is what gives the classes below `Symbol.dispose` and
+`Symbol.iterator` — the raw Embind classes don't have them until it runs.
+`createWasmBackend()` (the package's higher-level entry point) calls it for
+you; call it yourself only when working with this raw module directly, as
+the rest of this document does.
 
 ## ByteCaskDB
 
