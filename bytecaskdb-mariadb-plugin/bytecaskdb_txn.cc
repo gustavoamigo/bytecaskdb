@@ -12,10 +12,6 @@
 #include "mysql/plugin.h"
 #include "sql_priv.h"
 #include "mysqld_error.h"
-#ifndef PLUGIN_TESTING
-#undef WITH_WSREP
-#include <mysql/server/private/sql_class.h>  // ER_THD_OR_DEFAULT
-#endif
 
 #include <algorithm>
 #include <cassert>
@@ -256,7 +252,7 @@ MariaDBTxn::reverse_buffer_start(const std::vector<uint8_t> &hi) const {
 // Commit / rollback
 // ---------------------------------------------------------------------------
 
-int MariaDBTxn::commit(THD *thd, bool all) {
+int MariaDBTxn::commit(THD * /*thd*/, bool all) {
   if (bulk_copy_mode_ && (all || !registered_all_)) {
     // Flush any tail rows the copy loop left buffered, then fall through.
     // end_bulk_insert normally does this already; this covers paths that
@@ -310,7 +306,7 @@ int MariaDBTxn::commit(THD *thd, bool all) {
       if (deferred) {
         // Snapshot-less plan: the only precondition is ensure_absent, so a
         // conflict is a duplicate primary key.
-        report_deferred_dup_key(thd);
+        report_deferred_dup_key();
         revert_row_count_deltas();
         reset();
         return HA_ERR_FOUND_DUPP_KEY;
@@ -380,7 +376,7 @@ void MariaDBTxn::restore_row_count_deltas(const RowCountDeltas &saved) {
   row_count_deltas_ = saved;
 }
 
-void MariaDBTxn::report_deferred_dup_key(THD *thd) {
+void MariaDBTxn::report_deferred_dup_key() {
   // ops_ is still intact here; the first guarded key that exists in the
   // live DB is the one the ensure_absent guard rejected.
   const std::vector<uint8_t> *dup = nullptr;
@@ -394,15 +390,17 @@ void MariaDBTxn::report_deferred_dup_key(THD *thd) {
     }
     if (present) { dup = &op.key; break; }
   }
-  if (deferred_reporter_ && dup) {
-    deferred_reporter_(*dup);
+  if (deferred_reporter_ && dup && deferred_reporter_(*dup)) {
     return;
   }
-  // No handler (or no identifiable key): same error code and format the
-  // server uses, without a rendered value. ER_DUP_ENTRY's own format takes
-  // a key *index* as its second argument; the server pairs the ER_DUP_ENTRY
-  // code with the WITH_KEY_NAME format for named keys, and so do we.
-  my_printf_error(ER_DUP_ENTRY, ER_THD_OR_DEFAULT(thd, ER_DUP_ENTRY_WITH_KEY_NAME),
+  // No handler (or no identifiable key): same error code the server uses,
+  // with the WITH_KEY_NAME wording and no rendered value. The format is a
+  // literal on purpose: the server's message table is reached through THD
+  // members, and this plugin's view of THD (sql_class.h without WITH_WSREP)
+  // does not match the server's layout, so only exported functions may take
+  // a THD. ER_DUP_ENTRY's own format takes a key *index*, so it cannot be
+  // paired with a key name.
+  my_printf_error(ER_DUP_ENTRY, "Duplicate entry '%-.192s' for key '%-.192s'",
                   MYF(0), "", "PRIMARY");
 }
 

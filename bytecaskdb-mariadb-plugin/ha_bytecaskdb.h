@@ -106,7 +106,8 @@ public:
   // standard message, and records the PK as the duplicate key for
   // get_dup_key(). Called by MariaDBTxn when a deferred INSERT's
   // commit-time ensure_absent guard fails; see begin_deferred_insert.
-  void report_dup_pk(const std::vector<uint8_t> &pk);
+  // Returns false without reporting if `pk` is not this table's key.
+  bool report_dup_pk(const std::vector<uint8_t> &pk);
 
   // -------------------------------------------------------------------
   // Full table scan

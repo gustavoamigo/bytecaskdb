@@ -490,15 +490,18 @@ bool ha_bytecaskdb::has_unique_secondary_index() const {
 }
 
 // True when the current statement is a plain autocommit INSERT (no BEGIN, no
-// autocommit=0, not INSERT IGNORE / REPLACE / ON DUPLICATE KEY UPDATE). Such
-// a statement can defer its PK duplicate check to commit via an ensure_absent
-// guard instead of an eager per-row DB probe + snapshot.
+// autocommit=0, not INSERT IGNORE / REPLACE / ON DUPLICATE KEY UPDATE) into a
+// table without triggers. Such a statement can defer its PK duplicate check
+// to commit via an ensure_absent guard instead of an eager per-row DB probe +
+// snapshot. A trigger may read or write other tables in the same statement,
+// and those accesses need the snapshot the deferred path skips.
 bool ha_bytecaskdb::stmt_allows_deferred_dupcheck() const {
 #ifdef PLUGIN_TESTING
   return false;
 #else
   return thd_sql_command(ha_thd()) == SQLCOM_INSERT &&
-         !thd_test_options(ha_thd(), OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
+         !thd_test_options(ha_thd(), OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN) &&
+         table->triggers == nullptr;
 #endif
 }
 
@@ -540,9 +543,16 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   // INSERT IGNORE / REPLACE / ON DUPLICATE KEY UPDATE need the per-row verdict
   // (dupcheck_eager_), and a UNIQUE secondary index needs the eager snapshot
   // path, so both fall through to the classic check.
+  // Deferred mode may only begin on a transaction with no snapshot and no
+  // buffered writes: the first row of the statement. Once it is on, every
+  // further PK insert in the statement stays on it and carries its own
+  // commit-time guard, since an eager probe would read the live DB with no
+  // write-write protection behind it.
   const bool defer_dup =
-      !no_pk && !dupcheck_eager_ && !has_unique_secondary_index() &&
-      stmt_allows_deferred_dupcheck();
+      !no_pk && (txn->in_deferred_insert() ||
+                 (!txn->has_state() && !dupcheck_eager_ &&
+                  !has_unique_secondary_index() &&
+                  stmt_allows_deferred_dupcheck()));
 
   // PK-less rows can't collide on the primary key (synthetic rowids are
   // monotonic), so skip the dup check there. For PK tables, eager dup check
@@ -556,9 +566,9 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
       return HA_ERR_FOUND_DUPP_KEY;
     }
   }
-  if (defer_dup) {
+  if (defer_dup && !txn->in_deferred_insert()) {
     txn->begin_deferred_insert(
-        this, [this](const std::vector<uint8_t> &pk) { report_dup_pk(pk); });
+        this, [this](const std::vector<uint8_t> &pk) { return report_dup_pk(pk); });
   }
 
   // Check unique secondary index constraints.
@@ -719,7 +729,10 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
 // '...' for key 'PRIMARY'").
 // ---------------------------------------------------------------------------
 
-void ha_bytecaskdb::report_dup_pk(const std::vector<uint8_t> &pk) {
+bool ha_bytecaskdb::report_dup_pk(const std::vector<uint8_t> &pk) {
+  if (!key_belongs_to_table(pk.data(), pk.size(), table_id_)) {
+    return false;  // another table's key: let the caller report generically
+  }
   const uint pk_idx = table->s->primary_key;
   errkey = saved_errkey_ = pk_idx;
 #ifndef PLUGIN_TESTING
@@ -728,6 +741,7 @@ void ha_bytecaskdb::report_dup_pk(const std::vector<uint8_t> &pk) {
 #else
   my_error(ER_DUP_ENTRY, MYF(0), "", "PRIMARY");
 #endif
+  return true;
 }
 
 // ---------------------------------------------------------------------------

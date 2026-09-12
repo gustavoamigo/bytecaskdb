@@ -198,7 +198,13 @@ public:
   // the rest of the statement: commit runs before the statement's tables
   // are unlocked, and the handler deregisters itself on unlock/close in
   // case that order is ever different. Cleared by reset().
-  using DupKeyReporter = std::function<void(const std::vector<uint8_t> &pk)>;
+  // Returns true if it reported the error; false to fall back to the
+  // generic report (the key belongs to a table the reporter does not own).
+  using DupKeyReporter = std::function<bool(const std::vector<uint8_t> &pk)>;
+  bool in_deferred_insert() const { return deferred_insert_; }
+  // True once this statement/transaction holds a snapshot or buffered
+  // writes. Deferred-INSERT mode may only begin before either exists.
+  bool has_state() const { return snap_.has_value() || !ops_.empty(); }
   void begin_deferred_insert(const ha_bytecaskdb *handler,
                              DupKeyReporter reporter) {
     deferred_insert_ = true;
@@ -364,7 +370,7 @@ private:
   // finds the first guarded key that now exists, and raises ER_DUP_ENTRY
   // through the registered handler (with the key value) or, without one,
   // with an empty value.
-  void report_deferred_dup_key(THD *thd);
+  void report_deferred_dup_key();
 
   // Bulk-copy mode state (see begin_bulk_copy). Isolated from ops_/lookup_.
   bool bulk_copy_mode_{false};
