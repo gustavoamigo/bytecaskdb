@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -34,6 +35,8 @@ struct THD;
 struct handlerton;
 
 namespace bytecaskdb {
+
+class ha_bytecaskdb;
 
 class MariaDBTxn {
 public:
@@ -57,8 +60,10 @@ public:
   //
   // The snapshot iterator is one of bytecask::EntryIterator (forward) or
   // bytecask::ReverseEntryIterator (reverse). Stored as optionals; at most
-  // one is engaged. The buffer side is always walked forward (matching the
-  // pre-migration C-API behavior).
+  // one is engaged. The buffer side walks in the same direction as the
+  // snapshot side, and on each step the smaller (forward) or larger
+  // (reverse) key is emitted; on a tie the buffer wins and a tombstone
+  // suppresses the snapshot key.
   // -------------------------------------------------------------------
 
   class MergeIterator {
@@ -77,9 +82,11 @@ public:
                   std::vector<uint8_t> hi,
                   uint32_t table_id, uint16_t index_id);
 
-    // Reverse construction (full table).
+    // Reverse construction (full table). buf_it is the largest buffered key
+    // <= hi, or buf_end when there is none.
     MergeIterator(std::optional<bytecask::ReverseEntryIterator> snap_it,
                   LookupMap::const_iterator buf_it,
+                  LookupMap::const_iterator buf_begin,
                   LookupMap::const_iterator buf_end,
                   std::vector<uint8_t> lo,
                   uint32_t table_id);
@@ -87,6 +94,7 @@ public:
     // Reverse construction (secondary index — key-only snapshot).
     MergeIterator(std::optional<bytecask::ReverseKeyIterator> snap_it,
                   LookupMap::const_iterator buf_it,
+                  LookupMap::const_iterator buf_begin,
                   LookupMap::const_iterator buf_end,
                   std::vector<uint8_t> lo,
                   uint32_t table_id, uint16_t index_id);
@@ -120,6 +128,12 @@ public:
     void load_snap_current();
     bool snap_at_end() const;
     void snap_step();
+    void buf_step();
+    // True when the buffer cursor holds a candidate inside this scan's
+    // table/index namespace and, for forward scans, below the hi bound.
+    bool buf_candidate_valid() const;
+    void emit_buf();
+    void emit_snap();
 
     // At most one of these is engaged.
     std::optional<bytecask::EntryIterator>        snap_fwd_;
@@ -128,7 +142,11 @@ public:
     std::optional<bytecask::ReverseKeyIterator>   snap_key_rev_;
     bool reverse_{false};
 
+    // Buffer cursor. Forward: buf_it_ walks [buf_it_, buf_end_). Reverse:
+    // buf_it_ is the current candidate and steps toward buf_begin_;
+    // buf_end_ marks exhaustion in both directions.
     LookupMap::const_iterator buf_it_;
+    LookupMap::const_iterator buf_begin_;
     LookupMap::const_iterator buf_end_;
     std::vector<uint8_t> bound_;            // forward: hi (exclusive); reverse: lo (informational only)
     uint32_t table_id_;
@@ -174,9 +192,31 @@ public:
   // Enter deferred-dup-check mode for a plain autocommit INSERT: no snapshot
   // is acquired, and commit() builds a snapshot-less WritePlan whose
   // ensure_absent guards (see Op::guard_absent) carry the PK dup check.
-  // A commit conflict on such a plan is reported as HA_ERR_FOUND_DUPP_KEY.
-  // Cleared by reset() at commit/rollback.
-  void begin_deferred_insert() { deferred_insert_ = true; }
+  // A commit conflict on such a plan is reported as HA_ERR_FOUND_DUPP_KEY,
+  // with the duplicate's key value rendered by `handler`, which owns the
+  // TABLE the server's formatter needs. The handler stays registered for
+  // the rest of the statement: commit runs before the statement's tables
+  // are unlocked, and the handler deregisters itself on unlock/close in
+  // case that order is ever different. Cleared by reset().
+  // Returns true if it reported the error; false to fall back to the
+  // generic report (the key belongs to a table the reporter does not own).
+  using DupKeyReporter = std::function<bool(const std::vector<uint8_t> &pk)>;
+  bool in_deferred_insert() const { return deferred_insert_; }
+  // True once this statement/transaction holds a snapshot or buffered
+  // writes. Deferred-INSERT mode may only begin before either exists.
+  bool has_state() const { return snap_.has_value() || !ops_.empty(); }
+  void begin_deferred_insert(const ha_bytecaskdb *handler,
+                             DupKeyReporter reporter) {
+    deferred_insert_ = true;
+    deferred_handler_ = handler;
+    deferred_reporter_ = std::move(reporter);
+  }
+  void forget_deferred_handler(const ha_bytecaskdb *handler) {
+    if (deferred_handler_ == handler) {
+      deferred_handler_ = nullptr;
+      deferred_reporter_ = nullptr;
+    }
+  }
 
   // In-memory presence probe against the write buffer only (no snapshot, no
   // DB access). Used by the deferred INSERT path to catch duplicates within
@@ -278,9 +318,25 @@ public:
   bool bulk_unique_prefix_exists(const uint8_t *prefix, std::size_t plen);
 
 private:
+  void ensure_snapshot();
+  LookupMap::const_iterator
+  reverse_buffer_start(const std::vector<uint8_t> &hi) const;
   void reset();
   void revert_row_count_deltas();
   void bulk_reset();
+
+  struct RowCountDelta {
+    int64_t delta{0};
+    std::atomic<int64_t> *counter{nullptr};
+  };
+  using RowCountDeltas = std::map<uint32_t, RowCountDelta>;
+
+  // Rewinds the write buffer to its first `mark` ops and rebuilds the RYOW
+  // overlay from what remains. Shared by statement rollback and savepoints.
+  void truncate_ops(std::size_t mark);
+  // Undoes the row-count changes made since `saved` was captured and makes
+  // `saved` the current delta set. Shared by statement rollback and savepoints.
+  void restore_row_count_deltas(const RowCountDeltas &saved);
 
   bytecask::DB *db_;
   std::optional<bytecask::Snapshot> snap_;
@@ -291,20 +347,36 @@ private:
   // RYOW overlay — fast lookups by key.  nullopt = tombstone.
   LookupMap lookup_;
 
-  struct RowCountDelta {
-    int64_t delta{0};
-    std::atomic<int64_t> *counter{nullptr};
-  };
-
   // Per-table row count deltas accumulated during this transaction.
   // Reverted on rollback or commit failure.
-  std::map<uint32_t, RowCountDelta> row_count_deltas_;
+  RowCountDeltas row_count_deltas_;
+
+  // Where the current statement began, captured when the statement is
+  // registered in begin_if_needed. A statement-level rollback inside a
+  // multi-statement transaction rewinds to here and leaves earlier
+  // statements' work in the buffer.
+  std::size_t stmt_ops_mark_{0};
+  RowCountDeltas stmt_row_count_deltas_;
+
+  struct Savepoint {
+    std::size_t ops_mark;
+    RowCountDeltas row_count_deltas;
+  };
+  std::vector<Savepoint> savepoints_;
 
   bool registered_stmt_{false};
   bool registered_all_{false};
 
   // Set by begin_deferred_insert(); see that method. Reset by reset().
   bool deferred_insert_{false};
+  const ha_bytecaskdb *deferred_handler_{nullptr};  // identity only
+  DupKeyReporter deferred_reporter_;
+
+  // Reports a deferred-INSERT commit conflict as a duplicate primary key:
+  // finds the first guarded key that now exists, and raises ER_DUP_ENTRY
+  // through the registered handler (with the key value) or, without one,
+  // with an empty value.
+  void report_deferred_dup_key();
 
   // Bulk-copy mode state (see begin_bulk_copy). Isolated from ops_/lookup_.
   bool bulk_copy_mode_{false};

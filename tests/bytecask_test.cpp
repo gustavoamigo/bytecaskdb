@@ -2630,6 +2630,53 @@ TEST_CASE("DB riter_from with nonexistent key starts at predecessor",
   CHECK(keys[1] == "a");
 }
 
+TEST_CASE("DB riter_from with a key that is a strict prefix of an existing "
+          "key starts at the predecessor",
+          "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  // "ab" is a strict prefix of "abc" and has no entry of its own; the
+  // reverse scan from "ab" must begin at "aa", never at "abc" (> "ab").
+  db.put({}, to_bytes("aa"), to_bytes("1"));
+  db.put({}, to_bytes("abc"), to_bytes("2"));
+  db.put({}, to_bytes("abd"), to_bytes("3"));
+
+  SECTION("entry iterator") {
+    std::vector<std::string> keys;
+    for (auto &entry : db.riter_from({}, to_bytes("ab"))) {
+      keys.push_back(to_string(entry.key));
+    }
+    REQUIRE(keys == std::vector<std::string>{"aa"});
+  }
+
+  SECTION("key iterator agrees") {
+    std::vector<std::string> keys;
+    for (auto &k : db.rkeys_from({}, to_bytes("ab"))) {
+      keys.push_back(to_string(k));
+    }
+    REQUIRE(keys == std::vector<std::string>{"aa"});
+  }
+
+  SECTION("bound that diverges below a node prefix") {
+    // "ab\x00" < "abc": lower bound is "abc", predecessor is "aa".
+    std::vector<std::string> keys;
+    for (auto &entry : db.riter_from({}, to_bytes(std::string_view{"ab\0", 3}))) {
+      keys.push_back(to_string(entry.key));
+    }
+    REQUIRE(keys == std::vector<std::string>{"aa"});
+  }
+
+  SECTION("exact key present still starts inclusively") {
+    db.put({}, to_bytes("ab"), to_bytes("4"));
+    std::vector<std::string> keys;
+    for (auto &entry : db.riter_from({}, to_bytes("ab"))) {
+      keys.push_back(to_string(entry.key));
+    }
+    REQUIRE(keys == std::vector<std::string>{"ab", "aa"});
+  }
+}
+
 TEST_CASE("DB rkeys_from returns all keys in descending order",
           "[bytecask]") {
   TempDir td;

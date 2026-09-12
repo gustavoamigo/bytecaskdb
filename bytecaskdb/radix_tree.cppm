@@ -2580,10 +2580,10 @@ private:
     stack_.reserve(16);
     if (!root)
       return;
-    auto at_target = seek(root, target);
+    auto pos = seek(root, target);
     if (stack_.empty())
       return;
-    if (at_target && stack_.back().node->has_value())
+    if (pos.at_node && stack_.back().node->has_value())
       return;
     advance();
   }
@@ -2641,8 +2641,19 @@ private:
     }
   }
 
+  // Where seek() left the cursor. `at_node`: the top frame's node is the
+  // first node in key order whose key is >= target (child_idx 0, so the
+  // node itself is visited before its children). `exact`: that node's key
+  // equals target byte for byte. `exact` implies `at_node`; `at_node`
+  // without `exact` means the node's key is strictly greater than target
+  // (target ended inside the node's prefix, or diverged below it).
+  struct SeekPos {
+    bool at_node{false};
+    bool exact{false};
+  };
+
   auto seek(const IntrusivePtr<Node<V>> &root,
-            std::span<const std::byte> target) -> bool {
+            std::span<const std::byte> target) -> SeekPos {
     auto remaining = target;
     auto cur = root;
 
@@ -2654,21 +2665,21 @@ private:
       if (cpl < prefix_span.size() && cpl < remaining.size()) {
         if (prefix_span[cpl] > remaining[cpl]) {
           stack_.push_back({cur, 0});
-          return true;
+          return {.at_node = true, .exact = false};
         }
-        return false;
+        return {};
       }
 
       if (cpl < prefix_span.size()) {
         stack_.push_back({cur, 0});
-        return true;
+        return {.at_node = true, .exact = false};
       }
 
       remaining = remaining.subspan(cpl);
 
       if (remaining.empty()) {
         stack_.push_back({cur, 0});
-        return true;
+        return {.at_node = true, .exact = true};
       }
 
       auto target_byte = remaining[0];
@@ -2682,7 +2693,7 @@ private:
 
         if (!slot || slot->transition > target_byte) {
           stack_.push_back({cur, ordinal});
-          return false;
+          return {};
         }
         if (slot->transition < target_byte)
           continue;
@@ -2693,7 +2704,7 @@ private:
         break;
       }
     }
-    return false;
+    return {};
   }
 
   friend class PersistentRadixTree<V>;
@@ -2734,24 +2745,25 @@ public:
       past_rend_ = true;
       return;
     }
-    // Seek to the first key >= upper using a forward iterator.
+    // Position a forward cursor at lower_bound(upper): the first value node
+    // with key >= upper. If that key is exactly upper, start there
+    // (inclusive). Otherwise the last key <= upper is one retreat before
+    // the lower bound. Only a byte-exact match may start inclusively — a
+    // node that seek() lands on because upper ended inside its prefix has
+    // a key strictly greater than upper and must not be yielded.
     ValueIterator<V> fwd;
     fwd.stack_.reserve(16);
-    auto at_target = fwd.seek(root_, upper);
-    if (fwd.stack_.empty()) {
-      // All keys < upper. Position at the rightmost.
-      cur_.push_node(root_);
-      cur_.stack_.back().child_idx = cur_.stack_.back().node->child_count();
-      cur_.descend_rightmost();
-    } else if (at_target && fwd.stack_.back().node->has_value()) {
-      // Exact match — start here (inclusive).
+    auto pos = fwd.seek(root_, upper);
+    const bool on_value = !fwd.stack_.empty() && pos.at_node &&
+                          fwd.stack_.back().node->has_value();
+    if (on_value && pos.exact) {
       cur_ = std::move(fwd);
     } else {
-      // fwd is at or past the target — advance to the next value node,
-      // then retreat to find the last value node <= upper.
-      fwd.advance();
+      if (!fwd.stack_.empty() && !on_value) {
+        fwd.advance();
+      }
       if (fwd.stack_.empty()) {
-        // No key >= upper with a value; position at rightmost.
+        // Every key is < upper: start at the rightmost value node.
         cur_.push_node(root_);
         cur_.stack_.back().child_idx = cur_.stack_.back().node->child_count();
         cur_.descend_rightmost();

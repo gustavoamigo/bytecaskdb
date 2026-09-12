@@ -109,3 +109,44 @@
       expected: [['42']]
   teardown:
     - DROP DATABASE IF EXISTS txn7
+
+- name: Failed statement inside transaction keeps earlier statements (BC-249)
+  setup:
+    - DROP DATABASE IF EXISTS txn_stmt_rb
+    - CREATE DATABASE txn_stmt_rb
+    - CREATE TABLE txn_stmt_rb.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO txn_stmt_rb.t VALUES (99, 0)
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO txn_stmt_rb.t VALUES (1, 10)
+    - sql: INSERT INTO txn_stmt_rb.t VALUES (2, 20)
+    - sql: INSERT INTO txn_stmt_rb.t VALUES (3, 30), (99, 1)
+      error: 1062
+    - sql: COMMIT
+    - sql: SELECT id, v FROM txn_stmt_rb.t ORDER BY id
+      expected: [['1','10'],['2','20'],['99','0']]
+    - sql: SELECT COUNT(*) FROM txn_stmt_rb.t
+      expected: [['3']]
+  teardown:
+    - DROP DATABASE IF EXISTS txn_stmt_rb
+
+- name: INSERT with a trigger writing another table keeps duplicate detection and audit rows consistent
+  setup:
+    - DROP DATABASE IF EXISTS trg1
+    - CREATE DATABASE trg1
+    - CREATE TABLE trg1.t (id INT PRIMARY KEY, v INT) ENGINE=bytecaskdb
+    - CREATE TABLE trg1.audit (id INT PRIMARY KEY AUTO_INCREMENT, t_id INT) ENGINE=bytecaskdb
+    - CREATE TRIGGER trg1.t_ai AFTER INSERT ON trg1.t FOR EACH ROW INSERT INTO trg1.audit (t_id) VALUES (NEW.id)
+    - INSERT INTO trg1.t VALUES (1, 10)
+  steps:
+    - sql: INSERT INTO trg1.t VALUES (2, 20)
+    - sql: INSERT INTO trg1.t VALUES (1, 11)
+      error: 1062
+    - sql: INSERT INTO trg1.t VALUES (3, 30), (2, 22)
+      error: 1062
+    - sql: SELECT id, v FROM trg1.t ORDER BY id
+      expected: [['1','10'],['2','20']]
+    - sql: SELECT t_id FROM trg1.audit ORDER BY id
+      expected: [['1'],['2']]
+  teardown:
+    - DROP DATABASE IF EXISTS trg1

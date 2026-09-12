@@ -44,7 +44,10 @@ bool             catalog_rename_table_meta(bytecask::DB *db,
                                            const char *from,
                                            const char *to);
 std::optional<uint32_t> catalog_lookup_table_id(const char *name);
-const TableMeta *catalog_lookup_meta(uint32_t table_id);
+// Copies the table's metadata out under the catalog lock. Returns false if
+// the table is unknown. Handlers cache what they need at open(); DDL paths
+// take a fresh copy. No reference into the catalog cache is ever handed out.
+bool             catalog_copy_meta(uint32_t table_id, TableMeta &out);
 
 uint64_t         catalog_alloc_rowid(uint32_t table_id);
 uint64_t         catalog_alloc_rowid_range(uint32_t table_id, uint64_t count);
@@ -101,6 +104,13 @@ public:
   // Bulk copy (ALTER TABLE ... ALGORITHM=COPY) — flush the pending batch
   // with a durability barrier before the ALTER proceeds to the rename.
   int end_bulk_insert() override;
+
+  // Raises ER_DUP_ENTRY for the encoded primary key `pk` with the server's
+  // standard message, and records the PK as the duplicate key for
+  // get_dup_key(). Called by MariaDBTxn when a deferred INSERT's
+  // commit-time ensure_absent guard fails; see begin_deferred_insert.
+  // Returns false without reporting if `pk` is not this table's key.
+  bool report_dup_pk(const std::vector<uint8_t> &pk);
 
   // -------------------------------------------------------------------
   // Full table scan
@@ -214,6 +224,11 @@ private:
   // Saves `current_row_key_` from a slice the iterator gave us.
   void save_current_row_key(const uint8_t *data, std::size_t len);
   int index_read_current(uchar *buf);
+  // Encodes the optimizer's (partial) key for index `idx` into
+  // search_key_buf_, padding unsupplied parts low or high. Returns the
+  // length of namespace + supplied prefix. See index_read_map.
+  std::size_t build_search_key(uint idx, const uchar *key, uint prefix_len,
+                               bool pad_high);
 
   // True when this handler is the destination of an ALTER TABLE copy into a
   // hidden #sql-xxx table — the case where write_row switches to batched

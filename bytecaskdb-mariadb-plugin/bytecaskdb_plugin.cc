@@ -474,13 +474,14 @@ std::optional<uint32_t> catalog_lookup_table_id(const char *name) {
   return std::nullopt;
 }
 
-const TableMeta *catalog_lookup_meta(uint32_t table_id) {
+bool catalog_copy_meta(uint32_t table_id, TableMeta &out) {
   std::lock_guard<std::mutex> lk{s_catalog_mu};
   auto it = s_id_to_meta.find(table_id);
-  if (it != s_id_to_meta.end()) {
-    return &it->second;
+  if (it == s_id_to_meta.end()) {
+    return false;
   }
-  return nullptr;
+  out = it->second;
+  return true;
 }
 
 } // namespace bytecaskdb
@@ -737,7 +738,9 @@ static int bytecaskdb_init(void *p) {
   hton->close_connection         = bytecaskdb_close_connection;
   hton->start_consistent_snapshot = bytecaskdb_start_consistent_snapshot;
   hton->show_status              = bytecaskdb_show_status;
-  hton->flags                    = HTON_SUPPORTS_FOREIGN_KEYS;
+  // No HTON_SUPPORTS_FOREIGN_KEYS: FOREIGN KEY clauses are recorded in the
+  // catalog for DDL round-trips but nothing is enforced (see README).
+  hton->flags                    = 0;
   hton->savepoint_offset         = sizeof(uint32_t);
   hton->savepoint_set            = bytecaskdb_savepoint_set;
   hton->savepoint_rollback       = bytecaskdb_savepoint_rollback;
