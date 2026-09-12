@@ -15,6 +15,8 @@ import time
 import pytest
 import pymysql
 
+from conftest import root_user_args
+
 
 # ---------------------------------------------------------------------------
 # Helpers (session-scoped server tests)
@@ -96,7 +98,7 @@ class _StandaloneMariaDB:
         os.makedirs(os.path.join(self.test_dir, "tmp"), exist_ok=True)
         subprocess.run(
             ["mariadb-install-db", f"--datadir={self.data_dir}",
-             "--auth-root-authentication-method=normal"],
+             "--auth-root-authentication-method=normal", *root_user_args()],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         _symlink_provider_plugins(self.plugin_dir)
@@ -113,6 +115,7 @@ class _StandaloneMariaDB:
             f"--plugin-dir={self.plugin_dir}",
             f"--plugin-load-add=bytecaskdb=ha_bytecaskdb.so",
             f"--log-error={self.log_file}",
+            *root_user_args(),
         ]
         if self.skip_grant_tables:
             cmd.append("--skip-grant-tables")
