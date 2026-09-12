@@ -2,8 +2,7 @@
 
 > This document describes the correctness validation framework for
 > ByteCaskDB's write path. It should be read alongside
-> [`CONTRACT.md`](../CONTRACT.md) and the
-> [project plan](bytecask_project_plan.md).
+> [`CONTRACT.md`](../CONTRACT.md).
 
 ---
 

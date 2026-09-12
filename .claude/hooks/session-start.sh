@@ -15,6 +15,13 @@ log() { printf '[session-start] %s\n' "$*" >&2; }
 strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 project_dir="${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
+# Web containers start with git identity set to the harness default rather
+# than the repo owner. Local (not --global): scoped to this repo's clone only,
+# so it doesn't override identity for any other repo checked out in the same
+# container.
+git -C "$project_dir" config user.name "gustavoamigo"
+git -C "$project_dir" config user.email "gustavo.amigo@gmail.com"
+
 # xmake refuses to run as root without this, and these containers run as root.
 export XMAKE_ROOT=y
 [ -n "${CLAUDE_ENV_FILE:-}" ] && echo 'export XMAKE_ROOT=y' >> "$CLAUDE_ENV_FILE"
