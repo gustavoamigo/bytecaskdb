@@ -20,6 +20,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version string (e.g. v0.1.0) to stamp before building'
+        required: false
+        type: string
 
 # Required for GitHub Pages deployment.
 permissions:
@@ -47,6 +53,10 @@ jobs:
         python: ["cp312-cp312", "cp313-cp313", "cp314-cp314", "cp314-cp314t", "cp315-cp315", "cp315-cp315t"]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Stamp version
+        if: ${{ inputs.version != '' }}
+        run: python3 scripts/set_version.py ${{ inputs.version }}
 
       - name: Install LLVM toolchain
         run: |
@@ -126,6 +136,10 @@ jobs:
         python-version: ["3.12", "3.13", "3.14", "3.14t"]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Stamp version
+        if: ${{ inputs.version != '' }}
+        run: python3 scripts/set_version.py ${{ inputs.version }}
 
       - uses: actions/setup-python@v5
         with:

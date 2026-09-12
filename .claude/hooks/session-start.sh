@@ -71,7 +71,7 @@ command -v clang >/dev/null 2>&1 || { log "installing clang"; apt_install clang;
 # nanobind; without it, configure fails outright.
 python3 -c 'import nanobind' >/dev/null 2>&1 || {
   log "installing nanobind"
-  pip install --quiet --break-system-packages nanobind >&2
+  python3 -m pip install --quiet --break-system-packages nanobind >&2
 }
 
 # Configure now so the four xmake packages (crc32c, catch2, benchmark,
@@ -85,3 +85,5 @@ xmake f --toolchain=clang \
 
 echo "Toolchain ready. Build and test with:"
 echo "  xmake build bytecask_tests && xmake run bytecask_tests"
+sudo ln -sf /usr/bin/clang-19 /usr/bin/clang
+sudo ln -sf /usr/bin/clang++-19 /usr/bin/clang++
