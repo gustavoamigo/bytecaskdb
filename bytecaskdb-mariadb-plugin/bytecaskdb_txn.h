@@ -43,6 +43,9 @@ public:
     Kind kind;
     std::vector<uint8_t> key;
     std::vector<uint8_t> val;  // empty for Del
+    // Put only: emit ensure_absent(key) into the WritePlan before the put.
+    // Used by the deferred INSERT path to carry the PK dup check to commit.
+    bool guard_absent{false};
   };
 
   // RYOW lookup type: nullopt = tombstone (deleted within this txn).
@@ -164,8 +167,21 @@ public:
   // -------------------------------------------------------------------
 
   void buffer_put(const uint8_t *key, size_t klen,
-                  const uint8_t *val, size_t vlen);
+                  const uint8_t *val, size_t vlen,
+                  bool guard_absent = false);
   void buffer_del(const uint8_t *key, size_t klen);
+
+  // Enter deferred-dup-check mode for a plain autocommit INSERT: no snapshot
+  // is acquired, and commit() builds a snapshot-less WritePlan whose
+  // ensure_absent guards (see Op::guard_absent) carry the PK dup check.
+  // A commit conflict on such a plan is reported as HA_ERR_FOUND_DUPP_KEY.
+  // Cleared by reset() at commit/rollback.
+  void begin_deferred_insert() { deferred_insert_ = true; }
+
+  // In-memory presence probe against the write buffer only (no snapshot, no
+  // DB access). Used by the deferred INSERT path to catch duplicates within
+  // the same statement.
+  bool buffered_key_present(const uint8_t *key, size_t klen);
 
   // -------------------------------------------------------------------
   // RYOW reads
@@ -286,6 +302,9 @@ private:
 
   bool registered_stmt_{false};
   bool registered_all_{false};
+
+  // Set by begin_deferred_insert(); see that method. Reset by reset().
+  bool deferred_insert_{false};
 
   // Bulk-copy mode state (see begin_bulk_copy). Isolated from ops_/lookup_.
   bool bulk_copy_mode_{false};

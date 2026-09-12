@@ -309,6 +309,49 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn commit rollback", "[txn][commit]
 }
 
 // =========================================================================
+// Deferred INSERT dup-check (P3): commit-time ensure_absent conflict
+// =========================================================================
+
+TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn deferred insert dup check",
+                  "[txn][commit][deferred]") {
+  auto pk = make_key("user:1");
+  auto val1 = make_value("alice");
+  auto val2 = make_value("mallory");
+
+  // Commit the row via a first, ordinary (non-deferred) transaction so it's
+  // durable before the deferred-mode transaction under test tries to insert
+  // the same PK.
+  {
+    auto seed = create_txn();
+    THD thd{};
+    seed->buffer_put(pk.data(), pk.size(), val1.data(), val1.size());
+    REQUIRE(seed->commit(&thd, true) == 0);
+  }
+
+  SECTION("commit-time conflict returns HA_ERR_FOUND_DUPP_KEY and raises "
+          "ER_DUP_ENTRY_WITH_KEY_NAME") {
+    auto txn = create_txn();
+    THD thd{};
+
+    g_stub_last_my_error_code = 0;
+
+    txn->begin_deferred_insert();
+    txn->buffer_put(pk.data(), pk.size(), val2.data(), val2.size(),
+                    /*guard_absent=*/true);
+
+    int rc = txn->commit(&thd, true);
+
+    REQUIRE(rc == HA_ERR_FOUND_DUPP_KEY);
+    // ER_DUP_ENTRY's second format placeholder is an integer key index, not
+    // a string — passing a key name there is undefined behavior on the
+    // varargs call and produces a garbled message at runtime. Regression
+    // coverage for that bug: assert the code actually raised is the
+    // two-string variant the (value, key-name) args match.
+    REQUIRE(g_stub_last_my_error_code == ER_DUP_ENTRY_WITH_KEY_NAME);
+  }
+}
+
+// =========================================================================
 // Edge Cases and Error Handling
 // =========================================================================
 

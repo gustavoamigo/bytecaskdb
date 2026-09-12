@@ -43,8 +43,9 @@ void MariaDBTxn::begin_if_needed(THD *thd, handlerton *hton) {
 // ---------------------------------------------------------------------------
 
 void MariaDBTxn::buffer_put(const uint8_t *key, size_t klen,
-                            const uint8_t *val, size_t vlen) {
-  if (!snap_) {
+                            const uint8_t *val, size_t vlen,
+                            bool guard_absent) {
+  if (!snap_ && !deferred_insert_) {
     snap_.emplace(db_->snapshot());
   }
 
@@ -58,11 +59,11 @@ void MariaDBTxn::buffer_put(const uint8_t *key, size_t klen,
   lookup_[k] = v;
 
   // Append to ordered log.
-  ops_.push_back(Op{Op::Put, std::move(k), std::move(v)});
+  ops_.push_back(Op{Op::Put, std::move(k), std::move(v), guard_absent});
 }
 
 void MariaDBTxn::buffer_del(const uint8_t *key, size_t klen) {
-  if (!snap_) {
+  if (!snap_ && !deferred_insert_) {
     snap_.emplace(db_->snapshot());
   }
 
@@ -72,7 +73,13 @@ void MariaDBTxn::buffer_del(const uint8_t *key, size_t klen) {
   lookup_[k] = std::nullopt;
 
   // Append to ordered log.
-  ops_.push_back(Op{Op::Del, std::move(k), {}});
+  ops_.push_back(Op{Op::Del, std::move(k), {}, false});
+}
+
+bool MariaDBTxn::buffered_key_present(const uint8_t *key, size_t klen) {
+  if (lookup_.empty()) { return false; }
+  auto it = lookup_.find(std::vector<uint8_t>(key, key + klen));
+  return it != lookup_.end() && it->second.has_value();
 }
 
 // ---------------------------------------------------------------------------
@@ -252,14 +259,20 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
     return 0;
   }
 
+  const bool deferred = deferred_insert_;
   try {
-    // Build WritePlan from snapshot + replay ops in insertion order.
-    bytecask::WritePlan plan{std::move(*snap_)};
+    // Build the WritePlan and replay ops in insertion order. A deferred
+    // INSERT has no snapshot — its ensure_absent guards do the dup check.
+    bytecask::WritePlan plan = snap_ ? bytecask::WritePlan{std::move(*snap_)}
+                                     : bytecask::WritePlan{};
     snap_.reset();
 
     for (const auto &op : ops_) {
       switch (op.kind) {
       case Op::Put:
+        if (op.guard_absent) {
+          plan.ensure_absent(as_view(op.key));
+        }
         plan.put(as_view(op.key), as_view(op.val));
         break;
       case Op::Del:
@@ -273,6 +286,16 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
     if (!committed) {
       revert_row_count_deltas();
       reset();
+      if (deferred) {
+        // Snapshot-less plan: the only precondition is ensure_absent, so a
+        // conflict is a duplicate primary key. ER_DUP_ENTRY_WITH_KEY_NAME
+        // (not ER_DUP_ENTRY) takes two strings — "Duplicate entry '%s' for
+        // key '%s'" — matching the (value, key-name) args passed here.
+        // ER_DUP_ENTRY's second placeholder is an integer key index, so
+        // passing "PRIMARY" there is undefined behavior on the varargs call.
+        my_error(ER_DUP_ENTRY_WITH_KEY_NAME, MYF(0), "", "PRIMARY");
+        return HA_ERR_FOUND_DUPP_KEY;
+      }
       my_error(ER_LOCK_DEADLOCK, MYF(0));
       return HA_ERR_LOCK_DEADLOCK;
     }
@@ -297,6 +320,7 @@ void MariaDBTxn::rollback(THD * /*thd*/, bool all) {
     revert_row_count_deltas();
     ops_.clear();
     lookup_.clear();
+    deferred_insert_ = false;
     registered_stmt_ = false;
     return;
   }
@@ -309,6 +333,7 @@ void MariaDBTxn::reset() {
   ops_.clear();
   lookup_.clear();
   row_count_deltas_.clear();
+  deferred_insert_ = false;
   registered_stmt_ = false;
   registered_all_ = false;
   bulk_reset();

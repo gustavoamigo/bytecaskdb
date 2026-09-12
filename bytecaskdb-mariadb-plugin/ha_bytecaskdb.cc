@@ -480,6 +480,26 @@ bool ha_bytecaskdb::is_alter_copy_target() const {
 // write_row() — INSERT with duplicate PK detection
 // ---------------------------------------------------------------------------
 
+bool ha_bytecaskdb::has_unique_secondary_index() const {
+  for (const auto &ix : indexes_) {
+    if (ix.is_unique) { return true; }
+  }
+  return false;
+}
+
+// True when the current statement is a plain autocommit INSERT (no BEGIN, no
+// autocommit=0, not INSERT IGNORE / REPLACE / ON DUPLICATE KEY UPDATE). Such
+// a statement can defer its PK duplicate check to commit via an ensure_absent
+// guard instead of an eager per-row DB probe + snapshot.
+bool ha_bytecaskdb::stmt_allows_deferred_dupcheck() const {
+#ifdef PLUGIN_TESTING
+  return false;
+#else
+  return thd_sql_command(ha_thd()) == SQLCOM_INSERT &&
+         !thd_test_options(ha_thd(), OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
+#endif
+}
+
 int ha_bytecaskdb::write_row(const uchar *buf) {
   if (!g_db) { return HA_ERR_GENERIC; }
 
@@ -510,12 +530,31 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   auto &val = encode_row_buf_;
   encode_row_into(val, table, buf, schema_version_);
 
+  // Deferred PK dup check: a plain autocommit INSERT on a PK-only-unique table
+  // does not need to probe the DB (or take a snapshot) per row. The commit-time
+  // WritePlan carries an ensure_absent guard per PK instead; a duplicate then
+  // surfaces as HA_ERR_FOUND_DUPP_KEY from commit(). Within-statement duplicates
+  // are still caught eagerly against the in-memory write buffer below.
+  // INSERT IGNORE / REPLACE / ON DUPLICATE KEY UPDATE need the per-row verdict
+  // (dupcheck_eager_), and a UNIQUE secondary index needs the eager snapshot
+  // path, so both fall through to the classic check.
+  const bool defer_dup =
+      !no_pk && !dupcheck_eager_ && !has_unique_secondary_index() &&
+      stmt_allows_deferred_dupcheck();
+
   // PK-less rows can't collide on the primary key (synthetic rowids are
-  // monotonic), so skip the dup check there. For PK tables, eager dup check.
-  if (!no_pk && txn->exists(key.data(), key.size())) {
-    errkey = saved_errkey_ = table->s->primary_key;
-    return HA_ERR_FOUND_DUPP_KEY;
+  // monotonic), so skip the dup check there. For PK tables, eager dup check
+  // unless deferred (buffer-only probe catches same-statement duplicates).
+  if (!no_pk) {
+    const bool dup = defer_dup
+                         ? txn->buffered_key_present(key.data(), key.size())
+                         : txn->exists(key.data(), key.size());
+    if (dup) {
+      errkey = saved_errkey_ = table->s->primary_key;
+      return HA_ERR_FOUND_DUPP_KEY;
+    }
   }
+  if (defer_dup) { txn->begin_deferred_insert(); }
 
   // Check unique secondary index constraints.
   if (!indexes_.empty()) {
@@ -548,8 +587,10 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
     }
   }
 
-  // Buffer primary key operation.
-  txn->buffer_put(key.data(), key.size(), val.data(), val.size());
+  // Buffer primary key operation. In deferred mode the PK carries an
+  // ensure_absent guard applied at commit.
+  txn->buffer_put(key.data(), key.size(), val.data(), val.size(),
+                  /*guard_absent=*/defer_dup);
 
   FAULT_INJECTION(plugin_after_pk_buffer);
 
@@ -952,6 +993,15 @@ int ha_bytecaskdb::extra(enum ha_extra_function operation) {
       break;
     case HA_EXTRA_NO_KEYREAD:
       keyread_only_ = false;
+      break;
+    case HA_EXTRA_IGNORE_DUP_KEY:      // INSERT IGNORE, ON DUPLICATE KEY UPDATE
+    case HA_EXTRA_WRITE_CAN_REPLACE:   // REPLACE
+    case HA_EXTRA_INSERT_WITH_UPDATE:  // ON DUPLICATE KEY UPDATE
+      dupcheck_eager_ = true;
+      break;
+    case HA_EXTRA_NO_IGNORE_DUP_KEY:
+    case HA_EXTRA_WRITE_CANNOT_REPLACE:
+      dupcheck_eager_ = false;
       break;
     case HA_EXTRA_END_COPY:
       // Belt-and-suspenders: end_bulk_insert normally does the final flush.

@@ -288,6 +288,21 @@ private:
   // index path skips the secondary→PK row fetch.
   bool keyread_only_ = false;
 
+  // Set by extra(HA_EXTRA_IGNORE_DUP_KEY / WRITE_CAN_REPLACE / INSERT_WITH_UPDATE),
+  // cleared by the matching NO_IGNORE_DUP_KEY / WRITE_CANNOT_REPLACE. When true
+  // the statement needs a per-row HA_ERR_FOUND_DUPP_KEY verdict from write_row
+  // (INSERT IGNORE / REPLACE / ON DUPLICATE KEY UPDATE) and the eager dup check
+  // must run; when false a plain autocommit INSERT can defer it to commit.
+  bool dupcheck_eager_ = false;
+
+  // True iff the table has at least one UNIQUE secondary index. Deferred dup
+  // checking only applies to PK-only uniqueness, so this forces the eager path.
+  [[nodiscard]] bool has_unique_secondary_index() const;
+
+  // True when the current statement is a plain autocommit INSERT that may
+  // defer its PK dup check to commit. Always false under PLUGIN_TESTING.
+  [[nodiscard]] bool stmt_allows_deferred_dupcheck() const;
+
   static void write_table_id_prefix(uint8_t *buf4, uint32_t table_id);
 };
 
