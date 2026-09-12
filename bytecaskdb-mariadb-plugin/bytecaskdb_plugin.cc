@@ -841,10 +841,10 @@ maria_declare_plugin(ha_bytecaskdb) {
     PLUGIN_LICENSE_GPL,
     bytecaskdb::bytecaskdb_init,
     bytecaskdb::bytecaskdb_deinit,
-    0x0002,           // version 0.2
+    0x0001,           // version 0.2
     nullptr,          // status variables
     bytecaskdb_system_variables,
-    "0.2",            // version string
+    "0.1",            // version string
     MariaDB_PLUGIN_MATURITY_GAMMA,
 } maria_declare_plugin_end;
 
