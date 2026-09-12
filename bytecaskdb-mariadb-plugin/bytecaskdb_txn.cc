@@ -35,6 +35,8 @@ void MariaDBTxn::begin_if_needed(THD *thd, handlerton *hton) {
   if (!registered_stmt_) {
     trans_register_ha(thd, false, hton, 0);
     registered_stmt_ = true;
+    stmt_ops_mark_ = ops_.size();
+    stmt_row_count_deltas_ = row_count_deltas_;
   }
 }
 
@@ -328,10 +330,10 @@ void MariaDBTxn::rollback(THD * /*thd*/, bool all) {
   bulk_reset();
 
   if (!all && registered_all_) {
-    // Statement rollback within session txn — clear buffer (conservative).
-    revert_row_count_deltas();
-    ops_.clear();
-    lookup_.clear();
+    // Statement rollback within a session transaction: undo only this
+    // statement. Earlier statements stay buffered for the session commit.
+    restore_row_count_deltas(stmt_row_count_deltas_);
+    truncate_ops(stmt_ops_mark_);
     deferred_insert_ = false;
     registered_stmt_ = false;
     return;
@@ -340,11 +342,42 @@ void MariaDBTxn::rollback(THD * /*thd*/, bool all) {
   reset();
 }
 
+void MariaDBTxn::truncate_ops(std::size_t mark) {
+  if (mark > ops_.size()) { mark = ops_.size(); }
+  ops_.resize(mark);
+  lookup_.clear();
+  for (const auto &op : ops_) {
+    if (op.kind == Op::Put)
+      lookup_[op.key] = op.val;
+    else
+      lookup_[op.key] = std::nullopt;
+  }
+}
+
+void MariaDBTxn::restore_row_count_deltas(const RowCountDeltas &saved) {
+  for (auto &[table_id, entry] : row_count_deltas_) {
+    int64_t saved_delta = 0;
+    if (auto it = saved.find(table_id); it != saved.end()) {
+      saved_delta = it->second.delta;
+    }
+    const int64_t undo = entry.delta - saved_delta;
+    if (undo == 0) { continue; }
+    if (entry.counter) {
+      entry.counter->fetch_add(-undo);
+    } else {
+      catalog_row_count_add(table_id, -undo);
+    }
+  }
+  row_count_deltas_ = saved;
+}
+
 void MariaDBTxn::reset() {
   snap_.reset();
   ops_.clear();
   lookup_.clear();
   row_count_deltas_.clear();
+  stmt_ops_mark_ = 0;
+  stmt_row_count_deltas_.clear();
   deferred_insert_ = false;
   registered_stmt_ = false;
   registered_all_ = false;
@@ -368,16 +401,7 @@ void MariaDBTxn::track_row_count_delta(uint32_t table_id,
 }
 
 void MariaDBTxn::revert_row_count_deltas() {
-  for (auto &[table_id, entry] : row_count_deltas_) {
-    if (entry.delta != 0) {
-      if (entry.counter) {
-        entry.counter->fetch_add(-entry.delta);
-      } else {
-        catalog_row_count_add(table_id, -entry.delta);
-      }
-    }
-  }
-  row_count_deltas_.clear();
+  restore_row_count_deltas({});
 }
 
 // ---------------------------------------------------------------------------
@@ -475,15 +499,7 @@ void MariaDBTxn::savepoint_set(void *sv) {
 }
 
 void MariaDBTxn::savepoint_rollback(void *sv) {
-  uint32_t mark = *static_cast<const uint32_t *>(sv);
-  ops_.resize(mark);
-  lookup_.clear();
-  for (const auto &op : ops_) {
-    if (op.kind == Op::Put)
-      lookup_[op.key] = op.val;
-    else
-      lookup_[op.key] = std::nullopt;
-  }
+  truncate_ops(*static_cast<const uint32_t *>(sv));
 }
 
 void MariaDBTxn::savepoint_release(void * /*sv*/) {

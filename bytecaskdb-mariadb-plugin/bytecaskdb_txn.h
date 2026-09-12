@@ -283,6 +283,19 @@ private:
   void revert_row_count_deltas();
   void bulk_reset();
 
+  struct RowCountDelta {
+    int64_t delta{0};
+    std::atomic<int64_t> *counter{nullptr};
+  };
+  using RowCountDeltas = std::map<uint32_t, RowCountDelta>;
+
+  // Rewinds the write buffer to its first `mark` ops and rebuilds the RYOW
+  // overlay from what remains. Shared by statement rollback and savepoints.
+  void truncate_ops(std::size_t mark);
+  // Undoes the row-count changes made since `saved` was captured and makes
+  // `saved` the current delta set. Shared by statement rollback and savepoints.
+  void restore_row_count_deltas(const RowCountDeltas &saved);
+
   bytecask::DB *db_;
   std::optional<bytecask::Snapshot> snap_;
 
@@ -292,14 +305,16 @@ private:
   // RYOW overlay — fast lookups by key.  nullopt = tombstone.
   LookupMap lookup_;
 
-  struct RowCountDelta {
-    int64_t delta{0};
-    std::atomic<int64_t> *counter{nullptr};
-  };
-
   // Per-table row count deltas accumulated during this transaction.
   // Reverted on rollback or commit failure.
-  std::map<uint32_t, RowCountDelta> row_count_deltas_;
+  RowCountDeltas row_count_deltas_;
+
+  // Where the current statement began, captured when the statement is
+  // registered in begin_if_needed. A statement-level rollback inside a
+  // multi-statement transaction rewinds to here and leaves earlier
+  // statements' work in the buffer.
+  std::size_t stmt_ops_mark_{0};
+  RowCountDeltas stmt_row_count_deltas_;
 
   bool registered_stmt_{false};
   bool registered_all_{false};

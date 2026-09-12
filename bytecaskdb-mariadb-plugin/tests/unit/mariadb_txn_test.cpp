@@ -583,3 +583,68 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn bulk copy mode", "[txn][bulk]") 
     REQUIRE_FALSE(txn->in_bulk_copy());
   }
 }
+
+// =========================================================================
+// Statement rollback inside a multi-statement transaction (BC-249)
+// =========================================================================
+
+TEST_CASE_METHOD(MariaDBTxnFixture,
+                 "MariaDBTxn statement rollback keeps earlier statements",
+                 "[txn][rollback][statement]") {
+  auto k1 = make_key("row:1");
+  auto k2 = make_key("row:2");
+  auto k3 = make_key("row:3");
+  auto v = make_value("x");
+  THD thd{};
+  handlerton hton{};
+  std::atomic<int64_t> rows{0};
+
+  g_stub_thd_options = OPTION_BEGIN;
+  auto txn = create_txn();
+
+  // Statement 1: insert row:1.
+  txn->begin_if_needed(&thd, &hton);
+  txn->buffer_put(k1.data(), k1.size(), v.data(), v.size());
+  txn->track_row_count_delta(7, &rows, 1);
+  REQUIRE(txn->commit(&thd, false) == 0);
+
+  // Statement 2: insert row:2.
+  txn->begin_if_needed(&thd, &hton);
+  txn->buffer_put(k2.data(), k2.size(), v.data(), v.size());
+  txn->track_row_count_delta(7, &rows, 1);
+  REQUIRE(txn->commit(&thd, false) == 0);
+
+  // Statement 3: buffers row:3 and a delete of row:1, then fails.
+  txn->begin_if_needed(&thd, &hton);
+  txn->buffer_put(k3.data(), k3.size(), v.data(), v.size());
+  txn->track_row_count_delta(7, &rows, 1);
+  txn->buffer_del(k1.data(), k1.size());
+  txn->track_row_count_delta(7, &rows, -1);
+  REQUIRE(rows.load() == 2);
+  txn->rollback(&thd, false);
+
+  SECTION("only the failed statement's work is undone") {
+    REQUIRE(txn->exists(k1.data(), k1.size()));
+    REQUIRE(txn->exists(k2.data(), k2.size()));
+    REQUIRE_FALSE(txn->exists(k3.data(), k3.size()));
+    REQUIRE(rows.load() == 2);
+  }
+
+  SECTION("session commit persists statements 1 and 2") {
+    REQUIRE(txn->commit(&thd, true) == 0);
+    auto probe = create_txn();
+    REQUIRE(probe->exists(k1.data(), k1.size()));
+    REQUIRE(probe->exists(k2.data(), k2.size()));
+    REQUIRE_FALSE(probe->exists(k3.data(), k3.size()));
+    REQUIRE(rows.load() == 2);
+  }
+
+  SECTION("session rollback after a statement rollback reverts everything") {
+    txn->rollback(&thd, true);
+    REQUIRE(rows.load() == 0);
+    auto probe = create_txn();
+    REQUIRE_FALSE(probe->exists(k1.data(), k1.size()));
+  }
+
+  g_stub_thd_options = 0;
+}

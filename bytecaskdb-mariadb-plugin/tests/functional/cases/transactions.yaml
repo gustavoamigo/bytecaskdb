@@ -109,3 +109,23 @@
       expected: [['42']]
   teardown:
     - DROP DATABASE IF EXISTS txn7
+
+- name: Failed statement inside transaction keeps earlier statements (BC-249)
+  setup:
+    - DROP DATABASE IF EXISTS txn_stmt_rb
+    - CREATE DATABASE txn_stmt_rb
+    - CREATE TABLE txn_stmt_rb.t (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=bytecaskdb
+    - INSERT INTO txn_stmt_rb.t VALUES (99, 0)
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO txn_stmt_rb.t VALUES (1, 10)
+    - sql: INSERT INTO txn_stmt_rb.t VALUES (2, 20)
+    - sql: INSERT INTO txn_stmt_rb.t VALUES (3, 30), (99, 1)
+      error: 1062
+    - sql: COMMIT
+    - sql: SELECT id, v FROM txn_stmt_rb.t ORDER BY id
+      expected: [['1','10'],['2','20'],['99','0']]
+    - sql: SELECT COUNT(*) FROM txn_stmt_rb.t
+      expected: [['3']]
+  teardown:
+    - DROP DATABASE IF EXISTS txn_stmt_rb
