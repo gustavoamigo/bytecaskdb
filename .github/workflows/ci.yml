@@ -223,13 +223,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # python3/nanobind aren't used by anything in this job (no Python
+      # target is built here) but are still required: `xmake f` evaluates
+      # every target's on_load project-wide, including bytecaskdb_python's,
+      # which hard-imports nanobind to resolve include paths regardless of
+      # which target is actually being configured/built.
       - name: Install dependencies
         run: |
           dnf install -y \
             clang llvm llvm-devel lld \
             libcxx libcxx-devel \
             xmake cmake \
+            python3-pip python3-devel \
             git ninja-build
+          pip3 install nanobind
 
       - uses: actions/setup-node@v4
         with:
