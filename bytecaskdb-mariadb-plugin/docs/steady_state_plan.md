@@ -136,25 +136,40 @@ final average.
 
 No new SQL features until one of these branches is taken.
 
-## 6. Backlog from the review (not blocking)
+## 6. Review findings fixed alongside the blockers
 
-| Item | Note |
+All landed on the same branch as §2 and §3, one commit each.
+
+| Item | Outcome |
 |---|---|
-| Savepoint row-count drift | `savepoint_rollback` truncates `ops_` but not `row_count_deltas_`; `stats.records` drifts after `ROLLBACK TO SAVEPOINT`. |
-| Catalog pointer escapes its mutex | `catalog_lookup_meta` returns a pointer into a locked map; `update_row`, `delete_row`, `check` use it unlocked. The in-place `DROP FOREIGN KEY` ALTER reassigns the entry under `HA_ALTER_INPLACE_NO_LOCK`. Extend the BC-241 handler-side cache (`indexes_`) to those paths. |
-| Deferred-INSERT error message | Commit-time duplicate prints `Duplicate entry ''` because `apply_batch` does not say which guard failed. |
-| Triggers on deferred INSERT | A trigger that writes another table in a deferred autocommit INSERT gets no snapshot. Add a trigger functional test or exclude `table->triggers` from the deferred path. |
-| `records_in_range` | Returns a constant tenth of the table; the optimizer cannot rank ranges. |
-| Plugin guide | Says the server retries on deadlock; it does not. |
+| Savepoint row-count drift | Savepoints now checkpoint the row counters; `ROLLBACK TO` restores them. |
+| Catalog pointer escapes its mutex | `catalog_lookup_meta` replaced by `catalog_copy_meta` (copy under lock); DML paths use the handler's cached index list. |
+| Deferred-INSERT error message | Reported through the server's `print_keydup_error` with the key value, code 1062. PR #29 had changed the code to 1586, which broke every client that checks 1062. |
+| Triggers on deferred INSERT | Tables with triggers take the eager path; deferred mode can only start on a transaction with no snapshot and no buffered writes. The mixed state crashed the server (THD layout mismatch in the fallback message path). |
+| `records_in_range` | Exact count up to 1024 keys, merged with buffered writes; fallback fraction above that. |
+| Plugin guide | Snapshot timing, no server retry on 1213, V2 row format, statement rollback and savepoint semantics corrected. |
+
+Found while fixing §2.3 and fixed in the engine: `riter_from(from)` started
+one key too high when `from` was a strict prefix of an existing key. For the
+plugin that meant a descending PK scan on a table whose neighbouring table
+id had rows lost its whole snapshot side. Engine test added; the plugin
+functional suite has a neighbour-table case.
+
+Still open, not blocking: the composite-key `HA_READ_PREFIX_LAST` path had
+never worked (it was only reachable through the now-fixed
+`index_read_map`), so any optimizer plan that relied on it before this
+branch was returning wrong results silently. Worth a note in the release
+notes when this ships.
 
 ## 7. Status
 
 | Step | Status |
 |---|---|
-| PR #28 closed, branch kept | pending |
+| PR #28 closed, branch kept | pending (user action) |
 | PR #29 merged | done (d8f5f1f) |
-| 2.1 autocommit snapshot | open |
-| 2.2 statement rollback | open |
-| 2.3 reverse merge scan | open |
-| 3 semantics / FK flag / README | open |
-| 4 steady-state run | blocked on 2.x |
+| 2.1 autocommit snapshot | done |
+| 2.2 statement rollback | done |
+| 2.3 reverse merge scan + find flags | done, plus engine `riter_from` fix |
+| 3 semantics / FK flag / README | done; `run-sysbench.sh` comment corrected in the working tree alongside the uncommitted harness changes |
+| 6 review findings | done |
+| 4 steady-state run | ready to run |
