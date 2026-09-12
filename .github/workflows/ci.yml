@@ -208,6 +208,104 @@ jobs:
           "$BIN" "$CORPUS" "$SEED" -max_total_time=60 -max_len=65536
 
   # ---------------------------------------------------------------------------
+  # Node.js bindings (bytecaskdb-node): native (N-API) and WASM (Embind)
+  # backends, both exercised by the shared Vitest suite.
+  # ---------------------------------------------------------------------------
+  node-tests:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+      EMSDK: /opt/emsdk
+      EM_CONFIG: /opt/emsdk/.emscripten
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel \
+            xmake cmake \
+            git ninja-build
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # emsdk installs its own clang (also named "clang"); prepending its bin
+      # dir to PATH shadows the system clang xmake's native "clang" toolchain
+      # expects (see 8bb3ed2, "Pin devcontainer to system clang, fixing emsdk
+      # PATH shadowing"). Cache the SDK itself (a full install is ~1 GB and
+      # several minutes) — bump the key's suffix to force a refresh onto a
+      # newer emsdk "latest".
+      - name: Cache Emscripten SDK
+        id: emsdk-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/emsdk
+          key: emsdk-latest-v1
+
+      - name: Install Emscripten SDK
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git /opt/emsdk
+          cd /opt/emsdk && ./emsdk install latest && ./emsdk activate latest
+
+      - name: Add Emscripten SDK to PATH (appended, not prepended)
+        run: echo "PATH=$PATH:/opt/emsdk:/opt/emsdk/upstream/emscripten:/opt/emsdk/upstream/bin" >> "$GITHUB_ENV"
+
+      # wasm_embind (and every other WASM xmake target) links a prebuilt
+      # crc32c-wasm the xmake targets don't build themselves — only
+      # wasm/build.sh does (cross-compiling crc32c, Google Benchmark, and
+      # Catch2 for WASM). Cache it keyed on build.sh's own contents so a
+      # future change to the cross-compile recipe invalidates the cache.
+      - name: Cache WASM dependencies (crc32c, Google Benchmark, Catch2)
+        id: wasm-deps-cache
+        uses: actions/cache@v4
+        with:
+          path: bytecaskdb-node/wasm/build
+          key: wasm-deps-${{ hashFiles('bytecaskdb-node/wasm/build.sh') }}
+
+      - name: Build WASM dependencies
+        if: steps.wasm-deps-cache.outputs.cache-hit != 'true'
+        working-directory: bytecaskdb-node/wasm
+        run: bash build.sh
+
+      - name: Configure xmake (native toolchain pinned to system clang)
+        run: |
+          RESOURCE_DIR=$(/usr/bin/clang --print-resource-dir)
+          xmake f --toolchain=clang --cc=/usr/bin/clang --cxx=/usr/bin/clang++ \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" -y
+
+      - name: npm ci
+        working-directory: bytecaskdb-node
+        run: npm ci
+
+      - name: Build native addon and WASM module
+        run: |
+          xmake build bytecaskdb_node
+          xmake build wasm_embind
+
+      - name: Smoke test native backend
+        run: npm run --prefix bytecaskdb-node test:smoke:native
+
+      - name: Smoke test WASM backend
+        run: npm run --prefix bytecaskdb-node test:smoke
+
+      - name: Run Vitest suite (WASM backend, default)
+        working-directory: bytecaskdb-node
+        run: npm test
+
+      - name: Run Vitest suite (native backend)
+        working-directory: bytecaskdb-node
+        env:
+          BC_TEST_BACKEND: native
+        run: npm test
+
+  # ---------------------------------------------------------------------------
   # Coverage (LLVM/Clang)
   # ---------------------------------------------------------------------------
   coverage:
