@@ -414,7 +414,7 @@ Track BC-236 as four small phases so each step is verifiable before the next.
 
 ### Follow-up backlog after BC-236
 
-Tracked as BC-237 in `docs/bytecask_project_plan.md`:
+Tracked as [gustavoamigo/bytecaskdb#38](https://github.com/gustavoamigo/bytecaskdb/issues/38):
 
 - Async Promise-based variants for fsync-bound calls (`AsyncWorker`), kept
   beside synchronous APIs.

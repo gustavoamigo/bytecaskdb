@@ -3,7 +3,7 @@
 Status: **final**. Ready for implementation, gated by the benchmark decision
 rule in [Plan](#plan).
 Date: 2026-09-10 (proposed), 2026-09-10 (reviewed and finalised)
-Tracking: BC-244. Prerequisite: BC-243 (see `docs/bytecask_project_plan.md`).
+Tracking: [gustavoamigo/bytecaskdb#40](https://github.com/gustavoamigo/bytecaskdb/issues/40). Prerequisite BC-243 (thread-local read-state cache leak fix) is already landed.
 
 ## Problem
 
@@ -451,5 +451,5 @@ worthwhile independently of the outcome of step 4.
 | 2 | **D11** — `store_state(&&old, new)` as the sole publish point; delete the one-arg overload; `std::move(current)` at every site; debug `assert(old_state == atomic_load(&state_))`. Pure refactor, no behaviour change. | Compiles with `-Weverything`; full tests + `[model]` green. |
 | 3 | **BC-244** — `StateReclaimer` (D1–D5, D10) in `bytecask.concurrency` with the `BYTECASK_SINGLE_THREADED` variant; counters (D12) in `Counters` and `stats()`; `retire_state` + hooks 1 and 2; `reclaimer_` member after `worker_`; `[reclaimer]` unit tests; engine integration tests; `[model]` suites; TSan + ASan runs. | All tests green under release, TSan, ASan. `states_retired_inline == 0` in the single-writer integration test. |
 | 4 | **Benchmark gate.** Re-run step 0; apply the decision rule. | Before/after CSV rows shown; `oltp_insert` profile re-taken. |
-| 5 | **Docs** (with step 3 or 4): `docs/bytecask_design.md` (state publication, reclaimer, shutdown ordering, counters), `README.md` (counter list under Operational counters), `docs/bytecask_project_plan.md` (BC-243/BC-244 to Done; follow-ups to Backlog). | Docs match shipped behaviour. |
-| 6 | **Follow-ups → Backlog.** Right-size the plugin change (P3) from the new profile; ChildStore/refcount rework; byte-based queue bound if warranted; `~Snapshot` hook if a read-heavy profile shows it. | Entries in `docs/bytecask_project_plan.md`. |
+| 5 | **Docs** (with step 3 or 4): `docs/bytecask_design.md` (state publication, reclaimer, shutdown ordering, counters), `README.md` (counter list under Operational counters). Close [issue #40](https://github.com/gustavoamigo/bytecaskdb/issues/40); file follow-up issues. | Docs match shipped behaviour. |
+| 6 | **Follow-ups → GitHub issues.** Right-size the plugin change (P3) from the new profile; ChildStore/refcount rework; byte-based queue bound if warranted; `~Snapshot` hook if a read-heavy profile shows it. | New issues filed. |

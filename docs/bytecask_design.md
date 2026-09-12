@@ -1420,7 +1420,6 @@ The seam is intentionally minimal:
 - `tests/bytecask_test.cpp`: behavior tests for the full `Bytecask` engine API
 - `xmake.lua`: build and test target definitions
 - `docs/bytecask_design.md`: living design reference
-- `docs/bytecask_project_plan.md`: simple task tracker
 
 ## Near-term design direction
 
