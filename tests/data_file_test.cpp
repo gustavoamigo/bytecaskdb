@@ -6,6 +6,7 @@
 // throws std::system_error. No in-flight recovery is attempted.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <algorithm>
 #include <array>
 #include <csignal>
@@ -14,11 +15,18 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <sys/wait.h>
 #include <system_error>
+#ifdef __linux__
+#include <fcntl.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#endif
 #include <tuple>
 #include <unistd.h>
 #include <vector>
@@ -273,6 +281,78 @@ TEST_CASE("WritableDataFile::read_entry_unverified with mmap request",
 
   std::filesystem::remove(path);
 }
+
+#ifdef __linux__
+// Counts the file's extents and how many are still unwritten (allocated by
+// fallocate but never written). Returns nullopt where FIEMAP is unsupported
+// (tmpfs, overlayfs) so the test can skip rather than fail.
+struct ExtentCount { std::size_t total; std::size_t unwritten; };
+auto count_extents(const std::filesystem::path &path)
+    -> std::optional<ExtentCount> {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd == -1) return std::nullopt;
+  constexpr std::size_t kMaxExtents = 256;
+  std::vector<std::byte> buf(sizeof(fiemap) +
+                             kMaxExtents * sizeof(fiemap_extent));
+  auto *fm = reinterpret_cast<fiemap *>(buf.data());
+  fm->fm_start = 0;
+  fm->fm_length = FIEMAP_MAX_OFFSET;
+  fm->fm_flags = FIEMAP_FLAG_SYNC;
+  fm->fm_extent_count = kMaxExtents;
+  const int rc = ::ioctl(fd, FS_IOC_FIEMAP, fm);
+  ::close(fd);
+  if (rc != 0) return std::nullopt;
+  ExtentCount out{fm->fm_mapped_extents, 0};
+  for (std::size_t i = 0; i < fm->fm_mapped_extents; ++i) {
+    if (fm->fm_extents[i].fe_flags & FIEMAP_EXTENT_UNWRITTEN) ++out.unwritten;
+  }
+  return out;
+}
+
+// A fresh active file must have every extent *written* at creation, not
+// merely allocated: an unwritten extent is converted on first write, and that
+// conversion is journaled metadata every fdatasync then waits for. Holds for
+// both file types, and shrink_to_fit must give the tail back.
+TEST_CASE("WritableDataFile: fresh file has no unwritten extents",
+          "[data_file]") {
+  const bool use_mmap = GENERATE(false, true);
+  CAPTURE(use_mmap);
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_zero_fill.data";
+  std::filesystem::remove(path);
+
+  constexpr std::size_t kCapacity = 8 * 1024 * 1024;
+  auto file = bytecask::createDataFileForWrite(
+      std::filesystem::temp_directory_path(), "bc_test_zero_fill", ".data",
+      kCapacity, use_mmap);
+  CHECK(file->size() == 0);
+  CHECK(std::filesystem::file_size(path) == kCapacity);
+
+  if (const auto ext = count_extents(path)) {
+    CHECK(ext->total > 0);
+    CHECK(ext->unwritten == 0);
+  } else {
+    WARN("FIEMAP unsupported on this filesystem — extent check skipped");
+  }
+
+  // The zero tail must still read as end-of-data.
+  CHECK(!file->scan(0).has_value());
+  (void)file->append_entry(1, bytecask::EntryType::Put, to_bytes("k"),
+                           to_bytes("v"));
+  auto first = file->scan(0);
+  REQUIRE(first.has_value());
+  CHECK(first->first.sequence == 1);
+  CHECK(!file->scan(first->second).has_value());
+
+  // Sealing gives the tail back: physical size becomes the logical size.
+  file->shrink_to_fit();
+  CHECK(std::filesystem::file_size(path) == file->size());
+  CHECK(file->size() == first->second);
+
+  file.reset();
+  std::filesystem::remove(path);
+}
+#endif
 
 TEST_CASE("WritableDataFile::read_entry_unverified pread fallback",
           "[data_file]") {

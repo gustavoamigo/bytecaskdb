@@ -31,6 +31,7 @@ module;
 #include <system_error>
 #include <unistd.h>
 #include <utility>
+#include <algorithm>
 #include <vector>
 #include <ranges>
 
@@ -135,6 +136,13 @@ public:
   virtual void sync() = 0;
 
   virtual void truncate(Offset new_size) = 0;
+
+  // Releases the preallocated tail: truncates the file to size() and syncs
+  // the new length. Called once, when the file is sealed, so that a sealed
+  // file's physical size is its logical size. Unlike truncate() this never
+  // touches a mapping, so it is safe while readers hold snapshots of this
+  // file: every published offset lies below size().
+  virtual void shrink_to_fit() = 0;
 
 protected:
   explicit WritableDataFile(std::filesystem::path path)
@@ -277,6 +285,56 @@ struct WritableFileOps {
 
   [[nodiscard]] auto size() const noexcept -> Offset { return offset_; }
 
+  // Grows the file to capacity and writes zeros over [offset_, capacity).
+  // Allocation alone is not enough: fallocate reserves *unwritten* extents,
+  // and the first write into each block converts one — a journaled metadata
+  // change that the next fdatasync must wait for, roughly doubling the cost
+  // of every commit on ext4. Zeroing once here makes every extent written,
+  // so later fdatasyncs are pure data flushes. One sequential write of
+  // capacity bytes, paid at file creation. Leaves offset_ untouched.
+  void preallocate(std::size_t capacity) {
+    if (capacity <= offset_) return;
+#ifdef __linux__
+    if (::fallocate(fd_, 0, 0, narrow<off_t>(capacity)) != 0) {
+      throw std::system_error{errno, std::generic_category(),
+                              "WritableFileOps::preallocate: fallocate failed"};
+    }
+#else
+    if (::ftruncate(fd_, narrow<off_t>(capacity)) != 0) {
+      throw std::system_error{errno, std::generic_category(),
+                              "WritableFileOps::preallocate: ftruncate failed"};
+    }
+#endif
+    static constexpr std::size_t kChunk = 1024 * 1024;
+    const std::vector<std::byte> zeros(kChunk, std::byte{0});
+    for (auto off = static_cast<std::size_t>(offset_); off < capacity;
+         off += kChunk) {
+      const auto len = std::min(kChunk, capacity - off);
+      if (::pwrite(fd_, zeros.data(), len, narrow<off_t>(off)) !=
+          narrow<ssize_t>(len)) {
+        throw std::system_error{errno, std::generic_category(),
+                                "WritableFileOps::preallocate: pwrite failed"};
+      }
+    }
+    if (::fsync(fd_) != 0) {
+      throw std::system_error{errno, std::generic_category(),
+                              "WritableFileOps::preallocate: fsync failed"};
+    }
+  }
+
+  // See WritableDataFile::shrink_to_fit. ftruncate + fdatasync: the size
+  // change is metadata fdatasync is required to persist.
+  void shrink_to_fit() {
+    if (::ftruncate(fd_, narrow<off_t>(offset_)) != 0) {
+      throw std::system_error{errno, std::generic_category(),
+                              "WritableFileOps::shrink_to_fit: ftruncate failed"};
+    }
+    if (portable_fdatasync(fd_) != 0) {
+      throw std::system_error{errno, std::generic_category(),
+                              "WritableFileOps::shrink_to_fit: fdatasync failed"};
+    }
+  }
+
   [[nodiscard]] auto scan(Offset offset) const
       -> std::optional<std::pair<DataEntry, Offset>> {
     if (offset >= offset_) {
@@ -354,7 +412,8 @@ private:
 // ---------------------------------------------------------------------------
 // WritableMmapDataFile — mmap-backed writable data file.
 //
-// Pre-allocates the file to a fixed capacity and maps it with MAP_SHARED.
+// Pre-allocates and zero-fills the file to a fixed capacity
+// (WritableFileOps::preallocate) and maps it with MAP_SHARED.
 // Writes go through pwritev; reads come from the mmap region (zero syscalls).
 // When a read offset falls beyond the mmap region (rare: file grew past the
 // pre-allocated size in degraded mode), reads fall back to pread.
@@ -484,6 +543,9 @@ public:
     }
   }
 
+  // The mapping is left as is: pages past the new end are never read.
+  void shrink_to_fit() override { ops_.shrink_to_fit(); }
+
 private:
   WritableMmapDataFile(std::filesystem::path path, std::size_t capacity,
                        bool exclusive)
@@ -502,17 +564,7 @@ private:
 #endif
     ops_.offset_ = std::filesystem::file_size(path_);
     if (capacity > 0) {
-#ifdef __linux__
-      if (::fallocate(ops_.fd_, 0, 0, narrow<off_t>(capacity)) != 0) {
-        throw std::system_error{errno, std::generic_category(),
-                                "WritableMmapDataFile: fallocate failed"};
-      }
-#else
-      if (::ftruncate(ops_.fd_, narrow<off_t>(capacity)) != 0) {
-        throw std::system_error{errno, std::generic_category(),
-                                "WritableMmapDataFile: ftruncate failed"};
-      }
-#endif
+      ops_.preallocate(capacity);
       // NOLINTNEXTLINE(performance-no-int-to-ptr)
       auto *ptr = ::mmap(nullptr, capacity, PROT_READ, MAP_SHARED, ops_.fd_, 0);
       if (ptr == MAP_FAILED) {
@@ -528,6 +580,7 @@ private:
   WritableFileOps ops_;
   std::byte *mmap_base_{nullptr};
   std::size_t mmap_size_{0};
+
 
   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
     if (offset + kHeaderSize <= mmap_size_) {
@@ -597,10 +650,11 @@ WritableMmapDataFile::~WritableMmapDataFile() {
 export class WritablePosixDataFile : public WritableDataFile {
 public:
   [[nodiscard]] static auto create(std::filesystem::path path,
+                                   std::size_t capacity,
                                    bool exclusive = false)
       -> std::shared_ptr<WritableDataFile> {
     return std::shared_ptr<WritableDataFile>(
-        new WritablePosixDataFile{std::move(path), exclusive});
+        new WritablePosixDataFile{std::move(path), capacity, exclusive});
   }
 
   ~WritablePosixDataFile() override;
@@ -608,17 +662,11 @@ public:
   [[nodiscard]] auto append_entry(std::uint64_t sequence, EntryType entry_type,
                             std::span<const std::byte> key,
                             std::span<const std::byte> value) -> Offset override {
-    const auto total = kHeaderSize + key.size() + value.size() + kCrcSize;
-    ensure_preallocated(ops_.offset_ + static_cast<Offset>(total));
     return ops_.append_entry(sequence, entry_type, key, value);
   }
 
   void append_entries(std::span<const DataEntryView> entries,
                       std::span<Offset> offsets_out) override {
-    Offset total = 0;
-    for (const auto& e : entries)
-      total += kHeaderSize + e.key.size() + e.value.size() + kCrcSize;
-    ensure_preallocated(ops_.offset_ + total);
     ops_.append_entries(entries, offsets_out);
   }
 
@@ -699,11 +747,13 @@ public:
                               "WritablePosixDataFile::truncate"};
     }
     ops_.offset_ = new_size;
-    preallocated_end_ = new_size;
   }
 
+  void shrink_to_fit() override { ops_.shrink_to_fit(); }
+
 private:
-  WritablePosixDataFile(std::filesystem::path path, bool exclusive)
+  WritablePosixDataFile(std::filesystem::path path, std::size_t capacity,
+                        bool exclusive)
       : WritableDataFile{std::move(path)} {
     ops_.fd_ = ::open(path_.c_str(),
                       O_RDWR | O_CREAT | O_CLOEXEC | (exclusive ? O_EXCL : 0),
@@ -718,11 +768,16 @@ private:
     ::posix_fadvise(ops_.fd_, 0, 0, POSIX_FADV_RANDOM);
 #endif
     ops_.offset_ = std::filesystem::file_size(path_);
-    preallocated_end_ = ops_.offset_;
+#ifndef __EMSCRIPTEN__
+    // MEMFS holds files in memory: a preallocated tail would be resident
+    // memory with nothing to gain, since there is no journal to avoid.
+    if (capacity > 0) ops_.preallocate(capacity);
+#else
+    (void)capacity;
+#endif
   }
 
   WritableFileOps ops_;
-  Offset preallocated_end_{0};
 
   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
     std::array<std::byte, kHeaderSize> hdr{};
@@ -758,21 +813,6 @@ private:
     };
   }
 
-  void ensure_preallocated(Offset write_end) {
-#ifdef __linux__
-    if (write_end <= preallocated_end_) return;
-    static constexpr Offset kPreallocChunk = 4 * 1024 * 1024;  // 4 MiB
-    auto alloc_end =
-        ((write_end + kPreallocChunk - 1) / kPreallocChunk) * kPreallocChunk;
-    if (::fallocate(ops_.fd_, FALLOC_FL_KEEP_SIZE,
-                    narrow<off_t>(preallocated_end_),
-                    narrow<off_t>(alloc_end - preallocated_end_)) == 0) {
-      preallocated_end_ = alloc_end;
-    }
-#else
-    (void)write_end;
-#endif
-  }
 };
 
 WritablePosixDataFile::~WritablePosixDataFile() {
@@ -810,15 +850,18 @@ public:
 
   [[nodiscard]] auto scan(Offset offset) const
       -> std::optional<std::pair<DataEntry, Offset>> override {
-    if (offset >= file_size_) {
+    if (offset + kHeaderSize > file_size_) {
       return std::nullopt;
     }
     const auto header = read_header(offset);
     if (header.sequence == 0) return std::nullopt;
-    std::vector<std::byte> buf;
-    auto view = read_entry_with_key_size(offset, header.key_size, header.value_size, buf);
     const auto next =
         offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
+    if (next > file_size_) {
+      return std::nullopt;
+    }
+    std::vector<std::byte> buf;
+    auto view = read_entry_with_key_size(offset, header.key_size, header.value_size, buf);
     return std::make_pair(
         DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
                   .key = {view.key.begin(), view.key.end()},
@@ -1111,7 +1154,7 @@ export [[nodiscard]] inline auto openDataFileForWrite(
     return WritableMmapDataFile::create(std::move(path), capacity);
   }
 #endif
-  return WritablePosixDataFile::create(std::move(path));
+  return WritablePosixDataFile::create(std::move(path), capacity);
 }
 
 // Creates the one writable data file for stem in dir: "<stem>.data", or
@@ -1146,7 +1189,8 @@ export [[nodiscard]] inline auto createDataFileForWrite(
                                         /*exclusive=*/true);
   }
 #endif
-  return WritablePosixDataFile::create(std::move(path), /*exclusive=*/true);
+  return WritablePosixDataFile::create(std::move(path), capacity,
+                                       /*exclusive=*/true);
 }
 
 // Moves a staged data file onto its final name, refusing to replace an
