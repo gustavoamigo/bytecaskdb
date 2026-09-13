@@ -34,7 +34,12 @@ def _find_bytecask_root():
 
 def _symlink_provider_plugins(plugin_dir):
     """Symlink compression-provider .so files so mariadbd doesn't abort."""
-    for system_dir in ("/usr/lib64/mariadb/plugin", "/usr/lib/mariadb/plugin"):
+    # Fedora: /usr/lib64|lib/mariadb/plugin. Debian/Ubuntu: /usr/lib/mysql/plugin.
+    for system_dir in (
+        "/usr/lib64/mariadb/plugin",
+        "/usr/lib/mariadb/plugin",
+        "/usr/lib/mysql/plugin",
+    ):
         if not os.path.isdir(system_dir):
             continue
         for name in os.listdir(system_dir):

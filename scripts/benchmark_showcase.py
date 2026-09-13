@@ -109,7 +109,21 @@ def _exclude_filter(patterns: list[str]) -> str | None:
     kept  = [t for t in tests if not any(p in t for p in patterns)]
     if not kept:
         return None
-    return "|".join(re.escape(t) for t in kept)
+    # --benchmark_list_tests runs without BC_DATASET_SIZE set, so it reports
+    # ->Iterations(kDatasetSize) fixtures (e.g. Put/NoSync) with the *default*
+    # dataset size's iteration count baked into the name, e.g.
+    # ".../iterations:50000". _run() below invokes the binary with other
+    # dataset sizes, which report a different iterations:N — escaping the
+    # literal name would then never match, silently dropping that benchmark
+    # from every run except the one at the default size. Generalize the
+    # count to a wildcard so the filter matches at any dataset size.
+    # [0-9]+, not \d+: Google Benchmark's filter regex rejects \d ("Invalid
+    # escape in regular expression").
+    escaped = [
+        re.sub(r"iterations:\d+", r"iterations:[0-9]+", re.escape(t))
+        for t in kept
+    ]
+    return "|".join(escaped)
 
 
 def _run(dataset_size: int, extra_flags: list[str]) -> dict:
@@ -139,7 +153,13 @@ def _run(dataset_size: int, extra_flags: list[str]) -> dict:
 
 
 def run_regular(dataset_size: int) -> dict:
-    filt = _exclude_filter(["Recovery", "CasMT"])
+    # These families exist for ad hoc comparison (run engine_bench directly
+    # with --benchmark_filter) but no section_* renderer reads them — running
+    # them here only adds wall-clock time to every showcase run.
+    filt = _exclude_filter([
+        "Recovery", "CasMT", "BoundedStaleness", "UUIDv4", "UnorderedView",
+        "PeriodicSync", "_Pread",
+    ])
     if filt is None:
         raise RuntimeError("All benchmarks were excluded — nothing to run.")
     return _run(dataset_size, [f"--benchmark_filter={filt}"])
@@ -189,8 +209,12 @@ def extract_means(data: dict) -> dict[str, dict]:
         if bench.get("aggregate_name") != "mean":
             continue
         name: str = bench.get("name", "")
+        # Strip the fixed-iteration-count segment Google Benchmark inserts for
+        # ->Iterations(N) fixtures (e.g. Put/NoSync), which varies with
+        # dataset size and would otherwise defeat the static ST_ROWS lookup.
+        base = re.sub(r"/iterations:\d+", "", name)
         # Strip Google Benchmark aggregate suffix, e.g. /real_time_mean
-        base = re.sub(r"/real_time(?:_mean|_median|_stddev|_cv)$", "", name)
+        base = re.sub(r"/real_time(?:_mean|_median|_stddev|_cv)$", "", base)
         base = re.sub(r"(?:_mean|_median|_stddev|_cv)$", "", base)
         out[base] = bench
     return out
