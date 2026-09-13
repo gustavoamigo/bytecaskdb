@@ -44,6 +44,7 @@ public:
 export struct Slot {
   bool sync{false};
   bool done{false};
+  bool lead{false};  // set by WriteGroup when this slot is handed leadership
   std::exception_ptr err;
 };
 
@@ -85,10 +86,11 @@ private:
 // ---------------------------------------------------------------------------
 // WriteGroup — leader-applies-all write batching (Template Method pattern).
 //
-// The algorithm skeleton lives here: enqueue → elect leader → drain queue →
-// call executor → mark done → wake → loop until empty. The domain-specific
-// batch execution logic is injected via a BatchExecutor callback at
-// construction time.
+// The algorithm skeleton lives here: enqueue → elect leader → take the queue
+// as one batch → call executor → mark done → wake → repeat while slots are
+// queued, up to kMaxLeaderBatches, then pass leadership to the head of the
+// queue. The domain-specific batch execution logic is injected via a
+// BatchExecutor callback at construction time.
 //
 // submit() is non-template — it takes a Slot&.
 // ---------------------------------------------------------------------------
@@ -102,9 +104,9 @@ public:
   WriteGroup &operator=(const WriteGroup &) = delete;
 
 #ifdef BYTECASK_TESTING
-  // Test-only hook: called after the leader is elected but before
-  // leader_loop() drains the queue. Allows a second thread to enqueue
-  // its slot deterministically into the same batch.
+  // Test-only hook: called after the leader is elected but before it takes
+  // the queue as its batch. Allows a second thread to enqueue its slot
+  // deterministically into the same batch.
   std::function<void()> on_leader_start_;
 
   // Block until the internal queue has at least n entries.
@@ -119,39 +121,61 @@ public:
   }
 #endif
 
+  // Longest run of consecutive batches one leader executes before it hands
+  // leadership to the head of the queue. The leader's own slot is done after
+  // its first batch, so every further batch it runs is time its caller
+  // waits: this bounds that wait to kMaxLeaderBatches commit cycles. It is
+  // not 1 because a hand-off costs a thread wake-up before the next batch
+  // can start, and a leader that stays hot starts the next batch the moment
+  // the previous one ends; rotating every batch measured 30–40% lower
+  // sync-write throughput at 16–32 writers on 4 cores. Draining without a
+  // bound is the other extreme: under closed-loop writers the queue never
+  // empties, and one client thread became a permanent leader whose own
+  // commit did not return for a 13-second run.
+  static constexpr int kMaxLeaderBatches = 8;
+
+  // Enqueues slot and blocks until it is done. A submitter that finds no
+  // leader becomes one and runs batches — everything queued at the start of
+  // each, its own slot included in the first — until the queue is empty or
+  // it has run kMaxLeaderBatches, whichever comes first; then it returns to
+  // its caller. If slots remain, leadership passes to the head of the queue.
   void submit(Slot &slot) {
     std::unique_lock<std::mutex> lk{queue_mu_};
     slot.done = false;
+    slot.lead = false;
     slot.err = nullptr;
     queue_.push_back(&slot);
 
     if (!leader_active_) {
       leader_active_ = true;
-      lk.unlock();
-#ifdef BYTECASK_TESTING
-      if (on_leader_start_) on_leader_start_();
-#endif
-      leader_loop();
-      lk.lock();
+      slot.lead = true;
+    } else {
+      cv_.wait(lk, [&] { return slot.done || slot.lead; });
     }
-
-    cv_.wait(lk, [&] { return slot.done; });
+    if (slot.lead) lead(lk);
 
     if (slot.err) std::rethrow_exception(slot.err);
   }
 
 private:
-  void leader_loop() {
-    while (true) {
+  // Runs queued slots batch after batch. Called with lk held and
+  // leader_active_ set; drops lk around each executor call and each wake.
+  // Returns with lk held once the caller's slot is done and leadership has
+  // been passed on or released. Every batch end wakes all waiters: batch
+  // members return, the rest re-check and sleep — one broadcast, as opposed
+  // to a wake per slot, which measured 2× slower at 32 writers.
+  void lead(std::unique_lock<std::mutex> &lk) {
+#ifdef BYTECASK_TESTING
+    if (on_leader_start_) {
+      lk.unlock();
+      on_leader_start_();
+      lk.lock();
+    }
+#endif
+    for (int batches = 1;; ++batches) {
       std::vector<Slot *> batch;
-      {
-        std::unique_lock<std::mutex> lk{queue_mu_};
-        if (queue_.empty()) {
-          leader_active_ = false;
-          return;
-        }
-        batch.swap(queue_);
-      }
+      batch.swap(queue_);
+      lk.unlock();
 
       try {
         executor_(batch);
@@ -162,11 +186,27 @@ private:
         }
       }
 
-      {
-        std::unique_lock<std::mutex> lk{queue_mu_};
-        for (auto *s : batch) s->done = true;
-      }
+      lk.lock();
+      for (auto *s : batch) s->done = true;
+      lk.unlock();
       cv_.notify_all();
+      lk.lock();
+      // Decide only now, after the broadcast: by the time the lock is back,
+      // members of the batch just finished have often resubmitted, and the
+      // leader batches them without a hand-off. Deciding before the
+      // broadcast, when the queue is momentarily empty, retires the leader
+      // every batch and the first resubmitter starts a batch of one.
+      if (queue_.empty()) {
+        leader_active_ = false;
+        return;
+      }
+      if (batches == kMaxLeaderBatches) {
+        queue_.front()->lead = true;
+        lk.unlock();
+        cv_.notify_all();
+        lk.lock();
+        return;
+      }
     }
   }
 

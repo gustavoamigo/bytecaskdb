@@ -8,6 +8,7 @@
 #include <barrier>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -196,6 +197,72 @@ TEST_CASE("WriteGroup concurrent submits are batched", "[concurrency]") {
   CHECK(total_slots.load() == kThreads);
   CHECK(exec_calls.load() >= 1);
   CHECK(exec_calls.load() <= kThreads);
+}
+
+// A leader runs at most kMaxLeaderBatches consecutive batches, then returns
+// to its caller and passes leadership to a queued slot. Under an unbounded
+// drain-until-empty leader, A would also run batch K+1 before returning, and
+// that batch's executor — which waits for A to have returned — times out.
+TEST_CASE("WriteGroup leader hands off after kMaxLeaderBatches", "[concurrency]") {
+  constexpr int kMax = bytecask::WriteGroup::kMaxLeaderBatches;
+  std::mutex mu;
+  std::condition_variable cv;
+  int followers_queued = 0;   // written by main thread under mu
+  bool a_returned = false;
+  std::atomic<int> exec_calls{0};
+  std::thread::id a_id;
+  std::vector<std::thread::id> leaders;
+
+  bytecask::WriteGroup wg{[&](std::vector<bytecask::Slot *> &batch) {
+    const int call = ++exec_calls;
+    std::unique_lock<std::mutex> lk{mu};
+    leaders.push_back(std::this_thread::get_id());
+    if (call <= kMax) {
+      // Hold this batch open until one more follower is queued behind it,
+      // so the leader always finds a non-empty queue at the batch end.
+      cv.wait(lk, [&] { return followers_queued >= call; });
+    } else {
+      // Batch K+1 may only start once A is back with its caller.
+      REQUIRE(cv.wait_for(lk, std::chrono::seconds{5},
+                          [&] { return a_returned; }));
+    }
+    (void)batch;
+  }};
+
+  std::thread a([&] {
+    a_id = std::this_thread::get_id();
+    bytecask::Slot slot;
+    wg.submit(slot);
+    {
+      std::lock_guard<std::mutex> lk{mu};
+      a_returned = true;
+    }
+    cv.notify_all();
+  });
+
+  // One follower per batch: each is queued while the previous batch runs.
+  std::vector<std::thread> followers;
+  for (int i = 1; i <= kMax; ++i) {
+    while (exec_calls.load() < i) std::this_thread::yield();
+    followers.emplace_back([&] {
+      bytecask::Slot slot;
+      wg.submit(slot);
+    });
+    wg.wait_for_queue_size(1);
+    {
+      std::lock_guard<std::mutex> lk{mu};
+      ++followers_queued;
+    }
+    cv.notify_all();
+  }
+
+  a.join();
+  for (auto &t : followers) t.join();
+
+  CHECK(exec_calls.load() == kMax + 1);
+  REQUIRE(leaders.size() == static_cast<std::size_t>(kMax + 1));
+  for (int i = 0; i < kMax; ++i) CHECK(leaders[static_cast<std::size_t>(i)] == a_id);
+  CHECK(leaders.back() != a_id);
 }
 
 TEST_CASE("WriteGroup executor exception propagates to the failing slot",
