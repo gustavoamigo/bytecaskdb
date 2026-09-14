@@ -31,6 +31,9 @@ export struct Counters {
   std::atomic<std::int64_t> group_writer_coalesced{0};
   std::atomic<std::int64_t> file_rotations{0};
   std::atomic<std::int64_t> fsyncs{0};
+  // Writers that slept in commit_wait behind an in-flight flush. Zero for
+  // a lone writer, which always flushes on its own thread.
+  std::atomic<std::int64_t> commit_wait_blocked{0};
 
   // -- Read path --
   std::atomic<std::int64_t> disk_reads{0};

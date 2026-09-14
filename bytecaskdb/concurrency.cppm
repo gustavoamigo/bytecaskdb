@@ -5,6 +5,7 @@
 // group write batching.
 
 module;
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <exception>
@@ -140,6 +141,7 @@ public:
     slot.lead = false;
     slot.err = nullptr;
     queue_.push_back(&slot);
+    inflight_.fetch_add(1, std::memory_order_relaxed);
 
     if (!leader_active_) {
       leader_active_ = true;
@@ -150,6 +152,13 @@ public:
     if (slot.lead) lead(lk);
 
     if (slot.err) std::rethrow_exception(slot.err);
+  }
+
+  // True while any submitted slot has not been executed yet: queued, or in
+  // the batch the leader is running. Lock-free so the commit pipeline's
+  // flusher can let an in-progress batch land before it captures the head.
+  [[nodiscard]] auto busy() const noexcept -> bool {
+    return inflight_.load(std::memory_order_acquire) > 0;
   }
 
 private:
@@ -180,6 +189,8 @@ private:
 
     lk.lock();
     for (auto *s : batch) s->done = true;
+    inflight_.fetch_sub(static_cast<int>(batch.size()),
+                        std::memory_order_release);
     if (queue_.empty()) {
       leader_active_ = false;
     } else {
@@ -194,6 +205,7 @@ private:
   std::vector<Slot *> queue_;
   bool leader_active_{false};
   std::condition_variable cv_;
+  std::atomic<int> inflight_{0};
 };
 
 // ---------------------------------------------------------------------------

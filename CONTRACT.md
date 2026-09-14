@@ -38,7 +38,14 @@ degrades the engine does so *without* publishing the failed transition:
   applied to in-memory state.
 - Classes F, G (sync failures): bytes are in the page cache but the
   key-directory changes are not published. `next_seq` advances to
-  prevent sequence reuse, but no key-value changes become visible.
+  prevent sequence reuse, but no key-value changes become visible. With
+  the commit pipeline a failed commit fdatasync (F) covers every writer
+  appended since the last successful flush: all of them receive the error
+  and none of their changes are published. `resume()` replays every valid
+  entry it finds in the active file, so a writer that received the error
+  can see its write persisted after recovery — true for the single batch
+  of class F before the pipeline, and now for every batch since the last
+  flush.
 - Class H (rotation failure): the write succeeded and was published, but
   the rotation to a new file failed. The published state is consistent
   with what recovery would find — the committed entries are on disk.
@@ -275,21 +282,30 @@ persistent → `store_state` path via `TransientEngineState::apply_sync`.
   `store_state` (same check as `next_seq`, `active_file_id`,
   `next_file_id`).
 
-- **Only advanced after successful fdatasync.** `apply_sync` must only
-  be called after `file.sync()` returns successfully. If sync fails
-  (classes F, G), the transient's `durable_seq` must not be updated.
+- **Only advanced after successful fdatasync.** `durable_seq` advances
+  only after `file.sync()` returns successfully — in `flush_pending`,
+  which publishes the prepared head it captured before the fdatasync
+  with `durable_seq = next_seq - 1`, or through `apply_sync` on the
+  rotation and ingest paths. If sync fails (classes F, G), the published
+  `durable_seq` is unchanged.
 
-- **Covers all entries in the batch.** When group commit syncs a batch,
-  `durable_seq` advances to `next_seq - 1` (the highest sequence
-  consumed by Phase 1). All entries in the batch — including earlier
-  nosync entries — are covered by the single `fdatasync`.
+- **Covers every entry appended before the fdatasync.** A flush covers
+  the prepared head as it stood when the flush started: every batch
+  appended since the previous flush, including nosync entries, is
+  covered by the single `fdatasync`. Entries appended while the fdatasync
+  was in flight are not claimed; the next flush covers them.
+
+- **Never published ahead of its sync requests.** Every published state
+  satisfies `durable_seq >= sync_requested_seq`, where
+  `sync_requested_seq` is the highest sequence written by a `sync=true`
+  slot. Enforced by `store_state`; a violation degrades the engine.
 
 - **Recovery sets `durable_seq = next_seq - 1`.** All recovered entries
   were previously synced. After `DB::open()` and `resume()`,
   `durable_seq` reflects the full recovered state.
 
-- **NoSync-only writes do not advance `durable_seq`.** If no `fdatasync`
-  occurs in `execute_slots`, the transient carries forward the previous
+- **NoSync-only writes do not advance `durable_seq`.** If the prepared
+  head owes no fdatasync, `flush_pending` publishes it with the previous
   `durable_seq` unchanged.
 
 `durable_sequence(min_sequence, timeout)` exposes `durable_seq` to callers
