@@ -9,6 +9,7 @@
 #include "fault_injector.h"
 #endif
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -2130,6 +2131,107 @@ TEST_CASE("FileStats: recovery reconstructs stats", "[bytecask][filestats]") {
     if (fs.total_bytes > 0) post_total += fs.total_bytes;
   }
   CHECK(pre_total == post_total);
+}
+
+// ---------------------------------------------------------------------------
+// The active file is preallocated and zero-filled to max_file_bytes so that
+// commits never wait on extent conversion. Once a file is sealed — by
+// rotation, clean close, or recovery after a crash — its physical size must
+// be its logical size again: file_size is what seeds total_bytes at recovery.
+// ---------------------------------------------------------------------------
+namespace {
+
+// (physical size, total_bytes) for every file in the state except the
+// active one, plus the active file's physical and logical sizes.
+struct SizeReport {
+  std::vector<std::pair<std::uintmax_t, std::uint64_t>> sealed;
+  std::uintmax_t active_physical{0};
+  std::uint64_t active_logical{0};
+};
+
+auto size_report(const bytecask::DB &db) -> SizeReport {
+  SizeReport r;
+  const auto s = db.engine_state();
+  const auto stats = db.file_stats();
+  for (const auto [id, file] : s->files) {
+    const auto physical = std::filesystem::file_size(file->path());
+    if (id == s->active_file_id) {
+      r.active_physical = physical;
+      r.active_logical = file->size();
+    } else {
+      r.sealed.emplace_back(physical, stats.at(id).total_bytes);
+    }
+  }
+  return r;
+}
+
+}  // namespace
+
+TEST_CASE("Preallocated tail: sealed files shrink to their logical size",
+          "[bytecask][filestats]") {
+  const bool use_mmap = GENERATE(false, true);
+  CAPTURE(use_mmap);
+  constexpr std::uint64_t kCapacity = 4096;
+  const bytecask::Options opts{.max_file_bytes = kCapacity,
+                               .use_mmap = use_mmap};
+
+  TempDir td;
+  const auto db_path = td.path / "db";
+  const std::string big(1500, 'v');
+
+  std::uint64_t pre_total = 0;
+  {
+    auto db = bytecask::DB::open(db_path, opts);
+    // Three 1.5 KiB values cross the 4 KiB threshold: at least one rotation.
+    db.put({}, to_bytes("a"), to_bytes(big));
+    db.put({}, to_bytes("b"), to_bytes(big));
+    db.put({}, to_bytes("c"), to_bytes(big));
+
+    const auto r = size_report(db);
+    REQUIRE(!r.sealed.empty());
+    for (const auto &[physical, total] : r.sealed) CHECK(physical == total);
+    // The active file still carries its preallocated tail.
+    CHECK(r.active_physical == kCapacity);
+    CHECK(r.active_logical < kCapacity);
+    for (const auto &[id, fs] : db.file_stats()) pre_total += fs.total_bytes;
+
+    // Crash: snapshot the data files while the engine is live. Only .data
+    // files — hints are derived and regenerated at open, and the background
+    // hint writer may be renaming a .hint.tmp under a recursive copy. The
+    // copied active file has its 4 KiB tail; recovery must drop it.
+    const auto crash_path = td.path / "crash";
+    std::filesystem::create_directories(crash_path);
+    for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+      if (e.path().extension() == ".data")
+        std::filesystem::copy_file(e.path(), crash_path / e.path().filename());
+    }
+    {
+      auto crashed = bytecask::DB::open(crash_path, opts);
+      const auto cr = size_report(crashed);
+      for (const auto &[physical, total] : cr.sealed) CHECK(physical == total);
+      std::uint64_t post_total = 0;
+      for (const auto &[id, fs] : crashed.file_stats()) post_total += fs.total_bytes;
+      CHECK(post_total == pre_total);
+      bytecask::Bytes out;
+      CHECK(crashed.get({}, to_bytes("c"), out));
+    }
+  }
+
+  // Clean close drops the active file's tail: on disk, every file is now
+  // exactly its logical size, so the physical bytes add up to total_bytes.
+  std::uint64_t on_disk = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".data")
+      on_disk += std::filesystem::file_size(e.path());
+  }
+  CHECK(on_disk == pre_total);
+
+  auto db2 = bytecask::DB::open(db_path, opts);
+  const auto r2 = size_report(db2);
+  for (const auto &[physical, total] : r2.sealed) CHECK(physical == total);
+  std::uint64_t post_total = 0;
+  for (const auto &[id, fs] : db2.file_stats()) post_total += fs.total_bytes;
+  CHECK(post_total == pre_total);
 }
 
 // ---------------------------------------------------------------------------

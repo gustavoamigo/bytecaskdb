@@ -6,9 +6,13 @@
 # -------------
 # 1. MariaDB development package containing handler.h and related headers:
 #      Fedora / RHEL:  dnf install mariadb-devel
-#      Debian / Ubuntu: apt install libmariadb-dev
-#    The headers live under $(mariadb_config --include-dir) or
-#    /usr/include/mysql on many distributions.
+#    Debian/Ubuntu's mariadb dev packages (libmariadb-dev, libmariadbd-dev)
+#    never ship handler.h and the rest of the server-internal sql/ headers —
+#    only Fedora's mariadb-devel bundles them. On Ubuntu, run
+#    scripts/setup_ubuntu_host.sh, which fetches and builds a matching
+#    MariaDB server source tree under .mariadb_server_src/.mariadb_server_build
+#    for this purpose; this file falls back to that tree automatically when
+#    the Fedora-style layout isn't found.
 #
 # 2. ByteCaskDB static archive (libbytecask.a) and its C++ header:
 #    Build the static target first:
@@ -102,9 +106,97 @@ if(NOT MARIADB_INCLUDE_DIR OR NOT EXISTS "${MARIADB_INCLUDE_DIR}")
     "  -DMARIADB_INCLUDE_DIR=/path/to/mysql/include")
 endif()
 
+# The plugin needs the full server-internal API (handler.h, sql_class.h, and
+# everything they transitively include) — Fedora's mariadb-devel bundles it
+# under <MARIADB_INCLUDE_DIR>/server(/private), but Debian/Ubuntu's mariadb
+# dev packages never ship it at all. When that Fedora-style layout isn't
+# present, fall back to a MariaDB server source + build tree (as produced by
+# scripts/setup_ubuntu_host.sh), which supplies the same headers straight
+# from sql/, mysys/, storage/innobase/include, etc.
+set(MARIADB_SERVER_INCLUDE_DIRS
+  # server/private must precede server which must precede the client include
+  # root so that the server-side my_global.h (which defines MY_GLOBAL_INCLUDED)
+  # is found before the client-side stub.
+  "${MARIADB_INCLUDE_DIR}/server/private"
+  "${MARIADB_INCLUDE_DIR}/server"
+  "${MARIADB_INCLUDE_DIR}")
+
+if(NOT EXISTS "${MARIADB_INCLUDE_DIR}/server/handler.h" AND
+   NOT EXISTS "${MARIADB_INCLUDE_DIR}/server/private/handler.h")
+  if(NOT DEFINED MARIADB_SERVER_SRC_DIR)
+    set(MARIADB_SERVER_SRC_DIR "${BYTECASK_ROOT}/.mariadb_server_src")
+  endif()
+  if(NOT DEFINED MARIADB_SERVER_BUILD_DIR)
+    set(MARIADB_SERVER_BUILD_DIR "${BYTECASK_ROOT}/.mariadb_server_build")
+  endif()
+
+  if(EXISTS "${MARIADB_SERVER_SRC_DIR}/sql/handler.h")
+    message(STATUS "MariaDB server headers : ${MARIADB_SERVER_SRC_DIR} (source tree)")
+
+    # ha_bytecaskdb.cc includes <mysql/server/private/sql_class.h> — the exact
+    # layout Fedora's mariadb-devel installs into /usr/include/mysql/server/
+    # private, resolved there via the compiler's default /usr/include search
+    # path rather than any -I flag. Our source tree doesn't reproduce that
+    # layout, so recreate it with a symlink onto sql/ directly.
+    set(_mariadb_server_private_dir "${MARIADB_SERVER_SRC_DIR}/include/mysql/server")
+    if(NOT EXISTS "${_mariadb_server_private_dir}/private")
+      file(MAKE_DIRECTORY "${_mariadb_server_private_dir}")
+      file(CREATE_LINK "${MARIADB_SERVER_SRC_DIR}/sql" "${_mariadb_server_private_dir}/private" SYMBOLIC)
+    endif()
+
+    # ha_bytecaskdb.cc also includes <private/service_versions.h> — same
+    # Fedora-layout assumption (that file lives at
+    # <pkgincludedir>/mysql/private/service_versions.h there) for a header
+    # that in our tree sits directly under include/. Self-alias so
+    # "private/X" resolves back to include/X.
+    if(NOT EXISTS "${MARIADB_SERVER_SRC_DIR}/include/private")
+      file(CREATE_LINK "." "${MARIADB_SERVER_SRC_DIR}/include/private" SYMBOLIC)
+    endif()
+
+    set(MARIADB_SERVER_INCLUDE_DIRS
+      "${MARIADB_SERVER_BUILD_DIR}/include"
+      "${MARIADB_SERVER_BUILD_DIR}/sql"
+      "${MARIADB_SERVER_BUILD_DIR}/strings"
+      "${MARIADB_SERVER_SRC_DIR}/include"
+      "${MARIADB_SERVER_SRC_DIR}/include/providers"
+      "${MARIADB_SERVER_SRC_DIR}/sql"
+      "${MARIADB_SERVER_SRC_DIR}/dbug"
+      "${MARIADB_SERVER_SRC_DIR}/mysys"
+      "${MARIADB_SERVER_SRC_DIR}/storage/innobase/include"
+      "${MARIADB_SERVER_SRC_DIR}/tpool"
+      "${MARIADB_SERVER_SRC_DIR}/wsrep-lib/include"
+      "${MARIADB_SERVER_SRC_DIR}/wsrep-lib/wsrep-API/v26")
+  else()
+    message(FATAL_ERROR
+      "MariaDB server-internal headers (handler.h) not found under "
+      "${MARIADB_INCLUDE_DIR}/server, nor in a built MariaDB source tree at "
+      "${MARIADB_SERVER_SRC_DIR}.\n"
+      "Debian/Ubuntu's MariaDB dev packages don't ship these headers at all — "
+      "run scripts/setup_ubuntu_host.sh to fetch and build a matching MariaDB "
+      "server source tree, or install mariadb-devel (Fedora).")
+  endif()
+endif()
+
 message(STATUS "MariaDB include dir : ${MARIADB_INCLUDE_DIR}")
 message(STATUS "ByteCaskDB include  : ${BYTECASK_INCLUDE_DIR}")
 message(STATUS "ByteCaskDB library  : ${BYTECASK_LIB}")
+
+# ha_bytecaskdb.cc's extra() handles ALTER TABLE...ALGORITHM=COPY bulk-copy
+# state transitions. Every released MariaDB (10.3 through at least 12.0)
+# names these enumerators HA_EXTRA_END_ALTER_COPY / HA_EXTRA_ABORT_ALTER_COPY;
+# MariaDB's unreleased main branch dropped the "_ALTER_" infix. Detect which
+# spelling the active headers provide instead of hardcoding one, since a
+# plain #ifdef can't see enum members (only macros).
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES ${MARIADB_SERVER_INCLUDE_DIRS})
+set(CMAKE_REQUIRED_DEFINITIONS -DMYSQL_SERVER -DDBUG_OFF)
+check_cxx_source_compiles("
+#include <my_global.h>
+#include <my_base.h>
+int main() { return HA_EXTRA_END_ALTER_COPY + HA_EXTRA_ABORT_ALTER_COPY; }
+" BYTECASKDB_HAVE_ALTER_COPY_NAMES)
+unset(CMAKE_REQUIRED_INCLUDES)
+unset(CMAKE_REQUIRED_DEFINITIONS)
 
 # ---------------------------------------------------------------------------
 # Import the static library as a CMake target
@@ -114,10 +206,18 @@ add_library(bytecask_static STATIC IMPORTED)
 set_target_properties(bytecask_static PROPERTIES
   IMPORTED_LOCATION "${BYTECASK_LIB}")
 
-# ByteCaskDB uses crc32c internally; link it too.
-find_library(CRC32C_LIB   NAMES crc32c HINTS /usr/lib64 /usr/lib /usr/local/lib /usr/local/lib64)
+# ByteCaskDB uses crc32c internally; link it too. No libcrc32c-dev package
+# exists on Ubuntu (see scripts/setup_ubuntu_host.sh) — xmake.lua already
+# fetches its own copy via add_requires("crc32c") to build the core engine,
+# so fall back to that cached copy when no system package is installed.
+file(GLOB CRC32C_XMAKE_HINTS "$ENV{HOME}/.xmake/packages/c/crc32c/*/*/lib")
+find_library(CRC32C_LIB NAMES crc32c
+  HINTS /usr/lib64 /usr/lib /usr/local/lib /usr/local/lib64 ${CRC32C_XMAKE_HINTS})
 if(NOT CRC32C_LIB)
-  message(FATAL_ERROR "crc32c not found.  Install google-crc32c-devel (Fedora) or libcrc32c-dev (Debian).")
+  message(FATAL_ERROR
+    "crc32c not found. Install google-crc32c-devel (Fedora) or libcrc32c-dev "
+    "(Debian), or run 'xmake build bytecask' first so its fetched crc32c "
+    "copy under ~/.xmake/packages is available.")
 endif()
 
 # When ON, embed libstdc++ and libgcc statically so the .so has no C++ runtime
@@ -147,12 +247,7 @@ if(BYTECASKDB_STATIC_LIBSTDCXX)
 endif()
 
 target_include_directories(ha_bytecaskdb PRIVATE
-  # server/private must precede server which must precede the client include
-  # root so that the server-side my_global.h (which defines MY_GLOBAL_INCLUDED)
-  # is found before the client-side stub.
-  "${MARIADB_INCLUDE_DIR}/server/private"
-  "${MARIADB_INCLUDE_DIR}/server"
-  "${MARIADB_INCLUDE_DIR}"
+  ${MARIADB_SERVER_INCLUDE_DIRS}
   "${BYTECASK_INCLUDE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}"
 )
@@ -169,6 +264,7 @@ target_compile_options(ha_bytecaskdb PRIVATE
   # the plugin with the same flag so the macros collapse to no-ops.
   -DDBUG_OFF
   -DDISABLE_DTRACE
+  $<$<BOOL:${BYTECASKDB_HAVE_ALTER_COPY_NAMES}>:-DBYTECASKDB_HAVE_ALTER_COPY_NAMES>
   # MariaDB headers trigger some pedantic warnings; suppress known noise.
   -Wno-unused-parameter
   -Wno-missing-field-initializers

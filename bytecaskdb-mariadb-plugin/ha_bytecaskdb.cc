@@ -1035,7 +1035,15 @@ int ha_bytecaskdb::extra(enum ha_extra_function operation) {
     case HA_EXTRA_WRITE_CANNOT_REPLACE:
       dupcheck_eager_ = false;
       break;
+    // Every released MariaDB (10.3 through at least 12.0) names these
+    // HA_EXTRA_END_ALTER_COPY / HA_EXTRA_ABORT_ALTER_COPY; MariaDB's
+    // unreleased main branch dropped the "_ALTER_" infix. See CMakeLists.txt's
+    // BYTECASKDB_HAVE_ALTER_COPY_NAMES detection.
+#ifdef BYTECASKDB_HAVE_ALTER_COPY_NAMES
+    case HA_EXTRA_END_ALTER_COPY:
+#else
     case HA_EXTRA_END_COPY:
+#endif
       // Belt-and-suspenders: end_bulk_insert normally does the final flush.
       if (txn_cached_ && txn_cached_->in_bulk_copy()) {
         int e = txn_cached_->bulk_flush(true);
@@ -1043,7 +1051,11 @@ int ha_bytecaskdb::extra(enum ha_extra_function operation) {
         if (e) { return e; }
       }
       break;
+#ifdef BYTECASKDB_HAVE_ALTER_COPY_NAMES
+    case HA_EXTRA_ABORT_ALTER_COPY:
+#else
     case HA_EXTRA_ABORT_COPY:
+#endif
       if (txn_cached_) { txn_cached_->abort_bulk_copy(); }
       break;
     default:

@@ -80,9 +80,17 @@ export struct VacuumOptions {
 };
 
 
-// Default active-file size threshold: 64 MiB.
+// Default active-file size threshold: 64 MiB. Active files are zero-filled
+// in chunks up to this size (see WritableFileOps::ensure_zeroed), so the
+// test build uses 64 KiB: the suite opens hundreds of databases, and a
+// multi-MiB fill for each is disk writes for no extra coverage.
+#ifdef BYTECASK_TESTING
+export inline constexpr std::uint64_t kDefaultRotationThreshold =
+    64ULL * 1024;
+#else
 export inline constexpr std::uint64_t kDefaultRotationThreshold =
     64ULL * 1024 * 1024;
+#endif
 
 // Hard limits imposed by the on-disk entry header format and in-memory packing.
 // key_size is u16 (2 bytes), value_size is u24 in packed KeyDirEntry (16 MiB).
@@ -882,9 +890,12 @@ private:
   void deem_as_degraded(std::string reason);
 
   // Hint file management
-  // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint exists.
-  static void flush_hints_for(const std::shared_ptr<DataFile> &file,
-                               const std::filesystem::path &dir);
+  // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint
+  // exists. Returns the offset past the last committed entry, or nullopt
+  // when the hint already existed and nothing was scanned.
+  static auto flush_hints_for(const std::shared_ptr<DataFile> &file,
+                              const std::filesystem::path &dir)
+      -> std::optional<Offset>;
   // Writes hint files for all sealed files in s.
   void flush_hints(const EngineState &s);
 
@@ -1984,6 +1995,7 @@ DB::~DB() {
     try {
       auto t = s->transient();
       t.active_file().sync();
+      t.active_file().shrink_to_fit();
     } catch (...) {}
   }
   try {
@@ -2471,11 +2483,12 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 
 #pragma region File rotation
 
-// Opens a read-only mmap-backed file for the old active, dispatches hint
-// generation, and opens a new writable active file.
+// Drops the old active file's preallocated tail, opens it read-only,
+// dispatches hint generation, and opens a new writable active file.
 // Caller must sync the active file before calling if durability is required.
 void DB::rotate_active_file(TransientEngineState &t,
                             const std::shared_ptr<const EngineState> &) {
+  t.active_file().shrink_to_fit();
   auto read_only_old = openDataFileForRead(t.active_file().path(), use_mmap_);
   const auto stem = make_data_file_stem();
 #ifdef BYTECASK_TESTING
@@ -2499,19 +2512,23 @@ void DB::rotate_active_file(TransientEngineState &t,
 // and written only when BulkEnd is seen; an incomplete batch (crash
 // mid-write) is silently discarded. Idempotent: skips files whose .hint
 // already exists.
-void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
-                               const std::filesystem::path &dir) {
+auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
+                              const std::filesystem::path &dir)
+    -> std::optional<Offset> {
   const auto stem = file->path().stem().string();
   const auto hint_path = dir / (stem + ".hint");
   const auto tmp_path = dir / (stem + ".hint.tmp");
 
   if (std::filesystem::exists(hint_path)) {
-    return;
+    return std::nullopt;
   }
 
   auto hint = HintFile::OpenForWrite(tmp_path);
 
-  for (const auto &[entry, entry_off] : scan_committed(*file)) {
+  auto committed = scan_committed(*file);
+  auto it = committed.begin();
+  for (; it != std::default_sentinel; ++it) {
+    const auto &[entry, entry_off] = *it;
     if (entry.entry_type == EntryType::BulkBegin ||
         entry.entry_type == EntryType::BulkEnd) {
       hint.append(entry.sequence, entry.entry_type, entry_off, {}, 0);
@@ -2528,6 +2545,7 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
 
   hint.close();
   std::filesystem::rename(tmp_path, hint_path);
+  return it.committed_offset();
 }
 
 // Writes hint files for all sealed data files in the given state.
@@ -2667,6 +2685,7 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
         dir_, stem, ".data.tmp", rotation_threshold_, use_mmap_);
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id);
     tmp_file->sync();
+    tmp_file->shrink_to_fit();
   }
 
 #ifdef BYTECASK_TESTING
@@ -3134,12 +3153,22 @@ auto DB::recovery_prepare_files(EngineState &s)
 
     const auto file_id = s.next_file_id++;
     auto data_file = openDataFileForRead(p, use_mmap_);
-    files_t.set(file_id, data_file);
 
     const auto hint_path = dir_ / (p.stem().string() + ".hint");
     if (!std::filesystem::exists(hint_path)) {
-      flush_hints_for(data_file, dir_);
+      // A file without a hint was the active file at the last shutdown. A
+      // clean close already dropped its preallocated tail; after a crash it
+      // still carries it. Drop it now so its physical size is its logical
+      // size, as for every other sealed file — file_size below is what
+      // seeds total_bytes for vacuum.
+      const auto end = flush_hints_for(data_file, dir_);
+      if (end && *end < std::filesystem::file_size(p)) {
+        data_file.reset();
+        std::filesystem::resize_file(p, *end);
+        data_file = openDataFileForRead(p, use_mmap_);
+      }
     }
+    files_t.set(file_id, data_file);
 
     files.push_back({file_id, std::move(data_file), hint_path,
                      std::filesystem::file_size(p)});

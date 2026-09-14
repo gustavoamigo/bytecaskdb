@@ -1,3 +1,0 @@
-engine,workload,threads,tps,avg_lat_ms,p95_ms
-bytecaskdb,oltp_insert,1,84970,0.35,0.73
-innodb,oltp_insert,1,71083,0.42,1.03

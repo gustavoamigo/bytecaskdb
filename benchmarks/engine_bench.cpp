@@ -379,11 +379,18 @@ struct BcAdapterBase {
   }
 };
 
+// BcAdapter: default ByteCaskDB adapter behind the unlabeled "ByteCaskDB/..."
+// benchmarks. Uses mmap reads. BcPreadAdapter below is the pread counterpart,
+// benchmarked separately as "ByteCaskDB_Pread/...".
+using BcAdapter = BcAdapterBase<true>;
+
+// BcPreadAdapter: pread-based read path, for direct comparison against the
+// mmap default.
+using BcPreadAdapter = BcAdapterBase<false>;
+
 // BcAdapterStale: identical to BcAdapter but get() uses bounded staleness
 // (thread-local snapshot refreshed every staleness_tolerance). Lets BM_GetMT
 // compare the session path vs the bounded-staleness path under concurrency.
-using BcAdapter = BcAdapterBase<false>;
-
 struct BcAdapterStale : BcAdapter {
   static void get(Db &db, const std::string &k) {
     bytecask::ReadOptions ro;
@@ -1347,8 +1354,8 @@ void BM_RecoveryParallel(benchmark::State &state) {
 // reflected in throughput counters instead of being hidden by CPU-time.
 #define BENCH(...) BENCHMARK(__VA_ARGS__)->UseRealTime()
 
-using Bc  = BcAdapter;
-using BcMmap = BcAdapterBase<true>;
+using Bc  = BcAdapter;        // mmap (default read path)
+using BcPread = BcPreadAdapter;  // pread (explicit comparison)
 using BcUV = BcUnorderedViewAdapter;
 
 // BcAdapter with UUIDv4 keys for apples-to-apples comparison with UnorderedView.
@@ -1434,12 +1441,12 @@ BENCH(BM_GetMT<Bc>)                ->Name("ByteCaskDB/GetMT")           ->Thread
 BENCH(BM_GetMT<Bc>)                ->Name("ByteCaskDB/GetMT")           ->Threads(8);
 BENCH(BM_GetMT<Bc>)                ->Name("ByteCaskDB/GetMT")           ->Threads(16);
 BENCH(BM_GetMT<Bc>)                ->Name("ByteCaskDB/GetMT")           ->Threads(32);
-// --- Mmap GetMT ---
-BENCH(BM_GetMT<BcMmap>)            ->Name("ByteCaskDB_Mmap/GetMT")      ->Threads(2);
-BENCH(BM_GetMT<BcMmap>)            ->Name("ByteCaskDB_Mmap/GetMT")      ->Threads(4);
-BENCH(BM_GetMT<BcMmap>)            ->Name("ByteCaskDB_Mmap/GetMT")      ->Threads(8);
-BENCH(BM_GetMT<BcMmap>)            ->Name("ByteCaskDB_Mmap/GetMT")      ->Threads(16);
-BENCH(BM_GetMT<BcMmap>)            ->Name("ByteCaskDB_Mmap/GetMT")      ->Threads(32);
+// --- Pread GetMT ---
+BENCH(BM_GetMT<BcPread>)           ->Name("ByteCaskDB_Pread/GetMT")     ->Threads(2);
+BENCH(BM_GetMT<BcPread>)           ->Name("ByteCaskDB_Pread/GetMT")     ->Threads(4);
+BENCH(BM_GetMT<BcPread>)           ->Name("ByteCaskDB_Pread/GetMT")     ->Threads(8);
+BENCH(BM_GetMT<BcPread>)           ->Name("ByteCaskDB_Pread/GetMT")     ->Threads(16);
+BENCH(BM_GetMT<BcPread>)           ->Name("ByteCaskDB_Pread/GetMT")     ->Threads(32);
 #ifndef BENCH_NO_ROCKSDB
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(2);
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(4);
@@ -1460,12 +1467,12 @@ BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCaskDB/ReadAndWriteL
 BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCaskDB/ReadAndWriteLoad/Sync")            ->Threads(8);
 BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCaskDB/ReadAndWriteLoad/Sync")            ->Threads(16);
 BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCaskDB/ReadAndWriteLoad/Sync")            ->Threads(32);
-// --- Mmap ReadAndWriteLoad ---
-BENCH(BM_ReadWhileWriting<BcMmap, true>)        ->Name("ByteCaskDB_Mmap/ReadAndWriteLoad/Sync")        ->Threads(2);
-BENCH(BM_ReadWhileWriting<BcMmap, true>)        ->Name("ByteCaskDB_Mmap/ReadAndWriteLoad/Sync")        ->Threads(4);
-BENCH(BM_ReadWhileWriting<BcMmap, true>)        ->Name("ByteCaskDB_Mmap/ReadAndWriteLoad/Sync")        ->Threads(8);
-BENCH(BM_ReadWhileWriting<BcMmap, true>)        ->Name("ByteCaskDB_Mmap/ReadAndWriteLoad/Sync")        ->Threads(16);
-BENCH(BM_ReadWhileWriting<BcMmap, true>)        ->Name("ByteCaskDB_Mmap/ReadAndWriteLoad/Sync")        ->Threads(32);
+// --- Pread ReadAndWriteLoad ---
+BENCH(BM_ReadWhileWriting<BcPread, true>)       ->Name("ByteCaskDB_Pread/ReadAndWriteLoad/Sync")       ->Threads(2);
+BENCH(BM_ReadWhileWriting<BcPread, true>)       ->Name("ByteCaskDB_Pread/ReadAndWriteLoad/Sync")       ->Threads(4);
+BENCH(BM_ReadWhileWriting<BcPread, true>)       ->Name("ByteCaskDB_Pread/ReadAndWriteLoad/Sync")       ->Threads(8);
+BENCH(BM_ReadWhileWriting<BcPread, true>)       ->Name("ByteCaskDB_Pread/ReadAndWriteLoad/Sync")       ->Threads(16);
+BENCH(BM_ReadWhileWriting<BcPread, true>)       ->Name("ByteCaskDB_Pread/ReadAndWriteLoad/Sync")       ->Threads(32);
 BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(2);
 BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(4);
 BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(8);
@@ -1490,13 +1497,13 @@ BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads
 BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads(16); 
 BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads(32);
 BENCH(BM_PutMT<Bc, true>)          ->Name("ByteCaskDB/PutMT/Sync")     ->Threads(64);
-// --- Mmap PutMT ---
-BENCH(BM_PutMT<BcMmap, true>)      ->Name("ByteCaskDB_Mmap/PutMT/Sync") ->Threads(2) ;
-BENCH(BM_PutMT<BcMmap, true>)      ->Name("ByteCaskDB_Mmap/PutMT/Sync") ->Threads(4) ;
-BENCH(BM_PutMT<BcMmap, true>)      ->Name("ByteCaskDB_Mmap/PutMT/Sync") ->Threads(8) ;
-BENCH(BM_PutMT<BcMmap, true>)      ->Name("ByteCaskDB_Mmap/PutMT/Sync") ->Threads(16);
-BENCH(BM_PutMT<BcMmap, true>)      ->Name("ByteCaskDB_Mmap/PutMT/Sync") ->Threads(32);
-BENCH(BM_PutMT<BcMmap, true>)      ->Name("ByteCaskDB_Mmap/PutMT/Sync") ->Threads(64);
+// --- Pread PutMT ---
+BENCH(BM_PutMT<BcPread, true>)     ->Name("ByteCaskDB_Pread/PutMT/Sync") ->Threads(2) ;
+BENCH(BM_PutMT<BcPread, true>)     ->Name("ByteCaskDB_Pread/PutMT/Sync") ->Threads(4) ;
+BENCH(BM_PutMT<BcPread, true>)     ->Name("ByteCaskDB_Pread/PutMT/Sync") ->Threads(8) ;
+BENCH(BM_PutMT<BcPread, true>)     ->Name("ByteCaskDB_Pread/PutMT/Sync") ->Threads(16);
+BENCH(BM_PutMT<BcPread, true>)     ->Name("ByteCaskDB_Pread/PutMT/Sync") ->Threads(32);
+BENCH(BM_PutMT<BcPread, true>)     ->Name("ByteCaskDB_Pread/PutMT/Sync") ->Threads(64);
 #ifndef BENCH_NO_ROCKSDB
 BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(2) ;
 BENCH(BM_PutMT<Rdb, true>)         ->Name("RocksDB/PutMT/Sync")      ->Threads(4) ;
