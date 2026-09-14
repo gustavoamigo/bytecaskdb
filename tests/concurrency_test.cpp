@@ -199,15 +199,14 @@ TEST_CASE("WriteGroup concurrent submits are batched", "[concurrency]") {
   CHECK(exec_calls.load() <= kThreads);
 }
 
-// A leader runs at most kMaxLeaderBatches consecutive batches, then returns
-// to its caller and passes leadership to a queued slot. Under an unbounded
-// drain-until-empty leader, A would also run batch K+1 before returning, and
-// that batch's executor — which waits for A to have returned — times out.
-TEST_CASE("WriteGroup leader hands off after kMaxLeaderBatches", "[concurrency]") {
-  constexpr int kMax = bytecask::WriteGroup::kMaxLeaderBatches;
+// A leader runs exactly one batch, then returns to its caller and passes
+// leadership to a slot queued during that batch. Under a leader that kept
+// draining, A would also run the second batch before returning, and that
+// batch's executor — which waits for A to have returned — times out.
+TEST_CASE("WriteGroup leader hands off after its batch", "[concurrency]") {
   std::mutex mu;
   std::condition_variable cv;
-  int followers_queued = 0;   // written by main thread under mu
+  bool follower_queued = false;   // written by main thread under mu
   bool a_returned = false;
   std::atomic<int> exec_calls{0};
   std::thread::id a_id;
@@ -217,12 +216,12 @@ TEST_CASE("WriteGroup leader hands off after kMaxLeaderBatches", "[concurrency]"
     const int call = ++exec_calls;
     std::unique_lock<std::mutex> lk{mu};
     leaders.push_back(std::this_thread::get_id());
-    if (call <= kMax) {
-      // Hold this batch open until one more follower is queued behind it,
-      // so the leader always finds a non-empty queue at the batch end.
-      cv.wait(lk, [&] { return followers_queued >= call; });
+    if (call == 1) {
+      // Hold A's batch open until the follower is queued behind it, so A
+      // finds a non-empty queue at the batch end and must hand off.
+      cv.wait(lk, [&] { return follower_queued; });
     } else {
-      // Batch K+1 may only start once A is back with its caller.
+      // The follower's batch may only start once A is back with its caller.
       REQUIRE(cv.wait_for(lk, std::chrono::seconds{5},
                           [&] { return a_returned; }));
     }
@@ -240,29 +239,25 @@ TEST_CASE("WriteGroup leader hands off after kMaxLeaderBatches", "[concurrency]"
     cv.notify_all();
   });
 
-  // One follower per batch: each is queued while the previous batch runs.
-  std::vector<std::thread> followers;
-  for (int i = 1; i <= kMax; ++i) {
-    while (exec_calls.load() < i) std::this_thread::yield();
-    followers.emplace_back([&] {
-      bytecask::Slot slot;
-      wg.submit(slot);
-    });
-    wg.wait_for_queue_size(1);
-    {
-      std::lock_guard<std::mutex> lk{mu};
-      ++followers_queued;
-    }
-    cv.notify_all();
+  while (exec_calls.load() < 1) std::this_thread::yield();
+  std::thread follower([&] {
+    bytecask::Slot slot;
+    wg.submit(slot);
+  });
+  wg.wait_for_queue_size(1);
+  {
+    std::lock_guard<std::mutex> lk{mu};
+    follower_queued = true;
   }
+  cv.notify_all();
 
   a.join();
-  for (auto &t : followers) t.join();
+  follower.join();
 
-  CHECK(exec_calls.load() == kMax + 1);
-  REQUIRE(leaders.size() == static_cast<std::size_t>(kMax + 1));
-  for (int i = 0; i < kMax; ++i) CHECK(leaders[static_cast<std::size_t>(i)] == a_id);
-  CHECK(leaders.back() != a_id);
+  CHECK(exec_calls.load() == 2);
+  REQUIRE(leaders.size() == 2);
+  CHECK(leaders[0] == a_id);
+  CHECK(leaders[1] != a_id);
 }
 
 TEST_CASE("WriteGroup executor exception propagates to the failing slot",
