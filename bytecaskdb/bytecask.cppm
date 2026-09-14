@@ -80,10 +80,10 @@ export struct VacuumOptions {
 };
 
 
-// Default active-file size threshold: 64 MiB. Every new active file is
-// zero-filled to this size (see WritableFileOps::preallocate), so the test
-// build uses 64 KiB: the suite opens hundreds of databases, and 64 MiB each
-// is minutes of disk writes for no extra coverage.
+// Default active-file size threshold: 64 MiB. Active files are zero-filled
+// in chunks up to this size (see WritableFileOps::ensure_zeroed), so the
+// test build uses 64 KiB: the suite opens hundreds of databases, and a
+// multi-MiB fill for each is disk writes for no extra coverage.
 #ifdef BYTECASK_TESTING
 export inline constexpr std::uint64_t kDefaultRotationThreshold =
     64ULL * 1024;

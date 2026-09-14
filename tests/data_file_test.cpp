@@ -309,7 +309,7 @@ auto count_extents(const std::filesystem::path &path)
   return out;
 }
 
-// A fresh active file must have every extent *written* at creation, not
+// A fresh active file's first chunk must have every extent *written*, not
 // merely allocated: an unwritten extent is converted on first write, and that
 // conversion is journaled metadata every fdatasync then waits for. Holds for
 // both file types, and shrink_to_fit must give the tail back.
@@ -326,7 +326,8 @@ TEST_CASE("WritableDataFile: fresh file has no unwritten extents",
       std::filesystem::temp_directory_path(), "bc_test_zero_fill", ".data",
       kCapacity, use_mmap);
   CHECK(file->size() == 0);
-  CHECK(std::filesystem::file_size(path) == kCapacity);
+  // Zero-filled one chunk ahead, not to capacity.
+  CHECK(std::filesystem::file_size(path) == bytecask::kZeroFillChunkBytes);
 
   if (const auto ext = count_extents(path)) {
     CHECK(ext->total > 0);

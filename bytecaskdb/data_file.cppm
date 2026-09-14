@@ -115,6 +115,10 @@ protected:
 
 DataFile::~DataFile() = default;
 
+// Writable data files are zero-filled this far ahead of the write cursor,
+// never past their capacity. See WritableFileOps::ensure_zeroed.
+export inline constexpr std::size_t kZeroFillChunkBytes = 4 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // WritableDataFile — pure interface for the write API.
 //
@@ -137,7 +141,7 @@ public:
 
   virtual void truncate(Offset new_size) = 0;
 
-  // Releases the preallocated tail: truncates the file to size() and syncs
+  // Releases the zero-filled tail: truncates the file to size() and syncs
   // the new length. Called once, when the file is sealed, so that a sealed
   // file's physical size is its logical size. Unlike truncate() this never
   // touches a mapping, so it is safe while readers hold snapshots of this
@@ -161,7 +165,9 @@ WritableDataFile::~WritableDataFile() = default;
 
 struct WritableFileOps {
   int fd_{-1};
-  Offset offset_{0};
+  Offset offset_{0};       // logical end: next append lands here
+  Offset zeroed_end_{0};   // physical end: zeros written through here
+  std::size_t capacity_{0};  // zero-fill never extends past this (0 = off)
   std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};
 
   [[nodiscard]] auto append_entry(std::uint64_t sequence, EntryType entry_type,
@@ -181,6 +187,7 @@ struct WritableFileOps {
         {hdr_crc_buf_.data() + kHeaderSize, kCrcSize},
     }};
     const auto total = kHeaderSize + key.size() + value.size() + kCrcSize;
+    ensure_zeroed(offset_ + static_cast<Offset>(total));
 
     const auto written = ::pwritev(fd_, iov.data(), std::ssize(iov),
                                    narrow<off_t>(offset_));
@@ -256,6 +263,7 @@ struct WritableFileOps {
 #endif
       }
 
+      ensure_zeroed(offset_ + static_cast<Offset>(total_bytes));
       const auto written =
           ::pwritev(fd_, iov.data(), narrow<int>(chunk_size * kIovecsPerEntry),
                     narrow<off_t>(offset_));
@@ -285,41 +293,47 @@ struct WritableFileOps {
 
   [[nodiscard]] auto size() const noexcept -> Offset { return offset_; }
 
-  // Grows the file to capacity and writes zeros over [offset_, capacity).
-  // Allocation alone is not enough: fallocate reserves *unwritten* extents,
-  // and the first write into each block converts one — a journaled metadata
-  // change that the next fdatasync must wait for, roughly doubling the cost
-  // of every commit on ext4. Zeroing once here makes every extent written,
-  // so later fdatasyncs are pure data flushes. One sequential write of
-  // capacity bytes, paid at file creation. Leaves offset_ untouched.
-  void preallocate(std::size_t capacity) {
-    if (capacity <= offset_) return;
-#ifdef __linux__
-    if (::fallocate(fd_, 0, 0, narrow<off_t>(capacity)) != 0) {
-      throw std::system_error{errno, std::generic_category(),
-                              "WritableFileOps::preallocate: fallocate failed"};
-    }
+  // Keeps the file zero-filled ahead of the write cursor: before an append
+  // ends at write_end, zeros are written from zeroed_end_ up to the next
+  // kZeroFillChunkBytes boundary, never past capacity_ (an oversize entry
+  // beyond it gets exactly what it needs). capacity_ == 0 turns this off —
+  // tests and tooling that reopen files they wrote expect exact sizes.
+  // Extents that were only allocated (fallocate) are *unwritten*; the
+  // first write into each block converts
+  // one, a journaled metadata change every fdatasync then waits for — on
+  // ext4 roughly doubling the cost of each commit. Writing zeros converts a
+  // whole chunk at once: the commit that crosses into a new chunk flushes
+  // it (one journal commit, ~30 ms for 4 MiB on an SSD), and every other
+  // commit in the chunk is a pure data flush. The zeros are not synced
+  // here; the next sync covers them. A 1 MiB scratch buffer is enough,
+  // since the cost is the page-cache memcpy, not the call count.
+  void ensure_zeroed(Offset write_end) {
+#ifdef __EMSCRIPTEN__
+    // MEMFS holds files in memory: nothing to gain, and a zero tail would
+    // be resident memory.
+    (void)write_end;
 #else
-    if (::ftruncate(fd_, narrow<off_t>(capacity)) != 0) {
-      throw std::system_error{errno, std::generic_category(),
-                              "WritableFileOps::preallocate: ftruncate failed"};
-    }
-#endif
-    static constexpr std::size_t kChunk = 1024 * 1024;
-    const std::vector<std::byte> zeros(kChunk, std::byte{0});
-    for (auto off = static_cast<std::size_t>(offset_); off < capacity;
-         off += kChunk) {
-      const auto len = std::min(kChunk, capacity - off);
+    if (capacity_ == 0 || write_end <= zeroed_end_) return;
+    const auto chunk_end = (write_end + kZeroFillChunkBytes - 1) /
+                           kZeroFillChunkBytes * kZeroFillChunkBytes;
+    const auto target =
+        std::max(write_end, std::min<Offset>(chunk_end, capacity_));
+    static constexpr std::size_t kBuf = 1024 * 1024;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+    thread_local const std::vector<std::byte> zeros(kBuf, std::byte{0});
+#pragma clang diagnostic pop
+    for (auto off = zeroed_end_; off < target;) {
+      const auto len = std::min<Offset>(kBuf, target - off);
       if (::pwrite(fd_, zeros.data(), len, narrow<off_t>(off)) !=
           narrow<ssize_t>(len)) {
         throw std::system_error{errno, std::generic_category(),
-                                "WritableFileOps::preallocate: pwrite failed"};
+                                "WritableFileOps::ensure_zeroed: pwrite failed"};
       }
+      off += len;
     }
-    if (::fsync(fd_) != 0) {
-      throw std::system_error{errno, std::generic_category(),
-                              "WritableFileOps::preallocate: fsync failed"};
-    }
+    zeroed_end_ = target;
+#endif
   }
 
   // See WritableDataFile::shrink_to_fit. ftruncate + fdatasync: the size
@@ -333,6 +347,16 @@ struct WritableFileOps {
       throw std::system_error{errno, std::generic_category(),
                               "WritableFileOps::shrink_to_fit: fdatasync failed"};
     }
+    zeroed_end_ = offset_;
+  }
+
+  // Adopts the file's current length as both logical and physical end, and
+  // fills the first chunk of a fresh file so its first commits are cheap.
+  void adopt(Offset file_size, std::size_t capacity) {
+    offset_ = file_size;
+    zeroed_end_ = file_size;
+    capacity_ = capacity;
+    if (file_size == 0 && capacity > 0) ensure_zeroed(1);
   }
 
   [[nodiscard]] auto scan(Offset offset) const
@@ -412,8 +436,9 @@ private:
 // ---------------------------------------------------------------------------
 // WritableMmapDataFile — mmap-backed writable data file.
 //
-// Pre-allocates and zero-fills the file to a fixed capacity
-// (WritableFileOps::preallocate) and maps it with MAP_SHARED.
+// Maps the file at a fixed capacity with MAP_SHARED; the file itself is
+// zero-filled in chunks ahead of the write cursor (WritableFileOps::
+// ensure_zeroed), so pages past zeroed_end_ are mapped but never touched.
 // Writes go through pwritev; reads come from the mmap region (zero syscalls).
 // When a read offset falls beyond the mmap region (rare: file grew past the
 // pre-allocated size in degraded mode), reads fall back to pread.
@@ -529,6 +554,7 @@ public:
                               "WritableMmapDataFile::truncate"};
     }
     ops_.offset_ = new_size;
+    ops_.zeroed_end_ = new_size;
     if (new_size > 0) {
       // NOLINTNEXTLINE(performance-no-int-to-ptr)
       auto *ptr = ::mmap(nullptr, static_cast<std::size_t>(new_size),
@@ -562,9 +588,8 @@ private:
 #ifndef __APPLE__
     ::posix_fadvise(ops_.fd_, 0, 0, POSIX_FADV_RANDOM);
 #endif
-    ops_.offset_ = std::filesystem::file_size(path_);
+    ops_.adopt(std::filesystem::file_size(path_), capacity);
     if (capacity > 0) {
-      ops_.preallocate(capacity);
       // NOLINTNEXTLINE(performance-no-int-to-ptr)
       auto *ptr = ::mmap(nullptr, capacity, PROT_READ, MAP_SHARED, ops_.fd_, 0);
       if (ptr == MAP_FAILED) {
@@ -747,6 +772,7 @@ public:
                               "WritablePosixDataFile::truncate"};
     }
     ops_.offset_ = new_size;
+    ops_.zeroed_end_ = new_size;
   }
 
   void shrink_to_fit() override { ops_.shrink_to_fit(); }
@@ -767,14 +793,7 @@ private:
 #ifndef __APPLE__
     ::posix_fadvise(ops_.fd_, 0, 0, POSIX_FADV_RANDOM);
 #endif
-    ops_.offset_ = std::filesystem::file_size(path_);
-#ifndef __EMSCRIPTEN__
-    // MEMFS holds files in memory: a preallocated tail would be resident
-    // memory with nothing to gain, since there is no journal to avoid.
-    if (capacity > 0) ops_.preallocate(capacity);
-#else
-    (void)capacity;
-#endif
+    ops_.adopt(std::filesystem::file_size(path_), capacity);
   }
 
   WritableFileOps ops_;

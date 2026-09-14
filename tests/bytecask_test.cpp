@@ -2195,11 +2195,16 @@ TEST_CASE("Preallocated tail: sealed files shrink to their logical size",
     CHECK(r.active_logical < kCapacity);
     for (const auto &[id, fs] : db.file_stats()) pre_total += fs.total_bytes;
 
-    // Crash: snapshot the directory while the engine is live. The copied
-    // active file has its 4 KiB tail; recovery must drop it.
+    // Crash: snapshot the data files while the engine is live. Only .data
+    // files — hints are derived and regenerated at open, and the background
+    // hint writer may be renaming a .hint.tmp under a recursive copy. The
+    // copied active file has its 4 KiB tail; recovery must drop it.
     const auto crash_path = td.path / "crash";
-    std::filesystem::copy(db_path, crash_path,
-                          std::filesystem::copy_options::recursive);
+    std::filesystem::create_directories(crash_path);
+    for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+      if (e.path().extension() == ".data")
+        std::filesystem::copy_file(e.path(), crash_path / e.path().filename());
+    }
     {
       auto crashed = bytecask::DB::open(crash_path, opts);
       const auto cr = size_report(crashed);
