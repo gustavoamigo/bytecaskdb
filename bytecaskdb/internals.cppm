@@ -173,6 +173,10 @@ export struct EngineState {
   std::uint32_t next_file_id{};
   std::uint64_t next_seq{1};
   std::uint64_t durable_seq{0};
+  // Highest sequence written by a sync=true slot. A state whose
+  // sync_requested_seq exceeds its durable_seq owes an fdatasync and must
+  // not be published — store_state enforces durable_seq >= sync_requested_seq.
+  std::uint64_t sync_requested_seq{0};
   Mode mode{Mode::Leader};
   bool degraded{false};
   std::string degraded_reason;
