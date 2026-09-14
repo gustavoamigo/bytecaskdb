@@ -468,6 +468,18 @@ errors in `commit_wait`); `flush_pending` assigns `published->durable_seq`
 on a NoSync-only publish, since the head's value is never ahead of it; the
 `commit_wait` predicate checks coverage directly instead of pointer
 inequality.
+
+Coverage round: the diff coverage report pointed at a real ordering gap in
+`flush_failed`, which published the degraded state before recording the
+error, so a waiter could observe "degraded, no error" and get `DbDegraded`
+where the contract promises the I/O error; both now happen under one
+`durable_mu_` hold, the same mutex `commit_wait` checks under. The report
+also removed two pieces of dead code (`FlushRole`'s move constructor,
+never used since `quiesce()` returns a prvalue; an unused accessor) and
+one unreachable branch (a degraded head under a non-degraded published
+state). Two reachable paths gained tests through a `test_publish` seam:
+admission of a batch that entered the write group before a flush failure,
+and the publish invariant's degrade branch.
 | 6 | `scripts/run_sanitizer.sh thread` and `address` | done before the settle (1475 cases, 0 reports each); rerun after it below |
 | 7 | H3/H4: `engine_bench` `Put/Sync`, `Del/Sync`, `PutMT/Sync` 2–64 threads, baseline vs new, same window | done, see [Results](#results) |
 | 8 | H1/H2/H5/H6: plugin built from this branch, paired sysbench, cycle trace | done, see [Results](#results) |

@@ -600,7 +600,6 @@ public:
   [[nodiscard]] auto next_seq() const noexcept -> std::uint64_t;
 
   [[nodiscard]] auto durable_seq() const noexcept -> std::uint64_t;
-  [[nodiscard]] auto sync_requested_seq() const noexcept -> std::uint64_t;
 
   [[nodiscard]] auto mode() const noexcept -> Mode { return mode_; }
   [[nodiscard]] auto is_degraded() const noexcept -> bool { return degraded_; }
@@ -952,12 +951,13 @@ private:
   class FlushRole {
   public:
     explicit FlushRole(DB &db) : db_{&db} {}
-    FlushRole(FlushRole &&o) noexcept : db_{std::exchange(o.db_, nullptr)} {}
+    // Neither copied nor moved: quiesce() returns a prvalue and every
+    // holder initialises from it directly, so the role has one owner.
     FlushRole(const FlushRole &) = delete;
+    FlushRole(FlushRole &&) = delete;
     auto operator=(const FlushRole &) -> FlushRole & = delete;
     auto operator=(FlushRole &&) -> FlushRole & = delete;
     ~FlushRole() {
-      if (db_ == nullptr) return;
       db_->store_head(db_->load_state());
       db_->finish_flush();
     }
@@ -1126,6 +1126,12 @@ public:
   // fdatasync. Lets a test hold a flush in flight while other writers
   // append behind it.
   std::function<void()> test_before_flush_sync_;
+  // Publishes s through the checked store_state under a write barrier, so
+  // tests can drive the runtime invariant checks with a crafted state.
+  void test_publish(std::shared_ptr<EngineState> s) {
+    WriteBarrier barrier{*this};
+    store_state(load_state(), std::move(s));
+  }
 #endif
 };
 
@@ -1994,14 +2000,7 @@ auto TransientEngineState::durable_seq() const noexcept -> std::uint64_t {
 }
 
 void TransientEngineState::note_sync_requested(std::uint64_t seq) {
-  if (seq > sync_requested_seq_) {
-    sync_requested_seq_ = seq;
-  }
-}
-
-auto TransientEngineState::sync_requested_seq() const noexcept
-    -> std::uint64_t {
-  return sync_requested_seq_;
+  sync_requested_seq_ = std::max(sync_requested_seq_, seq);
 }
 
 auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
@@ -2304,22 +2303,22 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
 void DB::execute_slots(std::vector<Slot *> &batch) {
   std::lock_guard<std::mutex> wg{*write_mu_};
 
-  // Degraded is decided on the published state: a flush fails without
-  // write_mu_, and head_ is only reset by the next barrier. A batch that
-  // loaded head_ just before such a failure still ends in commit_wait with
-  // the flush error, its bytes handled by resume() like the failed flush's.
+  // Admission is decided on the published state, not the head: a flush
+  // fails without write_mu_ and head_ is only reset by the next barrier,
+  // so the head can be non-degraded while the engine is. (Mode is the same
+  // in both — set_mode is a barrier.) A batch that loaded head_ just before
+  // such a failure still ends in commit_wait with the flush error, its
+  // bytes handled by resume() like the failed flush's.
   auto published = load_state();
-  auto current = load_head();
-  if (published->degraded || !current->is_write_allowed()) {
+  if (!published->is_write_allowed()) {
     auto ex = published->degraded
         ? std::make_exception_ptr(DbDegraded{published->degraded_reason})
-        : current->degraded
-        ? std::make_exception_ptr(DbDegraded{current->degraded_reason})
         : std::make_exception_ptr(
               DbFollowerMode{"write rejected: engine is in follower mode"});
     for (auto *s : batch) s->err = ex;
     return;
   }
+  auto current = load_head();
 
   counters_.group_writer_batches.fetch_add(1, std::memory_order_relaxed);
   counters_.group_writer_coalesced.fetch_add(
@@ -2508,8 +2507,13 @@ void DB::flush_failed(std::exception_ptr ex,
       "durability not confirmed. Call resume() to recover.",
       active_path.string()));
   counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-  store_state(std::move(err_t).persistent());
+  // Published and recorded under one durable_mu_ hold: commit_wait checks
+  // flush_error_ under the same mutex, so no waiter can see the degraded
+  // state without the error and report DbDegraded where the contract
+  // promises the I/O error. (Raw store: the checked store_state takes
+  // durable_mu_ itself.)
   std::lock_guard<std::mutex> lk{durable_mu_};
+  store_state(std::move(err_t).persistent());
   flush_error_ = std::move(ex);
 }
 

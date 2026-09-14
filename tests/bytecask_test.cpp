@@ -7351,3 +7351,95 @@ TEST_CASE("pipeline: many concurrent sync writers, every commit durable and "
     }
   }
 }
+
+TEST_CASE("pipeline: a batch admitted before a flush failure is rejected as "
+          "degraded, not appended",
+          "[pipeline][degraded][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1'000'000});
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+
+  // A passes apply_batch's admission check and becomes the group leader,
+  // then parks in the leader hook before its executor runs.
+  std::mutex mu;
+  std::condition_variable cv;
+  bool leader_parked = false;
+  bool go = false;
+  db.test_write_group().on_leader_start_ = [&] {
+    std::unique_lock<std::mutex> lk{mu};
+    leader_parked = true;
+    cv.notify_all();
+    cv.wait(lk, [&] { return go; });
+  };
+  std::exception_ptr ea;
+  std::thread ta([&] {
+    try {
+      (void)db.put({.sync = true}, to_bytes("ka"), to_bytes("va"));
+    } catch (...) {
+      ea = std::current_exception();
+    }
+  });
+  {
+    std::unique_lock<std::mutex> lk{mu};
+    REQUIRE(cv.wait_for(lk, std::chrono::seconds{10}, [&] { return leader_parked; }));
+  }
+
+  // B bypasses the group (solo), appends, and its flush fails: degraded.
+  std::exception_ptr eb;
+  std::thread tb([&] {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    try {
+      (void)db.put({.sync = true, .solo = true}, to_bytes("kb"), to_bytes("vb"));
+    } catch (...) {
+      eb = std::current_exception();
+    }
+  });
+  tb.join();
+  REQUIRE(eb);
+  CHECK_THROWS_AS(std::rethrow_exception(eb), std::system_error);
+  REQUIRE(db.is_degraded());
+
+  // Release A: its executor must reject on the published state.
+  {
+    std::lock_guard<std::mutex> lk{mu};
+    go = true;
+  }
+  cv.notify_all();
+  ta.join();
+  db.test_write_group().on_leader_start_ = nullptr;
+  REQUIRE(ea);
+  CHECK_THROWS_AS(std::rethrow_exception(ea), bytecask::DbDegraded);
+
+  // kb reached the page cache and is replayed; ka was never appended.
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  CHECK(db.contains_key({}, to_bytes("kb")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("ka")));
+  CHECK(db.put({.sync = true}, to_bytes("kc"), to_bytes("vc")).durable);
+}
+
+TEST_CASE("pipeline: publishing a state that owes an fdatasync degrades the "
+          "engine",
+          "[pipeline][invariants][degraded][resume]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+
+  auto bad = std::make_shared<bytecask::EngineState>(*db.engine_state());
+  bad->sync_requested_seq = bad->durable_seq + 1;
+  db.test_publish(bad);
+
+  CHECK(db.is_degraded());
+  CHECK(db.degraded_reason().find("sync_requested_seq") != std::string::npos);
+  CHECK_THROWS_AS(db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")),
+                  bytecask::DbDegraded);
+  // The rejected state was never published: k1 is still readable, and
+  // resume() brings the engine back with it.
+  CHECK(db.contains_key({}, to_bytes("k1")));
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  CHECK(db.contains_key({}, to_bytes("k1")));
+  CHECK(db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")).durable);
+  const auto s = db.engine_state();
+  CHECK(s->durable_seq >= s->sync_requested_seq);
+}
