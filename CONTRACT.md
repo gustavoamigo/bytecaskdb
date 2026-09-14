@@ -41,7 +41,11 @@ degrades the engine does so *without* publishing the failed transition:
   prevent sequence reuse, but no key-value changes become visible. With
   the commit pipeline a failed commit fdatasync (F) covers every writer
   appended since the last successful flush: all of them receive the error
-  and none of their changes are published.
+  and none of their changes are published. `resume()` replays every valid
+  entry it finds in the active file, so a writer that received the error
+  can see its write persisted after recovery — true for the single batch
+  of class F before the pipeline, and now for every batch since the last
+  flush.
 - Class H (rotation failure): the write succeeded and was published, but
   the rotation to a new file failed. The published state is consistent
   with what recovery would find — the committed entries are on disk.

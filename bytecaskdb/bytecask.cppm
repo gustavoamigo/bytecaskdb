@@ -933,10 +933,8 @@ private:
   [[nodiscard]] auto load_state_for_read(const ReadOptions &opts) const
       -> const std::shared_ptr<const EngineState> &;
   // Barrier write path: the published state, which after quiesce() covers
-  // the prepared head. Caller must hold write_mu_ and the flush role. The
-  // head itself is only ever built on by execute_slots (load_head): its
-  // durable_seq lags the published one, since the head chain does not
-  // learn about flushes, so nothing else may derive a state from it.
+  // the prepared head. Caller must hold write_mu_ and the flush role. Only
+  // execute_slots builds on the head itself (load_head).
   [[nodiscard]] auto load_state_for_write() const
       -> std::shared_ptr<EngineState>;
   // Publish new state + bump timestamp. Caller must hold the flush role.
@@ -972,6 +970,21 @@ private:
   // Caller must hold write_mu_, so head_ cannot move underneath. On return
   // the published state covers head_, or the engine is degraded.
   [[nodiscard]] auto quiesce() -> FlushRole;
+  // write_mu_ plus quiesce() as one object, for barrier operations: locks,
+  // quiesces, and on destruction resets head_, releases the role, then
+  // unlocks — in that order, by member order, so the ordering rule cannot
+  // be broken at a call site.
+  class WriteBarrier {
+  public:
+    explicit WriteBarrier(DB &db)
+        : lk_{*db.write_mu_}, role_{db.quiesce()} {}
+    WriteBarrier(const WriteBarrier &) = delete;
+    auto operator=(const WriteBarrier &) -> WriteBarrier & = delete;
+
+  private:
+    std::unique_lock<std::mutex> lk_;
+    FlushRole role_;
+  };
   // Blocks until the published state covers slot's sequence — durable for
   // sync=true, visible for sync=false — flushing on this thread whenever
   // the flush role is free. Sets slot.result->durable. Rethrows the flush
@@ -983,7 +996,8 @@ private:
   // runs underneath the fdatasync. A failed fdatasync degrades the engine
   // and records the error for every writer appended since the last flush.
   void flush_pending();
-  // flush_pending, then release the role and wake every waiter.
+  // commit_wait's flush: settle, flush_pending, then release the role and
+  // wake every waiter.
   void flush_once();
   // Releases the flush role and wakes commit_wait / quiesce / durable_sequence
   // waiters. The empty durable_mu_ critical section orders the release
@@ -991,7 +1005,7 @@ private:
   // to block.
   void finish_flush();
   // Degrade path of flush_pending: publishes a degraded copy of the
-  // published state, resets head_ to it, and records ex for the waiters.
+  // published state and records ex for the waiters.
   void flush_failed(std::exception_ptr ex,
                     const std::shared_ptr<const EngineState> &published,
                     const std::filesystem::path &active_path);
@@ -1073,8 +1087,10 @@ private:
   // It may contain sync=true entries whose fdatasync has not returned, so
   // readers never see it. state_ is always an ancestor of head_ in the
   // persistent chain; they agree whenever no flush is in flight and no
-  // batch is pending. Advanced under write_mu_; read by flush_pending
-  // without it; reset to state_ by every barrier and degrade path.
+  // batch is pending. Written only under write_mu_: advanced by
+  // execute_slots, reset to state_ by ~FlushRole. Read by flush_pending
+  // without it. Its durable_seq is not meaningful — the head chain never
+  // learns about flushes — and flush_pending assigns it at publish.
   std::shared_ptr<EngineState> head_;
   // The flush role: exactly one thread runs flush_pending at a time. Taken
   // with exchange(true) in commit_wait and quiesce; released by
@@ -2288,16 +2304,16 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
 void DB::execute_slots(std::vector<Slot *> &batch) {
   std::lock_guard<std::mutex> wg{*write_mu_};
 
-  // flush_failed resets head_ without write_mu_, so a leader that loaded
-  // head_ just before can advance it past the degraded state. Checking the
-  // published state here closes that window: nothing is appended on a
-  // degraded engine.
-  if (auto published = load_state(); published->degraded) {
-    store_head(published);
-  }
+  // Degraded is decided on the published state: a flush fails without
+  // write_mu_, and head_ is only reset by the next barrier. A batch that
+  // loaded head_ just before such a failure still ends in commit_wait with
+  // the flush error, its bytes handled by resume() like the failed flush's.
+  auto published = load_state();
   auto current = load_head();
-  if (!current->is_write_allowed()) {
-    auto ex = current->degraded
+  if (published->degraded || !current->is_write_allowed()) {
+    auto ex = published->degraded
+        ? std::make_exception_ptr(DbDegraded{published->degraded_reason})
+        : current->degraded
         ? std::make_exception_ptr(DbDegraded{current->degraded_reason})
         : std::make_exception_ptr(
               DbFollowerMode{"write rejected: engine is in follower mode"});
@@ -2377,11 +2393,12 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
 
   // Rotation barrier: everything before this batch is flushed and
   // published, and this thread holds the flush role until `role` dies.
-  // `current` is stale in durable_seq (the head chain does not learn about
-  // flushes): apply_sync below overrides it, and degraded transitions
-  // build on the published state.
+  // Two fdatasyncs, once per max_file_bytes: quiesce() flushes the previous
+  // head, then this batch is synced before the file is sealed. apply_sync
+  // gives t the durable_seq the head chain does not carry; degraded
+  // transitions build on the published state.
   auto role = quiesce();
-  auto published = load_state();
+  published = load_state();  // quiesce may have published the previous head
   try {
     file.sync();
     counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
@@ -2453,28 +2470,9 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
 #pragma region Commit pipeline stage 2
 
 void DB::flush_pending() {
-  // Let slots already inside the write group finish stage 1 so this flush
-  // covers them. Writers released by the previous flush re-enter within a
-  // few microseconds but need a stage-1 batch (validate, apply, pwritev)
-  // before they are in the head; a flush that starts the instant the role
-  // is won leaves them for the flush after. Measured with 8 zero-think-time
-  // writers: 4.15 → 7.78 commits per fdatasync, +64% throughput, same
-  // fdatasync rate. Bounded so a stalled leader cannot hold the disk; the
-  // bound only binds under continuous arrivals, where it is ~8% of a flush.
-  {
-    const auto deadline =
-        std::chrono::steady_clock::now() + kFlushSettleMax;
-    while (write_group_.busy()
-           && std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::yield();
-    }
-  }
   auto head = load_head();
   auto published = load_state();
-  if (published->degraded) {
-    store_head(published);
-    return;
-  }
+  if (published->degraded) return;
   if (head->next_seq <= published->next_seq) return;  // nothing pending
 
   const bool need_sync = head->sync_requested_seq > published->durable_seq;
@@ -2494,11 +2492,10 @@ void DB::flush_pending() {
 
   // Publish the head as it stood before the fdatasync. Entries appended
   // since are not claimed: the next flush covers them. O(1): persistent
-  // roots are shared, only the integers differ.
+  // roots are shared, only the integers differ. durable_seq is assigned
+  // here; the head's own value is whatever state it was derived from.
   auto pub = std::make_shared<EngineState>(*head);
-  pub->durable_seq = need_sync
-      ? head->next_seq - 1
-      : std::max(head->durable_seq, published->durable_seq);
+  pub->durable_seq = need_sync ? head->next_seq - 1 : published->durable_seq;
   store_state(published, std::move(pub));
 }
 
@@ -2512,7 +2509,6 @@ void DB::flush_failed(std::exception_ptr ex,
       active_path.string()));
   counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
   store_state(std::move(err_t).persistent());
-  store_head(load_state());
   std::lock_guard<std::mutex> lk{durable_mu_};
   flush_error_ = std::move(ex);
 }
@@ -2524,6 +2520,25 @@ void DB::finish_flush() {
 }
 
 void DB::flush_once() {
+  // Let slots already inside the write group finish stage 1 so this flush
+  // covers them. Writers released by the previous flush re-enter within a
+  // few microseconds but need a stage-1 batch (validate, apply, pwritev)
+  // before they are in the head; a flush that starts the instant the role
+  // is won leaves them for the flush after. Measured with 8 zero-think-time
+  // writers: 4.15 → 7.78 commits per fdatasync, +64% throughput, same
+  // fdatasync rate. A throughput heuristic only, which is why it lives
+  // here and not in flush_pending: quiesce() callers hold write_mu_, so a
+  // running leader would be blocked on it and busy() could never clear.
+  // Bounded so a stalled leader cannot hold the disk; the bound only binds
+  // under continuous arrivals, where it is ~8% of a flush.
+  {
+    const auto deadline =
+        std::chrono::steady_clock::now() + kFlushSettleMax;
+    while (write_group_.busy()
+           && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+  }
   flush_pending();
   finish_flush();
 }
@@ -2566,9 +2581,16 @@ void DB::commit_wait(EngineSlot &slot) {
     }
     counters_.commit_wait_blocked.fetch_add(1, std::memory_order_relaxed);
     std::unique_lock<std::mutex> lk{durable_mu_};
+    // Woken by finish_flush (role released, error recorded) and by
+    // store_state when durable_seq advances. The coverage term is for a
+    // waiter that loaded `published` before a flush landed and reached the
+    // wait after: it must not sleep until the flush after that one.
     durable_cv_.wait(lk, [&] {
-      return !flush_in_flight_.load(std::memory_order_acquire)
-          || flush_error_ != nullptr || load_state() != published;
+      if (!flush_in_flight_.load(std::memory_order_acquire)) return true;
+      if (flush_error_ != nullptr) return true;
+      auto now = load_state();
+      return want_durable ? now->durable_seq >= target
+                          : now->next_seq > target;
     });
   }
 }
@@ -2967,8 +2989,7 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
   flush_hints_for(new_file, dir_);
 
   {
-    std::lock_guard<std::mutex> wg{*write_mu_};
-    auto role = quiesce();
+    WriteBarrier barrier{*this};
     vacuum_commit(file_id, scan, new_file);
   }
   // Bytes reclaimed = old total - new live (compacted file is smaller).
@@ -2986,8 +3007,7 @@ void DB::vacuum_remove_file(std::uint32_t file_id) {
   auto snap = load_state_for_write();
   auto old_total = snap->file_stats.get(file_id)->total_bytes;
   {
-    std::lock_guard<std::mutex> wg{*write_mu_};
-    auto role = quiesce();
+    WriteBarrier barrier{*this};
     VacuumScanResult empty{};
     vacuum_commit(file_id, empty, nullptr);
   }
@@ -3056,8 +3076,7 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
 }
 
 void DB::set_mode(Mode mode) {
-  std::lock_guard<std::mutex> wg{*write_mu_};
-  auto role = quiesce();
+  WriteBarrier barrier{*this};
   auto current = load_state_for_write();
   auto t = current->transient();
   t.apply_set_mode(mode);
@@ -3069,14 +3088,12 @@ void DB::deem_as_degraded(std::string reason) {
   auto t = current->transient();
   t.apply_degrade(std::move(reason));
   store_state(std::move(t).persistent());
-  store_head(load_state());
 }
 
 void DB::resume() {
   if (!is_degraded()) return;
 
-  auto guard = std::unique_lock<std::mutex>{*write_mu_};
-  auto role = quiesce();
+  WriteBarrier barrier{*this};
   auto current = load_state_for_write();
   if (!current->degraded) return;  // re-check under lock
 
@@ -3175,8 +3192,7 @@ auto DB::create_manifest() -> FileManifest {
   std::shared_ptr<const EngineState> manifest_state;
   std::uint64_t through_seq;
   {
-    std::lock_guard<std::mutex> wg{*write_mu_};
-    auto role = quiesce();
+    WriteBarrier barrier{*this};
 
     auto current = load_state_for_write();
     if (current->degraded) throw DbDegraded{current->degraded_reason};
@@ -3968,8 +3984,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     }
   }
 
-  std::lock_guard<std::mutex> wg{*write_mu_};
-  auto role = quiesce();
+  WriteBarrier barrier{*this};
 
   auto current = load_state_for_write();
   if (!current->is_ingestion_allowed()) {

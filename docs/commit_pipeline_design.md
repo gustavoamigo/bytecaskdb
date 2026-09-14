@@ -456,7 +456,18 @@ harmless: `flush_pending` publishes `next_seq - 1` after an fdatasync and
 `max(head, published)` otherwise, and the rotation path calls `apply_sync`.
 The doc's earlier `advance_head` / `drain` names became `store_head` /
 `quiesce`; `quiesce` returns the role as an RAII guard whose destructor
-resets the head to the published state, so no barrier can forget it.
+resets the head to the published state, and barrier operations use a
+`WriteBarrier` that owns `write_mu_` and that guard in the right order.
+
+Review changes (PR #73): the settle moved from `flush_pending` to the
+`commit_wait` path only, since `quiesce()` callers hold `write_mu_` and
+would block the leader they wait for; `head_` is now written only under
+`write_mu_` (the unlocked resets on the degrade paths are gone — stage 1
+rejects on the published state, and a batch that raced past that check
+errors in `commit_wait`); `flush_pending` assigns `published->durable_seq`
+on a NoSync-only publish, since the head's value is never ahead of it; the
+`commit_wait` predicate checks coverage directly instead of pointer
+inequality.
 | 6 | `scripts/run_sanitizer.sh thread` and `address` | done before the settle (1475 cases, 0 reports each); rerun after it below |
 | 7 | H3/H4: `engine_bench` `Put/Sync`, `Del/Sync`, `PutMT/Sync` 2–64 threads, baseline vs new, same window | done, see [Results](#results) |
 | 8 | H1/H2/H5/H6: plugin built from this branch, paired sysbench, cycle trace | done, see [Results](#results) |
