@@ -87,10 +87,9 @@ private:
 // WriteGroup — leader-applies-all write batching (Template Method pattern).
 //
 // The algorithm skeleton lives here: enqueue → elect leader → take the queue
-// as one batch → call executor → mark done → wake → repeat while slots are
-// queued, up to kMaxLeaderBatches, then pass leadership to the head of the
-// queue. The domain-specific batch execution logic is injected via a
-// BatchExecutor callback at construction time.
+// as one batch → call executor → mark done → hand leadership to the head of
+// the queue → wake. The domain-specific batch execution logic is injected via
+// a BatchExecutor callback at construction time.
 //
 // submit() is non-template — it takes a Slot&.
 // ---------------------------------------------------------------------------
@@ -121,24 +120,20 @@ public:
   }
 #endif
 
-  // Longest run of consecutive batches one leader executes before it hands
-  // leadership to the head of the queue. The leader's own slot is done after
-  // its first batch, so every further batch it runs is time its caller
-  // waits: this bounds that wait to kMaxLeaderBatches commit cycles. It is
-  // not 1 because a hand-off costs a thread wake-up before the next batch
-  // can start, and a leader that stays hot starts the next batch the moment
-  // the previous one ends; rotating every batch measured 30–40% lower
-  // sync-write throughput at 16–32 writers on 4 cores. Draining without a
-  // bound is the other extreme: under closed-loop writers the queue never
-  // empties, and one client thread became a permanent leader whose own
-  // commit did not return for a 13-second run.
-  static constexpr int kMaxLeaderBatches = 8;
-
   // Enqueues slot and blocks until it is done. A submitter that finds no
-  // leader becomes one and runs batches — everything queued at the start of
-  // each, its own slot included in the first — until the queue is empty or
-  // it has run kMaxLeaderBatches, whichever comes first; then it returns to
-  // its caller. If slots remain, leadership passes to the head of the queue.
+  // leader becomes one and runs a single batch — everything queued at that
+  // moment, its own slot included — then returns to its caller. If slots
+  // were queued while the batch ran, leadership passes to the head of the
+  // queue in the same broadcast that releases the batch.
+  //
+  // One batch per leader, not a run of them. The leader's own slot is done
+  // after its batch, so every further batch it ran was time its caller
+  // waited — and under closed-loop clients that batch released every other
+  // writer at once, leaving the queue empty for the round trip each needed
+  // before resubmitting. Measured on MariaDB sysbench oltp_write_only, 8
+  // clients, a leader allowed 8 consecutive batches alternated batches of 1
+  // and 7 with ~220 µs between batches; a hand-off after every batch gave
+  // uniform batches of ~4 and ~70 µs.
   void submit(Slot &slot) {
     std::unique_lock<std::mutex> lk{queue_mu_};
     slot.done = false;
@@ -158,12 +153,10 @@ public:
   }
 
 private:
-  // Runs queued slots batch after batch. Called with lk held and
-  // leader_active_ set; drops lk around each executor call and each wake.
-  // Returns with lk held once the caller's slot is done and leadership has
-  // been passed on or released. Every batch end wakes all waiters: batch
-  // members return, the rest re-check and sleep — one broadcast, as opposed
-  // to a wake per slot, which measured 2× slower at 32 writers.
+  // Runs one batch. Called with lk held and leader_active_ set; drops lk
+  // around the executor call and returns with lk released. One broadcast
+  // wakes the finished batch and the next leader together — a wake per slot
+  // measured 2× slower at 32 writers.
   void lead(std::unique_lock<std::mutex> &lk) {
 #ifdef BYTECASK_TESTING
     if (on_leader_start_) {
@@ -172,42 +165,28 @@ private:
       lk.lock();
     }
 #endif
-    for (int batches = 1;; ++batches) {
-      std::vector<Slot *> batch;
-      batch.swap(queue_);
-      lk.unlock();
+    std::vector<Slot *> batch;
+    batch.swap(queue_);
+    lk.unlock();
 
-      try {
-        executor_(batch);
-      } catch (...) {
-        auto ex = std::current_exception();
-        for (auto *s : batch) {
-          if (!s->err) s->err = ex;
-        }
-      }
-
-      lk.lock();
-      for (auto *s : batch) s->done = true;
-      lk.unlock();
-      cv_.notify_all();
-      lk.lock();
-      // Decide only now, after the broadcast: by the time the lock is back,
-      // members of the batch just finished have often resubmitted, and the
-      // leader batches them without a hand-off. Deciding before the
-      // broadcast, when the queue is momentarily empty, retires the leader
-      // every batch and the first resubmitter starts a batch of one.
-      if (queue_.empty()) {
-        leader_active_ = false;
-        return;
-      }
-      if (batches == kMaxLeaderBatches) {
-        queue_.front()->lead = true;
-        lk.unlock();
-        cv_.notify_all();
-        lk.lock();
-        return;
+    try {
+      executor_(batch);
+    } catch (...) {
+      auto ex = std::current_exception();
+      for (auto *s : batch) {
+        if (!s->err) s->err = ex;
       }
     }
+
+    lk.lock();
+    for (auto *s : batch) s->done = true;
+    if (queue_.empty()) {
+      leader_active_ = false;
+    } else {
+      queue_.front()->lead = true;
+    }
+    lk.unlock();
+    cv_.notify_all();
   }
 
   std::function<void(std::vector<Slot *> &)> executor_;
