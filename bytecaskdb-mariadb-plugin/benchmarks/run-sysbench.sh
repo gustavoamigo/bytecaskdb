@@ -28,8 +28,8 @@ THREADS="8"
 DURATION=20
 ENGINES="bytecaskdb,innodb,rocksdb"
 # WORKLOADS="oltp_point_select oltp_read_only oltp_write_only oltp_insert oltp_read_write"
-WORKLOADS="oltp_read_write"
-CREATE_SECONDARY="off"
+WORKLOADS="oltp_read_write oltp_insert oltp_write_only"
+CREATE_SECONDARY="on"
 
 #WORKLOADS="oltp_read_only:points_only oltp_read_only:ranges_only oltp_read_only:simple_range oltp_read_only:sum_range oltp_read_only:order_range oltp_read_only:distinct_range"
 

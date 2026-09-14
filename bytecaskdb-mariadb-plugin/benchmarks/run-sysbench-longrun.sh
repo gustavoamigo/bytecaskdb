@@ -213,7 +213,11 @@ echo "    Table size: $TABLE_SIZE rows | Duration: ${DURATION}s per engine | Rep
 echo "    Results: $RESULTS_CSV"
 echo ""
 
-echo "timestamp,engine,workload,threads,elapsed_s,report_threads,tps,qps,lat95_ms,err_per_s" > "$RESULTS_CSV"
+# Append across runs so a long-run history accumulates; the timestamp column
+# separates runs. The header is written only when the file is new.
+if [[ ! -s "$RESULTS_CSV" ]]; then
+  echo "timestamp,engine,workload,threads,elapsed_s,report_threads,tps,qps,lat95_ms,err_per_s" > "$RESULTS_CSV"
+fi
 
 if engine_enabled bytecaskdb; then
   echo "=== Starting ByteCaskDB MariaDB instance (port $BYTECASKDB_PORT) ==="
