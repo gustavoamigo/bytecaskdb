@@ -1,2 +1,7 @@
 [mariadbd]
 bytecaskdb_use_mmap = ON
+bytecaskdb_max_file_bytes = 67108864
+bytecaskdb_verify_checksums = ON
+bytecaskdb_vacuum_fragmentation_threshold = 0.7
+bytecaskdb_vacuum_busy_interval_ms = 1000
+bytecaskdb_vacuum_idle_interval_ms = 30000

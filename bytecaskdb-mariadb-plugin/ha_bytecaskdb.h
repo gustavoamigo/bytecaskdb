@@ -66,6 +66,9 @@ void             catalog_drop_autoinc(uint32_t table_id);
 // Current value of the bulk_copy_flush_bytes system variable (never 0).
 std::size_t      catalog_bulk_copy_flush_bytes();
 
+// ReadOptions for every plugin read, reflecting bytecaskdb_verify_checksums.
+bytecask::ReadOptions plugin_read_options();
+
 int64_t          catalog_row_count(uint32_t table_id);
 std::atomic<int64_t> *catalog_row_count_ptr(uint32_t table_id);
 void             catalog_row_count_add(uint32_t table_id, int64_t delta);

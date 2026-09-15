@@ -16,6 +16,22 @@ Read this before pointing an application written for InnoDB at the engine.
 - **Every table's key directory lives in memory.** Budget roughly 50 bytes per row per index (primary and secondary) of resident memory, in addition to MariaDB's own.
 - **Not supported:** `FULLTEXT` and `SPATIAL` indexes, `LOCK TABLES` blocking semantics, `HANDLER`, `INSERT DELAYED`, table-level lock priorities, `CHECKSUM TABLE ... QUICK`.
 
+## Configuration
+
+All settings are global. Set them in `my.cnf` under `[mariadbd]` or, for the dynamic ones, with `SET GLOBAL`.
+
+| Variable | Default | Range | Dynamic | Description |
+|---|---|---|---|---|
+| `bytecaskdb_use_mmap` | `OFF` | — | no | `mmap` sealed data files instead of `pread`. |
+| `bytecaskdb_max_file_bytes` | 64 MiB | 1 MiB – 4 GiB | no | Active data file rotation threshold. Sealed files are the unit of vacuum: smaller files reclaim space sooner at the cost of more files. |
+| `bytecaskdb_verify_checksums` | `ON` | — | yes | CRC-verify every value read from disk. Turn off only for benchmarking; recovery still verifies hint files. |
+| `bytecaskdb_vacuum_fragmentation_threshold` | 0.5 | 0.0 – 1.0 | yes | Fraction of dead bytes a sealed file must reach before background vacuum rewrites it. |
+| `bytecaskdb_vacuum_busy_interval_ms` | 500 | 10 – 3,600,000 | yes | Pause between vacuum passes while files are being reclaimed. |
+| `bytecaskdb_vacuum_idle_interval_ms` | 30000 | 100 – 86,400,000 | yes | Pause between vacuum passes when the last pass found nothing to reclaim. |
+| `bytecaskdb_bulk_copy_flush_bytes` | 64 MiB | 4 KiB – 4 GiB | yes | Buffered bytes per batch during `ALTER TABLE ... ALGORITHM=COPY` and `CREATE INDEX`. |
+
+Changes to the vacuum variables take effect on the next vacuum pass, at most one pause of the previous length later.
+
 ## Examples
 
 Ready-to-run Docker Compose setups demonstrating ByteCaskDB as a drop-in storage engine:

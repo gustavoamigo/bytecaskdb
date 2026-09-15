@@ -353,6 +353,29 @@ See `SMOKE_TEST.md` for the end-to-end MariaDB test procedure.
 
 ---
 
+## System variables
+
+Declared in `bytecaskdb_plugin.cc`; the user-facing table with defaults and
+ranges is in the plugin `README.md`. Two kinds:
+
+- **Read-only** (`bytecaskdb_use_mmap`, `bytecaskdb_max_file_bytes`) feed
+  `bytecask::Options` in `bytecaskdb_init()` and need a server restart.
+- **Dynamic** (`verify_checksums`, the three `vacuum_*` variables,
+  `bulk_copy_flush_bytes`) are read from hot paths on query and vacuum
+  threads while `SET GLOBAL` writes them from another. MariaDB writes the
+  sysvar's backing variable itself, so each dynamic variable has an update
+  callback that also publishes the value into a `std::atomic` in
+  `namespace bytecaskdb`; readers only ever load the atomic
+  (`plugin_read_options()`, `catalog_bulk_copy_flush_bytes()`, and
+  `vacuum_loop`). This keeps the plain backing variable for `SHOW VARIABLES`
+  and keeps cross-thread reads race-free.
+
+`plugin_read_options()` is the single source of `bytecask::ReadOptions` for
+every read in `MariaDBTxn`; the two key-only scans in `ha_bytecaskdb.cc`
+pass `{}` because `verify_checksums` only affects value reads.
+
+---
+
 ## Implementation status
 
 | Phase | Description | Status |

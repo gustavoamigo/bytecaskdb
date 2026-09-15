@@ -1,0 +1,77 @@
+# sysvars.yaml — plugin system variables: defaults, SET GLOBAL round-trips,
+# clamping, read-only rejection, and that reads work with checksums off.
+
+- name: Sysvar defaults
+  query: >
+    SELECT VARIABLE_NAME, VARIABLE_VALUE FROM information_schema.global_variables
+    WHERE VARIABLE_NAME IN ('BYTECASKDB_MAX_FILE_BYTES', 'BYTECASKDB_VERIFY_CHECKSUMS',
+      'BYTECASKDB_VACUUM_FRAGMENTATION_THRESHOLD', 'BYTECASKDB_VACUUM_BUSY_INTERVAL_MS',
+      'BYTECASKDB_VACUUM_IDLE_INTERVAL_MS')
+    ORDER BY VARIABLE_NAME
+  expected:
+    - ['BYTECASKDB_MAX_FILE_BYTES', '67108864']
+    - ['BYTECASKDB_VACUUM_BUSY_INTERVAL_MS', '500']
+    - ['BYTECASKDB_VACUUM_FRAGMENTATION_THRESHOLD', '0.500000']
+    - ['BYTECASKDB_VACUUM_IDLE_INTERVAL_MS', '30000']
+    - ['BYTECASKDB_VERIFY_CHECKSUMS', 'ON']
+
+- name: Dynamic sysvars round-trip through SET GLOBAL
+  setup:
+    - SET GLOBAL bytecaskdb_verify_checksums = OFF
+    - SET GLOBAL bytecaskdb_vacuum_fragmentation_threshold = 0.25
+    - SET GLOBAL bytecaskdb_vacuum_busy_interval_ms = 50
+    - SET GLOBAL bytecaskdb_vacuum_idle_interval_ms = 1000
+  query: >
+    SELECT @@global.bytecaskdb_verify_checksums,
+           @@global.bytecaskdb_vacuum_fragmentation_threshold,
+           @@global.bytecaskdb_vacuum_busy_interval_ms,
+           @@global.bytecaskdb_vacuum_idle_interval_ms
+  expected:
+    - ['0', '0.25', '50', '1000']
+  teardown:
+    - SET GLOBAL bytecaskdb_verify_checksums = DEFAULT
+    - SET GLOBAL bytecaskdb_vacuum_fragmentation_threshold = DEFAULT
+    - SET GLOBAL bytecaskdb_vacuum_busy_interval_ms = DEFAULT
+    - SET GLOBAL bytecaskdb_vacuum_idle_interval_ms = DEFAULT
+
+- name: Out-of-range sysvar values are clamped to their bounds
+  setup:
+    - SET GLOBAL bytecaskdb_vacuum_fragmentation_threshold = 7.5
+    - SET GLOBAL bytecaskdb_vacuum_busy_interval_ms = 1
+    - SET GLOBAL bytecaskdb_vacuum_idle_interval_ms = 1
+  query: >
+    SELECT @@global.bytecaskdb_vacuum_fragmentation_threshold,
+           @@global.bytecaskdb_vacuum_busy_interval_ms,
+           @@global.bytecaskdb_vacuum_idle_interval_ms
+  expected:
+    - ['1.0', '10', '100']
+  teardown:
+    - SET GLOBAL bytecaskdb_vacuum_fragmentation_threshold = DEFAULT
+    - SET GLOBAL bytecaskdb_vacuum_busy_interval_ms = DEFAULT
+    - SET GLOBAL bytecaskdb_vacuum_idle_interval_ms = DEFAULT
+
+- name: max_file_bytes is read-only
+  steps:
+    - sql: SET GLOBAL bytecaskdb_max_file_bytes = 1048576
+      error: 1238
+
+- name: Reads work with verify_checksums OFF
+  setup:
+    - DROP DATABASE IF EXISTS sysvars_crc
+    - CREATE DATABASE sysvars_crc
+    - CREATE TABLE sysvars_crc.t (id INT PRIMARY KEY, v VARCHAR(32) NOT NULL, INDEX (v)) ENGINE=bytecaskdb
+    - INSERT INTO sysvars_crc.t VALUES (1,'a'),(2,'b'),(3,'c')
+    - SET GLOBAL bytecaskdb_verify_checksums = OFF
+  steps:
+    - sql: SELECT v FROM sysvars_crc.t WHERE id = 2
+      expected: [['b']]
+    - sql: SELECT id FROM sysvars_crc.t USE INDEX (v) WHERE v = 'c'
+      expected: [['3']]
+    - sql: SELECT id, v FROM sysvars_crc.t ORDER BY id DESC
+      expected: [['3', 'c'], ['2', 'b'], ['1', 'a']]
+    - sql: SET GLOBAL bytecaskdb_verify_checksums = ON
+    - sql: SELECT v FROM sysvars_crc.t WHERE id = 1
+      expected: [['a']]
+  teardown:
+    - SET GLOBAL bytecaskdb_verify_checksums = DEFAULT
+    - DROP DATABASE IF EXISTS sysvars_crc

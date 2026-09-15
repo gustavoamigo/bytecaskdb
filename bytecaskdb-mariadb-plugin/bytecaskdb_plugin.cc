@@ -39,11 +39,17 @@
 #include <thread>
 
 namespace bytecaskdb {
-// Backing store for the bulk_copy_flush_bytes system variable. Defined ahead
-// of the MYSQL_SYSVAR block (which needs its address) and outside the
-// !PLUGIN_TESTING guard so catalog_bulk_copy_flush_bytes() links in test
-// builds too.
-std::size_t sysvar_bulk_copy_flush_bytes = 64ULL * 1024 * 1024;
+// Live values of the dynamic system variables. MariaDB writes a sysvar's
+// backing store from the SET GLOBAL thread; readers on query and vacuum
+// threads never touch that store directly. Instead each dynamic sysvar has an
+// update callback that publishes into one of these atomics, so a concurrent
+// read is a relaxed load rather than a data race. Defined outside the
+// !PLUGIN_TESTING guard so the accessors below link in test builds too.
+std::atomic<std::size_t> g_bulk_copy_flush_bytes{64ULL * 1024 * 1024};
+std::atomic<bool>        g_verify_checksums{true};
+std::atomic<double>      g_vacuum_fragmentation_threshold{0.5};
+std::atomic<unsigned long> g_vacuum_busy_interval_ms{500};
+std::atomic<unsigned long> g_vacuum_idle_interval_ms{30000};
 }  // namespace bytecaskdb
 
 #ifndef PLUGIN_TESTING
@@ -57,21 +63,106 @@ static MYSQL_SYSVAR_BOOL(use_mmap, sysvar_use_mmap,
     "Use mmap for sealed data files (default OFF)",
     nullptr, nullptr, FALSE);
 
-static MYSQL_SYSVAR_SIZE_T(bulk_copy_flush_bytes,
-    bytecaskdb::sysvar_bulk_copy_flush_bytes,
+static unsigned long long sysvar_max_file_bytes = 64ULL * 1024 * 1024;
+static MYSQL_SYSVAR_ULONGLONG(max_file_bytes, sysvar_max_file_bytes,
+    PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+    "Active data file rotation threshold in bytes (default 64 MiB). "
+    "Sealed files are the unit of vacuum.",
+    nullptr, nullptr,
+    64ULL * 1024 * 1024,          // default 64 MiB
+    1ULL * 1024 * 1024,           // min 1 MiB
+    4ULL * 1024 * 1024 * 1024,    // max 4 GiB (engine hard ceiling)
+    0);
+
+// Update callbacks for the dynamic sysvars: MariaDB has already validated and
+// clamped *save; store it in the plain backing variable (so SHOW VARIABLES
+// reads it) and publish it to the atomic the hot paths read.
+template <typename Backing, typename Atomic>
+static void publish_sysvar(void *var_ptr, const void *save, Atomic &live) {
+  const auto v = *static_cast<const Backing *>(save);
+  *static_cast<Backing *>(var_ptr) = v;
+  live.store(static_cast<typename Atomic::value_type>(v),
+             std::memory_order_relaxed);
+}
+
+static std::size_t sysvar_bulk_copy_flush_bytes = 64ULL * 1024 * 1024;
+static void update_bulk_copy_flush_bytes(THD *, st_mysql_sys_var *,
+                                         void *var_ptr, const void *save) {
+  publish_sysvar<std::size_t>(var_ptr, save,
+                              bytecaskdb::g_bulk_copy_flush_bytes);
+}
+static MYSQL_SYSVAR_SIZE_T(bulk_copy_flush_bytes, sysvar_bulk_copy_flush_bytes,
     PLUGIN_VAR_RQCMDARG,
     "Max buffered bytes before a batch flush during ALTER TABLE ... "
     "ALGORITHM=COPY (index builds). Bounds plugin memory and per-batch "
     "latency when reindexing large tables.",
-    nullptr, nullptr,
+    nullptr, update_bulk_copy_flush_bytes,
     64ULL * 1024 * 1024,          // default 64 MiB
     4096,                         // min 4 KiB (small values are for testing)
     4ULL * 1024 * 1024 * 1024,    // max 4 GiB
     0);
 
+static my_bool sysvar_verify_checksums = TRUE;
+static void update_verify_checksums(THD *, st_mysql_sys_var *,
+                                    void *var_ptr, const void *save) {
+  publish_sysvar<my_bool>(var_ptr, save, bytecaskdb::g_verify_checksums);
+}
+static MYSQL_SYSVAR_BOOL(verify_checksums, sysvar_verify_checksums,
+    PLUGIN_VAR_RQCMDARG,
+    "CRC-verify every value read from disk (default ON)",
+    nullptr, update_verify_checksums, TRUE);
+
+static double sysvar_vacuum_fragmentation_threshold = 0.5;
+static void update_vacuum_fragmentation_threshold(THD *, st_mysql_sys_var *,
+                                                  void *var_ptr,
+                                                  const void *save) {
+  publish_sysvar<double>(var_ptr, save,
+                         bytecaskdb::g_vacuum_fragmentation_threshold);
+}
+static MYSQL_SYSVAR_DOUBLE(vacuum_fragmentation_threshold,
+    sysvar_vacuum_fragmentation_threshold,
+    PLUGIN_VAR_RQCMDARG,
+    "Minimum fraction of dead bytes [0.0, 1.0] a sealed file must have "
+    "before background vacuum rewrites it (default 0.5)",
+    nullptr, update_vacuum_fragmentation_threshold,
+    0.5, 0.0, 1.0, 0);
+
+static unsigned long sysvar_vacuum_busy_interval_ms = 500;
+static void update_vacuum_busy_interval_ms(THD *, st_mysql_sys_var *,
+                                           void *var_ptr, const void *save) {
+  publish_sysvar<unsigned long>(var_ptr, save,
+                                bytecaskdb::g_vacuum_busy_interval_ms);
+}
+static MYSQL_SYSVAR_ULONG(vacuum_busy_interval_ms,
+    sysvar_vacuum_busy_interval_ms,
+    PLUGIN_VAR_RQCMDARG,
+    "Pause between background vacuum passes while files are being "
+    "reclaimed, in milliseconds (default 500)",
+    nullptr, update_vacuum_busy_interval_ms,
+    500, 10, 3600UL * 1000, 0);
+
+static unsigned long sysvar_vacuum_idle_interval_ms = 30000;
+static void update_vacuum_idle_interval_ms(THD *, st_mysql_sys_var *,
+                                           void *var_ptr, const void *save) {
+  publish_sysvar<unsigned long>(var_ptr, save,
+                                bytecaskdb::g_vacuum_idle_interval_ms);
+}
+static MYSQL_SYSVAR_ULONG(vacuum_idle_interval_ms,
+    sysvar_vacuum_idle_interval_ms,
+    PLUGIN_VAR_RQCMDARG,
+    "Pause between background vacuum passes when the last pass found "
+    "nothing to reclaim, in milliseconds (default 30000)",
+    nullptr, update_vacuum_idle_interval_ms,
+    30000, 100, 86400UL * 1000, 0);
+
 static struct st_mysql_sys_var *bytecaskdb_system_variables[] = {
     MYSQL_SYSVAR(use_mmap),
+    MYSQL_SYSVAR(max_file_bytes),
     MYSQL_SYSVAR(bulk_copy_flush_bytes),
+    MYSQL_SYSVAR(verify_checksums),
+    MYSQL_SYSVAR(vacuum_fragmentation_threshold),
+    MYSQL_SYSVAR(vacuum_busy_interval_ms),
+    MYSQL_SYSVAR(vacuum_idle_interval_ms),
     nullptr,
 };
 #endif // !PLUGIN_TESTING
@@ -95,8 +186,13 @@ bytecask::DB                  *g_db           = nullptr;
 handlerton                    *bytecaskdb_hton = nullptr;
 
 std::size_t catalog_bulk_copy_flush_bytes() {
-  std::size_t v = sysvar_bulk_copy_flush_bytes;
+  std::size_t v = g_bulk_copy_flush_bytes.load(std::memory_order_relaxed);
   return v ? v : (64ULL * 1024 * 1024);
+}
+
+bytecask::ReadOptions plugin_read_options() {
+  return bytecask::ReadOptions{
+      .verify_checksums = g_verify_checksums.load(std::memory_order_relaxed)};
 }
 
 // ---------------------------------------------------------------------------
@@ -599,10 +695,9 @@ static bool                               s_vacuum_in_progress = false;
 static std::condition_variable            s_vacuum_idle_cv;
 static std::optional<bytecask::FileManifest> s_backup_manifest;
 
+// The vacuum sysvars are re-read on every pass, so a SET GLOBAL takes effect
+// after at most one pause of the previous length.
 static void vacuum_loop() {
-  static constexpr auto kBusyInterval = std::chrono::milliseconds{500};
-  static constexpr auto kIdleInterval = std::chrono::seconds{30};
-
   std::unique_lock<std::mutex> lk{s_vacuum_mu};
   while (!s_vacuum_stop) {
     bool more_work = false;
@@ -610,7 +705,9 @@ static void vacuum_loop() {
       s_vacuum_in_progress = true;
       lk.unlock();
       try {
-        more_work = g_db->vacuum();
+        more_work = g_db->vacuum(bytecask::VacuumOptions{
+            .fragmentation_threshold = g_vacuum_fragmentation_threshold.load(
+                std::memory_order_relaxed)});
       } catch (const std::exception &e) {
         sql_print_error("ByteCaskDB: vacuum error: %s", e.what());
       }
@@ -618,8 +715,11 @@ static void vacuum_loop() {
       s_vacuum_in_progress = false;
       s_vacuum_idle_cv.notify_all();
     }
-    s_vacuum_cv.wait_for(lk, more_work ? kBusyInterval : kIdleInterval,
-                         [] { return s_vacuum_stop; });
+    const auto &interval = more_work ? g_vacuum_busy_interval_ms
+                                     : g_vacuum_idle_interval_ms;
+    s_vacuum_cv.wait_for(
+        lk, std::chrono::milliseconds{interval.load(std::memory_order_relaxed)},
+        [] { return s_vacuum_stop; });
   }
 }
 
@@ -760,6 +860,7 @@ static int bytecaskdb_init(void *p) {
   opts.max_value_bytes = 16 * 1024 * 1024;  // MEDIUMBLOB (16 MiB)
   opts.max_key_bytes = 8192;  // secondary index key + PK suffix can exceed 4096
   opts.use_mmap = sysvar_use_mmap;
+  opts.max_file_bytes = sysvar_max_file_bytes;
 
   try {
     g_db_owner = std::make_unique<DBHolder>(db_path, opts);
@@ -779,8 +880,8 @@ static int bytecaskdb_init(void *p) {
 
   sql_print_information("ByteCaskDB: opened global DB at '%s'",
           db_path.c_str());
-  sql_print_information("ByteCaskDB: use_mmap=%s",
-          sysvar_use_mmap ? "ON" : "OFF");
+  sql_print_information("ByteCaskDB: use_mmap=%s max_file_bytes=%llu",
+          sysvar_use_mmap ? "ON" : "OFF", sysvar_max_file_bytes);
 
   s_vacuum_stop = false;
   s_vacuum_pause_count = 0;
