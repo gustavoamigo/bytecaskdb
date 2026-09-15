@@ -126,11 +126,17 @@ test('handles large dataset operations efficiently', async ({ db }) => {
   const entryCount = 10000
   const keyPrefix = 'large-dataset-'
 
-  // Insert many entries
+  // Insert many entries. NoSync: what this test exercises is key capacity,
+  // lookup and ordered iteration, none of which depend on durability. With
+  // the default sync:true each put costs a real fdatasync (the WASM build
+  // runs on NODERAWFS), so the wall clock would be 10,000 disk round trips —
+  // measured between 1.5 s and 40 s on identical code, depending only on the
+  // CI runner's disk. Durability is covered by the tests that write a handful
+  // of keys.
   for (let i = 0; i < entryCount; i++) {
     const key = encodeString(`${keyPrefix}${i.toString().padStart(6, '0')}`)
     const value = encodeString(`value-${i}`)
-    db.put(key, value)
+    db.put(key, value, { sync: false })
   }
 
   // Verify random entries

@@ -55,9 +55,28 @@ jobs:
             clang clang-tools-extra llvm llvm-devel lld \
             make ninja-build git cmake zip
 
+      # Download to a file, then run it. Piped straight into bash, the step's
+      # exit status is bash's — a failed curl (transient DNS: "Could not
+      # resolve host: xmake.io") left xmake uninstalled and the step green,
+      # and the next step failed on a missing ~/.xmake/profile instead.
       - name: Install xmake
         run: |
-          curl -fsSL https://xmake.io/shget.text | bash
+          for attempt in 1 2 3 4; do
+            if curl -fsSL https://xmake.io/shget.text -o /tmp/xmake-install.sh; then
+              break
+            fi
+            echo "xmake installer download failed (attempt ${attempt})"
+            sleep $((attempt * 5))
+          done
+          if [ ! -s /tmp/xmake-install.sh ]; then
+            echo "::error::could not download the xmake installer"
+            exit 1
+          fi
+          bash /tmp/xmake-install.sh
+          if [ ! -f "$HOME/.xmake/profile" ]; then
+            echo "::error::xmake installer ran but left no ~/.xmake/profile"
+            exit 1
+          fi
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Set up Python ${{ matrix.python }}
