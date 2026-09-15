@@ -11,12 +11,16 @@
 #   - sysbench installed
 #
 # Usage:
-#   ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh [--table-size=N] [--threads=LIST] [--time=S] [--engines=LIST] [--workloads=LIST]
+#   ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh [--table-size=N] [--threads=LIST] [--time=S] [--engines=LIST] [--workloads=LIST] [--data-root=PATH]
 #
 #   --engines: comma-separated list of engines to benchmark (default: bytecaskdb,innodb,rocksdb)
 #              e.g. --engines=bytecaskdb or --engines=bytecaskdb,innodb
 #   --workloads: comma-separated list of sysbench workloads (default: common OLTP mix)
 #                e.g. --workloads=oltp_insert
+#   --data-root: directory under which the ephemeral mariadbd instances create their
+#                data/tmp/socket files (default: repository root). Point it at a
+#                filesystem that supports native fdatasync/O_DIRECT when the repo
+#                lives on a bind mount or overlay that doesn't, e.g. --data-root=/mnt/nvme
 
 set -euo pipefail
 
@@ -28,8 +32,9 @@ THREADS="8"
 DURATION=20
 ENGINES="bytecaskdb,innodb,rocksdb"
 # WORKLOADS="oltp_point_select oltp_read_only oltp_write_only oltp_insert oltp_read_write"
-WORKLOADS="oltp_read_write oltp_insert oltp_write_only"
+WORKLOADS="oltp_point_select oltp_read_write oltp_insert oltp_write_only"
 CREATE_SECONDARY="on"
+DATA_ROOT=""
 
 #WORKLOADS="oltp_read_only:points_only oltp_read_only:ranges_only oltp_read_only:simple_range oltp_read_only:sum_range oltp_read_only:order_range oltp_read_only:distinct_range"
 
@@ -47,9 +52,10 @@ for arg in "$@"; do
     --time=*)       DURATION="${arg#*=}" ;;
     --engines=*)    ENGINES="${arg#*=}" ;;
     --workloads=*)  WORKLOADS="${arg#*=}" ;;
+    --data-root=*)  DATA_ROOT="${arg#*=}" ;;
     --no-secondary-index) CREATE_SECONDARY="off" ;;
     --help|-h)
-      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--engines=bytecaskdb,innodb,rocksdb] [--workloads=oltp_insert] [--no-secondary-index]"
+      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--engines=bytecaskdb,innodb,rocksdb] [--workloads=oltp_insert] [--data-root=PATH] [--no-secondary-index]"
       exit 0
       ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -71,9 +77,14 @@ BYTECASK_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PLUGIN_DIR="$BYTECASK_ROOT/bytecaskdb-mariadb-plugin/build"
 RESULTS_CSV="$SCRIPT_DIR/sysbench_results.csv"
 
-BYTECASKDB_DIR="$BYTECASK_ROOT/.mariadb_sysbench_bytecaskdb"
-INNODB_DIR="$BYTECASK_ROOT/.mariadb_sysbench_innodb"
-ROCKSDB_DIR="$BYTECASK_ROOT/.mariadb_sysbench_rocksdb"
+# Where the ephemeral mariadbd instances live. Defaults to the repo root; override
+# with --data-root when that filesystem can't do native fdatasync (e.g. a bind mount).
+DATA_ROOT="${DATA_ROOT:-$BYTECASK_ROOT}"
+mkdir -p "$DATA_ROOT" || { echo "ERROR: cannot create --data-root=$DATA_ROOT"; exit 1; }
+DATA_ROOT="$(cd "$DATA_ROOT" && pwd)"
+BYTECASKDB_DIR="$DATA_ROOT/.mariadb_sysbench_bytecaskdb"
+INNODB_DIR="$DATA_ROOT/.mariadb_sysbench_innodb"
+ROCKSDB_DIR="$DATA_ROOT/.mariadb_sysbench_rocksdb"
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -235,6 +246,7 @@ echo "    Engines: ${ENGINES}"
 echo "    Table size: $TABLE_SIZE rows | Duration: ${DURATION}s per run"
 echo "    Threads: ${THREADS}"
 echo "    Workloads: $WORKLOADS"
+echo "    Data root: $DATA_ROOT"
 if engine_enabled rocksdb && [[ -z "$ROCKSDB_PLUGIN_DIR" ]]; then
   echo "    RocksDB: SKIPPED (plugin not found)"
 fi

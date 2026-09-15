@@ -5,12 +5,13 @@ Runs engine_bench across multiple dataset sizes and writes a self-contained
 Markdown performance report to the repo root.
 
 Usage:
-    python3 scripts/benchmark_showcase.py [--quick-run] [--skip-build]
+    python3 scripts/benchmark_showcase.py [--quick-run] [--skip-build] [--tmpdir DIR]
     python3 scripts/benchmark_showcase.py --from-json <bench_data/dir>
 
     --quick-run        Small datasets for fast validation:
                        regular: 10k, 50k  |  recovery: 50k, 1M
     --skip-build       Skip the xmake release build step.
+    --tmpdir DIR       Override TMPDIR for benchmark data (default: ./.tmp).
     --from-json <dir>  Regenerate the report from previously saved JSON files
                        (skips build and benchmark execution entirely).
 
@@ -820,6 +821,7 @@ def git_commit() -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global TMPDIR
     argv = sys.argv[1:]
     flags = set(argv)
 
@@ -828,6 +830,15 @@ def main() -> None:
     for i, a in enumerate(argv):
         if a == "--from-json" and i + 1 < len(argv):
             from_json_dir = Path(argv[i + 1]).resolve()
+            break
+
+    # Parse --tmpdir <dir> / --tmpdir=<dir>
+    for i, a in enumerate(argv):
+        if a == "--tmpdir" and i + 1 < len(argv):
+            TMPDIR = Path(argv[i + 1]).resolve()
+            break
+        if a.startswith("--tmpdir="):
+            TMPDIR = Path(a.split("=", 1)[1]).resolve()
             break
 
     quick    = "--quick-run"  in flags

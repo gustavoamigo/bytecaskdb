@@ -21,13 +21,17 @@
 # Usage:
 #   ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench-longrun.sh \
 #       [--table-size=N] [--duration=4h] [--report-interval=30s] \
-#       [--threads=N] [--workload=NAME] [--engines=LIST] [--out=PATH]
+#       [--threads=N] [--workload=NAME] [--engines=LIST] [--out=PATH] [--data-root=PATH]
 #
 #   --duration / --report-interval accept a plain integer (seconds) or a
 #   number with a trailing s/m/h/d suffix, e.g. --duration=6h --report-interval=30s.
 #   --table-size defaults large (5,000,000 rows) so the dataset exceeds the
 #   3G buffer pool / block cache configured in innodb.cnf / rocksdb.cnf —
 #   below that, everything fits in RAM and no engine visibly degrades.
+#   --data-root is the directory under which the ephemeral mariadbd instances
+#   create their data/tmp/socket files (default: repository root). Point it at
+#   a filesystem that supports native fdatasync/O_DIRECT when the repo lives on
+#   a bind mount or overlay that doesn't, e.g. --data-root=/mnt/nvme.
 
 set -uo pipefail  # not -e: one sysbench hiccup mid-run shouldn't abort everything
 
@@ -50,6 +54,7 @@ ROCKSDB_PORT=3332
 # Parse arguments
 # ---------------------------------------------------------------------------
 OUT_CSV=""
+DATA_ROOT=""
 for arg in "$@"; do
   case "$arg" in
     --table-size=*)      TABLE_SIZE="${arg#*=}" ;;
@@ -59,9 +64,10 @@ for arg in "$@"; do
     --workload=*)         WORKLOAD="${arg#*=}" ;;
     --engines=*)          ENGINES="${arg#*=}" ;;
     --out=*)              OUT_CSV="${arg#*=}" ;;
+    --data-root=*)        DATA_ROOT="${arg#*=}" ;;
     --no-secondary-index) CREATE_SECONDARY="off" ;;
     --help|-h)
-      echo "Usage: $0 [--table-size=5000000] [--duration=4h] [--report-interval=30s] [--threads=8] [--workload=oltp_read_write] [--engines=bytecaskdb,innodb] [--out=PATH] [--no-secondary-index]"
+      echo "Usage: $0 [--table-size=5000000] [--duration=4h] [--report-interval=30s] [--threads=8] [--workload=oltp_read_write] [--engines=bytecaskdb,innodb] [--out=PATH] [--data-root=PATH] [--no-secondary-index]"
       exit 0
       ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -94,9 +100,14 @@ BYTECASK_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PLUGIN_DIR="$BYTECASK_ROOT/bytecaskdb-mariadb-plugin/build"
 RESULTS_CSV="${OUT_CSV:-$SCRIPT_DIR/sysbench_longrun_results.csv}"
 
-BYTECASKDB_DIR="$BYTECASK_ROOT/.mariadb_longrun_bytecaskdb"
-INNODB_DIR="$BYTECASK_ROOT/.mariadb_longrun_innodb"
-ROCKSDB_DIR="$BYTECASK_ROOT/.mariadb_longrun_rocksdb"
+# Where the ephemeral mariadbd instances live. Defaults to the repo root; override
+# with --data-root when that filesystem can't do native fdatasync (e.g. a bind mount).
+DATA_ROOT="${DATA_ROOT:-$BYTECASK_ROOT}"
+mkdir -p "$DATA_ROOT" || { echo "ERROR: cannot create --data-root=$DATA_ROOT"; exit 1; }
+DATA_ROOT="$(cd "$DATA_ROOT" && pwd)"
+BYTECASKDB_DIR="$DATA_ROOT/.mariadb_longrun_bytecaskdb"
+INNODB_DIR="$DATA_ROOT/.mariadb_longrun_innodb"
+ROCKSDB_DIR="$DATA_ROOT/.mariadb_longrun_rocksdb"
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -211,6 +222,7 @@ echo "    Engines: ${ENGINES}"
 echo "    Workload: $WORKLOAD | Threads: $THREADS"
 echo "    Table size: $TABLE_SIZE rows | Duration: ${DURATION}s per engine | Report every ${REPORT_INTERVAL}s"
 echo "    Results: $RESULTS_CSV"
+echo "    Data root: $DATA_ROOT"
 echo ""
 
 # Append across runs so a long-run history accumulates; the timestamp column
