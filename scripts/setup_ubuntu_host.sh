@@ -173,8 +173,10 @@ log "Installing graft (repo context graph) under \$HOME/.npm-global"
 NPM_PREFIX="${HOME}/.npm-global"
 mkdir -p "$NPM_PREFIX"
 export PATH="${NPM_PREFIX}/bin:${PATH}"
+# Installed from our fork (gustavoamigo/Graft), which knows the .cppm
+# extension (C++20 module interface units) our core engine is written in.
 if ! command -v graft >/dev/null 2>&1; then
-  npm install -g --prefix "$NPM_PREFIX" @nanonets/graft
+  NPM_PREFIX="${NPM_PREFIX}" ./scripts/install_graft.sh
 fi
 graft init --agents copilot --agents claude -y
 
