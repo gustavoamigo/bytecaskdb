@@ -198,7 +198,7 @@ All writes (`put`, `del`, `apply_batch`) route through a single coordinator: `DB
 
 **Routing**: a write goes to `SoloWriter` when `WriteOptions::solo` is set (benchmarking) or when the plan's byte size exceeds `kGroupWriteMaxBytes` (256 KiB). All other writes go to `WriteGroup`.
 
-**WriteGroup**: a writer that arrives while no leader is active becomes the leader, takes every queued slot (its own included) as one batch, and executes them all under one lock hold. N concurrent sync writes share a single `fdatasync` instead of paying N separate calls. This is the dominant performance win — fdatasync is ~1–2 ms; pwritev is ~microseconds. A leader runs exactly one batch, then returns to its caller; if slots were queued while the batch ran, it hands leadership to the head of the queue by setting that slot's `lead` flag. The batch end is one broadcast on a shared condition variable that wakes the finished members and the next leader together — the rest re-check and sleep. (A wake per slot measured 2× slower at 32 writers.) Batch formation needs nothing more: slots accumulate during the running batch's `fdatasync`.
+**WriteGroup**: a writer that arrives while no leader is active becomes the leader, takes every queued slot (its own included) as one batch, and executes them all under one lock hold. N concurrent sync writes share a single `fdatasync` instead of paying N separate calls. This is the dominant performance win — fdatasync is ~1–2 ms; pwritev is ~microseconds. A leader runs exactly one batch, then returns to its caller; if slots were queued while the batch ran, it hands leadership to the head of the queue with one targeted wake (`kSlotLead` on that slot's wait word). Each slot is the object its owner waits on: a 32-bit word (phase + flags) slept on with a futex, so a member is woken by exactly one wake, when its phase reaches the `release_at` the executor set — `Applied` for a conflict, error or empty plan, `Visible` for a nosync write, `Durable` for a sync write. A sync member is not woken after stage 1 at all; its one wake comes from the flush that covers it. Batch formation needs nothing more: slots accumulate during the running batch's `fdatasync`.
 
 One batch per leader is a fairness rule. The leader's own slot is done after its batch, so every further batch it ran was time its caller waited. Two earlier policies were measured against it. Draining until the queue was empty made one sysbench client a permanent writer whose commit did not return for a 13-second run. Letting a leader run up to 8 consecutive batches ("hot leader") kept the disk busy under closed-loop writers but had two costs. With two writers it serialised to one put per fdatasync: the leader kept serving the other thread's resubmissions while its own caller waited (engine_bench `PutMT/Sync`, 2 threads: 477 ops/s, the same as one thread; 695 ops/s with a hand-off after every batch). With eight MariaDB clients the batch that released everyone else was followed by an empty queue for the length of each client's round trip, so batch sizes alternated between 1 and 7 with ~220 µs of idle disk between batches; a hand-off after every batch gave uniform batches of ~4 and ~70 µs, and sysbench `oltp_write_only`/`oltp_insert` throughput rose 6–8% with lower p95 in every paired run.
 
@@ -208,7 +208,7 @@ The hot leader wins one regime: many closed-loop writers with no think time on a
 
 ##### Commit pipeline: stage 1 under `write_mu_`, stage 2 under the flush role
 
-Design: `docs/commit_pipeline_design.md`. The executor (stage 1) runs under `write_mu_` and stops after the append; the fdatasync and the publication (stage 2) run under a separate *flush role*, outside `write_mu_`, so stage 1 of the next batch overlaps the fdatasync of the previous one. On a flush-bound disk this took ~280 µs of serial in-memory work per commit cycle off the disk's critical path.
+Design: `docs/commit_pipeline_design.md`. The executor (stage 1) runs under `write_mu_` and stops after the append; the fdatasync and the publication (stage 2) run under a separate *flush role*, outside `write_mu_`, so stage 1 of the next batch overlaps the fdatasync of the previous one. A writer sleeps at most once per commit, on its own slot, and is woken by one targeted wake.
 
 Two state pointers over the same persistent chain:
 
@@ -232,33 +232,51 @@ Two state pointers over the same persistent chain:
     5. collect entries into all_entries
   Phase 2: file.append_entries(all_entries)   — one pwritev, page cache
   note_sync_requested(batch_max_seq) if any slot is sync=true
+  slots with a sequence: release_at = sync ? Durable : Visible
   head_ = t.persistent()                      — no fdatasync, no publish
   (rotation needed? → quiesce(), then sync / seal / rotate / publish inline)
 
-  Stage 2 — commit_wait, on the writer's own thread, no write_mu_
-  ────────────────────────────────────────────────────────────────
-  loop:
-    covered?  sync=true:  state_->durable_seq >= my sequence
-              sync=false: state_->next_seq   >  my sequence     → return
-    flush error recorded / engine degraded                       → throw
-    flush role free?  take it, flush_pending(), release, wake all → loop
-    else               sleep on durable_cv_ until the flush lands  → loop
+  Hand-over — WriteGroup::lead after the executor, leader thread
+  ──────────────────────────────────────────────────────────────
+  advance every slot to Applied (wakes only owners with release_at Applied)
+  hand leadership to the queue head (kSlotLead, one wake)
+  after_batch(slots still waiting) → DB::pend_batch: push onto pending_,
+    then complete_covered(state_) in case a flush published them already
 
-  flush_pending (the role holder)
-    head = head_;  published = state_
-    if head->sync_requested_seq > published->durable_seq: fdatasync(head active file)
-    publish copy of head with durable_seq = head->next_seq - 1 (or unchanged)
+  Stage 2 — commit_wait, the leader's own slot, no write_mu_
+  ──────────────────────────────────────────────────────────
+  loop:
+    slot holds kSlotFlushNext?  take it, flush_once()               → loop
+    slot done (phase >= release_at)?  rethrow slot.err if set       → return
+    role free?  take it, flush_once()                               → loop
+    else  sleep once on the slot's word                             → loop
+  (a member sleeps in submit instead, on its own word, until released;
+   a leader with no sequence runs drive_pending instead of commit_wait)
+
+  flush_once (the role holder)
+    settle ≤ kFlushSettleMax while the WriteGroup is busy
+    flush_pending:
+      head = head_;  published = state_
+      if head->sync_requested_seq > published->durable_seq: fdatasync(head active file)
+      publish copy of head with durable_seq = head->next_seq - 1 (or unchanged)
+    release_role:
+      complete_covered: pop every slot in pending_ the published state covers,
+        set durable, advance each slot (one targeted wake per writer)
+      degraded? fail_pending with flush_error_ (or DbDegraded)
+      pending_ non-empty and no barrier waiting? hand the role to the lowest
+        uncovered slot (kSlotFlushNext, one wake) — else clear the flag
 ```
 
 The sequential per-slot processing in Phase 1 preserves the serial correctness model exactly. Each slot's `validate_preconditions` sees the key_dir after all previous slots' writes. A `del` with `ensure_present` in slot 2 correctly sees slot 1's `put`.
 
 Properties of stage 2:
 
-- **No new thread, no leader tenure.** The flush role is taken by whichever waiter finds it free after the previous flush's broadcast; a writer flushes at most the head as it stands when it wins. A lone writer takes the role immediately and flushes on its own thread: its path is the old one with the fdatasync moved from one function to the next, zero wake-ups (`bytecask.commit_wait_blocked` stays 0).
+- **No new thread, no leader tenure.** The flush role is taken by a writer that finds it free, or handed by the holder to the lowest pending writer with one targeted wake, the flag never clear in between: no broadcast, no race. A writer flushes at most the head as it stands when it takes the role. A lone writer takes the role immediately and flushes on its own thread: its path is the old one with the fdatasync moved from one function to the next, zero wake-ups (`bytecask.commit_wait_blocked` stays 0).
+- **One sleep per writer, one wake.** A slot is owned by one party at a time: the `WriteGroup` and the executor from `submit` until `lead` has advanced the batch and handed leadership on; then, through the group's `after_batch` hook on the leader thread, the flush role (`pending_`) for the slots that still wait; then its owner again, once `complete_covered` or `fail_pending` pops it and advances it in one step. The executor never pushes: a released owner may return and destroy its slot at once, and the group must be done with the batch before anyone else holds a pointer. `pending_` is unordered (leaders push after their batch) and scanned whole. A handed role is exercised before the done check in `commit_wait`, since a slot can be completed by a leader's catch-up in the instant it is handed the role. Members and first leaders sleep once; the writer woken to lead the next batch sleeps once more for durability (at most one per batch): `bytecask.group_writer_waits` + `bytecask.commit_wait_blocked` ≤ writes + batches. `durable_cv_` serves only `durable_sequence()` and `quiesce()`, which register in a waiter counter; `store_state` and `release_role` notify only when one is non-zero, and a waiting barrier takes precedence over the hand-off so writers cannot starve it.
 - **Batch formation is set by the disk.** A flush covers everything appended while the previous flush ran. A writer's worst case is two flushes.
 - **Settle before capture.** On the `commit_wait` path (`flush_once`, never in `quiesce()`, whose callers hold `write_mu_` and would block the leader they wait for), the role holder waits for slots already inside the `WriteGroup` to finish stage 1 before capturing the head, bounded by `kFlushSettleMax` (200 µs). A throughput heuristic; nothing depends on it for correctness. Writers released by the previous flush re-enter within microseconds but need a stage-1 batch before they are in the head; a flush that starts the instant the role is won leaves them for the flush after. With 8 zero-think-time writers the settle took commits per fdatasync from 4.15 to 7.78 at the same fdatasync rate. The bound only binds under continuous arrivals, where it is ~8% of a flush, and it is what keeps a stalled stage-1 leader from holding the disk.
 - **`sync=false` behind a flush** waits for that flush and is published by the next `flush_pending`, which fdatasyncs only if a `sync=true` slot landed behind it. Visibility latency ≤ one flush in the mixed case; unchanged in a pure NoSync workload.
-- **Barrier operations** — `create_manifest`, `resume`, `vacuum_commit`, `set_mode`, `ingest` — construct a `WriteBarrier`: it takes `write_mu_`, calls `quiesce()` (take the role, flush and publish the head on the calling thread), and on destruction resets `head_` to `state_`, releases the role, then unlocks, in that order by member layout. Rotation, already under `write_mu_` inside `execute_slots`, calls `quiesce()` directly. Every publication happens under the role, so a flush that is landing can never overwrite a barrier's or a failure path's state.
+- **Barrier operations** — `create_manifest`, `resume`, `vacuum_commit`, `set_mode`, `ingest` — construct a `WriteBarrier`: it takes `write_mu_`, calls `quiesce()` (take the role, flush and publish the head on the calling thread), and on destruction resets `head_` to `state_`, runs `release_role` (completing every pending slot: after a barrier everything is published and durable), then unlocks, in that order by member layout. Rotation, already under `write_mu_` inside `execute_slots`, calls `quiesce()` directly. Every publication happens under the role, so a flush that is landing can never overwrite a barrier's or a failure path's state.
 - **`head_` is written only under `write_mu_`**, by `execute_slots` and by `~FlushRole`. A flush failure publishes the degraded state without touching the head; stage 1 refuses to start on a degraded published state, and a batch that raced past that check ends in `commit_wait` with the flush error, its bytes handled by `resume()` like the failed flush's. The head's `durable_seq` is not meaningful — the head chain never learns about flushes — so only `execute_slots` derives a state from `head_`, and `flush_pending` assigns `durable_seq` at publish: `next_seq - 1` after an fdatasync, the published value otherwise.
 
 ##### Range deletion (`del_range`)
@@ -314,7 +332,7 @@ Implementation: `degraded_` is an `atomic<bool>` (release on write, acquire on r
 
 ##### Runtime invariant enforcement
 
-The engine validates structural invariants at runtime before publishing state, not just in tests. `store_state` compares old and new `EngineState` on every publication: `next_seq`, `active_file_id`, `next_file_id`, and `durable_seq` must never regress, and the new state's `durable_seq` must cover its `sync_requested_seq` (durability before visibility). On violation the engine degrades (nothing published, writes blocked, reads remain available). Cost: four integer comparisons per write — unmeasurable against `pwritev` + `fdatasync`. Debug builds add a full `next_seq > max(key_dir sequences)` walk. When `durable_seq` advances, `store_state` notifies `durable_cv_` — the condvar used by `durable_sequence(min_sequence, timeout)` for long-poll.
+The engine validates structural invariants at runtime before publishing state, not just in tests. `store_state` compares old and new `EngineState` on every publication: `next_seq`, `active_file_id`, `next_file_id`, and `durable_seq` must never regress, and the new state's `durable_seq` must cover its `sync_requested_seq` (durability before visibility). On violation the engine degrades (nothing published, writes blocked, reads remain available). Cost: four integer comparisons per write — unmeasurable against `pwritev` + `fdatasync`. Debug builds add a full `next_seq > max(key_dir sequences)` walk. When `durable_seq` advances and a `durable_sequence(min_sequence, timeout)` caller is registered as waiting, `store_state` notifies `durable_cv_` — the condvar used by that long-poll and by `quiesce()`; commits never pay for it otherwise.
 
 On cold paths (`DB::open()`, `resume()`), `validate_state_consistency` runs the full O(n) structural check: active file in registry, no dangling file references, `next_seq` ahead of all sequences, `file_stats` covers all files, `live_bytes` matches `key_dir`. On violation it throws — the DB does not open or `resume()` fails.
 
@@ -330,7 +348,7 @@ For multi-entry batches this is safe: the isolation rotation moves to a new file
 
 On the common path `flush_pending` advances it: after a successful fdatasync of the prepared head it publishes a copy of that head with `durable_seq = next_seq - 1` (every entry appended before the fdatasync started). On the rotation barrier and in `ingest`, `TransientEngineState::apply_sync(batch_max_seq)` is called after each successful `file.sync()` as before. If a sync fails, neither path advances it — the published state carries the previous `durable_seq` unchanged. The monotonicity guard in `apply_sync` makes repeated calls idempotent.
 
-`durable_sequence(min_sequence, timeout)` exposes `durable_seq` to callers (renamed from `current_sequence` — BC-231, since "current" was ambiguous between the highest *allocated* and highest *durable* sequence). It is the single sequence primitive: `min_sequence = 0`, an already-reached target, or a nonpositive `timeout` all return the current watermark immediately without blocking. Otherwise it blocks on `durable_cv_` (notified by `store_state` when `durable_seq` advances) until `durable_seq >= min_sequence` or the timeout expires, then returns the current watermark. The condvar notification is centralized in `store_state` — one place, one check. This single target-based primitive covers polling (`min_sequence = 0`), the replication wake-up (`min_sequence = follower.durable_sequence() + 1`), and RYOW waits (`min_sequence = result.sequence` from a `CommitResult`) — see `docs/commit_result_api_design.md` and `docs/replication_primitives_design.md`.
+`durable_sequence(min_sequence, timeout)` exposes `durable_seq` to callers (renamed from `current_sequence` — BC-231, since "current" was ambiguous between the highest *allocated* and highest *durable* sequence). It is the single sequence primitive: `min_sequence = 0`, an already-reached target, or a nonpositive `timeout` all return the current watermark immediately without blocking. Otherwise it registers as a waiter and blocks on `durable_cv_` (notified by `store_state` when `durable_seq` advances and a waiter is registered) until `durable_seq >= min_sequence` or the timeout expires, then returns the current watermark. The condvar notification is centralized in `store_state` — one place, one check. This single target-based primitive covers polling (`min_sequence = 0`), the replication wake-up (`min_sequence = follower.durable_sequence() + 1`), and RYOW waits (`min_sequence = result.sequence` from a `CommitResult`) — see `docs/commit_result_api_design.md` and `docs/replication_primitives_design.md`.
 
 After recovery (`DB::open`, `resume`), `durable_seq` is set to `next_seq - 1` because all recovered entries were previously synced.
 
@@ -352,8 +370,9 @@ exception and must retry. This matches the contract of every other peer engine.
 With the pipeline the failed flush is wider than one batch: every writer whose
 entries were appended since the last successful flush built on unpublished
 state, so all of them receive the same `std::system_error` (`flush_error_`,
-rethrown by `commit_wait`), the engine degrades, `head_` is reset to the
-degraded published state, and later writers get `DbDegraded` at stage 1.
+delivered to each pending slot by `release_role` and rethrown on the writer's
+own thread), the engine degrades, `head_` is reset to the degraded published
+state, and later writers get `DbDegraded` at stage 1.
 `resume()` clears `flush_error_` after it republishes; its active-file scan
 replays those entries as before.
 

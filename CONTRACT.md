@@ -312,9 +312,10 @@ persistent → `store_state` path via `TransientEngineState::apply_sync`.
 (renamed from `current_sequence` — BC-231; no compatibility alias remains).
 `min_sequence = 0`, an already-reached target, or a nonpositive `timeout`
 return the current watermark immediately without blocking. Otherwise it
-blocks on `durable_cv_` until `durable_seq >= min_sequence` or the timeout
-expires, then returns the watermark. The condvar notification is
-centralized in `store_state` — one place, one check.
+registers as a waiter and blocks on `durable_cv_` until `durable_seq >=
+min_sequence` or the timeout expires, then returns the watermark. The
+condvar notification is centralized in `store_state` — one place, one check
+— and is issued only while a waiter is registered.
 
 Every committed write (`put`, `del`, `del_range`, `apply_batch`) returns a
 `CommitResult{sequence, durable}` (`std::optional<CommitResult>` for `del`

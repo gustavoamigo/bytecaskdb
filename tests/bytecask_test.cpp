@@ -6780,6 +6780,7 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.file_rotations",
       "bytecask.fsyncs",
       "bytecask.commit_wait_blocked",
+      "bytecask.group_writer_waits",
       "bytecask.disk_reads",
       "bytecask.disk_read_bytes",
       "bytecask.vacuum_bytes_reclaimed",
@@ -7442,4 +7443,335 @@ TEST_CASE("pipeline: publishing a state that owes an fdatasync degrades the "
   CHECK(db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")).durable);
   const auto s = db.engine_state();
   CHECK(s->durable_seq >= s->sync_requested_seq);
+}
+
+TEST_CASE("pipeline: a writer sleeps at most once, a sync member is not woken "
+          "for stage 1, and the flush role is handed to a pending writer",
+          "[pipeline][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+  const auto fsyncs_before = db.stats().at("bytecask.fsyncs");
+  const auto waits_before = db.stats().at("bytecask.group_writer_waits");
+  const auto blocked_before = blocked_count(db);
+
+  FlushGate gate;
+  db.test_before_flush_sync_ = gate.hook();
+  std::optional<bytecask::CommitResult> ra;
+  std::optional<bytecask::CommitResult> rb;
+  std::optional<bytecask::CommitResult> rc;
+  std::thread ta([&] { ra = db.put({.sync = true}, to_bytes("k1"), to_bytes("v1")); });
+  gate.wait_in_flush();
+
+  // B leads the next batch and parks until C has enqueued behind it, so C
+  // is a member of B's batch and not a leader of its own.
+  db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().wait_for_queue_size(2);
+  };
+  std::thread tb([&] { rb = db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")); });
+  db.test_write_group().wait_for_queue_size(1);
+  std::thread tc([&] { rc = db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")); });
+
+  // B's batch lands behind the open flush: B sleeps in commit_wait, C in
+  // submit — C was applied but has nothing to wake for until it is durable.
+  wait_until([&] { return blocked_count(db) - blocked_before >= 1; });
+  wait_until([&] {
+    return db.stats().at("bytecask.group_writer_waits") - waits_before >= 1;
+  });
+  CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("k3")));
+
+  gate.open();
+  ta.join();
+  tb.join();
+  tc.join();
+  db.test_before_flush_sync_ = nullptr;
+  db.test_write_group().on_leader_start_ = nullptr;
+
+  REQUIRE(ra.has_value());
+  REQUIRE(rb.has_value());
+  REQUIRE(rc.has_value());
+  CHECK(ra->durable);
+  CHECK(rb->durable);
+  CHECK(rc->durable);
+  CHECK(db.contains_key({}, to_bytes("k1")));
+  CHECK(db.contains_key({}, to_bytes("k2")));
+  CHECK(db.contains_key({}, to_bytes("k3")));
+  // A's flush covered k1 only; the role was handed to B, which flushed k2
+  // and k3 with no new submission: two fdatasyncs in all.
+  CHECK(db.stats().at("bytecask.fsyncs") - fsyncs_before == 2);
+  // A never slept, B slept once (commit_wait), C slept once (submit).
+  CHECK(blocked_count(db) - blocked_before == 1);
+  CHECK(db.stats().at("bytecask.group_writer_waits") - waits_before == 1);
+}
+
+TEST_CASE("pipeline: fdatasync failure reaches a member that was never woken "
+          "for stage 1, and resume() recovers all of them",
+          "[pipeline][f_visibility][degraded][resume]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1'000'000});
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+
+  bytecask::testing::FaultInjector inj;
+  inj.fail_at_name = "io_data_file_sync";
+  FlushGate gate;
+  gate.after_release = [&] { bytecask::testing::active_injector = &inj; };
+  db.test_before_flush_sync_ = gate.hook();
+
+  std::exception_ptr ea;
+  std::exception_ptr eb;
+  std::exception_ptr ec;
+  std::thread ta([&] {
+    try {
+      (void)db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    } catch (...) {
+      ea = std::current_exception();
+    }
+    bytecask::testing::active_injector = nullptr;
+  });
+  gate.wait_in_flush();
+  db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().wait_for_queue_size(2);
+  };
+  std::thread tb([&] {
+    try {
+      (void)db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+    } catch (...) {
+      eb = std::current_exception();
+    }
+  });
+  db.test_write_group().wait_for_queue_size(1);
+  std::thread tc([&] {
+    try {
+      (void)db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+    } catch (...) {
+      ec = std::current_exception();
+    }
+  });
+  wait_until([&] { return blocked_count(db) >= 1; });
+  wait_until([&] { return db.stats().at("bytecask.group_writer_waits") >= 1; });
+
+  gate.open();
+  ta.join();
+  tb.join();
+  tc.join();
+  db.test_before_flush_sync_ = nullptr;
+  db.test_write_group().on_leader_start_ = nullptr;
+
+  // All three built on unpublished state: each gets the I/O error on its
+  // own thread, the member through submit, the leaders through commit_wait.
+  REQUIRE(ea);
+  REQUIRE(eb);
+  REQUIRE(ec);
+  CHECK_THROWS_AS(std::rethrow_exception(ea), std::system_error);
+  CHECK_THROWS_AS(std::rethrow_exception(eb), std::system_error);
+  CHECK_THROWS_AS(std::rethrow_exception(ec), std::system_error);
+  CHECK(db.is_degraded());
+  CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("k3")));
+
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  CHECK(db.contains_key({}, to_bytes("k1")));
+  CHECK(db.contains_key({}, to_bytes("k2")));
+  CHECK(db.contains_key({}, to_bytes("k3")));
+  CHECK(db.put({.sync = true}, to_bytes("k4"), to_bytes("v4")).durable);
+}
+
+TEST_CASE("pipeline: a barrier waiting behind a flush is not starved by the "
+          "role hand-off and completes the pending writer",
+          "[pipeline][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+  const auto fsyncs_before = db.stats().at("bytecask.fsyncs");
+
+  FlushGate gate;
+  db.test_before_flush_sync_ = gate.hook();
+  std::optional<bytecask::CommitResult> ra;
+  std::optional<bytecask::CommitResult> rb;
+  std::thread ta([&] { ra = db.put({.sync = true}, to_bytes("k1"), to_bytes("v1")); });
+  gate.wait_in_flush();
+  std::thread tb([&] { rb = db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")); });
+  wait_until([&] { return blocked_count(db) >= 1; });
+  // A barrier: takes write_mu_, then waits in quiesce() behind the open
+  // flush. When that flush lands the role goes to the barrier, not to B.
+  std::thread tm([&] { db.set_mode(bytecask::Mode::Leader); });
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
+
+  gate.open();
+  ta.join();
+  tb.join();
+  tm.join();
+  db.test_before_flush_sync_ = nullptr;
+
+  REQUIRE(ra.has_value());
+  REQUIRE(rb.has_value());
+  CHECK(ra->durable);
+  CHECK(rb->durable);
+  CHECK(db.contains_key({}, to_bytes("k1")));
+  CHECK(db.contains_key({}, to_bytes("k2")));
+  CHECK(db.mode() == bytecask::Mode::Leader);
+  // k1's flush, then one flush of k2's head — by the barrier or by B.
+  CHECK(db.stats().at("bytecask.fsyncs") - fsyncs_before == 2);
+  CHECK(db.durable_sequence() >= rb->sequence);
+}
+
+TEST_CASE("pipeline: a durable_sequence waiter is woken by the flush that "
+          "covers it",
+          "[pipeline]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto seed = db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+
+  FlushGate gate;
+  db.test_before_flush_sync_ = gate.hook();
+  std::optional<bytecask::CommitResult> ra;
+  std::thread ta([&] { ra = db.put({.sync = true}, to_bytes("k1"), to_bytes("v1")); });
+  gate.wait_in_flush();
+  std::uint64_t seen = 0;
+  std::thread tw([&] {
+    seen = db.durable_sequence(seed.sequence + 1, std::chrono::milliseconds{5000});
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds{20});
+
+  gate.open();
+  ta.join();
+  tw.join();
+  db.test_before_flush_sync_ = nullptr;
+  REQUIRE(ra.has_value());
+  CHECK(seen >= ra->sequence);
+}
+
+TEST_CASE("pipeline: a leader whose own plan conflicts still gets its sync "
+          "member flushed when no flush is in flight",
+          "[pipeline][concurrency][apply_batch]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("a"), to_bytes("v0"));
+  auto snap = db.snapshot();
+  db.put({.sync = true}, to_bytes("a"), to_bytes("v1"));  // snap is now stale for "a"
+  const auto fsyncs_before = db.stats().at("bytecask.fsyncs");
+
+  // A leads and parks until B is queued behind it, so B is A's member. A's
+  // plan conflicts: A has nothing to wait for, B waits for durability, and
+  // the flush role is free — nobody but A can start B's flush.
+  db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().wait_for_queue_size(2);
+  };
+  std::optional<bytecask::CommitResult> ra;
+  std::optional<bytecask::CommitResult> rb;
+  bool a_done = false;
+  std::thread ta([&] {
+    bytecask::WritePlan plan{std::move(snap)};
+    plan.put(to_bytes("a"), to_bytes("fromA"));
+    ra = db.apply_batch({.sync = true}, std::move(plan));
+    a_done = true;
+  });
+  db.test_write_group().wait_for_queue_size(1);
+  std::thread tb([&] { rb = db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")); });
+  ta.join();
+  tb.join();
+  db.test_write_group().on_leader_start_ = nullptr;
+
+  CHECK(a_done);
+  CHECK_FALSE(ra.has_value());
+  REQUIRE(rb.has_value());
+  CHECK(rb->durable);
+  CHECK(db.contains_key({}, to_bytes("k2")));
+  auto v = get_val(db, to_bytes("a"));
+  REQUIRE(v.has_value());
+  CHECK(to_string(*v) == "v1");
+  CHECK(db.stats().at("bytecask.fsyncs") - fsyncs_before == 1);
+}
+
+TEST_CASE("pipeline: stress — sync, nosync and conflicting writers over "
+          "rotations; one sleep per write; recovery agrees",
+          "[pipeline][concurrency][stress]") {
+  TempDir td;
+  constexpr int kThreads = 8;
+  struct Tally {
+    int writes{0};
+    int syncs{0};
+    int conflicts{0};
+    int not_durable{0};
+    int not_visible{0};
+    std::string last_key;
+  };
+  std::vector<Tally> tallies(kThreads);
+  {
+    auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 64 * 1024});
+    db.put({.sync = true}, to_bytes("hot"), to_bytes("0"));
+    const std::string pad(256, 'p');
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+      threads.emplace_back([&, t] {
+        std::mt19937 rng{static_cast<std::mt19937::result_type>(t + 1)};
+        auto &tally = tallies[static_cast<std::size_t>(t)];
+        bytecask::Bytes out;
+        for (int i = 0; !stop.load(std::memory_order_relaxed); ++i) {
+          const auto key = std::format("t{}-{}", t, i);
+          const auto kind = rng() % 4;
+          if (kind == 0) {
+            // A plan from a snapshot on a contended key: often a conflict,
+            // which makes this thread a leader with nothing to wait for.
+            bytecask::WritePlan plan{db.snapshot()};
+            plan.put(to_bytes("hot"), to_bytes(key));
+            auto r = db.apply_batch({.sync = true}, std::move(plan));
+            if (!r) {
+              ++tally.conflicts;
+              continue;
+            }
+            ++tally.syncs;
+            if (!r->durable) ++tally.not_durable;
+          } else {
+            const bool sync = kind != 3;
+            auto r = db.put({.sync = sync}, to_bytes(key), to_bytes(key + pad));
+            if (sync) {
+              ++tally.syncs;
+              if (!r.durable) ++tally.not_durable;
+            }
+            if (!db.get({}, to_bytes(key), out)) ++tally.not_visible;
+            tally.last_key = key;
+          }
+          ++tally.writes;
+        }
+      });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds{2});
+    stop.store(true, std::memory_order_relaxed);
+    for (auto &th : threads) th.join();
+
+    const auto s = db.engine_state();
+    CHECK(s->durable_seq >= s->sync_requested_seq);
+    int writes = 0;
+    int syncs = 0;
+    int conflicts = 0;
+    for (const auto &tl : tallies) {
+      CHECK(tl.not_durable == 0);
+      CHECK(tl.not_visible == 0);
+      writes += tl.writes;
+      syncs += tl.syncs;
+      conflicts += tl.conflicts;
+    }
+    CHECK(writes > 0);
+    CHECK(conflicts > 0);
+    // One sleep per submission (conflicting plans included), plus one for
+    // the writer woken to lead the next batch — at most one per batch.
+    const auto st = db.stats();
+    CHECK(st.at("bytecask.group_writer_waits") + st.at("bytecask.commit_wait_blocked")
+          <= writes + conflicts + st.at("bytecask.group_writer_batches"));
+    CHECK(st.at("bytecask.fsyncs") <= syncs + 1);
+    CHECK(st.at("bytecask.file_rotations") > 0);
+  }
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 64 * 1024});
+  for (const auto &tl : tallies) {
+    if (tl.last_key.empty()) continue;
+    auto v = get_val(db, to_bytes(tl.last_key));
+    REQUIRE(v.has_value());
+    CHECK(to_string(*v).starts_with(tl.last_key));
+  }
 }
