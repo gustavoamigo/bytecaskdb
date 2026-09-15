@@ -314,10 +314,13 @@ test('stats handle large numbers correctly', async ({ db }) => {
   // Perform many operations to test large counter values
   const operationCount = 1000
 
+  // NoSync: the assertions are about counter magnitude and type, not
+  // durability, and 1,000 fdatasyncs put this test's wall clock at the mercy
+  // of the CI runner's disk (4.7 s of its 10 s budget in one observed run).
   for (let i = 0; i < operationCount; i++) {
     const key = `large-stats-${i % 100}` // Reuse keys to create overwrites
     const value = `value-${i}`
-    db.put(key, value)
+    db.put(key, value, { sync: false })
   }
 
   const stats = db.stats()
