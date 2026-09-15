@@ -117,9 +117,9 @@ int MariaDBTxn::get(const uint8_t *key, size_t klen, bytecask::Bytes &out) {
   ensure_snapshot();
   try {
     if (snap_) {
-      return snap_->get({}, as_view(key, klen), out) ? 1 : 0;
+      return snap_->get(plugin_read_options(), as_view(key, klen), out) ? 1 : 0;
     }
-    return db_->get({}, as_view(key, klen), out) ? 1 : 0;
+    return db_->get(plugin_read_options(), as_view(key, klen), out) ? 1 : 0;
   } catch (...) {
     return -1;
   }
@@ -137,9 +137,9 @@ bool MariaDBTxn::exists(const uint8_t *key, size_t klen) {
   ensure_snapshot();
   try {
     if (snap_) {
-      return snap_->contains_key({}, as_view(key, klen));
+      return snap_->contains_key(plugin_read_options(), as_view(key, klen));
     }
-    return db_->contains_key({}, as_view(key, klen));
+    return db_->contains_key(plugin_read_options(), as_view(key, klen));
   } catch (...) {
     return false;
   }
@@ -158,7 +158,7 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_prefix(
 
   std::optional<bytecask::EntryIterator> snap_it;
   if (snap_) {
-    auto range = snap_->iter_from({}, as_view(lo, lo_len));
+    auto range = snap_->iter_from(plugin_read_options(), as_view(lo, lo_len));
     snap_it.emplace(std::move(range.begin()));
   }
 
@@ -180,7 +180,7 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_index_prefix(
 
   std::optional<bytecask::KeyIterator> snap_it;
   if (snap_) {
-    auto range = snap_->keys_from({}, as_view(lo, lo_len));
+    auto range = snap_->keys_from(plugin_read_options(), as_view(lo, lo_len));
     snap_it.emplace(std::move(range.begin()));
   }
 
@@ -203,7 +203,7 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_index_prefix(
 
   std::optional<bytecask::ReverseKeyIterator> snap_it;
   if (snap_) {
-    auto range = snap_->rkeys_from({}, as_view(hi, hi_len));
+    auto range = snap_->rkeys_from(plugin_read_options(), as_view(hi, hi_len));
     snap_it.emplace(std::move(range.begin()));
   }
 
@@ -226,7 +226,7 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
 
   std::optional<bytecask::ReverseEntryIterator> snap_it;
   if (snap_) {
-    auto range = snap_->riter_from({}, as_view(hi, hi_len));
+    auto range = snap_->riter_from(plugin_read_options(), as_view(hi, hi_len));
     snap_it.emplace(std::move(range.begin()));
   }
 
@@ -384,7 +384,7 @@ void MariaDBTxn::report_deferred_dup_key() {
     if (op.kind != Op::Put || !op.guard_absent) { continue; }
     bool present = false;
     try {
-      present = db_->contains_key({}, as_view(op.key));
+      present = db_->contains_key(plugin_read_options(), as_view(op.key));
     } catch (...) {
       present = false;
     }
@@ -503,7 +503,7 @@ bool MariaDBTxn::bulk_pk_exists(const uint8_t *key, std::size_t klen) {
     return true;
   }
   try {
-    return db_->contains_key({}, as_view(key, klen));
+    return db_->contains_key(plugin_read_options(), as_view(key, klen));
   } catch (...) {
     return false;
   }
@@ -516,7 +516,7 @@ bool MariaDBTxn::bulk_unique_prefix_exists(const uint8_t *prefix,
     return true;
   }
   try {
-    for (auto &k : db_->keys_from({}, as_view(prefix, plen))) {
+    for (auto &k : db_->keys_from(plugin_read_options(), as_view(prefix, plen))) {
       return k.size() >= plen &&
              std::memcmp(u8_data(k), prefix, plen) == 0;
     }

@@ -409,11 +409,13 @@ later is additive.
 H.1 — Vacuum: **Done**
 
 - Background thread launched in `bytecaskdb_init()`, joined in `bytecaskdb_deinit()`.
-- Calls `DB::vacuum()` in a loop; 500 ms between passes when reclaiming,
-  30 s when idle. Shutdown is immediate via condition variable.
+- Calls `DB::vacuum()` in a loop; the fragmentation threshold and the
+  busy/idle pause between passes are the `bytecaskdb_vacuum_*` system
+  variables (defaults 0.5, 500 ms, 30 s). Shutdown is immediate via
+  condition variable.
 - Exceptions are logged and the loop retries on the next cycle.
-- Future: expose intervals as plugin system variables; add status variables
-  (`bytecaskdb_last_vacuum_ms`, `_files_reclaimed`).
+- Future: add status variables (`bytecaskdb_last_vacuum_ms`,
+  `_files_reclaimed`).
 
 H.2 — Resume from degraded:
 
