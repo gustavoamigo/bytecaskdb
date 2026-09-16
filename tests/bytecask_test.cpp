@@ -6839,6 +6839,8 @@ TEST_CASE("stats: all expected keys are present in dump",
   auto db = bytecask::DB::open(td.path);
   auto s = db.stats();
   std::vector<std::string> expected = {
+      "bytecask.keydir_keys",
+      "bytecask.keydir_bytes_estimate",
       "bytecask.bytes_written",
       "bytecask.group_writer_batches",
       "bytecask.group_writer_coalesced",
@@ -7208,6 +7210,31 @@ TEST_CASE("io_backend=BufferPool: direct I/O fills serve identical bytes",
     WARN("temp dir refuses O_DIRECT: fallback path exercised, direct path not");
   }
 #endif
+}
+
+TEST_CASE("stats: keydir gauges track the live key count",
+          "[bytecask][stats]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  CHECK(db.stats().at("bytecask.keydir_keys") == 0);
+  CHECK(db.stats().at("bytecask.keydir_bytes_estimate") == 0);
+  for (int i = 0; i < 100; ++i) {
+    db.put({.sync = false}, to_bytes(std::format("k{:03d}", i)), to_bytes("v"));
+  }
+  auto st = db.stats();
+  CHECK(st.at("bytecask.keydir_keys") == 100);
+  // The estimate is a per-key constant; what matters is that it is derived
+  // from the live count, so it must move with deletes too.
+  CHECK(st.at("bytecask.keydir_bytes_estimate") ==
+        100 * (st.at("bytecask.keydir_bytes_estimate") / 100));
+  CHECK(st.at("bytecask.keydir_bytes_estimate") > 100 * 16);  // > sizeof(KeyDirEntry)
+  for (int i = 0; i < 40; ++i) {
+    (void)db.del({.sync = false}, to_bytes(std::format("k{:03d}", i)));
+  }
+  st = db.stats();
+  CHECK(st.at("bytecask.keydir_keys") == 60);
+  CHECK(st.at("bytecask.keydir_bytes_estimate") ==
+        60 * (st.at("bytecask.keydir_bytes_estimate") / 60));
 }
 
 TEST_CASE("io_backend=BufferPool: iteration and vacuum agree with pread",

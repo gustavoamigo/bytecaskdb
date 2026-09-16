@@ -329,7 +329,9 @@ keydir_bytes_estimate,
 pool_optimistic_retries, pool_direct_io_fallbacks
 ```
 
-Hit ratio is the primary A/B metric. `keydir_bytes_estimate` is what lets an operator size the pool as *total − key directory − slack*, which §1 makes the point of the exercise; without it the budget cannot be computed from outside. `pool_optimistic_retries` is the early warning for §8.2. `pool_direct_io_fallbacks` catches tmpfs degrading silently in CI.
+Hit ratio is the primary A/B metric. `keydir_bytes_estimate` is what lets an operator size the pool as *total − key directory − slack*, which §1 makes the point of the exercise; without it the budget cannot be computed from outside. `pool_optimistic_retries` is the early warning for §8.2. `pool_direct_io_fallbacks` catches a mount refusing `O_DIRECT` and degrading silently in CI.
+
+*As built:* `keydir_bytes_estimate` is `keydir_keys × 50`. The tree keeps no byte accounting, and adding it to the persistent clone/release path is not worth the risk for a gauge, so the constant comes from `scripts/run_memory_profile.py` on this tree: 47 B/key for 42-byte prefixed keys at 500 k (55 at 100 k), and 61–77 B/key for 8-byte binary keys, which share less prefix. That is an estimate within about ±30 % by key shape; `keydir_keys` is exact and sits beside it so an operator who has profiled their own keys can multiply for themselves. `pool_frames_resident` is a gauge; `pool_frames_pinned` waits on Phase 3.
 
 ### Correctness
 
