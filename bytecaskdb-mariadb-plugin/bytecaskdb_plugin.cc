@@ -57,11 +57,19 @@ std::atomic<unsigned long> g_vacuum_idle_interval_ms{30000};
 // System variables (global scope — MariaDB plugin API requirement)
 // ---------------------------------------------------------------------------
 
-static my_bool sysvar_use_mmap = FALSE;
-static MYSQL_SYSVAR_BOOL(use_mmap, sysvar_use_mmap,
+// Order must match bytecask::IoBackend.
+static const char *io_backend_names[] = {"pread", "mmap", "buffer_pool",
+                                         NullS};
+static TYPELIB io_backend_typelib = {
+    array_elements(io_backend_names) - 1, "io_backend_typelib",
+    io_backend_names, nullptr};
+
+static unsigned long sysvar_io_backend = 0;  // pread
+static MYSQL_SYSVAR_ENUM(io_backend, sysvar_io_backend,
     PLUGIN_VAR_READONLY,
-    "Use mmap for sealed data files (default OFF)",
-    nullptr, nullptr, FALSE);
+    "How sealed data files are read: pread (default), mmap, or buffer_pool. "
+    "The active file is unaffected — it is written the same way in every mode.",
+    nullptr, nullptr, 0, &io_backend_typelib);
 
 static unsigned long long sysvar_max_file_bytes = 64ULL * 1024 * 1024;
 static MYSQL_SYSVAR_ULONGLONG(max_file_bytes, sysvar_max_file_bytes,
@@ -156,7 +164,7 @@ static MYSQL_SYSVAR_ULONG(vacuum_idle_interval_ms,
     30000, 100, 86400UL * 1000, 0);
 
 static struct st_mysql_sys_var *bytecaskdb_system_variables[] = {
-    MYSQL_SYSVAR(use_mmap),
+    MYSQL_SYSVAR(io_backend),
     MYSQL_SYSVAR(max_file_bytes),
     MYSQL_SYSVAR(bulk_copy_flush_bytes),
     MYSQL_SYSVAR(verify_checksums),
@@ -859,7 +867,7 @@ static int bytecaskdb_init(void *p) {
   opts.recovery_threads = 4;
   opts.max_value_bytes = 16 * 1024 * 1024;  // MEDIUMBLOB (16 MiB)
   opts.max_key_bytes = 8192;  // secondary index key + PK suffix can exceed 4096
-  opts.use_mmap = sysvar_use_mmap;
+  opts.io_backend = static_cast<bytecask::IoBackend>(sysvar_io_backend);
   opts.max_file_bytes = sysvar_max_file_bytes;
 
   try {
@@ -880,8 +888,8 @@ static int bytecaskdb_init(void *p) {
 
   sql_print_information("ByteCaskDB: opened global DB at '%s'",
           db_path.c_str());
-  sql_print_information("ByteCaskDB: use_mmap=%s max_file_bytes=%llu",
-          sysvar_use_mmap ? "ON" : "OFF", sysvar_max_file_bytes);
+  sql_print_information("ByteCaskDB: io_backend=%s max_file_bytes=%llu",
+          io_backend_names[sysvar_io_backend], sysvar_max_file_bytes);
 
   s_vacuum_stop = false;
   s_vacuum_pause_count = 0;

@@ -66,8 +66,8 @@ def _build_open_opts(state: StateShape) -> str:
     parts: List[str] = []
     if state.max_file_bytes is not None:
         parts.append(f".max_file_bytes = {state.max_file_bytes}")
-    if state.use_mmap:
-        parts.append(".use_mmap = true")
+    if state.mmap_backend:
+        parts.append(".io_backend = bytecask::IoBackend::Mmap")
     return ", ".join(parts)
 
 
@@ -248,8 +248,8 @@ def gen_test(
     name = f"prove__{state.label}__{plan.label}__{failure.value}"
 
     parts: List[str] = []
-    if state.use_mmap:
-        # WASM/Emscripten builds reject Options::use_mmap outright (see
+    if state.mmap_backend:
+        # WASM/Emscripten builds reject IoBackend::Mmap outright (see
         # DB::open); these buffered/mmap variants only make sense natively.
         parts.append("#ifndef __EMSCRIPTEN__")
     parts.append(f'TEST_CASE("{name}", "[prove]") {{')
@@ -320,7 +320,7 @@ def gen_test(
             )
 
     parts.append("}")
-    if state.use_mmap:
+    if state.mmap_backend:
         parts.append("#endif  // __EMSCRIPTEN__")
     return "\n".join(parts)
 

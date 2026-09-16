@@ -1146,12 +1146,13 @@ ReadOnlyMmapDataFile::~ReadOnlyMmapDataFile() {
   }
 }
 
-// Generic factory: returns mmap-backed DataFile when possible, pread-based otherwise.
+// Generic factory: returns the read-only DataFile for the selected back-end.
+// BufferPool cannot reach here — DB::open rejects it until the pool lands.
 export [[nodiscard]] inline auto openDataFileForRead(
-    std::filesystem::path path, bool use_mmap = false)
+    std::filesystem::path path, IoBackend backend = IoBackend::Pread)
     -> std::shared_ptr<DataFile> {
 #ifndef __EMSCRIPTEN__
-  if (use_mmap) {
+  if (backend == IoBackend::Mmap) {
     struct stat st {};
     if (::stat(path.c_str(), &st) == 0 && st.st_size > 0) {
       return ReadOnlyMmapDataFile::openForRead(std::move(path));
@@ -1166,10 +1167,10 @@ export [[nodiscard]] inline auto openDataFileForRead(
 // if present. The engine never uses this to create a new file — see
 // createDataFileForWrite — but tests and tooling reopen a file they wrote.
 export [[nodiscard]] inline auto openDataFileForWrite(
-    std::filesystem::path path, std::size_t capacity, bool use_mmap)
+    std::filesystem::path path, std::size_t capacity, IoBackend backend)
     -> std::shared_ptr<WritableDataFile> {
 #ifndef __EMSCRIPTEN__
-  if (use_mmap && capacity > 0) {
+  if (backend == IoBackend::Mmap && capacity > 0) {
     return WritableMmapDataFile::create(std::move(path), capacity);
   }
 #endif
@@ -1188,7 +1189,7 @@ export [[nodiscard]] inline auto openDataFileForWrite(
 // caller cannot half-apply.
 export [[nodiscard]] inline auto createDataFileForWrite(
     const std::filesystem::path &dir, const std::string &stem,
-    std::string_view suffix, std::size_t capacity, bool use_mmap)
+    std::string_view suffix, std::size_t capacity, IoBackend backend)
     -> std::shared_ptr<WritableDataFile> {
   const auto hint_path = dir / (stem + ".hint");
   // error_code overload: the question is "is this stem taken", and a stat
@@ -1203,7 +1204,7 @@ export [[nodiscard]] inline auto createDataFileForWrite(
   }
   auto path = dir / (stem + std::string{suffix});
 #ifndef __EMSCRIPTEN__
-  if (use_mmap && capacity > 0) {
+  if (backend == IoBackend::Mmap && capacity > 0) {
     return WritableMmapDataFile::create(std::move(path), capacity,
                                         /*exclusive=*/true);
   }

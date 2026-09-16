@@ -707,7 +707,7 @@ TEST_CASE("DB recovery: incomplete batch is discarded",
   {
     // Manually write a data file simulating a crash mid-batch.
     auto df = bytecask::openDataFileForWrite(
-        db_path / "data_00000000000000_00000000_V01.data", 0, false);
+        db_path / "data_00000000000000_00000000_V01.data", 0, bytecask::IoBackend::Pread);
     // Standalone entry — should survive.
     std::ignore = df->append_entry(1, bytecask::EntryType::Put, to_bytes("good"),
                             to_bytes("value1"));
@@ -757,7 +757,7 @@ TEST_CASE("DB recovery: order-independent tombstone",
     // File with a Put for "gone" (seq=1) and "alive" (seq=2).
     {
       auto df = bytecask::openDataFileForWrite(
-          db_path / std::format("{}.data", put_stem), 0, false);
+          db_path / std::format("{}.data", put_stem), 0, bytecask::IoBackend::Pread);
       std::ignore = df->append_entry(1, bytecask::EntryType::Put, to_bytes("gone"),
                               to_bytes("v1"));
       std::ignore = df->append_entry(2, bytecask::EntryType::Put, to_bytes("alive"),
@@ -768,7 +768,7 @@ TEST_CASE("DB recovery: order-independent tombstone",
     // File with a Delete for "gone" (seq=3) — higher sequence wins.
     {
       auto df = bytecask::openDataFileForWrite(
-          db_path / std::format("{}.data", del_stem), 0, false);
+          db_path / std::format("{}.data", del_stem), 0, bytecask::IoBackend::Pread);
       std::ignore = df->append_entry(3, bytecask::EntryType::Delete,
                               to_bytes("gone"), {});
       df->sync();
@@ -2170,11 +2170,12 @@ auto size_report(const bytecask::DB &db) -> SizeReport {
 
 TEST_CASE("Preallocated tail: sealed files shrink to their logical size",
           "[bytecask][filestats]") {
-  const bool use_mmap = GENERATE(false, true);
-  CAPTURE(use_mmap);
+  const auto io_backend =
+      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap);
+  CAPTURE(static_cast<int>(io_backend));
   constexpr std::uint64_t kCapacity = 4096;
   const bytecask::Options opts{.max_file_bytes = kCapacity,
-                               .use_mmap = use_mmap};
+                               .io_backend = io_backend};
 
   TempDir td;
   const auto db_path = td.path / "db";
@@ -6372,7 +6373,7 @@ TEST_CASE("leader-to-follower replication round-trip", "[replication]") {
 
 TEST_CASE("DataFileIterator over empty file yields nothing", "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::openDataFileForWrite(td.path / "empty.data", 0, false); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "empty.data", 0, bytecask::IoBackend::Pread); auto &file = *file_ptr;
 
   std::vector<bytecask::DataEntry> entries;
   for (const auto& [entry, off] : bytecask::scan_entries(file)) {
@@ -6383,7 +6384,7 @@ TEST_CASE("DataFileIterator over empty file yields nothing", "[iterator]") {
 
 TEST_CASE("DataFileIterator yields all entries in order", "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, bytecask::IoBackend::Pread); auto &file = *file_ptr;
   (void)file.append_entry(1, bytecask::EntryType::Put,
                           to_bytes("k1"), to_bytes("v1"));
   (void)file.append_entry(2, bytecask::EntryType::Put,
@@ -6404,7 +6405,7 @@ TEST_CASE("DataFileIterator yields all entries in order", "[iterator]") {
 
 TEST_CASE("DataFileIterator reports correct offsets", "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, bytecask::IoBackend::Pread); auto &file = *file_ptr;
   auto off1 = file.append_entry(1, bytecask::EntryType::Put,
                                 to_bytes("a"), to_bytes("1"));
   auto off2 = file.append_entry(2, bytecask::EntryType::Put,
@@ -6427,7 +6428,7 @@ TEST_CASE("DataFileIterator reports correct offsets", "[iterator]") {
 TEST_CASE("scan_committed standalone entries yield individual entries",
           "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, bytecask::IoBackend::Pread); auto &file = *file_ptr;
   (void)file.append_entry(1, bytecask::EntryType::Put,
                           to_bytes("k1"), to_bytes("v1"));
   (void)file.append_entry(2, bytecask::EntryType::Delete,
@@ -6448,7 +6449,7 @@ TEST_CASE("scan_committed standalone entries yield individual entries",
 TEST_CASE("scan_committed yields BulkBegin/BulkEnd as regular entries",
           "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, bytecask::IoBackend::Pread); auto &file = *file_ptr;
   (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
   (void)file.append_entry(11, bytecask::EntryType::Put,
                           to_bytes("k1"), to_bytes("v1"));
@@ -6474,7 +6475,7 @@ TEST_CASE("scan_committed yields BulkBegin/BulkEnd as regular entries",
 
 TEST_CASE("scan_committed discards incomplete batch at EOF", "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, bytecask::IoBackend::Pread); auto &file = *file_ptr;
   // Standalone entry first, then an incomplete batch.
   (void)file.append_entry(1, bytecask::EntryType::Put,
                           to_bytes("k1"), to_bytes("v1"));
@@ -6496,7 +6497,7 @@ TEST_CASE("scan_committed discards incomplete batch at EOF", "[iterator]") {
 TEST_CASE("scan_committed interleaved standalone and batch entries",
           "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, bytecask::IoBackend::Pread); auto &file = *file_ptr;
   (void)file.append_entry(1, bytecask::EntryType::Put,
                           to_bytes("standalone1"), to_bytes("v1"));
   (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
@@ -6522,7 +6523,7 @@ TEST_CASE("scan_committed interleaved standalone and batch entries",
 TEST_CASE("scan_committed committed_offset tracks last committed position",
           "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, bytecask::IoBackend::Pread); auto &file = *file_ptr;
   (void)file.append_entry(1, bytecask::EntryType::Put,
                           to_bytes("k"), to_bytes("v"));
   (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
@@ -6541,7 +6542,7 @@ TEST_CASE("scan_committed committed_offset tracks last committed position",
 
 TEST_CASE("scan_committed over empty file yields nothing", "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::openDataFileForWrite(td.path / "empty.data", 0, false); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "empty.data", 0, bytecask::IoBackend::Pread); auto &file = *file_ptr;
 
   std::vector<std::pair<bytecask::DataEntry, bytecask::Offset>> entries;
   for (const auto& e : bytecask::scan_committed(file)) {
@@ -6552,7 +6553,7 @@ TEST_CASE("scan_committed over empty file yields nothing", "[iterator]") {
 
 TEST_CASE("scan_committed handles RangeDel inside batch", "[iterator]") {
   TempDir td;
-  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, false); auto &file = *file_ptr;
+  auto file_ptr = bytecask::openDataFileForWrite(td.path / "test.data", 0, bytecask::IoBackend::Pread); auto &file = *file_ptr;
   (void)file.append_entry(10, bytecask::EntryType::BulkBegin, {}, {});
   (void)file.append_entry(11, bytecask::EntryType::Put,
                           to_bytes("k1"), to_bytes("v1"));
@@ -6834,14 +6835,14 @@ TEST_CASE("iter_from and riter_from with verify_checksums=false",
 }
 
 // ---------------------------------------------------------------------------
-// Options: use_mmap
+// Options: io_backend
 // ---------------------------------------------------------------------------
 
-TEST_CASE("use_mmap=false: put/get with file rotation",
+TEST_CASE("io_backend=Pread: put/get with file rotation",
           "[bytecask][no_mmap]") {
   TempDir td;
   auto db = bytecask::DB::open(
-      td.path, {.max_file_bytes = 64, .use_mmap = false});
+      td.path, {.max_file_bytes = 64, .io_backend = bytecask::IoBackend::Pread});
   constexpr int kCount = 50;
   for (int i = 0; i < kCount; ++i) {
     auto key = std::format("k{:04d}", i);
@@ -6857,17 +6858,17 @@ TEST_CASE("use_mmap=false: put/get with file rotation",
   }
 }
 
-TEST_CASE("use_mmap=true: put/get round-trip",
+TEST_CASE("io_backend=Mmap: put/get round-trip",
           "[bytecask][mmap]") {
   TempDir td;
 #ifdef __EMSCRIPTEN__
   // WASM/Emscripten builds never support mmap: mmap emulation would
   // double-buffer the data file into the WASM heap rather than avoiding a
   // copy, so DB::open rejects the option instead of silently ignoring it.
-  CHECK_THROWS_AS(bytecask::DB::open(td.path, {.use_mmap = true}),
+  CHECK_THROWS_AS(bytecask::DB::open(td.path, {.io_backend = bytecask::IoBackend::Mmap}),
                   std::invalid_argument);
 #else
-  auto db = bytecask::DB::open(td.path, {.use_mmap = true});
+  auto db = bytecask::DB::open(td.path, {.io_backend = bytecask::IoBackend::Mmap});
   constexpr int kCount = 20;
   for (int i = 0; i < kCount; ++i) {
     auto key = std::format("k{:04d}", i);
@@ -6884,12 +6885,23 @@ TEST_CASE("use_mmap=true: put/get round-trip",
 #endif
 }
 
-TEST_CASE("use_mmap=false: full pread mode",
+TEST_CASE("io_backend=BufferPool: rejected until the pool is implemented",
+          "[bytecask][buffer_pool]") {
+  TempDir td;
+  // Reserved, not silently downgraded to pread — the same stance DB::open
+  // takes on an unsupported mmap option.
+  CHECK_THROWS_AS(
+      bytecask::DB::open(td.path,
+                         {.io_backend = bytecask::IoBackend::BufferPool}),
+      std::invalid_argument);
+}
+
+TEST_CASE("io_backend=Pread: full pread mode",
           "[bytecask][pread_mode]") {
   TempDir td;
   auto db = bytecask::DB::open(
       td.path,
-      {.max_file_bytes = 64, .use_mmap = false});
+      {.max_file_bytes = 64, .io_backend = bytecask::IoBackend::Pread});
   constexpr int kCount = 50;
   for (int i = 0; i < kCount; ++i) {
     auto key = std::format("k{:04d}", i);
@@ -6905,20 +6917,20 @@ TEST_CASE("use_mmap=false: full pread mode",
   }
 }
 
-TEST_CASE("use_mmap=false: recovery loads sealed files via pread",
+TEST_CASE("io_backend=Pread: recovery loads sealed files via pread",
           "[bytecask][no_mmap][recovery]") {
   TempDir td;
   auto db_path = td.path / "db";
   {
     auto db = bytecask::DB::open(
-        db_path, {.max_file_bytes = 64, .use_mmap = false});
+        db_path, {.max_file_bytes = 64, .io_backend = bytecask::IoBackend::Pread});
     for (int i = 0; i < 50; ++i) {
       auto key = std::format("k{:04d}", i);
       auto val = std::format("v{:04d}", i);
       db.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
   }
-  auto db = bytecask::DB::open(db_path, {.use_mmap = false});
+  auto db = bytecask::DB::open(db_path, {.io_backend = bytecask::IoBackend::Pread});
   bytecask::Bytes out;
   for (int i = 0; i < 50; ++i) {
     auto key = std::format("k{:04d}", i);
@@ -6928,11 +6940,11 @@ TEST_CASE("use_mmap=false: recovery loads sealed files via pread",
   }
 }
 
-TEST_CASE("use_mmap=false: vacuum reclaims space",
+TEST_CASE("io_backend=Pread: vacuum reclaims space",
           "[bytecask][no_mmap][vacuum]") {
   TempDir td;
   auto db = bytecask::DB::open(
-      td.path, {.max_file_bytes = 64, .use_mmap = false});
+      td.path, {.max_file_bytes = 64, .io_backend = bytecask::IoBackend::Pread});
   for (int i = 0; i < 30; ++i) {
     auto key = std::format("k{:04d}", i);
     db.put({.sync = false}, to_bytes(key), to_bytes("initial"));

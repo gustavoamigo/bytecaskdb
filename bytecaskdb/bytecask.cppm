@@ -211,10 +211,11 @@ export struct Options {
   // Maximum value size in bytes. Values exceeding this limit are rejected with
   // std::invalid_argument. Hard ceiling: 16,777,215 (24-bit packed KeyDirEntry).
   std::uint32_t max_value_bytes{kDefaultMaxValueBytes};
-  // When true, sealed files are memory-mapped for zero-copy reads.
-  // When false (default), reads use pread(2), avoiding virtual address space
-  // pressure under memory contention.
-  bool use_mmap{false};
+  // Selects how data files are read. Pread (default) issues pread(2) per read
+  // and avoids virtual address space pressure under memory contention; Mmap
+  // memory-maps sealed files for zero-copy reads; BufferPool serves sealed
+  // files from a bounded, engine-owned cache. See IoBackend.
+  IoBackend io_backend{IoBackend::Pread};
 };
 
 // ---------------------------------------------------------------------------
@@ -1066,7 +1067,7 @@ private:
   std::filesystem::path dir_;
   int lock_fd_{-1};  // flock() on dir_/.lock; released by close() in ~DB()
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
-  bool use_mmap_{false};
+  IoBackend io_backend_{IoBackend::Pread};
   SizeLimits size_limits_;
   mutable Counters counters_;
   // All mutable state — SWMR. Writers publish via atomic_store()
@@ -2027,19 +2028,34 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
 // Throws std::system_error if the directory cannot be prepared.
 DB::DB(std::filesystem::path dir, Options opts)
     : dir_{std::move(dir)}, rotation_threshold_{opts.max_file_bytes},
-      use_mmap_{opts.use_mmap},
+      io_backend_{opts.io_backend},
       size_limits_{std::min(opts.max_key_bytes, kMaxKeySize),
                    std::min(opts.max_value_bytes, kMaxValueSize)},
       state_{std::make_shared<EngineState>()} {
 #ifdef __EMSCRIPTEN__
-  if (opts.use_mmap) {
+  if (opts.io_backend == IoBackend::Mmap) {
     throw std::invalid_argument{
-        "Options::use_mmap is not supported on WASM/Emscripten builds: "
+        "IoBackend::Mmap is not supported on WASM/Emscripten builds: "
         "mmap emulation would double-buffer the data file into the WASM "
         "heap instead of avoiding a copy, so this build always uses the "
         "pread-based data file regardless of this option"};
   }
+  if (opts.io_backend == IoBackend::BufferPool) {
+    throw std::invalid_argument{
+        "IoBackend::BufferPool is not supported on WASM/Emscripten builds: "
+        "MEMFS is already memory, so there is no page cache to bound and the "
+        "pool would only add a second copy of every value"};
+  }
 #endif
+  // The enum carries BufferPool ahead of the pool itself so the option surface
+  // settles once. Until the pool lands, accepting it would silently serve
+  // pread — the same accepted-but-ignored mismatch this constructor already
+  // rejects above. Remove this when the pool is wired in.
+  if (opts.io_backend == IoBackend::BufferPool) {
+    throw std::invalid_argument{
+        "IoBackend::BufferPool is not implemented yet: the option is reserved "
+        "and rejected rather than silently falling back to pread"};
+  }
   KeyDirEntry::check_file_offset(opts.max_file_bytes);
   std::filesystem::create_directories(dir_);
 
@@ -2083,7 +2099,7 @@ DB::DB(std::filesystem::path dir, Options opts)
     s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
     auto new_active = createDataFileForWrite(
-        dir_, stem, ".data", rotation_threshold_, use_mmap_);
+        dir_, stem, ".data", rotation_threshold_, io_backend_);
     // +1 for the new active file.
     counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
     auto files_t = s.files.transient();
@@ -2782,13 +2798,13 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 void DB::rotate_active_file(TransientEngineState &t,
                             const std::shared_ptr<const EngineState> &) {
   t.active_file().shrink_to_fit();
-  auto read_only_old = openDataFileForRead(t.active_file().path(), use_mmap_);
+  auto read_only_old = openDataFileForRead(t.active_file().path(), io_backend_);
   const auto stem = make_data_file_stem();
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_rotate_file_creation);
 #endif
   auto new_file = createDataFileForWrite(
-      dir_, stem, ".data", rotation_threshold_, use_mmap_);
+      dir_, stem, ".data", rotation_threshold_, io_backend_);
   t.apply_rotate_file(read_only_old, std::move(new_file));
   auto dir = dir_;
   worker_.dispatch([f = std::move(read_only_old), d = std::move(dir)] {
@@ -2975,7 +2991,7 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
     FAULT_INJECTION(io_vacuum_compact_tmp_create);
 #endif
     auto tmp_file = createDataFileForWrite(
-        dir_, stem, ".data.tmp", rotation_threshold_, use_mmap_);
+        dir_, stem, ".data.tmp", rotation_threshold_, io_backend_);
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id);
     tmp_file->sync();
     tmp_file->shrink_to_fit();
@@ -2989,7 +3005,7 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
   // between here and the staging create. renameDataFileExclusive refuses the
   // target instead of replacing it.
   renameDataFileExclusive(tmp_data_path, final_data_path);
-  auto new_file = openDataFileForRead(final_data_path, use_mmap_);
+  auto new_file = openDataFileForRead(final_data_path, io_backend_);
   flush_hints_for(new_file, dir_);
 
   {
@@ -3144,7 +3160,7 @@ void DB::resume() {
   file.sync();
 
   // Open the old active as read-only for hint generation.
-  auto read_only_old = openDataFileForRead(file.path(), use_mmap_);
+  auto read_only_old = openDataFileForRead(file.path(), io_backend_);
 
   // Dispatch hint generation — idempotent (flush_hints_for skips files
   // whose .hint already exists).
@@ -3158,7 +3174,7 @@ void DB::resume() {
   FAULT_INJECTION(io_resume_file_creation);
 #endif
   auto new_file = createDataFileForWrite(
-      dir_, stem, ".data", rotation_threshold_, use_mmap_);
+      dir_, stem, ".data", rotation_threshold_, io_backend_);
 
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.
@@ -3468,7 +3484,7 @@ auto DB::recovery_prepare_files(EngineState &s)
     }
 
     const auto file_id = s.next_file_id++;
-    auto data_file = openDataFileForRead(p, use_mmap_);
+    auto data_file = openDataFileForRead(p, io_backend_);
 
     const auto hint_path = dir_ / (p.stem().string() + ".hint");
     if (!std::filesystem::exists(hint_path)) {
@@ -3481,7 +3497,7 @@ auto DB::recovery_prepare_files(EngineState &s)
       if (end && *end < std::filesystem::file_size(p)) {
         data_file.reset();
         std::filesystem::resize_file(p, *end);
-        data_file = openDataFileForRead(p, use_mmap_);
+        data_file = openDataFileForRead(p, io_backend_);
       }
     }
     files_t.set(file_id, data_file);

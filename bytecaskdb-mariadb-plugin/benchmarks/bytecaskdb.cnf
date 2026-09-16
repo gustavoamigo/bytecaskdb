@@ -1,5 +1,5 @@
 [mariadbd]
-bytecaskdb_use_mmap = ON
+bytecaskdb_io_backend = mmap
 bytecaskdb_max_file_bytes = 67108864
 bytecaskdb_verify_checksums = ON
 bytecaskdb_vacuum_fragmentation_threshold = 0.7
