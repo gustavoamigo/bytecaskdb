@@ -141,6 +141,32 @@ public:
   void read_at(std::uint32_t file_id, PoolFile file, std::uint64_t offset,
                std::size_t len, std::size_t file_size, std::byte *dst);
 
+  // The active file's frames are never evicted: CLOCK skips them, and the
+  // engine moves this at rotation (under the write lock), at which point
+  // the previous active file's frames become ordinary — no sweep, one
+  // comparison in the victim check (design §5). kNoActiveFile pins nothing.
+  static constexpr std::uint32_t kNoActiveFile = ~std::uint32_t{0};
+  inline void set_active_file(std::uint32_t file_id) noexcept {
+    active_file_id_.store(file_id, std::memory_order_relaxed);
+  }
+
+  // The writer just appended bytes to [offset, offset + bytes.size()) of the
+  // active file. Puts them in the pool so the active file stays resident and
+  // read-your-own-writes never touches disk. A frame already resident is
+  // extended in place with plain relaxed word stores and no version bump:
+  // an append never modifies existing bytes, a boundary word is observed
+  // old-or-new atomically, and a reader only uses bytes below the published
+  // size — so no reader can see anything but what it would have read before.
+  // A frame not yet resident is admitted with its written prefix. Best
+  // effort: if no frame can be claimed the bytes stay on disk and reads take
+  // the buffered fallback.
+  void append_resident(std::uint32_t file_id, std::uint64_t offset,
+                       std::span<const std::byte> bytes);
+
+  // Frames currently belonging to the active file. A gauge, computed by a
+  // walk over frame metadata: O(frames), fine for a scrape.
+  [[nodiscard]] auto pinned_frames() const noexcept -> std::int64_t;
+
   [[nodiscard]] inline auto direct_io() const noexcept -> bool {
     return direct_io_;
   }
@@ -227,6 +253,32 @@ private:
     if (done < len) {
       const auto value = words[w].load(std::memory_order_relaxed);
       std::memcpy(dst + done, &value, len - done);
+    }
+  }
+
+  // Writes len bytes at byte_off within a frame's words from src, relaxed
+  // stores. A boundary word is load-patch-store: the bytes it already held
+  // are unchanged by an append, so a reader sees an old-or-new word whose
+  // old part is identical either way. Single writer by construction.
+  static void write_words_range(std::atomic<std::uint64_t> *words,
+                                std::size_t byte_off, const std::byte *src,
+                                std::size_t len) noexcept {
+    std::size_t done = 0;
+    while (done < len) {
+      const auto pos = byte_off + done;
+      const auto w = pos / kWordBytes;
+      const auto in_word = pos % kWordBytes;
+      const auto chunk = std::min(kWordBytes - in_word, len - done);
+      std::uint64_t value = 0;
+      if (in_word != 0 || chunk != kWordBytes) {
+        value = words[w].load(std::memory_order_relaxed);
+      }
+      std::byte buf[kWordBytes];
+      std::memcpy(buf, &value, kWordBytes);
+      std::memcpy(buf + in_word, src + done, chunk);
+      std::memcpy(&value, buf, kWordBytes);
+      words[w].store(value, std::memory_order_relaxed);
+      done += chunk;
     }
   }
 
@@ -489,6 +541,15 @@ private:
       if ((meta_[f].version.load(std::memory_order_relaxed) & 1U) != 0U) {
         continue;
       }
+      // Pinned: belongs to the active file. Not a reference-bit clear — the
+      // frame must survive a full sweep untouched. An empty frame's key is
+      // all ones, whose file half equals kNoActiveFile, so it is excluded
+      // explicitly rather than by the comparison.
+      const auto k = meta_[f].key.load(std::memory_order_relaxed);
+      if (k != kEmptyKey &&
+          (k >> 32) == active_file_id_.load(std::memory_order_relaxed)) {
+        continue;
+      }
       if (meta_[f].ref.load(std::memory_order_relaxed) != 0) {
         meta_[f].ref.store(0, std::memory_order_relaxed);
         continue;
@@ -545,6 +606,7 @@ private:
   mutable std::vector<Slot> table_;
   std::mutex fill_mu_;
   std::size_t hand_{0};  // guarded by fill_mu_
+  std::atomic<std::uint32_t> active_file_id_{kNoActiveFile};
 };
 
 void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
@@ -626,6 +688,80 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
           static_cast<std::size_t>(t_from - frame_start),
           static_cast<std::size_t>(t_to - t_from));
   }
+}
+
+void BufferPool::append_resident(std::uint32_t file_id, std::uint64_t offset,
+                                 std::span<const std::byte> bytes) {
+  if (bytes.empty()) return;
+  const auto end = offset + bytes.size();
+  const auto first = offset / kPoolFrameBytes;
+  const auto last = (end - 1) / kPoolFrameBytes;
+  for (auto f = first; f <= last; ++f) {
+    const auto frame_start = f * kPoolFrameBytes;
+    const auto seg_from = std::max(offset, frame_start);
+    const auto seg_to = std::min(end, frame_start + kPoolFrameBytes);
+    const auto *src = bytes.data() + (seg_from - offset);
+    const auto seg_len = static_cast<std::size_t>(seg_to - seg_from);
+    const auto in_frame = static_cast<std::size_t>(seg_from - frame_start);
+    const auto key = make_key(file_id, f);
+
+    const auto resident = lookup(key);
+    if (resident < frame_count_) {
+      // Extend in place. No version bump — see the declaration.
+      write_words_range(arena_.data() + resident * kWordsPerFrame, in_frame,
+                        src, seg_len);
+      continue;
+    }
+    // Not resident. Only a frame whose written prefix starts here can be
+    // admitted from these bytes alone; anything earlier in the frame is on
+    // disk, and a read miss will admit the whole frame later if it can.
+    if (in_frame != 0) continue;
+
+    std::size_t victim = 0;
+    {
+      std::lock_guard<std::mutex> lk{fill_mu_};
+      if (lookup(key) < frame_count_ || !claim_victim(victim)) continue;
+      const auto old = meta_[victim].key.load(std::memory_order_relaxed);
+      if (old != kEmptyKey) {
+        table_erase(old);
+        counters_.pool_evictions.fetch_add(1, std::memory_order_relaxed);
+        counters_.pool_frames_resident.fetch_sub(1, std::memory_order_relaxed);
+      }
+      meta_[victim].version.fetch_add(1, std::memory_order_release);
+      meta_[victim].key.store(kEmptyKey, std::memory_order_relaxed);
+      if (old != kEmptyKey) {
+        const auto slots =
+            std::popcount(meta_[victim].touched_lo.load(std::memory_order_relaxed)) +
+            std::popcount(meta_[victim].touched_hi.load(std::memory_order_relaxed));
+        counters_.pool_evicted_bytes_touched.fetch_add(
+            narrow<std::int64_t>(static_cast<std::size_t>(slots) * kTouchSlotBytes),
+            std::memory_order_relaxed);
+      }
+      meta_[victim].touched_lo.store(0, std::memory_order_relaxed);
+      meta_[victim].touched_hi.store(0, std::memory_order_relaxed);
+    }
+    write_words_range(arena_.data() + victim * kWordsPerFrame, 0, src, seg_len);
+    {
+      std::lock_guard<std::mutex> lk{fill_mu_};
+      meta_[victim].key.store(key, std::memory_order_release);
+      meta_[victim].ref.store(1, std::memory_order_relaxed);
+      meta_[victim].version.fetch_add(1, std::memory_order_release);
+      table_insert(key, victim);
+    }
+    counters_.pool_writer_inserts.fetch_add(1, std::memory_order_relaxed);
+    counters_.pool_frames_resident.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+auto BufferPool::pinned_frames() const noexcept -> std::int64_t {
+  const auto active = active_file_id_.load(std::memory_order_relaxed);
+  if (active == kNoActiveFile) return 0;
+  std::int64_t n = 0;
+  for (const auto &m : meta_) {
+    const auto k = m.key.load(std::memory_order_relaxed);
+    if (k != kEmptyKey && (k >> 32) == active) ++n;
+  }
+  return n;
 }
 
 } // namespace bytecask

@@ -6923,6 +6923,8 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.pool_optimistic_retries",
       "bytecask.pool_evicted_bytes_touched",
       "bytecask.pool_frames_total",
+      "bytecask.pool_frames_pinned",
+      "bytecask.pool_writer_inserts",
       "bytecask.pool_frames_resident",
       "bytecask.pool_direct_io_fallbacks",
       "bytecask.vacuum_bytes_reclaimed",
@@ -7140,8 +7142,12 @@ TEST_CASE("io_backend=BufferPool: vacuum does not pollute the pool",
   for (int i = 1; i < kCount; i += 2) {
     REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
   }
-  const auto fills_before = db.stats().at("bytecask.pool_fills");
-  REQUIRE(fills_before > 0);
+  // With active-file residency the writer put every frame there and these
+  // reads all hit, so "fills" is not the precondition — residency is.
+  const auto before = db.stats();
+  REQUIRE(before.at("bytecask.pool_frames_resident") > 0);
+  const auto fills_before = before.at("bytecask.pool_fills");
+  const auto inserts_before = before.at("bytecask.pool_writer_inserts");
 
   bool vacuumed = false;
   // Threshold 0 so a pass definitely runs — a no-op vacuum would prove nothing.
@@ -7150,8 +7156,12 @@ TEST_CASE("io_backend=BufferPool: vacuum does not pollute the pool",
   }
   REQUIRE(vacuumed);
 
-  // The sweep must not have admitted a single frame.
-  CHECK(db.stats().at("bytecask.pool_fills") == fills_before);
+  // The sweep must not have admitted a single frame — not through a read
+  // fill, and not through the compaction writer, which is created without
+  // a pool on purpose.
+  const auto after = db.stats();
+  CHECK(after.at("bytecask.pool_fills") == fills_before);
+  CHECK(after.at("bytecask.pool_writer_inserts") == inserts_before);
 
   // ... and the data is still correct afterwards.
   for (int i = 1; i < kCount; i += 2) {
@@ -7300,6 +7310,91 @@ TEST_CASE("stats: keydir gauges track the live key count",
   CHECK(st.at("bytecask.keydir_keys") == 60);
   CHECK(st.at("bytecask.keydir_bytes_estimate") ==
         60 * (st.at("bytecask.keydir_bytes_estimate") / 60));
+}
+
+TEST_CASE("io_backend=BufferPool: the active file is resident on write",
+          "[bytecask][buffer_pool]") {
+#ifndef __EMSCRIPTEN__
+  // Read-your-own-writes must never miss: every byte of the active file went
+  // into the pool as it was appended. Small values so one frame is extended
+  // in place many times; a second batch large enough to straddle frames.
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path, {.max_file_bytes = 8 * 1024 * 1024,
+                .io_backend = bytecask::IoBackend::BufferPool,
+                .buffer_pool = {.capacity_bytes = 32 * 1024 * 1024}});
+  const auto value_for = [](int i) {
+    return std::format("v{:05d}", i) + std::string(i < 400 ? 20 : 900, 'x');
+  };
+  constexpr int kCount = 600;
+  for (int i = 0; i < kCount; ++i) {
+    db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+           to_bytes(value_for(i)));
+  }
+  auto st = db.stats();
+  REQUIRE(st.at("bytecask.file_rotations") == 0);  // all in the active file
+  CHECK(st.at("bytecask.pool_writer_inserts") > 0);
+  CHECK(st.at("bytecask.pool_frames_pinned") > 0);
+  CHECK(st.at("bytecask.pool_frames_pinned") == st.at("bytecask.pool_frames_resident"));
+
+  bytecask::Bytes out;
+  for (int i = 0; i < kCount; ++i) {
+    REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
+    CHECK(to_string(out) == value_for(i));
+  }
+  st = db.stats();
+  CHECK(st.at("bytecask.pool_misses") == 0);
+  CHECK(st.at("bytecask.pool_hits") == kCount);
+  // Nothing was ever filled by a read: the writer put it all there.
+  CHECK(st.at("bytecask.pool_fills") == 0);
+  // Batches take the other append path; same guarantee.
+  bytecask::WritePlan plan;
+  for (int i = 0; i < 50; ++i) {
+    plan.put(to_bytes(std::format("b{:05d}", i)), to_bytes(value_for(i)));
+  }
+  REQUIRE(db.apply_batch({.sync = false}, std::move(plan)).has_value());
+  for (int i = 0; i < 50; ++i) {
+    REQUIRE(db.get({}, to_bytes(std::format("b{:05d}", i)), out));
+    CHECK(to_string(out) == value_for(i));
+  }
+  CHECK(db.stats().at("bytecask.pool_misses") == 0);
+#endif
+}
+
+TEST_CASE("io_backend=BufferPool: rotation releases the previous active file",
+          "[bytecask][buffer_pool]") {
+#ifndef __EMSCRIPTEN__
+  // The pool is barely larger than the 2 x max_file_bytes floor, so it can
+  // hold the active file and about one sealed one. Writing through several
+  // rotations must evict sealed frames — never pinned ones — and every read
+  // must still be right. The pinned count can never exceed one file.
+  TempDir td;
+  constexpr std::uint64_t kFile = 64 * 1024;
+  auto db = bytecask::DB::open(
+      td.path, {.max_file_bytes = kFile,
+                .io_backend = bytecask::IoBackend::BufferPool,
+                .buffer_pool = {.capacity_bytes = 2 * kFile + 32 * 1024}});
+  const auto value_for = [](int i) {
+    return std::format("v{:05d}", i) + std::string(300, 'x');
+  };
+  constexpr int kCount = 1500;  // ~470 KiB: many rotations
+  bytecask::Bytes out;
+  for (int i = 0; i < kCount; ++i) {
+    db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+           to_bytes(value_for(i)));
+    const auto st = db.stats();
+    // Pinned frames never exceed what one active file can occupy.
+    CHECK(st.at("bytecask.pool_frames_pinned") <=
+          static_cast<std::int64_t>(kFile / bytecask::kPoolFrameBytes) + 1);
+  }
+  const auto st = db.stats();
+  REQUIRE(st.at("bytecask.file_rotations") >= 4);
+  CHECK(st.at("bytecask.pool_evictions") > 0);
+  for (int i = 0; i < kCount; ++i) {
+    REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
+    CHECK(to_string(out) == value_for(i));
+  }
+#endif
 }
 
 TEST_CASE("io_backend=BufferPool: iteration and vacuum agree with pread",

@@ -60,6 +60,9 @@ export struct Counters {
   // design's `u`: how much of a frame earns its place before it goes. Low u
   // is the number that would reopen the entry-cache decision (§10, §12.2).
   std::atomic<std::int64_t> pool_evicted_bytes_touched{0};
+  // Frames the writer put into the pool on append (active-file residency),
+  // as opposed to pool_fills, which a read miss caused.
+  std::atomic<std::int64_t> pool_writer_inserts{0};
   std::int64_t pool_frames_total{0};
   // Gauge: frames currently holding a file's bytes. Resident / total is the
   // fill level an operator sizes against.

@@ -545,8 +545,12 @@ public:
   // State transition: register a sealed read-only file in place of the old
   // active, then register a new writable file as the new active.
   // Cannot fail.
+  // new_file_id must come from reserve_file_id(): the new active file is
+  // created before this runs, and under the buffer pool it carries its id
+  // from construction so the writer can key its frames.
   void apply_rotate_file(std::shared_ptr<DataFile> sealed_old,
-                         std::shared_ptr<DataFile> new_file);
+                         std::shared_ptr<DataFile> new_file,
+                         std::uint32_t new_file_id);
 
   // State transition: remap keys after vacuum scan+copy.
   // Cannot fail.
@@ -1879,10 +1883,9 @@ void TransientEngineState::apply_ingest(
 
 void TransientEngineState::apply_rotate_file(
     std::shared_ptr<DataFile> sealed_old,
-    std::shared_ptr<DataFile> new_file) {
+    std::shared_ptr<DataFile> new_file, std::uint32_t new_file_id) {
   files_.set(active_file_id_, std::move(sealed_old));
-  KeyDirEntry::check_file_id(next_file_id_);
-  active_file_id_ = next_file_id_++;
+  active_file_id_ = new_file_id;
   files_.set(active_file_id_, std::move(new_file));
   file_stats_.set(active_file_id_, FileStats{});
 }
@@ -2128,7 +2131,9 @@ DB::DB(std::filesystem::path dir, Options opts)
     s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
     auto new_active = createDataFileForWrite(
-        dir_, stem, ".data", rotation_threshold_, io_backend_);
+        dir_, stem, ".data", rotation_threshold_, io_backend_, pool_.get(),
+        s.active_file_id);
+    if (pool_) pool_->set_active_file(s.active_file_id);
     // +1 for the new active file.
     counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
     auto files_t = s.files.transient();
@@ -2833,9 +2838,13 @@ void DB::rotate_active_file(TransientEngineState &t,
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_rotate_file_creation);
 #endif
+  const auto new_file_id = t.reserve_file_id();
   auto new_file = createDataFileForWrite(
-      dir_, stem, ".data", rotation_threshold_, io_backend_);
-  t.apply_rotate_file(read_only_old, std::move(new_file));
+      dir_, stem, ".data", rotation_threshold_, io_backend_, pool_.get(),
+      new_file_id);
+  t.apply_rotate_file(read_only_old, std::move(new_file), new_file_id);
+  // The sealed file's frames become evictable and the new file's pinned.
+  if (pool_) pool_->set_active_file(new_file_id);
   auto dir = dir_;
   worker_.dispatch([f = std::move(read_only_old), d = std::move(dir)] {
     flush_hints_for(f, d);
@@ -3156,6 +3165,9 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
       {"bytecask.pool_evicted_bytes_touched",
        counters_.pool_evicted_bytes_touched.load(std::memory_order_relaxed)},
       {"bytecask.pool_frames_total", counters_.pool_frames_total},
+      {"bytecask.pool_frames_pinned", pool_ ? pool_->pinned_frames() : 0},
+      {"bytecask.pool_writer_inserts",
+       counters_.pool_writer_inserts.load(std::memory_order_relaxed)},
       {"bytecask.pool_frames_resident",
        counters_.pool_frames_resident.load(std::memory_order_relaxed)},
       {"bytecask.pool_direct_io_fallbacks",
@@ -3260,13 +3272,17 @@ void DB::resume() {
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_resume_file_creation);
 #endif
+  const auto new_file_id = t.reserve_file_id();
   auto new_file = createDataFileForWrite(
-      dir_, stem, ".data", rotation_threshold_, io_backend_);
+      dir_, stem, ".data", rotation_threshold_, io_backend_, pool_.get(),
+      new_file_id);
 
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.
   t.apply_resume(old_file_id, committed, valid_offset);
-  t.apply_rotate_file(std::move(read_only_old), std::move(new_file));
+  t.apply_rotate_file(std::move(read_only_old), std::move(new_file),
+                      new_file_id);
+  if (pool_) pool_->set_active_file(new_file_id);
   // All entries recovered from disk were previously synced.
   t.apply_sync(t.next_seq() > 0 ? t.next_seq() - 1 : 0);
   t.apply_clear_degraded();

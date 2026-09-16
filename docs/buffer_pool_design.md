@@ -177,6 +177,10 @@ Two details:
 
 **Sizing constraint:** the pool must be meaningfully larger than `max_file_bytes`, or the active file alone consumes it. This is the `capacity_bytes < 2 × max_file_bytes` rejection in §3, and it is the reason that check is mandatory rather than advisory.
 
+*As built.* `WritableFileOps` hands the bytes of every successful `pwritev` to `BufferPool::append_resident` — gathered from the same iovecs it just wrote, one memcpy of the entry, never a re-read — and the writable file's point reads go through `read_at` like a sealed file's, with its logical end as the file size. CLOCK skips any frame whose key names the active file, and the engine moves that id at rotation and resume, under the write lock; the new active file gets its id from `reserve_file_id()` *before* it is created, the same ordering vacuum needed. The tail frame is admitted with its written prefix and **extended in place by later appends with plain relaxed word stores and no version bump**: an append never modifies existing bytes, a boundary word is observed old-or-new atomically, and a reader only uses bytes below the published size — which is what makes this section's "safe without a latch" true, and it is true only because frames are atomic words.
+
+Two departures from the text above. Residency is **reliable, not an invariant**: a frame the writer cannot claim (the pool entirely pinned or mid-fill, which the 2x floor makes unreachable in practice) stays on disk, and a read of it takes the buffered `pread` fallback inside `read_at` — coherent, because the active file is never opened `O_DIRECT`. The test asserts zero misses across 650 read-your-own-writes, which is the property that matters, rather than asserting a frame count. And a frame not resident whose next append does not start at its first byte is skipped rather than assembled from a partial re-read; a later read miss admits it whole. `pool_frames_pinned` is computed by a walk over frame metadata; `pool_writer_inserts` counts frames the writer placed, distinct from `pool_fills`, which a read miss caused.
+
 ---
 
 ## 6. Sealed files — `O_DIRECT`
