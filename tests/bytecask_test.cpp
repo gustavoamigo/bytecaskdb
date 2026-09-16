@@ -7223,14 +7223,16 @@ auto temp_dir_supports_direct_io() -> bool {
     std::ofstream f{path, std::ios::binary};
     f << std::string(8192, 'p');
   }
-  auto fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
   bool ok = false;
+#ifdef O_DIRECT
+  auto fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
   if (fd != -1) {
     void *buf = std::aligned_alloc(4096, 4096);
     ok = buf != nullptr && ::pread(fd, buf, 4096, 0) == 4096;
     std::free(buf);
     ::close(fd);
   }
+#endif
   std::error_code ec;
   std::filesystem::remove(path, ec);
   return ok;

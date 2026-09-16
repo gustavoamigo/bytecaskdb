@@ -44,7 +44,9 @@ public:
     REQUIRE(fd_ != -1);
     // -1 where the filesystem refuses O_DIRECT; the pool then fills buffered,
     // which is the same fallback a real sealed file takes.
+#ifdef O_DIRECT
     direct_fd_ = ::open(path_.c_str(), O_RDONLY | O_DIRECT);
+#endif
   }
 
   ~ScratchFile() {

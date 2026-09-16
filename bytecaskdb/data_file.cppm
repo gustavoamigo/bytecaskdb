@@ -1222,6 +1222,18 @@ ReadOnlyMmapDataFile::~ReadOnlyMmapDataFile() {
   }
 }
 
+// Releases a file's page-cache residency. Linux only: macOS has no
+// posix_fadvise, and its buffered reads have no per-file drop — the direct
+// descriptor there uses F_NOCACHE instead, so the residency this releases
+// on Linux is simply never built up on macOS.
+inline void drop_page_cache(int fd) noexcept {
+#ifndef __APPLE__
+  ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#else
+  (void)fd;
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // ReadOnlyBufferPoolDataFile — sealed file served through the buffer pool.
 //
@@ -1264,7 +1276,7 @@ public:
         // file built up while it was the active file is pure waste from here
         // on. It was fdatasync'd before it was sealed, so the pages are clean
         // and this is a release, not a discard of unwritten data.
-        ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        drop_page_cache(fd);
       }
     }
     return std::shared_ptr<ReadOnlyBufferPoolDataFile>(
@@ -1358,8 +1370,24 @@ private:
   // Returns -1 when the filesystem refuses; the caller counts the fallback.
   [[nodiscard]] static auto open_direct(const std::filesystem::path &path,
                                         std::size_t file_size) -> int {
+#if defined(O_DIRECT)
     auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
     if (fd == -1) return -1;
+#elif defined(F_NOCACHE)
+    // macOS: no O_DIRECT. F_NOCACHE is the analogue the design names — reads
+    // bypass the buffer cache, with no alignment requirement, so the aligned
+    // fills below are simply valid reads.
+    auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) return -1;
+    if (::fcntl(fd, F_NOCACHE, 1) == -1) {
+      ::close(fd);
+      return -1;
+    }
+#else
+    (void)path;
+    (void)file_size;
+    return -1;  // no uncached read on this platform: every file falls back
+#endif
     if (file_size == 0) return fd;  // nothing to probe, nothing to fill
     void *probe = std::aligned_alloc(kPoolFrameBytes, kPoolFrameBytes);
     if (probe == nullptr) {
@@ -1381,7 +1409,7 @@ private:
   [[nodiscard]] auto sweep_done() const
       -> std::optional<std::pair<DataEntry, Offset>> {
     if (direct_fd_ != -1) {
-      ::posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
+      drop_page_cache(fd_);
     }
     return std::nullopt;
   }
