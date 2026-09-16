@@ -234,7 +234,17 @@ One case genuinely cannot be served: an entry larger than the pool, or large eno
 
 The distinction from the rejected bypass matters. This is not "large values are slow", it is "one value may not evict the cache to hold itself". With the default 4 MiB ceiling it never fires unless the pool is smaller than about 32 MiB, and if it fires often that is a misconfiguration the counters should surface (`pool_oversize_reads`), not a tuning opportunity.
 
-**Recommendation: A3**, frame size configurable with a default of 4096, extents as the admission and eviction unit, and no size-based bypass other than the capacity-derived guard rail.
+**Decision: A3**, frame size configurable with a default of 4096, extents as the admission and eviction unit, and no size-based bypass other than the capacity-derived guard rail.
+
+The fork against A1 was reopened once, on the strength of the density and dead-entry arguments above, and closed again on the allocator accounting — which is worth recording, because the deciding argument is not the obvious one.
+
+Fixed frames give a free list over uniform objects: pop to allocate, push to free, index-to-address is arithmetic. No fragmentation, no per-object size field, no coalescing. A size-class allocator gives roughly fifty classes on a 1.25× ladder, each with its own free list and partially filled slabs, about 11 % internal fragmentation, a per-object size header, and slab calcification — memory assigned to one class cannot migrate when the value-size distribution shifts. memcached needed a slab rebalancer for exactly this and it is still not fully solved.
+
+But the deciding cost is not allocator overhead. **Size classes fragment the eviction policy.** Fixed frames give one global recency ordering over uniform objects; size classes give fifty independent orderings that cannot be compared, so a hot 300-byte entry is evicted while a cold 5 KiB entry survives purely because they sit in different classes — memcached's documented pathology. Size-aware policies (GDSF and relatives) avoid it only by requiring an allocator that can satisfy arbitrary-size admission, which brings fragmentation and compaction straight back.
+
+That settles it: **density is a constant factor on capacity, and capacity is buyable; a degraded eviction policy is not.** The dead-entry argument weakens on the same inspection — vacuum exists to remove superseded entries, so that waste is bounded by vacuum aggressiveness, a knob the engine already owns.
+
+A1 stays in the A/B rather than being deleted. Phase 0's counters measure value-size distribution and live-byte fraction on a real workload, which says exactly how much density A3 is conceding before either cache is built. If small values dominate *and* the live ratio stays poor, A1 is worth revisiting — with the allocator and eviction-quality costs priced in.
 
 ### Axis B — eviction policy
 
@@ -273,13 +283,23 @@ The mechanical problem: **CRC is per entry, frames are per 4 KiB, and entries st
 
 **C1. Verify what you fetch, always.** Verify only the requested entry, on hits as well as misses. No semantic change, no new state — and no benefit. This is the do-nothing option, and it is the honest control arm for the A/B.
 
-**C2. Verified-extent watermark per frame (recommended).** Every read arrives with an exact entry extent: the caller knows `offset`, `key_size` and `value_size`, so the entry occupies `[offset, offset + kHeaderSize + key_size + value_size + kCrcSize)`. Therefore **every read tells the pool about one known entry boundary.** Store two offsets in the frame header, `verified_from` and `verified_to`:
+**C2. Verified-extent watermark per frame (recommended).**
 
-- On a fill triggered by a read at offset `O`, verify the requested entry, then walk forward from its end verifying each successive entry while it lies wholly inside the filled range — stopping at a zero header, which is the zero-fill tail and cannot be a real entry. Set `verified_from = O`, `verified_to =` the end of the last fully verified entry.
-- A read of `[a, b)` skips the CRC iff `verified_from <= a && b <= verified_to`. Otherwise it verifies itself and extends the watermark if the new extent is contiguous with it.
-- Straddling entries are covered naturally: a multi-frame fill verifies across the boundary, and the watermark on each frame records its own share.
+Start from what is *not* possible: a frame cannot be verified when it is pulled. The CRC covers header + key + value per entry, entries straddle frame boundaries, and there is no way to locate entry starts inside an arbitrary 4 KiB frame — nothing marks a boundary and the walk only runs forwards. Verification is therefore entry-driven, and the only real question is where to record that an entry has already been checked.
 
-Two `uint16_t` per frame. The forward walk costs CRC over the filled extent — with the hardware CRC-32C instruction, roughly a microsecond for 4 KiB, against a device read measured in tens to hundreds of microseconds. It is off the hot path by construction.
+Every read arrives with an exact entry extent: the caller supplies `offset` and `key_size`, the key directory supplies `value_size`, so the entry occupies `[offset, offset + kHeaderSize + key_size + value_size + kCrcSize)`. **Every read therefore hands the frame one true entry boundary.** Store two offsets in the frame header, `verified_from` and `verified_to`, and skip the CRC for a read of `[a, b)` iff `verified_from <= a && b <= verified_to`.
+
+One contiguous range is enough — it does not need a per-entry bitmap or a set — because entries are contiguous on disk. A forward walk from any lower boundary necessarily arrives at `verified_from`, so two verified regions in a frame always merge into one. The range only grows, and converges toward whole-frame coverage as distinct entries are touched. A per-entry structure would cost far more and buy nothing.
+
+Where the work happens matters as much as the bookkeeping:
+
+- **On fill**, verify the requested entry at `O`, then walk forward to the frame end. Roughly a microsecond of CRC for 4 KiB against a device read of tens to hundreds of microseconds, so it is free in context. Set `verified_from = O`, `verified_to` = the end of the last fully verified entry. A fill triggered by a random entry covers about half the frame in expectation.
+- **On a hit outside the range**, verify that entry alone and stop. Do *not* walk to extend the range downward: that would put ~1 µs of speculative CRC on an operation that should cost ~150 ns. Extending `verified_from` is only worth it when the entry is immediately adjacent, which costs nothing to check.
+- Straddling entries are covered naturally: a multi-frame fill verifies across the boundary and each frame records its own share.
+
+**The forward walk verifies entries nobody asked for, which has a correctness consequence.** If one of those entries is corrupt, that must not fail the caller's read of a different, valid entry. The walk stops, records coverage up to that point, and returns normally — it never throws. It also needs hard bounds, since it is parsing lengths out of bytes it has not yet verified: stop at the frame end, stop at a zero header (the zero-fill tail, which no real entry can carry), and never let a bogus `key_size`/`value_size` advance the cursor past the filled extent. Corruption found this way wants its own counter; `crc_failures` currently means a read actually failed, and conflating the two would make the metric useless for alerting.
+
+Cost of the state is two `uint16_t` per frame. Whether that is worth anything depends on what a CRC actually costs on a hit: a ~139-byte entry does not reach the vectorized CRC-32C path, so realistically 50–100 ns — comparable to the hash lookup and memcpy that make up the rest of a pool hit. Removing it is therefore on the order of 25–40 % of hit latency, not noise. Two `uint16_t` buys that; a per-entry structure would not.
 
 **C3. Re-checksum at frame granularity.** Compute our own CRC over the whole frame at fill time and verify it on access. Rejected: verifying 4 KiB on every read of a 100-byte value is strictly worse than verifying the entry. It has one legitimate use — a background scrubber for long-resident frames — which is a separate feature, not this one.
 
@@ -482,7 +502,7 @@ The combination matrix is then machine-enumerable, which is the point.
 pool_hits, pool_misses, pool_fills, pool_fill_bytes,
 pool_evictions, pool_oversize_reads, pool_multi_frame_reads,
 pool_frames_released_per_eviction_max,
-pool_crc_verifications, pool_crc_bytes,
+pool_crc_verifications, pool_crc_bytes, pool_speculative_crc_failures,
 pool_frames_resident, pool_frames_total,
 pool_optimistic_retries, pool_direct_io_fallbacks
 ```
