@@ -2,6 +2,19 @@
 
 > **Status: proposal.** No code exists. This describes the smallest buffer pool worth building: a third `DataFile` back-end alongside `pread` and `mmap`. Alternatives considered and deferred are listed in §10.
 
+## Goal
+
+**This exists for memory-constrained deployments** — a container with a `memory.max`, a shared host, a tuned appliance — where the dataset is far larger than available RAM and the memory the engine uses has to be **bounded and configurable**.
+
+In those setups the operator needs to divide RAM explicitly between two things with very different requirements: the **key directory, which must be fully resident** and is not a cache, and the **value cache, which must not be allowed to grow without limit**. Today the kernel makes that division, using a page cache that is an unbounded competitor for the same memory, and it makes it without knowing which of the two is load-bearing. §1 works through what that costs.
+
+So the deliverable is a single number the operator sets and the engine honours: `capacity_bytes`, meaning total footprint (§3). Everything else here — frame size, eviction policy, `O_DIRECT`, the pinned active file — exists to make that number meaningful.
+
+**Non-goals.**
+
+- **Making a dataset that already fits in RAM faster.** It cannot: the pool loses to `mmap` on a resident hit, structurally (§9). Where memory is not constrained, leave it off.
+- **Improving throughput on the current benchmark suite.** Every benchmark today runs in the regime where the pool should be disabled. Measuring it there measures overhead — see the benchmarking note in §9.
+
 ---
 
 ## 1. Why
