@@ -12,8 +12,12 @@ module;
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <new>
+#include <set>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -24,7 +28,6 @@ module;
 export module bytecask.radix_tree;
 
 namespace bytecask {
-
 // ---------------------------------------------------------------------------
 // CompactPrefix
 //
@@ -77,120 +80,65 @@ static_assert(sizeof(CompactPrefix) == 8);
 static_assert(alignof(CompactPrefix) == 1);
 
 // ---------------------------------------------------------------------------
-// IntrusivePtr<T>
-//
-// Lightweight single-pointer smart pointer (8 bytes) replacing
-// std::shared_ptr (16 bytes + ~32 byte control block). Requires T to
-// provide addref() and release() methods (embedded in Node below).
-// No weak_ptr support.
-// ---------------------------------------------------------------------------
-template <typename T> class IntrusivePtr {
-public:
-  IntrusivePtr() noexcept = default;
-  IntrusivePtr(std::nullptr_t) noexcept {
-  } // NOLINT — implicit for pair{nullptr,..}
-
-  // Adopt a raw pointer. Caller must have already set refcount to 1
-  // (e.g. via make_intrusive). Does NOT addref — takes ownership.
-  static auto adopt(T *p) noexcept -> IntrusivePtr {
-    IntrusivePtr ip;
-    ip.ptr_ = p;
-    return ip;
-  }
-
-  ~IntrusivePtr() {
-    if (ptr_)
-      ptr_->release();
-  }
-
-  IntrusivePtr(const IntrusivePtr &o) noexcept : ptr_(o.ptr_) {
-    if (ptr_)
-      ptr_->addref();
-  }
-
-  IntrusivePtr(IntrusivePtr &&o) noexcept : ptr_(o.ptr_) { o.ptr_ = nullptr; }
-
-  auto operator=(const IntrusivePtr &o) noexcept -> IntrusivePtr & {
-    // Cache RHS pointer before touching *ptr_: if `o` itself lives inside
-    // *ptr_ (e.g. a child slot of this node), releasing ptr_ destroys `o`,
-    // and a later read of `o.ptr_` would be a use-after-free. Reading the
-    // pointer value up front and addref-ing first keeps the target node
-    // alive across the release.
-    auto *new_ptr = o.ptr_;
-    if (new_ptr)
-      new_ptr->addref();
-    if (ptr_)
-      ptr_->release();
-    ptr_ = new_ptr;
-    return *this;
-  }
-
-  auto operator=(IntrusivePtr &&o) noexcept -> IntrusivePtr & {
-    if (this == &o)
-      return *this;
-    // Extract before releasing: handles both the sub-object case (o lives
-    // inside *ptr_) and the aliased case (ptr_ == o.ptr_ with two distinct
-    // IntrusivePtr objects). Zeroing o.ptr_ first means that if releasing
-    // ptr_ transitively destroys `o`'s IntrusivePtr, its destructor sees a
-    // null and does not double-decrement the target refcount.
-    auto *tmp = o.ptr_;
-    o.ptr_ = nullptr;
-    if (ptr_)
-      ptr_->release();
-    ptr_ = tmp;
-    return *this;
-  }
-
-  auto operator->() const noexcept -> T * { return ptr_; }
-  auto operator*() const noexcept -> T & { return *ptr_; }
-  explicit operator bool() const noexcept { return ptr_ != nullptr; }
-  [[nodiscard]] auto get() const noexcept -> T * { return ptr_; }
-
-  // Relinquish ownership WITHOUT decrementing refcount. The caller
-  // must eventually balance the refcount (e.g. via release()). Used by
-  // Node::release() for iterative destruction.
-  auto detach() noexcept -> T * {
-    auto *p = ptr_;
-    ptr_ = nullptr;
-    return p;
-  }
-
-  auto operator==(const IntrusivePtr &o) const noexcept -> bool {
-    return ptr_ == o.ptr_;
-  }
-
-private:
-  T *ptr_{nullptr};
-};
-
-template <typename T, typename... Args>
-auto make_intrusive(Args &&...args) -> IntrusivePtr<T> {
-  // new sets refcount to 1 (default member initializer); adopt() takes
-  // ownership without incrementing.
-  return IntrusivePtr<T>::adopt(new T(std::forward<Args>(args)...));
-}
-
-// ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
+export template <typename V> class PersistentRadixTree;
 export template <typename V> class TransientRadixTree;
 export template <typename V> class RadixTreeIterator;
 export template <typename V> class ReverseRadixTreeIterator;
 export template <typename V> class ValueIterator;
 export template <typename V> class ReverseValueIterator;
 
-// Global edit-tag counter for transient sessions.
-// Relaxed ordering: only uniqueness is required, not inter-thread visibility
-// ordering. Each transient session gets a distinct tag via fetch_add.
 namespace detail {
+
+// Global edit-tag counter for build sessions (transients and merges).
+// Relaxed ordering: only uniqueness is required, not inter-thread visibility
+// ordering. Each session gets a distinct tag via fetch_add. Tags are 60 bits
+// wide (see Node::packed_tag_) so they never wrap in practice; the tag alone
+// decides whether a node may be mutated in place, so it must be unique for
+// the lifetime of the process.
 inline std::atomic<std::uint64_t> next_edit_tag{1};
+
+// Test-only node accounting (BYTECASK_RADIX_ACCOUNTING). Every node
+// allocation and free is counted, per value type so that trees of
+// different types cannot disturb each other's totals. `retired` tracks
+// nodes the registry still owes a free to. The invariant the tree unit
+// tests check is
+//   allocated - freed == nodes reachable from live trees, plus parked ones.
+export template <typename V> struct RadixAccounting {
+  std::atomic<std::int64_t> allocated{0};
+  std::atomic<std::int64_t> freed{0};
+  std::atomic<std::int64_t> retired{0};
+};
+export template <typename V>
+auto radix_accounting() -> RadixAccounting<V> & {
+  static RadixAccounting<V> acc;
+  return acc;
+}
+#ifdef BYTECASK_RADIX_ACCOUNTING
+template <typename V> void account_alloc() noexcept {
+  radix_accounting<V>().allocated.fetch_add(1, std::memory_order_relaxed);
+}
+template <typename V> void account_free() noexcept {
+  radix_accounting<V>().freed.fetch_add(1, std::memory_order_relaxed);
+}
+template <typename V> void account_retired(std::int64_t delta) noexcept {
+  radix_accounting<V>().retired.fetch_add(delta, std::memory_order_relaxed);
+}
+#else
+template <typename V> void account_alloc() noexcept {}
+template <typename V> void account_free() noexcept {}
+template <typename V> void account_retired(std::int64_t) noexcept {}
+#endif
+
 } // namespace detail
+
 
 // ---------------------------------------------------------------------------
 // Node<V> — base type for all radix tree nodes (leaf and internal).
 //
 // packed_tag_ bit layout:
-//   [31: has_value] [30-28: node_type] [27:0: edit_tag]
+//   [63: has_value] [62-60: node_type] [59:0: edit_tag]
 //
 // Internal nodes are tiered by fanout to avoid dynamic-vector allocation
 // overhead at the low fanout where most internal nodes actually live
@@ -236,8 +184,6 @@ template <typename V> struct Node48;       // forward declaration (48-slot tier)
 template <typename V> struct Node256;      // forward declaration (256-slot tier)
 
 template <typename V> struct Node {
-  mutable std::atomic<std::uint32_t> refcount_{1};
-
   enum class NodeType : std::uint32_t {
     Leaf = 0,
     Node4 = 1,
@@ -246,13 +192,33 @@ template <typename V> struct Node {
     Node48 = 4,
   };
 
-  static constexpr std::uint32_t kHasValueBit = 0x8000'0000u;
-  static constexpr std::uint32_t kNodeTypeShift = 28u;
-  static constexpr std::uint32_t kNodeTypeMask = 0x7000'0000u;
-  static constexpr std::uint32_t kFlagBits = kHasValueBit | kNodeTypeMask;
-  static constexpr std::uint32_t kTagMask = 0x0FFF'FFFFu;
+  // packed_tag_ bit layout: [63: has_value] [62-60: node_type] [59:0: edit_tag]
+  //
+  // No reference count: nodes are owned by the version history, not by the
+  // pointers to them. A node is freed either by the session that created it
+  // (when that session discards it before publishing) or by the epoch
+  // registry once every version that could reach it is gone — see
+  // EpochRegistry. Child slots are therefore plain pointers, and cloning a
+  // node is a memcpy of its child array.
+  static constexpr std::uint64_t kHasValueBit = 1ull << 63;
+  static constexpr unsigned kNodeTypeShift = 60u;
+  static constexpr std::uint64_t kNodeTypeMask = 0x7ull << kNodeTypeShift;
+  // Set while this node sits on some build session's retired list, so a
+  // second session that supersedes the same shared node does not retire it
+  // twice. Outside kTagMask, so a tier promotion that carries the edit tag
+  // across does not carry this with it.
+  static constexpr std::uint64_t kRetiredBit = 1ull << 59;
+  static constexpr std::uint64_t kFlagBits =
+      kHasValueBit | kNodeTypeMask | kRetiredBit;
+  static constexpr std::uint64_t kTagMask = kRetiredBit - 1;
 
-  std::uint32_t packed_tag_{0};
+  // Atomic only so that marking a node retired is not a data race against
+  // lock-free readers walking the version it still belongs to: the retired
+  // bit shares this word with the node type and has-value flag. Every
+  // access is relaxed — the word carries no ordering, just its own bits —
+  // which on every target this builds for is a plain load or store, and it
+  // keeps the node exactly as large as a plain uint64_t would.
+  std::atomic<std::uint64_t> packed_tag_{0};
   V value_{};
 
   using Prefix = CompactPrefix;
@@ -262,133 +228,58 @@ template <typename V> struct Node {
   //
   // `transition` is a value, not a reference: Node256 has no stored key
   // array (the transition byte *is* the index into children_), so there is
-  // no lvalue byte to bind a reference to for that tier. Every existing
-  // caller only reads `.transition` (never assigns through it), so this
-  // costs nothing at the other tiers, where it was previously a reference
-  // into keys_[i] and is now just a copy of the same byte. `ptr` stays a
+  // no lvalue byte to bind a reference to for that tier. `ptr` stays a
   // real reference — callers do assign through `.ptr` (e.g. splicing in a
-  // merged child) — and every tier has an actual IntrusivePtr<Node> slot
-  // to bind it to.
+  // merged child) — and every tier has an actual child slot to bind it to.
   struct ChildRef {
     std::byte transition;
-    IntrusivePtr<Node> &ptr;
+    Node *&ptr;
   };
   struct ConstChildRef {
     std::byte transition;
-    const IntrusivePtr<Node> &ptr;
+    Node *const &ptr;
   };
 
-  void addref() const noexcept {
-    refcount_.fetch_add(1, std::memory_order_relaxed);
+  // The whole tag word. Every read and write of packed_tag_ goes through
+  // these two.
+  [[nodiscard]] auto tag_word() const noexcept -> std::uint64_t {
+    return packed_tag_.load(std::memory_order_relaxed);
   }
-  // Iterative tail-release avoids the O(depth) recursive destructor chain
-  // that otherwise occurs via ~IntrusivePtr → release → delete → ~Node →
-  // ~IntrusivePtr (the freed node's own child slots) → … .
-  //
-  // Profiling (perf record, MergeOverlapping/100K) showed this cascade as
-  // 29% of total merge time. Converting the last-child release to a loop
-  // eliminates recursive call overhead for chains of single-child nodes —
-  // the dominant pattern in compressed radix trees.
-  void release() const noexcept {
-    const Node* cur = this;
-    while (cur->refcount_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      auto* mut = const_cast<Node*>(cur);
-
-      // Deliberately not value-initialized: every element ever read (indices
-      // [0, inline_count)) is always written first by the switch below, and
-      // nothing reads past inline_count. Zero-initializing the full array
-      // here would cost real time on every single node release (this loop
-      // runs once per node in the tree) for no observed benefit — this is
-      // exactly the class of latent, capacity-proportional-not-work-
-      // proportional cost that caused Node48 (and, most likely, the earlier
-      // stashed Node256 attempt) to regress RadixTree/MergeOverlapping /
-      // RadixTree/Iterate before it was found and removed.
-      std::array<Node*, 256> inline_kids;
-      std::size_t inline_count = 0;
-
-      switch (mut->node_type()) {
-      case NodeType::Leaf:
-        delete mut;
-        break;
-      case NodeType::Node4: {
-        auto* n4 = static_cast<Node4<V>*>(mut);
-        inline_count = n4->count_;
-        for (std::size_t i = 0; i < inline_count; ++i)
-          inline_kids[i] = n4->children_[i].detach();
-        delete n4;
-        break;
-      }
-      case NodeType::Node16: {
-        auto* n16 = static_cast<Node16<V>*>(mut);
-        inline_count = n16->count_;
-        for (std::size_t i = 0; i < inline_count; ++i)
-          inline_kids[i] = n16->children_[i].detach();
-        delete n16;
-        break;
-      }
-      case NodeType::Node48: {
-        auto* n48 = static_cast<Node48<V>*>(mut);
-        inline_count = n48->count_;
-        for (std::size_t i = 0; i < inline_count; ++i)
-          inline_kids[i] = n48->children_[i].detach();
-        delete n48;
-        break;
-      }
-      case NodeType::Node256: {
-        // No count-sized prefix to walk — children are scattered across
-        // all 256 direct-mapped slots by transition byte, not packed at
-        // the front, so every slot is checked. This scan is bounded (256
-        // iterations) and paid only when releasing an actual Node256 node
-        // (rare — see §7.9), unlike the value-init cost above, which used
-        // to run on every node release regardless of tier.
-        auto* n256 = static_cast<Node256<V>*>(mut);
-        for (std::size_t i = 0; i < 256; ++i) {
-          auto* raw = n256->children_[i].detach();
-          if (raw)
-            inline_kids[inline_count++] = raw;
-        }
-        delete n256;
-        break;
-      }
-      }
-
-      const Node* tail = nullptr;
-      for (std::size_t i = 0; i < inline_count; ++i) {
-        auto* raw = inline_kids[i];
-        if (!raw) continue;
-        if (tail)
-          tail->release();
-        tail = raw;
-      }
-
-      if (!tail)
-        return;
-      cur = tail;
-    }
+  void set_tag_word(std::uint64_t w) noexcept {
+    packed_tag_.store(w, std::memory_order_relaxed);
   }
 
   [[nodiscard]] auto has_value() const noexcept -> bool {
-    return (packed_tag_ & kHasValueBit) != 0;
+    return (tag_word() & kHasValueBit) != 0;
   }
   [[nodiscard]] auto node_type() const noexcept -> NodeType {
-    return static_cast<NodeType>((packed_tag_ & kNodeTypeMask) >>
+    return static_cast<NodeType>((tag_word() & kNodeTypeMask) >>
                                   kNodeTypeShift);
   }
   void set_node_type(NodeType t) noexcept {
-    packed_tag_ = (packed_tag_ & ~kNodeTypeMask) |
-                  (static_cast<std::uint32_t>(t) << kNodeTypeShift);
+    set_tag_word((tag_word() & ~kNodeTypeMask) |
+                 (static_cast<std::uint64_t>(t) << kNodeTypeShift));
   }
-  [[nodiscard]] auto edit_tag() const noexcept -> std::uint32_t {
-    return packed_tag_ & kTagMask;
+  [[nodiscard]] auto edit_tag() const noexcept -> std::uint64_t {
+    return tag_word() & kTagMask;
   }
-  void set_edit_tag(std::uint32_t tag) noexcept {
-    packed_tag_ = (packed_tag_ & kFlagBits) | (tag & kTagMask);
+  void set_edit_tag(std::uint64_t tag) noexcept {
+    set_tag_word((tag_word() & kFlagBits) | (tag & kTagMask));
   }
+  [[nodiscard]] auto is_retired() const noexcept -> bool {
+    return (tag_word() & kRetiredBit) != 0;
+  }
+  // The one write to a node that outlives the session that created it, and
+  // the reason this word is atomic. Only ever done by the thread that
+  // retires the node, and only once (a node already marked is left alone),
+  // so a plain relaxed store of the new value is enough.
+  void mark_retired() noexcept { set_tag_word(tag_word() | kRetiredBit); }
+  void clear_retired() noexcept { set_tag_word(tag_word() & ~kRetiredBit); }
   void set_value(V v) {
     value_ = std::move(v);
-    packed_tag_ |= kHasValueBit;
+    set_tag_word(tag_word() | kHasValueBit);
   }
-  void clear_value() noexcept { packed_tag_ &= ~kHasValueBit; }
+  void clear_value() noexcept { set_tag_word(tag_word() & ~kHasValueBit); }
 
   [[nodiscard]] auto as_node4() noexcept -> Node4<V> * {
     if (node_type() != NodeType::Node4)
@@ -682,14 +573,46 @@ template <typename V> struct Node {
     return std::nullopt;
   }
 
+  // -- Allocation and destruction ------------------------------------------
+  //
+  // Every node allocation goes through alloc<T>() and every free through
+  // destroy(), so the test-only accounting sees them all. Nodes have no
+  // virtual destructor: destroy() dispatches on node_type() to delete the
+  // tier the node was allocated as.
+  template <typename T> [[nodiscard]] static auto alloc() -> T * {
+    detail::account_alloc<V>();
+    return new T();
+  }
+
+  static void destroy(Node *n) noexcept {
+    switch (n->node_type()) {
+    case NodeType::Leaf:
+      delete n;
+      break;
+    case NodeType::Node4:
+      delete static_cast<Node4<V> *>(n);
+      break;
+    case NodeType::Node16:
+      delete static_cast<Node16<V> *>(n);
+      break;
+    case NodeType::Node48:
+      delete static_cast<Node48<V> *>(n);
+      break;
+    case NodeType::Node256:
+      delete static_cast<Node256<V> *>(n);
+      break;
+    }
+    detail::account_free<V>();
+  }
+
   // Allocates a Node4 carrying src's value/prefix (not its children — src
   // is assumed to have none, and not its edit_tag — matches clone()'s
   // tag-free contract). Shared by clone_as_internal() and by
   // insert_child/remove_child's tier transitions, which OR the tag back in
   // themselves since (unlike clone()) they must preserve it.
   [[nodiscard]] static auto make_node4_like(const Node &src) -> Node4<V> * {
-    auto *n = new Node4<V>();
-    n->packed_tag_ |= src.packed_tag_ & kHasValueBit;
+    auto *n = alloc<Node4<V>>();
+    n->set_tag_word(n->tag_word() | (src.tag_word() & kHasValueBit));
     n->value_ = src.value_;
     n->prefix = src.prefix;
     return n;
@@ -698,8 +621,8 @@ template <typename V> struct Node {
   // — see make_node4_like). Shared by insert_child's Node4 -> Node16
   // promotion and remove_child's Node48 -> Node16 demotion.
   [[nodiscard]] static auto make_node16_like(const Node &src) -> Node16<V> * {
-    auto *n = new Node16<V>();
-    n->packed_tag_ |= src.packed_tag_ & kHasValueBit;
+    auto *n = alloc<Node16<V>>();
+    n->set_tag_word(n->tag_word() | (src.tag_word() & kHasValueBit));
     n->value_ = src.value_;
     n->prefix = src.prefix;
     return n;
@@ -709,19 +632,19 @@ template <typename V> struct Node {
   // promotion and remove_child's Node256 -> Node48 demotion. child_index_
   // is default-constructed to all-kEmptyMarker by Node48's constructor.
   [[nodiscard]] static auto make_node48_like(const Node &src) -> Node48<V> * {
-    auto *n = new Node48<V>();
-    n->packed_tag_ |= src.packed_tag_ & kHasValueBit;
+    auto *n = alloc<Node48<V>>();
+    n->set_tag_word(n->tag_word() | (src.tag_word() & kHasValueBit));
     n->value_ = src.value_;
     n->prefix = src.prefix;
     return n;
   }
   // Allocates an (empty) Node256 node carrying src's value/prefix (tag-free
   // — see make_node4_like). Shared by insert_child's Node48 -> Node256
-  // promotion. children_ is default-constructed to all-null IntrusivePtrs.
+  // promotion. children_ is default-constructed to all-null.
   [[nodiscard]] static auto make_node256_like(const Node &src)
       -> Node256<V> * {
-    auto *n = new Node256<V>();
-    n->packed_tag_ |= src.packed_tag_ & kHasValueBit;
+    auto *n = alloc<Node256<V>>();
+    n->set_tag_word(n->tag_word() | (src.tag_word() & kHasValueBit));
     n->value_ = src.value_;
     n->prefix = src.prefix;
     return n;
@@ -732,13 +655,15 @@ template <typename V> struct Node {
   // Node16 on its 5th; a Node16 at capacity promotes to Node48 on its
   // 17th; a Node48 at capacity promotes to Node256 on its 49th. Node256 is
   // the terminal tier — 256 slots is the ceiling on fanout for a single
-  // byte transition, so it never promotes further. Takes ownership of
-  // `node` and returns the resulting node, which may be a different
-  // underlying allocation.
-  [[nodiscard]] static auto insert_child(IntrusivePtr<Node> node,
-                                         std::byte b,
-                                         IntrusivePtr<Node> child)
-      -> IntrusivePtr<Node> {
+  // byte transition, so it never promotes further.
+  //
+  // `node` must be owned by `session` (it is mutated in place). When a
+  // promotion replaces it, the narrower node is handed to
+  // session.discard(), which frees it at once. Returns the resulting node,
+  // which may be a different allocation.
+  template <typename Session>
+  [[nodiscard]] static auto insert_child(Session &session, Node *node,
+                                         std::byte b, Node *child) -> Node * {
     if (auto *n4 = node->as_node4()) {
       if (n4->count_ < Node4<V>::kCapacity) {
         std::size_t pos = 0;
@@ -748,25 +673,26 @@ template <typename V> struct Node {
                "duplicate transition byte");
         for (std::size_t i = n4->count_; i > pos; --i) {
           n4->keys_[i] = n4->keys_[i - 1];
-          n4->children_[i] = std::move(n4->children_[i - 1]);
+          n4->children_[i] = n4->children_[i - 1];
         }
         n4->keys_[pos] = b;
-        n4->children_[pos] = std::move(child);
+        n4->children_[pos] = child;
         ++n4->count_;
         return node;
       }
       // Node4 at capacity — promote to Node16. Unlike clone(), a tier
-      // transition must preserve the source node's edit_tag: for a
-      // transient node, `node` was already claimed by the current session
-      // (via ensure_mutable) before insert_child was called.
+      // transition must preserve the source node's edit_tag: `node` was
+      // already claimed by the current session (via ensure_mutable) before
+      // insert_child was called.
       auto *n16 = make_node16_like(*node);
-      n16->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n16->set_tag_word(n16->tag_word() | (node->tag_word() & kTagMask));
       n16->count_ = n4->count_;
       for (std::size_t i = 0; i < n4->count_; ++i) {
         n16->keys_[i] = n4->keys_[i];
-        n16->children_[i] = std::move(n4->children_[i]);
+        n16->children_[i] = n4->children_[i];
       }
-      return insert_child(IntrusivePtr<Node>::adopt(n16), b, std::move(child));
+      session.discard(node);
+      return insert_child(session, n16, b, child);
     }
 
     if (auto *n16 = node->as_node16()) {
@@ -778,10 +704,10 @@ template <typename V> struct Node {
                "duplicate transition byte");
         for (std::size_t i = n16->count_; i > pos; --i) {
           n16->keys_[i] = n16->keys_[i - 1];
-          n16->children_[i] = std::move(n16->children_[i - 1]);
+          n16->children_[i] = n16->children_[i - 1];
         }
         n16->keys_[pos] = b;
-        n16->children_[pos] = std::move(child);
+        n16->children_[pos] = child;
         ++n16->count_;
         return node;
       }
@@ -789,15 +715,16 @@ template <typename V> struct Node {
       // Node4 -> Node16 branch above). child_index_ starts all-empty (set
       // by Node48's constructor) and is filled in below alongside keys_.
       auto *n48 = make_node48_like(*node);
-      n48->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n48->set_tag_word(n48->tag_word() | (node->tag_word() & kTagMask));
       n48->count_ = n16->count_;
       for (std::size_t i = 0; i < n16->count_; ++i) {
         n48->keys_[i] = n16->keys_[i];
-        n48->children_[i] = std::move(n16->children_[i]);
+        n48->children_[i] = n16->children_[i];
         n48->child_index_[std::to_integer<std::uint8_t>(n16->keys_[i])] =
             static_cast<std::uint8_t>(i);
       }
-      return insert_child(IntrusivePtr<Node>::adopt(n48), b, std::move(child));
+      session.discard(node);
+      return insert_child(session, n48, b, child);
     }
 
     if (auto *n48 = node->as_node48()) {
@@ -809,12 +736,12 @@ template <typename V> struct Node {
                "duplicate transition byte");
         for (std::size_t i = n48->count_; i > pos; --i) {
           n48->keys_[i] = n48->keys_[i - 1];
-          n48->children_[i] = std::move(n48->children_[i - 1]);
+          n48->children_[i] = n48->children_[i - 1];
           n48->child_index_[std::to_integer<std::uint8_t>(n48->keys_[i])] =
               static_cast<std::uint8_t>(i);
         }
         n48->keys_[pos] = b;
-        n48->children_[pos] = std::move(child);
+        n48->children_[pos] = child;
         n48->child_index_[std::to_integer<std::uint8_t>(b)] =
             static_cast<std::uint8_t>(pos);
         ++n48->count_;
@@ -824,22 +751,23 @@ template <typename V> struct Node {
       // Node4 -> Node16 branch above). children_ starts all-null (set by
       // Node256's constructor) and is filled in below by transition byte.
       auto *n256 = make_node256_like(*node);
-      n256->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n256->set_tag_word(n256->tag_word() | (node->tag_word() & kTagMask));
       n256->count_ = n48->count_;
       for (std::size_t i = 0; i < n48->count_; ++i) {
         n256->children_[std::to_integer<std::uint8_t>(n48->keys_[i])] =
-            std::move(n48->children_[i]);
+            n48->children_[i];
       }
-      return insert_child(IntrusivePtr<Node>::adopt(n256), b,
-                          std::move(child));
+      session.discard(node);
+      return insert_child(session, n256, b, child);
     }
 
     if (node->node_type() == NodeType::Leaf) {
       // First child — promote leaf to Node4, preserving edit_tag (see the
       // Node4 -> Node16 branch above for why).
       auto *n4 = make_node4_like(*node);
-      n4->packed_tag_ |= node->packed_tag_ & kTagMask;
-      return insert_child(IntrusivePtr<Node>::adopt(n4), b, std::move(child));
+      n4->set_tag_word(n4->tag_word() | (node->tag_word() & kTagMask));
+      session.discard(node);
+      return insert_child(session, n4, b, child);
     }
 
     // Node256 — the terminal tier. Direct-mapped by transition byte, so
@@ -848,7 +776,7 @@ template <typename V> struct Node {
     assert(n256 != nullptr);
     assert(!n256->children_[std::to_integer<std::uint8_t>(b)] &&
            "duplicate transition byte");
-    n256->children_[std::to_integer<std::uint8_t>(b)] = std::move(child);
+    n256->children_[std::to_integer<std::uint8_t>(b)] = child;
     ++n256->count_;
     return node;
   }
@@ -861,19 +789,21 @@ template <typename V> struct Node {
   // (75% of Node16's capacity, same rationale, for the 16/17 boundary),
   // demotes to Node16; if this is Node16 and its count drops to <=
   // Node4<V>::kCapacity, demotes to Node4 (symmetric — no hysteresis needed
-  // at this boundary, see §7.7). Takes ownership of `node` and returns the
-  // resulting node.
-  [[nodiscard]] static auto remove_child(IntrusivePtr<Node> node,
-                                         std::byte b) -> IntrusivePtr<Node> {
+  // at this boundary, see §7.7). `node` must be owned by `session`; a
+  // demoted-from node is handed to session.discard(). The removed child is
+  // the caller's to discard. Returns the resulting node.
+  template <typename Session>
+  [[nodiscard]] static auto remove_child(Session &session, Node *node,
+                                         std::byte b) -> Node * {
     if (auto *n4 = node->as_node4()) {
       for (std::size_t i = 0; i < n4->count_; ++i) {
         if (n4->keys_[i] == b) {
           for (std::size_t j = i; j + 1 < n4->count_; ++j) {
             n4->keys_[j] = n4->keys_[j + 1];
-            n4->children_[j] = std::move(n4->children_[j + 1]);
+            n4->children_[j] = n4->children_[j + 1];
           }
           --n4->count_;
-          n4->children_[n4->count_] = IntrusivePtr<Node>{};
+          n4->children_[n4->count_] = nullptr;
           return node;
         }
       }
@@ -885,10 +815,10 @@ template <typename V> struct Node {
         if (n16->keys_[i] == b) {
           for (std::size_t j = i; j + 1 < n16->count_; ++j) {
             n16->keys_[j] = n16->keys_[j + 1];
-            n16->children_[j] = std::move(n16->children_[j + 1]);
+            n16->children_[j] = n16->children_[j + 1];
           }
           --n16->count_;
-          n16->children_[n16->count_] = IntrusivePtr<Node>{};
+          n16->children_[n16->count_] = nullptr;
           break;
         }
       }
@@ -898,13 +828,14 @@ template <typename V> struct Node {
       // this fanout. Preserve edit_tag (see insert_child's Node4 -> Node16
       // branch for why).
       auto *n4 = make_node4_like(*node);
-      n4->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n4->set_tag_word(n4->tag_word() | (node->tag_word() & kTagMask));
       n4->count_ = static_cast<std::uint8_t>(n16->count_);
       for (std::size_t i = 0; i < n16->count_; ++i) {
         n4->keys_[i] = n16->keys_[i];
-        n4->children_[i] = std::move(n16->children_[i]);
+        n4->children_[i] = n16->children_[i];
       }
-      return IntrusivePtr<Node>::adopt(n4);
+      session.discard(node);
+      return n4;
     }
 
     if (auto *n48 = node->as_node48()) {
@@ -912,12 +843,12 @@ template <typename V> struct Node {
       if (pos != Node48<V>::kEmptyMarker) {
         for (std::size_t j = pos; j + 1 < n48->count_; ++j) {
           n48->keys_[j] = n48->keys_[j + 1];
-          n48->children_[j] = std::move(n48->children_[j + 1]);
+          n48->children_[j] = n48->children_[j + 1];
           n48->child_index_[std::to_integer<std::uint8_t>(n48->keys_[j])] =
               static_cast<std::uint8_t>(j);
         }
         --n48->count_;
-        n48->children_[n48->count_] = IntrusivePtr<Node>{};
+        n48->children_[n48->count_] = nullptr;
         n48->child_index_[std::to_integer<std::uint8_t>(b)] =
             Node48<V>::kEmptyMarker;
       }
@@ -926,13 +857,14 @@ template <typename V> struct Node {
       // Demote back to Node16 — see the comment above remove_child for the
       // hysteresis rationale.
       auto *n16 = make_node16_like(*node);
-      n16->packed_tag_ |= node->packed_tag_ & kTagMask;
+      n16->set_tag_word(n16->tag_word() | (node->tag_word() & kTagMask));
       n16->count_ = static_cast<std::uint8_t>(n48->count_);
       for (std::size_t i = 0; i < n48->count_; ++i) {
         n16->keys_[i] = n48->keys_[i];
-        n16->children_[i] = std::move(n48->children_[i]);
+        n16->children_[i] = n48->children_[i];
       }
-      return IntrusivePtr<Node>::adopt(n16);
+      session.discard(node);
+      return n16;
     }
 
     // Node256 — direct-mapped, so removal is just clearing the slot; no
@@ -942,7 +874,7 @@ template <typename V> struct Node {
       return node;
     auto idx = std::to_integer<std::uint8_t>(b);
     if (n256->children_[idx]) {
-      n256->children_[idx] = IntrusivePtr<Node>{};
+      n256->children_[idx] = nullptr;
       --n256->count_;
     }
     // 75% of Node48's capacity — DuckDB's proportional hysteresis, mirrors
@@ -952,102 +884,80 @@ template <typename V> struct Node {
 
     // Demote back to Node48.
     auto *n48 = make_node48_like(*node);
-    n48->packed_tag_ |= node->packed_tag_ & kTagMask;
+    n48->set_tag_word(n48->tag_word() | (node->tag_word() & kTagMask));
     std::uint8_t pos = 0;
     for (std::size_t i = 0; i < 256; ++i) {
       if (!n256->children_[i])
         continue;
       n48->keys_[pos] = static_cast<std::byte>(i);
-      n48->children_[pos] = std::move(n256->children_[i]);
+      n48->children_[pos] = n256->children_[i];
       n48->child_index_[i] = pos;
       ++pos;
     }
     n48->count_ = pos;
-    return IntrusivePtr<Node>::adopt(n48);
+    session.discard(node);
+    return n48;
   }
 
-  // Deep clone of this node (not recursive — children are shared).
-  [[nodiscard]] auto clone() const -> IntrusivePtr<Node> {
+  // Shallow clone of this node: same tier, value, prefix and child
+  // pointers (children are shared, not copied — a plain array copy, no
+  // per-child work). The clone carries no edit tag; the caller stamps it.
+  [[nodiscard]] auto clone() const -> Node * {
     if (auto *self = as_node4()) {
-      auto *n = new Node4<V>();
-      n->packed_tag_ |= packed_tag_ & kHasValueBit;
+      auto *n = alloc<Node4<V>>();
+      n->set_tag_word(n->tag_word() | (tag_word() & kHasValueBit));
       n->value_ = value_;
       n->prefix = prefix;
       n->count_ = self->count_;
       n->keys_ = self->keys_;
-      n->children_ = self->children_; // IntrusivePtr copies -> addref each
-      return IntrusivePtr<Node>::adopt(n);
+      n->children_ = self->children_;
+      return n;
     }
     if (auto *self = as_node16()) {
-      auto *n = new Node16<V>();
-      n->packed_tag_ |= packed_tag_ & kHasValueBit;
+      auto *n = alloc<Node16<V>>();
+      n->set_tag_word(n->tag_word() | (tag_word() & kHasValueBit));
       n->value_ = value_;
       n->prefix = prefix;
       n->count_ = self->count_;
       n->keys_ = self->keys_;
-      n->children_ = self->children_; // IntrusivePtr copies -> addref each
-      return IntrusivePtr<Node>::adopt(n);
+      n->children_ = self->children_;
+      return n;
     }
     if (auto *self = as_node48()) {
-      auto *n = new Node48<V>();
-      n->packed_tag_ |= packed_tag_ & kHasValueBit;
+      auto *n = alloc<Node48<V>>();
+      n->set_tag_word(n->tag_word() | (tag_word() & kHasValueBit));
       n->value_ = value_;
       n->prefix = prefix;
       n->count_ = self->count_;
       n->keys_ = self->keys_;
-      n->children_ = self->children_; // IntrusivePtr copies -> addref each
+      n->children_ = self->children_;
       n->child_index_ = self->child_index_;
-      return IntrusivePtr<Node>::adopt(n);
+      return n;
     }
     if (auto *self = as_node256()) {
-      auto *n = new Node256<V>();
-      n->packed_tag_ |= packed_tag_ & kHasValueBit;
+      auto *n = alloc<Node256<V>>();
+      n->set_tag_word(n->tag_word() | (tag_word() & kHasValueBit));
       n->value_ = value_;
       n->prefix = prefix;
       n->count_ = self->count_;
-      n->children_ = self->children_; // IntrusivePtr copies -> addref each
-      return IntrusivePtr<Node>::adopt(n);
+      n->children_ = self->children_;
+      return n;
     }
-    auto* n = new Node();
-    n->packed_tag_ = packed_tag_ & kHasValueBit;
+    auto *n = alloc<Node>();
+    n->set_tag_word(n->tag_word() | (tag_word() & kHasValueBit));
     n->value_ = value_;
     n->prefix = prefix;
-    return IntrusivePtr<Node>::adopt(n);
-  }
-
-  // Clone and stamp with edit tag for transient ownership.
-  [[nodiscard]] auto clone_for(std::uint32_t tag) const -> IntrusivePtr<Node> {
-    auto n = clone();
-    n->set_edit_tag(tag);
     return n;
-  }
-
-  // Clone, promoting to Node4 if this is a leaf.
-  // Used when the caller will insert children into the clone.
-  [[nodiscard]] auto clone_as_internal() const -> IntrusivePtr<Node> {
-    if (node_type() != NodeType::Leaf)
-      return clone();
-    return IntrusivePtr<Node>::adopt(make_node4_like(*this));
   }
 };
 
-// ---------------------------------------------------------------------------
-// Node4<V> — fixed 4-slot internal node, children embedded inline.
-//
-// Single allocation (no separate ChildStore heap object or buffers) for the
-// common low-fanout case: chain-compression routing nodes have exactly 1
-// child, and prefix splits start at 2. Transition bytes are kept sorted;
-// lookup is a short linear scan (never more than 4 comparisons). Promotes
-// to Node16 on its 5th child; Node16 demotes back to Node4 when its count
-// drops to <= kCapacity (see Node::insert_child / Node::remove_child).
-// ---------------------------------------------------------------------------
 template <typename V> struct Node4 : Node<V> {
   static constexpr std::uint8_t kCapacity = 4;
 
   Node4() { Node<V>::set_node_type(Node<V>::NodeType::Node4); }
   std::uint8_t count_{0};
   std::array<std::byte, kCapacity> keys_{};
-  std::array<IntrusivePtr<Node<V>>, kCapacity> children_{};
+  std::array<Node<V> *, kCapacity> children_{};
 };
 
 // ---------------------------------------------------------------------------
@@ -1063,7 +973,7 @@ template <typename V> struct Node16 : Node<V> {
   Node16() { Node<V>::set_node_type(Node<V>::NodeType::Node16); }
   std::uint8_t count_{0};
   std::array<std::byte, kCapacity> keys_{};
-  std::array<IntrusivePtr<Node<V>>, kCapacity> children_{};
+  std::array<Node<V> *, kCapacity> children_{};
 };
 
 // ---------------------------------------------------------------------------
@@ -1091,7 +1001,7 @@ template <typename V> struct Node48 : Node<V> {
   std::uint8_t count_{0};
   std::array<std::uint8_t, 256> child_index_{};
   std::array<std::byte, kCapacity> keys_{};
-  std::array<IntrusivePtr<Node<V>>, kCapacity> children_{};
+  std::array<Node<V> *, kCapacity> children_{};
 };
 
 // ---------------------------------------------------------------------------
@@ -1114,14 +1024,14 @@ template <typename V> struct Node256 : Node<V> {
 
   Node256() { Node<V>::set_node_type(Node<V>::NodeType::Node256); }
   std::uint16_t count_{0};
-  std::array<IntrusivePtr<Node<V>>, kCapacity> children_{};
+  std::array<Node<V> *, kCapacity> children_{};
 };
 
-// Node<uint64_t>: 4+4+8+8 = 24 (no children field; no pointers, so this
-// holds regardless of IntrusivePtr's underlying pointer size).
+// Node<uint64_t>: 8+8+8 = 24 (no children field; no pointers, so this
+// holds regardless of the target's pointer size).
 static_assert(sizeof(Node<std::uint64_t>) == 24);
 
-// The four tiers below embed IntrusivePtr<Node> child arrays, so their sizes
+// The four tiers below embed Node* child arrays, so their sizes
 // scale with the target's pointer width: 8 bytes/child on 64-bit hosts
 // (native, MariaDB plugin, Python bindings), 4 bytes/child on wasm32 (the
 // Node.js WASM backend, built with -DBYTECASK_SINGLE_THREADED). Both are
@@ -1143,21 +1053,6 @@ static_assert(sizeof(Node48<std::uint64_t>) ==
 static_assert(sizeof(Node256<std::uint64_t>) ==
               (sizeof(void *) == 8 ? 2080 : 1056));
 
-// Factory functions for node allocation.
-// make_leaf: allocates Node (24B for uint64_t value), no children.
-// make_internal: allocates a fresh Node4 (the entry tier for any node that
-// will receive children — routing/split nodes) — promotes to Node16, then
-// Node48, then Node256, automatically via Node::insert_child as fanout
-// grows.
-template <typename V>
-auto make_leaf() -> IntrusivePtr<Node<V>> {
-  return IntrusivePtr<Node<V>>::adopt(new Node<V>());
-}
-
-template <typename V>
-auto make_internal() -> IntrusivePtr<Node<V>> {
-  return IntrusivePtr<Node<V>>::adopt(new Node4<V>());
-}
 
 // ---------------------------------------------------------------------------
 // Helper: compute the common prefix length between a node's prefix and a key
@@ -1172,41 +1067,1138 @@ inline auto common_prefix_length(std::span<const std::byte> a,
   return i;
 }
 
+// Walks the subtree under `root`, descending through every node for which
+// `is_garbage(node)` holds and freeing those of them that are not on some
+// build session's retired list (whoever retired a node frees it). The
+// predicate must be monotone along a path — once it is false for a node it
+// is false for everything below it — which holds for both predicates used
+// here, because a node's children are never newer than the node itself: a
+// session links new children only into nodes it owns. Iterative — no
+// recursion on tree depth.
+template <typename V, typename Pred>
+void free_subtree_if(Node<V> *root, Pred is_garbage) {
+  if (!root || !is_garbage(root))
+    return;
+  std::vector<Node<V> *> stack;
+  stack.push_back(root);
+  while (!stack.empty()) {
+    auto *n = stack.back();
+    stack.pop_back();
+    typename Node<V>::ChildCursor cursor;
+    while (auto child = n->next_child(cursor)) {
+      if (is_garbage(child->ptr))
+        stack.push_back(child->ptr);
+    }
+    if (!n->is_retired())
+      Node<V>::destroy(n);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// VersionRegistry<V> — owns node lifetime for every PersistentRadixTree<V>.
+//
+// A persistent tree is a *version*. Each version is identified by the edit
+// tag of the session that built it, and is registered here while any handle
+// to it lives. The session retires the base nodes it makes unreachable —
+// the ones it clones or unlinks — and hands that list over when it
+// publishes. Nothing carries a reference count; freeing is a batch of plain
+// deletes off the write path.
+//
+// When can a retired node be freed? Tags increase with every session, and a
+// session starts only after its base was published, so a node created by
+// session S is reachable only from the version S published and from
+// versions derived from it — all of which have tags >= S. A node X retired
+// by session R is, by definition, not reachable from R's version nor from
+// anything derived from it. So X is reachable from a live version V exactly
+// when tag(V) lies in [tag(X), tag(R)).
+//
+// Each retired node is therefore parked on the live version that currently
+// blocks it — the smallest live tag at or above its own — and freed the
+// moment no live tag falls in its window. A version's death re-examines
+// only the nodes parked on it, so the cost is paid once per node per
+// blocker, never as a scan. A long-lived snapshot holds exactly the nodes
+// it can still reach, not everything retired since it was taken.
+//
+// Forks. The window argument assumes a version's tag orders it against
+// everything that can reach its nodes, which holds while versions form a
+// chain. Two versions derived from the same base — a fork — break it: each
+// can reach what the other superseded while carrying a larger tag. Parking
+// is therefore suspended while any base has more than one version derived
+// from it, and the held nodes are placed as soon as that resolves. The
+// engine forks only between a failed flush and the resume() that clears it.
+//
+// A version whose last handle goes while nothing was derived from it frees
+// what only it could reach: walking down from its root, a node whose tag is
+// above every version it was derived from was created after all of them,
+// so nothing else can reach it. A node's children are never newer than the
+// node, so the walk stops where the test fails, and parked nodes are
+// stepped over because their blocker frees them.
+//
+// That floor is what the derivation graph is for. A dead version is spliced
+// out and its successor inherits its bases, which lowers the successor's
+// floor onto the nodes it now holds alone — but only while at most one
+// version was derived from it. A dead version with two or more successors
+// stays as a tombstone: they share its nodes with each other, and it is
+// what stops either one's walk from freeing what the other still reads.
+// When their number falls back to one, it is spliced out like any other and
+// the survivor takes over its nodes. So the last version of a lineage has
+// no bases left and frees the whole structure.
+//
+// Reclamation runs on the thread that drops the last handle. All registry
+// state is under one mutex, and the freeing of retired nodes happens after
+// it is released; the walk above is the exception and holds it, because
+// once a version leaves the graph another thread may decide that what it
+// reached is free while the walk is still stepping through those nodes.
+//
+// There are only ever a handful of versions, so they live in flat vectors
+// searched linearly rather than in node-based containers: records sorted by
+// tag, the derivation graph as a list of base-to-successor pairs, and the
+// retired nodes kept in the vector the session already built. Publishing a
+// version then allocates nothing once those buffers have settled, which
+// matters because the engine publishes three of them per batch. The buffers
+// are handed back when the last version of this value type goes.
+// ---------------------------------------------------------------------------
+template <typename V> class VersionRegistry {
+public:
+  static auto instance() -> VersionRegistry & {
+    // Immortal: a tree can outlive static destruction, so the registry is
+    // constructed once in static storage and never destroyed. Static
+    // storage rather than the heap, so a leak checker sees nothing left
+    // behind at exit.
+    alignas(VersionRegistry) static std::byte storage[sizeof(VersionRegistry)];
+    static auto *registry = new (storage) VersionRegistry();
+    return *registry;
+  }
+
+  // Registers a new version built by session `tag` from `bases` (tag 0 = the
+  // empty tree, which owns nothing) and returns its id. On success `retired`
+  // is taken over and left empty; on a throw it is untouched and still
+  // belongs to the session. Bases must be live — the builder holds a handle
+  // to each.
+  [[nodiscard]] auto publish(std::uint64_t tag,
+                             std::span<const std::uint64_t> bases,
+                             std::vector<Node<V> *> &retired)
+      -> std::uint64_t {
+    std::vector<Node<V> *> to_free;
+    {
+      std::lock_guard<std::mutex> lk{mu_};
+      records_.insert(seat_for(tag), Record{.tag = tag, .live = 1});
+      for (auto b : bases) {
+        if (b != 0)
+          add_edge(b, tag);
+      }
+      if (!retired.empty())
+        pending_.push_back(Parcel{std::move(retired), tag});
+      retired.clear();
+      drain_pending(to_free);
+    }
+    destroy_all(to_free);
+    return tag;
+  }
+
+  void pin(std::uint64_t id) {
+    std::lock_guard<std::mutex> lk{mu_};
+    ++find(id)->live;
+  }
+
+  // Drops one handle of `id`. `root` is walked only when this was the last
+  // handle and no version was derived from it — see the class comment for
+  // the tag test that decides what such a walk frees.
+  void unpin(std::uint64_t id, Node<V> *root) {
+    std::vector<Node<V> *> to_free;
+    {
+      std::lock_guard<std::mutex> lk{mu_};
+      auto *rec = find(id);
+      if (--rec->live > 0)
+        return;
+      bool walk_root = true;
+      std::uint64_t floor = 0;
+      // Ids are session tags, so the largest base id is the newest state
+      // this version still shares with something else.
+      for (const auto &e : edges_) {
+        if (e.base == id)
+          walk_root = false;
+        else if (e.successor == id)
+          floor = std::max(floor, e.base);
+      }
+      // Under the lock: once this version leaves the graph another thread
+      // may decide that what it reached is free, and this walk is still
+      // stepping through those nodes to reach the ones below them. Walks
+      // are rare — only a version nothing was derived from has one — so
+      // holding the lock across it costs nothing in the steady state.
+      if (walk_root)
+        free_subtree_if<V>(root, [floor](Node<V> *n) {
+          return n->edit_tag() > floor;
+        });
+      // Nodes parked on this version may now be free, or may have to move
+      // to an older version that still reaches them.
+      take_parcels(*rec);
+      collapse(id, to_free);
+      drain_pending(to_free);
+      release_buffers_if_idle();
+    }
+    destroy_all(to_free);
+  }
+
+  // Test-only: every retired node still waiting for a live version to
+  // release it.
+  [[nodiscard]] auto parked_nodes() -> std::vector<const void *> {
+    std::lock_guard<std::mutex> lk{mu_};
+    std::vector<const void *> out;
+    auto add = [&out](const Parcel &parcel) {
+      out.insert(out.end(), parcel.nodes.begin(), parcel.nodes.end());
+    };
+    for (const auto &rec : records_) {
+      add(rec.parked);
+      for (const auto &parcel : rec.more)
+        add(parcel);
+    }
+    for (const auto &parcel : forked_)
+      add(parcel);
+    for (const auto &parcel : pending_)
+      add(parcel);
+    return out;
+  }
+
+private:
+  // base -> successor. Also flat: the same handful of versions, and reading
+  // it is a scan of a few contiguous pairs.
+  struct Edge {
+    std::uint64_t base{0};
+    std::uint64_t successor{0};
+  };
+
+  // Nodes retired by one session. `retired_by` closes their reachability
+  // window: a live version with a tag at or above it was derived from that
+  // session and cannot reach them.
+  struct Parcel {
+    std::vector<Node<V> *> nodes;
+    std::uint64_t retired_by{0};
+  };
+
+  // One version. Live versions and the tombstones described in the class
+  // comment, kept in one vector sorted by tag: there are a handful of them,
+  // so a flat vector searches faster than a node-based container and, once
+  // its capacity has settled, publishing a version allocates nothing.
+  struct Record {
+    std::uint64_t tag{0};
+    std::uint32_t live{0};
+    // Nodes parked on this version, because it is the live version that
+    // still reaches them. One parcel inline covers the usual case — one
+    // published version's worth of superseded nodes — so parking allocates
+    // nothing; further ones spill into `more`.
+    Parcel parked;
+    std::vector<Parcel> more;
+  };
+
+  std::mutex mu_;
+  std::uint32_t forks_{0}; // versions with more than one successor
+  std::vector<Record> records_;
+  std::vector<Edge> edges_;
+  std::vector<Parcel> forked_;  // held while a fork is unresolved
+  // Scratch reused under mu_, so the steady state allocates nothing: a
+  // published version's bookkeeping is pushes into vectors that already
+  // have the capacity.
+  std::vector<Parcel> pending_;
+  std::vector<std::uint64_t> work_;
+  std::vector<std::uint64_t> bases_;
+  std::vector<std::uint64_t> successors_;
+
+  // Where `tag` belongs in the sorted record vector.
+  [[nodiscard]] auto seat_for(std::uint64_t tag) -> typename std::vector<Record>::iterator {
+    return std::lower_bound(records_.begin(), records_.end(), tag,
+                            [](const Record &r, std::uint64_t t) {
+                              return r.tag < t;
+                            });
+  }
+  [[nodiscard]] auto find(std::uint64_t tag) -> Record * {
+    auto it = seat_for(tag);
+    assert(it != records_.end() && it->tag == tag);
+    return &*it;
+  }
+
+  [[nodiscard]] auto successor_count(std::uint64_t tag) const -> std::size_t {
+    std::size_t n = 0;
+    for (const auto &e : edges_)
+      if (e.base == tag)
+        ++n;
+    return n;
+  }
+
+  void add_edge(std::uint64_t base, std::uint64_t successor) {
+    if (successor_count(base) == 1)
+      ++forks_;
+    edges_.push_back(Edge{base, successor});
+  }
+
+  void remove_edge(std::uint64_t base, std::uint64_t successor) {
+    auto it = std::find_if(edges_.begin(), edges_.end(),
+                           [&](const Edge &e) {
+                             return e.base == base && e.successor == successor;
+                           });
+    if (it == edges_.end())
+      return;
+    edges_.erase(it);
+    if (successor_count(base) == 1 && --forks_ == 0) {
+      pending_.insert(pending_.end(), std::make_move_iterator(forked_.begin()),
+                      std::make_move_iterator(forked_.end()));
+      forked_.clear();
+    }
+  }
+
+  // Under mu_. Removes every dead record that no longer holds two or more
+  // successors apart, starting at `id`. See the class comment for why a
+  // dead version with two successors has to stay.
+  void collapse(std::uint64_t id, std::vector<Node<V> *> & /*out*/) {
+    work_.clear();
+    work_.push_back(id);
+    while (!work_.empty()) {
+      const auto cur = work_.back();
+      work_.pop_back();
+      auto it = seat_for(cur);
+      if (it == records_.end() || it->tag != cur || it->live > 0)
+        continue;
+      bases_.clear();
+      successors_.clear();
+      for (const auto &e : edges_) {
+        if (e.successor == cur)
+          bases_.push_back(e.base);
+        else if (e.base == cur)
+          successors_.push_back(e.successor);
+      }
+      if (successors_.size() > 1)
+        continue; // tombstone: it keeps its successors' nodes apart
+      take_parcels(*it);
+      records_.erase(it);
+      for (auto b : bases_) {
+        // Connect before disconnecting: dropping to one successor first
+        // would briefly read as "no forks left" and release parked nodes
+        // that the successor taking this one's place still blocks.
+        for (auto s : successors_)
+          add_edge(b, s);
+        remove_edge(b, cur);
+      }
+      for (auto s : successors_)
+        remove_edge(cur, s);
+      work_.insert(work_.end(), bases_.begin(), bases_.end());
+    }
+  }
+
+  // Under mu_: moves everything parked on `rec` onto the pending queue, to
+  // be placed again once the graph has settled.
+  void take_parcels(Record &rec) {
+    if (!rec.parked.nodes.empty()) {
+      pending_.push_back(std::move(rec.parked));
+      rec.parked.nodes.clear();
+    }
+    if (!rec.more.empty()) {
+      pending_.insert(pending_.end(),
+                      std::make_move_iterator(rec.more.begin()),
+                      std::make_move_iterator(rec.more.end()));
+      rec.more.clear();
+    }
+  }
+
+  // Under mu_: places every pending parcel. Runs after the record vector
+  // has stopped moving, so park() can hold a reference into it.
+  void drain_pending(std::vector<Node<V> *> &out) {
+    while (!pending_.empty()) {
+      auto parcel = std::move(pending_.back());
+      pending_.pop_back();
+      park(std::move(parcel), out);
+    }
+  }
+
+  // The live version that still reaches a node retired by `retired_by`: the
+  // smallest live tag at or above the node's own, when that is below
+  // `retired_by`. Returns 0 when nothing reaches it.
+  [[nodiscard]] auto blocker_for(std::uint64_t node_tag,
+                                 std::uint64_t retired_by) const
+      -> std::uint64_t {
+    auto it = std::lower_bound(records_.begin(), records_.end(), node_tag,
+                               [](const Record &r, std::uint64_t t) {
+                                 return r.tag < t;
+                               });
+    for (; it != records_.end() && it->tag < retired_by; ++it)
+      if (it->live > 0)
+        return it->tag;
+    return 0;
+  }
+
+  // Under mu_: sends each node of `parcel` to the live version that still
+  // reaches it, or to `out` when none does. The nodes of one parcel almost
+  // always share a blocker — they came off one path in one version — so
+  // that case moves the whole list and allocates nothing.
+  void park(Parcel parcel, std::vector<Node<V> *> &out) {
+    if (forks_ > 0) {
+      forked_.push_back(std::move(parcel));
+      return;
+    }
+    const auto first = blocker_for(parcel.nodes.front()->edit_tag(),
+                                   parcel.retired_by);
+    bool uniform = true;
+    for (auto *n : parcel.nodes) {
+      if (blocker_for(n->edit_tag(), parcel.retired_by) != first) {
+        uniform = false;
+        break;
+      }
+    }
+    if (uniform) {
+      if (first == 0)
+        out.insert(out.end(), parcel.nodes.begin(), parcel.nodes.end());
+      else
+        hold(first, std::move(parcel));
+      return;
+    }
+    // Mixed: split by blocker. Rare, and the split lists are short.
+    std::vector<Parcel> groups;
+    for (auto *n : parcel.nodes) {
+      const auto blocker = blocker_for(n->edit_tag(), parcel.retired_by);
+      if (blocker == 0) {
+        out.push_back(n);
+        continue;
+      }
+      auto group = std::find_if(groups.begin(), groups.end(),
+                                [blocker](const Parcel &g) {
+                                  return g.retired_by == blocker;
+                                });
+      if (group == groups.end())
+        groups.push_back(Parcel{{n}, blocker});
+      else
+        group->nodes.push_back(n);
+    }
+    for (auto &group : groups) {
+      const auto blocker = group.retired_by;
+      hold(blocker, Parcel{std::move(group.nodes), parcel.retired_by});
+    }
+  }
+
+  // Under mu_: hands a parcel to the version that still reaches it.
+  void hold(std::uint64_t blocker, Parcel parcel) {
+    auto *rec = find(blocker);
+    if (rec->parked.nodes.empty())
+      rec->parked = std::move(parcel);
+    else
+      rec->more.push_back(std::move(parcel));
+  }
+
+  // Under mu_: when the last version of every tree of this value type is
+  // gone, hand the registry's own buffers back too. They are reused and
+  // never shrink otherwise, which is what makes publishing allocation-free
+  // in the steady state — but an idle process should not be holding them,
+  // and the tree is then provably responsible for no memory at all, which
+  // the memory tests check.
+  void release_buffers_if_idle() {
+    if (!records_.empty() || !edges_.empty() || !forked_.empty() ||
+        !pending_.empty())
+      return;
+    records_.shrink_to_fit();
+    edges_.shrink_to_fit();
+    forked_.shrink_to_fit();
+    pending_.shrink_to_fit();
+    work_.shrink_to_fit();
+    bases_.shrink_to_fit();
+    successors_.shrink_to_fit();
+  }
+
+  static void destroy_all(const std::vector<Node<V> *> &nodes) noexcept {
+    if (nodes.empty())
+      return;
+    detail::account_retired<V>(-static_cast<std::int64_t>(nodes.size()));
+    for (auto *n : nodes)
+      Node<V>::destroy(n);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// BuildSession<V> — one build of a new version from a base.
+//
+// Owns the edit tag that marks the nodes it creates and the list of base
+// nodes it retires. Every structural algorithm lives here so the four
+// places a node becomes garbage all go through discard():
+//   1. superseded — mutable_copy() clones a node it does not own;
+//   2. replaced — insert_child / remove_child / merge_with_child swap a
+//      node for a different tier or collapse a routing node;
+//   3. dropped — erase unlinks a node that has no value and no children;
+//   4. never published — the session is destroyed without publishing:
+//      the nodes it created are freed by walking the root (see
+//      TransientRadixTree), and its retired list is forgotten.
+// A node the session owns (edit tag == tag_) is freed at once — nothing
+// outside the session can reach it. A foreign node is retired: it stays
+// allocated until every version that can reach it is gone.
+//
+// Used by one thread at a time. Iterators over a session's root hold raw
+// node pointers: do not mutate while one is alive.
+// ---------------------------------------------------------------------------
+template <typename V> class BuildSession {
+public:
+  using N = Node<V>;
+
+  BuildSession() : tag_{new_tag()} {}
+  BuildSession(const BuildSession &) = delete;
+  auto operator=(const BuildSession &) -> BuildSession & = delete;
+  BuildSession(BuildSession &&other) noexcept
+      : tag_{std::exchange(other.tag_, 0)},
+        retired_{std::move(other.retired_)} {
+    other.retired_.clear();
+  }
+  auto operator=(BuildSession &&other) noexcept -> BuildSession & {
+    if (this != &other) {
+      forget_retired();
+      tag_ = std::exchange(other.tag_, 0);
+      retired_ = std::move(other.retired_);
+      other.retired_.clear();
+    }
+    return *this;
+  }
+  ~BuildSession() { forget_retired(); }
+
+  [[nodiscard]] auto tag() const noexcept -> std::uint64_t { return tag_; }
+  [[nodiscard]] auto owns(const N *n) const noexcept -> bool {
+    return n->edit_tag() == tag_;
+  }
+
+  // The retired list, for EpochRegistry::publish to take over on success.
+  [[nodiscard]] auto retired_list() noexcept -> std::vector<N *> & {
+    return retired_;
+  }
+
+  // Ends the session after publishing: nothing it created is owned by it
+  // any more, and the retired list now belongs to the registry.
+  void finish() noexcept {
+    tag_ = 0;
+    retired_.clear();
+  }
+
+  // Frees every node this session created that is still reachable from
+  // `root`, and forgets the retired list. For a session that is dropped
+  // without publishing: the base version is intact, so nothing it retired
+  // is garbage, and nothing it created is reachable from anywhere else.
+  void discard_all(N *root) noexcept {
+    const auto tag = tag_;
+    if (tag != 0)
+      free_subtree_if<V>(root, [tag](N *n) { return n->edit_tag() == tag; });
+    forget_retired();
+    tag_ = 0;
+  }
+
+  void discard(N *n) {
+    if (owns(n)) {
+      // Created by this session and never published: nothing outside can
+      // reach it.
+      N::destroy(n);
+      return;
+    }
+    if (n->is_retired())
+      return; // another session already owns its disposal
+    n->mark_retired();
+    retired_.push_back(n);
+    detail::account_retired<V>(1);
+  }
+
+  // The node itself if this session owns it, else a clone stamped with the
+  // session's tag; the original is retired. Null yields a fresh leaf.
+  [[nodiscard]] auto mutable_copy(N *node) -> N * {
+    if (!node)
+      return make_leaf();
+    if (owns(node))
+      return node;
+    auto *n = node->clone();
+    n->set_edit_tag(tag_);
+    discard(node);
+    return n;
+  }
+
+  [[nodiscard]] auto make_leaf() -> N * {
+    auto *n = N::template alloc<N>();
+    n->set_edit_tag(tag_);
+    return n;
+  }
+  [[nodiscard]] auto make_internal() -> N * {
+    auto *n = N::template alloc<Node4<V>>();
+    n->set_edit_tag(tag_);
+    return n;
+  }
+
+  // -- chain builders --
+  // Build a chain of routing nodes ending in a value-bearing leaf.
+  // Chunks key left-to-right: each intermediate node gets 7 prefix bytes +
+  // 1 transition byte (8 bytes of key material per hop). The final leaf
+  // gets the remaining 0–7 bytes as prefix.
+  auto build_leaf_chain(std::span<const std::byte> key, V val) -> N * {
+    // Fast path: key fits in a single node's prefix.
+    if (key.size() <= CompactPrefix::kInlineCap) {
+      auto *leaf = make_leaf();
+      for (auto b : key)
+        leaf->prefix.push_back(b);
+      leaf->set_value(std::move(val));
+      return leaf;
+    }
+
+    // Partition key into chunks of 7 prefix + 1 transition byte.
+    // Collect chunk boundaries first, then build bottom-up.
+    struct Chunk {
+      std::size_t prefix_start;
+      std::size_t prefix_len;
+      std::size_t transition_idx; // index of transition byte (unused for last)
+    };
+    std::vector<Chunk> chunks;
+    std::size_t pos = 0;
+    while (key.size() - pos > CompactPrefix::kInlineCap) {
+      chunks.push_back({pos, CompactPrefix::kInlineCap, pos + CompactPrefix::kInlineCap});
+      pos += CompactPrefix::kInlineCap + 1; // 7 prefix + 1 transition
+    }
+    // Last chunk: remaining 0–7 bytes become the leaf's prefix.
+    auto leaf_prefix = key.subspan(pos);
+
+    // Build bottom-up: leaf first, then wrap in routing nodes.
+    auto *cur = make_leaf();
+    for (auto b : leaf_prefix)
+      cur->prefix.push_back(b);
+    cur->set_value(std::move(val));
+
+    for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
+      auto *routing = make_internal();
+      for (std::size_t i = 0; i < it->prefix_len; ++i)
+        routing->prefix.push_back(key[it->prefix_start + i]);
+      cur = N::insert_child(*this, routing, key[it->transition_idx], cur);
+    }
+    return cur;
+  }
+
+  // Build a chain of routing nodes with an existing terminal node at the end.
+  // Overwrites terminal->prefix with the last chunk. Leaves terminal's
+  // children and value intact. `terminal` must be owned by this session.
+  auto build_routing_chain(std::span<const std::byte> merged, N *terminal)
+      -> N * {
+    assert(owns(terminal));
+    // Fast path: fits in a single prefix.
+    if (merged.size() <= CompactPrefix::kInlineCap) {
+      terminal->prefix.clear();
+      for (auto b : merged)
+        terminal->prefix.push_back(b);
+      return terminal;
+    }
+
+    // Partition into chunks.
+    struct Chunk {
+      std::size_t prefix_start;
+      std::size_t prefix_len;
+      std::size_t transition_idx;
+    };
+    std::vector<Chunk> chunks;
+    std::size_t pos = 0;
+    while (merged.size() - pos > CompactPrefix::kInlineCap) {
+      chunks.push_back({pos, CompactPrefix::kInlineCap, pos + CompactPrefix::kInlineCap});
+      pos += CompactPrefix::kInlineCap + 1;
+    }
+
+    // Set terminal's prefix to the last chunk.
+    terminal->prefix.clear();
+    for (auto b : merged.subspan(pos))
+      terminal->prefix.push_back(b);
+
+    // Build bottom-up: terminal is the innermost node.
+    auto *cur = terminal;
+    for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
+      auto *routing = make_internal();
+      for (std::size_t i = 0; i < it->prefix_len; ++i)
+        routing->prefix.push_back(merged[it->prefix_start + i]);
+      cur = N::insert_child(*this, routing, merged[it->transition_idx], cur);
+    }
+    return cur;
+  }
+
+  // -- set: mutates owned nodes in place, copies foreign ones --
+  // Returns {new subtree root, whether a new key was inserted}.
+  auto set(N *node, std::span<const std::byte> key, V val)
+      -> std::pair<N *, bool> {
+    if (!node)
+      return {build_leaf_chain(key, std::move(val)), true};
+
+    auto *mutable_node = mutable_copy(node);
+    auto prefix_span = std::span<const std::byte>{mutable_node->prefix.data(),
+                                                  mutable_node->prefix.size()};
+    auto cpl = common_prefix_length(prefix_span, key);
+
+    if (cpl < prefix_span.size()) {
+      // Split: divergence within this node's prefix.
+      auto *split = make_internal();
+      for (std::size_t i = 0; i < cpl; ++i)
+        split->prefix.push_back(prefix_span[i]);
+
+      auto old_transition = prefix_span[cpl];
+      typename N::Prefix old_suffix;
+      for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
+        old_suffix.push_back(prefix_span[i]);
+      mutable_node->prefix = std::move(old_suffix);
+      split = N::insert_child(*this, split, old_transition, mutable_node);
+
+      auto remaining = key.subspan(cpl);
+      if (remaining.empty()) {
+        split->set_value(std::move(val));
+      } else {
+        auto new_transition = remaining[0];
+        auto *chain = build_leaf_chain(remaining.subspan(1), std::move(val));
+        split = N::insert_child(*this, split, new_transition, chain);
+      }
+      return {split, true};
+    }
+
+    auto remaining = key.subspan(cpl);
+    if (remaining.empty()) {
+      bool was_absent = !mutable_node->has_value();
+      mutable_node->set_value(std::move(val));
+      return {mutable_node, was_absent};
+    }
+
+    auto transition = remaining[0];
+    auto child_key = remaining.subspan(1);
+    auto existing_child = mutable_node->find_child_mut(transition);
+    if (existing_child) {
+      auto [new_child, inserted] =
+          set(existing_child->ptr, child_key, std::move(val));
+      existing_child->ptr = new_child;
+      return {mutable_node, inserted};
+    }
+    // insert_child promotes mutable_node (leaf -> Node4 -> Node16 ->
+    // Node48 -> Node256) as needed.
+    auto *chain = build_leaf_chain(child_key, std::move(val));
+    mutable_node = N::insert_child(*this, mutable_node, transition, chain);
+    return {mutable_node, true};
+  }
+
+  // Single-traversal upsert — like set, but conditionally replaces an
+  // existing value. Returns {new subtree root, displaced value, inserted}.
+  // When the key already exists, calls should_replace(existing, incoming);
+  // if true, swaps in the new value and returns the old one as displaced.
+  template <typename Pred>
+  auto upsert(N *node, std::span<const std::byte> key, V val,
+              Pred &&should_replace)
+      -> std::tuple<N *, std::optional<V>, bool> {
+    if (!node)
+      return {build_leaf_chain(key, std::move(val)), std::nullopt, true};
+
+    auto *mutable_node = mutable_copy(node);
+    auto prefix_span = std::span<const std::byte>{mutable_node->prefix.data(),
+                                                  mutable_node->prefix.size()};
+    auto cpl = common_prefix_length(prefix_span, key);
+
+    if (cpl < prefix_span.size()) {
+      // Split — key diverges from prefix, so this is always a new insert.
+      auto *split = make_internal();
+      for (std::size_t i = 0; i < cpl; ++i)
+        split->prefix.push_back(prefix_span[i]);
+
+      auto old_transition = prefix_span[cpl];
+      typename N::Prefix old_suffix;
+      for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
+        old_suffix.push_back(prefix_span[i]);
+      mutable_node->prefix = std::move(old_suffix);
+      split = N::insert_child(*this, split, old_transition, mutable_node);
+
+      auto remaining = key.subspan(cpl);
+      if (remaining.empty()) {
+        split->set_value(std::move(val));
+      } else {
+        auto new_transition = remaining[0];
+        auto *chain = build_leaf_chain(remaining.subspan(1), std::move(val));
+        split = N::insert_child(*this, split, new_transition, chain);
+      }
+      return {split, std::nullopt, true};
+    }
+
+    auto remaining = key.subspan(cpl);
+    if (remaining.empty()) {
+      if (mutable_node->has_value()) {
+        if (should_replace(mutable_node->value_, val)) {
+          auto old = std::move(mutable_node->value_);
+          mutable_node->set_value(std::move(val));
+          return {mutable_node, std::move(old), false};
+        }
+        return {mutable_node, std::nullopt, false};
+      }
+      mutable_node->set_value(std::move(val));
+      return {mutable_node, std::nullopt, true};
+    }
+
+    auto transition = remaining[0];
+    auto child_key = remaining.subspan(1);
+    auto existing_child = mutable_node->find_child_mut(transition);
+    if (existing_child) {
+      auto [new_child, displaced, inserted] =
+          upsert(existing_child->ptr, child_key, std::move(val),
+                 std::forward<Pred>(should_replace));
+      existing_child->ptr = new_child;
+      return {mutable_node, std::move(displaced), inserted};
+    }
+    auto *chain = build_leaf_chain(child_key, std::move(val));
+    mutable_node = N::insert_child(*this, mutable_node, transition, chain);
+    return {mutable_node, std::nullopt, true};
+  }
+
+  // -- erase with path compression --
+  // Returns {new subtree root (null if the subtree is gone), removed}.
+  // Only nodes on a path that actually changes are copied: a node that
+  // disappears entirely (a leaf, or a routing node whose only child is
+  // going away) is discarded without a clone.
+  auto erase(N *node, std::span<const std::byte> key)
+      -> std::pair<N *, bool> {
+    if (!node)
+      return {nullptr, false};
+
+    auto prefix_span =
+        std::span<const std::byte>{node->prefix.data(), node->prefix.size()};
+    auto cpl = common_prefix_length(prefix_span, key);
+
+    if (cpl < prefix_span.size())
+      return {node, false};
+
+    auto remaining = key.subspan(cpl);
+    if (remaining.empty()) {
+      if (!node->has_value())
+        return {node, false};
+      if (!node->has_children()) {
+        discard(node);
+        return {nullptr, true};
+      }
+      auto *mutable_node = mutable_copy(node);
+      mutable_node->clear_value();
+      if (mutable_node->child_count() == 1)
+        return {merge_with_child(mutable_node), true};
+      return {mutable_node, true};
+    }
+
+    auto transition = remaining[0];
+    auto child_key = remaining.subspan(1);
+    auto existing = node->find_child(transition);
+    if (!existing)
+      return {node, false};
+
+    auto [new_child, removed] = erase(existing->ptr, child_key);
+    if (!removed)
+      return {node, false};
+
+    if (!new_child) {
+      if (!node->has_value() && node->child_count() == 1) {
+        // A routing node whose only child is gone goes with it.
+        discard(node);
+        return {nullptr, true};
+      }
+      auto *mutable_node = mutable_copy(node);
+      mutable_node = N::remove_child(*this, mutable_node, transition);
+      if (!mutable_node->has_value() && mutable_node->child_count() == 1)
+        return {merge_with_child(mutable_node), true};
+      return {mutable_node, true};
+    }
+    auto *mutable_node = mutable_copy(node);
+    mutable_node->find_child_mut(transition)->ptr = new_child;
+    return {mutable_node, true};
+  }
+
+  // Merge a routing node (owned, no value, one child) into that child.
+  // New prefix = node.prefix + transition_byte + child.prefix; if the
+  // combined prefix exceeds 7 bytes, builds a chain of routing nodes.
+  auto merge_with_child(N *node) -> N * {
+    assert(owns(node) && !node->has_value() && node->child_count() == 1);
+    auto slot = node->child_at(0);
+    auto transition = slot.transition;
+    auto *child = mutable_copy(slot.ptr);
+
+    auto total = node->prefix.size() + 1 + child->prefix.size();
+    if (total <= CompactPrefix::kInlineCap) {
+      typename N::Prefix merged_prefix;
+      for (std::size_t i = 0; i < node->prefix.size(); ++i)
+        merged_prefix.push_back(node->prefix[i]);
+      merged_prefix.push_back(transition);
+      for (std::size_t i = 0; i < child->prefix.size(); ++i)
+        merged_prefix.push_back(child->prefix[i]);
+      child->prefix = std::move(merged_prefix);
+      discard(node);
+      return child;
+    }
+    std::vector<std::byte> merged;
+    merged.reserve(total);
+    for (std::size_t i = 0; i < node->prefix.size(); ++i)
+      merged.push_back(node->prefix[i]);
+    merged.push_back(transition);
+    for (std::size_t i = 0; i < child->prefix.size(); ++i)
+      merged.push_back(child->prefix[i]);
+    discard(node);
+    return build_routing_chain(std::span<const std::byte>{merged}, child);
+  }
+
+  // -- merge of two subtrees --
+  // Recursively merges the subtrees rooted at `a` and `b`. Disjoint
+  // subtrees are shared in O(1) (no clone). Every node of either input that
+  // the result does not reuse is retired. Returns {merged_root,
+  // overlap_count} where overlap_count is the number of keys present in
+  // both a and b (i.e. where resolve was called).
+  template <typename ResolveFunc>
+  auto merge(N *a, N *b, ResolveFunc &&resolve)
+      -> std::pair<N *, std::size_t> {
+    if (!a)
+      return {b, 0};
+    if (!b)
+      return {a, 0};
+
+    // Align the two nodes on their common prefix.
+    auto pa = std::span<const std::byte>{a->prefix.data(), a->prefix.size()};
+    auto pb = std::span<const std::byte>{b->prefix.data(), b->prefix.size()};
+    auto cpl = common_prefix_length(pa, pb);
+
+    if (cpl < pa.size() && cpl < pb.size()) {
+      // The two prefixes diverge — build a split node with the common prefix,
+      // then place trimmed a and trimmed b as its two children.
+      //
+      // Every byte of pa and pb this branch needs is copied out first:
+      // mutable_copy may hand back the node itself (when this session owns
+      // it), and rewriting its prefix below would otherwise change the
+      // bytes pa/pb point at.
+      const auto a_transition = pa[cpl];
+      const auto b_transition = pb[cpl];
+      typename N::Prefix a_suffix;
+      for (std::size_t i = cpl + 1; i < pa.size(); ++i)
+        a_suffix.push_back(pa[i]);
+      typename N::Prefix b_suffix;
+      for (std::size_t i = cpl + 1; i < pb.size(); ++i)
+        b_suffix.push_back(pb[i]);
+
+      auto *split = make_internal();
+      for (std::size_t i = 0; i < cpl; ++i)
+        split->prefix.push_back(pa[i]);
+
+      auto *a_trimmed = mutable_copy(a);
+      a_trimmed->prefix = std::move(a_suffix);
+      split = N::insert_child(*this, split, a_transition, a_trimmed);
+
+      auto *b_trimmed = mutable_copy(b);
+      b_trimmed->prefix = std::move(b_suffix);
+      split = N::insert_child(*this, split, b_transition, b_trimmed);
+
+      return {split, 0};
+    }
+
+    if (cpl < pa.size()) {
+      // b's prefix is fully consumed — b's node sits *above* a in the trie.
+      // Build result based on b; insert a under b at transition pa[cpl].
+      // Copied out before any prefix is rewritten in place — see the
+      // diverging branch above.
+      const auto a_transition = pa[cpl];
+      typename N::Prefix a_suffix;
+      for (std::size_t i = cpl + 1; i < pa.size(); ++i)
+        a_suffix.push_back(pa[i]);
+
+      auto *new_b = mutable_as_internal(b);
+      auto *a_trimmed = mutable_copy(a);
+      a_trimmed->prefix = std::move(a_suffix);
+
+      auto existing = new_b->find_child_mut(a_transition);
+      std::size_t overlaps = 0;
+      if (existing) {
+        auto [child, child_overlaps] =
+            merge(a_trimmed, existing->ptr, resolve);
+        existing->ptr = child;
+        overlaps = child_overlaps;
+      } else {
+        new_b = N::insert_child(*this, new_b, a_transition, a_trimmed);
+      }
+      return {new_b, overlaps};
+    }
+
+    if (cpl < pb.size()) {
+      // a's prefix is fully consumed — a's node sits *above* b in the trie.
+      // Build result based on a; insert b under a at transition pb[cpl].
+      // Copied out before any prefix is rewritten in place — see the
+      // diverging branch above.
+      const auto b_transition = pb[cpl];
+      typename N::Prefix b_suffix;
+      for (std::size_t i = cpl + 1; i < pb.size(); ++i)
+        b_suffix.push_back(pb[i]);
+
+      auto *new_a = mutable_as_internal(a);
+      auto *b_trimmed = mutable_copy(b);
+      b_trimmed->prefix = std::move(b_suffix);
+
+      auto existing = new_a->find_child_mut(b_transition);
+      std::size_t overlaps = 0;
+      if (existing) {
+        auto [child, child_overlaps] =
+            merge(existing->ptr, b_trimmed, resolve);
+        existing->ptr = child;
+        overlaps = child_overlaps;
+      } else {
+        new_a = N::insert_child(*this, new_a, b_transition, b_trimmed);
+      }
+      return {new_a, overlaps};
+    }
+
+    // Full prefix match — both nodes share the same compressed key prefix.
+    // Fold b's value and children into a; b's node itself is not reused.
+    auto *merged = mutable_as_internal(a);
+    std::size_t overlaps = 0;
+
+    if (b->has_value()) {
+      if (merged->has_value()) {
+        merged->set_value(resolve(merged->value_, b->value_));
+        ++overlaps;
+      } else {
+        merged->set_value(b->value_);
+      }
+    }
+
+    if (b->has_children()) {
+      // Cursor walk rather than child_at(i) per ordinal: b's children are
+      // visited in full here, and on a Node256 the ordinal accessor rescans
+      // the direct-mapped slots on every call, making the walk quadratic in
+      // fanout (see Node::next_child).
+      typename N::ChildCursor cursor;
+      while (auto b_slot = b->next_child(cursor)) {
+        auto slot = merged->find_child_mut(b_slot->transition);
+        if (slot) {
+          auto [child, child_overlaps] =
+              merge(slot->ptr, b_slot->ptr, resolve);
+          slot->ptr = child;
+          overlaps += child_overlaps;
+        } else {
+          // Disjoint subtree — share it in O(1), no clone needed.
+          merged = N::insert_child(*this, merged, b_slot->transition,
+                                   b_slot->ptr);
+        }
+      }
+    }
+    discard(b);
+
+    return {merged, overlaps};
+  }
+
+private:
+  std::uint64_t tag_{0};
+  std::vector<N *> retired_;
+
+  static auto new_tag() -> std::uint64_t {
+    // Relaxed ordering: only uniqueness is required. Tags are truncated to
+    // the 60-bit tag field; 0 is reserved for "no session".
+    auto raw = detail::next_edit_tag.fetch_add(1, std::memory_order_relaxed);
+    auto tag = raw & N::kTagMask;
+    if (tag == 0) [[unlikely]]
+      tag = detail::next_edit_tag.fetch_add(1, std::memory_order_relaxed) &
+            N::kTagMask;
+    return tag;
+  }
+
+  // Like mutable_copy, but a leaf becomes a Node4 so children can be added.
+  [[nodiscard]] auto mutable_as_internal(N *node) -> N * {
+    if (node->node_type() != N::NodeType::Leaf)
+      return mutable_copy(node);
+    auto *n = N::make_node4_like(*node);
+    n->set_edit_tag(tag_);
+    discard(node);
+    return n;
+  }
+
+  // Gives the retired nodes back: they are still reachable from the base,
+  // which outlives an unpublished session. Only for a session that never
+  // published — a published one hands the list to the registry.
+  void forget_retired() noexcept {
+    if (retired_.empty())
+      return;
+    detail::account_retired<V>(-static_cast<std::int64_t>(retired_.size()));
+    for (auto *n : retired_)
+      n->clear_retired();
+    retired_.clear();
+  }
+};
+
+// Lookup shared by the persistent and transient trees. Uses raw pointers:
+// the caller's handle (or session) keeps the whole subtree alive.
+template <typename V>
+auto radix_get_ptr(const Node<V> *cur, std::span<const std::byte> key) noexcept
+    -> const V * {
+  auto remaining = key;
+  while (cur) {
+    auto prefix_span =
+        std::span<const std::byte>{cur->prefix.data(), cur->prefix.size()};
+    auto cpl = common_prefix_length(prefix_span, remaining);
+    if (cpl < prefix_span.size())
+      return nullptr;
+    remaining = remaining.subspan(cpl);
+    if (remaining.empty()) {
+      if (cur->has_value())
+        return &cur->value_;
+      return nullptr;
+    }
+    auto transition = remaining[0];
+    remaining = remaining.subspan(1);
+    auto child = cur->find_child(transition);
+    if (!child)
+      return nullptr;
+    cur = child->ptr;
+  }
+  return nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // PersistentRadixTree<V>
+//
+// A handle to one immutable version. Copies are O(1): a root pointer, a
+// size and a pin on the version. Node lifetime belongs to VersionRegistry;
+// this class only pins and unpins. set() and erase() are one-operation
+// transients, so every mutation goes through the same path.
 // ---------------------------------------------------------------------------
 export template <typename V> class PersistentRadixTree {
 public:
   PersistentRadixTree() = default;
-  PersistentRadixTree(const PersistentRadixTree &) = default;
-  auto operator=(const PersistentRadixTree &) -> PersistentRadixTree & = default;
-
-  PersistentRadixTree(PersistentRadixTree &&other) noexcept
-      : root_{std::move(other.root_)}, size_{std::exchange(other.size_, 0)} {}
-  auto operator=(PersistentRadixTree &&other) noexcept
-      -> PersistentRadixTree & {
-    root_ = std::move(other.root_);
-    size_ = std::exchange(other.size_, 0);
+  PersistentRadixTree(const PersistentRadixTree &other)
+      : root_{other.root_}, size_{other.size_}, version_{other.version_} {
+    if (version_)
+      registry().pin(version_);
+  }
+  auto operator=(const PersistentRadixTree &other) -> PersistentRadixTree & {
+    if (this == &other)
+      return *this;
+    // Pin the new epoch before releasing the old one: if both are the same
+    // version this keeps it alive throughout; if not, order does not matter.
+    if (other.version_)
+      registry().pin(other.version_);
+    release();
+    root_ = other.root_;
+    size_ = other.size_;
+    version_ = other.version_;
     return *this;
   }
+  PersistentRadixTree(PersistentRadixTree &&other) noexcept
+      : root_{std::exchange(other.root_, nullptr)},
+        size_{std::exchange(other.size_, 0)},
+        version_{std::exchange(other.version_, 0)} {}
+  auto operator=(PersistentRadixTree &&other) noexcept
+      -> PersistentRadixTree & {
+    if (this == &other)
+      return *this;
+    release();
+    root_ = std::exchange(other.root_, nullptr);
+    size_ = std::exchange(other.size_, 0);
+    version_ = std::exchange(other.version_, 0);
+    return *this;
+  }
+  ~PersistentRadixTree() { release(); }
 
   [[nodiscard]] auto size() const noexcept -> std::size_t { return size_; }
   [[nodiscard]] auto empty() const noexcept -> bool { return size_ == 0; }
 
   [[nodiscard]] auto get(std::span<const std::byte> key) const
       -> std::optional<V> {
-    if (!root_)
+    auto *p = radix_get_ptr<V>(root_, key);
+    if (!p)
       return std::nullopt;
-    return get_impl(root_, key);
+    return *p;
   }
 
   // Returns a pointer to the value stored in the tree node, or nullptr.
   // Valid for the lifetime of this tree instance.
   [[nodiscard]] auto get_ptr(std::span<const std::byte> key) const noexcept
       -> const V * {
-    if (!root_)
-      return nullptr;
-    return get_ptr_impl(root_, key);
+    return radix_get_ptr<V>(root_, key);
   }
 
   [[nodiscard]] auto contains(std::span<const std::byte> key) const -> bool {
@@ -1214,27 +2206,18 @@ public:
   }
 
   [[nodiscard]] auto set(std::span<const std::byte> key, V val) const
-      -> PersistentRadixTree {
-    auto [new_root, inserted] = set_impl(root_, key, std::move(val));
-    return PersistentRadixTree{std::move(new_root),
-                               inserted ? size_ + 1 : size_};
-  }
+      -> PersistentRadixTree;
 
   [[nodiscard]] auto erase(std::span<const std::byte> key) const
-      -> PersistentRadixTree {
-    if (!root_)
-      return *this;
-    auto [new_root, removed] = erase_impl(root_, key);
-    if (!removed)
-      return *this;
-    return PersistentRadixTree{std::move(new_root), size_ - 1};
-  }
+      -> PersistentRadixTree;
 
   [[nodiscard]] auto transient() const -> TransientRadixTree<V>;
 
-  // Merge two trees. On key conflicts, resolve(a_val, b_val) picks the winner.
-  // Disjoint subtrees are shared in O(1) via IntrusivePtr copy.
-  // Size is computed inline as a.size() + b.size() - overlaps (no post-merge walk).
+  // Merge two trees into a new version derived from both. On key conflicts,
+  // resolve(a_val, b_val) picks the winner. Disjoint subtrees are shared in
+  // O(1); nodes of either input the result does not reuse are retired and
+  // freed once the inputs are gone. Size is computed inline as a.size() +
+  // b.size() - overlaps (no post-merge walk).
   template <typename ResolveFunc>
   [[nodiscard]] static auto merge(const PersistentRadixTree &a,
                                   const PersistentRadixTree &b,
@@ -1265,508 +2248,109 @@ public:
   [[nodiscard]] auto value_rlower_bound(std::span<const std::byte> key) const
       -> ReverseValueIterator<V>;
 
+  // Test-only: every node still held back by a live version, as opaque
+  // identities. With for_each_node this gives the whole set of allocated
+  // nodes, which the accounting counters must agree with.
+  [[nodiscard]] static auto parked_nodes() -> std::vector<const void *> {
+    return registry().parked_nodes();
+  }
+
+  // Test-only: visits every node reachable from this version once. Used
+  // with detail::radix_accounting() to check the node accounting
+  // invariant. O(nodes).
+  template <typename Visit> void for_each_node(Visit visit) const {
+    if (!root_)
+      return;
+    std::vector<const Node<V> *> stack{root_};
+    while (!stack.empty()) {
+      auto *n = stack.back();
+      stack.pop_back();
+      visit(n);
+      typename Node<V>::ChildCursor cursor;
+      while (auto child = n->next_child(cursor))
+        stack.push_back(child->ptr);
+    }
+  }
 private:
   // Returns an iterator-typed end sentinel for upper_bound() and as the
   // starting point for ReverseRadixTreeIterator construction. Not named
   // end() to avoid shadowing the cheaper default_sentinel_t overload used
   // in tight forward-iteration loops.
   [[nodiscard]] auto end_iter() const -> RadixTreeIterator<V>;
-  IntrusivePtr<Node<V>> root_;
+
+  Node<V> *root_{nullptr};
   std::size_t size_{0};
+  std::uint64_t version_{0}; // 0: the empty tree, pins nothing
 
-  PersistentRadixTree(IntrusivePtr<Node<V>> root, std::size_t sz)
-      : root_{std::move(root)}, size_{sz} {}
-
-  // -- get --
-  // Uses raw pointers during traversal to avoid IntrusivePtr refcount
-  // traffic. Safe because the caller's IntrusivePtr to the root keeps the
-  // entire node tree alive (parents own IntrusivePtr children).
-  static auto get_impl(const IntrusivePtr<Node<V>> &node,
-                       std::span<const std::byte> key) -> std::optional<V> {
-    auto *p = get_ptr_impl(node, key);
-    if (!p)
-      return std::nullopt;
-    return *p;
+  static auto registry() -> VersionRegistry<V> & {
+    return VersionRegistry<V>::instance();
   }
 
-  static auto get_ptr_impl(const IntrusivePtr<Node<V>> &node,
-                            std::span<const std::byte> key) noexcept
-      -> const V * {
-    auto remaining = key;
-    const Node<V> *cur = node.get();
-    while (cur) {
-      auto prefix_span =
-          std::span<const std::byte>{cur->prefix.data(), cur->prefix.size()};
-      auto cpl = common_prefix_length(prefix_span, remaining);
-      if (cpl < prefix_span.size())
-        return nullptr;
-      remaining = remaining.subspan(cpl);
-      if (remaining.empty()) {
-        if (cur->has_value())
-          return &cur->value_;
-        return nullptr;
-      }
-      auto transition = remaining[0];
-      remaining = remaining.subspan(1);
-      auto child = cur->find_child(transition);
-      if (!child)
-        return nullptr;
-      cur = child->ptr.get();
+  // Adopts a freshly published version (the registry already counts this
+  // handle).
+  PersistentRadixTree(Node<V> *root, std::size_t sz, std::uint64_t version)
+      : root_{root}, size_{sz}, version_{version} {}
+
+  void release() noexcept {
+    if (version_) {
+      registry().unpin(version_, root_);
+      version_ = 0;
     }
-    return nullptr;
-  }
-
-  // -- chain builders --
-  // Build a chain of routing nodes ending in a value-bearing leaf.
-  // Chunks key left-to-right: each intermediate node gets 7 prefix bytes +
-  // 1 transition byte (8 bytes of key material per hop). The final leaf
-  // gets the remaining 0–7 bytes as prefix.
-  static auto build_leaf_chain(std::span<const std::byte> key, V val,
-                               std::uint32_t tag = 0)
-      -> IntrusivePtr<Node<V>> {
-    // Fast path: key fits in a single node's prefix.
-    if (key.size() <= CompactPrefix::kInlineCap) {
-      auto leaf = make_leaf<V>();
-      if (tag)
-        leaf->set_edit_tag(tag);
-      for (auto b : key)
-        leaf->prefix.push_back(b);
-      leaf->set_value(std::move(val));
-      return leaf;
-    }
-
-    // Partition key into chunks of 7 prefix + 1 transition byte.
-    // Collect chunk boundaries first, then build bottom-up.
-    struct Chunk {
-      std::size_t prefix_start;
-      std::size_t prefix_len;
-      std::size_t transition_idx; // index of transition byte (unused for last)
-    };
-    std::vector<Chunk> chunks;
-    std::size_t pos = 0;
-    while (key.size() - pos > CompactPrefix::kInlineCap) {
-      chunks.push_back({pos, CompactPrefix::kInlineCap, pos + CompactPrefix::kInlineCap});
-      pos += CompactPrefix::kInlineCap + 1; // 7 prefix + 1 transition
-    }
-    // Last chunk: remaining 0–7 bytes become the leaf's prefix.
-    auto leaf_prefix = key.subspan(pos);
-
-    // Build bottom-up: leaf first, then wrap in routing nodes.
-    auto cur = make_leaf<V>();
-    if (tag)
-      cur->set_edit_tag(tag);
-    for (auto b : leaf_prefix)
-      cur->prefix.push_back(b);
-    cur->set_value(std::move(val));
-
-    for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
-      auto routing = make_internal<V>();
-      if (tag)
-        routing->set_edit_tag(tag);
-      for (std::size_t i = 0; i < it->prefix_len; ++i)
-        routing->prefix.push_back(key[it->prefix_start + i]);
-      routing = Node<V>::insert_child(std::move(routing),
-                                      key[it->transition_idx], std::move(cur));
-      cur = std::move(routing);
-    }
-    return cur;
-  }
-
-  // Build a chain of routing nodes with an existing terminal node at the end.
-  // Overwrites terminal->prefix with the last chunk. Leaves terminal's
-  // children and value intact.
-  static auto build_routing_chain(std::span<const std::byte> merged,
-                                  IntrusivePtr<Node<V>> terminal,
-                                  std::uint32_t tag = 0)
-      -> IntrusivePtr<Node<V>> {
-    // Fast path: fits in a single prefix.
-    if (merged.size() <= CompactPrefix::kInlineCap) {
-      terminal->prefix.clear();
-      for (auto b : merged)
-        terminal->prefix.push_back(b);
-      return terminal;
-    }
-
-    // Partition into chunks.
-    struct Chunk {
-      std::size_t prefix_start;
-      std::size_t prefix_len;
-      std::size_t transition_idx;
-    };
-    std::vector<Chunk> chunks;
-    std::size_t pos = 0;
-    while (merged.size() - pos > CompactPrefix::kInlineCap) {
-      chunks.push_back({pos, CompactPrefix::kInlineCap, pos + CompactPrefix::kInlineCap});
-      pos += CompactPrefix::kInlineCap + 1;
-    }
-
-    // Set terminal's prefix to the last chunk.
-    terminal->prefix.clear();
-    for (auto b : merged.subspan(pos))
-      terminal->prefix.push_back(b);
-
-    // Build bottom-up: terminal is the innermost node.
-    auto cur = std::move(terminal);
-    for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
-      auto routing = make_internal<V>();
-      if (tag)
-        routing->set_edit_tag(tag);
-      for (std::size_t i = 0; i < it->prefix_len; ++i)
-        routing->prefix.push_back(merged[it->prefix_start + i]);
-      routing = Node<V>::insert_child(
-          std::move(routing), merged[it->transition_idx], std::move(cur));
-      cur = std::move(routing);
-    }
-    return cur;
-  }
-
-  // -- set (returns new root + whether a new key was inserted) --
-  static auto set_impl(const IntrusivePtr<Node<V>> &node,
-                       std::span<const std::byte> key, V val)
-      -> std::pair<IntrusivePtr<Node<V>>, bool> {
-    if (!node) {
-      // Create a leaf (chain-split if key > 7 bytes).
-      return {build_leaf_chain(key, std::move(val)), true};
-    }
-
-    auto new_node = node->clone();
-    auto prefix_span = std::span<const std::byte>{new_node->prefix.data(),
-                                                  new_node->prefix.size()};
-    auto cpl = common_prefix_length(prefix_span, key);
-
-    if (cpl < prefix_span.size()) {
-      // Split: divergence within this node's prefix.
-      auto split = make_internal<V>();
-      for (std::size_t i = 0; i < cpl; ++i)
-        split->prefix.push_back(prefix_span[i]);
-
-      // The existing node becomes a child after removing the common prefix +
-      // the transition byte.
-      auto existing_child = node->clone();
-      auto old_transition = prefix_span[cpl];
-      typename Node<V>::Prefix old_suffix;
-      for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
-        old_suffix.push_back(prefix_span[i]);
-      existing_child->prefix = std::move(old_suffix);
-      split = Node<V>::insert_child(std::move(split), old_transition,
-                                    std::move(existing_child));
-
-      auto remaining = key.subspan(cpl);
-      if (remaining.empty()) {
-        // The key matches exactly the common prefix — value goes on split
-        // node.
-        split->set_value(std::move(val));
-      } else {
-        auto new_transition = remaining[0];
-        auto chain = build_leaf_chain(remaining.subspan(1), std::move(val));
-        split = Node<V>::insert_child(std::move(split), new_transition,
-                                      std::move(chain));
-      }
-      return {std::move(split), true};
-    }
-
-    // Full prefix matched.
-    auto remaining = key.subspan(cpl);
-    if (remaining.empty()) {
-      // Key ends exactly at this node.
-      bool was_absent = !new_node->has_value();
-      new_node->set_value(std::move(val));
-      return {std::move(new_node), was_absent};
-    }
-
-    // Recurse into child.
-    auto transition = remaining[0];
-    auto child_key = remaining.subspan(1);
-    auto existing_child = new_node->find_child_mut(transition);
-    if (existing_child) {
-      auto [new_child, inserted] =
-          set_impl(existing_child->ptr, child_key, std::move(val));
-      existing_child->ptr = std::move(new_child);
-      return {std::move(new_node), inserted};
-    }
-    // No child for this transition — create a leaf. insert_child promotes
-    // new_node (leaf -> Node4 -> Node16 -> Node48 -> Node256) as needed.
-    auto chain = build_leaf_chain(child_key, std::move(val));
-    new_node = Node<V>::insert_child(std::move(new_node), transition,
-                                     std::move(chain));
-    return {std::move(new_node), true};
-  }
-
-  // -- erase (returns new root + whether a key was removed) --
-  // Also applies path compression: merges a routing node with its single child.
-  static auto erase_impl(const IntrusivePtr<Node<V>> &node,
-                         std::span<const std::byte> key)
-      -> std::pair<IntrusivePtr<Node<V>>, bool> {
-    if (!node)
-      return {nullptr, false};
-
-    auto prefix_span =
-        std::span<const std::byte>{node->prefix.data(), node->prefix.size()};
-    auto cpl = common_prefix_length(prefix_span, key);
-
-    if (cpl < prefix_span.size()) {
-      // Key diverges within prefix — nothing to erase.
-      return {node, false};
-    }
-
-    auto remaining = key.subspan(cpl);
-    if (remaining.empty()) {
-      // Key matches this node.
-      if (!node->has_value())
-        return {node, false};
-
-      auto new_node = node->clone();
-      new_node->clear_value();
-
-      // Path compression.
-      if (!new_node->has_children()) {
-        // No children and no value — node is dead.
-        return {nullptr, true};
-      }
-      if (new_node->child_count() == 1) {
-        // Merge with sole child.
-        return {merge_with_child(std::move(new_node)), true};
-      }
-      return {std::move(new_node), true};
-    }
-
-    // Recurse.
-    auto transition = remaining[0];
-    auto child_key = remaining.subspan(1);
-    auto existing = node->find_child(transition);
-    if (!existing)
-      return {node, false};
-
-    auto [new_child, removed] = erase_impl(existing->ptr, child_key);
-    if (!removed)
-      return {node, false};
-
-    auto new_node = node->clone();
-    if (!new_child) {
-      // Child was deleted entirely.
-      new_node = Node<V>::remove_child(std::move(new_node), transition);
-      // Path compression: if this node is now a routing node with 1 child and
-      // no value, merge.
-      if (!new_node->has_value() && new_node->child_count() == 1) {
-        return {merge_with_child(std::move(new_node)), true};
-      }
-      if (!new_node->has_value() && !new_node->has_children()) {
-        return {nullptr, true};
-      }
-      return {std::move(new_node), true};
-    }
-    auto child_slot = new_node->find_child_mut(transition);
-    child_slot->ptr = std::move(new_child);
-    // Path compression on the child side: child might now be a routing node
-    // with 1 child and no value — but that's the child's responsibility,
-    // already handled in the recursive call.
-    return {std::move(new_node), true};
-  }
-
-  // Merge a routing node (no value) with its single child.
-  // New prefix = node.prefix + transition_byte + child.prefix
-  // If combined prefix > 7 bytes, builds a chain of routing nodes.
-  static auto merge_with_child(IntrusivePtr<Node<V>> node)
-      -> IntrusivePtr<Node<V>> {
-    assert(!node->has_value() && node->child_count() == 1);
-    auto slot0 = node->child_at(0);
-    auto transition = slot0.transition;
-    auto child = slot0.ptr->clone();
-
-    auto total = node->prefix.size() + 1 + child->prefix.size();
-    if (total <= CompactPrefix::kInlineCap) {
-      // Fast path: fits in a single prefix.
-      typename Node<V>::Prefix merged_prefix;
-      for (auto b : node->prefix)
-        merged_prefix.push_back(b);
-      merged_prefix.push_back(transition);
-      for (std::size_t i = 0; i < child->prefix.size(); ++i)
-        merged_prefix.push_back(child->prefix[i]);
-      child->prefix = std::move(merged_prefix);
-      return std::move(child);
-    }
-    // Overflow: collect merged bytes, build a routing chain.
-    std::vector<std::byte> merged;
-    merged.reserve(total);
-    for (auto b : node->prefix)
-      merged.push_back(b);
-    merged.push_back(transition);
-    for (std::size_t i = 0; i < child->prefix.size(); ++i)
-      merged.push_back(child->prefix[i]);
-    return build_routing_chain(std::span<const std::byte>{merged},
-                               std::move(child));
-  }
-
-  // -- merge_impl --
-  // Recursively merges two subtrees rooted at `a` and `b`.
-  // Disjoint subtrees are shared in O(1) via IntrusivePtr copy (no clone).
-  // Returns {merged_root, overlap_count} where overlap_count is the number
-  // of keys present in both a and b (i.e. where resolve was called).
-  template <typename ResolveFunc>
-  static auto merge_impl(const IntrusivePtr<Node<V>> &a,
-                         const IntrusivePtr<Node<V>> &b,
-                         ResolveFunc &&resolve)
-      -> std::pair<IntrusivePtr<Node<V>>, std::size_t> {
-    if (!a)
-      return {b, 0};
-    if (!b)
-      return {a, 0};
-
-    // Align the two nodes on their common prefix.
-    auto pa = std::span<const std::byte>{a->prefix.data(), a->prefix.size()};
-    auto pb = std::span<const std::byte>{b->prefix.data(), b->prefix.size()};
-    auto cpl = common_prefix_length(pa, pb);
-
-    if (cpl < pa.size() && cpl < pb.size()) {
-      // The two prefixes diverge — build a split node with the common prefix,
-      // then place trimmed a and trimmed b as its two children.
-      auto split = make_internal<V>();
-      for (std::size_t i = 0; i < cpl; ++i)
-        split->prefix.push_back(pa[i]);
-
-      auto a_trimmed = a->clone();
-      typename Node<V>::Prefix a_suffix;
-      for (std::size_t i = cpl + 1; i < pa.size(); ++i)
-        a_suffix.push_back(pa[i]);
-      a_trimmed->prefix = std::move(a_suffix);
-      split = Node<V>::insert_child(std::move(split), pa[cpl],
-                                    std::move(a_trimmed));
-
-      auto b_trimmed = b->clone();
-      typename Node<V>::Prefix b_suffix;
-      for (std::size_t i = cpl + 1; i < pb.size(); ++i)
-        b_suffix.push_back(pb[i]);
-      b_trimmed->prefix = std::move(b_suffix);
-      split = Node<V>::insert_child(std::move(split), pb[cpl],
-                                    std::move(b_trimmed));
-
-      return {std::move(split), 0};
-    }
-
-    if (cpl < pa.size()) {
-      // b's prefix is fully consumed — b's node sits *above* a in the trie.
-      // Build result based on b; insert a under b at transition pa[cpl].
-      auto new_b = b->clone_as_internal();
-      auto a_trimmed = a->clone();
-      typename Node<V>::Prefix a_suffix;
-      for (std::size_t i = cpl + 1; i < pa.size(); ++i)
-        a_suffix.push_back(pa[i]);
-      a_trimmed->prefix = std::move(a_suffix);
-
-      auto existing = new_b->find_child_mut(pa[cpl]);
-      std::size_t overlaps = 0;
-      if (existing) {
-        auto [child, child_overlaps] =
-            merge_impl(a_trimmed, existing->ptr, resolve);
-        existing->ptr = std::move(child);
-        overlaps = child_overlaps;
-      } else {
-        new_b = Node<V>::insert_child(std::move(new_b), pa[cpl],
-                                      std::move(a_trimmed));
-      }
-      return {std::move(new_b), overlaps};
-    }
-
-    if (cpl < pb.size()) {
-      // a's prefix is fully consumed — a's node sits *above* b in the trie.
-      // Build result based on a; insert b under a at transition pb[cpl].
-      auto new_a = a->clone_as_internal();
-      auto b_trimmed = b->clone();
-      typename Node<V>::Prefix b_suffix;
-      for (std::size_t i = cpl + 1; i < pb.size(); ++i)
-        b_suffix.push_back(pb[i]);
-      b_trimmed->prefix = std::move(b_suffix);
-
-      auto existing = new_a->find_child_mut(pb[cpl]);
-      std::size_t overlaps = 0;
-      if (existing) {
-        auto [child, child_overlaps] =
-            merge_impl(existing->ptr, b_trimmed, resolve);
-        existing->ptr = std::move(child);
-        overlaps = child_overlaps;
-      } else {
-        new_a = Node<V>::insert_child(std::move(new_a), pb[cpl],
-                                      std::move(b_trimmed));
-      }
-      return {std::move(new_a), overlaps};
-    }
-
-    // Full prefix match — both nodes share the same compressed key prefix.
-    // Clone a as internal — b's children may need to be folded in.
-    auto merged = a->clone_as_internal();
-    std::size_t overlaps = 0;
-
-    if (b->has_value()) {
-      if (merged->has_value()) {
-        merged->set_value(resolve(merged->value_, b->value_));
-        ++overlaps;
-      } else {
-        merged->set_value(b->value_);
-      }
-    }
-
-    if (b->has_children()) {
-      // Cursor walk rather than child_at(i) per ordinal: b's children are
-      // visited in full here, and on a Node256 the ordinal accessor rescans
-      // the direct-mapped slots on every call, making the walk quadratic in
-      // fanout (see Node::next_child).
-      typename Node<V>::ChildCursor cursor;
-      while (auto b_slot = b->next_child(cursor)) {
-        auto slot = merged->find_child_mut(b_slot->transition);
-        if (slot) {
-          auto [child, child_overlaps] =
-              merge_impl(slot->ptr, b_slot->ptr, resolve);
-          slot->ptr = std::move(child);
-          overlaps += child_overlaps;
-        } else {
-          // Disjoint subtree — share it in O(1), no clone needed.
-          merged = Node<V>::insert_child(std::move(merged),
-                                         b_slot->transition, b_slot->ptr);
-        }
-      }
-    }
-
-    return {std::move(merged), overlaps};
+    root_ = nullptr;
+    size_ = 0;
   }
 
   friend class TransientRadixTree<V>;
   friend class RadixTreeIterator<V>;
   friend class ValueIterator<V>;
+  friend class ReverseValueIterator<V>;
 };
 
 // ---------------------------------------------------------------------------
 // TransientRadixTree<V>
+//
+// Builder for the next version of a base tree. Holds a handle to the base
+// (so the base cannot die under it) and a BuildSession. persistent()
+// publishes the result as a new version; a transient destroyed without
+// persistent() frees what it built and leaves the base untouched.
 // ---------------------------------------------------------------------------
 export template <typename V> class TransientRadixTree {
 public:
   TransientRadixTree(const TransientRadixTree &) = delete;
   auto operator=(const TransientRadixTree &) -> TransientRadixTree & = delete;
   TransientRadixTree(TransientRadixTree &&other) noexcept
-      : root_{std::move(other.root_)},
+      : base_{std::move(other.base_)},
+        session_{std::move(other.session_)},
+        root_{std::exchange(other.root_, nullptr)},
         size_{std::exchange(other.size_, 0)},
-        tag_{std::exchange(other.tag_, 0)} {}
+        changed_{std::exchange(other.changed_, false)} {}
   auto operator=(TransientRadixTree &&other) noexcept
       -> TransientRadixTree & {
-    root_ = std::move(other.root_);
-    size_ = std::exchange(other.size_, 0);
-    tag_ = std::exchange(other.tag_, 0);
+    if (this != &other) {
+      discard();
+      base_ = std::move(other.base_);
+      session_ = std::move(other.session_);
+      root_ = std::exchange(other.root_, nullptr);
+      size_ = std::exchange(other.size_, 0);
+      changed_ = std::exchange(other.changed_, false);
+    }
     return *this;
   }
+  ~TransientRadixTree() { discard(); }
 
   [[nodiscard]] auto get(std::span<const std::byte> key) const
       -> std::optional<V> {
     ensure_active();
-    if (!root_)
+    auto *p = radix_get_ptr<V>(root_, key);
+    if (!p)
       return std::nullopt;
-    return PersistentRadixTree<V>::get_impl(root_, key);
+    return *p;
   }
 
   [[nodiscard]] auto get_ptr(std::span<const std::byte> key) const
       -> const V * {
     ensure_active();
-    if (!root_)
-      return nullptr;
-    return PersistentRadixTree<V>::get_ptr_impl(root_, key);
+    return radix_get_ptr<V>(root_, key);
   }
 
   [[nodiscard]] auto contains(std::span<const std::byte> key) const -> bool {
@@ -1775,8 +2359,9 @@ public:
 
   void set(std::span<const std::byte> key, V val) {
     ensure_active();
-    auto [new_root, inserted] = set_transient(root_, key, std::move(val), tag_);
-    root_ = std::move(new_root);
+    auto [new_root, inserted] = session_.set(root_, key, std::move(val));
+    root_ = new_root;
+    changed_ = true;
     if (inserted)
       ++size_;
   }
@@ -1790,10 +2375,12 @@ public:
   auto upsert(std::span<const std::byte> key, V val, Pred &&should_replace)
       -> std::optional<V> {
     ensure_active();
-    auto [new_root, displaced, inserted] = upsert_transient(
-        root_, key, std::move(val), tag_,
-        std::forward<Pred>(should_replace));
-    root_ = std::move(new_root);
+    auto [new_root, displaced, inserted] = session_.upsert(
+        root_, key, std::move(val), std::forward<Pred>(should_replace));
+    root_ = new_root;
+    // Unconditional: upsert copies the path before it asks the predicate,
+    // so even a no-op upsert has built nodes that must be published.
+    changed_ = true;
     if (inserted)
       ++size_;
     return displaced;
@@ -1801,305 +2388,98 @@ public:
 
   auto erase(std::span<const std::byte> key) -> bool {
     ensure_active();
-    if (!root_)
-      return false;
-    auto [new_root, removed] = erase_transient(root_, key, tag_);
-    root_ = std::move(new_root);
+    auto [new_root, removed] = session_.erase(root_, key);
+    root_ = new_root;
+    // An erase that removes nothing returns the subtree it was given, at
+    // every level, without copying anything — so the tree is untouched.
+    changed_ = changed_ || removed;
     if (removed)
       --size_;
     return removed;
   }
 
+  // Publishes the built tree as a new version. Throws std::logic_error if
+  // the base already has a live successor; the transient is then still
+  // active and its destructor discards what it built.
   [[nodiscard]] auto persistent() && -> PersistentRadixTree<V> {
     ensure_active();
+    if (!changed_) {
+      // Nothing was touched, so this is the base version, not a new one.
+      // Handing back the base's own handle keeps the registry out of it
+      // entirely — the engine opens a transient per batch on maps that
+      // most batches do not change. Every operation that builds or
+      // supersedes a node sets changed_, so there is nothing to publish
+      // and nothing to free.
+      assert(root_ == base_.root_ && session_.retired_list().empty());
+      session_.finish();
+      root_ = nullptr;
+      size_ = 0;
+      return std::move(base_);
+    }
+    auto &retired = session_.retired_list();
+    const std::uint64_t bases[] = {base_.version_};
+    auto version = PersistentRadixTree<V>::registry().publish(
+        session_.tag(), bases, retired);
+    session_.finish();
     auto live_size = std::exchange(size_, 0);
-    tag_ = 0; // Retire the tag — nodes become immutable.
-    return PersistentRadixTree<V>{std::move(root_), live_size};
+    auto *root = std::exchange(root_, nullptr);
+    base_ = PersistentRadixTree<V>{};
+    return PersistentRadixTree<V>{root, live_size, version};
   }
 
-  // Iteration support for range scans on the transient tree.
-  // Shares the same internal structure as PersistentRadixTree.
+  // Iteration support for range scans on the transient tree. The iterator
+  // holds raw node pointers: do not mutate the transient while it is alive.
   [[nodiscard]] auto lower_bound(std::span<const std::byte> key) const
       -> RadixTreeIterator<V> {
     ensure_active();
-    return RadixTreeIterator<V>{root_, key};
+    return RadixTreeIterator<V>{PersistentRadixTree<V>{}, root_, key};
   }
 
 private:
-  IntrusivePtr<Node<V>> root_;
+  PersistentRadixTree<V> base_;
+  BuildSession<V> session_;
+  Node<V> *root_{nullptr};
   std::size_t size_{0};
-  std::uint32_t tag_{0};
+  bool changed_{false}; // whether anything was actually written
 
-  TransientRadixTree(IntrusivePtr<Node<V>> root, std::size_t sz,
-                     std::uint32_t tag)
-      : root_{std::move(root)}, size_{sz}, tag_{tag} {}
+  explicit TransientRadixTree(const PersistentRadixTree<V> &base)
+      : base_{base}, root_{base.root_}, size_{base.size_} {}
 
   void ensure_active() const {
-    if (tag_ == 0) [[unlikely]] {
+    if (session_.tag() == 0) [[unlikely]] {
       throw std::logic_error{"TransientRadixTree already consumed"};
     }
   }
 
-  // Ensure a node is owned by this transient session.
-  // Requires both matching edit tag AND unique ownership (refcount == 1)
-  // to allow in-place mutation.
-  //
-  // The refcount is the load-bearing half of that test, not the tag. Edit
-  // tags are 28 bits (bits 30:28 of packed_tag_ hold the node type), so they
-  // wrap after 2^28 sessions — reachable in well under an hour of sustained
-  // writes at one session per batch, so a stale node carrying this session's
-  // tag must be assumed to exist. It is still safe to mutate only what
-  // refcount == 1 admits: any node another holder can reach is either shared
-  // directly (refcount >= 2) or sits under a shared ancestor, and cloning
-  // that ancestor addrefs its children before this session descends into
-  // them. The tag is therefore a cheap filter that keeps clones rare, not
-  // the ownership proof.
-  using Ops = PersistentRadixTree<V>;
-
-  static auto ensure_mutable(const IntrusivePtr<Node<V>> &node,
-                             std::uint32_t tag) -> IntrusivePtr<Node<V>> {
-    if (node && node->edit_tag() == tag &&
-        node->refcount_.load(std::memory_order_acquire) == 1)
-      return node;
-    if (!node) {
-      auto n = make_leaf<V>();
-      n->set_edit_tag(tag);
-      return n;
-    }
-    return node->clone_for(tag);
-  }
-
-  // Transient set — mutates owned nodes in-place, copies shared ones.
-  static auto set_transient(const IntrusivePtr<Node<V>> &node,
-                            std::span<const std::byte> key, V val,
-                            std::uint32_t tag)
-      -> std::pair<IntrusivePtr<Node<V>>, bool> {
-    if (!node) {
-      return {Ops::build_leaf_chain(key, std::move(val), tag), true};
-    }
-
-    auto mutable_node = ensure_mutable(node, tag);
-    auto prefix_span = std::span<const std::byte>{mutable_node->prefix.data(),
-                                                  mutable_node->prefix.size()};
-    auto cpl = common_prefix_length(prefix_span, key);
-
-    if (cpl < prefix_span.size()) {
-      // Split.
-      auto split = make_internal<V>();
-      split->set_edit_tag(tag);
-      for (std::size_t i = 0; i < cpl; ++i)
-        split->prefix.push_back(prefix_span[i]);
-
-      auto old_transition = prefix_span[cpl];
-      typename Node<V>::Prefix old_suffix;
-      for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
-        old_suffix.push_back(prefix_span[i]);
-      mutable_node->prefix = std::move(old_suffix);
-      split = Node<V>::insert_child(std::move(split), old_transition,
-                                    std::move(mutable_node));
-
-      auto remaining = key.subspan(cpl);
-      if (remaining.empty()) {
-        split->set_value(std::move(val));
-      } else {
-        auto new_transition = remaining[0];
-        auto chain = Ops::build_leaf_chain(remaining.subspan(1), std::move(val), tag);
-        split = Node<V>::insert_child(std::move(split), new_transition,
-                                      std::move(chain));
-      }
-      return {std::move(split), true};
-    }
-
-    auto remaining = key.subspan(cpl);
-    if (remaining.empty()) {
-      bool was_absent = !mutable_node->has_value();
-      mutable_node->set_value(std::move(val));
-      return {std::move(mutable_node), was_absent};
-    }
-
-    auto transition = remaining[0];
-    auto child_key = remaining.subspan(1);
-    auto existing_child = mutable_node->find_child_mut(transition);
-    if (existing_child) {
-      auto [new_child, inserted] =
-          set_transient(existing_child->ptr, child_key, std::move(val), tag);
-      existing_child->ptr = std::move(new_child);
-      return {std::move(mutable_node), inserted};
-    }
-    // insert_child promotes mutable_node (leaf -> Node4 -> Node16 ->
-    // Node48 -> Node256) as needed.
-    auto chain = Ops::build_leaf_chain(child_key, std::move(val), tag);
-    mutable_node = Node<V>::insert_child(std::move(mutable_node), transition,
-                                         std::move(chain));
-    return {std::move(mutable_node), true};
-  }
-
-  // Single-traversal upsert — like set_transient, but conditionally replaces
-  // an existing value. Returns {new_root, displaced_value, was_newly_inserted}.
-  // When the key already exists, calls should_replace(existing, incoming);
-  // if true, swaps in the new value and returns the old one as displaced.
-  template <typename Pred>
-  static auto upsert_transient(const IntrusivePtr<Node<V>> &node,
-                               std::span<const std::byte> key, V val,
-                               std::uint32_t tag, Pred &&should_replace)
-      -> std::tuple<IntrusivePtr<Node<V>>, std::optional<V>, bool> {
-    if (!node) {
-      return {Ops::build_leaf_chain(key, std::move(val), tag), std::nullopt, true};
-    }
-
-    auto mutable_node = ensure_mutable(node, tag);
-    auto prefix_span = std::span<const std::byte>{mutable_node->prefix.data(),
-                                                  mutable_node->prefix.size()};
-    auto cpl = common_prefix_length(prefix_span, key);
-
-    if (cpl < prefix_span.size()) {
-      // Split — key diverges from prefix, so this is always a new insert.
-      auto split = make_internal<V>();
-      split->set_edit_tag(tag);
-      for (std::size_t i = 0; i < cpl; ++i)
-        split->prefix.push_back(prefix_span[i]);
-
-      auto old_transition = prefix_span[cpl];
-      typename Node<V>::Prefix old_suffix;
-      for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
-        old_suffix.push_back(prefix_span[i]);
-      mutable_node->prefix = std::move(old_suffix);
-      split = Node<V>::insert_child(std::move(split), old_transition,
-                                    std::move(mutable_node));
-
-      auto remaining = key.subspan(cpl);
-      if (remaining.empty()) {
-        split->set_value(std::move(val));
-      } else {
-        auto new_transition = remaining[0];
-        auto chain = Ops::build_leaf_chain(remaining.subspan(1), std::move(val), tag);
-        split = Node<V>::insert_child(std::move(split), new_transition,
-                                      std::move(chain));
-      }
-      return {std::move(split), std::nullopt, true};
-    }
-
-    auto remaining = key.subspan(cpl);
-    if (remaining.empty()) {
-      if (mutable_node->has_value()) {
-        if (should_replace(mutable_node->value_, val)) {
-          auto old = std::move(mutable_node->value_);
-          mutable_node->set_value(std::move(val));
-          return {std::move(mutable_node), std::move(old), false};
-        }
-        return {std::move(mutable_node), std::nullopt, false};
-      }
-      mutable_node->set_value(std::move(val));
-      return {std::move(mutable_node), std::nullopt, true};
-    }
-
-    auto transition = remaining[0];
-    auto child_key = remaining.subspan(1);
-    auto existing_child = mutable_node->find_child_mut(transition);
-    if (existing_child) {
-      auto [new_child, displaced, inserted] = upsert_transient(
-          existing_child->ptr, child_key, std::move(val), tag,
-          std::forward<Pred>(should_replace));
-      existing_child->ptr = std::move(new_child);
-      return {std::move(mutable_node), std::move(displaced), inserted};
-    }
-    // insert_child promotes mutable_node (leaf -> Node4 -> Node16 ->
-    // Node48 -> Node256) as needed.
-    auto chain = Ops::build_leaf_chain(child_key, std::move(val), tag);
-    mutable_node = Node<V>::insert_child(std::move(mutable_node), transition,
-                                         std::move(chain));
-    return {std::move(mutable_node), std::nullopt, true};
-  }
-
-  // Transient erase with path compression.
-  static auto erase_transient(const IntrusivePtr<Node<V>> &node,
-                              std::span<const std::byte> key, std::uint32_t tag)
-      -> std::pair<IntrusivePtr<Node<V>>, bool> {
-    if (!node)
-      return {nullptr, false};
-
-    auto prefix_span =
-        std::span<const std::byte>{node->prefix.data(), node->prefix.size()};
-    auto cpl = common_prefix_length(prefix_span, key);
-
-    if (cpl < prefix_span.size())
-      return {node, false};
-
-    auto remaining = key.subspan(cpl);
-    if (remaining.empty()) {
-      if (!node->has_value())
-        return {node, false};
-
-      auto mutable_node = ensure_mutable(node, tag);
-      mutable_node->clear_value();
-
-      if (!mutable_node->has_children())
-        return {nullptr, true};
-      if (mutable_node->child_count() == 1) {
-        return {merge_with_child_transient(std::move(mutable_node), tag), true};
-      }
-      return {std::move(mutable_node), true};
-    }
-
-    auto transition = remaining[0];
-    auto child_key = remaining.subspan(1);
-    auto existing = node->find_child(transition);
-    if (!existing)
-      return {node, false};
-
-    auto [new_child, removed] =
-        erase_transient(existing->ptr, child_key, tag);
-    if (!removed)
-      return {node, false};
-
-    auto mutable_node = ensure_mutable(node, tag);
-    if (!new_child) {
-      mutable_node = Node<V>::remove_child(std::move(mutable_node), transition);
-      if (!mutable_node->has_value() && mutable_node->child_count() == 1) {
-        return {merge_with_child_transient(std::move(mutable_node), tag), true};
-      }
-      if (!mutable_node->has_value() && !mutable_node->has_children()) {
-        return {nullptr, true};
-      }
-      return {std::move(mutable_node), true};
-    }
-    auto child_slot = mutable_node->find_child_mut(transition);
-    child_slot->ptr = std::move(new_child);
-    return {std::move(mutable_node), true};
-  }
-
-  static auto merge_with_child_transient(IntrusivePtr<Node<V>> node,
-                                         std::uint32_t tag)
-      -> IntrusivePtr<Node<V>> {
-    assert(!node->has_value() && node->child_count() == 1);
-    auto slot = node->child_at(0);
-    auto transition = slot.transition;
-    auto child = ensure_mutable(slot.ptr, tag);
-
-    auto total = node->prefix.size() + 1 + child->prefix.size();
-    if (total <= CompactPrefix::kInlineCap) {
-      typename Node<V>::Prefix merged_prefix;
-      for (std::size_t i = 0; i < node->prefix.size(); ++i)
-        merged_prefix.push_back(node->prefix[i]);
-      merged_prefix.push_back(transition);
-      for (std::size_t i = 0; i < child->prefix.size(); ++i)
-        merged_prefix.push_back(child->prefix[i]);
-      child->prefix = std::move(merged_prefix);
-      return std::move(child);
-    }
-    std::vector<std::byte> merged;
-    merged.reserve(total);
-    for (std::size_t i = 0; i < node->prefix.size(); ++i)
-      merged.push_back(node->prefix[i]);
-    merged.push_back(transition);
-    for (std::size_t i = 0; i < child->prefix.size(); ++i)
-      merged.push_back(child->prefix[i]);
-    return Ops::build_routing_chain(std::span<const std::byte>{merged},
-                               std::move(child), tag);
+  void discard() noexcept {
+    session_.discard_all(root_);
+    root_ = nullptr;
+    size_ = 0;
   }
 
   friend class PersistentRadixTree<V>;
 };
+
+// Out-of-line: PersistentRadixTree::set() / erase() — one-operation
+// transients.
+template <typename V>
+auto PersistentRadixTree<V>::set(std::span<const std::byte> key, V val) const
+    -> PersistentRadixTree {
+  auto t = transient();
+  t.set(key, std::move(val));
+  return std::move(t).persistent();
+}
+
+template <typename V>
+auto PersistentRadixTree<V>::erase(std::span<const std::byte> key) const
+    -> PersistentRadixTree {
+  if (!root_)
+    return *this;
+  auto t = transient();
+  if (!t.erase(key))
+    return *this; // nothing touched: t discards an empty session
+  return std::move(t).persistent();
+}
 
 // Out-of-line: PersistentRadixTree::merge()
 template <typename V>
@@ -2112,27 +2492,26 @@ auto PersistentRadixTree<V>::merge(const PersistentRadixTree &a,
     return b;
   if (!b.root_)
     return a;
+  BuildSession<V> session;
   auto [new_root, overlaps] =
-      merge_impl(a.root_, b.root_, std::forward<ResolveFunc>(resolve));
+      session.merge(a.root_, b.root_, std::forward<ResolveFunc>(resolve));
   auto sz = a.size_ + b.size_ - overlaps;
-  return PersistentRadixTree{std::move(new_root), sz};
+  const std::uint64_t bases[] = {a.version_, b.version_};
+  std::uint64_t version = 0;
+  try {
+    version = registry().publish(session.tag(), bases, session.retired_list());
+  } catch (...) {
+    session.discard_all(new_root);
+    throw;
+  }
+  session.finish();
+  return PersistentRadixTree{new_root, sz, version};
 }
 
 // Out-of-line: PersistentRadixTree::transient()
 template <typename V>
 auto PersistentRadixTree<V>::transient() const -> TransientRadixTree<V> {
-  // Relaxed ordering: only uniqueness is required, not inter-thread visibility
-  // ordering. Each transient session gets a distinct tag via fetch_add.
-  // Truncate to the tag field — tag 0 is reserved for the "immutable"
-  // sentinel. packed_tag_ layout: bit 31 = has_value, bits 30:28 = node
-  // type, bits 27:0 = edit_tag.
-  auto raw = detail::next_edit_tag.fetch_add(1, std::memory_order_relaxed);
-  auto tag = static_cast<std::uint32_t>(raw & Node<V>::kTagMask);
-  if (tag == 0) [[unlikely]]
-    tag = static_cast<std::uint32_t>(
-        detail::next_edit_tag.fetch_add(1, std::memory_order_relaxed) &
-        Node<V>::kTagMask);
-  return TransientRadixTree<V>{root_, size_, tag};
+  return TransientRadixTree<V>{*this};
 }
 
 // ---------------------------------------------------------------------------
@@ -2193,18 +2572,22 @@ public:
 
 private:
   struct Frame {
-    IntrusivePtr<Node<V>> node;
+    Node<V> *node;
     std::size_t child_idx; // Next child to visit.
     std::size_t key_len;   // Length of current_key_ when this frame was pushed.
   };
 
-  IntrusivePtr<Node<V>> root_;
+  // pin_ keeps the version alive; frames hold raw pointers into it. An
+  // iterator over a transient has an empty pin_ and must not outlive the
+  // transient or span a mutation of it.
+  PersistentRadixTree<V> pin_;
+  Node<V> *root_{nullptr};
   std::vector<Frame> stack_;
   std::vector<std::byte> current_key_;
 
   // Construct an iterator starting at begin (visit the whole tree).
-  explicit RadixTreeIterator(IntrusivePtr<Node<V>> root)
-      : root_{std::move(root)} {
+  explicit RadixTreeIterator(PersistentRadixTree<V> pin)
+      : pin_{std::move(pin)}, root_{pin_.root_} {
     if (!root_)
       return;
     push_node(root_, 0);
@@ -2213,10 +2596,11 @@ private:
     }
   }
 
-  // Construct a lower_bound iterator.
-  RadixTreeIterator(IntrusivePtr<Node<V>> root,
+  // Construct a lower_bound iterator over `root` (pin_.root_ for a
+  // persistent tree, the working root for a transient).
+  RadixTreeIterator(PersistentRadixTree<V> pin, Node<V> *root,
                     std::span<const std::byte> target)
-      : root_{std::move(root)} {
+      : pin_{std::move(pin)}, root_{root} {
     stack_.reserve(16);
     current_key_.reserve(128);
     if (!root_)
@@ -2230,10 +2614,10 @@ private:
   }
 
   // Construct an end iterator (empty stack, root stored for --end()).
-  RadixTreeIterator(IntrusivePtr<Node<V>> root, std::default_sentinel_t)
-      : root_{std::move(root)} {}
+  RadixTreeIterator(PersistentRadixTree<V> pin, std::default_sentinel_t)
+      : pin_{std::move(pin)}, root_{pin_.root_} {}
 
-  void push_node(const IntrusivePtr<Node<V>> &node,
+  void push_node(Node<V> *node,
                  std::size_t key_len_before) {
     // Append this node's prefix to the key.
     for (std::size_t i = 0; i < node->prefix.size(); ++i) {
@@ -2340,7 +2724,7 @@ private:
   // before checking divergence. On the "subtree < target" path the append is
   // undone via current_key_.resize(klb). Any refactoring must preserve this
   // append-then-undo discipline, or the key buffer will be corrupted.
-  auto seek(const IntrusivePtr<Node<V>> &root,
+  auto seek(Node<V> *root,
             std::span<const std::byte> target) -> bool {
     auto remaining = target;
     auto cur = root;
@@ -2422,16 +2806,17 @@ private:
   friend class ReverseRadixTreeIterator<V>;
 };
 
+
 // Out-of-line: PersistentRadixTree::begin()
 template <typename V>
 auto PersistentRadixTree<V>::begin() const -> RadixTreeIterator<V> {
-  return RadixTreeIterator<V>{root_};
+  return RadixTreeIterator<V>{*this};
 }
 
 // Out-of-line: PersistentRadixTree::end_iter()
 template <typename V>
 auto PersistentRadixTree<V>::end_iter() const -> RadixTreeIterator<V> {
-  return RadixTreeIterator<V>{root_, std::default_sentinel};
+  return RadixTreeIterator<V>{*this, std::default_sentinel};
 }
 
 // ---------------------------------------------------------------------------
@@ -2505,7 +2890,7 @@ public:
     if (past_rend_) {
       // rend().base() must equal begin(). Reconstruct from the underlying
       // iterator's retained root pointer.
-      return RadixTreeIterator<V>{cur_.root_};
+      return RadixTreeIterator<V>{cur_.pin_};
     }
     auto fwd = cur_;
     ++fwd;
@@ -2527,7 +2912,7 @@ auto PersistentRadixTree<V>::rbegin() const -> ReverseRadixTreeIterator<V> {
 template <typename V>
 auto PersistentRadixTree<V>::lower_bound(std::span<const std::byte> key) const
     -> RadixTreeIterator<V> {
-  return RadixTreeIterator<V>{root_, key};
+  return RadixTreeIterator<V>{*this, root_, key};
 }
 
 // Out-of-line: PersistentRadixTree::upper_bound()
@@ -2575,26 +2960,27 @@ public:
 
 private:
   struct Frame {
-    IntrusivePtr<Node<V>> node;
+    Node<V> *node;
     std::size_t child_idx;
   };
 
+  PersistentRadixTree<V> pin_; // keeps the version alive (see RadixTreeIterator)
   std::vector<Frame> stack_;
 
-  explicit ValueIterator(IntrusivePtr<Node<V>> root) {
-    if (!root)
+  explicit ValueIterator(PersistentRadixTree<V> pin) : pin_{std::move(pin)} {
+    if (!pin_.root_)
       return;
-    push_node(root);
+    push_node(pin_.root_);
     if (!stack_.empty() && !stack_.back().node->has_value())
       advance();
   }
 
-  ValueIterator(IntrusivePtr<Node<V>> root,
-                std::span<const std::byte> target) {
+  ValueIterator(PersistentRadixTree<V> pin, std::span<const std::byte> target)
+      : pin_{std::move(pin)} {
     stack_.reserve(16);
-    if (!root)
+    if (!pin_.root_)
       return;
-    auto pos = seek(root, target);
+    auto pos = seek(pin_.root_, target);
     if (stack_.empty())
       return;
     if (pos.at_node && stack_.back().node->has_value())
@@ -2602,7 +2988,7 @@ private:
     advance();
   }
 
-  void push_node(const IntrusivePtr<Node<V>> &node) {
+  void push_node(Node<V> *node) {
     stack_.push_back({node, 0});
   }
 
@@ -2666,7 +3052,7 @@ private:
     bool exact{false};
   };
 
-  auto seek(const IntrusivePtr<Node<V>> &root,
+  auto seek(Node<V> *root,
             std::span<const std::byte> target) -> SeekPos {
     auto remaining = target;
     auto cur = root;
@@ -2738,24 +3124,26 @@ public:
 
   ReverseValueIterator() = default;
 
-  explicit ReverseValueIterator(IntrusivePtr<Node<V>> root)
-      : root_{std::move(root)} {
-    if (!root_) {
+  explicit ReverseValueIterator(PersistentRadixTree<V> pin)
+      : pin_{std::move(pin)} {
+    auto *root = pin_.root_;
+    if (!root) {
       past_rend_ = true;
       return;
     }
     // Descend to the rightmost (largest) value node.
-    cur_.push_node(root_);
+    cur_.push_node(root);
     cur_.stack_.back().child_idx = cur_.stack_.back().node->child_count();
     cur_.descend_rightmost();
     if (cur_.stack_.empty())
       past_rend_ = true;
   }
 
-  ReverseValueIterator(IntrusivePtr<Node<V>> root,
+  ReverseValueIterator(PersistentRadixTree<V> pin,
                        std::span<const std::byte> upper)
-      : root_{std::move(root)} {
-    if (!root_) {
+      : pin_{std::move(pin)} {
+    auto *root = pin_.root_;
+    if (!root) {
       past_rend_ = true;
       return;
     }
@@ -2767,7 +3155,7 @@ public:
     // a key strictly greater than upper and must not be yielded.
     ValueIterator<V> fwd;
     fwd.stack_.reserve(16);
-    auto pos = fwd.seek(root_, upper);
+    auto pos = fwd.seek(root, upper);
     const bool on_value = !fwd.stack_.empty() && pos.at_node &&
                           fwd.stack_.back().node->has_value();
     if (on_value && pos.exact) {
@@ -2778,7 +3166,7 @@ public:
       }
       if (fwd.stack_.empty()) {
         // Every key is < upper: start at the rightmost value node.
-        cur_.push_node(root_);
+        cur_.push_node(root);
         cur_.stack_.back().child_idx = cur_.stack_.back().node->child_count();
         cur_.descend_rightmost();
       } else {
@@ -2818,7 +3206,7 @@ public:
   }
 
 private:
-  IntrusivePtr<Node<V>> root_;
+  PersistentRadixTree<V> pin_; // keeps the version alive
   ValueIterator<V> cur_;
   bool past_rend_{false};
 
@@ -2828,27 +3216,27 @@ private:
 // Out-of-line: PersistentRadixTree::value_begin()
 template <typename V>
 auto PersistentRadixTree<V>::value_begin() const -> ValueIterator<V> {
-  return ValueIterator<V>{root_};
+  return ValueIterator<V>{*this};
 }
 
 // Out-of-line: PersistentRadixTree::value_lower_bound()
 template <typename V>
 auto PersistentRadixTree<V>::value_lower_bound(
     std::span<const std::byte> key) const -> ValueIterator<V> {
-  return ValueIterator<V>{root_, key};
+  return ValueIterator<V>{*this, key};
 }
 
 // Out-of-line: PersistentRadixTree::value_rbegin()
 template <typename V>
 auto PersistentRadixTree<V>::value_rbegin() const -> ReverseValueIterator<V> {
-  return ReverseValueIterator<V>{root_};
+  return ReverseValueIterator<V>{*this};
 }
 
 // Out-of-line: PersistentRadixTree::value_rlower_bound()
 template <typename V>
 auto PersistentRadixTree<V>::value_rlower_bound(
     std::span<const std::byte> key) const -> ReverseValueIterator<V> {
-  return ReverseValueIterator<V>{root_, key};
+  return ReverseValueIterator<V>{*this, key};
 }
 
 } // namespace bytecask

@@ -176,8 +176,8 @@ This component inherits the ByteCaskDB design tenets in order of priority:
 
 *   **Key Type:** `std::span<const std::byte>` (Ingested and prefix-compressed natively).
 *   **Value Type:** Generic `V`.
-*   **Immutability:** All mutating operations return a new version of the tree. Untouched nodes are shared via intrusive reference-counted pointers (`IntrusivePtr<Node>`).
-*   **Memory Management:** Standard allocators. Nodes embed their own reference count (`std::atomic<std::uint32_t>`) and are managed via `IntrusivePtr<T>`, a lightweight single-pointer (8 B) smart pointer that replaces `std::shared_ptr` (16 B + 32 B control block). This eliminates 32 bytes of `make_shared` control-block overhead per node and halves the pointer size in every child slot.
+*   **Immutability:** All mutating operations return a new version of the tree. Untouched nodes are shared between versions as plain pointers.
+*   **Memory Management:** Standard allocators, no reference counts. Child slots are raw `Node*`, so cloning a node is a `memcpy` of its child array and releasing a version is a counter decrement. Node lifetime belongs to a per-value-type registry: the session that builds a version retires the base nodes it makes unreachable, and each retired node is freed once no live version can still reach it (§3.3).
 *   **Prefix Compression:** Shared byte sequences are stored once in the highest common parent node.
 *   **Edit Tags (COW):** Transient mode uses epoch tags to safely mutate uniquely-owned nodes in-place, falling back to Path Copying when sharing occurs.
 
@@ -196,8 +196,12 @@ Appendix B):
 ```cpp
 // Base node — 94% of all nodes are leaves and use only this struct.
 struct Node {
-    mutable std::atomic<uint32_t> refcount; // intrusive reference count
-    uint32_t packed_tag; // high bit = has_value, next 3 bits = node_type, low 28 bits = edit tag
+    // bit 63 = has_value, bits 62-60 = node_type, bit 59 = retired,
+    // bits 58-0 = edit tag. No reference count: see §3.3. Atomic only so
+    // that setting the retired bit is not a race against lock-free readers
+    // of the same word; every access is relaxed, and the node is the size
+    // it would be with a plain uint64_t.
+    std::atomic<uint64_t> packed_tag;
 
     V value;
 
@@ -217,7 +221,7 @@ struct Node4 : Node {
     static constexpr uint8_t kCapacity = 4;
     uint8_t count;
     std::array<std::byte, kCapacity> keys;
-    std::array<IntrusivePtr<Node>, kCapacity> children;
+    std::array<Node *, kCapacity> children;
 };
 
 // Node16 — same shape as Node4 (sorted inline array, linear scan) but a
@@ -226,7 +230,7 @@ struct Node16 : Node {
     static constexpr uint8_t kCapacity = 16;
     uint8_t count;
     std::array<std::byte, kCapacity> keys;
-    std::array<IntrusivePtr<Node>, kCapacity> children;
+    std::array<Node *, kCapacity> children;
 };
 
 // Node48 — same sorted keys/children array as Node4/Node16 (so ordinal
@@ -239,7 +243,7 @@ struct Node48 : Node {
     uint8_t count;
     std::array<uint8_t, 256> child_index;  // byte -> slot, or kEmptyMarker
     std::array<std::byte, kCapacity> keys;
-    std::array<IntrusivePtr<Node>, kCapacity> children;
+    std::array<Node *, kCapacity> children;
 };
 
 // Node256 — the terminal tier: 256 slots is the ceiling on fanout for a
@@ -250,7 +254,7 @@ struct Node48 : Node {
 struct Node256 : Node {
     static constexpr uint16_t kCapacity = 256;
     uint16_t count;
-    std::array<IntrusivePtr<Node>, kCapacity> children;
+    std::array<Node *, kCapacity> children;
 };
 ```
 
@@ -267,7 +271,7 @@ avoid promote/demote thrashing right at the tier boundary. `Node16`
 demotes to `Node4` at ≤4, symmetrically (no hysteresis needed at this
 boundary — see §7.7). All eight transitions are owned by exactly two
 functions — `Node::insert_child` and `Node::remove_child` — which take
-the node by `IntrusivePtr` and return the (possibly reallocated) result;
+the node by raw pointer and return the (possibly reallocated) result;
 every other call site (the persistent and transient `set`/`erase`/`merge`
 paths) just reassigns its local pointer to whatever comes back, the same
 pattern the leaf → internal promotion already used before this tiering
@@ -275,9 +279,12 @@ existed. See §7.7 for the measured memory impact of each tier by key
 shape, and §7.8 for the ordered-traversal design each tier's `child_at`
 accessor has to support.
 
-`IntrusivePtr<T>` is a lightweight single-pointer (8 bytes) smart pointer. It calls `addref()` on copy and `release()` on destruction; when the count reaches zero, the node is deleted. Copy assignment uses addref-before-release sequencing to prevent use-after-free when the source is a sub-object of the destination (e.g., reassigning a root to one of its own children). Move assignment detaches the source pointer before releasing the old destination for the same reason. This eliminates the ~32-byte `make_shared` control block per node and halves the pointer size in every child slot from 16 bytes (`shared_ptr`) to 8 bytes (`IntrusivePtr`).
-
-`Node::release()` uses an **iterative tail-release** to avoid the O(depth) recursive destructor chain that would otherwise result from chained `~IntrusivePtr → release → delete → ~Node → …` calls down a path of single-child nodes. When the last reference to a node is dropped, the implementation detaches all children — from whichever tier's array the node is (`Node4`/`Node16`/`Node48`'s packed prefix, or a full scan of `Node256`'s 256 direct-mapped slots) — before calling `delete`, then loops over those children releasing each one in turn, converting the last-child release into a loop. For chains of single-child nodes (the dominant pattern in prefix-compressed trees), this eliminates the recursive call overhead entirely. Profiling showed the naive recursive approach consuming 29% of total merge time at 100k keys. The detach buffer is *not* value-initialized — every slot it can ever read is written first by the switch above it, and nothing reads past the actual count — because zero-initializing it unconditionally on every single node release, regardless of that node's tier, was itself a measured performance bug — see §7.7.
+Child slots are raw `Node *`. A node's clone copies that array wholesale
+and touches nothing it points at, which is the whole point of the change
+recorded in §7.13: under reference counting a `Node256` clone was 256
+dependent writes to 256 other nodes, and its release another 256, all of
+them cache misses on a large tree. Lifetime is decided per version instead
+of per pointer — see §3.3.
 
 `PersistentRadixTree` and `TransientRadixTree` use explicit move constructors/assignments that reset the source's `size_` (and `tag_` for transient) to zero via `std::exchange`. This ensures a moved-from tree is in a valid empty state (`size() == 0`, `empty() == true`) rather than carrying stale metadata while the root pointer has been transferred.
 
@@ -289,11 +296,81 @@ Leaf nodes use `Node` directly (no children field — accessing one through a `N
 
 ### 3.2. Transient Copy-on-Write (COW) Model
 The `transient()` / `persistent()` API pattern — a mutable builder that freezes into an immutable snapshot — was popularised by [Rich Hickey's Clojure transients](https://clojure.org/reference/transients) (Clojure 1.1, ~2009).
-*   A global `std::atomic<uint64_t>` generates unique edit tags for Transient sessions.
-*   During a transient mutation, if the traversed node's `edit_tag` matches the session's tag **and** the node's reference count is 1 (uniquely owned), the node is mutated **in-place**.
-*   If the tag differs (e.g., `0` or an older session) or the node is shared (refcount > 1), the node is **copied**, the copy is tagged with the current session ID, and the mutation applies to the copy.
-*   The refcount guard is what actually makes this safe, not the tag width: edit tags are 28 bits (`packed_tag_`'s remaining 3 bits hold the node type), so the tag space repeats after 2^28 `transient()` calls — reachable well within a single day of sustained writes — but a shared node is never mutated in place regardless of its tag, since any node another holder can reach is either shared directly (refcount > 1) or sits under a shared ancestor that gets cloned (and its children addref'd) before this session descends into it.
-*   A transient is single-use. `persistent() &&` retires the session tag, and any later operation on a consumed or moved-from builder throws `std::logic_error` in release builds instead of depending on debug-only assertions.
+*   A global `std::atomic<uint64_t>` generates unique edit tags for build sessions. Every structural algorithm — `set`, `upsert`, `erase`, `merge` and the chain builders — belongs to a `BuildSession`, which owns that tag and the list of nodes it retires.
+*   During a mutation, if the traversed node's `edit_tag` matches the session's tag, the node was created by this session, nothing outside it can reach the node, and it is mutated **in-place**.
+*   Otherwise the node is **copied**, the copy is tagged with the session, the mutation applies to the copy, and the original is **retired** (§3.3).
+*   The tag alone is the ownership proof, so it must never repeat: tags are 59 bits (`packed_tag_` spends bit 63 on has_value, bits 62–60 on the node type and bit 59 on the retired flag), which at one session per write does not wrap in any realistic process lifetime. This replaces the old 28-bit tag, which did wrap and so needed a reference count of 1 as the real guard.
+*   A transient is single-use. `persistent() &&` ends the session, and any later operation on a consumed or moved-from builder throws `std::logic_error` in release builds instead of depending on debug-only assertions.
+*   A transient destroyed without `persistent()` frees every node its session created and gives back everything it retired: the base version is intact and still holds them.
+
+### 3.3. Node Lifetime — Version Registry
+
+Nodes carry no reference count, so a node is not freed when the last pointer
+to it goes. It is freed when no live *version* can reach it. One registry per
+value type, behind one mutex, tracks that.
+
+A node becomes garbage at exactly one moment, on the thread running the
+session: when the session makes it unreachable from the version being built.
+That is `mutable_copy` cloning a node it does not own, a tier promotion or
+demotion replacing a node, path compression collapsing a routing node, or an
+erase unlinking a subtree. All of them go through `BuildSession::discard`,
+which frees the node at once if the session created it and otherwise retires
+it. `persistent()` hands the retired list to the registry.
+
+When can a retired node be freed? Tags increase with every session, and a
+session starts only after its base was published, so a node created by
+session `S` is reachable only from the version `S` published and from
+versions derived from it — all with tags at or above `S`. A node retired by
+session `R` is by definition not reachable from `R`'s version nor from
+anything derived from it. So the node is reachable from a live version `V`
+exactly when `tag(V)` falls in `[tag(X), tag(R))`.
+
+Each retired node is parked on the live version that currently blocks it —
+the smallest live tag at or above its own — and freed the moment no live tag
+falls in its window. A version's death re-examines only what was parked on
+it, never a scan. This is what keeps a long-lived `db.snapshot()` holding
+exactly the nodes it can still reach rather than everything retired since it
+was taken, which is the behaviour reference counting gave and the property
+the memory tests check.
+
+A version whose last handle goes while nothing was derived from it frees what
+only it could reach, by the same tag test: walking from its root, a node
+whose tag is above every version it was derived from is reachable from
+nothing else, and since a node's children are never newer than the node, the
+walk stops where the test fails. Already-parked nodes are stepped over.
+
+The registry therefore keeps the derivation graph, not just a counter. A dead
+version is spliced out and its successor inherits its bases, lowering that
+successor's floor onto the nodes it now holds alone. A dead version with two
+or more versions derived from it stays as a tombstone: they share its nodes
+with each other, and it is what stops either one's walk from freeing what the
+other still reads. When their number falls back to one it is spliced out like
+any other. The last version of a lineage has no bases left and frees the whole
+structure, which is why the tree leaks nothing at process exit.
+
+**Forks.** The window argument assumes a version's tag orders it against
+everything that can reach its nodes, which holds while versions form a chain.
+Two versions derived from the same base can each reach what the other
+superseded while carrying a larger tag, so parking is suspended while any
+base has more than one version derived from it, and the held nodes are placed
+as soon as that resolves. The engine forks only between a failed flush and
+the `resume()` that clears it; a direct user of the persistent API forks
+whenever it keeps two descendants of one version alive.
+
+**Retiring a shared node once.** Two versions derived from the same base can
+both supersede the same node, and it must be retired once or it would be
+freed twice. Bit 59 of the tag word records that a node is already on some
+retired list, and `discard` leaves such a node alone. That bit is the only
+write a node ever receives after the session that created it published, and
+readers of other versions may be reading the same word at that moment, which
+is why the word is atomic; the accesses are relaxed, since the word carries
+no ordering of its own.
+
+**Invariant.** Under `BYTECASK_RADIX_ACCOUNTING` the tree counts every node
+allocation and free per value type. The tree unit tests assert, after each
+scenario, that the nodes which exist are exactly those reachable from a live
+version plus those the registry still owes a free to, and that the count
+returns to its starting value once every version is gone.
 
 ---
 
@@ -391,7 +468,7 @@ When removing a value (`node->value = std::nullopt`), the tree must maintain Pat
 
 ### 5.3. Merge
 
-`merge(a, b, resolve)` combines two persistent trees into one, producing a new tree that shares unmodified subtrees from both inputs via `IntrusivePtr` copy (no node cloning).
+`merge(a, b, resolve)` combines two persistent trees into one, producing a new tree that shares unmodified subtrees from both inputs by pointer (no node cloning). The result is a version derived from both, and the nodes of either input it does not reuse are retired onto it.
 
 **Signature:**
 ```cpp
@@ -455,7 +532,7 @@ The function walks both trees in tandem, recursing only where the two trees over
 - Clone `node_a`. If both have a value, call `resolve(a.value, b.value)` to pick the winner. If only `b` has a value, copy it.
 - Walk `node_b`'s child list and for each `(transition_byte, child_b)`:
   - If `node_a` has a child with the same transition byte, recurse: `merge_impl(child_a, child_b, resolve)`.
-  - Otherwise, adopt `child_b` directly (O(1) `IntrusivePtr` copy — the entire disjoint subtree is shared).
+  - Otherwise, adopt `child_b` directly (O(1) pointer copy — the entire disjoint subtree is shared).
 - *This is the case shown in the overview diagram above:* both roots share the prefix `"ap"`, so they are cloned and their children merged recursively.
 
 **Size computation:**
@@ -510,14 +587,13 @@ Hint files are assigned to workers round-robin. Each worker builds a `TransientR
 
 ### 7.1. Node layout breakdown
 
-Nodes are allocated via `new` and managed by `IntrusivePtr<Node>`, which embeds the reference count inside the node itself. No separate control block is allocated. Leaf nodes (94% of all nodes) use the base `Node<V>` struct; the remaining ~6% use one of four fixed-capacity tiers (`Node4`, `Node16`, `Node48`, `Node256`) by fanout — there is no unbounded fallback: `Node256`'s 256 slots is the ceiling on fanout for a single byte transition, so every possible child count has a tier. (An `InternalNode`/`ChildStore` "Large" tier filled this role before `Node256` existed; it has since been removed — see §7.7.)
+Nodes are allocated via `new` and freed by the version registry (§3.3). They carry no reference count and no separate control block. Leaf nodes (94% of all nodes) use the base `Node<V>` struct; the remaining ~6% use one of four fixed-capacity tiers (`Node4`, `Node16`, `Node48`, `Node256`) by fanout — there is no unbounded fallback: `Node256`'s 256 slots is the ceiling on fanout for a single byte transition, so every possible child count has a tier. (An `InternalNode`/`ChildStore` "Large" tier filled this role before `Node256` existed; it has since been removed — see §7.7.)
 
 **`Node<V>` (base — used for leaves):**
 
 | Field | Type | Bytes |
 |---|---|---|
-| `refcount_` | `atomic<uint32_t>` | 4 |
-| `packed_tag_` | `uint32_t` | 4 |
+| `packed_tag_` | `uint64_t` (flags + retired bit + 59-bit edit tag) | 8 |
 | `value_` | `V` (e.g. `KeyDirEntry`, 24 B) | 24 |
 | `prefix` | `CompactPrefix` (7 inline bytes, alignof 1) | 8 |
 | **Node struct total** | | **40 bytes** |
@@ -529,7 +605,7 @@ Nodes are allocated via `new` and managed by `IntrusivePtr<Node>`, which embeds 
 | (inherits `Node<V>`) | | 40 |
 | `count_` | `uint8_t` | 1 (+ padding) |
 | `keys_` | `array<byte, 4>` | 4 |
-| `children_` | `array<IntrusivePtr<Node>, 4>` | 32 |
+| `children_` | `array<Node *, 4>` | 32 |
 | **Node4 struct total** | | **~72–80 bytes, one allocation** |
 
 **`Node16<V>` (5–16 children):**
@@ -539,7 +615,7 @@ Nodes are allocated via `new` and managed by `IntrusivePtr<Node>`, which embeds 
 | (inherits `Node<V>`) | | 40 |
 | `count_` | `uint8_t` | 1 (+ padding) |
 | `keys_` | `array<byte, 16>` | 16 |
-| `children_` | `array<IntrusivePtr<Node>, 16>` | 128 |
+| `children_` | `array<Node *, 16>` | 128 |
 | **Node16 struct total** | | **~184–192 bytes, one allocation** |
 
 **`Node48<V>` (17–48 children):**
@@ -550,7 +626,7 @@ Nodes are allocated via `new` and managed by `IntrusivePtr<Node>`, which embeds 
 | `count_` | `uint8_t` | 1 |
 | `child_index_` | `array<uint8_t, 256>` (byte → slot, `find_child` in O(1)) | 256 |
 | `keys_` | `array<byte, 48>` | 48 |
-| `children_` | `array<IntrusivePtr<Node>, 48>` (7 B pad before this) | 384 |
+| `children_` | `array<Node *, 48>` (7 B pad before this) | 384 |
 | **Node48 struct total** | | **~720–736 bytes, one allocation** |
 
 `Node48` keeps the same sorted `keys_`/`children_` array as `Node4`/`Node16` (so `child_at(i)` stays an O(1) ordinal lookup, not a rescan of `child_index_`) and adds `child_index_` purely to make `find_child(b)` O(1) instead of a linear scan — costing 48 more bytes than a `child_index_`-only design (e.g. DuckDB's, ~672 B) but avoiding the O(n) rescan that ordinal traversal pays on `Node256` (§7.8). See §7.7 for why this tier's fixed cost measured flat rather than negative on every shape tested.
@@ -561,7 +637,7 @@ Nodes are allocated via `new` and managed by `IntrusivePtr<Node>`, which embeds 
 |---|---|---|
 | (inherits `Node<V>`) | | 40 |
 | `count_` | `uint16_t` (not `uint8_t` — 256 doesn't fit in 8 bits) | 2 (+ 6 pad) |
-| `children_` | `array<IntrusivePtr<Node>, 256>` | 2048 |
+| `children_` | `array<Node *, 256>` | 2048 |
 | **Node256 struct total** | | **2080 bytes, one allocation** |
 
 `Node256` is direct-mapped: `children_[b]` is the child for transition byte `b`, so there is no stored key array (the byte value is the index) and `find_child`/insertion/removal are O(1). `child_at(i)` — the ordinal accessor the shared iterator code uses — has no packed array to index into, so it scans `children_` for the `i`-th occupied slot; see §7.8 for the ordered-traversal cost this creates and the cursor that avoids it on the hot paths.
@@ -607,7 +683,7 @@ The primary concern for ByteCaskDB is the key directory at production scale. The
 | Current (`Node`/`InternalNode` split, struct-of-arrays children, `CompactPrefix` 8 B, packed tag) | **~69** | **~6.9 GB** |
 | `std::map` (no persistence, no prefix compression) | 72 | ~7.2 GB |
 
-The original `shared_ptr`-based design measured 129 B/key (generic) and 139 B/key (prefixed). Intrusive refcounting reduced this to 108/116 B/key (−17%). The leaf node optimization (null `unique_ptr` instead of empty SmallVector) reduced to 86/92 B/key (−20% from intrusive, −33% from original). Replacing `SmallVector<byte,24>` (32 B) with `CompactPrefix` (16 B) and reordering `KeyDirEntry` fields to eliminate alignment padding further reduced to 70/74 B/key (−19% from leaf optimization, −46% from original). Shrinking `CompactPrefix` from 16 B to 8 B with chain-splitting for long prefixes, replacing child slot `pair<byte, IntrusivePtr>` with struct-of-arrays (`ChildStore`), and splitting `Node`/`InternalNode` so leaves allocate 40 B instead of 56 B brought the footprint to ~61/63 B/key at 100k and ~69 B/key at 1M (−47% from original).
+The original `shared_ptr`-based design measured 129 B/key (generic) and 139 B/key (prefixed). Intrusive refcounting reduced this to 108/116 B/key (−17%). (Reference counts have since been removed entirely — §3.3 — which left the node the same size, the 4-byte count having been absorbed by widening `packed_tag_` to 64 bits.) The leaf node optimization (null `unique_ptr` instead of empty SmallVector) reduced to 86/92 B/key (−20% from intrusive, −33% from original). Replacing `SmallVector<byte,24>` (32 B) with `CompactPrefix` (16 B) and reordering `KeyDirEntry` fields to eliminate alignment padding further reduced to 70/74 B/key (−19% from leaf optimization, −46% from original). Shrinking `CompactPrefix` from 16 B to 8 B with chain-splitting for long prefixes, replacing child slot `pair<byte, IntrusivePtr>` with struct-of-arrays (`ChildStore`), and splitting `Node`/`InternalNode` so leaves allocate 40 B instead of 56 B brought the footprint to ~61/63 B/key at 100k and ~69 B/key at 1M (−47% from original).
 
 ### 7.6. Memory footprint by key shape
 
@@ -844,8 +920,9 @@ mutation-tested: dropping `Node256`'s ordinal bookkeeping in `next_child`
 fails 699 assertions, and making the walk skip every other slot fails the
 merge case. The full `[radix_tree]` suite passes under AddressSanitizer,
 which matters here specifically because `seek` assigns a child slot
-reference into the iterator's own traversal pointer (`cur = slot->ptr`) —
-the sub-object aliasing case `IntrusivePtr::operator=` is hardened for.
+reference into the iterator's own traversal pointer (`cur = slot->ptr`).
+That was a sub-object aliasing hazard while child slots were smart
+pointers; they are now raw pointers and the assignment is a plain copy.
 
 **Left as is.** `advance`, `retreat` and `descend_rightmost` still index
 by ordinal, because `RadixTreeIterator::Frame` stores an ordinal and uses
@@ -955,7 +1032,7 @@ Merge-only cost (two pre-built N/2-key trees, merge step only):
 | Overlapping (50% overlap) | 44 | 454 | 6,208 |
 | **Ratio** | **1.9×** | **1.7×** | **2.2×** |
 
-Overlapping merges are ~2× more expensive due to node cloning and conflict resolution at every shared key. Disjoint merges adopt entire subtrees via `IntrusivePtr` copy.
+Overlapping merges are ~2× more expensive due to node cloning and conflict resolution at every shared key. Disjoint merges adopt entire subtrees by pointer.
 
 ### 8.10. Split-build-merge vs linear build
 
