@@ -8,6 +8,7 @@
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
 #endif
+#include "mapping_probe.h"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <chrono>
@@ -3507,6 +3508,58 @@ TEST_CASE("reads work on a degraded DB", "[degraded]") {
   REQUIRE_NOTHROW(db.resume());
   CHECK_FALSE(db.is_degraded());
 }
+
+#ifndef __EMSCRIPTEN__
+// resume() truncates the active file while reads stay lock-free. With
+// use_mmap it must do so without disturbing the mapping: an EntryIterator
+// hands out spans into it that stay valid until the next operator++, i.e.
+// across the body of the caller's range-for — and resume() can land there.
+TEST_CASE("mmap: resume() keeps reader spans valid",
+          "[degraded][resume][mmap]") {
+  TempDir td;
+  constexpr std::uint64_t kCapacity = 1024 * 1024;
+  auto db = bytecask::DB::open(
+      td.path / "db", {.max_file_bytes = kCapacity, .use_mmap = true});
+  db.put({.sync = false}, to_bytes("k"), to_bytes("mapped_value"));
+
+  // Degrade via an orphaned BulkBegin: the batch's bytes reach the file but
+  // are never published, so resume() has to truncate them away.
+  {
+    bytecask::testing::ScopedFaultInjector fi{2};
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("a"), to_bytes("v1"));
+    plan.put(to_bytes("b"), to_bytes("v2"));
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = false}, std::move(plan)),
+                      std::system_error);
+  }
+  REQUIRE(db.is_degraded());
+
+  // Reads remain available while degraded. Take an entry and hold it.
+  auto range = db.iter_from({}, to_bytes("k"));
+  auto it = range.begin();
+  REQUIRE(it != std::default_sentinel);
+  const auto &entry = *it;
+  const auto *addr = entry.value.data();
+  REQUIRE(to_string(entry.value) == "mapped_value");
+
+  // A second iterator resolving to the same address proves the value is
+  // served from the mapping rather than copied into each iterator's buffer —
+  // without it the checks below would hold vacuously.
+  auto probe = db.iter_from({}, to_bytes("k"));
+  auto probe_it = probe.begin();
+  REQUIRE((*probe_it).value.data() == addr);
+
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+
+  // The span survives resume(): same address, still mapped, same bytes.
+  // Probing half the capacity rules out a remap that reused the address.
+  CHECK(bytecask::testing::is_mapped(addr, kCapacity / 2));
+  CHECK(entry.value.data() == addr);
+  CHECK(to_string(entry.key) == "k");
+  CHECK(to_string(entry.value) == "mapped_value");
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // F/G visibility tests — BC-155: key changes not published on sync failure.

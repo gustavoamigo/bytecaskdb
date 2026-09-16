@@ -34,6 +34,7 @@
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
 #endif
+#include "mapping_probe.h"
 
 import bytecask.data_file;
 import bytecask.data_entry;
@@ -583,6 +584,74 @@ TEST_CASE("WritableMmapDataFile: read_entry_with_key_size pread fallback",
 
   std::filesystem::remove(path);
 }
+
+// ---------------------------------------------------------------------------
+// WritableMmapDataFile::truncate — mapping stability
+//
+// resume() truncates the active file while reads stay lock-free, so a reader
+// can be holding a span into the mapping at that moment (EntryIterator hands
+// spans out until the next operator++). Unmapping and remapping underneath it
+// would leave that span addressing memory the process no longer owns.
+// ---------------------------------------------------------------------------
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("WritableMmapDataFile::truncate leaves the mapping in place",
+          "[data_file][mmap]") {
+  const auto path = std::filesystem::temp_directory_path() /
+                    "bc_test_mmap_truncate_mapping.data";
+  std::filesystem::remove(path);
+
+  constexpr std::size_t kCapacity = 1024 * 1024;
+  auto file = bytecask::openDataFileForWrite(path, kCapacity, true);
+  const auto key = to_bytes("tk");
+  const auto val = to_bytes("truncate_must_not_move_this");
+  const auto kept = file->append_entry(1, bytecask::EntryType::Put, key, val);
+  const auto valid_end = file->size();
+  // The garbage tail a resume() would drop.
+  const auto garbage_key = to_bytes("gk");
+  const auto garbage_val = to_bytes("garbage");
+  const auto dropped = file->append_entry(2, bytecask::EntryType::Put,
+                                          garbage_key, garbage_val);
+
+  std::vector<std::byte> io_buf;
+  auto view = file->read_entry_unverified(
+      kept, static_cast<std::uint32_t>(val.size()), io_buf);
+  REQUIRE(io_buf.empty());  // the span points into the mapping, not io_buf
+  const auto *addr = view.value.data();
+
+  file->truncate(valid_end);
+  CHECK(std::filesystem::file_size(path) == valid_end);
+
+  // The span taken before the truncate still addresses live memory holding
+  // the same bytes. Probing half the capacity is what makes this conclusive:
+  // a remap of the truncated file covers only the surviving entry, so it
+  // fails the probe even when mmap hands back the address just released.
+  CHECK(bytecask::testing::is_mapped(addr, kCapacity / 2));
+  CHECK(std::equal(view.value.begin(), view.value.end(), val.begin()));
+
+  // A fresh read of the same offset resolves to the same address.
+  auto again = file->read_entry_unverified(
+      kept, static_cast<std::uint32_t>(val.size()), io_buf);
+  CHECK(again.value.data() == addr);
+  CHECK(io_buf.empty());
+
+  // Past the new end the file is gone: reads take the pread path and fail as
+  // a short read rather than faulting on a mapped page beyond EOF.
+  CHECK_THROWS_AS(
+      file->read_entry_unverified(
+          dropped, static_cast<std::uint32_t>(garbage_val.size()), io_buf),
+      std::system_error);
+  std::vector<std::byte> out;
+  CHECK_THROWS_AS(
+      file->read_value(dropped, static_cast<std::uint16_t>(garbage_key.size()),
+                       static_cast<std::uint32_t>(garbage_val.size()), false,
+                       io_buf, out),
+      std::system_error);
+
+  file.reset();
+  std::filesystem::remove(path);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // ReadOnlyMmapDataFile::scan — truncated file handling
