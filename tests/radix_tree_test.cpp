@@ -14,6 +14,7 @@
 #include <random>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -804,10 +805,13 @@ TEST_CASE("RadixTree long keys chain-split", "[radix_tree]") {
   CHECK(*t.get(to_bytes(long_a)) == 1);
   CHECK(*t.get(to_bytes(long_b)) == 2);
 
-  // Erase long key and verify path compression with long prefix.
-  auto t2 = t.erase(to_bytes(long_a));
-  CHECK(t2.size() == 1U);
-  CHECK(*t2.get(to_bytes(long_b)) == 2);
+  // Erase long key and verify path compression with long prefix. Scoped:
+  // t can be derived from again only once this successor is gone.
+  {
+    auto t2 = t.erase(to_bytes(long_a));
+    CHECK(t2.size() == 1U);
+    CHECK(*t2.get(to_bytes(long_b)) == 2);
+  }
 
   // 200-byte key.
   std::string very_long(200, 'z');
@@ -1414,7 +1418,8 @@ TEST_CASE("RadixTree merge disjoint trees", "[radix_tree][merge]") {
   auto a = Tree{}.set(to_bytes("apple"), 1).set(to_bytes("avocado"), 2);
   auto b = Tree{}.set(to_bytes("banana"), 3).set(to_bytes("blueberry"), 4);
 
-  auto merged = Tree::merge(a, b, [](int, int r) { return r; });
+  auto merged =
+      Tree::merge(std::move(a), std::move(b), [](int, int r) { return r; });
 
   CHECK(merged.size() == 4U);
   CHECK(*merged.get(to_bytes("apple")) == 1);
@@ -1422,9 +1427,9 @@ TEST_CASE("RadixTree merge disjoint trees", "[radix_tree][merge]") {
   CHECK(*merged.get(to_bytes("banana")) == 3);
   CHECK(*merged.get(to_bytes("blueberry")) == 4);
 
-  // Originals unmodified.
-  CHECK(a.size() == 2U);
-  CHECK(b.size() == 2U);
+  // Inputs consumed.
+  CHECK(a.empty());
+  CHECK(b.empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,7 +1439,8 @@ TEST_CASE("RadixTree merge conflict resolver picks b", "[radix_tree][merge]") {
   auto a = Tree{}.set(to_bytes("key"), 1).set(to_bytes("only_a"), 10);
   auto b = Tree{}.set(to_bytes("key"), 2).set(to_bytes("only_b"), 20);
 
-  auto merged = Tree::merge(a, b, [](int, int bv) { return bv; });
+  auto merged =
+      Tree::merge(std::move(a), std::move(b), [](int, int bv) { return bv; });
 
   CHECK(merged.size() == 3U);
   CHECK(*merged.get(to_bytes("key")) == 2);   // b wins
@@ -1449,7 +1455,8 @@ TEST_CASE("RadixTree merge conflict resolver picks a", "[radix_tree][merge]") {
   auto a = Tree{}.set(to_bytes("key"), 100);
   auto b = Tree{}.set(to_bytes("key"), 999);
 
-  auto merged = Tree::merge(a, b, [](int av, int) { return av; });
+  auto merged =
+      Tree::merge(std::move(a), std::move(b), [](int av, int) { return av; });
 
   CHECK(merged.size() == 1U);
   CHECK(*merged.get(to_bytes("key")) == 100);  // a wins
@@ -1459,19 +1466,18 @@ TEST_CASE("RadixTree merge conflict resolver picks a", "[radix_tree][merge]") {
 // merge: empty inputs
 // ---------------------------------------------------------------------------
 TEST_CASE("RadixTree merge with empty trees", "[radix_tree][merge]") {
-  const Tree empty;
   auto t = Tree{}.set(to_bytes("x"), 7);
   auto resolve = [](int, int r) { return r; };
 
-  auto m1 = Tree::merge(empty, t, resolve);
+  auto m1 = Tree::merge(Tree{}, std::move(t), resolve);
   CHECK(m1.size() == 1U);
   CHECK(*m1.get(to_bytes("x")) == 7);
 
-  auto m2 = Tree::merge(t, empty, resolve);
+  auto m2 = Tree::merge(std::move(m1), Tree{}, resolve);
   CHECK(m2.size() == 1U);
   CHECK(*m2.get(to_bytes("x")) == 7);
 
-  auto m3 = Tree::merge(empty, empty, resolve);
+  auto m3 = Tree::merge(Tree{}, Tree{}, resolve);
   CHECK(m3.empty());
 }
 
@@ -1483,7 +1489,8 @@ TEST_CASE("RadixTree merge prefix relationship across trees",
   auto a = Tree{}.set(to_bytes("abc"), 1);
   auto b = Tree{}.set(to_bytes("abcdef"), 2);
 
-  auto merged = Tree::merge(a, b, [](int, int r) { return r; });
+  auto merged =
+      Tree::merge(std::move(a), std::move(b), [](int, int r) { return r; });
 
   CHECK(merged.size() == 2U);
   CHECK(*merged.get(to_bytes("abc")) == 1);
@@ -1498,7 +1505,8 @@ TEST_CASE("RadixTree merge overlapping prefix split", "[radix_tree][merge]") {
   auto a = Tree{}.set(to_bytes("foo"), 1).set(to_bytes("foobar"), 2);
   auto b = Tree{}.set(to_bytes("foo"), 99).set(to_bytes("foobaz"), 3);
 
-  auto merged = Tree::merge(a, b, [](int, int bv) { return bv; });
+  auto merged =
+      Tree::merge(std::move(a), std::move(b), [](int, int bv) { return bv; });
 
   CHECK(merged.size() == 3U);
   CHECK(*merged.get(to_bytes("foo")) == 99);    // b wins conflict
@@ -1513,7 +1521,8 @@ TEST_CASE("RadixTree merge result is ordered", "[radix_tree][merge]") {
   auto a = Tree{}.set(to_bytes("cherry"), 3).set(to_bytes("apple"), 1);
   auto b = Tree{}.set(to_bytes("banana"), 2).set(to_bytes("date"), 4);
 
-  auto merged = Tree::merge(a, b, [](int, int r) { return r; });
+  auto merged =
+      Tree::merge(std::move(a), std::move(b), [](int, int r) { return r; });
 
   std::vector<std::string> keys;
   for (auto [k, v] : merged)
@@ -1540,7 +1549,8 @@ TEST_CASE("RadixTree merge large overlapping sets", "[radix_tree][merge]") {
   auto a = std::move(ta).persistent();
   auto b = std::move(tb).persistent();
 
-  auto merged = Tree::merge(a, b, [](int, int bv) { return bv; });
+  auto merged =
+      Tree::merge(std::move(a), std::move(b), [](int, int bv) { return bv; });
 
   // All 500 a-keys present + 250 disjoint b-keys.
   CHECK(merged.size() == 750U);
@@ -1610,7 +1620,7 @@ TEST_CASE("RadixTree merge model-based", "[radix_tree][merge]") {
         it->second = resolve(it->second, v);
     }
 
-    auto merged = Tree::merge(tree_a, tree_b, resolve);
+    auto merged = Tree::merge(std::move(tree_a), std::move(tree_b), resolve);
 
     INFO("n=" << n);
 
@@ -1661,9 +1671,9 @@ TEST_CASE("RadixTree merge model-based", "[radix_tree][merge]") {
       }
     }
 
-    // Originals unchanged.
-    CHECK(tree_a.size() == map_a.size());
-    CHECK(tree_b.size() == map_b.size());
+    // Inputs consumed.
+    CHECK(tree_a.empty());
+    CHECK(tree_b.empty());
   }
 }
 
@@ -2240,7 +2250,7 @@ TEST_CASE("RadixTree merge walks a wide node", "[radix_tree][merge]") {
       model[key] = i;
     }
 
-    auto merged = Tree::merge(a, b, resolve);
+    auto merged = Tree::merge(std::move(a), std::move(b), resolve);
     REQUIRE(merged.size() == model.size());
     CHECK(same_entries(collect_entries(merged), model));
   }
@@ -2256,7 +2266,7 @@ TEST_CASE("RadixTree merge walks a wide node", "[radix_tree][merge]") {
       model[key] = i + 1000;
     }
 
-    auto merged = Tree::merge(a, b, resolve);
+    auto merged = Tree::merge(std::move(a), std::move(b), resolve);
     REQUIRE(merged.size() == model.size());
     CHECK(same_entries(collect_entries(merged), model));
   }
@@ -2277,7 +2287,7 @@ TEST_CASE("RadixTree merge walks a wide node", "[radix_tree][merge]") {
       a = a.set(to_bytes(key), i);
     }
 
-    auto merged = Tree::merge(a, b, resolve);
+    auto merged = Tree::merge(std::move(a), std::move(b), resolve);
     REQUIRE(merged.size() == model.size());
     CHECK(same_entries(collect_entries(merged), model));
   }
@@ -2511,14 +2521,15 @@ TEST_CASE("Accounting: merge frees the input nodes it does not reuse",
     auto a = std::move(ba).persistent();
     auto b = std::move(bb).persistent();
 
-    auto merged = Tree::merge(a, b, [](int x, int) { return x; });
+    // merge consumes its inputs: whatever of theirs the result does not
+    // reuse is freed at publish, and nothing is left parked.
+    auto merged =
+        Tree::merge(std::move(a), std::move(b), [](int x, int) { return x; });
     CHECK(merged.size() == 400U);
-    check_accounting({&a, &b, &merged});
-
-    a = Tree{};
-    b = Tree{};
+    CHECK(a.empty());
+    CHECK(b.empty());
     check_accounting({&merged});
-    CHECK(merged.size() == 400U);
+    CHECK(Tree::parked_nodes().empty());
     for (int i = 0; i < 200; ++i) {
       CHECK(*merged.get(to_bytes("a_" + std::to_string(i))) == i);
       CHECK(*merged.get(to_bytes("b_" + std::to_string(i))) == i);
@@ -2559,6 +2570,147 @@ TEST_CASE("Accounting: an iterator outlives every supersession of its path",
     CHECK(observed == expected);
     // Once the iterator is gone, so is the version it was pinning.
     check_accounting({&head});
+  }
+  CHECK(live_nodes() == before);
+}
+
+// ===========================================================================
+// The chain contract — a version is derived only from the end of its
+// lineage, merge consumes its inputs — and retraction, which hands a
+// lineage back to its newest live version when the versions above it die.
+// ===========================================================================
+namespace {
+
+auto build_200() -> Tree {
+  auto b = Tree{}.transient();
+  for (int i = 0; i < 200; ++i)
+    b.set(to_bytes("key_" + std::to_string(i)), i);
+  return std::move(b).persistent();
+}
+
+} // namespace
+
+TEST_CASE("Chain: a version with a live successor cannot be derived from",
+          "[radix_tree][accounting][chain]") {
+  const auto before = live_nodes();
+  {
+    auto t1 = build_200();
+    auto t2 = t1.set(to_bytes("key_7"), 7000);
+    // A sibling of t2 would share t1's key_7 subtree, which t2 has already
+    // retired: refused, and nothing changes.
+    CHECK_THROWS_AS((void)t1.set(to_bytes("key_8"), 8000), std::logic_error);
+    check_accounting({&t1, &t2});
+    CHECK(*t1.get(to_bytes("key_7")) == 7);
+    CHECK(*t2.get(to_bytes("key_7")) == 7000);
+    CHECK(t1.size() == 200U);
+    CHECK(t2.size() == 200U);
+
+    // A transient refused at persistent() is still active — what it built
+    // and retired is its own until it dies — and then cleans up.
+    {
+      auto tr = t1.transient();
+      tr.set(to_bytes("key_9"), 9000);
+      CHECK_THROWS_AS((void)std::move(tr).persistent(), std::logic_error);
+      CHECK(*tr.get(to_bytes("key_9")) == 9000);
+    }
+    check_accounting({&t1, &t2});
+  }
+  CHECK(live_nodes() == before);
+}
+
+TEST_CASE("Chain: a dead successor is retracted and its base derived from "
+          "again",
+          "[radix_tree][accounting][chain]") {
+  const auto before = live_nodes();
+  {
+    auto t1 = build_200();
+    const auto t1_nodes = reachable(t1);
+    {
+      auto t2 = t1.set(to_bytes("key_7"), 7000); // retires t1's key_7 path
+      check_accounting({&t1, &t2});
+    } // t2 dies: what it created is freed, what it retired is t1's again
+    check_accounting({&t1});
+    CHECK(Tree::parked_nodes().empty());
+    CHECK(reachable(t1) == t1_nodes);
+
+    auto t3 = t1.set(to_bytes("key_8"), 8000); // shares t1's key_7 subtree
+    t1 = Tree{};
+    CHECK(*t3.get(to_bytes("key_7")) == 7);
+    CHECK(*t3.get(to_bytes("key_8")) == 8000);
+    CHECK(t3.size() == 200U);
+    check_accounting({&t3});
+  }
+  CHECK(live_nodes() == before);
+}
+
+TEST_CASE("Chain: retracting a dead segment of two versions",
+          "[radix_tree][accounting][chain]") {
+  const auto before = live_nodes();
+  {
+    auto t1 = build_200();
+    const auto t1_nodes = reachable(t1);
+    {
+      auto t2 = t1.set(to_bytes("key_7"), 7000);
+      auto t3 = t2.set(to_bytes("key_7"), 7001); // retires t2's own path
+      auto t3b = t3.set(to_bytes("key_8"), 8000);
+      check_accounting({&t1, &t2, &t3, &t3b});
+      // Middle first, then the tail, then the head: every drop order the
+      // engine's pipeline can produce behind a failed flush.
+      t2 = Tree{};
+      check_accounting({&t1, &t3, &t3b});
+      t3b = Tree{};
+      check_accounting({&t1, &t3});
+      t3 = Tree{};
+      check_accounting({&t1});
+    }
+    CHECK(Tree::parked_nodes().empty());
+    CHECK(reachable(t1) == t1_nodes);
+    for (int i = 0; i < 200; ++i)
+      CHECK(*t1.get(to_bytes("key_" + std::to_string(i))) == i);
+
+    auto t4 = t1.set(to_bytes("key_7"), 7);
+    check_accounting({&t1, &t4});
+    CHECK(t4.size() == 200U);
+  }
+  CHECK(live_nodes() == before);
+}
+
+TEST_CASE("Chain: merge refuses an input it cannot consume",
+          "[radix_tree][accounting][chain]") {
+  const auto before = live_nodes();
+  auto resolve = [](int x, int) { return x; };
+  {
+    auto a = build_200();
+    auto b = Tree{}.set(to_bytes("other"), 1);
+
+    // A second handle on an input.
+    auto copy = a;
+    CHECK_THROWS_AS((void)Tree::merge(std::move(a), std::move(b), resolve),
+                    std::logic_error);
+    CHECK(a.size() == 200U);
+    CHECK(b.size() == 1U);
+    check_accounting({&a, &b, &copy});
+    copy = Tree{};
+
+    // An input with a live predecessor.
+    auto b2 = b.set(to_bytes("more"), 2);
+    CHECK_THROWS_AS((void)Tree::merge(std::move(a), std::move(b2), resolve),
+                    std::logic_error);
+    CHECK(b2.size() == 2U);
+    check_accounting({&a, &b, &b2});
+
+    // An input with a successor.
+    CHECK_THROWS_AS((void)Tree::merge(std::move(a), std::move(b), resolve),
+                    std::logic_error);
+    check_accounting({&a, &b, &b2});
+    b = Tree{};
+
+    // Once the lineage is a single version again it can be consumed.
+    auto merged = Tree::merge(std::move(a), std::move(b2), resolve);
+    CHECK(merged.size() == 202U);
+    CHECK(a.empty());
+    CHECK(b2.empty());
+    check_accounting({&merged});
   }
   CHECK(live_nodes() == before);
 }

@@ -177,7 +177,7 @@ This component inherits the ByteCaskDB design tenets in order of priority:
 *   **Key Type:** `std::span<const std::byte>` (Ingested and prefix-compressed natively).
 *   **Value Type:** Generic `V`.
 *   **Immutability:** All mutating operations return a new version of the tree. Untouched nodes are shared between versions as plain pointers.
-*   **Memory Management:** Standard allocators, no reference counts. Child slots are raw `Node*`, so cloning a node is a `memcpy` of its child array and releasing a version is a counter decrement. Node lifetime belongs to a per-value-type registry: the session that builds a version retires the base nodes it makes unreachable, and each retired node is freed once no live version can still reach it (§3.3).
+*   **Memory Management:** Standard allocators, no reference counts. Child slots are raw `Node*`, so cloning a node is a `memcpy` of its child array and releasing a version is a counter decrement. Node lifetime belongs to a per-value-type version chain: the session that builds a version retires the base nodes it makes unreachable, and each retired node is freed once no live version can still reach it (§3.3).
 *   **Prefix Compression:** Shared byte sequences are stored once in the highest common parent node.
 *   **Edit Tags (COW):** Transient mode uses epoch tags to safely mutate uniquely-owned nodes in-place, falling back to Path Copying when sharing occurs.
 
@@ -196,12 +196,10 @@ Appendix B):
 ```cpp
 // Base node — 94% of all nodes are leaves and use only this struct.
 struct Node {
-    // bit 63 = has_value, bits 62-60 = node_type, bit 59 = retired,
-    // bits 58-0 = edit tag. No reference count: see §3.3. Atomic only so
-    // that setting the retired bit is not a race against lock-free readers
-    // of the same word; every access is relaxed, and the node is the size
-    // it would be with a plain uint64_t.
-    std::atomic<uint64_t> packed_tag;
+    // bit 63 = has_value, bits 62-60 = node_type, bits 59-0 = edit tag.
+    // No reference count: see §3.3. A plain word: nothing writes to a
+    // node after the session that created it has published.
+    uint64_t packed_tag;
 
     V value;
 
@@ -299,78 +297,66 @@ The `transient()` / `persistent()` API pattern — a mutable builder that freeze
 *   A global `std::atomic<uint64_t>` generates unique edit tags for build sessions. Every structural algorithm — `set`, `upsert`, `erase`, `merge` and the chain builders — belongs to a `BuildSession`, which owns that tag and the list of nodes it retires.
 *   During a mutation, if the traversed node's `edit_tag` matches the session's tag, the node was created by this session, nothing outside it can reach the node, and it is mutated **in-place**.
 *   Otherwise the node is **copied**, the copy is tagged with the session, the mutation applies to the copy, and the original is **retired** (§3.3).
-*   The tag alone is the ownership proof, so it must never repeat: tags are 59 bits (`packed_tag_` spends bit 63 on has_value, bits 62–60 on the node type and bit 59 on the retired flag), which at one session per write does not wrap in any realistic process lifetime. This replaces the old 28-bit tag, which did wrap and so needed a reference count of 1 as the real guard.
+*   The tag alone is the ownership proof, so it must never repeat: tags are 60 bits (`packed_tag_` spends bit 63 on has_value and bits 62–60 on the node type), which at one session per write does not wrap in any realistic process lifetime. This replaces the old 28-bit tag, which did wrap and so needed a reference count of 1 as the real guard.
 *   A transient is single-use. `persistent() &&` ends the session, and any later operation on a consumed or moved-from builder throws `std::logic_error` in release builds instead of depending on debug-only assertions.
 *   A transient destroyed without `persistent()` frees every node its session created and gives back everything it retired: the base version is intact and still holds them.
 
-### 3.3. Node Lifetime — Version Registry
+### 3.3. Node Lifetime — Version Chain
 
 Nodes carry no reference count, so a node is not freed when the last pointer
-to it goes. It is freed when no live *version* can reach it. One registry per
-value type, behind one mutex, tracks that.
+to it goes. It is freed when no live *version* can reach it. One
+`VersionChain` per value type, behind one mutex, decides that from two
+contracts it enforces at publish.
 
-A node becomes garbage at exactly one moment, on the thread running the
-session: when the session makes it unreachable from the version being built.
-That is `mutable_copy` cloning a node it does not own, a tier promotion or
-demotion replacing a node, path compression collapsing a routing node, or an
-erase unlinking a subtree. All of them go through `BuildSession::discard`,
-which frees the node at once if the session created it and otherwise retires
-it. `persistent()` hands the retired list to the registry.
+**Chain.** A version may be derived only from a version that has no
+successor; `persistent()` throws `std::logic_error` otherwise. The versions
+derived from one another form a *lineage*, and within a lineage the session
+tags order the versions. A node created by session `S` is reachable only from
+`S`'s version and its descendants. A node retired by session `R` — cloned or
+unlinked by it, always through `BuildSession::discard` — is reachable from
+none of `R`'s version or its descendants. So a node created by `S` and
+retired by `R` is reachable from exactly the versions of its lineage with
+tags in `[S, R)`.
 
-When can a retired node be freed? Tags increase with every session, and a
-session starts only after its base was published, so a node created by
-session `S` is reachable only from the version `S` published and from
-versions derived from it — all with tags at or above `S`. A node retired by
-session `R` is by definition not reachable from `R`'s version nor from
-anything derived from it. So the node is reachable from a live version `V`
-exactly when `tag(V)` falls in `[tag(X), tag(R))`.
+**Consumption.** `merge` takes the sole handle of two versions with neither
+predecessor nor successor — what a builder or a previous merge yields — and
+its result starts a new lineage. The inputs stop being versions at publish,
+and the nodes of theirs the result does not reuse are freed at once, since
+nothing else reached them. Anything else throws `std::logic_error` and leaves
+both inputs intact.
 
-Each retired node is parked on the live version that currently blocks it —
-the smallest live tag at or above its own — and freed the moment no live tag
-falls in its window. A version's death re-examines only what was parked on
-it, never a scan. This is what keeps a long-lived `db.snapshot()` holding
-exactly the nodes it can still reach rather than everything retired since it
-was taken, which is the behaviour reference counting gave and the property
-the memory tests check.
+**Free rule.** A retired node is parked on the live version that blocks it:
+the smallest live tag of its lineage in `[S, R)`. It is freed the moment no
+such version exists — at publish if none is alive, otherwise when the version
+it is parked on dies and nothing in the window is left. A version's death
+re-examines only the nodes parked on it, never a scan. This is what keeps a
+long-lived `db.snapshot()` holding exactly the nodes it can still reach
+rather than everything retired since it was taken — the behaviour reference
+counting gave and the property the memory tests check.
 
-A version whose last handle goes while nothing was derived from it frees what
-only it could reach, by the same tag test: walking from its root, a node
-whose tag is above every version it was derived from is reachable from
-nothing else, and since a node's children are never newer than the node, the
-walk stops where the test fails. Already-parked nodes are stepped over.
+**Retraction.** When a version with no successor loses its last handle, the
+lineage shrinks back to its newest live predecessor `F`, or ends if there is
+none. Everything above `F` is a dead segment nothing reaches any more: nodes
+reachable from the dead root with a tag above `F` were created by the segment
+and are freed by a walk (a node's children are never newer than the node, so
+the walk stops where the test fails); nodes retired by the segment are
+reachable from `F` again and are unparked — live nodes of `F` once more. With
+no `F` the lineage is over and they are freed too. `F` is then the head of its
+lineage again. This one rule covers the head dropped after a failed flush
+(`DB::resume`), a version a test publishes and drops, the last handle at DB
+close, and the tail of a recovery partition, and it is what keeps the tag
+interval exact, so the free rule needs nothing more.
 
-The registry therefore keeps the derivation graph, not just a counter. A dead
-version is spliced out and its successor inherits its bases, lowering that
-successor's floor onto the nodes it now holds alone. A dead version with two
-or more versions derived from it stays as a tombstone: they share its nodes
-with each other, and it is what stops either one's walk from freeing what the
-other still reads. When their number falls back to one it is spliced out like
-any other. The last version of a lineage has no bases left and frees the whole
-structure, which is why the tree leaks nothing at process exit.
-
-**Forks.** The window argument assumes a version's tag orders it against
-everything that can reach its nodes, which holds while versions form a chain.
-Two versions derived from the same base can each reach what the other
-superseded while carrying a larger tag, so parking is suspended while any
-base has more than one version derived from it, and the held nodes are placed
-as soon as that resolves. The engine forks only between a failed flush and
-the `resume()` that clears it; a direct user of the persistent API forks
-whenever it keeps two descendants of one version alive.
-
-**Retiring a shared node once.** Two versions derived from the same base can
-both supersede the same node, and it must be retired once or it would be
-freed twice. Bit 59 of the tag word records that a node is already on some
-retired list, and `discard` leaves such a node alone. That bit is the only
-write a node ever receives after the session that created it published, and
-readers of other versions may be reading the same word at that moment, which
-is why the word is atomic; the accesses are relaxed, since the word carries
-no ordering of its own.
+Nothing writes to a node after the session that created it has published:
+lifetime is decided by the chain and never recorded in the node, so the tag
+word is a plain integer and lock-free readers share nodes with no
+synchronisation.
 
 **Invariant.** Under `BYTECASK_RADIX_ACCOUNTING` the tree counts every node
 allocation and free per value type. The tree unit tests assert, after each
 scenario, that the nodes which exist are exactly those reachable from a live
-version plus those the registry still owes a free to, and that the count
-returns to its starting value once every version is gone.
+version plus those the chain still owes a free to, and that the count returns
+to its starting value once every version is gone.
 
 ---
 
@@ -387,7 +373,10 @@ All operations leave the original tree unchanged and return a new instance.
 *   `PersistentRadixTree set(std::span<const std::byte> key, V val) const` (Insert or overwrite).
 *   `PersistentRadixTree erase(std::span<const std::byte> key) const`
 *   `TransientRadixTree<V> transient() const` (Spawns a mutable builder).
-*   `PersistentRadixTree merge(a, b, resolve)` (Static. Merges two trees; see §5.3).
+*   `PersistentRadixTree merge(PersistentRadixTree&& a, PersistentRadixTree&& b, resolve)` (Static. Consumes both inputs; see §5.3).
+
+A version can be derived from — `set`, `erase`, `transient()` — only while it
+has no live successor; a second derivation throws `std::logic_error` (§3.3).
 
 
 ### 4.2. Transient API (`TransientRadixTree<V>`)
@@ -468,13 +457,13 @@ When removing a value (`node->value = std::nullopt`), the tree must maintain Pat
 
 ### 5.3. Merge
 
-`merge(a, b, resolve)` combines two persistent trees into one, producing a new tree that shares unmodified subtrees from both inputs by pointer (no node cloning). The result is a version derived from both, and the nodes of either input it does not reuse are retired onto it.
+`merge(a, b, resolve)` combines two persistent trees into one, producing a new tree that shares unmodified subtrees from both inputs by pointer (no node cloning). It consumes its inputs: each must be the only handle of a version with neither predecessor nor successor, or `std::logic_error` is thrown and both are left intact. The result starts a new lineage; the nodes of either input it does not reuse are freed at publish (§3.3).
 
 **Signature:**
 ```cpp
 template <typename ResolveFunc>
-static auto merge(const PersistentRadixTree& a,
-                  const PersistentRadixTree& b,
+static auto merge(PersistentRadixTree&& a,
+                  PersistentRadixTree&& b,
                   ResolveFunc&& resolve) -> PersistentRadixTree;
 // resolve(const V& a_val, const V& b_val) -> V
 ```
@@ -587,13 +576,13 @@ Hint files are assigned to workers round-robin. Each worker builds a `TransientR
 
 ### 7.1. Node layout breakdown
 
-Nodes are allocated via `new` and freed by the version registry (§3.3). They carry no reference count and no separate control block. Leaf nodes (94% of all nodes) use the base `Node<V>` struct; the remaining ~6% use one of four fixed-capacity tiers (`Node4`, `Node16`, `Node48`, `Node256`) by fanout — there is no unbounded fallback: `Node256`'s 256 slots is the ceiling on fanout for a single byte transition, so every possible child count has a tier. (An `InternalNode`/`ChildStore` "Large" tier filled this role before `Node256` existed; it has since been removed — see §7.7.)
+Nodes are allocated via `new` and freed by the version chain (§3.3). They carry no reference count and no separate control block. Leaf nodes (94% of all nodes) use the base `Node<V>` struct; the remaining ~6% use one of four fixed-capacity tiers (`Node4`, `Node16`, `Node48`, `Node256`) by fanout — there is no unbounded fallback: `Node256`'s 256 slots is the ceiling on fanout for a single byte transition, so every possible child count has a tier. (An `InternalNode`/`ChildStore` "Large" tier filled this role before `Node256` existed; it has since been removed — see §7.7.)
 
 **`Node<V>` (base — used for leaves):**
 
 | Field | Type | Bytes |
 |---|---|---|
-| `packed_tag_` | `uint64_t` (flags + retired bit + 59-bit edit tag) | 8 |
+| `packed_tag_` | `uint64_t` (flags + 60-bit edit tag) | 8 |
 | `value_` | `V` (e.g. `KeyDirEntry`, 24 B) | 24 |
 | `prefix` | `CompactPrefix` (7 inline bytes, alignof 1) | 8 |
 | **Node struct total** | | **40 bytes** |

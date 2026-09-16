@@ -102,7 +102,7 @@ inline std::atomic<std::uint64_t> next_edit_tag{1};
 // Test-only node accounting (BYTECASK_RADIX_ACCOUNTING). Every node
 // allocation and free is counted, per value type so that trees of
 // different types cannot disturb each other's totals. `retired` tracks
-// nodes the registry still owes a free to. The invariant the tree unit
+// nodes the chain still owes a free to. The invariant the tree unit
 // tests check is
 //   allocated - freed == nodes reachable from live trees, plus parked ones.
 export template <typename V> struct RadixAccounting {
@@ -196,29 +196,19 @@ template <typename V> struct Node {
   //
   // No reference count: nodes are owned by the version history, not by the
   // pointers to them. A node is freed either by the session that created it
-  // (when that session discards it before publishing) or by the epoch
-  // registry once every version that could reach it is gone — see
-  // EpochRegistry. Child slots are therefore plain pointers, and cloning a
-  // node is a memcpy of its child array.
+  // (when that session discards it before publishing) or by VersionChain
+  // once every version that could reach it is gone. Child slots are
+  // therefore plain pointers, and cloning a node is a memcpy of its child
+  // array. Nothing writes to a node after the session that created it has
+  // published — lifetime is decided by the chain and never recorded in the
+  // node — so lock-free readers share it with no synchronisation at all.
   static constexpr std::uint64_t kHasValueBit = 1ull << 63;
   static constexpr unsigned kNodeTypeShift = 60u;
   static constexpr std::uint64_t kNodeTypeMask = 0x7ull << kNodeTypeShift;
-  // Set while this node sits on some build session's retired list, so a
-  // second session that supersedes the same shared node does not retire it
-  // twice. Outside kTagMask, so a tier promotion that carries the edit tag
-  // across does not carry this with it.
-  static constexpr std::uint64_t kRetiredBit = 1ull << 59;
-  static constexpr std::uint64_t kFlagBits =
-      kHasValueBit | kNodeTypeMask | kRetiredBit;
-  static constexpr std::uint64_t kTagMask = kRetiredBit - 1;
+  static constexpr std::uint64_t kFlagBits = kHasValueBit | kNodeTypeMask;
+  static constexpr std::uint64_t kTagMask = (1ull << kNodeTypeShift) - 1;
 
-  // Atomic only so that marking a node retired is not a data race against
-  // lock-free readers walking the version it still belongs to: the retired
-  // bit shares this word with the node type and has-value flag. Every
-  // access is relaxed — the word carries no ordering, just its own bits —
-  // which on every target this builds for is a plain load or store, and it
-  // keeps the node exactly as large as a plain uint64_t would.
-  std::atomic<std::uint64_t> packed_tag_{0};
+  std::uint64_t packed_tag_{0};
   V value_{};
 
   using Prefix = CompactPrefix;
@@ -240,14 +230,21 @@ template <typename V> struct Node {
     Node *const &ptr;
   };
 
+  // Result of a structural edit: the node now standing where the edited one
+  // stood, and the allocation the edit displaced when it changed tier, or
+  // null when the edit was in place. Disposing of the displaced node is
+  // the caller's business — Node knows nothing about lifetime.
+  struct Edit {
+    Node *node;
+    Node *displaced{nullptr};
+  };
+
   // The whole tag word. Every read and write of packed_tag_ goes through
   // these two.
   [[nodiscard]] auto tag_word() const noexcept -> std::uint64_t {
-    return packed_tag_.load(std::memory_order_relaxed);
+    return packed_tag_;
   }
-  void set_tag_word(std::uint64_t w) noexcept {
-    packed_tag_.store(w, std::memory_order_relaxed);
-  }
+  void set_tag_word(std::uint64_t w) noexcept { packed_tag_ = w; }
 
   [[nodiscard]] auto has_value() const noexcept -> bool {
     return (tag_word() & kHasValueBit) != 0;
@@ -266,15 +263,6 @@ template <typename V> struct Node {
   void set_edit_tag(std::uint64_t tag) noexcept {
     set_tag_word((tag_word() & kFlagBits) | (tag & kTagMask));
   }
-  [[nodiscard]] auto is_retired() const noexcept -> bool {
-    return (tag_word() & kRetiredBit) != 0;
-  }
-  // The one write to a node that outlives the session that created it, and
-  // the reason this word is atomic. Only ever done by the thread that
-  // retires the node, and only once (a node already marked is left alone),
-  // so a plain relaxed store of the new value is enough.
-  void mark_retired() noexcept { set_tag_word(tag_word() | kRetiredBit); }
-  void clear_retired() noexcept { set_tag_word(tag_word() & ~kRetiredBit); }
   void set_value(V v) {
     value_ = std::move(v);
     set_tag_word(tag_word() | kHasValueBit);
@@ -657,13 +645,11 @@ template <typename V> struct Node {
   // the terminal tier — 256 slots is the ceiling on fanout for a single
   // byte transition, so it never promotes further.
   //
-  // `node` must be owned by `session` (it is mutated in place). When a
-  // promotion replaces it, the narrower node is handed to
-  // session.discard(), which frees it at once. Returns the resulting node,
-  // which may be a different allocation.
-  template <typename Session>
-  [[nodiscard]] static auto insert_child(Session &session, Node *node,
-                                         std::byte b, Node *child) -> Node * {
+  // `node` is mutated in place, so it must be owned by the calling session.
+  // When a promotion replaces it, the narrower node comes back as
+  // `displaced`.
+  [[nodiscard]] static auto insert_child(Node *node, std::byte b, Node *child)
+      -> Edit {
     if (auto *n4 = node->as_node4()) {
       if (n4->count_ < Node4<V>::kCapacity) {
         std::size_t pos = 0;
@@ -678,11 +664,11 @@ template <typename V> struct Node {
         n4->keys_[pos] = b;
         n4->children_[pos] = child;
         ++n4->count_;
-        return node;
+        return {node};
       }
       // Node4 at capacity — promote to Node16. Unlike clone(), a tier
       // transition must preserve the source node's edit_tag: `node` was
-      // already claimed by the current session (via ensure_mutable) before
+      // already claimed by the current session (via mutable_copy) before
       // insert_child was called.
       auto *n16 = make_node16_like(*node);
       n16->set_tag_word(n16->tag_word() | (node->tag_word() & kTagMask));
@@ -691,8 +677,7 @@ template <typename V> struct Node {
         n16->keys_[i] = n4->keys_[i];
         n16->children_[i] = n4->children_[i];
       }
-      session.discard(node);
-      return insert_child(session, n16, b, child);
+      return {insert_child(n16, b, child).node, node};
     }
 
     if (auto *n16 = node->as_node16()) {
@@ -709,7 +694,7 @@ template <typename V> struct Node {
         n16->keys_[pos] = b;
         n16->children_[pos] = child;
         ++n16->count_;
-        return node;
+        return {node};
       }
       // Node16 at capacity — promote to Node48. Preserve edit_tag (see the
       // Node4 -> Node16 branch above). child_index_ starts all-empty (set
@@ -723,8 +708,7 @@ template <typename V> struct Node {
         n48->child_index_[std::to_integer<std::uint8_t>(n16->keys_[i])] =
             static_cast<std::uint8_t>(i);
       }
-      session.discard(node);
-      return insert_child(session, n48, b, child);
+      return {insert_child(n48, b, child).node, node};
     }
 
     if (auto *n48 = node->as_node48()) {
@@ -745,7 +729,7 @@ template <typename V> struct Node {
         n48->child_index_[std::to_integer<std::uint8_t>(b)] =
             static_cast<std::uint8_t>(pos);
         ++n48->count_;
-        return node;
+        return {node};
       }
       // Node48 at capacity — promote to Node256. Preserve edit_tag (see the
       // Node4 -> Node16 branch above). children_ starts all-null (set by
@@ -757,8 +741,7 @@ template <typename V> struct Node {
         n256->children_[std::to_integer<std::uint8_t>(n48->keys_[i])] =
             n48->children_[i];
       }
-      session.discard(node);
-      return insert_child(session, n256, b, child);
+      return {insert_child(n256, b, child).node, node};
     }
 
     if (node->node_type() == NodeType::Leaf) {
@@ -766,8 +749,7 @@ template <typename V> struct Node {
       // Node4 -> Node16 branch above for why).
       auto *n4 = make_node4_like(*node);
       n4->set_tag_word(n4->tag_word() | (node->tag_word() & kTagMask));
-      session.discard(node);
-      return insert_child(session, n4, b, child);
+      return {insert_child(n4, b, child).node, node};
     }
 
     // Node256 — the terminal tier. Direct-mapped by transition byte, so
@@ -778,7 +760,7 @@ template <typename V> struct Node {
            "duplicate transition byte");
     n256->children_[std::to_integer<std::uint8_t>(b)] = child;
     ++n256->count_;
-    return node;
+    return {node};
   }
 
   // Remove the child under transition byte b. If this is Node256 and
@@ -789,12 +771,10 @@ template <typename V> struct Node {
   // (75% of Node16's capacity, same rationale, for the 16/17 boundary),
   // demotes to Node16; if this is Node16 and its count drops to <=
   // Node4<V>::kCapacity, demotes to Node4 (symmetric — no hysteresis needed
-  // at this boundary, see §7.7). `node` must be owned by `session`; a
-  // demoted-from node is handed to session.discard(). The removed child is
-  // the caller's to discard. Returns the resulting node.
-  template <typename Session>
-  [[nodiscard]] static auto remove_child(Session &session, Node *node,
-                                         std::byte b) -> Node * {
+  // at this boundary, see §7.7). `node` is mutated in place, so it must be
+  // owned by the calling session; a demoted-from node comes back as
+  // `displaced`. The removed child is the caller's to dispose of.
+  [[nodiscard]] static auto remove_child(Node *node, std::byte b) -> Edit {
     if (auto *n4 = node->as_node4()) {
       for (std::size_t i = 0; i < n4->count_; ++i) {
         if (n4->keys_[i] == b) {
@@ -804,10 +784,10 @@ template <typename V> struct Node {
           }
           --n4->count_;
           n4->children_[n4->count_] = nullptr;
-          return node;
+          return {node};
         }
       }
-      return node;
+      return {node};
     }
 
     if (auto *n16 = node->as_node16()) {
@@ -823,7 +803,7 @@ template <typename V> struct Node {
         }
       }
       if (n16->count_ > Node4<V>::kCapacity)
-        return node;
+        return {node};
       // Demote back to Node4 — Node16's per-slot cost only pays off above
       // this fanout. Preserve edit_tag (see insert_child's Node4 -> Node16
       // branch for why).
@@ -834,8 +814,7 @@ template <typename V> struct Node {
         n4->keys_[i] = n16->keys_[i];
         n4->children_[i] = n16->children_[i];
       }
-      session.discard(node);
-      return n4;
+      return {n4, node};
     }
 
     if (auto *n48 = node->as_node48()) {
@@ -853,7 +832,7 @@ template <typename V> struct Node {
             Node48<V>::kEmptyMarker;
       }
       if (n48->count_ > Node48<V>::kShrinkThreshold)
-        return node;
+        return {node};
       // Demote back to Node16 — see the comment above remove_child for the
       // hysteresis rationale.
       auto *n16 = make_node16_like(*node);
@@ -863,15 +842,14 @@ template <typename V> struct Node {
         n16->keys_[i] = n48->keys_[i];
         n16->children_[i] = n48->children_[i];
       }
-      session.discard(node);
-      return n16;
+      return {n16, node};
     }
 
     // Node256 — direct-mapped, so removal is just clearing the slot; no
     // shifting, unlike the packed lower tiers.
     auto *n256 = node->as_node256();
     if (!n256)
-      return node;
+      return {node};
     auto idx = std::to_integer<std::uint8_t>(b);
     if (n256->children_[idx]) {
       n256->children_[idx] = nullptr;
@@ -880,7 +858,7 @@ template <typename V> struct Node {
     // 75% of Node48's capacity — DuckDB's proportional hysteresis, mirrors
     // Node48's own demotion threshold (see the comment above remove_child).
     if (n256->count_ > Node256<V>::kShrinkThreshold)
-      return node;
+      return {node};
 
     // Demote back to Node48.
     auto *n48 = make_node48_like(*node);
@@ -895,8 +873,7 @@ template <typename V> struct Node {
       ++pos;
     }
     n48->count_ = pos;
-    session.discard(node);
-    return n48;
+    return {n48, node};
   }
 
   // Shallow clone of this node: same tier, value, prefix and child
@@ -1068,13 +1045,11 @@ inline auto common_prefix_length(std::span<const std::byte> a,
 }
 
 // Walks the subtree under `root`, descending through every node for which
-// `is_garbage(node)` holds and freeing those of them that are not on some
-// build session's retired list (whoever retired a node frees it). The
-// predicate must be monotone along a path — once it is false for a node it
-// is false for everything below it — which holds for both predicates used
-// here, because a node's children are never newer than the node itself: a
-// session links new children only into nodes it owns. Iterative — no
-// recursion on tree depth.
+// `is_garbage(node)` holds and freeing it. The predicate must be monotone
+// along a path — once it is false for a node it is false for everything
+// below it — which holds for both predicates used here, because a node's
+// children are never newer than the node itself: a session links new
+// children only into nodes it owns. Iterative — no recursion on tree depth.
 template <typename V, typename Pred>
 void free_subtree_if(Node<V> *root, Pred is_garbage) {
   if (!root || !is_garbage(root))
@@ -1089,111 +1064,132 @@ void free_subtree_if(Node<V> *root, Pred is_garbage) {
       if (is_garbage(child->ptr))
         stack.push_back(child->ptr);
     }
-    if (!n->is_retired())
-      Node<V>::destroy(n);
+    Node<V>::destroy(n);
   }
 }
 
 // ---------------------------------------------------------------------------
-// VersionRegistry<V> — owns node lifetime for every PersistentRadixTree<V>.
+// VersionChain<V> — owns node lifetime for every PersistentRadixTree<V>.
 //
-// A persistent tree is a *version*. Each version is identified by the edit
-// tag of the session that built it, and is registered here while any handle
-// to it lives. The session retires the base nodes it makes unreachable —
-// the ones it clones or unlinks — and hands that list over when it
-// publishes. Nothing carries a reference count; freeing is a batch of plain
-// deletes off the write path.
+// A persistent tree is a *version*, identified by the tag of the session
+// that built it, and registered here while any handle to it lives. The
+// session retires the base nodes it makes unreachable — the ones it clones
+// or unlinks — and hands that list over when it publishes. Nothing carries a
+// reference count; freeing is a batch of plain deletes off the write path.
 //
-// When can a retired node be freed? Tags increase with every session, and a
-// session starts only after its base was published, so a node created by
-// session S is reachable only from the version S published and from
-// versions derived from it — all of which have tags >= S. A node X retired
-// by session R is, by definition, not reachable from R's version nor from
-// anything derived from it. So X is reachable from a live version V exactly
-// when tag(V) lies in [tag(X), tag(R)).
+// Two contracts make the free rule exact. publish() enforces both.
 //
-// Each retired node is therefore parked on the live version that currently
-// blocks it — the smallest live tag at or above its own — and freed the
-// moment no live tag falls in its window. A version's death re-examines
-// only the nodes parked on it, so the cost is paid once per node per
-// blocker, never as a scan. A long-lived snapshot holds exactly the nodes
-// it can still reach, not everything retired since it was taken.
+//   Chain. A version may be derived only from a version that has no
+//   successor. The versions derived from one another form a lineage, and
+//   within it the tags order the versions. Tags increase with every
+//   session, and a session starts only after its base was published, so a
+//   node created by session S is reachable only from S's version and the
+//   ones derived from it, and a node retired by session R is reachable from
+//   none of R's version or its descendants. A node created by S and retired
+//   by R is therefore reachable from exactly the versions of its lineage
+//   with tags in [S, R).
 //
-// Forks. The window argument assumes a version's tag orders it against
-// everything that can reach its nodes, which holds while versions form a
-// chain. Two versions derived from the same base — a fork — break it: each
-// can reach what the other superseded while carrying a larger tag. Parking
-// is therefore suspended while any base has more than one version derived
-// from it, and the held nodes are placed as soon as that resolves. The
-// engine forks only between a failed flush and the resume() that clears it.
+//   Consumption. merge takes the sole handle of two versions that have
+//   neither predecessor nor successor — what a builder or a previous merge
+//   yields — and its result starts a new lineage. The inputs stop being
+//   versions at publish, and the nodes of theirs the result does not reuse
+//   are freed at once: nothing else reached them.
 //
-// A version whose last handle goes while nothing was derived from it frees
-// what only it could reach: walking down from its root, a node whose tag is
-// above every version it was derived from was created after all of them,
-// so nothing else can reach it. A node's children are never newer than the
-// node, so the walk stops where the test fails, and parked nodes are
-// stepped over because their blocker frees them.
+// When is a retired node freed? It is parked on the live version that
+// blocks it — the smallest live tag of its lineage in [S, R) — and freed the
+// moment no such version exists: at publish when none is alive, otherwise
+// when the version it is parked on dies and nothing in the window is left.
+// That test is blocker_for. A version's death re-examines only the nodes
+// parked on it, never a scan, so a long-lived snapshot holds exactly the
+// nodes it can still reach, not everything retired since it was taken.
 //
-// That floor is what the derivation graph is for. A dead version is spliced
-// out and its successor inherits its bases, which lowers the successor's
-// floor onto the nodes it now holds alone — but only while at most one
-// version was derived from it. A dead version with two or more successors
-// stays as a tombstone: they share its nodes with each other, and it is
-// what stops either one's walk from freeing what the other still reads.
-// When their number falls back to one, it is spliced out like any other and
-// the survivor takes over its nodes. So the last version of a lineage has
-// no bases left and frees the whole structure.
+// Retraction. When a version with no successor loses its last handle, the
+// lineage shrinks back to its newest live predecessor F, or ends if there is
+// none. Everything above F is a dead segment nothing reaches any more:
+//   - nodes reachable from the dead root with a tag above F were created by
+//     the segment: freed by a walk, which stops where the test fails since
+//     children are never newer than their parent;
+//   - nodes retired by the segment — retiring tag above F — are reachable
+//     from F again and are unparked: live nodes of F once more. With no F
+//     the lineage is over and they are freed as well.
+// F is then the head of its lineage again. This one rule covers the head
+// dropped after a failed flush (DB::resume), a version a test publishes and
+// drops, the last handle at DB close, and the tail of a recovery partition.
 //
-// Reclamation runs on the thread that drops the last handle. All registry
-// state is under one mutex, and the freeing of retired nodes happens after
-// it is released; the walk above is the exception and holds it, because
-// once a version leaves the graph another thread may decide that what it
-// reached is free while the walk is still stepping through those nodes.
+// Reclamation runs on the thread that drops the last handle. All state is
+// under one mutex, and the freeing of retired nodes happens after it is
+// released; the retraction walk is the exception and holds it, because once
+// a version leaves the chain another thread may decide that what it reached
+// is free while the walk is still stepping through those nodes.
 //
-// There are only ever a handful of versions, so they live in flat vectors
-// searched linearly rather than in node-based containers: records sorted by
-// tag, the derivation graph as a list of base-to-successor pairs, and the
-// retired nodes kept in the vector the session already built. Publishing a
-// version then allocates nothing once those buffers have settled, which
-// matters because the engine publishes three of them per batch. The buffers
-// are handed back when the last version of this value type goes.
+// There are only ever a handful of versions, so they live in a flat vector
+// sorted by tag and searched linearly, and retired nodes stay in the vector
+// the session already built. Publishing a version then allocates nothing
+// once those buffers have settled, which matters because the engine
+// publishes one per batch. The buffers are handed back when the last
+// version of this value type goes.
 // ---------------------------------------------------------------------------
-template <typename V> class VersionRegistry {
+template <typename V> class VersionChain {
 public:
-  static auto instance() -> VersionRegistry & {
-    // Immortal: a tree can outlive static destruction, so the registry is
+  static auto instance() -> VersionChain & {
+    // Immortal: a tree can outlive static destruction, so the chain is
     // constructed once in static storage and never destroyed. Static
     // storage rather than the heap, so a leak checker sees nothing left
     // behind at exit.
-    alignas(VersionRegistry) static std::byte storage[sizeof(VersionRegistry)];
-    static auto *registry = new (storage) VersionRegistry();
-    return *registry;
+    alignas(VersionChain) static std::byte storage[sizeof(VersionChain)];
+    static auto *chain = new (storage) VersionChain();
+    return *chain;
   }
 
-  // Registers a new version built by session `tag` from `bases` (tag 0 = the
-  // empty tree, which owns nothing) and returns its id. On success `retired`
-  // is taken over and left empty; on a throw it is untouched and still
-  // belongs to the session. Bases must be live — the builder holds a handle
-  // to each.
-  [[nodiscard]] auto publish(std::uint64_t tag,
-                             std::span<const std::uint64_t> bases,
-                             std::vector<Node<V> *> &retired)
-      -> std::uint64_t {
+  // Registers the version built by session `tag` from `base` (0 = the empty
+  // tree, which starts a lineage). Throws std::logic_error if `base` already
+  // has a successor — the chain contract — with nothing changed and
+  // `retired` still the session's. On success `retired` is taken over and
+  // left empty. The base is live: the builder holds a handle to it.
+  void publish(std::uint64_t tag, std::uint64_t base,
+               std::vector<Node<V> *> &retired) {
     std::vector<Node<V> *> to_free;
     {
       std::lock_guard<std::mutex> lk{mu_};
-      records_.insert(seat_for(tag), Record{.tag = tag, .live = 1});
-      for (auto b : bases) {
-        if (b != 0)
-          add_edge(b, tag);
+      auto lineage = tag;
+      if (base != 0) {
+        auto *b = find(base);
+        if (b->successor != 0)
+          throw std::logic_error{
+              "PersistentRadixTree: a version that already has a successor "
+              "cannot be derived from again"};
+        b->successor = tag;
+        lineage = b->lineage;
       }
-      if (!retired.empty())
-        pending_.push_back(Parcel{std::move(retired), tag});
-      retired.clear();
-      drain_pending(to_free);
+      add_version(tag, lineage);
+      park_retired(tag, lineage, retired, to_free);
     }
     destroy_all(to_free);
-    return tag;
+  }
+
+  // Registers the version built by session `tag` merging versions `a` and
+  // `b` (0 = the empty tree), consuming both: each must be held by exactly
+  // one handle and be the only version of its lineage, or std::logic_error
+  // is thrown with nothing changed. On success the inputs are no longer
+  // versions — the caller drops its handles without unpinning — and the
+  // result starts a lineage of its own.
+  void publish_merge(std::uint64_t tag, std::uint64_t a, std::uint64_t b,
+                     std::vector<Node<V> *> &retired) {
+    std::vector<Node<V> *> to_free;
+    {
+      std::lock_guard<std::mutex> lk{mu_};
+      for (auto input : {a, b}) {
+        if (input != 0)
+          check_consumable(input);
+      }
+      for (auto input : {a, b}) {
+        if (input != 0)
+          records_.erase(seat_for(input));
+      }
+      add_version(tag, tag);
+      park_retired(tag, tag, retired, to_free);
+    }
+    destroy_all(to_free);
   }
 
   void pin(std::uint64_t id) {
@@ -1202,38 +1198,24 @@ public:
   }
 
   // Drops one handle of `id`. `root` is walked only when this was the last
-  // handle and no version was derived from it — see the class comment for
-  // the tag test that decides what such a walk frees.
+  // handle and the version has no successor — see the class comment.
   void unpin(std::uint64_t id, Node<V> *root) {
     std::vector<Node<V> *> to_free;
     {
       std::lock_guard<std::mutex> lk{mu_};
-      auto *rec = find(id);
-      if (--rec->live > 0)
+      auto it = seat_for(id);
+      assert(it != records_.end() && it->tag == id);
+      if (--it->live > 0)
         return;
-      bool walk_root = true;
-      std::uint64_t floor = 0;
-      // Ids are session tags, so the largest base id is the newest state
-      // this version still shares with something else.
-      for (const auto &e : edges_) {
-        if (e.base == id)
-          walk_root = false;
-        else if (e.successor == id)
-          floor = std::max(floor, e.base);
+      if (it->successor != 0) {
+        // Dead inside the chain: its successor reaches everything it did,
+        // except what was parked here — that moves on to the next version
+        // still reaching it, or is freed.
+        take_parcels_if(*it, [](const Parcel &) { return true; });
+        records_.erase(it);
+      } else {
+        retract(it, root, to_free);
       }
-      // Under the lock: once this version leaves the graph another thread
-      // may decide that what it reached is free, and this walk is still
-      // stepping through those nodes to reach the ones below them. Walks
-      // are rare — only a version nothing was derived from has one — so
-      // holding the lock across it costs nothing in the steady state.
-      if (walk_root)
-        free_subtree_if<V>(root, [floor](Node<V> *n) {
-          return n->edit_tag() > floor;
-        });
-      // Nodes parked on this version may now be free, or may have to move
-      // to an older version that still reaches them.
-      take_parcels(*rec);
-      collapse(id, to_free);
       drain_pending(to_free);
       release_buffers_if_idle();
     }
@@ -1253,36 +1235,29 @@ public:
       for (const auto &parcel : rec.more)
         add(parcel);
     }
-    for (const auto &parcel : forked_)
-      add(parcel);
     for (const auto &parcel : pending_)
       add(parcel);
     return out;
   }
 
 private:
-  // base -> successor. Also flat: the same handful of versions, and reading
-  // it is a scan of a few contiguous pairs.
-  struct Edge {
-    std::uint64_t base{0};
-    std::uint64_t successor{0};
-  };
-
   // Nodes retired by one session. `retired_by` closes their reachability
-  // window: a live version with a tag at or above it was derived from that
-  // session and cannot reach them.
+  // window: a version of `lineage` with a tag at or above it was derived
+  // from that session and cannot reach them.
   struct Parcel {
     std::vector<Node<V> *> nodes;
     std::uint64_t retired_by{0};
+    std::uint64_t lineage{0};
   };
 
-  // One version. Live versions and the tombstones described in the class
-  // comment, kept in one vector sorted by tag: there are a handful of them,
-  // so a flat vector searches faster than a node-based container and, once
-  // its capacity has settled, publishing a version allocates nothing.
+  // One live version. Kept in one vector sorted by tag: there are a handful
+  // of them, so a flat vector searches faster than a node-based container
+  // and, once its capacity has settled, publishing allocates nothing.
   struct Record {
     std::uint64_t tag{0};
-    std::uint32_t live{0};
+    std::uint64_t lineage{0};   // tag of the first version of its lineage
+    std::uint64_t successor{0}; // tag of the version derived from it, or 0
+    std::uint32_t live{0};      // handles
     // Nodes parked on this version, because it is the live version that
     // still reaches them. One parcel inline covers the usual case — one
     // published version's worth of superseded nodes — so parking allocates
@@ -1292,20 +1267,14 @@ private:
   };
 
   std::mutex mu_;
-  std::uint32_t forks_{0}; // versions with more than one successor
   std::vector<Record> records_;
-  std::vector<Edge> edges_;
-  std::vector<Parcel> forked_;  // held while a fork is unresolved
-  // Scratch reused under mu_, so the steady state allocates nothing: a
-  // published version's bookkeeping is pushes into vectors that already
-  // have the capacity.
+  // Parcels taken off a record and waiting to be placed again or released.
+  // Scratch reused under mu_, so the steady state allocates nothing.
   std::vector<Parcel> pending_;
-  std::vector<std::uint64_t> work_;
-  std::vector<std::uint64_t> bases_;
-  std::vector<std::uint64_t> successors_;
 
   // Where `tag` belongs in the sorted record vector.
-  [[nodiscard]] auto seat_for(std::uint64_t tag) -> typename std::vector<Record>::iterator {
+  [[nodiscard]] auto seat_for(std::uint64_t tag)
+      -> typename std::vector<Record>::iterator {
     return std::lower_bound(records_.begin(), records_.end(), tag,
                             [](const Record &r, std::uint64_t t) {
                               return r.tag < t;
@@ -1317,90 +1286,110 @@ private:
     return &*it;
   }
 
-  [[nodiscard]] auto successor_count(std::uint64_t tag) const -> std::size_t {
-    std::size_t n = 0;
-    for (const auto &e : edges_)
-      if (e.base == tag)
-        ++n;
-    return n;
+  // Under mu_: a new live version with one handle.
+  void add_version(std::uint64_t tag, std::uint64_t lineage) {
+    Record rec;
+    rec.tag = tag;
+    rec.lineage = lineage;
+    rec.live = 1;
+    records_.insert(seat_for(tag), std::move(rec));
   }
 
-  void add_edge(std::uint64_t base, std::uint64_t successor) {
-    if (successor_count(base) == 1)
-      ++forks_;
-    edges_.push_back(Edge{base, successor});
+  // Under mu_: takes the session's retired list over as one parcel and
+  // places it. Leaves `retired` empty.
+  void park_retired(std::uint64_t tag, std::uint64_t lineage,
+                    std::vector<Node<V> *> &retired,
+                    std::vector<Node<V> *> &out) {
+    if (!retired.empty())
+      pending_.push_back(Parcel{std::move(retired), tag, lineage});
+    retired.clear();
+    drain_pending(out);
   }
 
-  void remove_edge(std::uint64_t base, std::uint64_t successor) {
-    auto it = std::find_if(edges_.begin(), edges_.end(),
-                           [&](const Edge &e) {
-                             return e.base == base && e.successor == successor;
-                           });
-    if (it == edges_.end())
-      return;
-    edges_.erase(it);
-    if (successor_count(base) == 1 && --forks_ == 0) {
-      pending_.insert(pending_.end(), std::make_move_iterator(forked_.begin()),
-                      std::make_move_iterator(forked_.end()));
-      forked_.clear();
+  // Under mu_: the consumption contract for one merge input.
+  void check_consumable(std::uint64_t tag) {
+    const auto *rec = find(tag);
+    if (rec->live != 1)
+      throw std::logic_error{
+          "PersistentRadixTree::merge: an input is held by another handle"};
+    if (rec->successor != 0)
+      throw std::logic_error{
+          "PersistentRadixTree::merge: an input has a successor"};
+    for (const auto &r : records_) {
+      if (r.lineage == rec->lineage && r.tag != tag)
+        throw std::logic_error{
+            "PersistentRadixTree::merge: an input has a live predecessor"};
     }
+    // Nothing can be parked on the only version of a lineage.
+    assert(rec->parked.nodes.empty() && rec->more.empty());
   }
 
-  // Under mu_. Removes every dead record that no longer holds two or more
-  // successors apart, starting at `id`. See the class comment for why a
-  // dead version with two successors has to stay.
-  void collapse(std::uint64_t id, std::vector<Node<V> *> & /*out*/) {
-    work_.clear();
-    work_.push_back(id);
-    while (!work_.empty()) {
-      const auto cur = work_.back();
-      work_.pop_back();
-      auto it = seat_for(cur);
-      if (it == records_.end() || it->tag != cur || it->live > 0)
-        continue;
-      bases_.clear();
-      successors_.clear();
-      for (const auto &e : edges_) {
-        if (e.successor == cur)
-          bases_.push_back(e.base);
-        else if (e.base == cur)
-          successors_.push_back(e.successor);
+  // Under mu_: the version at `it` has no successor and no handle left.
+  // Frees what the dead segment above the newest live predecessor created,
+  // unparks what it retired, and makes that predecessor the head again —
+  // see the class comment.
+  void retract(typename std::vector<Record>::iterator it, Node<V> *root,
+               std::vector<Node<V> *> &out) {
+    const auto tag = it->tag;
+    const auto lineage = it->lineage;
+    Record *pred = nullptr;
+    for (auto r = it; r != records_.begin();) {
+      --r;
+      if (r->lineage == lineage) {
+        pred = &*r;
+        break;
       }
-      if (successors_.size() > 1)
-        continue; // tombstone: it keeps its successors' nodes apart
-      take_parcels(*it);
-      records_.erase(it);
-      for (auto b : bases_) {
-        // Connect before disconnecting: dropping to one successor first
-        // would briefly read as "no forks left" and release parked nodes
-        // that the successor taking this one's place still blocks.
-        for (auto s : successors_)
-          add_edge(b, s);
-        remove_edge(b, cur);
-      }
-      for (auto s : successors_)
-        remove_edge(cur, s);
-      work_.insert(work_.end(), bases_.begin(), bases_.end());
     }
+    const auto floor = pred ? pred->tag : 0;
+    // Under the lock: once this version leaves the chain another thread may
+    // decide that what it reached is free while this walk is still stepping
+    // through those nodes to reach the ones below them.
+    free_subtree_if<V>(root, [floor](Node<V> *n) {
+      return n->edit_tag() > floor;
+    });
+    // What the segment retired is parked on versions of this lineage at or
+    // below it.
+    for (auto &r : records_) {
+      if (r.lineage == lineage && r.tag <= tag)
+        take_parcels_if(r, [floor](const Parcel &p) {
+          return p.retired_by > floor;
+        });
+    }
+    for (auto &parcel : pending_) {
+      if (pred)
+        detail::account_retired<V>(
+            -static_cast<std::int64_t>(parcel.nodes.size()));
+      else
+        out.insert(out.end(), parcel.nodes.begin(), parcel.nodes.end());
+    }
+    pending_.clear();
+    if (pred)
+      pred->successor = 0;
+    records_.erase(it);
   }
 
-  // Under mu_: moves everything parked on `rec` onto the pending queue, to
-  // be placed again once the graph has settled.
-  void take_parcels(Record &rec) {
-    if (!rec.parked.nodes.empty()) {
+  // Under mu_: moves every parcel of `rec` for which `pred` holds onto the
+  // pending queue.
+  template <typename Pred> void take_parcels_if(Record &rec, Pred pred) {
+    if (!rec.parked.nodes.empty() && pred(rec.parked)) {
       pending_.push_back(std::move(rec.parked));
       rec.parked.nodes.clear();
     }
-    if (!rec.more.empty()) {
-      pending_.insert(pending_.end(),
-                      std::make_move_iterator(rec.more.begin()),
-                      std::make_move_iterator(rec.more.end()));
-      rec.more.clear();
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < rec.more.size(); ++i) {
+      if (pred(rec.more[i])) {
+        pending_.push_back(std::move(rec.more[i]));
+        continue;
+      }
+      if (kept != i)
+        rec.more[kept] = std::move(rec.more[i]);
+      ++kept;
     }
+    rec.more.resize(kept);
   }
 
   // Under mu_: places every pending parcel. Runs after the record vector
-  // has stopped moving, so park() can hold a reference into it.
+  // has stopped moving, so hold() can take a pointer into it.
   void drain_pending(std::vector<Node<V> *> &out) {
     while (!pending_.empty()) {
       auto parcel = std::move(pending_.back());
@@ -1409,19 +1398,17 @@ private:
     }
   }
 
-  // The live version that still reaches a node retired by `retired_by`: the
-  // smallest live tag at or above the node's own, when that is below
-  // `retired_by`. Returns 0 when nothing reaches it.
-  [[nodiscard]] auto blocker_for(std::uint64_t node_tag,
-                                 std::uint64_t retired_by) const
+  // The free rule. The live version that still reaches a node created by
+  // session `node_tag` and retired by `parcel.retired_by`: the smallest live
+  // tag of the parcel's lineage in [node_tag, retired_by). Returns 0 when
+  // no version reaches the node any more and it can be freed.
+  [[nodiscard]] auto blocker_for(std::uint64_t node_tag, const Parcel &parcel)
       -> std::uint64_t {
-    auto it = std::lower_bound(records_.begin(), records_.end(), node_tag,
-                               [](const Record &r, std::uint64_t t) {
-                                 return r.tag < t;
-                               });
-    for (; it != records_.end() && it->tag < retired_by; ++it)
-      if (it->live > 0)
+    for (auto it = seat_for(node_tag);
+         it != records_.end() && it->tag < parcel.retired_by; ++it) {
+      if (it->lineage == parcel.lineage)
         return it->tag;
+    }
     return 0;
   }
 
@@ -1430,15 +1417,10 @@ private:
   // always share a blocker — they came off one path in one version — so
   // that case moves the whole list and allocates nothing.
   void park(Parcel parcel, std::vector<Node<V> *> &out) {
-    if (forks_ > 0) {
-      forked_.push_back(std::move(parcel));
-      return;
-    }
-    const auto first = blocker_for(parcel.nodes.front()->edit_tag(),
-                                   parcel.retired_by);
+    const auto first = blocker_for(parcel.nodes.front()->edit_tag(), parcel);
     bool uniform = true;
     for (auto *n : parcel.nodes) {
-      if (blocker_for(n->edit_tag(), parcel.retired_by) != first) {
+      if (blocker_for(n->edit_tag(), parcel) != first) {
         uniform = false;
         break;
       }
@@ -1451,26 +1433,25 @@ private:
       return;
     }
     // Mixed: split by blocker. Rare, and the split lists are short.
-    std::vector<Parcel> groups;
+    std::vector<std::pair<std::uint64_t, Parcel>> groups;
     for (auto *n : parcel.nodes) {
-      const auto blocker = blocker_for(n->edit_tag(), parcel.retired_by);
+      const auto blocker = blocker_for(n->edit_tag(), parcel);
       if (blocker == 0) {
         out.push_back(n);
         continue;
       }
       auto group = std::find_if(groups.begin(), groups.end(),
-                                [blocker](const Parcel &g) {
-                                  return g.retired_by == blocker;
+                                [blocker](const auto &g) {
+                                  return g.first == blocker;
                                 });
       if (group == groups.end())
-        groups.push_back(Parcel{{n}, blocker});
+        groups.emplace_back(blocker, Parcel{{n}, parcel.retired_by,
+                                            parcel.lineage});
       else
-        group->nodes.push_back(n);
+        group->second.nodes.push_back(n);
     }
-    for (auto &group : groups) {
-      const auto blocker = group.retired_by;
-      hold(blocker, Parcel{std::move(group.nodes), parcel.retired_by});
-    }
+    for (auto &[blocker, group] : groups)
+      hold(blocker, std::move(group));
   }
 
   // Under mu_: hands a parcel to the version that still reaches it.
@@ -1483,22 +1464,16 @@ private:
   }
 
   // Under mu_: when the last version of every tree of this value type is
-  // gone, hand the registry's own buffers back too. They are reused and
-  // never shrink otherwise, which is what makes publishing allocation-free
-  // in the steady state — but an idle process should not be holding them,
-  // and the tree is then provably responsible for no memory at all, which
-  // the memory tests check.
+  // gone, hand the chain's own buffers back too. They are reused and never
+  // shrink otherwise, which is what makes publishing allocation-free in the
+  // steady state — but an idle process should not be holding them, and the
+  // tree is then provably responsible for no memory at all, which the
+  // memory tests check.
   void release_buffers_if_idle() {
-    if (!records_.empty() || !edges_.empty() || !forked_.empty() ||
-        !pending_.empty())
+    if (!records_.empty() || !pending_.empty())
       return;
     records_.shrink_to_fit();
-    edges_.shrink_to_fit();
-    forked_.shrink_to_fit();
     pending_.shrink_to_fit();
-    work_.shrink_to_fit();
-    bases_.shrink_to_fit();
-    successors_.shrink_to_fit();
   }
 
   static void destroy_all(const std::vector<Node<V> *> &nodes) noexcept {
@@ -1517,15 +1492,15 @@ private:
 // nodes it retires. Every structural algorithm lives here so the four
 // places a node becomes garbage all go through discard():
 //   1. superseded — mutable_copy() clones a node it does not own;
-//   2. replaced — insert_child / remove_child / merge_with_child swap a
-//      node for a different tier or collapse a routing node;
+//   2. replaced — a tier change (link_child / unlink_child) or path
+//      compression (merge_with_child) swaps a node for another allocation;
 //   3. dropped — erase unlinks a node that has no value and no children;
 //   4. never published — the session is destroyed without publishing:
 //      the nodes it created are freed by walking the root (see
 //      TransientRadixTree), and its retired list is forgotten.
 // A node the session owns (edit tag == tag_) is freed at once — nothing
 // outside the session can reach it. A foreign node is retired: it stays
-// allocated until every version that can reach it is gone.
+// allocated until every version that can reach it is gone (VersionChain).
 //
 // Used by one thread at a time. Iterators over a session's root hold raw
 // node pointers: do not mutate while one is alive.
@@ -1558,13 +1533,13 @@ public:
     return n->edit_tag() == tag_;
   }
 
-  // The retired list, for EpochRegistry::publish to take over on success.
+  // The retired list, for VersionChain::publish to take over on success.
   [[nodiscard]] auto retired_list() noexcept -> std::vector<N *> & {
     return retired_;
   }
 
   // Ends the session after publishing: nothing it created is owned by it
-  // any more, and the retired list now belongs to the registry.
+  // any more, and the retired list now belongs to the chain.
   void finish() noexcept {
     tag_ = 0;
     retired_.clear();
@@ -1582,18 +1557,34 @@ public:
     tag_ = 0;
   }
 
+  // The one place a node becomes garbage. Owned by this session: freed at
+  // once, nothing outside can reach it. Foreign: retired, to be freed by
+  // the chain once every version that reaches it is gone. A session unlinks
+  // a foreign node as it discards it and, under the chain contract, no
+  // other session can be retiring the same node, so it is retired exactly
+  // once and nothing has to be recorded in the node.
   void discard(N *n) {
     if (owns(n)) {
-      // Created by this session and never published: nothing outside can
-      // reach it.
       N::destroy(n);
       return;
     }
-    if (n->is_retired())
-      return; // another session already owns its disposal
-    n->mark_retired();
     retired_.push_back(n);
     detail::account_retired<V>(1);
+  }
+
+  // Node's structural edits with the displaced allocation, if any, sent
+  // through discard() like any other garbage of this session.
+  [[nodiscard]] auto link_child(N *node, std::byte b, N *child) -> N * {
+    auto edit = N::insert_child(node, b, child);
+    if (edit.displaced)
+      discard(edit.displaced);
+    return edit.node;
+  }
+  [[nodiscard]] auto unlink_child(N *node, std::byte b) -> N * {
+    auto edit = N::remove_child(node, b);
+    if (edit.displaced)
+      discard(edit.displaced);
+    return edit.node;
   }
 
   // The node itself if this session owns it, else a clone stamped with the
@@ -1661,7 +1652,7 @@ public:
       auto *routing = make_internal();
       for (std::size_t i = 0; i < it->prefix_len; ++i)
         routing->prefix.push_back(key[it->prefix_start + i]);
-      cur = N::insert_child(*this, routing, key[it->transition_idx], cur);
+      cur = link_child(routing, key[it->transition_idx], cur);
     }
     return cur;
   }
@@ -1704,7 +1695,7 @@ public:
       auto *routing = make_internal();
       for (std::size_t i = 0; i < it->prefix_len; ++i)
         routing->prefix.push_back(merged[it->prefix_start + i]);
-      cur = N::insert_child(*this, routing, merged[it->transition_idx], cur);
+      cur = link_child(routing, merged[it->transition_idx], cur);
     }
     return cur;
   }
@@ -1732,7 +1723,7 @@ public:
       for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
         old_suffix.push_back(prefix_span[i]);
       mutable_node->prefix = std::move(old_suffix);
-      split = N::insert_child(*this, split, old_transition, mutable_node);
+      split = link_child(split, old_transition, mutable_node);
 
       auto remaining = key.subspan(cpl);
       if (remaining.empty()) {
@@ -1740,7 +1731,7 @@ public:
       } else {
         auto new_transition = remaining[0];
         auto *chain = build_leaf_chain(remaining.subspan(1), std::move(val));
-        split = N::insert_child(*this, split, new_transition, chain);
+        split = link_child(split, new_transition, chain);
       }
       return {split, true};
     }
@@ -1764,7 +1755,7 @@ public:
     // insert_child promotes mutable_node (leaf -> Node4 -> Node16 ->
     // Node48 -> Node256) as needed.
     auto *chain = build_leaf_chain(child_key, std::move(val));
-    mutable_node = N::insert_child(*this, mutable_node, transition, chain);
+    mutable_node = link_child(mutable_node, transition, chain);
     return {mutable_node, true};
   }
 
@@ -1795,7 +1786,7 @@ public:
       for (std::size_t i = cpl + 1; i < prefix_span.size(); ++i)
         old_suffix.push_back(prefix_span[i]);
       mutable_node->prefix = std::move(old_suffix);
-      split = N::insert_child(*this, split, old_transition, mutable_node);
+      split = link_child(split, old_transition, mutable_node);
 
       auto remaining = key.subspan(cpl);
       if (remaining.empty()) {
@@ -1803,7 +1794,7 @@ public:
       } else {
         auto new_transition = remaining[0];
         auto *chain = build_leaf_chain(remaining.subspan(1), std::move(val));
-        split = N::insert_child(*this, split, new_transition, chain);
+        split = link_child(split, new_transition, chain);
       }
       return {split, std::nullopt, true};
     }
@@ -1833,7 +1824,7 @@ public:
       return {mutable_node, std::move(displaced), inserted};
     }
     auto *chain = build_leaf_chain(child_key, std::move(val));
-    mutable_node = N::insert_child(*this, mutable_node, transition, chain);
+    mutable_node = link_child(mutable_node, transition, chain);
     return {mutable_node, std::nullopt, true};
   }
 
@@ -1886,7 +1877,7 @@ public:
         return {nullptr, true};
       }
       auto *mutable_node = mutable_copy(node);
-      mutable_node = N::remove_child(*this, mutable_node, transition);
+      mutable_node = unlink_child(mutable_node, transition);
       if (!mutable_node->has_value() && mutable_node->child_count() == 1)
         return {merge_with_child(mutable_node), true};
       return {mutable_node, true};
@@ -1970,11 +1961,11 @@ public:
 
       auto *a_trimmed = mutable_copy(a);
       a_trimmed->prefix = std::move(a_suffix);
-      split = N::insert_child(*this, split, a_transition, a_trimmed);
+      split = link_child(split, a_transition, a_trimmed);
 
       auto *b_trimmed = mutable_copy(b);
       b_trimmed->prefix = std::move(b_suffix);
-      split = N::insert_child(*this, split, b_transition, b_trimmed);
+      split = link_child(split, b_transition, b_trimmed);
 
       return {split, 0};
     }
@@ -2001,7 +1992,7 @@ public:
         existing->ptr = child;
         overlaps = child_overlaps;
       } else {
-        new_b = N::insert_child(*this, new_b, a_transition, a_trimmed);
+        new_b = link_child(new_b, a_transition, a_trimmed);
       }
       return {new_b, overlaps};
     }
@@ -2028,7 +2019,7 @@ public:
         existing->ptr = child;
         overlaps = child_overlaps;
       } else {
-        new_a = N::insert_child(*this, new_a, b_transition, b_trimmed);
+        new_a = link_child(new_a, b_transition, b_trimmed);
       }
       return {new_a, overlaps};
     }
@@ -2062,7 +2053,7 @@ public:
           overlaps += child_overlaps;
         } else {
           // Disjoint subtree — share it in O(1), no clone needed.
-          merged = N::insert_child(*this, merged, b_slot->transition,
+          merged = link_child(merged, b_slot->transition,
                                    b_slot->ptr);
         }
       }
@@ -2099,13 +2090,11 @@ private:
 
   // Gives the retired nodes back: they are still reachable from the base,
   // which outlives an unpublished session. Only for a session that never
-  // published — a published one hands the list to the registry.
+  // published — a published one hands the list to the chain.
   void forget_retired() noexcept {
     if (retired_.empty())
       return;
     detail::account_retired<V>(-static_cast<std::int64_t>(retired_.size()));
-    for (auto *n : retired_)
-      n->clear_retired();
     retired_.clear();
   }
 };
@@ -2142,7 +2131,7 @@ auto radix_get_ptr(const Node<V> *cur, std::span<const std::byte> key) noexcept
 // PersistentRadixTree<V>
 //
 // A handle to one immutable version. Copies are O(1): a root pointer, a
-// size and a pin on the version. Node lifetime belongs to VersionRegistry;
+// size and a pin on the version. Node lifetime belongs to VersionChain;
 // this class only pins and unpins. set() and erase() are one-operation
 // transients, so every mutation goes through the same path.
 // ---------------------------------------------------------------------------
@@ -2152,7 +2141,7 @@ public:
   PersistentRadixTree(const PersistentRadixTree &other)
       : root_{other.root_}, size_{other.size_}, version_{other.version_} {
     if (version_)
-      registry().pin(version_);
+      chain().pin(version_);
   }
   auto operator=(const PersistentRadixTree &other) -> PersistentRadixTree & {
     if (this == &other)
@@ -2160,7 +2149,7 @@ public:
     // Pin the new epoch before releasing the old one: if both are the same
     // version this keeps it alive throughout; if not, order does not matter.
     if (other.version_)
-      registry().pin(other.version_);
+      chain().pin(other.version_);
     release();
     root_ = other.root_;
     size_ = other.size_;
@@ -2213,14 +2202,16 @@ public:
 
   [[nodiscard]] auto transient() const -> TransientRadixTree<V>;
 
-  // Merge two trees into a new version derived from both. On key conflicts,
-  // resolve(a_val, b_val) picks the winner. Disjoint subtrees are shared in
-  // O(1); nodes of either input the result does not reuse are retired and
-  // freed once the inputs are gone. Size is computed inline as a.size() +
-  // b.size() - overlaps (no post-merge walk).
+  // Merges two trees into one that shares their untouched subtrees, and
+  // consumes both: each must be the only handle of a version with neither
+  // predecessor nor successor — what a builder or a previous merge yields —
+  // or std::logic_error is thrown and both are left intact. On success the
+  // inputs are empty handles, and the nodes of theirs the result does not
+  // reuse are freed at once. On key conflicts resolve(a_val, b_val) picks
+  // the winner. Size is computed inline as a.size() + b.size() - overlaps.
   template <typename ResolveFunc>
-  [[nodiscard]] static auto merge(const PersistentRadixTree &a,
-                                  const PersistentRadixTree &b,
+  [[nodiscard]] static auto merge(PersistentRadixTree &&a,
+                                  PersistentRadixTree &&b,
                                   ResolveFunc &&resolve)
       -> PersistentRadixTree;
 
@@ -2252,7 +2243,7 @@ public:
   // identities. With for_each_node this gives the whole set of allocated
   // nodes, which the accounting counters must agree with.
   [[nodiscard]] static auto parked_nodes() -> std::vector<const void *> {
-    return registry().parked_nodes();
+    return chain().parked_nodes();
   }
 
   // Test-only: visits every node reachable from this version once. Used
@@ -2282,22 +2273,30 @@ private:
   std::size_t size_{0};
   std::uint64_t version_{0}; // 0: the empty tree, pins nothing
 
-  static auto registry() -> VersionRegistry<V> & {
-    return VersionRegistry<V>::instance();
+  static auto chain() -> VersionChain<V> & {
+    return VersionChain<V>::instance();
   }
 
-  // Adopts a freshly published version (the registry already counts this
+  // Adopts a freshly published version (the chain already counts this
   // handle).
   PersistentRadixTree(Node<V> *root, std::size_t sz, std::uint64_t version)
       : root_{root}, size_{sz}, version_{version} {}
 
   void release() noexcept {
     if (version_) {
-      registry().unpin(version_, root_);
+      chain().unpin(version_, root_);
       version_ = 0;
     }
     root_ = nullptr;
     size_ = 0;
+  }
+
+  // Drops the handle without unpinning: for a version the chain has
+  // already consumed (merge).
+  void forget() noexcept {
+    root_ = nullptr;
+    size_ = 0;
+    version_ = 0;
   }
 
   friend class TransientRadixTree<V>;
@@ -2399,13 +2398,14 @@ public:
   }
 
   // Publishes the built tree as a new version. Throws std::logic_error if
-  // the base already has a live successor; the transient is then still
-  // active and its destructor discards what it built.
+  // the base already has a successor (the chain contract, see
+  // VersionChain); the transient is then still active and its destructor
+  // discards what it built.
   [[nodiscard]] auto persistent() && -> PersistentRadixTree<V> {
     ensure_active();
     if (!changed_) {
       // Nothing was touched, so this is the base version, not a new one.
-      // Handing back the base's own handle keeps the registry out of it
+      // Handing back the base's own handle keeps the chain out of it
       // entirely — the engine opens a transient per batch on maps that
       // most batches do not change. Every operation that builds or
       // supersedes a node sets changed_, so there is nothing to publish
@@ -2416,10 +2416,9 @@ public:
       size_ = 0;
       return std::move(base_);
     }
-    auto &retired = session_.retired_list();
-    const std::uint64_t bases[] = {base_.version_};
-    auto version = PersistentRadixTree<V>::registry().publish(
-        session_.tag(), bases, retired);
+    PersistentRadixTree<V>::chain().publish(session_.tag(), base_.version_,
+                                            session_.retired_list());
+    const auto version = session_.tag();
     session_.finish();
     auto live_size = std::exchange(size_, 0);
     auto *root = std::exchange(root_, nullptr);
@@ -2484,27 +2483,31 @@ auto PersistentRadixTree<V>::erase(std::span<const std::byte> key) const
 // Out-of-line: PersistentRadixTree::merge()
 template <typename V>
 template <typename ResolveFunc>
-auto PersistentRadixTree<V>::merge(const PersistentRadixTree &a,
-                                   const PersistentRadixTree &b,
+auto PersistentRadixTree<V>::merge(PersistentRadixTree &&a,
+                                   PersistentRadixTree &&b,
                                    ResolveFunc &&resolve)
     -> PersistentRadixTree {
   if (!a.root_)
-    return b;
+    return std::move(b);
   if (!b.root_)
-    return a;
+    return std::move(a);
   BuildSession<V> session;
   auto [new_root, overlaps] =
       session.merge(a.root_, b.root_, std::forward<ResolveFunc>(resolve));
   auto sz = a.size_ + b.size_ - overlaps;
-  const std::uint64_t bases[] = {a.version_, b.version_};
-  std::uint64_t version = 0;
   try {
-    version = registry().publish(session.tag(), bases, session.retired_list());
+    chain().publish_merge(session.tag(), a.version_, b.version_,
+                          session.retired_list());
   } catch (...) {
+    // The inputs are intact — the session only ever mutates its own
+    // clones — and their handles release them as usual.
     session.discard_all(new_root);
     throw;
   }
+  const auto version = session.tag();
   session.finish();
+  a.forget();
+  b.forget();
   return PersistentRadixTree{new_root, sz, version};
 }
 

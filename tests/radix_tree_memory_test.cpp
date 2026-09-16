@@ -1017,16 +1017,13 @@ TEST_CASE("Memory: merge stress", "[radix_tree][memory]") {
         // Tree B: last 600 keys (200 overlap with A).
         auto tree_b = build_tree({keys.begin() + 400, keys.end()});
 
-        // Merge B into A, keeping A's value on conflict.
+        // Merge B into A, keeping A's value on conflict. merge consumes
+        // both inputs; only merged is left.
         auto merged = Tree::merge(
-            tree_a, tree_b,
+            std::move(tree_a), std::move(tree_b),
             [](const int &a, const int &) { return a; });
 
         REQUIRE(merged.size() == 1000);
-
-        // Drop originals, keep only merged.
-        tree_a = Tree{};
-        tree_b = Tree{};
       }
       mem_after = alloc_tracker::net_bytes();
 

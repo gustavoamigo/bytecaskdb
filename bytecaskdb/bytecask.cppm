@@ -3094,6 +3094,13 @@ void DB::resume() {
   auto current = load_state_for_write();
   if (!current->degraded) return;  // re-check under lock
 
+  // The failed flush left one or two heads derived from the published
+  // state alive in head_. The key directory derives a version only from
+  // the end of its chain, so drop them now — ~FlushRole would only do it at
+  // the end of the barrier — and the resumed state is derived from the
+  // published one with those heads already reclaimed.
+  store_head(current);
+
   auto t = current->transient();
   const auto old_file_id = t.active_file_id();
   auto &file = t.active_file();
@@ -3609,8 +3616,9 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
     return kde_newer(x, y) ? x : y;
   };
 
-  auto merged =
-      PersistentRadixTree<KeyDirEntry>::merge(a.key_dir, b.key_dir, seq_resolver);
+  // merge consumes both inputs; a and b are ours, moved in by the caller.
+  auto merged = PersistentRadixTree<KeyDirEntry>::merge(
+      std::move(a.key_dir), std::move(b.key_dir), seq_resolver);
 
   for (const auto &[key, tomb_seq] : b.tombstones) {
     std::span<const std::byte> key_span{key.begin(), key.size()};

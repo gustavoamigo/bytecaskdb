@@ -1,6 +1,7 @@
 # Radix tree epoch reclamation — no reference counts on the write path
 
-Status: implemented on `radix-epoch-reclamation`; see Implementation notes.
+Status: implemented on `radix-epoch-reclamation`; see Implementation notes,
+in particular *Versions form a chain* for what changed after review.
 Intended as the implementation guide for a separate session; every code
 reference is to `main` at `4538844`.
 
@@ -297,44 +298,51 @@ re-examines only what was parked on it. Retention is then the same set
 reference counting held, and the cost is a `lower_bound` over the live
 versions (one to three of them) per retired node.
 
-### Versions form a graph, and a dead one is not always removable
+### Versions form a chain, and a dead head is retracted
 
-A version whose last handle goes while nothing was derived from it has to
-free what only it could reach, and the test is the same tag comparison:
-above every version it was derived from, and nothing else can reach it.
-That requires knowing its live ancestors, so the registry keeps the
-derivation graph and splices a dead version out, its successor inheriting
-its bases — which is what lowers the successor's floor onto the nodes it now
-holds alone, and why the last version of a lineage frees the whole
-structure.
+The interval rule above is exact only if every version with a tag at or
+above `R` was derived from `R`. The first implementation on this branch did
+not require that: it kept the derivation graph, spliced dead versions out,
+kept a dead version with two successors as a tombstone, suspended parking
+while any base had two live successors, and marked retirement in the node
+so that two siblings could not retire the same node twice. Review of the
+branch (PR #86) showed it still freed nodes a live version reached whenever
+two versions were derived from one base — sequentially, so the fork counter
+never rose, or concurrently, with the parked nodes released the moment the
+count dropped back while a sibling still read them — and that the engine
+derived from a non-head in exactly one place: `DB::resume`, whose barrier
+derives the resumed state from the published one while `FlushRole` still
+holds the failed head until the end of the barrier.
 
-Splicing unconditionally is wrong. The engine forks: a failed flush leaves
-an unpublished head, and the `resume()` that clears it derives a second
-version from the same published state. When that shared base died, both
-branches inherited its ancestors, the floor dropped below the base's own
-nodes, and the first branch to die freed nodes the other was still reading —
-found by ASAN as a heap-use-after-free in `contains_key` after `resume()`.
-A dead version with two or more successors is therefore kept as a tombstone:
-they share its nodes with each other, and it is what stops either one's walk
-from freeing what the other reads. It is spliced out when their number falls
-back to one.
+So the contract is stated and enforced instead. A version may be derived
+only from a version with no successor; `publish` throws `std::logic_error`
+otherwise. `merge` consumes its inputs — each the sole handle of a version
+with neither predecessor nor successor, which is what parallel recovery
+produces — and its result starts a new lineage, with the input nodes it
+does not reuse freed at publish. `resume()` resets `head_` to the published
+state before it derives, so the failed heads are reclaimed first.
 
-The same fork breaks the window argument for parking, since a fork can reach
-what its sibling superseded while carrying a larger tag, so parking is
-suspended while any base has more than one successor and resumes when that
-resolves. The engine is forked only between a failed flush and its `resume()`.
+Reclaiming them is *retraction*: when a version with no successor loses its
+last handle, let `F` be its newest live predecessor. Nodes reachable from
+the dead root with a tag above `F` were created by the dead segment and are
+freed by a walk; nodes still parked whose retiring tag is above `F` were
+retired by the segment and are reachable from `F` again, so they are
+unparked and left alone; `F` is the head again. With no `F` the lineage is
+over and everything goes. Two dead heads behind a failed flush, a published
+version a test drops, DB close and the tail of a recovery partition are all
+this one rule, and it is what makes the tag interval exact: `blocker_for`
+stays the only free rule.
 
-### The tag word has to be atomic
+That removed the derivation graph, the fork counter, the tombstones, the
+collapse routine and the retired bit. With the chain a node is retired
+exactly once and nothing writes to it after its session publishes, so the
+tag word is a plain `uint64_t` again and the tag has its 60 bits back.
+`Node::insert_child` and `remove_child` no longer take a session: they
+return the displaced allocation and `BuildSession` discards it, so the node
+layer knows nothing about lifetime. The reclaimer (`VersionChain`) has
+publish, pin/unpin and retract; `blocker_for` is the free rule.
 
-Two versions derived from one base can both supersede the same node, so
-retirement is marked in the node (bit 59) and a node already marked is left
-alone. That bit is the only write a node receives after its session
-published, and readers of other versions read the same word — TSAN reported
-77 races on it. The word is now `std::atomic<std::uint64_t>` with relaxed
-access everywhere: same node size, and on every target this builds for the
-loads and stores are the plain instructions they were.
-
-### The registry has to be allocation-free per version
+### The chain has to be allocation-free per version
 
 The first working version published each tree version into a `std::map` of
 records and a `std::set` of live tags, with the retired nodes grouped into
@@ -345,13 +353,12 @@ per key, which is what the engine's single-writer no-sync path looks like —
 was 87% slower at 1k keys. `perf` put `malloc`/`free` at 34% of that
 benchmark, with red-black tree rebalancing behind it.
 
-There are only ever a handful of live versions, so the registry now keeps
-them in flat vectors searched linearly: records sorted by tag, and the
-derivation graph as a flat list of base→successor pairs. Retired nodes stay
-in the vector the session already built and are moved, not regrouped,
+There are only ever a handful of live versions, so the chain now keeps
+them in a flat vector sorted by tag and searched linearly. Retired nodes
+stay in the vector the session already built and are moved, not regrouped,
 because the nodes of one parcel almost always share a blocker. Parcels hang
 off the record itself rather than a second map, and the scratch used while
-collapsing the graph is reused under the lock. Publishing a version then
+re-placing them is reused under the lock. Publishing a version then
 allocates nothing once the buffers have settled, and they are handed back
 when the last tree of that value type goes. `PersistentSet` went from −87% /
 −53% / −33% to −16% / +4% / +12% at 1k / 10k / 100k.
@@ -407,6 +414,47 @@ MergeDisjoint +21% to +26%, SplitBuildMergePrefixed +13% to +16%.
 `MergeOverlappingBinary/100000` is −26%, a wide-node shape the engine's
 recovery merge does not produce; it was not chased further.
 
+### Measurements after the chain rework
+
+Same host, September 16 2026, `main` at `4538844`, the branch before review
+at `3fee07b`, and the branch after the rework, interleaved in that order,
+best of two rounds. `map_bench` merge-only benchmarks changed shape with the
+consuming `merge` — inputs are rebuilt and the previous result freed with
+the timer paused, so they now time the merge plus the freeing of the input
+nodes it does not reuse, which the old shape deferred to the inputs' drop —
+and are not comparable across the change; `SplitBuildMerge*` builds, merges
+and frees on every side and is the like-for-like number. `PersistentSet/10000`
+is bimodal on this host (4 ms or 7 ms in different runs on every side) and
+is left out. Multi-threaded rows above 8 threads oversubscribe the 4 vCPUs
+and swing ±40% between rounds; they are not listed.
+
+| `engine_bench`, 1M keys | vs `main` | vs pre-review branch |
+|---|---|---|
+| Get | +0.9% | −0.8% |
+| Range50 | +43% | +6% |
+| Put/Sync | −2% | +10% |
+| Del/Sync | −3% | +1% |
+| MixedBatch/Sync | +4% | +4% |
+| PutMT/Sync 2 / 4 / 8 threads | −1% / +4% / −17% | +6% / +8% / +4% |
+| Recovery 2 / 4 / 8 / 16 threads | +18% / +8% / +13% / +8% | −3% / −1% / −8% / −3% |
+
+| `map_bench` | vs `main` | vs pre-review branch |
+|---|---|---|
+| TransientSet 1k / 10k / 100k | +37% / +29% / +34% | +1% / +8% / +7% |
+| TransientSetPrefixed | +20% / +28% / +31% | +15% / +8% / +12% |
+| TransientUpdate | +10% / +18% / +22% | −4% / +6% / +4% |
+| PersistentSet 1k / 100k | −10% / +18% | −12% / +11% |
+| SplitBuildMerge | +34% / +16% / +20% | +5% / +9% / +8% |
+| SplitBuildMergePrefixed | +24% / +27% / +36% | +11% / +12% / +17% |
+| LowerBound / UpperBound | +38–47% / +34–48% | +4–6% / +6–8% |
+
+The write path that was 4–9% behind `main` on this branch is now within
+noise of it on `engine_bench` (Put/Sync −2%, Del/Sync −3%, MixedBatch +4%)
+and ahead of the pre-review branch by 4–10%, with the pin on the walk path
+no longer taking the lock to mark a node retired. Recovery is 8–18% ahead of
+`main`; its rounds against the pre-review branch were single iterations and
+within their own noise.
+
 ### What is left
 
 The tree itself is 13–22% faster on every batched path, and the engine gains
@@ -416,15 +464,13 @@ upper bound. `perf` on `engine_bench`'s no-sync put attributes 4% of the
 branch's time to `pthread_mutex_lock`/`unlock`, against none on `main`, plus
 about 5 points more in `malloc`/`free`.
 
-The cause is structural rather than incidental: a commit opens a transient on
-three persistent maps (key directory, file registry, file stats), and each
-one pins its base, publishes, and drops the old version through one
-process-wide mutex per value type. `main` paid nothing here because a handle
-copy was a per-node atomic increment with no shared lock.
-
-The fix that follows from this is to make pinning lock-free: give records
-stable addresses and an atomic handle count, have the tree handle hold the
-record pointer rather than the tag, and take the lock only when a count
-reaches zero or a version is published. That removes the lock from every
-handle copy and from every drop but the last, leaving two lock acquisitions
-per version instead of four to six. It is not done here.
+Of the three persistent maps a commit touches only the key directory is a
+`PersistentRadixTree`; `files` and `file_stats` are `PersistentU32Map` and
+never touch the chain. So the mutex cost is one publish, one pin of the base
+and one drop of the previous version per batch, plus a pin and drop per
+handle copy. Issue #85 proposed making pinning lock-free — records with
+stable addresses and an atomic handle count, the lock taken only when a
+count reaches zero or a version is published. It is on hold until the chain
+rework above has been re-measured: publish is single-writer and the walk
+path no longer takes the lock to mark a node retired, so part of the
+measured mutex time should be gone without a separate change.
