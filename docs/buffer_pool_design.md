@@ -138,16 +138,31 @@ These are hypotheses, not claims. They have to be measured with `GetMT` at 2–3
 
 ---
 
-## 9. Where this loses
+## 9. Scope — when to turn it on
 
-- **In-RAM datasets.** Pure overhead — a lookup and a policy update in front of what the kernel already did for free. Every current benchmark is in this regime.
+This is opt-in, and the default stays `pread` / `mmap`.
+
+**The pool cannot beat `mmap` on a resident hit, structurally.** `ReadOnlyMmapDataFile` resolves a read to `mmap_base_ + offset` — an addition and a memcpy. The pool computes a frame index, hashes it, probes a table, checks the generation and takes a seqlock reading first: two or three extra cache misses on every hit. Against a resident dataset with no memory pressure, the pool is slower than what already ships. It beats `pread` (no syscall) and loses to `mmap`.
+
+That is not an argument against building it — it is the same trade every buffer pool makes, and the reason they are all sized explicitly rather than enabled by default. What it buys is what a buffer pool is for:
+
+- **Bounded, enforced residency.** The pool decides what stays. Under a cgroup limit, where page cache is charged to us and reclaimed on the kernel's schedule, nothing else here can make that promise.
+- **A hit ratio.** `disk_reads` cannot distinguish a page-cache hit from a device round trip, so there is currently no number to size against or alert on. A pool knows when it misses.
+
+Two secondary effects push the same way at scale: a 100 GiB mapping needs roughly 25 M page-table entries and lives in TLB-miss territory under random access, where a huge-page arena needs 512× fewer; and for the MariaDB plugin, an explicit pool size is the knob operators already know how to reason about.
+
+**Set `buffer_pool_bytes` when there is a memory budget to enforce. Leave it at zero otherwise.**
+
+### Real risks, to be measured
+
 - **Miss latency has no floor.** Today a "miss" often still hits the page cache. With `O_DIRECT` it is a device round trip. Mean throughput can improve while p99 regresses, which tenet 3 counts as a regression.
+- **32-thread read scaling.** 14.0 Mops/s is the strongest number in the README, and §8 is a set of hypotheses about not losing it, not a set of claims.
 - **Density.** A block cache stores headers, keys and superseded entries, exactly as the page cache does. §10 quantifies what a format-aware cache would save.
-- **Sharding costs hit ratio.** Capacity cannot move between shards. That is a deliberate trade of hit ratio for scaling, and both should be measured.
+- **Sharding costs hit ratio.** Capacity cannot move between shards — a deliberate trade of hit ratio for scaling, and both should be measured.
 
-The bet is **datasets larger than RAM, and memory-limited deployments** — not the 1 M-key benchmark.
+### Benchmarking consequence
 
----
+Comparing the pool against `mmap` on the current benchmarks measures the regime where it should be switched off, and will show it losing. The only comparison that means anything runs under memory pressure: the `pool_bytes / dataset_bytes` sweep in Phase 0, with p50 and p99, is the benchmark — not an addition to it.
 
 ## 10. Deferred — the A/B backlog
 
