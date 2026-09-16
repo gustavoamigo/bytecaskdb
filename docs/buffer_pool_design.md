@@ -234,7 +234,14 @@ One case genuinely cannot be served: an entry larger than the pool, or large eno
 
 The distinction from the rejected bypass matters. This is not "large values are slow", it is "one value may not evict the cache to hold itself". With the default 4 MiB ceiling it never fires unless the pool is smaller than about 32 MiB, and if it fires often that is a misconfiguration the counters should surface (`pool_oversize_reads`), not a tuning opportunity.
 
-**Provisional: A3**, frame size configurable with a default of 4096, extents as the admission and eviction unit, and no size-based bypass other than the capacity-derived guard rail. Provisional rather than decided — see *Pricing the trade properly* below, which is a Phase 0 measurement and a gate on Phase 1.
+**Decision for v1: A3**, frame size configurable with a default of 4096, extents as the admission and eviction unit, and no size-based bypass other than the capacity-derived guard rail. Revisited if the `u` measurement below says so, but built first regardless, for four reasons that are not about density:
+
+1. **The failure modes are not symmetric.** A3's downside is being less dense than optimal — a constant factor, recoverable by adding RAM. A1's downside is slab calcification and per-class eviction: a behavioural pathology that is hard to diagnose and which memcached has still not fully solved. Prefer the failure that can be bought out of. That is tenets 1 and 2 taking precedence over 4, which is the stated ordering.
+2. **A3 is the instrument that measures its own replacement.** `u` is defined as the fraction of a frame's entries read before eviction, so the quantity only exists once frames exist. It can be estimated in Phase 0 by replaying a read trace, but the real number comes from a running block cache. Building A3 is how the evidence for A1 gets earned.
+3. **It serves both read paths from the same bytes.** A1 either stores keys — surrendering the density that motivated it — or reconstructs them from the radix tree, and that cost lands on `iter_from`, already the weakest benchmark against RocksDB.
+4. **It is reversible.** Everything above the storage layer is identical either way: the CRC watermark, the `O_DIRECT` lifecycle split, insert-on-write, sharding, scan bypass, the counters and the phasing. Swapping the storage layer later is a contained change, not a redesign.
+
+See *Pricing the trade properly* below for the measurement that would reopen it.
 
 The fork against A1 was reopened once, on the strength of the density and dead-entry arguments above, and closed again on the allocator accounting — which is worth recording, because the deciding argument is not the obvious one.
 
@@ -282,7 +289,7 @@ Two estimated constants carry this arithmetic — 11 % internal fragmentation an
 - `u` — one counter per frame, incremented on hit, histogrammed at eviction. A frame-lifetime hit count over-counts repeat reads of the same entry, so it is an upper bound on `u` and therefore a *conservative* estimate in A3's favour, which is the right direction for a number being used to defend A3.
 - `L` — the live-byte fraction, which `file_stats` already tracks for vacuum.
 
-If measured `u` lands near or above 0.9, A3 is correct and the question closes. If it lands at 0.3 or below, A1's density advantage is large enough that the eviction-quality cost has to be measured rather than asserted, and Phase 1 should build A1 instead — with the allocator and per-class eviction costs priced in, not waved away as they were in the first draft of this section.
+If measured `u` lands near or above 0.9, A3 is correct on density too and the question closes permanently. If it lands at 0.3 or below, A1's density advantage is large enough that the eviction-quality cost has to be measured rather than asserted — with the allocator and per-class eviction costs priced in, not waved away as they were in the first draft of this section. Between those, A3 stands on the four reasons given above. Note that the trigger reopens the storage layer only; nothing else in this document depends on which way it lands.
 
 ### Axis B — eviction policy
 
@@ -583,7 +590,7 @@ If Phase 1 does not show a win in the regime Phase 0 establishes, the honest out
 ## 10. Open questions
 
 1. **Does `verify_checksums` keep its meaning?** Section 3 Axis C changes it from per-read to per-transfer. Is that acceptable as a silent change of meaning under a different back-end, or does it need a separate option so the two are not conflated?
-2. **Does Axis A resolve to a block cache or an entry cache?** Reopened: once allocator bookkeeping is counted, the header-and-key density argument for A1 nets to zero, but the frame-utilization term gives A1 roughly `0.9 / u` of A3's effective capacity, crossing over near 90 % utilization. Phase 0 measures `u` and `L`, and Phase 1 builds whichever side that lands on. Not to be settled by argument — see *Pricing the trade properly*.
+2. ~~Does Axis A resolve to a block cache or an entry cache?~~ Settled for v1: block cache, on failure-mode asymmetry, reversibility, and the fact that a block cache is what measures whether an entry cache is warranted. The density arithmetic still favours A1 at low frame utilization, so `u <= 0.3` reopens the storage layer — and only the storage layer. See *Pricing the trade properly*.
 3. **Should the pool be per-DB or process-wide?** Per-DB is simpler and matches `Options`. Process-wide matters for the MariaDB plugin, where many tables would otherwise each carve out their own fixed arena.
 4. **Is `O_DIRECT` alone enough, or do we want `RWF_NOWAIT` / `preadv2` as a "hit the page cache or tell me you missed" probe?** That would let us keep the page cache as a free second tier without giving up control.
 5. **What is the acceptance bar?** Section 8 argues it should be a hit ratio and a p99 at a stated working-set ratio, not a throughput number on the existing benchmarks. That bar should be agreed before Phase 1, not after.
