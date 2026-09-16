@@ -177,6 +177,43 @@ Concretely, the chain is policy metadata: frames in an extent link to their succ
 
 This also fixes a second-order problem: with per-frame reference bits, a hot 1024-frame value sets 1024 bits and is 1024 separate eviction decisions. With one bit per extent, it is one object with one recency, which is what it actually is.
 
+#### What a read touches, and what a frame stores
+
+These are two different questions, and the answer differs.
+
+**On the read path, the key is dead weight — and the pool can skip it entirely.** `read_value` receives `key_size` from the caller, because the caller already *has* the key; it reads the key off disk only to step over it and to feed it into the CRC. So today's `pread` path for a `get` does:
+
+1. `pread` the whole entry, `19 + key_size + value_size` bytes, into `io_buf` — one syscall, one copy;
+2. CRC over all of it;
+3. `out.assign(...)` — a second copy, of the value alone.
+
+A pool-backed `read_value`, with the CRC already discharged at fill time (Axis C), does:
+
+1. resolve the frames covering `[offset + kHeaderSize + key_size, ... + value_size)` — the **value's** byte range, not the entry's;
+2. memcpy those bytes straight into `out`.
+
+The header, the key and the CRC trailer are never touched, never copied, and **`io_buf` is never written at all** on this path. It stays in the signature because the contract requires it, and a pool-backed `read_value` simply ignores it.
+
+Worth keeping the size of this in proportion: the dominant saving is the avoided syscall and the avoided CRC, both measured in microseconds or hundreds of nanoseconds. Not copying the key saves one memcpy of tens of bytes — real, but second-order next to the I/O it replaces. The place the key genuinely costs something is *storage*, below.
+
+**In the frames, the key is stored, and that is a deliberate trade.** A frame is a verbatim image of 4 KiB of file, so it holds headers, keys, CRC trailers and neighbouring entries alongside the values. Storing only values would be denser — the question is by how much, and what it costs:
+
+| value | key | value as % of entry | density gain if values only |
+|---:|---:|---:|---:|
+| 16 B | 16 B | 31 % | 3.2× |
+| 64 B | 16 B | 65 % | 1.6× |
+| 256 B | 24 B | 86 % | 1.2× |
+| 1 KiB | 24 B | 96 % | 1.04× |
+| 4 KiB | 24 B | 99 % | 1.01× |
+
+So a value-only cache is worth 1.5–3× the effective capacity for small values and rounds to nothing above about 256 bytes.
+
+Against that, the device transfer is 4 KiB whether we want it or not — that is the `O_DIRECT` alignment unit and the kernel's minimum besides. At 51 bytes per entry, one aligned read brings in roughly **80 entries**. A block cache keeps all 80 and can serve any of them; a value-only cache keeps one and discards 79 it has already paid to transfer. Whether that matters is entirely a question of whether the workload has spatial locality — and in an append-only file, physical adjacency *is* write-time adjacency, which is exactly the correlation that batch writes, event streams and session data produce.
+
+Density of 1.5–3× against up to 80 neighbours per I/O is not a trade that argument settles. It is Axis A's real content, and it belongs in the A/B rather than in this paragraph: A1 (entry/value cache) versus A3 (block cache) is precisely this question, and the counters in Section 9.2 are what decide it.
+
+One coupling to note before anyone tries a values-only pool: `read_entry` / `read_entry_unverified` **do** need the key, because `EntryIterator` yields `EntryView{key, value}` and sources the key from disk deliberately — `bytecask.cppm:289` records that it "uses `ValueIterator` internally — no key reconstruction during tree walk". A values-only pool could not serve the iterator paths without either reconstructing keys from the radix tree (which `KeyIterator` already does, at a cost that comment was written to avoid) or falling back to disk for the key alone. A block cache serves both paths from the same bytes.
+
 #### Costs, stated honestly
 
 - **Eviction latency is no longer bounded.** Freeing one victim may release 1024 frames, and the thread that pays is the reader that took the miss. That is a tenet 3 problem, and it is the real price of dropping the bypass. Mitigations worth measuring: cap the work done per victim selection and continue the release incrementally, or hand large releases to the background worker. This needs a p99 measurement on a mixed small/large workload before it is called settled.
@@ -480,7 +517,7 @@ If Phase 1 does not show a win in the regime Phase 0 establishes, the honest out
 ## 10. Open questions
 
 1. **Does `verify_checksums` keep its meaning?** Section 3 Axis C changes it from per-read to per-transfer. Is that acceptable as a silent change of meaning under a different back-end, or does it need a separate option so the two are not conflated?
-2. **Is the entry cache (A1) really dismissed?** It is the only option that makes CRC-on-fill trivially correct with no per-frame state at all. The case against it is read amplification under `O_DIRECT` and metadata overhead for small values — both arguments, not measurements.
+2. **Is the entry cache (A1) really dismissed?** It is the only option that makes CRC-on-fill trivially correct with no per-frame state at all, and storing values without their keys and headers is worth 1.5–3× effective capacity below ~64-byte values (Axis A, *What a read touches*). Against that it discards ~79 of the ~80 entries every aligned device read already paid for, and it cannot serve the `read_entry` / `EntryIterator` paths without key reconstruction. Density versus locality is a measurement, not an argument — it should be settled by the A/B, not here.
 3. **Should the pool be per-DB or process-wide?** Per-DB is simpler and matches `Options`. Process-wide matters for the MariaDB plugin, where many tables would otherwise each carve out their own fixed arena.
 4. **Is `O_DIRECT` alone enough, or do we want `RWF_NOWAIT` / `preadv2` as a "hit the page cache or tell me you missed" probe?** That would let us keep the page cache as a free second tier without giving up control.
 5. **What is the acceptance bar?** Section 8 argues it should be a hit ratio and a p99 at a stated working-set ratio, not a throughput number on the existing benchmarks. That bar should be agreed before Phase 1, not after.
