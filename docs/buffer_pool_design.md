@@ -71,18 +71,42 @@ Three of the five are a clean fit:
 
 `read_entry` / `read_entry_unverified` return a `DataEntryView` whose `key` and `value` are non-owning spans. The two existing implementations satisfy this differently:
 
-- mmap: spans point into the mapping, valid for the lifetime of the `DataFile`.
+- mmap: spans point into the mapping, valid for the lifetime of the `DataFile` — with one exception, noted below.
 - pread: spans point into the caller's `io_buf`, valid until the next call with that buffer. `EntryIterator` documents exactly this: *"Spans are valid until the next `operator++()`"*.
 
-A pool cannot offer the mmap guarantee. A frame can be evicted by another thread between the call and the caller's use of the span. Two ways out:
+**Why mmap gets its guarantee for free, and a pool cannot.** `ReadOnlyMmapDataFile` maps the whole file once: the byte at file offset `N` is always at `mmap_base_ + N`, for the entire life of the object, and the registry's `shared_ptr<DataFile>` keeps that object alive as long as any iterator holds it. Nothing moves or reuses that address. The guarantee is not maintained by the implementation — it is a consequence of a 1:1, address-stable mapping that never recycles.
+
+A pool exists precisely to put more file behind fewer bytes of memory: frame slot 4711 holds `(file 3, frame 900)` now and `(file 7, frame 12)` later. Address stability is the thing a cache trades away in order to be a cache. So a span into a frame is valid only until that frame is recycled, and the recycling decision belongs to whoever next takes a miss:
+
+```
+Thread A: for (auto& [k, v] : db.iter_from({}, prefix))   // v spans frame 4711
+              ...user code...                              // window is user-controlled
+Thread B: db.get(other_key)  -> miss -> pool full -> victim search picks 4711
+                             -> refills it with unrelated file content
+Thread A: reads v                                          // wrong bytes
+```
+
+Two things about this are worth stating precisely, because both are easy to get wrong:
+
+**It does not require a second thread.** `EntryIterator::operator*` hands out a span; the user's loop body calls `db.get(k)`; that read misses, needs a victim, and can select the very frame the live span points into. A single-threaded program is enough.
+
+**A sanitiser will not catch it.** This is not the BC-122 failure mode, where the dangling span pointed at freed heap and ASan reported a heap-use-after-free. Here the arena is still mapped and readable — the memory is valid, the *contents* belong to a different file. And because a frame holds real entry bytes, the garbage is structurally plausible: right shape, plausible lengths, wrong data. The result is a silently wrong value returned to the caller, with no crash and no sanitiser report. That is strictly harder to detect than the bug the coding guidelines hold up as the cautionary tale, which is reason enough to design the hazard out rather than manage it.
+
+**In fairness, the mmap guarantee has one hole.** `resume()` is the only `truncate()` call site, and `WritableMmapDataFile::truncate` performs `munmap` -> `ftruncate` -> `mmap` in place on a live `DataFile`. `WriteBarrier` excludes writers only; reads are lock-free and remain available while the engine is degraded. A reader holding a span from `read_entry` on the active mmap file across a `resume()` therefore holds a genuinely dangling pointer, and since `mmap(nullptr, ...)` may return the same address, it would often appear to work. This has not been shown reachable by a test, and it is pre-existing and orthogonal to this proposal — but the mmap guarantee should not be described as unconditional.
+
+There are three ways out, not two:
 
 **Option R1 — copy out into `io_buf` (recommended).** The pool-backed implementation copies the entry's bytes from its frames into the caller's `io_buf` and returns spans into that, exactly like `ReadOnlyPosixDataFile`. The contract is unchanged, byte for byte, and the caller-visible lifetime rule is the one already documented.
 
-**Option R2 — return a pinned handle.** Change the signature to return an RAII `PinnedEntry` that holds a pin on the frames. Zero-copy, but it changes the contract for all three back-ends, puts a refcount on the hot read path (Section 6.2 explains why that is the expensive choice, not the cheap one), and keeps a pin alive for as long as the caller holds the view — which for `EntryIterator` is an unbounded user-controlled window.
+**Option R2 — return a pinned handle.** Change the signature to return an RAII `PinnedEntry` holding a pin on the frames. Zero-copy, but it changes the contract for all three back-ends, and puts a refcount on the hot read path (Section 6.2 explains why that is the expensive choice, not the cheap one). It is also more than "add a refcount": the pin lives as long as the caller holds the view, which for `EntryIterator` is an unbounded, user-controlled window, so a slow loop body can pin an arbitrary fraction of the pool — up to a miss finding no evictable victim at all.
+
+**Option R3 — epoch-based reclamation (QSBR).** Readers publish an epoch on entry; evicted frames go to a retired list and are recycled only once every reader that could have observed them has quiesced. No per-read refcount, so the hot path is cheaper than R2. Rejected for the same unbounded window: an `EntryIterator` span stays live across the user's loop body, so a reader can sit in an epoch indefinitely and stall reclamation *pool-wide*, not just for the frame it is using. That is a worse failure than the one it fixes.
+
+A fourth shape — hand back the span plus a version stamp and require the caller to re-validate before use — is rejected on principle: it makes correctness depend on caller discipline, which the coding guidelines rank below designs where incorrect usage is impossible.
 
 **Recommendation: R1.** The copy is a memcpy of typically a few hundred bytes (tens of nanoseconds) against a saved syscall or device read (microseconds to hundreds of microseconds). It keeps the new back-end a genuine drop-in, which is precisely what makes the A/B honest — the same test bodies and the same benchmark bodies run unmodified against all three. R2 is a later optimisation with a measurement behind it, not a starting point.
 
-There is a second reason for R1 that is not about simplicity: copy-out is what lets us use optimistic reads instead of pin counts (Section 6.2). Handing out long-lived pointers forces refcounting; refcounting on a hot frame is a contended cacheline; a contended cacheline is how we lose the 32-thread scaling number.
+R1 is also the only one of the three in which the dangerous window does not exist, rather than being managed by additional machinery. And there is a second reason for it that is not about simplicity: copy-out is what lets us use optimistic reads instead of pin counts (Section 6.2). Handing out long-lived pointers forces refcounting; refcounting on a hot frame is a contended cacheline; a contended cacheline is how we lose the 32-thread scaling number.
 
 ### 2.2 Blast radius
 
@@ -419,3 +443,4 @@ If Phase 1 does not show a win in the regime Phase 0 establishes, the honest out
 3. **Should the pool be per-DB or process-wide?** Per-DB is simpler and matches `Options`. Process-wide matters for the MariaDB plugin, where many tables would otherwise each carve out their own fixed arena.
 4. **Is `O_DIRECT` alone enough, or do we want `RWF_NOWAIT` / `preadv2` as a "hit the page cache or tell me you missed" probe?** That would let us keep the page cache as a free second tier without giving up control.
 5. **What is the acceptance bar?** Section 8 argues it should be a hit ratio and a p99 at a stated working-set ratio, not a throughput number on the existing benchmarks. That bar should be agreed before Phase 1, not after.
+6. **Is the `resume()` / `WritableMmapDataFile::truncate` span hazard (Section 2.1) reachable in practice?** It predates this proposal and is independent of it: `truncate` remaps in place while lock-free readers may hold spans from `read_entry` on the active file. If reachable it is its own bug with its own fix, and should be tracked separately rather than folded into this work.
