@@ -52,6 +52,22 @@ export struct BufferPoolOptions {
   // and never admitted: admitting it would evict the working set to hold a
   // single value. Derived from capacity, not a tuning knob.
   unsigned oversize_guard_divisor{8};
+  // Fill frames with O_DIRECT so the pool is the only consumer of memory for
+  // sealed-file data. This is the mechanism, not an optimisation: a pool
+  // filled through the page cache bounds nothing but itself. A filesystem
+  // that refuses O_DIRECT (older tmpfs, some FUSE and overlay mounts) falls
+  // back to buffered fills per file, counted in pool_direct_io_fallbacks.
+  bool direct_io{true};
+};
+
+// The descriptors a pool-backed file hands to the pool. `direct` is opened
+// O_DIRECT and serves frame-aligned fills only; it is -1 where the filesystem
+// refused it, and fills then go through `buffered`. `buffered` serves
+// everything else: oversize reads, reads into a caller's unaligned buffer,
+// and the fallback.
+export struct PoolFile {
+  int buffered{-1};
+  int direct{-1};
 };
 
 // ---------------------------------------------------------------------------
@@ -78,7 +94,7 @@ export class BufferPool {
 public:
   // Thrown when capacity is too small to hold any frame at all.
   BufferPool(const BufferPoolOptions &opts, Counters &counters)
-      : counters_{counters},
+      : counters_{counters}, direct_io_{opts.direct_io},
         oversize_limit_{opts.oversize_guard_divisor > 0
                             ? opts.capacity_bytes / opts.oversize_guard_divisor
                             : opts.capacity_bytes} {
@@ -121,76 +137,18 @@ public:
   // frame's contents be fixed-length with no per-frame valid-length field.
   //
   // Throws std::system_error if the underlying read fails or comes up short.
-  void read_at(std::uint32_t file_id, int fd, std::uint64_t offset,
-               std::size_t len, std::size_t file_size, std::byte *dst) {
-    if (len == 0) return;
+  void read_at(std::uint32_t file_id, PoolFile file, std::uint64_t offset,
+               std::size_t len, std::size_t file_size, std::byte *dst);
 
-    // An oversize entry would evict the working set to hold one value.
-    if (len > oversize_limit_) {
-      counters_.pool_oversize_reads.fetch_add(1, std::memory_order_relaxed);
-      pread_exact(fd, dst, len, offset);
-      return;
-    }
+  [[nodiscard]] inline auto direct_io() const noexcept -> bool {
+    return direct_io_;
+  }
 
-    const auto first = offset / kPoolFrameBytes;
-    const auto last = (offset + len - 1) / kPoolFrameBytes;
-    if (first != last) {
-      counters_.pool_multi_frame_reads.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    // Try to serve every frame from cache before touching the device, so a
-    // fully-resident multi-frame read costs no I/O at all.
-    bool all_hit = true;
-    for (auto f = first; f <= last && all_hit; ++f) {
-      all_hit = copy_out_of_frame(make_key(file_id, f), f, offset, len, dst);
-    }
-    if (all_hit) {
-      counters_.pool_hits.fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
-    counters_.pool_misses.fetch_add(1, std::memory_order_relaxed);
-
-    // Coalesce the misses into one read of the frame-aligned extent, then
-    // admit each whole frame it covered.
-    const auto extent_start = first * kPoolFrameBytes;
-    const auto extent_end = (last + 1) * kPoolFrameBytes;
-    const auto clamped_end = std::min<std::uint64_t>(extent_end, file_size);
-    if (clamped_end <= extent_start) {
-      pread_exact(fd, dst, len, offset);
-      return;
-    }
-    const auto extent_len = static_cast<std::size_t>(clamped_end - extent_start);
-
-    // Reused across calls. A fresh vector here would heap-allocate AND
-    // zero-fill several KiB on every miss, immediately before overwriting all
-    // of it — an allocation on the read path, which tenet 3 rules out.
-    // Thread-exit destructor is intentional; suppress the Clang diagnostic.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wexit-time-destructors"
-    thread_local std::vector<std::byte> scratch;
-#pragma clang diagnostic pop
-    scratch.resize(extent_len);
-    pread_exact(fd, scratch.data(), extent_len, extent_start);
-
-    // The caller's bytes come from the buffer we just read, not from the
-    // frames: a frame admitted here can be evicted before we copy out of it.
-    const auto copy_from = static_cast<std::size_t>(offset - extent_start);
-    if (copy_from + len > extent_len) {
-      throw std::system_error{
-          EIO, std::generic_category(),
-          std::format("BufferPool::read_at: file {} is shorter than the "
-                      "requested range [{}, {})",
-                      file_id, offset, offset + len)};
-    }
-    std::memcpy(dst, scratch.data() + copy_from, len);
-
-    for (auto f = first; f <= last; ++f) {
-      const auto frame_start = f * kPoolFrameBytes;
-      // Only whole frames are admitted; a short tail frame stays uncached.
-      if (frame_start + kPoolFrameBytes > file_size) break;
-      admit(make_key(file_id, f),
-            scratch.data() + (frame_start - extent_start));
-    }
+  // A pool-backed file reports that its filesystem refused O_DIRECT and it
+  // will fill through the page cache. Surfaced so a CI run on tmpfs cannot
+  // silently measure the wrong thing.
+  inline void note_direct_io_fallback() noexcept {
+    counters_.pool_direct_io_fallbacks.fetch_add(1, std::memory_order_relaxed);
   }
 
 private:
@@ -270,6 +228,77 @@ private:
     k ^= k >> 31;
     return static_cast<std::size_t>(k);
   }
+
+  // One fill request: a frame-aligned extent that may end at EOF.
+  struct FillRequest {
+    std::uint64_t offset;  // multiple of kPoolFrameBytes
+    std::size_t len;       // bytes actually needed; unaligned at EOF
+    std::byte *dst;        // kPoolFrameBytes-aligned, room for align_up(len)
+  };
+
+  // The one seam every fill goes through. A batch of one today, so that
+  // preadv, O_DIRECT and io_uring are implementations of this call rather
+  // than of read_at; iter_from knows its next N keys with no I/O and is the
+  // caller that would hand in more than one.
+  void fill(PoolFile file, std::span<const FillRequest> reqs) {
+    for (const auto &r : reqs) {
+      if (file.direct >= 0 && fill_direct(file.direct, r)) continue;
+      pread_exact(file.buffered, r.dst, r.len, r.offset);
+    }
+  }
+
+  // O_DIRECT needs the offset, the length and the buffer aligned to the
+  // device block size, and frames give all three at 4 KiB — a multiple of
+  // every real block size, so no statx probe is needed. The length is
+  // rounded up, and a read that runs past EOF comes back short, which is
+  // allowed. Returns false on anything else so the caller retries buffered:
+  // a device wanting alignment above 4 KiB answers EINVAL here, not at open.
+  [[nodiscard]] static auto fill_direct(int fd, const FillRequest &r) noexcept
+      -> bool {
+    const auto want = align_up(r.len, kPoolFrameBytes);
+    std::size_t done = 0;
+    while (done < want) {
+      const auto n = ::pread(fd, r.dst + done, want - done,
+                             static_cast<off_t>(r.offset + done));
+      if (n < 0) return false;
+      if (n == 0) break;  // EOF
+      done += static_cast<std::size_t>(n);
+    }
+    return done >= r.len;
+  }
+
+  [[nodiscard]] static constexpr auto align_up(std::size_t v,
+                                               std::size_t a) noexcept
+      -> std::size_t {
+    return (v + a - 1) / a * a;
+  }
+
+  // Page-aligned, grow-only scratch for fills. Held thread_local by read_at.
+  class AlignedScratch {
+  public:
+    AlignedScratch() = default;
+    ~AlignedScratch() { std::free(p_); }
+    AlignedScratch(const AlignedScratch &) = delete;
+    auto operator=(const AlignedScratch &) -> AlignedScratch & = delete;
+
+    // bytes must be a multiple of kPoolFrameBytes (aligned_alloc requires it).
+    [[nodiscard]] auto ensure(std::size_t bytes) -> std::byte * {
+      if (bytes > cap_) {
+        std::free(p_);
+        p_ = static_cast<std::byte *>(std::aligned_alloc(kPoolFrameBytes, bytes));
+        if (p_ == nullptr) {
+          cap_ = 0;
+          throw std::bad_alloc{};
+        }
+        cap_ = bytes;
+      }
+      return p_;
+    }
+
+  private:
+    std::byte *p_{nullptr};
+    std::size_t cap_{0};
+  };
 
   static void pread_exact(int fd, std::byte *dst, std::size_t len,
                           std::uint64_t offset) {
@@ -353,6 +382,7 @@ private:
       if (old != kEmptyKey) {
         table_erase(old);
         counters_.pool_evictions.fetch_add(1, std::memory_order_relaxed);
+        counters_.pool_frames_resident.fetch_sub(1, std::memory_order_relaxed);
       }
       // Odd version parks readers and keeps CLOCK off this frame while the
       // copy below runs without the lock.
@@ -374,6 +404,7 @@ private:
     counters_.pool_fills.fetch_add(1, std::memory_order_relaxed);
     counters_.pool_fill_bytes.fetch_add(narrow<std::int64_t>(kPoolFrameBytes),
                                         std::memory_order_relaxed);
+    counters_.pool_frames_resident.fetch_add(1, std::memory_order_relaxed);
   }
 
   // CLOCK: advance the hand, clearing reference bits, until an unreferenced
@@ -428,6 +459,7 @@ private:
   }
 
   Counters &counters_;
+  bool direct_io_;
   std::size_t oversize_limit_;
   std::size_t frame_count_{0};
   std::size_t table_mask_{0};
@@ -443,5 +475,81 @@ private:
   std::mutex fill_mu_;
   std::size_t hand_{0};  // guarded by fill_mu_
 };
+
+void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
+                       std::uint64_t offset, std::size_t len,
+                       std::size_t file_size, std::byte *dst) {
+  if (len == 0) return;
+
+  // An oversize entry would evict the working set to hold one value. It
+  // lands in the caller's buffer, which is not aligned, so never O_DIRECT.
+  if (len > oversize_limit_) {
+    counters_.pool_oversize_reads.fetch_add(1, std::memory_order_relaxed);
+    pread_exact(file.buffered, dst, len, offset);
+    return;
+  }
+
+  const auto first = offset / kPoolFrameBytes;
+  const auto last = (offset + len - 1) / kPoolFrameBytes;
+  if (first != last) {
+    counters_.pool_multi_frame_reads.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // Try to serve every frame from cache before touching the device, so a
+  // fully-resident multi-frame read costs no I/O at all.
+  bool all_hit = true;
+  for (auto f = first; f <= last && all_hit; ++f) {
+    all_hit = copy_out_of_frame(make_key(file_id, f), f, offset, len, dst);
+  }
+  if (all_hit) {
+    counters_.pool_hits.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  counters_.pool_misses.fetch_add(1, std::memory_order_relaxed);
+
+  // Coalesce the misses into one read of the frame-aligned extent, then
+  // admit each whole frame it covered.
+  const auto extent_start = first * kPoolFrameBytes;
+  const auto extent_end = (last + 1) * kPoolFrameBytes;
+  const auto clamped_end = std::min<std::uint64_t>(extent_end, file_size);
+  if (clamped_end <= extent_start) {
+    pread_exact(file.buffered, dst, len, offset);
+    return;
+  }
+  const auto extent_len = static_cast<std::size_t>(clamped_end - extent_start);
+
+  // Reused across calls and page-aligned, so a direct fill can land in it.
+  // A fresh buffer here would heap-allocate on every miss — an allocation on
+  // the read path, which tenet 3 rules out. Sized to the rounded-up extent
+  // because a direct read must ask for a block multiple even at EOF.
+  // Thread-exit destructor is intentional; suppress the Clang diagnostic.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  thread_local AlignedScratch scratch;
+#pragma clang diagnostic pop
+  auto *buf = scratch.ensure(align_up(extent_len, kPoolFrameBytes));
+
+  const FillRequest req{.offset = extent_start, .len = extent_len, .dst = buf};
+  fill(file, std::span<const FillRequest>{&req, 1});
+
+  // The caller's bytes come from the buffer we just read, not from the
+  // frames: a frame admitted here can be evicted before we copy out of it.
+  const auto copy_from = static_cast<std::size_t>(offset - extent_start);
+  if (copy_from + len > extent_len) {
+    throw std::system_error{
+        EIO, std::generic_category(),
+        std::format("BufferPool::read_at: file {} is shorter than the "
+                    "requested range [{}, {})",
+                    file_id, offset, offset + len)};
+  }
+  std::memcpy(dst, buf + copy_from, len);
+
+  for (auto f = first; f <= last; ++f) {
+    const auto frame_start = f * kPoolFrameBytes;
+    // Only whole frames are admitted; a short tail frame stays uncached.
+    if (frame_start + kPoolFrameBytes > file_size) break;
+    admit(make_key(file_id, f), buf + (frame_start - extent_start));
+  }
+}
 
 } // namespace bytecask

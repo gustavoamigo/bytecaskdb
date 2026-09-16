@@ -42,9 +42,13 @@ public:
     REQUIRE(std::fclose(f) == 0);
     fd_ = ::open(path_.c_str(), O_RDONLY);
     REQUIRE(fd_ != -1);
+    // -1 where the filesystem refuses O_DIRECT; the pool then fills buffered,
+    // which is the same fallback a real sealed file takes.
+    direct_fd_ = ::open(path_.c_str(), O_RDONLY | O_DIRECT);
   }
 
   ~ScratchFile() {
+    if (direct_fd_ != -1) ::close(direct_fd_);
     if (fd_ != -1) ::close(fd_);
     std::error_code ec;
     std::filesystem::remove(path_, ec);
@@ -53,7 +57,9 @@ public:
   ScratchFile(const ScratchFile &) = delete;
   auto operator=(const ScratchFile &) -> ScratchFile & = delete;
 
-  [[nodiscard]] auto fd() const noexcept -> int { return fd_; }
+  [[nodiscard]] auto fd() const noexcept -> bytecask::PoolFile {
+    return {.buffered = fd_, .direct = direct_fd_};
+  }
   [[nodiscard]] auto size() const noexcept -> std::size_t { return size_; }
   // The oracle: what a correct read of [offset, offset+len) must return.
   [[nodiscard]] auto expected(std::size_t offset, std::size_t len) const
@@ -72,6 +78,7 @@ private:
   std::vector<std::byte> bytes_;
   std::size_t size_;
   int fd_{-1};
+  int direct_fd_{-1};
 };
 
 // Big enough that frames are plentiful unless a test says otherwise.

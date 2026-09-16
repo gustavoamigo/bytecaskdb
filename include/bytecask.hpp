@@ -67,6 +67,7 @@ enum class IoBackend { Pread, Mmap, BufferPool };
 struct BufferPoolOptions {
   std::size_t capacity_bytes{0};
   unsigned oversize_guard_divisor{8};
+  bool direct_io{true};
 };
 
 enum class EntryType : std::uint8_t {

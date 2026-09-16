@@ -1195,9 +1195,23 @@ public:
     if (::fstat(fd, &st) == 0) {
       file_size = static_cast<std::size_t>(st.st_size);
     }
+
+    int direct_fd = -1;
+    if (pool.direct_io()) {
+      direct_fd = open_direct(path, file_size);
+      if (direct_fd == -1) {
+        pool.note_direct_io_fallback();
+      } else {
+        // Fills no longer come from the page cache, so the residency this
+        // file built up while it was the active file is pure waste from here
+        // on. It was fdatasync'd before it was sealed, so the pages are clean
+        // and this is a release, not a discard of unwritten data.
+        ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+      }
+    }
     return std::shared_ptr<ReadOnlyBufferPoolDataFile>(
-        new ReadOnlyBufferPoolDataFile{std::move(path), fd, file_size, file_id,
-                                       pool});
+        new ReadOnlyBufferPoolDataFile{std::move(path), fd, direct_fd,
+                                       file_size, file_id, pool});
   }
 
   ~ReadOnlyBufferPoolDataFile() override;
@@ -1205,19 +1219,19 @@ public:
   [[nodiscard]] auto scan(Offset offset) const
       -> std::optional<std::pair<DataEntry, Offset>> override {
     if (offset + kHeaderSize > file_size_) {
-      return std::nullopt;
+      return sweep_done();
     }
-    const auto header = read_header(offset, Source::Direct);
-    if (header.sequence == 0) return std::nullopt;
+    const auto header = read_header(offset, Source::Bypass);
+    if (header.sequence == 0) return sweep_done();
     const auto next =
         offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
     if (next > file_size_) {
-      return std::nullopt;
+      return sweep_done();
     }
     std::vector<std::byte> buf;
     auto view = read_entry_with_key_size(offset, header.key_size,
                                          header.value_size, buf,
-                                         Source::Direct);
+                                         Source::Bypass);
     return std::make_pair(
         DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
                   .key = {view.key.begin(), view.key.end()},
@@ -1274,12 +1288,48 @@ public:
 
 private:
   ReadOnlyBufferPoolDataFile(std::filesystem::path path, int fd,
-                             std::size_t file_size, std::uint32_t file_id,
-                             BufferPool &pool)
-      : DataFile{std::move(path)}, fd_{fd}, file_size_{file_size},
-        file_id_{file_id}, pool_{&pool} {}
+                             int direct_fd, std::size_t file_size,
+                             std::uint32_t file_id, BufferPool &pool)
+      : DataFile{std::move(path)}, fd_{fd}, direct_fd_{direct_fd},
+        file_size_{file_size}, file_id_{file_id}, pool_{&pool} {}
+
+  // Opens a second descriptor with O_DIRECT for frame fills, and proves it
+  // usable with one aligned read before handing it over — some filesystems
+  // accept the flag at open and fail at read, so the open alone proves
+  // nothing.
+  // Returns -1 when the filesystem refuses; the caller counts the fallback.
+  [[nodiscard]] static auto open_direct(const std::filesystem::path &path,
+                                        std::size_t file_size) -> int {
+    auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+    if (fd == -1) return -1;
+    if (file_size == 0) return fd;  // nothing to probe, nothing to fill
+    void *probe = std::aligned_alloc(kPoolFrameBytes, kPoolFrameBytes);
+    if (probe == nullptr) {
+      ::close(fd);
+      return -1;
+    }
+    const auto n = ::pread(fd, probe, kPoolFrameBytes, 0);
+    std::free(probe);
+    if (n <= 0) {
+      ::close(fd);
+      return -1;
+    }
+    return fd;
+  }
+
+  // A sweep just finished. Under direct I/O the page cache it pulled in serves
+  // nothing afterwards — point reads come from frames — so give it back. The
+  // buffered fallback keeps its cache: there it IS the fill path.
+  [[nodiscard]] auto sweep_done() const
+      -> std::optional<std::pair<DataEntry, Offset>> {
+    if (direct_fd_ != -1) {
+      ::posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
+    }
+    return std::nullopt;
+  }
 
   int fd_;
+  int direct_fd_;  // -1: filesystem refused O_DIRECT; fills use fd_
   std::size_t file_size_;
   std::uint32_t file_id_;
   BufferPool *pool_;
@@ -1289,12 +1339,13 @@ private:
   // admitting those frames would flush the working set on every vacuum pass
   // (design §7). Making the source an explicit argument means a new read path
   // has to choose rather than inherit whichever default was nearest.
-  enum class Source { Pool, Direct };
+  enum class Source { Pool, Bypass };
 
   void fetch(Offset offset, std::size_t len, std::byte *dst,
              Source source) const {
     if (source == Source::Pool) {
-      pool_->read_at(file_id_, fd_, offset, len, file_size_, dst);
+      pool_->read_at(file_id_, PoolFile{.buffered = fd_, .direct = direct_fd_},
+                     offset, len, file_size_, dst);
       return;
     }
     std::size_t done = 0;
@@ -1335,13 +1386,17 @@ private:
 };
 
 ReadOnlyBufferPoolDataFile::~ReadOnlyBufferPoolDataFile() {
+  if (direct_fd_ != -1) {
+    ::close(direct_fd_);
+  }
   if (fd_ != -1) {
     ::close(fd_);
   }
 }
 
 // Generic factory: returns the read-only DataFile for the selected back-end.
-// BufferPool cannot reach here — DB::open rejects it until the pool lands.
+// BufferPool needs the DB's pool and the file's engine id; both are required
+// there and ignored elsewhere.
 export [[nodiscard]] inline auto openDataFileForRead(
     std::filesystem::path path, IoBackend backend = IoBackend::Pread,
     BufferPool *pool = nullptr, std::uint32_t file_id = 0)

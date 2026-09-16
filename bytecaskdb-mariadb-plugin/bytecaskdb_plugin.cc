@@ -79,6 +79,14 @@ static MYSQL_SYSVAR_ULONGLONG(buffer_pool_size, sysvar_buffer_pool_size,
     "2 x bytecaskdb_max_file_bytes.",
     nullptr, nullptr, 0, 0, ~0ULL, 1);
 
+static my_bool sysvar_buffer_pool_direct_io = TRUE;
+static MYSQL_SYSVAR_BOOL(buffer_pool_direct_io, sysvar_buffer_pool_direct_io,
+    PLUGIN_VAR_READONLY,
+    "Fill the buffer pool with O_DIRECT so it is the only consumer of memory "
+    "for sealed-file data (default ON). Filesystems that refuse it fall back "
+    "to buffered fills per file.",
+    nullptr, nullptr, TRUE);
+
 static unsigned long long sysvar_max_file_bytes = 64ULL * 1024 * 1024;
 static MYSQL_SYSVAR_ULONGLONG(max_file_bytes, sysvar_max_file_bytes,
     PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
@@ -174,6 +182,7 @@ static MYSQL_SYSVAR_ULONG(vacuum_idle_interval_ms,
 static struct st_mysql_sys_var *bytecaskdb_system_variables[] = {
     MYSQL_SYSVAR(io_backend),
     MYSQL_SYSVAR(buffer_pool_size),
+    MYSQL_SYSVAR(buffer_pool_direct_io),
     MYSQL_SYSVAR(max_file_bytes),
     MYSQL_SYSVAR(bulk_copy_flush_bytes),
     MYSQL_SYSVAR(verify_checksums),
@@ -879,6 +888,7 @@ static int bytecaskdb_init(void *p) {
   opts.io_backend = static_cast<bytecask::IoBackend>(sysvar_io_backend);
   opts.buffer_pool.capacity_bytes =
       static_cast<std::size_t>(sysvar_buffer_pool_size);
+  opts.buffer_pool.direct_io = sysvar_buffer_pool_direct_io;
   opts.max_file_bytes = sysvar_max_file_bytes;
 
   try {

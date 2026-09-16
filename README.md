@@ -233,6 +233,9 @@ struct BufferPoolOptions {
     size_t capacity_bytes{0};          // TOTAL pool footprint, not just frame bytes.
                                        // Must be >= 2 x max_file_bytes.
     unsigned oversize_guard_divisor{8}; // an entry larger than capacity/N is never cached
+    bool direct_io{true};              // O_DIRECT fills: the pool, not the page cache,
+                                       // holds sealed-file data. Falls back per file
+                                       // where the filesystem refuses.
 };
 
 struct WriteOptions {

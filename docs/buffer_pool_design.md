@@ -189,7 +189,13 @@ Alignment falls out of the frame size: the arena is page-aligned, frames are 4 K
 
 **`O_DIRECT` is never applied to the write path.** Appends are `pwritev` at arbitrary offsets gathering unaligned caller buffers; aligning them would need a bounce buffer, destroying the zero-copy gather, and would fight `ensure_zeroed`. It is also not a durability primitive — `fdatasync` is still required.
 
-**Portability:** unavailable on macOS (`F_NOCACHE` is the analogue), unavailable under Emscripten, and **rejected by tmpfs with `EINVAL`**, which matters because CI often runs on it. The back-end must detect this at open and fall back to buffered fills, recording that it did.
+**Portability:** unavailable on macOS (`F_NOCACHE` is the analogue), unavailable under Emscripten, and refused by some filesystems — older tmpfs, some FUSE and overlay mounts — which matters because CI can run on them. The back-end must detect this at open and fall back to buffered fills, recording that it did.
+
+*As built.* Each pool-backed file opens a second descriptor with `O_DIRECT` for frame fills and keeps the buffered one for everything else — scans, oversize reads, and the fallback. The direct descriptor is **proved usable with one aligned read at open** before it is trusted, because some filesystems accept the flag at `open` and fail at `read`; refusal counts in `pool_direct_io_fallbacks` and that file fills buffered. Alignment is not probed with `statx`: every fill is a frame-aligned offset, a rounded-up length and a 4 KiB-aligned scratch, and 4 KiB is a multiple of every real block size — a device wanting more answers `EINVAL` on the read and takes the same per-read fallback. A direct read that runs past EOF comes back short, which is allowed, so the file's length need not be aligned.
+
+`POSIX_FADV_DONTNEED` runs twice: at open, releasing the residency the file built up while it was the active file (it was `fdatasync`'d before it was sealed, so the pages are clean), and at the end of every scan sweep, since under direct I/O the page cache a sweep pulls in serves nothing afterwards. Under the buffered fallback neither runs — there the page cache *is* the fill path. tmpfs on Linux 6.6+ accepts `O_DIRECT`, so it can no longer be relied on to exercise the fallback; the fallback detection is covered only where a mount refuses.
+
+All fills go through one seam, `fill(PoolFile, span<FillRequest>)` — a batch of one today, so that `preadv`, `O_DIRECT` and `io_uring` are implementations of that call rather than of `read_at`, per §10.
 
 ---
 
@@ -340,28 +346,28 @@ The benchmark sweep in Phase 0 is not optional. Every current benchmark fits in 
 
 **Phase 0 is worth building whether or not the pool follows.** The missing hit-ratio visibility and the missing out-of-RAM benchmark are gaps today.
 
-### First measurements
+### Measurements
 
-`benchmarks/pool_bench.cpp`, via `python3 scripts/run_pool_bench.py`; recorded in `benchmarks/pool_bench_results.csv`. 60 k keys x 512 B (31 MiB on disk), Zipf(0.99), 1 MiB files, dev container — not the benchmark host the README reports, so read the columns against each other, not against the README.
+`benchmarks/pool_bench.cpp`, via `python3 scripts/run_pool_bench.py`; recorded in `benchmarks/pool_bench_results.csv`. 60 k keys x 512 B (31 MiB on disk), Zipf(0.99), 1 MiB files, one run each, dev container — read the columns against each other, not against the README. The pool runs each ratio twice: `direct_io=0` (Phase 1, fills through the page cache) and `direct_io=1` (Phase 2, `O_DIRECT` fills with the file's page-cache residency dropped at open).
 
-| Back-end | ratio | ops/s | p50 | p99 | hit ratio |
-|---|---:|---:|---:|---:|---:|
-| pread | — | 993 K | 583 ns | 1.57 µs | — |
-| mmap | — | 1.66 M | 238 ns | 998 ns | — |
-| buffer pool | 0.10 | 857 K | 305 ns | 3.80 µs | 0.696 |
-| buffer pool | 0.25 | 1.12 M | 287 ns | 2.86 µs | 0.808 |
-| buffer pool | 0.50 | 1.26 M | 277 ns | 2.78 µs | 0.890 |
-| buffer pool | 1.00 | 1.35 M | 270 ns | 2.66 µs | 0.928 |
+| Back-end | direct | ratio | ops/s | p50 | p99 | hit ratio |
+|---|:-:|---:|---:|---:|---:|---:|
+| pread | — | — | 1.03 M | 552 ns | 1.65 µs | — |
+| mmap | — | — | 1.61 M | 241 ns | 1.08 µs | — |
+| buffer pool | 0 | 0.25 | 692 K | 700 ns | 3.99 µs | 0.808 |
+| buffer pool | 0 | 1.00 | 980 K | 489 ns | 2.96 µs | 0.928 |
+| buffer pool | 1 | 0.25 | 92 K | 812 ns | **63.0 µs** | 0.808 |
+| buffer pool | 1 | 1.00 | 211 K | 722 ns | **52.7 µs** | 0.928 |
 
-Against §12.1's proposed bar, at ratio 0.25: **hit ratio 0.808 passes** (bar: ≥ 0.6). **p99 fails** — 2.86 µs is 2.9x `mmap`, against a bar of 2x. Optimistic retries were zero throughout, which passes. The 32-thread `GetMT` criterion is not yet measured; there is no multi-threaded arm in this benchmark.
+**What `O_DIRECT` does here is exactly what §9 warned it would.** Under `direct_io=1` a pool miss is a device read, and this VM's disk answers in ~50–75 µs. p99 is that number at every ratio, because even at 1.00 the residual 7 % of misses are compulsory first-touches inside the measurement window, and at 1 % of 60 k reads the tail is made entirely of them. Throughput falls 5–8x against the buffered pool. This is not a regression to fix: it is the cost of the pool doing its actual job, measured in the one regime — everything resident, page cache warm, no memory pressure — where the design says to switch it off. The `pread` and `mmap` rows are reading the same bytes from a warm page cache the machine cannot drop without root; their tails are a floor.
 
-By §12.1's own rule, a p99 failure is a design problem that blocks Phase 2, and that is the state this leaves things in — the bar was written before the numbers existed, which is the point of agreeing it first.
+What this benchmark still cannot show is the pool's *benefit*: a dataset larger than RAM, or a cgroup limit, where the page cache is the thing evicting the key directory. Neither is set up here. On this evidence the pool is a bounded, measurable cost with no demonstrated upside — and that is an honest description of Phase 2 on a machine with spare RAM.
 
-p50 is the encouraging half: 270–305 ns beats `pread`'s 583 ns roughly twofold and sits within ~15 % of `mmap`. The tail is where the miss path shows, and at ratio 1.00 the residual 7.2 % miss rate is compulsory — first touch of each frame inside the measurement window, not eviction (evictions were zero).
+**A hit-path regression is visible in the buffered rows.** At ratio 1.00 the buffered pool measured 1.35 M ops/s, p50 270 ns before the frame copy was made a data-race-free sequence of relaxed atomic word loads; it now measures 980 K, p50 489 ns. The word loop copies 8 bytes at a time through two `memcpy`s and a modulo per iteration, against one vectorised `memcpy` before. The atomics are not negotiable — the plain `memcpy` was UB — but the loop is naive and should recover most of the difference (unaligned head, whole words direct to `dst`, tail). Open, with the in-band reference bit from §8.3 as the other hit-path item.
 
-**One real bug fell out of building this.** Tail latency initially *rose* with pool size — p99 4.5 µs at ratio 1.00 against 2.8 µs at 0.10, with fewer evictions at the larger size. The arena was being faulted in lazily, one page at a time, on the read path, so a larger pool meant more cold pages and a worse tail. Pre-faulting the arena at construction removed the inversion (p99 4.5 µs → 2.7 µs at ratio 1.00) and is independently right: §3 promises that configuring N bytes yields N bytes resident, and a lazily-faulted arena makes that a ceiling rather than a reservation.
+Against §12.1's proposed Phase 1 bar (measured on the buffered rows, which is what Phase 1 is): hit ratio 0.808 at ratio 0.25 passes; optimistic retries were zero, passes; p99 3.99 µs is 3.7x `mmap` against a bar of 2x, fails; the 32-thread `GetMT` criterion is still unmeasured. The bar was written before any numbers existed, and Phase 1 reads through the page cache on both sides, so it cannot structurally match `mmap` there — whether that means the bar was wrong or the miss path is, is the question §12.1 exists to settle before Phase 2 is judged.
 
-The caveat that bounds all of it: Phase 1 fills through the page cache, so a miss here is usually still a page-cache hit, not a device round trip. These miss latencies are a floor. What bypassing the page cache costs at p99 is Phase 2's question and needs a dataset larger than RAM.
+The arena page-fault inversion found by the first version of this benchmark (p99 rising with pool size because the arena faulted in lazily on the read path) stays fixed: buffered p99 falls monotonically from 0.10 to 1.00.
 
 ---
 

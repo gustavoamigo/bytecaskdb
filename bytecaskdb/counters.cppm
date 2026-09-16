@@ -56,6 +56,12 @@ export struct Counters {
   // is fighting readers.
   std::atomic<std::int64_t> pool_optimistic_retries{0};
   std::int64_t pool_frames_total{0};
+  // Gauge: frames currently holding a file's bytes. Resident / total is the
+  // fill level an operator sizes against.
+  std::atomic<std::int64_t> pool_frames_resident{0};
+  // Files whose filesystem refused O_DIRECT and fill through the page cache
+  // instead. Catches a CI mount that would otherwise measure the wrong thing.
+  std::atomic<std::int64_t> pool_direct_io_fallbacks{0};
 
   // -- Vacuum --
   std::atomic<std::int64_t> vacuum_bytes_reclaimed{0};

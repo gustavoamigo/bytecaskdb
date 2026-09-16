@@ -24,6 +24,7 @@ All settings are global. Set them in `my.cnf` under `[mariadbd]` or, for the dyn
 |---|---|---|---|---|
 | `bytecaskdb_io_backend` | `pread` | `pread`, `mmap`, `buffer_pool` | no | How sealed data files are read. The active file is written the same way in every mode. |
 | `bytecaskdb_buffer_pool_size` | `0` | bytes | no | Pool size when `io_backend = buffer_pool`. Total footprint, not just frame bytes. Must be at least `2 x bytecaskdb_max_file_bytes`. |
+| `bytecaskdb_buffer_pool_direct_io` | `ON` | — | no | Fill the pool with `O_DIRECT`, so it is the only consumer of memory for sealed-file data. Falls back to buffered fills per file where the filesystem refuses. |
 | `bytecaskdb_max_file_bytes` | 64 MiB | 1 MiB – 4 GiB | no | Active data file rotation threshold. Sealed files are the unit of vacuum: smaller files reclaim space sooner at the cost of more files. |
 | `bytecaskdb_verify_checksums` | `ON` | — | yes | CRC-verify every value read from disk. Turn off only for benchmarking; recovery still verifies hint files. |
 | `bytecaskdb_vacuum_fragmentation_threshold` | 0.5 | 0.0 – 1.0 | yes | Fraction of dead bytes a sealed file must reach before background vacuum rewrites it. |

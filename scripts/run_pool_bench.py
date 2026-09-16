@@ -21,11 +21,14 @@ Usage:
     --full          240 000 keys / 240 000 ops. Default is a lighter 60 000.
     --ratios        pool_bytes / dataset_bytes points (default 0.1,0.25,0.5,1.0,2.0).
 
-CAVEAT — what this measures. Phase 1 fills through the page cache, so a "miss"
-is usually still a page-cache hit rather than a device round trip, and this
-machine cannot drop the page cache without root. Miss latency here is a floor,
-not a prediction. Bypassing the page cache is Phase 2 (O_DIRECT) and needs a
-dataset larger than RAM to measure.
+CAVEAT — what this measures. The pool runs each ratio twice: direct_io=1
+(O_DIRECT fills, the file's page-cache residency dropped at open) and
+direct_io=0 (fills through the page cache). Under direct_io=1 a miss is a real
+device read, while the pread and mmap baselines still hit a warm page cache
+that this machine cannot drop without root. That asymmetry is what the pool
+costs when it is doing its job, not a flaw in the comparison — but it does
+mean the baselines' tail numbers are a floor. Showing the pool's *benefit*
+needs a dataset larger than RAM or a cgroup limit, and neither is set up here.
 """
 
 import argparse
@@ -45,7 +48,8 @@ BENCH_BINARY = REPO_ROOT / "build/linux/x86_64/release/pool_bench"
 CSV_PATH = REPO_ROOT / "benchmarks/pool_bench_results.csv"
 
 BENCH_COLUMNS = [
-    "backend", "ratio", "pool_bytes", "dataset_bytes", "keys", "value_bytes",
+    "backend", "direct_io", "ratio", "pool_bytes", "dataset_bytes", "keys",
+    "value_bytes",
     "ops", "zipf_s", "ops_per_sec", "p50_ns", "p99_ns", "p999_ns",
     "hit_ratio", "evictions", "optimistic_retries",
 ]

@@ -18,9 +18,15 @@
 // measurement of what bypassing the page cache buys, which is Phase 2's and
 // needs O_DIRECT plus a dataset larger than RAM.
 //
-// Nothing here drops the page cache between runs (it needs root), so a "miss"
-// is usually still a page-cache hit rather than a device round trip. Miss
-// latency measured here is therefore a floor, not a prediction.
+// The pool runs twice per ratio: direct_io=true (Phase 2: O_DIRECT fills, the
+// file's page-cache residency dropped at open) and direct_io=false (Phase 1:
+// fills through the page cache). The difference is the price of bypassing the
+// page cache — which is real device I/O on a miss, against a pread/mmap
+// baseline that is still warm. That asymmetry is the point, not a flaw: it is
+// what the pool costs when it is doing its actual job.
+//
+// Nothing here drops the page cache for the baselines (it needs root), so
+// their "misses" are page-cache hits. Their numbers are a floor.
 //
 // Output is CSV on stdout; scripts/run_pool_bench.py records it.
 
@@ -107,6 +113,7 @@ void build_dataset(const Config &cfg) {
 
 struct Result {
   std::string backend;
+  bool direct_io = false;      // meaningful only for buffer_pool
   double ratio = 0.0;          // 0 for the non-pool baselines
   std::uint64_t pool_bytes = 0;
   double ops_per_sec = 0.0;
@@ -128,11 +135,12 @@ auto percentile(std::vector<std::uint64_t> &v, double p) -> std::uint64_t {
 }
 
 auto measure(const Config &cfg, bytecask::IoBackend backend,
-             std::uint64_t pool_bytes, double ratio) -> Result {
+             std::uint64_t pool_bytes, double ratio, bool direct_io) -> Result {
   bytecask::Options opts{.max_file_bytes = cfg.max_file_bytes,
                          .io_backend = backend};
   if (backend == bytecask::IoBackend::BufferPool) {
     opts.buffer_pool.capacity_bytes = static_cast<std::size_t>(pool_bytes);
+    opts.buffer_pool.direct_io = direct_io;
   }
   // A fresh open gives every configuration a cold pool.
   auto db = bytecask::DB::open(cfg.dir, opts);
@@ -166,6 +174,7 @@ auto measure(const Config &cfg, bytecask::IoBackend backend,
   r.backend = backend == bytecask::IoBackend::Pread    ? "pread"
               : backend == bytecask::IoBackend::Mmap   ? "mmap"
                                                        : "buffer_pool";
+  r.direct_io = direct_io;
   r.ratio = ratio;
   r.pool_bytes = pool_bytes;
   const auto secs =
@@ -242,32 +251,40 @@ auto main(int argc, char **argv) -> int {
   std::vector<Result> results;
   // Baselines first, so a regression in the pool is read against them rather
   // than against an absolute number that says nothing on its own.
-  results.push_back(measure(cfg, bytecask::IoBackend::Pread, 0, 0.0));
-  results.push_back(measure(cfg, bytecask::IoBackend::Mmap, 0, 0.0));
-  for (const auto ratio : cfg.ratios) {
-    auto pool_bytes = static_cast<std::uint64_t>(
-        static_cast<double>(bytes) * ratio);
-    // DB::open rejects a pool below 2 x max_file_bytes; a ratio that lands
-    // under the floor is reported rather than silently clamped.
-    if (pool_bytes < 2 * cfg.max_file_bytes) {
-      std::fprintf(stderr,
-                   "ratio %.2f -> %llu B is below 2 x max_file_bytes (%llu B); "
-                   "skipped\n",
-                   ratio, static_cast<unsigned long long>(pool_bytes),
-                   static_cast<unsigned long long>(2 * cfg.max_file_bytes));
-      continue;
+  results.push_back(measure(cfg, bytecask::IoBackend::Pread, 0, 0.0, false));
+  results.push_back(measure(cfg, bytecask::IoBackend::Mmap, 0, 0.0, false));
+  // Every buffered arm runs before any direct arm. A direct open drops the
+  // file's page-cache residency (FADV_DONTNEED), and a buffered run that
+  // followed it would start cold and report disk latency as pool cost. In
+  // this order the buffered arms and the baselines all see the page cache
+  // the dataset build left warm, and the direct arms — which never use it —
+  // can drop it freely.
+  for (const bool direct_io : {false, true}) {
+    for (const auto ratio : cfg.ratios) {
+      auto pool_bytes = static_cast<std::uint64_t>(
+          static_cast<double>(bytes) * ratio);
+      // DB::open rejects a pool below 2 x max_file_bytes; a ratio that lands
+      // under the floor is reported rather than silently clamped.
+      if (pool_bytes < 2 * cfg.max_file_bytes) {
+        std::fprintf(stderr,
+                     "ratio %.2f -> %llu B is below 2 x max_file_bytes "
+                     "(%llu B); skipped\n",
+                     ratio, static_cast<unsigned long long>(pool_bytes),
+                     static_cast<unsigned long long>(2 * cfg.max_file_bytes));
+        continue;
+      }
+      results.push_back(measure(cfg, bytecask::IoBackend::BufferPool,
+                                pool_bytes, ratio, direct_io));
     }
-    results.push_back(
-        measure(cfg, bytecask::IoBackend::BufferPool, pool_bytes, ratio));
   }
 
   std::printf(
-      "backend,ratio,pool_bytes,dataset_bytes,keys,value_bytes,ops,zipf_s,"
-      "ops_per_sec,p50_ns,p99_ns,p999_ns,hit_ratio,evictions,"
+      "backend,direct_io,ratio,pool_bytes,dataset_bytes,keys,value_bytes,ops,"
+      "zipf_s,ops_per_sec,p50_ns,p99_ns,p999_ns,hit_ratio,evictions,"
       "optimistic_retries\n");
   for (const auto &r : results) {
-    std::printf("%s,%.3f,%llu,%llu,%zu,%zu,%zu,%.3f,%.1f,%llu,%llu,%llu,",
-                r.backend.c_str(), r.ratio,
+    std::printf("%s,%d,%.3f,%llu,%llu,%zu,%zu,%zu,%.3f,%.1f,%llu,%llu,%llu,",
+                r.backend.c_str(), r.direct_io ? 1 : 0, r.ratio,
                 static_cast<unsigned long long>(r.pool_bytes),
                 static_cast<unsigned long long>(bytes), cfg.keys,
                 cfg.value_bytes, cfg.ops, cfg.zipf_s, r.ops_per_sec,

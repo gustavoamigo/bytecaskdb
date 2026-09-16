@@ -30,6 +30,9 @@
 #include <thread>
 #include <tuple>
 #include <vector>
+#include <fcntl.h>
+#include <unistd.h>
+
 import bytecask;
 import bytecask.batch_iterator;
 import bytecask.data_entry;
@@ -6853,6 +6856,8 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.pool_multi_frame_reads",
       "bytecask.pool_optimistic_retries",
       "bytecask.pool_frames_total",
+      "bytecask.pool_frames_resident",
+      "bytecask.pool_direct_io_fallbacks",
       "bytecask.vacuum_bytes_reclaimed",
       "bytecask.vacuum_files_unlinked",
       "bytecask.recovery_files",
@@ -7128,6 +7133,80 @@ TEST_CASE("io_backend=BufferPool: verify_checksums=false read paths",
     ++rseen;
   }
   CHECK(rseen == kCount);
+#endif
+}
+
+namespace {
+// Whether the test directory's filesystem serves O_DIRECT reads. Where it does
+// not, the pool falls back per file and the direct-path assertions below do
+// not apply — the fallback itself is what is under test there.
+auto temp_dir_supports_direct_io() -> bool {
+  const auto path = std::filesystem::temp_directory_path() / "bc_odirect_probe";
+  {
+    std::ofstream f{path, std::ios::binary};
+    f << std::string(8192, 'p');
+  }
+  auto fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+  bool ok = false;
+  if (fd != -1) {
+    void *buf = std::aligned_alloc(4096, 4096);
+    ok = buf != nullptr && ::pread(fd, buf, 4096, 0) == 4096;
+    std::free(buf);
+    ::close(fd);
+  }
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  return ok;
+}
+}  // namespace
+
+TEST_CASE("io_backend=BufferPool: direct I/O fills serve identical bytes",
+          "[bytecask][buffer_pool]") {
+#ifndef __EMSCRIPTEN__
+  // Same workload through O_DIRECT fills and through buffered fills; both
+  // must agree with each other and with what was written. The O_DIRECT path
+  // reads block multiples past EOF and copies out of an aligned scratch, so
+  // the file tail is the part most worth checking.
+  const bool direct_supported = temp_dir_supports_direct_io();
+  auto run = [](bool direct_io) {
+    TempDir td;
+    auto db = bytecask::DB::open(
+        td.path, {.max_file_bytes = 32 * 1024,
+                  .io_backend = bytecask::IoBackend::BufferPool,
+                  .buffer_pool = {.capacity_bytes = 512 * 1024,
+                                  .direct_io = direct_io}});
+    constexpr int kCount = 700;
+    // Odd sizes so entries straddle frame boundaries and files end unaligned.
+    const auto value_for = [](int i) {
+      return std::format("v{:05d}", i) + std::string(37 + (i % 211), 'x');
+    };
+    for (int i = 0; i < kCount; ++i) {
+      db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+             to_bytes(value_for(i)));
+    }
+    std::vector<std::string> seen;
+    bytecask::Bytes out;
+    for (int i = 0; i < kCount; ++i) {
+      REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
+      CHECK(to_string(out) == value_for(i));
+      seen.push_back(to_string(out));
+    }
+    const auto st = db.stats();
+    REQUIRE(st.at("bytecask.file_rotations") > 0);
+    return std::make_pair(seen, st.at("bytecask.pool_direct_io_fallbacks"));
+  };
+  const auto [direct_seen, direct_fallbacks] = run(true);
+  const auto [buffered_seen, buffered_fallbacks] = run(false);
+  CHECK(direct_seen == buffered_seen);
+  // direct_io=false never attempts O_DIRECT, so it can never fall back.
+  CHECK(buffered_fallbacks == 0);
+  if (direct_supported) {
+    // On a filesystem that serves O_DIRECT every sealed file must have taken
+    // it — otherwise the pool was measured with the page cache underneath.
+    CHECK(direct_fallbacks == 0);
+  } else {
+    WARN("temp dir refuses O_DIRECT: fallback path exercised, direct path not");
+  }
 #endif
 }
 
