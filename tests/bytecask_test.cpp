@@ -1201,6 +1201,22 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
     verify("parallel/max", collect(db));
     CHECK(collect_stats(db) == serial_stats_vals);
   }
+
+#ifndef __EMSCRIPTEN__
+  // The pool serves every value read below, so this proves recovery and
+  // pool-backed reads agree with the oracle together — not just that the
+  // key directory was rebuilt.
+  SECTION("parallel recovery through the buffer pool (2 workers)") {
+    const auto p = td.path / "pool";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 2,
+                                     .io_backend = bytecask::IoBackend::BufferPool,
+                                     .buffer_pool = {.capacity_bytes = 1 << 20}});
+    verify("parallel/2/pool", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
+  }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1332,6 +1348,22 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
     verify("parallel/4", collect(db));
     CHECK(collect_stats(db) == serial_stats_vals);
   }
+
+#ifndef __EMSCRIPTEN__
+  // The pool serves every value read below, so this proves recovery and
+  // pool-backed reads agree with the oracle together — not just that the
+  // key directory was rebuilt.
+  SECTION("parallel through the buffer pool (4 workers)") {
+    const auto p = td.path / "pool";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 4,
+                                     .io_backend = bytecask::IoBackend::BufferPool,
+                                     .buffer_pool = {.capacity_bytes = 1 << 20}});
+    verify("parallel/4/pool", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
+  }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1452,6 +1484,22 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
     verify("parallel/max", collect(db));
     CHECK(collect_stats(db) == serial_stats_vals);
   }
+
+#ifndef __EMSCRIPTEN__
+  // The pool serves every value read below, so this proves recovery and
+  // pool-backed reads agree with the oracle together — not just that the
+  // key directory was rebuilt.
+  SECTION("parallel through the buffer pool (3 workers)") {
+    const auto p = td.path / "pool";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 3,
+                                     .io_backend = bytecask::IoBackend::BufferPool,
+                                     .buffer_pool = {.capacity_bytes = 1 << 20}});
+    verify("parallel/3/pool", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
+  }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -4997,6 +5045,22 @@ TEST_CASE("Recovery model-based: workload with range deletes",
     verify("parallel/max", collect(db));
     CHECK(collect_stats(db) == serial_stats_vals);
   }
+
+#ifndef __EMSCRIPTEN__
+  // The pool serves every value read below, so this proves recovery and
+  // pool-backed reads agree with the oracle together — not just that the
+  // key directory was rebuilt.
+  SECTION("parallel recovery through the buffer pool (2 workers)") {
+    const auto p = td.path / "pool";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 2,
+                                     .io_backend = bytecask::IoBackend::BufferPool,
+                                     .buffer_pool = {.capacity_bytes = 1 << 20}});
+    verify("parallel/2/pool", collect(db));
+    CHECK(collect_stats(db) == serial_stats_vals);
+  }
+#endif
 }
 
 // ---------------------------------------------------------------------------
