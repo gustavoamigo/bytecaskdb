@@ -263,23 +263,29 @@ private:
   static void write_words_range(std::atomic<std::uint64_t> *words,
                                 std::size_t byte_off, const std::byte *src,
                                 std::size_t len) noexcept {
+    // Head, body, tail, like read_words: only a boundary word needs the
+    // load-patch-store; every whole word is one memcpy from src and one
+    // store, which the compiler turns into a mov pair.
+    auto w = byte_off / kWordBytes;
     std::size_t done = 0;
-    while (done < len) {
-      const auto pos = byte_off + done;
-      const auto w = pos / kWordBytes;
-      const auto in_word = pos % kWordBytes;
-      const auto chunk = std::min(kWordBytes - in_word, len - done);
-      std::uint64_t value = 0;
-      if (in_word != 0 || chunk != kWordBytes) {
-        value = words[w].load(std::memory_order_relaxed);
-      }
+    const auto patch = [&](std::size_t in_word, std::size_t chunk) {
+      auto value = words[w].load(std::memory_order_relaxed);
       std::byte buf[kWordBytes];
       std::memcpy(buf, &value, kWordBytes);
       std::memcpy(buf + in_word, src + done, chunk);
       std::memcpy(&value, buf, kWordBytes);
-      words[w].store(value, std::memory_order_relaxed);
+      words[w++].store(value, std::memory_order_relaxed);
       done += chunk;
+    };
+    if (const auto head = byte_off % kWordBytes; head != 0) {
+      patch(head, std::min(kWordBytes - head, len));
     }
+    for (; done + kWordBytes <= len; done += kWordBytes) {
+      std::uint64_t value = 0;
+      std::memcpy(&value, src + done, kWordBytes);
+      words[w++].store(value, std::memory_order_relaxed);
+    }
+    if (done < len) patch(0, len - done);
   }
 
   // Writes a whole frame from src. Relaxed stores, for the same reason.

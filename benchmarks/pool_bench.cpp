@@ -69,6 +69,10 @@ struct Config {
   // skips it. Runs at ratio 1.0 — fully resident — because the question is
   // whether the lock-free read path scales, not what a miss costs.
   std::vector<unsigned> mt_threads;
+  // Read-your-own-writes arm (§11 Phase 3's question): N put/get pairs on
+  // fresh keys, so every get is of the newest bytes in the active file.
+  // 0 skips it. Only the gets are timed.
+  std::size_t ryow_pairs = 0;
   std::filesystem::path dir = ".tmp/pool_bench";
 };
 
@@ -120,6 +124,7 @@ struct Result {
   std::string backend;
   bool direct_io = false;      // meaningful only for buffer_pool
   unsigned threads = 1;
+  bool ryow = false;           // this row is the read-your-own-writes arm
   double ratio = 0.0;          // 0 for the non-pool baselines
   std::uint64_t pool_bytes = 0;
   double ops_per_sec = 0.0;
@@ -293,6 +298,58 @@ auto measure_mt(const Config &cfg, bytecask::IoBackend backend,
   return r;
 }
 
+// Put a fresh key, read it straight back, repeat. Under the pool the read
+// should be a hit on a frame the writer just filled; under pread and mmap it
+// is a page-cache read of bytes just written. Only the gets are timed.
+auto measure_ryow(const Config &cfg, bytecask::IoBackend backend,
+                  std::uint64_t pool_bytes) -> Result {
+  bytecask::Options opts{.max_file_bytes = cfg.max_file_bytes,
+                         .io_backend = backend};
+  if (backend == bytecask::IoBackend::BufferPool) {
+    opts.buffer_pool.capacity_bytes = static_cast<std::size_t>(pool_bytes);
+    opts.buffer_pool.direct_io = false;
+  }
+  auto db = bytecask::DB::open(cfg.dir, opts);
+  const std::string value(cfg.value_bytes, 'w');
+  bytecask::Bytes out;
+  std::vector<std::uint64_t> lat;
+  lat.reserve(cfg.ryow_pairs);
+  const auto before = db.stats();
+  const auto start = std::chrono::steady_clock::now();
+  for (std::size_t i = 0; i < cfg.ryow_pairs; ++i) {
+    const auto key = std::format("ryow{:09d}", i);
+    db.put({.sync = false}, to_bytes(key), to_bytes(value));
+    const auto t0 = std::chrono::steady_clock::now();
+    (void)db.get({}, to_bytes(key), out);
+    const auto t1 = std::chrono::steady_clock::now();
+    lat.push_back(static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  const auto after = db.stats();
+  Result r;
+  r.backend = backend == bytecask::IoBackend::Pread    ? "pread"
+              : backend == bytecask::IoBackend::Mmap   ? "mmap"
+                                                       : "buffer_pool";
+  r.ryow = true;
+  r.ratio = backend == bytecask::IoBackend::BufferPool ? 1.0 : 0.0;
+  r.pool_bytes = pool_bytes;
+  const auto secs =
+      std::chrono::duration_cast<std::chrono::duration<double>>(elapsed).count();
+  r.ops_per_sec = secs > 0 ? static_cast<double>(cfg.ryow_pairs) / secs : 0.0;
+  r.p50_ns = percentile(lat, 0.50);
+  r.p99_ns = percentile(lat, 0.99);
+  r.p999_ns = percentile(lat, 0.999);
+  if (backend == bytecask::IoBackend::BufferPool) {
+    const auto hits = after.at("bytecask.pool_hits") - before.at("bytecask.pool_hits");
+    const auto misses = after.at("bytecask.pool_misses") - before.at("bytecask.pool_misses");
+    r.hit_ratio = hits + misses > 0
+                      ? static_cast<double>(hits) / static_cast<double>(hits + misses)
+                      : 0.0;
+  }
+  return r;
+}
+
 auto parse_size(std::string_view s) -> std::size_t {
   std::size_t v = 0;
   std::from_chars(s.data(), s.data() + s.size(), v);
@@ -325,6 +382,8 @@ auto main(int argc, char **argv) -> int {
         if (comma == std::string::npos) break;
         pos = comma + 1;
       }
+    } else if (a == "--ryow") {
+      cfg.ryow_pairs = parse_size(next());
     } else if (a == "--mt-threads") {
       cfg.mt_threads.clear();
       std::string list{next()};
@@ -340,7 +399,8 @@ auto main(int argc, char **argv) -> int {
       std::puts(
           "pool_bench [--keys N] [--value-bytes N] [--ops N] [--zipf S]\n"
           "           [--max-file-bytes N] [--ratios a,b,c] [--dir PATH]\n"
-          "           [--mt-threads a,b,c]  (multi-reader arm at ratio 1.0)");
+          "           [--mt-threads a,b,c]  (multi-reader arm at ratio 1.0)\n"
+          "           [--ryow N]            (N put/get pairs; gets timed)");
       return 0;
     }
   }
@@ -357,6 +417,14 @@ auto main(int argc, char **argv) -> int {
   // than against an absolute number that says nothing on its own.
   results.push_back(measure(cfg, bytecask::IoBackend::Pread, 0, 0.0, false));
   results.push_back(measure(cfg, bytecask::IoBackend::Mmap, 0, 0.0, false));
+
+  // Read-your-own-writes arm. Before any direct arm, like the one below.
+  if (cfg.ryow_pairs > 0) {
+    results.push_back(measure_ryow(cfg, bytecask::IoBackend::Pread, 0));
+    results.push_back(measure_ryow(cfg, bytecask::IoBackend::Mmap, 0));
+    results.push_back(measure_ryow(cfg, bytecask::IoBackend::BufferPool,
+                                   bytes + 2 * cfg.max_file_bytes));
+  }
 
   // Multi-reader arm: is the pool's lock-free read path still lock-free
   // under contention? mmap is the bar; pread is context. Fully resident,
@@ -396,12 +464,13 @@ auto main(int argc, char **argv) -> int {
   }
 
   std::printf(
-      "backend,direct_io,threads,ratio,pool_bytes,dataset_bytes,keys,"
+      "backend,direct_io,threads,ryow,ratio,pool_bytes,dataset_bytes,keys,"
       "value_bytes,ops,zipf_s,ops_per_sec,p50_ns,p99_ns,p999_ns,hit_ratio,u,"
       "evictions,optimistic_retries\n");
   for (const auto &r : results) {
-    std::printf("%s,%d,%u,%.3f,%llu,%llu,%zu,%zu,%zu,%.3f,%.1f,%llu,%llu,%llu,",
-                r.backend.c_str(), r.direct_io ? 1 : 0, r.threads, r.ratio,
+    std::printf("%s,%d,%u,%d,%.3f,%llu,%llu,%zu,%zu,%zu,%.3f,%.1f,%llu,%llu,%llu,",
+                r.backend.c_str(), r.direct_io ? 1 : 0, r.threads, r.ryow ? 1 : 0,
+                r.ratio,
                 static_cast<unsigned long long>(r.pool_bytes),
                 static_cast<unsigned long long>(bytes), cfg.keys,
                 cfg.value_bytes, cfg.ops, cfg.zipf_s, r.ops_per_sec,

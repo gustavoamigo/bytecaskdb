@@ -48,7 +48,8 @@ BENCH_BINARY = REPO_ROOT / "build/linux/x86_64/release/pool_bench"
 CSV_PATH = REPO_ROOT / "benchmarks/pool_bench_results.csv"
 
 BENCH_COLUMNS = [
-    "backend", "direct_io", "threads", "ratio", "pool_bytes", "dataset_bytes",
+    "backend", "direct_io", "threads", "ryow", "ratio", "pool_bytes",
+    "dataset_bytes",
     "keys",
     "value_bytes",
     "ops", "zipf_s", "ops_per_sec", "p50_ns", "p99_ns", "p999_ns",
@@ -89,6 +90,8 @@ def main() -> int:
     ap.add_argument("--max-file-bytes", type=int, default=1024 * 1024)
     ap.add_argument("--ratios", default="0.1,0.25,0.5,1.0,2.0")
     ap.add_argument("--tmpdir", default=str(REPO_ROOT / ".tmp"))
+    ap.add_argument("--ryow", type=int, default=0,
+                    help="put/get pairs for the read-your-own-writes arm")
     ap.add_argument("--mt-threads", default="",
                     help="comma list for the multi-reader arm, e.g. 2,4,8")
     args = ap.parse_args()
@@ -119,6 +122,8 @@ def main() -> int:
     ]
     if args.mt_threads:
         cmd += ["--mt-threads", args.mt_threads]
+    if args.ryow:
+        cmd += ["--ryow", str(args.ryow)]
     print(" ".join(cmd), file=sys.stderr)
     try:
         out = subprocess.check_output(cmd, cwd=REPO_ROOT, text=True)

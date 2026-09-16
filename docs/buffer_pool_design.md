@@ -388,6 +388,18 @@ Against §12.1's proposed Phase 1 bar (measured on the buffered rows, which is w
 
 Retries at zero everywhere is the result that matters: the seqlock read never lost a race to eviction, so §8.4's optimistic copy-out is carrying no fallback load. The pool scales at least as well as `mmap` up to the core count — the throughput gap is the per-hit cost already visible single-threaded, not contention — and its p99 ratio to `mmap` does not widen with threads, so the single fill mutex (§8.2's deviation) leaves no signature at this concurrency. Against §8's "within 10 % of `mmap`" it is 12 % at four threads; the 2-thread row where the pool leads is one run and should be read as noise. None of this speaks to 32 threads.
 
+**Read-your-own-writes (§11 Phase 3's question).** `--ryow N`: put a fresh 512-byte value, read it straight back, N = 20 000 times; only the gets are timed, at ratio 1.0 with buffered fills, one run.
+
+| Back-end | pairs/s | get p50 | get p99 | hit ratio |
+|---|---:|---:|---:|---:|
+| pread | 148 K | 1.24 µs | 2.27 µs | — |
+| mmap | 126 K | 1.52 µs | 3.50 µs | — |
+| buffer pool | 120 K | 1.71 µs | 2.89 µs | **1.000** |
+
+The mechanism works: every one of 20 000 reads of just-written bytes was served from the frame the writer filled, zero misses, no disk and no page cache. The answer to "does it improve on a write-heavy mix", on this machine, is **no**: `pread`'s read of bytes it just wrote is a warm page-cache hit at 1.2 µs, and the pool's is slower, while the put side pays about 19 % for the insert (after fixing the same naive word loop on the write side that had cost the read side; 25 % before). What residency buys — never touching the page cache — is invisible without memory pressure, which is the same sentence every other row in this section ends on.
+
+One number here is not explained. A pool hit on the active file costs ~1.7 µs, against ~0.32 µs for a pool hit on a sealed file in the sweep above: same `read_at`, same copy-out, same frames. The get-after-put baseline (state refresh, the released snapshot's node reclamation) is shared by all three back-ends and cannot be it. It wants a profile before anyone reasons about it; it is left open rather than theorised.
+
 The arena page-fault inversion found by the first version of this benchmark (p99 rising with pool size because the arena faulted in lazily on the read path) stays fixed: buffered p99 falls monotonically from 0.10 to 1.00.
 
 ---
