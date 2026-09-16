@@ -39,6 +39,24 @@ export struct Counters {
   std::atomic<std::int64_t> disk_reads{0};
   std::atomic<std::int64_t> disk_read_bytes{0};
 
+  // -- Buffer pool (all zero when IoBackend != BufferPool) --
+  // hits/misses are the primary A/B metric: unlike disk_reads, a miss here
+  // is known to have left the pool, which is the visibility §1 of the design
+  // says the page cache cannot give.
+  std::atomic<std::int64_t> pool_hits{0};
+  std::atomic<std::int64_t> pool_misses{0};
+  std::atomic<std::int64_t> pool_fills{0};
+  std::atomic<std::int64_t> pool_fill_bytes{0};
+  std::atomic<std::int64_t> pool_evictions{0};
+  // Entries larger than capacity/oversize_guard_divisor: read straight to the
+  // caller and never admitted, so one value cannot evict the working set.
+  std::atomic<std::int64_t> pool_oversize_reads{0};
+  std::atomic<std::int64_t> pool_multi_frame_reads{0};
+  // Seqlock read raced an eviction and retried. Early warning that eviction
+  // is fighting readers.
+  std::atomic<std::int64_t> pool_optimistic_retries{0};
+  std::int64_t pool_frames_total{0};
+
   // -- Vacuum --
   std::atomic<std::int64_t> vacuum_bytes_reclaimed{0};
   std::atomic<std::int64_t> vacuum_files_unlinked{0};

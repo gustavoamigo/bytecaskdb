@@ -46,6 +46,7 @@ static inline int portable_fdatasync(int fd) { return fdatasync(fd); }
 export module bytecask.data_file;
 
 import bytecask.util;
+import bytecask.buffer_pool;
 import bytecask.data_entry;
 import bytecask.types;
 
@@ -1146,12 +1147,170 @@ ReadOnlyMmapDataFile::~ReadOnlyMmapDataFile() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// ReadOnlyBufferPoolDataFile — sealed file served through the buffer pool.
+//
+// Byte fetching goes to BufferPool::read_at; parsing and CRC verification use
+// the same free functions as every other back-end, so the decoded result is
+// identical by construction. The pool is owned by the DB and outlives every
+// file registered with it, and hands each file a cache id of its own — the
+// engine's file_id is never needed here.
+//
+// Spans returned by read_entry / read_entry_unverified point into the caller's
+// io_buf, exactly as ReadOnlyPosixDataFile does — never into a frame. A frame
+// is reused memory, so a span into one would dangle the moment it was evicted,
+// and an EntryIterator holds its span across the user's whole loop body.
+export class ReadOnlyBufferPoolDataFile : public DataFile {
+public:
+  [[nodiscard]] static auto openForRead(std::filesystem::path path,
+                                        BufferPool &pool)
+      -> std::shared_ptr<ReadOnlyBufferPoolDataFile> {
+    auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("ReadOnlyBufferPoolDataFile: cannot open '{}'",
+                      path.string())};
+    }
+    struct stat st {};
+    std::size_t file_size = 0;
+    if (::fstat(fd, &st) == 0) {
+      file_size = static_cast<std::size_t>(st.st_size);
+    }
+    return std::shared_ptr<ReadOnlyBufferPoolDataFile>(
+        new ReadOnlyBufferPoolDataFile{std::move(path), fd, file_size,
+                                       pool.acquire_cache_id(), pool});
+  }
+
+  ~ReadOnlyBufferPoolDataFile() override;
+
+  [[nodiscard]] auto scan(Offset offset) const
+      -> std::optional<std::pair<DataEntry, Offset>> override {
+    if (offset + kHeaderSize > file_size_) {
+      return std::nullopt;
+    }
+    const auto header = read_header(offset);
+    if (header.sequence == 0) return std::nullopt;
+    const auto next =
+        offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
+    if (next > file_size_) {
+      return std::nullopt;
+    }
+    std::vector<std::byte> buf;
+    auto view =
+        read_entry_with_key_size(offset, header.key_size, header.value_size, buf);
+    return std::make_pair(
+        DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
+                  .key = {view.key.begin(), view.key.end()},
+                  .value = {view.value.begin(), view.value.end()}},
+        next);
+  }
+
+  void read_value(Offset offset, std::uint16_t key_size,
+                  std::uint32_t value_size, bool verify,
+                  std::vector<std::byte> &io_buf,
+                  std::vector<std::byte> &out) const override {
+    if (verify) {
+      auto view = read_entry_with_key_size(offset, key_size, value_size, io_buf);
+      out.assign(view.value.begin(), view.value.end());
+    } else {
+      const auto val_offset = offset + kHeaderSize + key_size;
+      out.resize(value_size);
+      fetch(val_offset, value_size, out.data());
+    }
+  }
+
+  [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
+                                std::vector<std::byte> &io_buf) const
+      -> DataEntryView override {
+    auto hdr = read_header(offset);
+    return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf);
+  }
+
+  // No speculative over-read here, unlike the pread back-end: that exists to
+  // save a second syscall, and a pool hit has no syscall to save. Reading the
+  // header first is both simpler and usually free — it lands in the same frame.
+  [[nodiscard]] auto read_entry_unverified(
+      Offset offset, std::uint32_t value_size,
+      std::vector<std::byte> &io_buf) const -> DataEntryView override {
+    const auto hdr = read_header(offset);
+    const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
+    io_buf.resize(total);
+    fetch(offset, total, io_buf.data());
+    auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
+                                           hdr.key_size + value_size};
+    return DataEntryView{
+        .sequence = hdr.sequence,
+        .entry_type = hdr.entry_type,
+        .key = body.subspan(0, hdr.key_size),
+        .value = body.subspan(hdr.key_size, value_size),
+    };
+  }
+
+  [[nodiscard]] auto size() const noexcept -> Offset override {
+    return static_cast<Offset>(file_size_);
+  }
+
+private:
+  ReadOnlyBufferPoolDataFile(std::filesystem::path path, int fd,
+                             std::size_t file_size, std::uint32_t cache_id,
+                             BufferPool &pool)
+      : DataFile{std::move(path)}, fd_{fd}, file_size_{file_size},
+        cache_id_{cache_id}, pool_{&pool} {}
+
+  int fd_;
+  std::size_t file_size_;
+  std::uint32_t cache_id_;
+  BufferPool *pool_;
+
+  void fetch(Offset offset, std::size_t len, std::byte *dst) const {
+    pool_->read_at(cache_id_, fd_, offset, len, file_size_, dst);
+  }
+
+  [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
+    std::array<std::byte, kHeaderSize> hdr{};
+    fetch(offset, kHeaderSize, hdr.data());
+    return bytecask::read_header(std::span{hdr});
+  }
+
+  [[nodiscard]] auto read_entry_with_key_size(
+      Offset offset, std::uint16_t key_size, std::uint32_t value_size,
+      std::vector<std::byte> &io_buf) const -> DataEntryView {
+    const auto total = kHeaderSize + key_size + value_size + kCrcSize;
+    io_buf.resize(total);
+    fetch(offset, total, io_buf.data());
+    const auto header = parse_header_and_verify(io_buf);
+    auto body = std::span<const std::byte>{io_buf}.subspan(kHeaderSize);
+    return DataEntryView{
+        .sequence = header.sequence,
+        .entry_type = header.entry_type,
+        .key = body.subspan(0, key_size),
+        .value = body.subspan(key_size, value_size),
+    };
+  }
+};
+
+ReadOnlyBufferPoolDataFile::~ReadOnlyBufferPoolDataFile() {
+  if (fd_ != -1) {
+    ::close(fd_);
+  }
+}
+
 // Generic factory: returns the read-only DataFile for the selected back-end.
 // BufferPool cannot reach here — DB::open rejects it until the pool lands.
 export [[nodiscard]] inline auto openDataFileForRead(
-    std::filesystem::path path, IoBackend backend = IoBackend::Pread)
-    -> std::shared_ptr<DataFile> {
+    std::filesystem::path path, IoBackend backend = IoBackend::Pread,
+    BufferPool *pool = nullptr) -> std::shared_ptr<DataFile> {
 #ifndef __EMSCRIPTEN__
+  if (backend == IoBackend::BufferPool) {
+    if (pool == nullptr) {
+      // Falling back to pread would make the configured bound quietly
+      // meaningless, which is the whole point of the subsystem.
+      throw std::logic_error{
+          "openDataFileForRead: IoBackend::BufferPool requires a pool"};
+    }
+    return ReadOnlyBufferPoolDataFile::openForRead(std::move(path), *pool);
+  }
   if (backend == IoBackend::Mmap) {
     struct stat st {};
     if (::stat(path.c_str(), &st) == 0 && st.st_size > 0) {

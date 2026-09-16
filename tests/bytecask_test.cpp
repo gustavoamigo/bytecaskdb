@@ -6783,6 +6783,15 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.commit_wait_blocked",
       "bytecask.disk_reads",
       "bytecask.disk_read_bytes",
+      "bytecask.pool_hits",
+      "bytecask.pool_misses",
+      "bytecask.pool_fills",
+      "bytecask.pool_fill_bytes",
+      "bytecask.pool_evictions",
+      "bytecask.pool_oversize_reads",
+      "bytecask.pool_multi_frame_reads",
+      "bytecask.pool_optimistic_retries",
+      "bytecask.pool_frames_total",
       "bytecask.vacuum_bytes_reclaimed",
       "bytecask.vacuum_files_unlinked",
       "bytecask.recovery_files",
@@ -6885,15 +6894,124 @@ TEST_CASE("io_backend=Mmap: put/get round-trip",
 #endif
 }
 
-TEST_CASE("io_backend=BufferPool: rejected until the pool is implemented",
+TEST_CASE("io_backend=BufferPool: a pool smaller than 2x max_file_bytes is rejected",
           "[bytecask][buffer_pool]") {
   TempDir td;
-  // Reserved, not silently downgraded to pread — the same stance DB::open
-  // takes on an unsupported mmap option.
+  // Below this the active file alone would consume half the pool, leaving a
+  // cache that silently does nothing. Rejecting beats degrading.
+  CHECK_THROWS_AS(
+      bytecask::DB::open(
+          td.path,
+          {.max_file_bytes = 8 * 1024 * 1024,
+           .io_backend = bytecask::IoBackend::BufferPool,
+           .buffer_pool = {.capacity_bytes = 4 * 1024 * 1024}}),
+      std::invalid_argument);
+}
+
+TEST_CASE("io_backend=BufferPool: put/get round-trip across rotation",
+          "[bytecask][buffer_pool]") {
+  TempDir td;
+#ifdef __EMSCRIPTEN__
   CHECK_THROWS_AS(
       bytecask::DB::open(td.path,
-                         {.io_backend = bytecask::IoBackend::BufferPool}),
+                         {.io_backend = bytecask::IoBackend::BufferPool,
+                          .buffer_pool = {.capacity_bytes = 4 * 1024 * 1024}}),
       std::invalid_argument);
+#else
+  // Small files so the reads under test land on sealed, pool-backed files
+  // rather than on the active file.
+  auto db = bytecask::DB::open(
+      td.path, {.max_file_bytes = 64 * 1024,
+                .io_backend = bytecask::IoBackend::BufferPool,
+                .buffer_pool = {.capacity_bytes = 1024 * 1024}});
+  constexpr int kCount = 2000;
+  const auto value_for = [](int i) {
+    return std::format("v{:05d}", i) + std::string(200, 'x');
+  };
+  for (int i = 0; i < kCount; ++i) {
+    db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+           to_bytes(value_for(i)));
+  }
+  bytecask::Bytes out;
+  for (int i = 0; i < kCount; ++i) {
+    REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
+    CHECK(to_string(out) == value_for(i));
+  }
+  // Re-read the same keys: now served from frames the first pass admitted.
+  for (int i = 0; i < kCount; ++i) {
+    REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
+    CHECK(to_string(out) == value_for(i));
+  }
+  // Rotation must actually have happened, or the reads never left the
+  // active file and this proves nothing about the pool.
+  CHECK(db.stats().at("bytecask.file_rotations") > 0);
+  const auto stats = db.stats();
+  CHECK(stats.at("bytecask.pool_frames_total") > 0);
+  CHECK(stats.at("bytecask.pool_hits") > 0);
+#endif
+}
+
+TEST_CASE("io_backend=BufferPool: values survive recovery",
+          "[bytecask][buffer_pool]") {
+#ifndef __EMSCRIPTEN__
+  TempDir td;
+  constexpr int kCount = 500;
+  {
+    auto db = bytecask::DB::open(
+        td.path, {.max_file_bytes = 32 * 1024,
+                  .io_backend = bytecask::IoBackend::BufferPool,
+                  .buffer_pool = {.capacity_bytes = 512 * 1024}});
+    for (int i = 0; i < kCount; ++i) {
+      db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+             to_bytes(std::format("v{:05d}", i) + std::string(200, 'x')));
+    }
+  }
+  // Reopening rebuilds from hint files and re-registers every sealed file with
+  // a fresh pool; cache ids are per-pool, so nothing carries over.
+  auto db = bytecask::DB::open(
+      td.path, {.max_file_bytes = 32 * 1024,
+                .io_backend = bytecask::IoBackend::BufferPool,
+                .buffer_pool = {.capacity_bytes = 512 * 1024}});
+  bytecask::Bytes out;
+  for (int i = 0; i < kCount; ++i) {
+    REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
+    CHECK(to_string(out) ==
+          std::format("v{:05d}", i) + std::string(200, 'x'));
+  }
+#endif
+}
+
+TEST_CASE("io_backend=BufferPool: iteration and vacuum agree with pread",
+          "[bytecask][buffer_pool]") {
+#ifndef __EMSCRIPTEN__
+  // The pool must be byte-identical to pread through every read path, so the
+  // same workload under both back-ends has to produce the same key/value set.
+  constexpr int kCount = 800;
+  auto run = [](bytecask::IoBackend backend) {
+    TempDir td;
+    bytecask::Options opts{.max_file_bytes = 32 * 1024, .io_backend = backend};
+    if (backend == bytecask::IoBackend::BufferPool) {
+      opts.buffer_pool.capacity_bytes = 256 * 1024;  // forces eviction
+    }
+    auto db = bytecask::DB::open(td.path, opts);
+    for (int i = 0; i < kCount; ++i) {
+      db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+             to_bytes(std::format("v{:05d}", i) + std::string(200, 'x')));
+    }
+    for (int i = 0; i < kCount; i += 3) {
+      (void)db.del({.sync = false}, to_bytes(std::format("k{:05d}", i)));
+    }
+    while (db.vacuum()) {
+    }
+    std::vector<std::string> seen;
+    for (auto &[key, value] : db.iter_from({})) {
+      seen.push_back(to_string(key) + "=" + to_string(value));
+    }
+    return seen;
+  };
+  CHECK(run(bytecask::IoBackend::BufferPool) ==
+        run(bytecask::IoBackend::Pread));
+#endif
 }
 
 TEST_CASE("io_backend=Pread: full pread mode",

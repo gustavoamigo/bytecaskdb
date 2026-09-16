@@ -45,6 +45,7 @@ export module bytecask;
 export import :internals;
 import bytecask.batch_iterator;
 import bytecask.concurrency;
+export import bytecask.buffer_pool;
 export import bytecask.counters;
 import bytecask.data_entry;
 import bytecask.data_file;
@@ -216,6 +217,8 @@ export struct Options {
   // memory-maps sealed files for zero-copy reads; BufferPool serves sealed
   // files from a bounded, engine-owned cache. See IoBackend.
   IoBackend io_backend{IoBackend::Pread};
+  // Only read when io_backend == IoBackend::BufferPool.
+  BufferPoolOptions buffer_pool{};
 };
 
 // ---------------------------------------------------------------------------
@@ -1068,6 +1071,9 @@ private:
   int lock_fd_{-1};  // flock() on dir_/.lock; released by close() in ~DB()
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
   IoBackend io_backend_{IoBackend::Pread};
+  // Declared before state_ so it outlives every DataFile holding a pointer to
+  // it: members are destroyed in reverse declaration order.
+  std::unique_ptr<BufferPool> pool_;
   SizeLimits size_limits_;
   mutable Counters counters_;
   // All mutable state — SWMR. Writers publish via atomic_store()
@@ -2047,14 +2053,18 @@ DB::DB(std::filesystem::path dir, Options opts)
         "pool would only add a second copy of every value"};
   }
 #endif
-  // The enum carries BufferPool ahead of the pool itself so the option surface
-  // settles once. Until the pool lands, accepting it would silently serve
-  // pread — the same accepted-but-ignored mismatch this constructor already
-  // rejects above. Remove this when the pool is wired in.
   if (opts.io_backend == IoBackend::BufferPool) {
-    throw std::invalid_argument{
-        "IoBackend::BufferPool is not implemented yet: the option is reserved "
-        "and rejected rather than silently falling back to pread"};
+    // The active file is pinned in the pool by a later phase; until then the
+    // floor only has to leave room for a working set beyond one file. Rejecting
+    // rather than degrading keeps the configured bound meaningful.
+    if (opts.buffer_pool.capacity_bytes < 2 * opts.max_file_bytes) {
+      throw std::invalid_argument{std::format(
+          "IoBackend::BufferPool: buffer_pool.capacity_bytes = {} must be at "
+          "least 2 x max_file_bytes = {}. Raise the pool, or lower "
+          "max_file_bytes — the two are coupled.",
+          opts.buffer_pool.capacity_bytes, opts.max_file_bytes)};
+    }
+    pool_ = std::make_unique<BufferPool>(opts.buffer_pool, counters_);
   }
   KeyDirEntry::check_file_offset(opts.max_file_bytes);
   std::filesystem::create_directories(dir_);
@@ -2798,7 +2808,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 void DB::rotate_active_file(TransientEngineState &t,
                             const std::shared_ptr<const EngineState> &) {
   t.active_file().shrink_to_fit();
-  auto read_only_old = openDataFileForRead(t.active_file().path(), io_backend_);
+  auto read_only_old = openDataFileForRead(t.active_file().path(), io_backend_, pool_.get());
   const auto stem = make_data_file_stem();
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_rotate_file_creation);
@@ -3005,7 +3015,7 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
   // between here and the staging create. renameDataFileExclusive refuses the
   // target instead of replacing it.
   renameDataFileExclusive(tmp_data_path, final_data_path);
-  auto new_file = openDataFileForRead(final_data_path, io_backend_);
+  auto new_file = openDataFileForRead(final_data_path, io_backend_, pool_.get());
   flush_hints_for(new_file, dir_);
 
   {
@@ -3074,6 +3084,23 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.disk_reads.load(std::memory_order_relaxed)},
       {"bytecask.disk_read_bytes",
        counters_.disk_read_bytes.load(std::memory_order_relaxed)},
+      {"bytecask.pool_hits",
+       counters_.pool_hits.load(std::memory_order_relaxed)},
+      {"bytecask.pool_misses",
+       counters_.pool_misses.load(std::memory_order_relaxed)},
+      {"bytecask.pool_fills",
+       counters_.pool_fills.load(std::memory_order_relaxed)},
+      {"bytecask.pool_fill_bytes",
+       counters_.pool_fill_bytes.load(std::memory_order_relaxed)},
+      {"bytecask.pool_evictions",
+       counters_.pool_evictions.load(std::memory_order_relaxed)},
+      {"bytecask.pool_oversize_reads",
+       counters_.pool_oversize_reads.load(std::memory_order_relaxed)},
+      {"bytecask.pool_multi_frame_reads",
+       counters_.pool_multi_frame_reads.load(std::memory_order_relaxed)},
+      {"bytecask.pool_optimistic_retries",
+       counters_.pool_optimistic_retries.load(std::memory_order_relaxed)},
+      {"bytecask.pool_frames_total", counters_.pool_frames_total},
       {"bytecask.vacuum_bytes_reclaimed",
        counters_.vacuum_bytes_reclaimed.load(std::memory_order_relaxed)},
       {"bytecask.vacuum_files_unlinked",
@@ -3160,7 +3187,7 @@ void DB::resume() {
   file.sync();
 
   // Open the old active as read-only for hint generation.
-  auto read_only_old = openDataFileForRead(file.path(), io_backend_);
+  auto read_only_old = openDataFileForRead(file.path(), io_backend_, pool_.get());
 
   // Dispatch hint generation — idempotent (flush_hints_for skips files
   // whose .hint already exists).
@@ -3484,7 +3511,7 @@ auto DB::recovery_prepare_files(EngineState &s)
     }
 
     const auto file_id = s.next_file_id++;
-    auto data_file = openDataFileForRead(p, io_backend_);
+    auto data_file = openDataFileForRead(p, io_backend_, pool_.get());
 
     const auto hint_path = dir_ / (p.stem().string() + ".hint");
     if (!std::filesystem::exists(hint_path)) {
@@ -3497,7 +3524,7 @@ auto DB::recovery_prepare_files(EngineState &s)
       if (end && *end < std::filesystem::file_size(p)) {
         data_file.reset();
         std::filesystem::resize_file(p, *end);
-        data_file = openDataFileForRead(p, io_backend_);
+        data_file = openDataFileForRead(p, io_backend_, pool_.get());
       }
     }
     files_t.set(file_id, data_file);

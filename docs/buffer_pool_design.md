@@ -71,7 +71,9 @@ The contract is unchanged. Of the five methods:
 
 The five methods are enough to *serve* a read from the pool. They are not enough to *build* one, because two things it needs are held by the engine rather than by the file.
 
-**The frame key.** Frames are keyed `(file_id, frame_index)`, and `file_id` is assigned by the engine — `openDataFileForRead(path, use_mmap)` (`data_file.cppm:1150`) takes neither an id nor a pool handle and returns a file that knows only its path. All five call sites are in the engine (`bytecask.cppm:2785, 2992, 3147, 3471, 3484`), and four have the id in hand. **Vacuum is the exception**: it opens the compacted file at `bytecask.cppm:2992`, and the id is minted afterwards inside `apply_vacuum` (`bytecask.cppm:1872`). Either the factory takes an explicit `file_id` and vacuum mints its id before opening the file, or the pool-backed file is constructed without one and has it set at registration. The first is preferable — the reorder is local, and the second puts a mutable field on a type that lock-free readers share.
+**The frame key.** Frames need a per-file identifier, and the engine's `file_id` is not available where files are opened: `openDataFileForRead` takes neither an id nor a pool handle, four of its five call sites have the id in hand, and **vacuum does not** — it opens the compacted file before `apply_vacuum` mints the id. That left a choice between reordering vacuum and giving a shared, lock-free-read type a mutable field.
+
+*Resolved — the premise was wrong.* The key only has to be **unique**, never equal to the engine's `file_id`, and conflating the two is what created the problem. The pool hands each file a **pool-local cache id** from its own monotonic counter when the file is opened (`BufferPool::acquire_cache_id`). Vacuum needs no reorder, no file carries a mutable id, and the orphan argument below is unchanged because pool-local ids are monotonic too. The factory still has to take the pool, so it grows one parameter rather than two.
 
 **A shared owner.** The pool is per-DB state, so the factory has to carry a pointer to it, which makes `openDataFileForRead` a member or a DB-bound factory rather than the free function it is today.
 
@@ -212,6 +214,8 @@ This is worth stating because the obvious design is a per-frame `(file_id, gener
 Writers (fill and evict) take a striped lock, re-validate the slot after acquiring it, and publish **key and value before the control word**, so a reader that sees an occupied slot is guaranteed to see the matching contents.
 
 **2. Striped locks, not partitioned sub-pools.** An earlier draft sharded the pool into independent sub-pools, each with its own table, free list, hand and lock. That was sized to defend a read path that turns out not to need defending. Striping locks over one shared table gives the same write-path concurrency **without fragmenting capacity between shards**, so the hit ratio previously written off as the price of scaling is not lost.
+
+*As built, V0 takes one fill/evict mutex rather than ~64 stripes* — and releases it across the device read, so the hold is the victim choice and the table update, not the I/O. By this section's own argument that makes contention noise against a 10–100 µs read. One lock is materially easier to audit, and tenet 2 outranks tenet 4 without a measured case. Striping stays available if `GetMT` shows the single lock contended; the number this section exists to defend, lock-free reads, is unaffected either way.
 
 **3. No unconditional writes on a hit.** Test-then-set the reference bit, so a hot frame writes nothing after the first touch. Keep the bit **in-band** — packed into the control word the probe already loaded, rather than in the frame header, which would be a second cache line touched per hit. Lost updates are harmless: a slightly-less-recently-used frame may be evicted a little sooner, which is within a cache's tolerance.
 

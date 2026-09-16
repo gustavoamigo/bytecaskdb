@@ -71,6 +71,14 @@ static MYSQL_SYSVAR_ENUM(io_backend, sysvar_io_backend,
     "The active file is unaffected — it is written the same way in every mode.",
     nullptr, nullptr, 0, &io_backend_typelib);
 
+static unsigned long long sysvar_buffer_pool_size = 0;
+static MYSQL_SYSVAR_ULONGLONG(buffer_pool_size, sysvar_buffer_pool_size,
+    PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+    "Buffer pool size in bytes, used only when bytecaskdb_io_backend is "
+    "buffer_pool. TOTAL footprint, not just frame bytes. Must be at least "
+    "2 x bytecaskdb_max_file_bytes.",
+    nullptr, nullptr, 0, 0, ~0ULL, 1);
+
 static unsigned long long sysvar_max_file_bytes = 64ULL * 1024 * 1024;
 static MYSQL_SYSVAR_ULONGLONG(max_file_bytes, sysvar_max_file_bytes,
     PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
@@ -165,6 +173,7 @@ static MYSQL_SYSVAR_ULONG(vacuum_idle_interval_ms,
 
 static struct st_mysql_sys_var *bytecaskdb_system_variables[] = {
     MYSQL_SYSVAR(io_backend),
+    MYSQL_SYSVAR(buffer_pool_size),
     MYSQL_SYSVAR(max_file_bytes),
     MYSQL_SYSVAR(bulk_copy_flush_bytes),
     MYSQL_SYSVAR(verify_checksums),
@@ -868,6 +877,8 @@ static int bytecaskdb_init(void *p) {
   opts.max_value_bytes = 16 * 1024 * 1024;  // MEDIUMBLOB (16 MiB)
   opts.max_key_bytes = 8192;  // secondary index key + PK suffix can exceed 4096
   opts.io_backend = static_cast<bytecask::IoBackend>(sysvar_io_backend);
+  opts.buffer_pool.capacity_bytes =
+      static_cast<std::size_t>(sysvar_buffer_pool_size);
   opts.max_file_bytes = sysvar_max_file_bytes;
 
   try {
@@ -888,8 +899,10 @@ static int bytecaskdb_init(void *p) {
 
   sql_print_information("ByteCaskDB: opened global DB at '%s'",
           db_path.c_str());
-  sql_print_information("ByteCaskDB: io_backend=%s max_file_bytes=%llu",
-          io_backend_names[sysvar_io_backend], sysvar_max_file_bytes);
+  sql_print_information(
+          "ByteCaskDB: io_backend=%s max_file_bytes=%llu buffer_pool_size=%llu",
+          io_backend_names[sysvar_io_backend], sysvar_max_file_bytes,
+          sysvar_buffer_pool_size);
 
   s_vacuum_stop = false;
   s_vacuum_pause_count = 0;

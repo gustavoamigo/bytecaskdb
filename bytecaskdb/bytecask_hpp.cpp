@@ -83,6 +83,11 @@ auto to_module(bytecask::internal::IoBackend b) noexcept -> bytecask::IoBackend 
   return static_cast<bytecask::IoBackend>(b);
 }
 
+auto to_module(bytecask::internal::BufferPoolOptions o) noexcept
+    -> bytecask::BufferPoolOptions {
+  return {o.capacity_bytes, o.oversize_guard_divisor};
+}
+
 auto to_module(bytecask::internal::Options o) noexcept -> bytecask::Options {
   return {
     o.max_file_bytes,
@@ -92,6 +97,7 @@ auto to_module(bytecask::internal::Options o) noexcept -> bytecask::Options {
     o.max_key_bytes,
     o.max_value_bytes,
     to_module(o.io_backend),
+    to_module(o.buffer_pool),
   };
 }
 
