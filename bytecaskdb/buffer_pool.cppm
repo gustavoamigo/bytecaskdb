@@ -101,6 +101,12 @@ public:
     if (arena_ == nullptr) {
       throw std::bad_alloc{};
     }
+    // Touch every page now. Without this the arena faults in lazily, one page
+    // at a time, on the read path — so a larger pool has a WORSE tail, which
+    // is backwards. It also makes "configure N bytes, observe N bytes
+    // resident" true: the operator asked for this memory, so take it at open
+    // rather than charging it to p99 during serving.
+    std::memset(arena_, 0, arena_bytes);
     meta_ = std::vector<FrameMeta>(frame_count_);
     table_ = std::vector<Slot>(table_mask_ + 1);
     counters_.pool_frames_total = narrow<std::int64_t>(frame_count_);
@@ -183,7 +189,15 @@ public:
     }
     const auto extent_len = static_cast<std::size_t>(clamped_end - extent_start);
 
-    std::vector<std::byte> scratch(extent_len);
+    // Reused across calls. A fresh vector here would heap-allocate AND
+    // zero-fill several KiB on every miss, immediately before overwriting all
+    // of it — an allocation on the read path, which tenet 3 rules out.
+    // Thread-exit destructor is intentional; suppress the Clang diagnostic.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+    thread_local std::vector<std::byte> scratch;
+#pragma clang diagnostic pop
+    scratch.resize(extent_len);
     pread_exact(fd, scratch.data(), extent_len, extent_start);
 
     // The caller's bytes come from the buffer we just read, not from the

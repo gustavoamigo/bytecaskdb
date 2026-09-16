@@ -186,6 +186,20 @@ target("engine_bench")
         add_release_opts(t)
     end)
 
+-- Buffer pool sweep over pool_bytes / dataset_bytes. Deliberately independent
+-- of engine_bench: no RocksDB, no Google Benchmark, since this is a parameter
+-- sweep reported as p50/p99, not a microbenchmark.
+target("pool_bench")
+    set_kind("binary")
+    set_default(false)
+    add_files("benchmarks/pool_bench.cpp", "bytecaskdb/*.cppm")
+    add_packages("crc32c")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+
 target("memory_profile")
     set_kind("binary")
     set_default(false)

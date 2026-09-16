@@ -332,6 +332,29 @@ The benchmark sweep in Phase 0 is not optional. Every current benchmark fits in 
 
 **Phase 0 is worth building whether or not the pool follows.** The missing hit-ratio visibility and the missing out-of-RAM benchmark are gaps today.
 
+### First measurements
+
+`benchmarks/pool_bench.cpp`, via `python3 scripts/run_pool_bench.py`; recorded in `benchmarks/pool_bench_results.csv`. 60 k keys x 512 B (31 MiB on disk), Zipf(0.99), 1 MiB files, dev container — not the benchmark host the README reports, so read the columns against each other, not against the README.
+
+| Back-end | ratio | ops/s | p50 | p99 | hit ratio |
+|---|---:|---:|---:|---:|---:|
+| pread | — | 993 K | 583 ns | 1.57 µs | — |
+| mmap | — | 1.66 M | 238 ns | 998 ns | — |
+| buffer pool | 0.10 | 857 K | 305 ns | 3.80 µs | 0.696 |
+| buffer pool | 0.25 | 1.12 M | 287 ns | 2.86 µs | 0.808 |
+| buffer pool | 0.50 | 1.26 M | 277 ns | 2.78 µs | 0.890 |
+| buffer pool | 1.00 | 1.35 M | 270 ns | 2.66 µs | 0.928 |
+
+Against §12.1's proposed bar, at ratio 0.25: **hit ratio 0.808 passes** (bar: ≥ 0.6). **p99 fails** — 2.86 µs is 2.9x `mmap`, against a bar of 2x. Optimistic retries were zero throughout, which passes. The 32-thread `GetMT` criterion is not yet measured; there is no multi-threaded arm in this benchmark.
+
+By §12.1's own rule, a p99 failure is a design problem that blocks Phase 2, and that is the state this leaves things in — the bar was written before the numbers existed, which is the point of agreeing it first.
+
+p50 is the encouraging half: 270–305 ns beats `pread`'s 583 ns roughly twofold and sits within ~15 % of `mmap`. The tail is where the miss path shows, and at ratio 1.00 the residual 7.2 % miss rate is compulsory — first touch of each frame inside the measurement window, not eviction (evictions were zero).
+
+**One real bug fell out of building this.** Tail latency initially *rose* with pool size — p99 4.5 µs at ratio 1.00 against 2.8 µs at 0.10, with fewer evictions at the larger size. The arena was being faulted in lazily, one page at a time, on the read path, so a larger pool meant more cold pages and a worse tail. Pre-faulting the arena at construction removed the inversion (p99 4.5 µs → 2.7 µs at ratio 1.00) and is independently right: §3 promises that configuring N bytes yields N bytes resident, and a lazily-faulted arena makes that a ceiling rather than a reservation.
+
+The caveat that bounds all of it: Phase 1 fills through the page cache, so a miss here is usually still a page-cache hit, not a device round trip. These miss latencies are a floor. What bypassing the page cache costs at p99 is Phase 2's question and needs a dataset larger than RAM.
+
 ---
 
 ## 12. Open
