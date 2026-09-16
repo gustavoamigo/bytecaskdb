@@ -350,6 +350,57 @@ auto measure_ryow(const Config &cfg, bytecask::IoBackend backend,
   return r;
 }
 
+// Diagnostic, not a benchmark row: the cost of a pool hit on the active file
+// against one on a sealed file, with no writes interleaved. Writes 4000
+// entries under 1 MiB files so key 0 is sealed and the last key is active,
+// then times repeated gets of each. Prints and returns; nothing is recorded.
+void hit_probe(const Config &cfg) {
+  std::filesystem::remove_all(cfg.dir);
+  std::filesystem::create_directories(cfg.dir);
+  const std::string value(cfg.value_bytes, 'h');
+  constexpr int kEntries = 4000;
+  auto db = bytecask::DB::open(
+      cfg.dir, {.max_file_bytes = 1024 * 1024,
+                .io_backend = bytecask::IoBackend::BufferPool,
+                .buffer_pool = {.capacity_bytes = 64 * 1024 * 1024,
+                                .direct_io = false}});
+  for (int i = 0; i < kEntries; ++i) {
+    db.put({.sync = false}, to_bytes(key_for(static_cast<std::size_t>(i))),
+           to_bytes(value));
+  }
+  const auto st = db.stats();
+  std::fprintf(stderr, "hit_probe: rotations=%lld pinned=%lld resident=%lld\n",
+               static_cast<long long>(st.at("bytecask.file_rotations")),
+               static_cast<long long>(st.at("bytecask.pool_frames_pinned")),
+               static_cast<long long>(st.at("bytecask.pool_frames_resident")));
+  const auto time_key = [&](const char *label, std::size_t idx) {
+    const auto key = key_for(idx);
+    bytecask::Bytes out;
+    std::vector<std::uint64_t> lat;
+    lat.reserve(200000);
+    const auto before = db.stats();
+    for (int i = 0; i < 200000; ++i) {
+      const auto t0 = std::chrono::steady_clock::now();
+      (void)db.get({}, to_bytes(key), out);
+      const auto t1 = std::chrono::steady_clock::now();
+      lat.push_back(static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+    }
+    const auto after = db.stats();
+    std::printf("hit_probe %-8s p50=%llu ns  p99=%llu ns  hits=%lld misses=%lld retries=%lld\n",
+                label, static_cast<unsigned long long>(percentile(lat, 0.5)),
+                static_cast<unsigned long long>(percentile(lat, 0.99)),
+                static_cast<long long>(after.at("bytecask.pool_hits") - before.at("bytecask.pool_hits")),
+                static_cast<long long>(after.at("bytecask.pool_misses") - before.at("bytecask.pool_misses")),
+                static_cast<long long>(after.at("bytecask.pool_optimistic_retries") -
+                                       before.at("bytecask.pool_optimistic_retries")));
+  };
+  time_key("sealed", 0);
+  time_key("active", kEntries - 1);
+  time_key("sealed", 0);
+  time_key("active", kEntries - 1);
+}
+
 auto parse_size(std::string_view s) -> std::size_t {
   std::size_t v = 0;
   std::from_chars(s.data(), s.data() + s.size(), v);
@@ -382,6 +433,9 @@ auto main(int argc, char **argv) -> int {
         if (comma == std::string::npos) break;
         pos = comma + 1;
       }
+    } else if (a == "--hit-probe") {
+      hit_probe(cfg);
+      return 0;
     } else if (a == "--ryow") {
       cfg.ryow_pairs = parse_size(next());
     } else if (a == "--mt-threads") {
