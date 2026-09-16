@@ -73,8 +73,10 @@ The contract is unchanged. Of the five methods:
 
 ```
 Arena        one aligned allocation, fixed 4 KiB frames, free list
-Index        shards; shard = hash(file_id, frame_index) % N
-             each shard owns its table, free list, clock hand and lock
+Index        one shared open-addressed table; lock-free reads (acquire loads)
+             striped locks (~64) on the fill/evict path only
+Clock        one global hand, advanced by CAS; never touched by a reader
+             reference bit in-band in the control byte, test-then-set
 Key          (file_id, frame_index)
 Eviction     CLOCK, test-then-set reference bit
 Active file  fully resident and never evictable (§5)
@@ -191,9 +193,17 @@ This is worth stating because the obvious design is a per-frame `(file_id, gener
 
 14.0 Mops/s at 32 threads is the strongest number in the README and the thing most at risk, since the pool puts shared mutable state on a lock-free read path. Three rules:
 
-1. **Shard everything.** One pool-wide lock, free list or clock hand is a serialisation point. Each shard owns its own.
-2. **Optimistic reads, not pin counts.** A refcount makes 32 readers of one hot frame take that cacheline exclusive, serialising them however short the critical section. Instead: read the frame's version, memcpy out, re-read the version; on mismatch retry, or fall back to a direct `pread`, which is always correct. This is why §2 chose copy-out — the two decisions are one.
-3. **No unconditional writes on a hit.** Test-then-set the reference bit, so a hot frame writes nothing after the first touch.
+**1. The read path takes no lock, and the clock hand is not on it.** The hand is advanced only by a thread that has already missed and needs a victim. Since a miss costs a device read of 10–100 µs, contention on a single global hand at ~100 ns is noise — so it does not need sharding either. Readers probe the table with acquire loads and never touch it.
+
+Writers (fill and evict) take a striped lock, re-validate the slot after acquiring it, and publish **key and value before the control word**, so a reader that sees an occupied slot is guaranteed to see the matching contents.
+
+**2. Striped locks, not partitioned sub-pools.** An earlier draft sharded the pool into independent sub-pools, each with its own table, free list, hand and lock. That was sized to defend a read path that turns out not to need defending. Striping locks over one shared table gives the same write-path concurrency **without fragmenting capacity between shards**, so the hit ratio previously written off as the price of scaling is not lost.
+
+**3. No unconditional writes on a hit.** Test-then-set the reference bit, so a hot frame writes nothing after the first touch. Keep the bit **in-band** — packed into the control word the probe already loaded, rather than in the frame header, which would be a second cache line touched per hit. Lost updates are harmless: a slightly-less-recently-used frame may be evicted a little sooner, which is within a cache's tolerance.
+
+**4. Optimistic reads, not pin counts.** A refcount makes 32 readers of one hot frame take that cache line exclusive, serialising them however short the critical section. Instead: read the frame's version, memcpy out, re-read the version; on mismatch retry, or fall back to a direct `pread`, which is always correct.
+
+The version check is **not** redundant with the publish-last ordering in (1), and the difference is worth being precise about. Publish-last is sufficient for a cache of object references — a reader that races with eviction gets a reference to an object that is still valid, so the worst outcome is a logically-evicted but correct value. Our frames are **reused memory**: a reader racing with evict-then-refill gets bytes that are part old and part new, which is garbage rather than a stale-but-valid value. Ordering makes the *slot* consistent; only the version check makes the *bytes* consistent. This is the same reason §2 copies out instead of handing back spans.
 
 These are hypotheses, not claims. They have to be measured with `GetMT` at 2–32 threads against both existing back-ends, with a working set that does not fit the pool.
 
@@ -219,7 +229,6 @@ Two secondary effects push the same way at scale: a 100 GiB mapping needs roughl
 - **Miss latency has no floor.** Today a "miss" often still hits the page cache. With `O_DIRECT` it is a device round trip. Mean throughput can improve while p99 regresses, which tenet 3 counts as a regression.
 - **32-thread read scaling.** 14.0 Mops/s is the strongest number in the README, and §8 is a set of hypotheses about not losing it, not a set of claims.
 - **Density.** A block cache stores headers, keys and superseded entries, exactly as the page cache does. §10 quantifies what a format-aware cache would save.
-- **Sharding costs hit ratio.** Capacity cannot move between shards — a deliberate trade of hit ratio for scaling, and both should be measured.
 
 ### Benchmarking consequence
 
@@ -257,7 +266,7 @@ Each of these is a real option that V0 does not take. They are listed so that th
 struct BufferPoolOptions {
   std::size_t capacity_bytes;          // 0 = disabled; TOTAL footprint, not frame bytes
   std::size_t frame_bytes;             // default 4096
-  unsigned    shards;
+  unsigned    lock_stripes;        // fill/evict path only; reads take no lock
   unsigned    oversize_guard_divisor;  // entry > capacity/N is never admitted
   bool        direct_io;
   bool        huge_pages;
