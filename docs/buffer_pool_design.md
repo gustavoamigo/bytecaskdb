@@ -76,7 +76,6 @@ Arena        one aligned allocation, fixed 4 KiB frames, free list
 Index        shards; shard = hash(file_id, frame_index) % N
              each shard owns its table, free list, clock hand and lock
 Key          (file_id, frame_index)
-Validity     per-frame (file_id, generation); stale generation == miss
 Eviction     CLOCK, test-then-set reference bit
 Active file  fully resident and never evictable (§5)
 Sealed files O_DIRECT fills (§6)
@@ -174,9 +173,11 @@ Alignment falls out of the frame size: the arena is page-aligned, frames are 4 K
 
 **Scans.** `scan()`, `scan_committed()` and `create_manifest()` sweep whole files once. Admitting those frames would flush the working set on every vacuum pass. Scan paths bypass the pool and use buffered sequential `preadv` with `FADV_SEQUENTIAL` ahead and `FADV_DONTNEED` behind, leaving neither cache polluted.
 
-**Vacuum.** Unlinking a file bumps its `file_id` generation; its frames become lazy misses and are recycled on contact. O(1), no sweep.
+**Vacuum needs no invalidation at all.** `active_file_id_ = next_file_id_++` (`bytecask.cppm:1864`) — file ids are strictly monotonic and never reused within a process. So when vacuum unlinks a file, no `KeyDirEntry` points at it any more and its id is never issued again, which means nothing will ever look up `(that file_id, any frame)`. Its frames are not stale, they are **orphans** — and orphans are what CLOCK evicts best, since they are never referenced again and their reference bits stay clear. They clean themselves up on the next hand pass.
 
-**`truncate()`** — called by `resume()` — bumps the generation the same way.
+This is worth stating because the obvious design is a per-frame `(file_id, generation)` stamp compared on every lookup, so that bumping a counter invalidates a whole file in O(1). That buys a hot-path comparison and four bytes per frame in exchange for reclaiming dead capacity one CLOCK sweep earlier than it happens anyway. **If file ids ever become reusable, this reasoning breaks and the generation stamp becomes a correctness requirement** — not an optimisation.
+
+**`truncate()`** — called by `resume()` — needs nothing either. Every published entry lies below `valid_offset`, so frames above it hold bytes no reader addresses, and the file is sealed immediately afterwards.
 
 **Snapshots and rotation.** Snapshots hold files open, so nothing they reference can be unlinked. `file_id` is stable across registry snapshots, so rotation invalidates nothing.
 
