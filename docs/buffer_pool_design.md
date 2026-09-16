@@ -234,7 +234,7 @@ One case genuinely cannot be served: an entry larger than the pool, or large eno
 
 The distinction from the rejected bypass matters. This is not "large values are slow", it is "one value may not evict the cache to hold itself". With the default 4 MiB ceiling it never fires unless the pool is smaller than about 32 MiB, and if it fires often that is a misconfiguration the counters should surface (`pool_oversize_reads`), not a tuning opportunity.
 
-**Decision: A3**, frame size configurable with a default of 4096, extents as the admission and eviction unit, and no size-based bypass other than the capacity-derived guard rail.
+**Provisional: A3**, frame size configurable with a default of 4096, extents as the admission and eviction unit, and no size-based bypass other than the capacity-derived guard rail. Provisional rather than decided — see *Pricing the trade properly* below, which is a Phase 0 measurement and a gate on Phase 1.
 
 The fork against A1 was reopened once, on the strength of the density and dead-entry arguments above, and closed again on the allocator accounting — which is worth recording, because the deciding argument is not the obvious one.
 
@@ -244,7 +244,45 @@ But the deciding cost is not allocator overhead. **Size classes fragment the evi
 
 That settles it: **density is a constant factor on capacity, and capacity is buyable; a degraded eviction policy is not.** The dead-entry argument weakens on the same inspection — vacuum exists to remove superseded entries, so that waste is bounded by vacuum aggressiveness, a knob the engine already owns.
 
-A1 stays in the A/B rather than being deleted. Phase 0's counters measure value-size distribution and live-byte fraction on a real workload, which says exactly how much density A3 is conceding before either cache is built. If small values dominate *and* the live ratio stays poor, A1 is worth revisiting — with the allocator and eviction-quality costs priced in.
+#### Pricing the trade properly
+
+The density figures earlier in this section are **wrong as an argument for A1**, because they count only the 15-byte header and 4-byte CRC that an entry cache avoids storing, and ignore the bookkeeping that buying variable-size storage costs. Counting both sides, per cached entry:
+
+- **A3** stores `19 + K + V` bytes of frame, plus about 1 % frame metadata.
+- **A1** stores `(K + V) × 1.11` for internal fragmentation on a 1.25× size-class ladder, plus roughly 20 bytes of per-object metadata — packed key, object size, table or slab index, eviction byte.
+
+For a 16-byte key and 16-byte value that is 51 bytes against 55.5. **A1 is worse.** At 1 KiB values it is 1067 against 1183 — worse by the same margin. The header-and-key saving does not survive contact with the allocator at any entry size, which is the objection that prompted this subsection and it is correct.
+
+What does survive is the term this document had been treating as hand-waving. Let `u` be the fraction of a frame's entries that are actually read before it is evicted. Then
+
+```
+A1 effective capacity / A3 effective capacity  ≈  0.9 / u
+```
+
+and the ratio is near size-independent, because the header saving and the fragmentation penalty cancel across the range.
+
+| frame utilization `u` | A1 vs A3 |
+|---:|---:|
+| 1.0 | 0.9× — A3 ahead |
+| 0.9 | 1.0× — crossover |
+| 0.5 | 1.8× |
+| 0.25 | 3.6× |
+| 0.1 | 9× |
+
+Note `u <= L`, since a dead entry can never be read: the live ratio is a ceiling on utilization, which is how the superseded-entry argument folds into this one rather than standing separately.
+
+**The crossover sits at about 90 % frame utilization**, which is a demanding bar. In the regime the cache exists for — random point reads over a dataset far larger than the cache — `u` is plausibly 0.1 to 0.3, putting A1 at three to nine times the effective capacity.
+
+That is uncomfortable for the provisional decision above, and the discomfort should be recorded rather than smoothed over: **the density side of the trade appears to favour A1 in the target regime, so the A3 choice rests entirely on the allocator and eviction-fragmentation argument** — and that argument has no number attached to it. The gap between a good and a degraded eviction policy is typically worth 1.1× to 1.5× effective capacity. A three- to nine-fold density difference would swamp it.
+
+Two estimated constants carry this arithmetic — 11 % internal fragmentation and ~20 bytes of per-object metadata — which is not a basis for reversing a design decision. But it is ample basis for refusing to call one settled.
+
+**So this is a Phase 0 measurement and a Phase 1 gate.** Both inputs are observable before either cache is built:
+
+- `u` — one counter per frame, incremented on hit, histogrammed at eviction. A frame-lifetime hit count over-counts repeat reads of the same entry, so it is an upper bound on `u` and therefore a *conservative* estimate in A3's favour, which is the right direction for a number being used to defend A3.
+- `L` — the live-byte fraction, which `file_stats` already tracks for vacuum.
+
+If measured `u` lands near or above 0.9, A3 is correct and the question closes. If it lands at 0.3 or below, A1's density advantage is large enough that the eviction-quality cost has to be measured rather than asserted, and Phase 1 should build A1 instead — with the allocator and per-class eviction costs priced in, not waved away as they were in the first draft of this section.
 
 ### Axis B — eviction policy
 
@@ -532,7 +570,7 @@ Each phase is independently benchmarkable and independently revertible. That is 
 
 | Phase | Content | What it answers |
 |---|---|---|
-| 0 | Back-end enum, counters, benchmark sweep with a working set that exceeds RAM. No pool. | What is the baseline, and can we even see the regime where a pool matters? |
+| 0 | Back-end enum, counters, benchmark sweep with a working set that exceeds RAM. Frame-utilization (`u`) and live-ratio (`L`) instrumentation. No pool. | What is the baseline, can we see the regime where a pool matters, and does Axis A resolve to a block or an entry cache? |
 | 1 | Pool with buffered `preadv` fills, CLOCK, sharded, copy-out, C2 CRC. | Does the pool beat the page cache while still using it? Does 32-thread scaling survive? |
 | 2 | `O_DIRECT` on sealed files, `FADV_DONTNEED` after seal. | What does bypassing the page cache actually buy, and what does it cost at p99? |
 | 3 | Insert-on-write for the active file. | Does read-your-own-writes improve on a write-heavy mix? |
@@ -545,7 +583,7 @@ If Phase 1 does not show a win in the regime Phase 0 establishes, the honest out
 ## 10. Open questions
 
 1. **Does `verify_checksums` keep its meaning?** Section 3 Axis C changes it from per-read to per-transfer. Is that acceptable as a silent change of meaning under a different back-end, or does it need a separate option so the two are not conflated?
-2. **Is the entry cache (A1) really dismissed?** It is the only option that makes CRC-on-fill trivially correct with no per-frame state at all, and storing values without their keys and headers is worth 1.5–3× effective capacity below ~64-byte values (Axis A, *What a read touches*). Against that it discards ~79 of the ~80 entries every aligned device read already paid for, and it cannot serve the `read_entry` / `EntryIterator` paths without key reconstruction. Density versus locality is a measurement, not an argument — it should be settled by the A/B, not here.
+2. **Does Axis A resolve to a block cache or an entry cache?** Reopened: once allocator bookkeeping is counted, the header-and-key density argument for A1 nets to zero, but the frame-utilization term gives A1 roughly `0.9 / u` of A3's effective capacity, crossing over near 90 % utilization. Phase 0 measures `u` and `L`, and Phase 1 builds whichever side that lands on. Not to be settled by argument — see *Pricing the trade properly*.
 3. **Should the pool be per-DB or process-wide?** Per-DB is simpler and matches `Options`. Process-wide matters for the MariaDB plugin, where many tables would otherwise each carve out their own fixed arena.
 4. **Is `O_DIRECT` alone enough, or do we want `RWF_NOWAIT` / `preadv2` as a "hit the page cache or tell me you missed" probe?** That would let us keep the page cache as a free second tier without giving up control.
 5. **What is the acceptance bar?** Section 8 argues it should be a hit ratio and a p99 at a stated working-set ratio, not a throughput number on the existing benchmarks. That bar should be agreed before Phase 1, not after.
