@@ -7042,6 +7042,95 @@ TEST_CASE("io_backend=BufferPool: values survive recovery",
 #endif
 }
 
+TEST_CASE("io_backend=BufferPool: vacuum does not pollute the pool",
+          "[bytecask][buffer_pool]") {
+#ifndef __EMSCRIPTEN__
+  // A vacuum pass sweeps whole files. If scan() admitted those frames it would
+  // evict the working set every pass, so scan reads straight from the fd.
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path, {.max_file_bytes = 32 * 1024,
+                .io_backend = bytecask::IoBackend::BufferPool,
+                .buffer_pool = {.capacity_bytes = 1024 * 1024}});
+  constexpr int kCount = 600;
+  const auto value_for = [](int i) {
+    return std::format("v{:05d}", i) + std::string(200, 'x');
+  };
+  for (int i = 0; i < kCount; ++i) {
+    db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+           to_bytes(value_for(i)));
+  }
+  for (int i = 0; i < kCount; i += 2) {
+    (void)db.del({.sync = false}, to_bytes(std::format("k{:05d}", i)));
+  }
+  // Populate the pool with the reads we care about keeping.
+  bytecask::Bytes out;
+  for (int i = 1; i < kCount; i += 2) {
+    REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
+  }
+  const auto fills_before = db.stats().at("bytecask.pool_fills");
+  REQUIRE(fills_before > 0);
+
+  bool vacuumed = false;
+  // Threshold 0 so a pass definitely runs — a no-op vacuum would prove nothing.
+  while (db.vacuum({.fragmentation_threshold = 0.0})) {
+    vacuumed = true;
+  }
+  REQUIRE(vacuumed);
+
+  // The sweep must not have admitted a single frame.
+  CHECK(db.stats().at("bytecask.pool_fills") == fills_before);
+
+  // ... and the data is still correct afterwards.
+  for (int i = 1; i < kCount; i += 2) {
+    REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
+    CHECK(to_string(out) == value_for(i));
+  }
+#endif
+}
+
+TEST_CASE("io_backend=BufferPool: verify_checksums=false read paths",
+          "[bytecask][buffer_pool]") {
+#ifndef __EMSCRIPTEN__
+  // Exercises read_value's unverified branch and read_entry_unverified, which
+  // the CRC-verifying default never reaches.
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path, {.max_file_bytes = 32 * 1024,
+                .io_backend = bytecask::IoBackend::BufferPool,
+                .buffer_pool = {.capacity_bytes = 512 * 1024}});
+  constexpr int kCount = 400;
+  const auto value_for = [](int i) {
+    return std::format("v{:05d}", i) + std::string(200, 'x');
+  };
+  for (int i = 0; i < kCount; ++i) {
+    db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+           to_bytes(value_for(i)));
+  }
+  const bytecask::ReadOptions no_crc{.verify_checksums = false};
+
+  bytecask::Bytes out;
+  for (int i = 0; i < kCount; ++i) {
+    REQUIRE(db.get(no_crc, to_bytes(std::format("k{:05d}", i)), out));
+    CHECK(to_string(out) == value_for(i));
+  }
+  // Forward and reverse iteration both take read_entry_unverified here.
+  int seen = 0;
+  for (auto &[key, value] : db.iter_from(no_crc)) {
+    CHECK(to_string(value).size() == value_for(0).size());
+    ++seen;
+  }
+  CHECK(seen == kCount);
+  int rseen = 0;
+  for (auto &[key, value] : db.riter_from(no_crc, to_bytes("k~"))) {
+    (void)key;
+    (void)value;
+    ++rseen;
+  }
+  CHECK(rseen == kCount);
+#endif
+}
+
 TEST_CASE("io_backend=BufferPool: iteration and vacuum agree with pread",
           "[bytecask][buffer_pool]") {
 #ifndef __EMSCRIPTEN__
@@ -7062,7 +7151,7 @@ TEST_CASE("io_backend=BufferPool: iteration and vacuum agree with pread",
     for (int i = 0; i < kCount; i += 3) {
       (void)db.del({.sync = false}, to_bytes(std::format("k{:05d}", i)));
     }
-    while (db.vacuum()) {
+    while (db.vacuum({.fragmentation_threshold = 0.0})) {
     }
     std::vector<std::string> seen;
     for (auto &[key, value] : db.iter_from({})) {

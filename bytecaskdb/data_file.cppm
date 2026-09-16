@@ -1207,7 +1207,7 @@ public:
     if (offset + kHeaderSize > file_size_) {
       return std::nullopt;
     }
-    const auto header = read_header(offset);
+    const auto header = read_header(offset, Source::Direct);
     if (header.sequence == 0) return std::nullopt;
     const auto next =
         offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
@@ -1215,8 +1215,9 @@ public:
       return std::nullopt;
     }
     std::vector<std::byte> buf;
-    auto view =
-        read_entry_with_key_size(offset, header.key_size, header.value_size, buf);
+    auto view = read_entry_with_key_size(offset, header.key_size,
+                                         header.value_size, buf,
+                                         Source::Direct);
     return std::make_pair(
         DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
                   .key = {view.key.begin(), view.key.end()},
@@ -1229,20 +1230,22 @@ public:
                   std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const override {
     if (verify) {
-      auto view = read_entry_with_key_size(offset, key_size, value_size, io_buf);
+      auto view = read_entry_with_key_size(offset, key_size, value_size,
+                                           io_buf, Source::Pool);
       out.assign(view.value.begin(), view.value.end());
     } else {
       const auto val_offset = offset + kHeaderSize + key_size;
       out.resize(value_size);
-      fetch(val_offset, value_size, out.data());
+      fetch(val_offset, value_size, out.data(), Source::Pool);
     }
   }
 
   [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
                                 std::vector<std::byte> &io_buf) const
       -> DataEntryView override {
-    auto hdr = read_header(offset);
-    return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf);
+    auto hdr = read_header(offset, Source::Pool);
+    return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf,
+                                    Source::Pool);
   }
 
   // No speculative over-read here, unlike the pread back-end: that exists to
@@ -1251,10 +1254,10 @@ public:
   [[nodiscard]] auto read_entry_unverified(
       Offset offset, std::uint32_t value_size,
       std::vector<std::byte> &io_buf) const -> DataEntryView override {
-    const auto hdr = read_header(offset);
+    const auto hdr = read_header(offset, Source::Pool);
     const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
     io_buf.resize(total);
-    fetch(offset, total, io_buf.data());
+    fetch(offset, total, io_buf.data(), Source::Pool);
     auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
                                            hdr.key_size + value_size};
     return DataEntryView{
@@ -1281,22 +1284,45 @@ private:
   std::uint32_t file_id_;
   BufferPool *pool_;
 
-  void fetch(Offset offset, std::size_t len, std::byte *dst) const {
-    pool_->read_at(file_id_, fd_, offset, len, file_size_, dst);
+  // Point reads go through the pool; scans deliberately do not. scan() sweeps
+  // a whole file once — vacuum, hint generation, create_manifest — and
+  // admitting those frames would flush the working set on every vacuum pass
+  // (design §7). Making the source an explicit argument means a new read path
+  // has to choose rather than inherit whichever default was nearest.
+  enum class Source { Pool, Direct };
+
+  void fetch(Offset offset, std::size_t len, std::byte *dst,
+             Source source) const {
+    if (source == Source::Pool) {
+      pool_->read_at(file_id_, fd_, offset, len, file_size_, dst);
+      return;
+    }
+    std::size_t done = 0;
+    while (done < len) {
+      const auto n = ::pread(fd_, dst + done, len - done,
+                             narrow<off_t>(offset + done));
+      if (n <= 0) {
+        throw std::system_error{
+            errno, std::generic_category(),
+            "ReadOnlyBufferPoolDataFile: pread failed"};
+      }
+      done += static_cast<std::size_t>(n);
+    }
   }
 
-  [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
+  [[nodiscard]] auto read_header(Offset offset, Source source) const
+      -> EntryHeader {
     std::array<std::byte, kHeaderSize> hdr{};
-    fetch(offset, kHeaderSize, hdr.data());
+    fetch(offset, kHeaderSize, hdr.data(), source);
     return bytecask::read_header(std::span{hdr});
   }
 
   [[nodiscard]] auto read_entry_with_key_size(
       Offset offset, std::uint16_t key_size, std::uint32_t value_size,
-      std::vector<std::byte> &io_buf) const -> DataEntryView {
+      std::vector<std::byte> &io_buf, Source source) const -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
     io_buf.resize(total);
-    fetch(offset, total, io_buf.data());
+    fetch(offset, total, io_buf.data(), source);
     const auto header = parse_header_and_verify(io_buf);
     auto body = std::span<const std::byte>{io_buf}.subspan(kHeaderSize);
     return DataEntryView{
