@@ -607,8 +607,11 @@ private:
   WritableFileOps ops_;
   std::byte *mmap_base_{nullptr};
   std::size_t mmap_len_{0};   // mapped length — fixed after construction
-  // Bytes of the mapping backed by the file. Read on the lock-free read path
-  // while truncate() lowers it, so it is atomic.
+  // Upper bound for mapping-served reads; past it, reads take the pread path.
+  // Not the file's length — a fresh mapping spans the whole capacity while the
+  // file is only zero-filled ahead of the write cursor. What holds is that
+  // every path shrinking the file lowers this with it. Read on the lock-free
+  // read path while truncate() lowers it, so it is atomic.
   std::atomic<std::size_t> mmap_end_{0};
 
   [[nodiscard]] auto mmap_end() const noexcept -> std::size_t {

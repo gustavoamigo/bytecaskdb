@@ -3552,8 +3552,11 @@ TEST_CASE("mmap: resume() keeps reader spans valid",
   REQUIRE_NOTHROW(db.resume());
   CHECK_FALSE(db.is_degraded());
 
-  // The span survives resume(): same address, still mapped, same bytes.
-  // Probing half the capacity rules out a remap that reused the address.
+  // The span survives resume(): same address, still mapped, same bytes. The
+  // bytes are what discriminate here — resume() opens the new active file at
+  // the same capacity, so a mapping that took over the address would satisfy
+  // both the mapped and address checks while serving zeros from that empty
+  // file.
   CHECK(bytecask::testing::is_mapped(addr, kCapacity / 2));
   CHECK(entry.value.data() == addr);
   CHECK(to_string(entry.key) == "k");
