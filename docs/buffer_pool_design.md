@@ -78,6 +78,40 @@ An entry spanning several frames is resolved as several independent lookups; con
 
 Per-frame metadata is roughly 32 bytes — `file_id`, `frame_index`, `generation`, seqlock version, reference byte, flags — about 1 % over a 4 KiB frame.
 
+### The bound is the contract
+
+`capacity_bytes` is the whole point of the subsystem, so it means **total pool footprint**, not the frame bytes with overhead added on afterwards. Configure 1 GiB, observe 1 GiB of resident memory. `innodb_buffer_pool_size` is widely criticised for the opposite behaviour, where actual RSS exceeds what the operator asked for.
+
+Frame count is therefore derived from the budget rather than the budget from the frame count:
+
+```
+frames = capacity_bytes / (frame_bytes + per_frame_metadata + table_share)
+```
+
+Everything the pool owns comes out of that number:
+
+| Inside the bound | Notes |
+|---|---|
+| Frame arena | the bulk |
+| Per-frame metadata | ~32 B per frame |
+| Hash table | open-addressed, ~`frames / 0.7` entries |
+| Per-shard free lists, clock hands | small, but counted |
+| **The pinned active file** | up to `max_file_bytes` — see below |
+
+**The pinned active file is inside the budget, not additional to it.** §5 keeps it fully resident and non-evictable, which could be read as a separate allocation. It is not: as the active file grows, the cache available for sealed data shrinks, and at rotation it is released. If it were outside, the true total would be `capacity_bytes + max_file_bytes` and §1's argument would not hold.
+
+That is what makes the sizing check mandatory rather than advisory: `DB::open` rejects `capacity_bytes < 2 × max_file_bytes`, because below that the active file alone consumes half the pool. With the 4 GiB rotation ceiling, that implies an 8 GiB minimum — strict, but the alternative is a cache that silently does nothing.
+
+**What is not inside the bound**, stated plainly so the accounting is honest: the caller's `out` buffer and `EntryIterator::io_buf_`, each sized to the largest value that caller has read. Both are caller-owned and caller-controlled. So the real equation is
+
+```
+key directory  +  pool (capacity_bytes)  +  caller buffers  +  slack
+```
+
+`DB::get`'s `thread_local io_buf` does **not** grow on the pool path — the pool copies straight into `out` and never touches it.
+
+For the MariaDB plugin this surfaces as a `bytecaskdb_buffer_pool_size` sysvar, which is the knob operators already know how to reason about.
+
 ---
 
 ## 4. CRC — unchanged in V0
@@ -195,6 +229,8 @@ Each of these is a real option that V0 does not take. They are listed so that th
 
 **Process-wide pool.** V0 is per-DB, matching `Options`. A shared pool matters for the MariaDB plugin, where every table would otherwise carve out its own arena.
 
+**Online resize.** `capacity_bytes` is fixed at open in V0. InnoDB supports resizing its pool without a restart, which operators expect; doing it here means growing or shrinking the arena and rebuilding the shard tables while serving reads.
+
 ---
 
 ## 11. Options, counters, phases
@@ -205,7 +241,7 @@ Each of these is a real option that V0 does not take. They are listed so that th
 
 ```cpp
 struct BufferPoolOptions {
-  std::size_t capacity_bytes;          // 0 = disabled
+  std::size_t capacity_bytes;          // 0 = disabled; TOTAL footprint, not frame bytes
   std::size_t frame_bytes;             // default 4096
   unsigned    shards;
   unsigned    oversize_guard_divisor;  // entry > capacity/N is never admitted
