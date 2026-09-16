@@ -67,6 +67,16 @@ The contract is unchanged. Of the five methods:
 | Vacuum, `create_manifest`, `scan_committed` | Via `scan` — **bypasses the pool** (§7) |
 | Recovery | No — reads hint files |
 
+### What the contract does not provide
+
+The five methods are enough to *serve* a read from the pool. They are not enough to *build* one, because two things it needs are held by the engine rather than by the file.
+
+**The frame key.** Frames are keyed `(file_id, frame_index)`, and `file_id` is assigned by the engine — `openDataFileForRead(path, use_mmap)` (`data_file.cppm:1150`) takes neither an id nor a pool handle and returns a file that knows only its path. All five call sites are in the engine (`bytecask.cppm:2785, 2992, 3147, 3471, 3484`), and four have the id in hand. **Vacuum is the exception**: it opens the compacted file at `bytecask.cppm:2992`, and the id is minted afterwards inside `apply_vacuum` (`bytecask.cppm:1872`). Either the factory takes an explicit `file_id` and vacuum mints its id before opening the file, or the pool-backed file is constructed without one and has it set at registration. The first is preferable — the reorder is local, and the second puts a mutable field on a type that lock-free readers share.
+
+**A shared owner.** The pool is per-DB state, so the factory has to carry a pointer to it, which makes `openDataFileForRead` a member or a DB-bound factory rather than the free function it is today.
+
+Neither is deep, but together they mean the pool is not a drop-in third back-end: the seam has to move before there is anything to put behind it. That is Phase 0 work, and it is worth landing while the answer is still "there is no pool".
+
 ---
 
 ## 3. Shape
@@ -83,14 +93,14 @@ Active file  fully resident and never evictable (§5)
 Sealed files O_DIRECT fills (§6)
 CRC          unchanged — verified per entry, per read (§4)
 Scans        bypass (§7)
-Disabled     buffer_pool_bytes == 0 behaves exactly as today
+Disabled     capacity_bytes == 0 behaves exactly as today
 ```
 
 4 KiB because it is the `O_DIRECT` alignment unit and the device transfer minimum, so read amplification over a bare `pread` is approximately zero — the kernel already reads a page minimum today.
 
 An entry spanning several frames is resolved as several independent lookups; contiguous misses coalesce into one fill. There is no size threshold and no bypass, with one exception: an entry whose extent exceeds a fixed fraction of the pool (proposed: one eighth) is read directly into `out` and never admitted, because admitting it would evict the working set to hold a single value. That is an invariant derived from capacity, not a tuning knob, and a counter surfaces it.
 
-Per-frame metadata is roughly 32 bytes — `file_id`, `frame_index`, `generation`, seqlock version, reference byte, flags — about 1 % over a 4 KiB frame.
+Per-frame metadata is roughly 32 bytes — `file_id`, `frame_index`, seqlock version, reference byte, flags — about 1 % over a 4 KiB frame. There is no `generation` stamp: §7 shows file ids are never reused within a process, so there is nothing to invalidate.
 
 ### The bound is the contract
 
@@ -114,7 +124,9 @@ Everything the pool owns comes out of that number:
 
 **The pinned active file is inside the budget, not additional to it.** §5 keeps it fully resident and non-evictable, which could be read as a separate allocation. It is not: as the active file grows, the cache available for sealed data shrinks, and at rotation it is released. If it were outside, the true total would be `capacity_bytes + max_file_bytes` and §1's argument would not hold.
 
-That is what makes the sizing check mandatory rather than advisory: `DB::open` rejects `capacity_bytes < 2 × max_file_bytes`, because below that the active file alone consumes half the pool. With the 4 GiB rotation ceiling, that implies an 8 GiB minimum — strict, but the alternative is a cache that silently does nothing.
+That is what makes the sizing check mandatory rather than advisory: `DB::open` rejects `capacity_bytes < 2 × max_file_bytes`, because below that the active file alone consumes half the pool.
+
+The floor scales with the *configured* `max_file_bytes`, not with the rotation ceiling: at the 64 MiB default it is 128 MiB, and only a database configured at the 4 GiB ceiling needs 8 GiB. The two knobs are coupled — an operator who wants a small pool lowers `max_file_bytes` to match — so the rejection message must name both values and say which one to change, rather than only reporting that the pool is too small.
 
 **What is not inside the bound**, stated plainly so the accounting is honest: the caller's `out` buffer and `EntryIterator::io_buf_`, each sized to the largest value that caller has read. Both are caller-owned and caller-controlled. So the real equation is
 
@@ -148,12 +160,14 @@ Three things follow.
 
 **Sealing is the release.** CLOCK skips any frame whose `file_id` is the current active file. On rotation, `active_file_id` changes and the previous file's frames become evictable immediately — no sweep, no bookkeeping, one comparison in the victim check.
 
+**This is a write-path insert, not a back-end choice.** The active file is a `WritableDataFile`, and it serves reads through the same registry as every sealed file. So none of the above follows from selecting a back-end at open: `WritableFileOps::append_entries` (`data_file.cppm:207`) gains a pool insert after the `pwritev`, and the writable file's `read_value` / `read_entry` have to consult the pool. That is why this is Phase 3 and why it is the only phase that touches the write path — Phases 1 and 2 leave it untouched. It is also why the residency invariant has to be proved, not assumed: if any append path can skip the insert, a read of the active file falls through to a file that was never opened for reading.
+
 Two details:
 
 - **The tail frame is admitted while still being appended into.** This is safe without a latch: appended bytes are never modified, and a reader can only address an offset that has been published, which happens after the bytes are written (`state_.store()` follows `fdatasync`). Reader and writer never touch the same bytes.
 - **Pinned bytes are the active file's *current* size**, growing from zero to `max_file_bytes` and released at seal — so the average pinned cost is about half the rotation threshold.
 
-**Sizing constraint:** the pool must be meaningfully larger than `max_file_bytes`, or the active file alone consumes it. `DB::open` should reject `buffer_pool_bytes < 2 × max_file_bytes` with a clear error rather than degrade silently.
+**Sizing constraint:** the pool must be meaningfully larger than `max_file_bytes`, or the active file alone consumes it. This is the `capacity_bytes < 2 × max_file_bytes` rejection in §3, and it is the reason that check is mandatory rather than advisory.
 
 ---
 
@@ -213,7 +227,7 @@ These are hypotheses, not claims. They have to be measured with `GetMT` at 2–3
 
 This is opt-in, and the default stays `pread` / `mmap`.
 
-**The pool cannot beat `mmap` on a resident hit, structurally.** `ReadOnlyMmapDataFile` resolves a read to `mmap_base_ + offset` — an addition and a memcpy. The pool computes a frame index, hashes it, probes a table, checks the generation and takes a seqlock reading first: two or three extra cache misses on every hit. Against a resident dataset with no memory pressure, the pool is slower than what already ships. It beats `pread` (no syscall) and loses to `mmap`.
+**The pool cannot beat `mmap` on a resident hit, structurally.** `ReadOnlyMmapDataFile` resolves a read to `mmap_base_ + offset` — an addition and a memcpy. The pool computes a frame index, hashes it, probes a table and takes a seqlock reading first: two or three extra cache misses on every hit. Against a resident dataset with no memory pressure, the pool is slower than what already ships. It beats `pread` (no syscall) and loses to `mmap`.
 
 That is not an argument against building it — it is the same trade every buffer pool makes, and the reason they are all sized explicitly rather than enabled by default. What it buys is what a buffer pool is for:
 
@@ -222,7 +236,7 @@ That is not an argument against building it — it is the same trade every buffe
 
 Two secondary effects push the same way at scale: a 100 GiB mapping needs roughly 25 M page-table entries and lives in TLB-miss territory under random access, where a huge-page arena needs 512× fewer; and for the MariaDB plugin, an explicit pool size is the knob operators already know how to reason about.
 
-**Set `buffer_pool_bytes` when there is a memory budget to enforce. Leave it at zero otherwise.**
+**Set `capacity_bytes` when there is a memory budget to enforce. Leave it at zero otherwise.**
 
 ### Real risks, to be measured
 
@@ -260,13 +274,23 @@ Each of these is a real option that V0 does not take. They are listed so that th
 
 ### Options
 
-`Options::use_mmap` is a `bool` at its limit. Replace it with `enum class IoBackend { Pread, Mmap, BufferPool }` — mechanical, but it touches the C ABI shim, the C++ header shim, the Python and Node bindings, the MariaDB sysvar, and the tests that `GENERATE(false, true)`. Worth doing before there is a third value.
+`Options::use_mmap` is a `bool` at its limit. The back-end is a three-way selection now, so the option becomes one:
+
+```cpp
+enum class IoBackend { Pread, Mmap, BufferPool };
+```
+
+**It selects the writable file too.** `use_mmap` is threaded into `createDataFileForWrite` and `openDataFileForWrite` as well as `openDataFileForRead`, so the enum has to answer what `BufferPool` means for the active file. It means **`Pread`**: §6 keeps `O_DIRECT` off the write path entirely, and §5 keeps the active file resident by inserting on append, not by changing how it is written. So `BufferPool` selects the pool for sealed files and builds the writable file exactly as `Pread` does today. Worth stating in the enum's own comment, because "buffer pool" naturally reads as covering both.
+
+The project is pre-stable, so `use_mmap` is replaced rather than deprecated alongside the enum — one representation, no shim.
+
+Blast radius, all mechanical: `Options` and its `include/bytecask.hpp` mirror, `bytecask_hpp.cpp`, the C ABI shim, the Python and Node bindings, the `bytecaskdb_use_mmap` sysvar and the plugin README table, `benchmarks/engine_bench.cpp`, and the tests. The test surface looks alarming at ~630 references but is not: 591 are `.use_mmap = true}` in `tests/proof/generated/`, regenerated from `tests/proof/*/generate_tests.py`, leaving two `GENERATE(false, true)` sites and about twenty literals to touch by hand.
 
 ```cpp
 struct BufferPoolOptions {
   std::size_t capacity_bytes;          // 0 = disabled; TOTAL footprint, not frame bytes
   std::size_t frame_bytes;             // default 4096
-  unsigned    lock_stripes;        // fill/evict path only; reads take no lock
+  unsigned    lock_stripes;          // fill/evict path only; reads take no lock
   unsigned    oversize_guard_divisor;  // entry > capacity/N is never admitted
   bool        direct_io;
   bool        huge_pages;
@@ -296,7 +320,7 @@ Hit ratio is the primary A/B metric. `keydir_bytes_estimate` is what lets an ope
 | Phase | Content | Answers |
 |---|---|---|
 | 0 | Back-end enum, counters, `u` and `L` instrumentation, a benchmark sweep whose working set exceeds RAM | What is the baseline, and can we even see the regime where a cache matters? |
-| 1 | Pool with buffered `preadv` fills, CLOCK, sharded, copy-out | Does it beat the page cache while still using it? Does 32-thread scaling survive? |
+| 1 | Pool with buffered `preadv` fills, CLOCK, striped fill/evict locks, copy-out | Does it beat the page cache while still using it? Does 32-thread scaling survive? |
 | 2 | `O_DIRECT` on sealed files, `FADV_DONTNEED` after seal | What does bypassing the page cache buy, and cost at p99? |
 | 3 | Active-file residency and pinning | Does read-your-own-writes improve on a write-heavy mix? |
 
@@ -308,6 +332,16 @@ The benchmark sweep in Phase 0 is not optional. Every current benchmark fits in 
 
 ## 12. Open
 
-1. **What is the acceptance bar for Phase 1?** It should be a hit ratio and a p99 at a stated working-set ratio, not a throughput number on benchmarks that cannot see the regime. Agree it before Phase 1, not after.
+1. **What is the acceptance bar for Phase 1?** Proposed below — still to be agreed before Phase 1 starts, which is the point of asking. It is a hit ratio and a p99 at a stated working-set ratio, not a throughput number on benchmarks that cannot see the regime.
+
+   Measured at `pool_bytes / dataset_bytes = 0.25` under a Zipfian read workload (s ≈ 0.99, the YCSB default) over a dataset that does not fit in RAM:
+
+   - **Hit ratio ≥ 0.6.** CLOCK over Zipf(0.99) at a quarter of the working set should clear this comfortably. Below it, the fault is the policy or the admission rule, not the pool.
+   - **p99 within 2× of the `mmap` back-end** on the same workload. Phase 1 still fills through the page cache, so both sides read the same bytes from the same place and the gap *is* the pool's own overhead — which is what this phase exists to measure. Tenet 3 makes p99 the deciding number, not mean throughput.
+   - **`GetMT` at 32 threads within 10 % of the `mmap` back-end on a fully resident dataset.** This is §8 restated as pass/fail. The regression that matters is the one on the workload where the pool should be switched off but its code is still on the read path, and 14.0 Mops/s is the number being defended.
+   - **`pool_optimistic_retries / pool_hits < 10⁻³`** at 32 threads. Higher means eviction is fighting readers and §8.4's `pread` fallback is carrying load it was not designed to carry.
+
+   Failing the first is a policy problem and does not block Phase 2. Failing either of the last two is a design problem and does.
+
 2. **Does measured `u` reopen Axis A?** See §10. `u ≥ 0.9` closes it permanently; `u ≤ 0.3` reopens the storage layer, and only the storage layer.
 3. ~~Is the `resume()` / `truncate` mmap span hazard real?~~ Filed as [#87](https://github.com/gustavoamigo/bytecaskdb/issues/87). Pre-existing, independent of this work.
