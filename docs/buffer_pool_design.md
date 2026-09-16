@@ -92,7 +92,7 @@ Two things about this are worth stating precisely, because both are easy to get 
 
 **A sanitiser will not catch it.** This is not the BC-122 failure mode, where the dangling span pointed at freed heap and ASan reported a heap-use-after-free. Here the arena is still mapped and readable — the memory is valid, the *contents* belong to a different file. And because a frame holds real entry bytes, the garbage is structurally plausible: right shape, plausible lengths, wrong data. The result is a silently wrong value returned to the caller, with no crash and no sanitiser report. That is strictly harder to detect than the bug the coding guidelines hold up as the cautionary tale, which is reason enough to design the hazard out rather than manage it.
 
-**In fairness, the mmap guarantee has one hole.** `resume()` is the only `truncate()` call site, and `WritableMmapDataFile::truncate` performs `munmap` -> `ftruncate` -> `mmap` in place on a live `DataFile`. `WriteBarrier` excludes writers only; reads are lock-free and remain available while the engine is degraded. A reader holding a span from `read_entry` on the active mmap file across a `resume()` therefore holds a genuinely dangling pointer, and since `mmap(nullptr, ...)` may return the same address, it would often appear to work. This has not been shown reachable by a test, and it is pre-existing and orthogonal to this proposal — but the mmap guarantee should not be described as unconditional.
+**In fairness, the mmap guarantee has one hole.** `resume()` is the only `truncate()` call site, and `WritableMmapDataFile::truncate` performs `munmap` -> `ftruncate` -> `mmap` in place on a live `DataFile`. `WriteBarrier` excludes writers only; reads are lock-free and remain available while the engine is degraded. A reader holding a span from `read_entry` on the active mmap file across a `resume()` therefore holds a genuinely dangling pointer, and since `mmap(nullptr, ...)` may return the same address, it would often appear to work. This has not been shown reachable by a test, and it is pre-existing and orthogonal to this proposal — but the mmap guarantee should not be described as unconditional. Tracked as [#87](https://github.com/gustavoamigo/bytecaskdb/issues/87).
 
 There are three ways out, not two:
 
@@ -104,7 +104,7 @@ There are three ways out, not two:
 
 A fourth shape — hand back the span plus a version stamp and require the caller to re-validate before use — is rejected on principle: it makes correctness depend on caller discipline, which the coding guidelines rank below designs where incorrect usage is impossible.
 
-**Recommendation: R1.** The copy is a memcpy of typically a few hundred bytes (tens of nanoseconds) against a saved syscall or device read (microseconds to hundreds of microseconds). It keeps the new back-end a genuine drop-in, which is precisely what makes the A/B honest — the same test bodies and the same benchmark bodies run unmodified against all three. R2 is a later optimisation with a measurement behind it, not a starting point.
+**Decision: R1.** Settled — the pool copies into `io_buf`; R2 and R3 stay on the record as alternatives, not as work. The copy is a memcpy of typically a few hundred bytes (tens of nanoseconds) against a saved syscall or device read (microseconds to hundreds of microseconds). It keeps the new back-end a genuine drop-in, which is precisely what makes the A/B honest — the same test bodies and the same benchmark bodies run unmodified against all three. R2 is a later optimisation with a measurement behind it, not a starting point.
 
 R1 is also the only one of the three in which the dangerous window does not exist, rather than being managed by additional machinery. And there is a second reason for it that is not about simplicity: copy-out is what lets us use optimistic reads instead of pin counts (Section 6.2). Handing out long-lived pointers forces refcounting; refcounting on a hot frame is a contended cacheline; a contended cacheline is how we lose the 32-thread scaling number.
 
@@ -259,7 +259,8 @@ Indexing      N independent shards; shard = hash(file_id, frame_index) % N
               each shard owns its table, free list, clock hand and lock
 Lookup        open-addressed table per shard, key (file_id, frame_index)
 Validity      per-frame (file_id, generation); stale generation == miss
-Read          optimistic seqlock: read version, memcpy out, re-read version,
+Read          copy out into the caller's io_buf (R1, decided), under an
+              optimistic seqlock: read version, memcpy out, re-read version,
               retry or fall back to a direct pread on mismatch
 Policy        CLOCK, test-then-set reference bit, liveness-biased victim choice
 CRC           C2: verified_from / verified_to watermark per frame
@@ -443,4 +444,4 @@ If Phase 1 does not show a win in the regime Phase 0 establishes, the honest out
 3. **Should the pool be per-DB or process-wide?** Per-DB is simpler and matches `Options`. Process-wide matters for the MariaDB plugin, where many tables would otherwise each carve out their own fixed arena.
 4. **Is `O_DIRECT` alone enough, or do we want `RWF_NOWAIT` / `preadv2` as a "hit the page cache or tell me you missed" probe?** That would let us keep the page cache as a free second tier without giving up control.
 5. **What is the acceptance bar?** Section 8 argues it should be a hit ratio and a p99 at a stated working-set ratio, not a throughput number on the existing benchmarks. That bar should be agreed before Phase 1, not after.
-6. **Is the `resume()` / `WritableMmapDataFile::truncate` span hazard (Section 2.1) reachable in practice?** It predates this proposal and is independent of it: `truncate` remaps in place while lock-free readers may hold spans from `read_entry` on the active file. If reachable it is its own bug with its own fix, and should be tracked separately rather than folded into this work.
+6. ~~Is the `resume()` / `WritableMmapDataFile::truncate` span hazard (Section 2.1) reachable in practice?~~ Filed as [#87](https://github.com/gustavoamigo/bytecaskdb/issues/87). Pre-existing and independent of this proposal; not a dependency for any phase here.
