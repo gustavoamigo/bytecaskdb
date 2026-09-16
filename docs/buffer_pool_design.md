@@ -373,6 +373,17 @@ Against §12.1's proposed Phase 1 bar (measured on the buffered rows, which is w
 
 **`u` is 0.17–0.23 on this workload — under §12.2's threshold.** Measured at ratios 0.10 / 0.25 / 0.50 as 0.172 / 0.196 / 0.229, identical under buffered and direct fills, undefined at 1.00 and above where nothing is evicted. With 512-byte values a frame holds ~7.5 entries, so an evicted frame served about 1.3–1.7 of them before it went: the frames that get evicted are, by construction, the cold ones, filled for a single read whose neighbours were never asked for. Two things make the real figure lower still, not higher — the bitmap counts 32-byte slots, an overcount against entries, and this workload's Zipf rank *is* its disk order, so hot keys are physically adjacent, which is kinder to a block cache than a real key space would be. §12.2 says `u ≤ 0.3` reopens the storage layer, and only the storage layer. This measurement does that. It does not decide it: §10's estimate is that an entry cache has ~`0.9/u` of a block cache's effective capacity — about 4× here — against a slab-calcification failure mode that has no number attached, and one workload shape at one value size is not the evidence to settle that on. What it is, is the first number the question has ever had.
 
+**Multi-reader arm (§8's hypotheses).** `--mt-threads`, fully resident (ratio 1.0, buffered fills), N threads sharing one DB and one Zipf sampler; 120 k reads split across them; a 4-core container, so 8 threads is 2x oversubscribed and §8's 32-thread criterion is not measurable here.
+
+| threads | mmap | pool | pool/mmap | 1→N scaling, mmap / pool | pool p99 / mmap p99 | optimistic retries |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1.60 M | 1.16 M | 72 % | — | 2.7x | 0 |
+| 2 | 1.77 M | 2.13 M | 120 % | 1.1x / 1.8x | 2.0x | 0 |
+| 4 | 2.96 M | 2.62 M | 88 % | 1.85x / 2.26x | 2.5x | 0 |
+| 8 | 3.77 M | 2.78 M | 74 % | 2.4x / 2.4x | 3.0x | 0 |
+
+Retries at zero everywhere is the result that matters: the seqlock read never lost a race to eviction, so §8.4's optimistic copy-out is carrying no fallback load. The pool scales at least as well as `mmap` up to the core count — the throughput gap is the per-hit cost already visible single-threaded, not contention — and its p99 ratio to `mmap` does not widen with threads, so the single fill mutex (§8.2's deviation) leaves no signature at this concurrency. Against §8's "within 10 % of `mmap`" it is 12 % at four threads; the 2-thread row where the pool leads is one run and should be read as noise. None of this speaks to 32 threads.
+
 The arena page-fault inversion found by the first version of this benchmark (p99 rising with pool size because the arena faulted in lazily on the read path) stays fixed: buffered p99 falls monotonically from 0.10 to 1.00.
 
 ---

@@ -47,6 +47,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 import bytecask;
@@ -64,6 +65,10 @@ struct Config {
   double zipf_s = 0.99;
   std::uint64_t max_file_bytes = 4ULL * 1024 * 1024;
   std::vector<double> ratios = {0.1, 0.25, 0.5, 1.0, 2.0};
+  // Thread counts for the multi-reader arm (§8's GetMT criterion). Empty
+  // skips it. Runs at ratio 1.0 — fully resident — because the question is
+  // whether the lock-free read path scales, not what a miss costs.
+  std::vector<unsigned> mt_threads;
   std::filesystem::path dir = ".tmp/pool_bench";
 };
 
@@ -114,6 +119,7 @@ void build_dataset(const Config &cfg) {
 struct Result {
   std::string backend;
   bool direct_io = false;      // meaningful only for buffer_pool
+  unsigned threads = 1;
   double ratio = 0.0;          // 0 for the non-pool baselines
   std::uint64_t pool_bytes = 0;
   double ops_per_sec = 0.0;
@@ -208,6 +214,85 @@ auto measure(const Config &cfg, bytecask::IoBackend backend,
   return r;
 }
 
+// Same workload as measure(), split across threads that share one DB and
+// one Zipf sampler. Reported throughput is aggregate over wall time; the
+// percentiles are over every thread's samples pooled.
+auto measure_mt(const Config &cfg, bytecask::IoBackend backend,
+                std::uint64_t pool_bytes, unsigned threads) -> Result {
+  bytecask::Options opts{.max_file_bytes = cfg.max_file_bytes,
+                         .io_backend = backend};
+  if (backend == bytecask::IoBackend::BufferPool) {
+    opts.buffer_pool.capacity_bytes = static_cast<std::size_t>(pool_bytes);
+    opts.buffer_pool.direct_io = false;
+  }
+  auto db = bytecask::DB::open(cfg.dir, opts);
+  const Zipf zipf{cfg.keys, cfg.zipf_s};
+  const auto per_thread = cfg.ops / threads;
+
+  // Warm on one thread so every thread starts against the same resident set.
+  {
+    std::mt19937_64 rng{42};
+    bytecask::Bytes out;
+    for (std::size_t i = 0; i < cfg.ops / 10; ++i) {
+      (void)db.get({}, to_bytes(key_for(zipf(rng))), out);
+    }
+  }
+
+  const auto before = db.stats();
+  std::vector<std::vector<std::uint64_t>> lats(threads);
+  std::vector<std::thread> workers;
+  workers.reserve(threads);
+  const auto start = std::chrono::steady_clock::now();
+  for (unsigned t = 0; t < threads; ++t) {
+    workers.emplace_back([&, t] {
+      std::mt19937_64 rng{1000 + t};
+      bytecask::Bytes out;
+      auto &lat = lats[t];
+      lat.reserve(per_thread);
+      for (std::size_t i = 0; i < per_thread; ++i) {
+        const auto key = key_for(zipf(rng));
+        const auto t0 = std::chrono::steady_clock::now();
+        (void)db.get({}, to_bytes(key), out);
+        const auto t1 = std::chrono::steady_clock::now();
+        lat.push_back(static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+                .count()));
+      }
+    });
+  }
+  for (auto &w : workers) w.join();
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  const auto after = db.stats();
+
+  std::vector<std::uint64_t> all;
+  all.reserve(per_thread * threads);
+  for (auto &l : lats) all.insert(all.end(), l.begin(), l.end());
+
+  Result r;
+  r.backend = backend == bytecask::IoBackend::Pread    ? "pread"
+              : backend == bytecask::IoBackend::Mmap   ? "mmap"
+                                                       : "buffer_pool";
+  r.threads = threads;
+  r.ratio = backend == bytecask::IoBackend::BufferPool ? 1.0 : 0.0;
+  r.pool_bytes = pool_bytes;
+  const auto secs =
+      std::chrono::duration_cast<std::chrono::duration<double>>(elapsed).count();
+  r.ops_per_sec = secs > 0 ? static_cast<double>(all.size()) / secs : 0.0;
+  r.p50_ns = percentile(all, 0.50);
+  r.p99_ns = percentile(all, 0.99);
+  r.p999_ns = percentile(all, 0.999);
+  if (backend == bytecask::IoBackend::BufferPool) {
+    const auto hits = after.at("bytecask.pool_hits") - before.at("bytecask.pool_hits");
+    const auto misses = after.at("bytecask.pool_misses") - before.at("bytecask.pool_misses");
+    r.hit_ratio = hits + misses > 0
+                      ? static_cast<double>(hits) / static_cast<double>(hits + misses)
+                      : 0.0;
+    r.retries = after.at("bytecask.pool_optimistic_retries") -
+                before.at("bytecask.pool_optimistic_retries");
+  }
+  return r;
+}
+
 auto parse_size(std::string_view s) -> std::size_t {
   std::size_t v = 0;
   std::from_chars(s.data(), s.data() + s.size(), v);
@@ -240,10 +325,22 @@ auto main(int argc, char **argv) -> int {
         if (comma == std::string::npos) break;
         pos = comma + 1;
       }
+    } else if (a == "--mt-threads") {
+      cfg.mt_threads.clear();
+      std::string list{next()};
+      std::size_t pos = 0;
+      while (pos <= list.size()) {
+        const auto comma = list.find(',', pos);
+        const auto tok = list.substr(pos, comma - pos);
+        if (!tok.empty()) cfg.mt_threads.push_back(static_cast<unsigned>(std::stoul(tok)));
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+      }
     } else if (a == "--help") {
       std::puts(
           "pool_bench [--keys N] [--value-bytes N] [--ops N] [--zipf S]\n"
-          "           [--max-file-bytes N] [--ratios a,b,c] [--dir PATH]");
+          "           [--max-file-bytes N] [--ratios a,b,c] [--dir PATH]\n"
+          "           [--mt-threads a,b,c]  (multi-reader arm at ratio 1.0)");
       return 0;
     }
   }
@@ -260,6 +357,19 @@ auto main(int argc, char **argv) -> int {
   // than against an absolute number that says nothing on its own.
   results.push_back(measure(cfg, bytecask::IoBackend::Pread, 0, 0.0, false));
   results.push_back(measure(cfg, bytecask::IoBackend::Mmap, 0, 0.0, false));
+
+  // Multi-reader arm: is the pool's lock-free read path still lock-free
+  // under contention? mmap is the bar; pread is context. Fully resident,
+  // and run here — before any direct arm — because a direct open drops
+  // the page cache and every row in this arm depends on it being warm.
+  for (const auto threads : cfg.mt_threads) {
+    if (threads == 0) continue;
+    results.push_back(measure_mt(cfg, bytecask::IoBackend::Pread, 0, threads));
+    results.push_back(measure_mt(cfg, bytecask::IoBackend::Mmap, 0, threads));
+    results.push_back(measure_mt(cfg, bytecask::IoBackend::BufferPool,
+                                 bytes + 2 * cfg.max_file_bytes, threads));
+  }
+
   // Every buffered arm runs before any direct arm. A direct open drops the
   // file's page-cache residency (FADV_DONTNEED), and a buffered run that
   // followed it would start cold and report disk latency as pool cost. In
@@ -286,12 +396,12 @@ auto main(int argc, char **argv) -> int {
   }
 
   std::printf(
-      "backend,direct_io,ratio,pool_bytes,dataset_bytes,keys,value_bytes,ops,"
-      "zipf_s,ops_per_sec,p50_ns,p99_ns,p999_ns,hit_ratio,u,evictions,"
-      "optimistic_retries\n");
+      "backend,direct_io,threads,ratio,pool_bytes,dataset_bytes,keys,"
+      "value_bytes,ops,zipf_s,ops_per_sec,p50_ns,p99_ns,p999_ns,hit_ratio,u,"
+      "evictions,optimistic_retries\n");
   for (const auto &r : results) {
-    std::printf("%s,%d,%.3f,%llu,%llu,%zu,%zu,%zu,%.3f,%.1f,%llu,%llu,%llu,",
-                r.backend.c_str(), r.direct_io ? 1 : 0, r.ratio,
+    std::printf("%s,%d,%u,%.3f,%llu,%llu,%zu,%zu,%zu,%.3f,%.1f,%llu,%llu,%llu,",
+                r.backend.c_str(), r.direct_io ? 1 : 0, r.threads, r.ratio,
                 static_cast<unsigned long long>(r.pool_bytes),
                 static_cast<unsigned long long>(bytes), cfg.keys,
                 cfg.value_bytes, cfg.ops, cfg.zipf_s, r.ops_per_sec,
