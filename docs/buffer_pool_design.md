@@ -6,18 +6,31 @@
 
 ## 1. Why
 
-Both existing back-ends delegate caching to the kernel. That is free and a good default, but it leaves four things outside our control:
+**The engine's foundational bet is that all keys live in RAM.** The key directory is not a cache — it is mandatory. At roughly 50 bytes per key that is ~5 GB at 100 M keys and ~50 GB at 1 B. If any of it is not resident, a lookup becomes a page fault, and the flat sub-microsecond latency that is the whole premise degrades into disk I/O *to read the index* — worse than the B-tree engines the design exists to improve on.
 
-1. **Residency.** Under memory pressure — especially a cgroup limit, where page cache is charged to us — the kernel reclaims our hot pages on its own schedule. Tenet 3 is *predictable latency*; page-cache reclaim is the opposite.
-2. **Granularity.** The kernel caches 4 KiB pages with its own readahead. We already fight this with `POSIX_FADV_RANDOM` / `MADV_RANDOM`.
-3. **Content.** The page cache stores raw blocks, so it also caches superseded entries — overwritten and tombstoned records that stay in a file until vacuum rewrites it.
-4. **Visibility.** `stats()` cannot distinguish a read served by the page cache from one that hit the device. There is no hit ratio to tune or alert on.
+**Nothing currently guarantees the key directory that memory.** The page cache is an unbounded competitor for the same RAM, and the kernel arbitrates between them knowing only that one is anonymous and the other is file-backed — not that one is load-bearing and the other is discretionary.
 
-**What makes this tractable here:** an append-only store does not need a real buffer pool, only a cache. Pages are never modified in place, so there is no dirty bit, no flush list, no background writer, no checkpoint, no WAL ordering constraint on eviction, and no torn-page protection. What remains is a hash table over fixed frames, an eviction policy, and a fill path.
+The failure is usually not dramatic. Without swap, page cache is reclaimed before anonymous memory, so the tree mostly survives; what you get is reclaim churn and **direct-reclaim stalls in the allocation path**. And the key directory grows: every `put` of a new key allocates radix tree nodes, so when the page cache holds all otherwise-free memory, a write can stall synchronously inside reclaim — a latency spike with no cause visible from inside the engine. Where swap exists, the sharper failure is available too.
 
-**One claim to avoid:** this is not automatically *less* memory. Today the bytes live once, in the page cache. The dependable win is a footprint that is **bounded, single-copy and non-reclaimable** — not smaller.
+**This is the inversion worth noticing.** A B-tree engine's buffer pool caches index and data together and can evict either under pressure. Here the index cannot be evicted at all, so bounding the value cache is the only way to protect it. This engine needs an explicit memory budget *more* than InnoDB does, not less.
 
----
+A buffer pool makes the division explicit: the key directory takes what it needs, values get a fixed budget, and the total is known rather than negotiated by the kernel.
+
+Three secondary things follow from owning the cache rather than borrowing it:
+
+- **Granularity.** The kernel caches 4 KiB pages with its own readahead. We already fight this with `POSIX_FADV_RANDOM` / `MADV_RANDOM`.
+- **Content.** The page cache stores raw blocks, so it also caches superseded entries — overwritten and tombstoned records that stay in a file until vacuum rewrites it.
+- **Visibility.** `stats()` cannot distinguish a read served by the page cache from one that hit the device. There is no hit ratio to size against or alert on.
+
+### `O_DIRECT` is the mechanism, not an optimization
+
+A pool filled through buffered `pread` **bounds nothing** — it puts a bounded cache in front of an unbounded one, and the page cache goes on growing and competing with the key directory. Only with `O_DIRECT` is the pool the sole consumer of memory for file data, which is what makes the total `key directory + pool + slack`.
+
+Phase 1 (§11) measures the pool's own cost with buffered fills, which is worth doing on its own. It does not deliver the goal. Phase 2 does.
+
+### What makes this tractable
+
+An append-only store does not need a real buffer pool, only a cache. Pages are never modified in place, so there is no dirty bit, no flush list, no background writer, no checkpoint, no WAL ordering constraint on eviction, and no torn-page protection. What remains is a hash table over fixed frames, an eviction policy, and a fill path.
 
 ## 2. Fit with the `DataFile` contract
 
@@ -209,10 +222,11 @@ Onto the existing `Counters`, surfaced by `stats()`:
 pool_hits, pool_misses, pool_fills, pool_fill_bytes,
 pool_evictions, pool_oversize_reads, pool_multi_frame_reads,
 pool_frames_resident, pool_frames_pinned, pool_frames_total,
+keydir_bytes_estimate,
 pool_optimistic_retries, pool_direct_io_fallbacks
 ```
 
-Hit ratio is the primary A/B metric. `pool_optimistic_retries` is the early warning for §8.2. `pool_direct_io_fallbacks` catches tmpfs degrading silently in CI.
+Hit ratio is the primary A/B metric. `keydir_bytes_estimate` is what lets an operator size the pool as *total − key directory − slack*, which §1 makes the point of the exercise; without it the budget cannot be computed from outside. `pool_optimistic_retries` is the early warning for §8.2. `pool_direct_io_fallbacks` catches tmpfs degrading silently in CI.
 
 ### Correctness
 
