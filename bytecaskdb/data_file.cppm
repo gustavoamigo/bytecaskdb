@@ -5,6 +5,7 @@
 
 module;
 #include <array>
+#include <atomic>
 #include <cassert>
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
@@ -444,6 +445,14 @@ private:
 // When a read offset falls beyond the mmap region (rare: file grew past the
 // pre-allocated size in degraded mode), reads fall back to pread.
 //
+// The mapping is established once, in the constructor, and unmapped once, in
+// the destructor: its address is stable for the object's whole life, so a
+// reader holding a span into it can never be left with a stale address.
+// mmap_end_ is the only mutable part — the prefix of the mapping still backed
+// by the file. truncate() lowers it so reads at or past the new end take the
+// pread path (a clean short-read error) instead of faulting on a page beyond
+// EOF.
+//
 // Thread safety: NOT thread-safe for writes (external synchronization required).
 // Concurrent reads are safe: readers only access offsets published in the
 // key directory after pwritev + fdatasync.
@@ -484,7 +493,7 @@ public:
       out.assign(view.value.begin(), view.value.end());
     } else {
       const auto val_offset = offset + kHeaderSize + key_size;
-      if (val_offset + value_size <= mmap_size_) {
+      if (val_offset + value_size <= mmap_end()) {
         auto *base = mmap_base_ + val_offset;
         out.assign(base, base + value_size);
       } else {
@@ -512,7 +521,7 @@ public:
       -> DataEntryView override {
     auto hdr = read_header(offset);
     const auto body_size = hdr.key_size + value_size;
-    if (offset + kHeaderSize + body_size <= mmap_size_) {
+    if (offset + kHeaderSize + body_size <= mmap_end()) {
       auto body = std::span<const std::byte>{
           mmap_base_ + offset + kHeaderSize, body_size};
       return DataEntryView{
@@ -544,34 +553,26 @@ public:
     return ops_.size();
   }
 
+  // Called by resume() while reads stay lock-free, so the mapping must not be
+  // disturbed: a reader can be holding a span into it (EntryIterator hands
+  // spans out until the next operator++). The mapping is left alone and only
+  // mmap_end_ moves down — every published offset lies below new_size by
+  // construction, and anything at or past it now takes the pread path.
   void truncate(Offset new_size) override {
-    if (mmap_base_) {
-      ::munmap(mmap_base_, mmap_size_);
-      mmap_base_ = nullptr;
-      mmap_size_ = 0;
-    }
     if (::ftruncate(ops_.fd_, narrow<off_t>(new_size)) != 0) {
       throw std::system_error{errno, std::system_category(),
                               "WritableMmapDataFile::truncate"};
     }
     ops_.offset_ = new_size;
     ops_.zeroed_end_ = new_size;
-    if (new_size > 0) {
-      // NOLINTNEXTLINE(performance-no-int-to-ptr)
-      auto *ptr = ::mmap(nullptr, static_cast<std::size_t>(new_size),
-                         PROT_READ, MAP_SHARED, ops_.fd_, 0);
-      if (ptr == MAP_FAILED) {
-        throw std::system_error{errno, std::generic_category(),
-                                "WritableMmapDataFile::truncate: mmap failed"};
-      }
-      mmap_base_ = static_cast<std::byte *>(ptr);
-      mmap_size_ = static_cast<std::size_t>(new_size);
-      ::madvise(mmap_base_, mmap_size_, MADV_RANDOM);
-    }
+    set_mmap_end(new_size);
   }
 
-  // The mapping is left as is: pages past the new end are never read.
-  void shrink_to_fit() override { ops_.shrink_to_fit(); }
+  // Like truncate(), this never touches the mapping — see the class comment.
+  void shrink_to_fit() override {
+    ops_.shrink_to_fit();
+    set_mmap_end(ops_.size());
+  }
 
 private:
   WritableMmapDataFile(std::filesystem::path path, std::size_t capacity,
@@ -598,18 +599,34 @@ private:
                                 "WritableMmapDataFile: mmap failed"};
       }
       mmap_base_ = static_cast<std::byte *>(ptr);
-      mmap_size_ = capacity;
-      ::madvise(mmap_base_, mmap_size_, MADV_RANDOM);
+      mmap_len_ = capacity;
+      mmap_end_.store(capacity, std::memory_order_release);
+      ::madvise(mmap_base_, mmap_len_, MADV_RANDOM);
     }
   }
 
   WritableFileOps ops_;
   std::byte *mmap_base_{nullptr};
-  std::size_t mmap_size_{0};
+  std::size_t mmap_len_{0};   // mapped length — fixed after construction
+  // Upper bound for mapping-served reads; past it, reads take the pread path.
+  // Not the file's length — a fresh mapping spans the whole capacity while the
+  // file is only zero-filled ahead of the write cursor. What holds is that
+  // every path shrinking the file lowers this with it. Read on the lock-free
+  // read path while truncate() lowers it, so it is atomic.
+  std::atomic<std::size_t> mmap_end_{0};
 
+  [[nodiscard]] auto mmap_end() const noexcept -> std::size_t {
+    return mmap_end_.load(std::memory_order_acquire);
+  }
+
+  // The file just shrank to file_size: clamp the readable prefix to it.
+  void set_mmap_end(Offset file_size) noexcept {
+    mmap_end_.store(std::min(mmap_len_, static_cast<std::size_t>(file_size)),
+                    std::memory_order_release);
+  }
 
   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
-    if (offset + kHeaderSize <= mmap_size_) {
+    if (offset + kHeaderSize <= mmap_end()) {
       return bytecask::read_header(
           std::span{mmap_base_ + offset, kHeaderSize});
     }
@@ -626,7 +643,7 @@ private:
       Offset offset, std::uint16_t key_size, std::uint32_t value_size,
       std::vector<std::byte> &io_buf) const -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    if (offset + total <= mmap_size_) {
+    if (offset + total <= mmap_end()) {
       std::span<const std::byte> raw{mmap_base_ + offset, total};
       const auto header = parse_header_and_verify(raw);
       auto body = raw.subspan(kHeaderSize);
@@ -657,7 +674,7 @@ private:
 
 WritableMmapDataFile::~WritableMmapDataFile() {
   if (mmap_base_) {
-    ::munmap(mmap_base_, mmap_size_);
+    ::munmap(mmap_base_, mmap_len_);
   }
   if (ops_.fd_ != -1) {
     ::close(ops_.fd_);

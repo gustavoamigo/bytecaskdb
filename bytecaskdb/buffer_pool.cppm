@@ -95,24 +95,18 @@ public:
     frame_count_ = frames;
     table_mask_ = round_up_pow2(frames * 10 / 7) - 1;
 
-    const auto arena_bytes = frame_count_ * kPoolFrameBytes;
-    arena_ = static_cast<std::byte *>(
-        std::aligned_alloc(kPoolFrameBytes, arena_bytes));
-    if (arena_ == nullptr) {
-      throw std::bad_alloc{};
-    }
-    // Touch every page now. Without this the arena faults in lazily, one page
-    // at a time, on the read path — so a larger pool has a WORSE tail, which
-    // is backwards. It also makes "configure N bytes, observe N bytes
-    // resident" true: the operator asked for this memory, so take it at open
-    // rather than charging it to p99 during serving.
-    std::memset(arena_, 0, arena_bytes);
+    // Value-initialising the vector touches every page, which is load-bearing
+    // twice over. Without it the arena faults in lazily, one page at a time,
+    // on the read path — so a larger pool had a WORSE tail, which is
+    // backwards. It also makes "configure N bytes, observe N bytes resident"
+    // true: the operator asked for this memory, so take it at open rather
+    // than charging it to p99 during serving.
+    arena_ = std::vector<std::atomic<std::uint64_t>>(frame_count_ *
+                                                     kWordsPerFrame);
     meta_ = std::vector<FrameMeta>(frame_count_);
     table_ = std::vector<Slot>(table_mask_ + 1);
     counters_.pool_frames_total = narrow<std::int64_t>(frame_count_);
   }
-
-  ~BufferPool() { std::free(arena_); }
 
   BufferPool(const BufferPool &) = delete;
   auto operator=(const BufferPool &) -> BufferPool & = delete;
@@ -244,6 +238,8 @@ private:
   // always correct — so the reader stops spinning and pays for the syscall.
   static constexpr int kMaxOptimisticRetries = 4;
   static constexpr std::uint32_t kMaxCacheId = ~std::uint32_t{0};
+  static constexpr std::size_t kWordBytes = sizeof(std::uint64_t);
+  static constexpr std::size_t kWordsPerFrame = kPoolFrameBytes / kWordBytes;
 
   [[nodiscard]] static auto make_key(std::uint32_t cache_id,
                                      std::uint64_t frame_index) noexcept
@@ -257,6 +253,34 @@ private:
     std::size_t p = 1;
     while (p < v) p <<= 1;
     return p;
+  }
+
+  // Copies len bytes starting at byte_off within a frame's words into dst,
+  // using relaxed atomic loads so a concurrent fill is not a data race.
+  static void read_words(const std::atomic<std::uint64_t> *words,
+                         std::size_t byte_off, std::size_t len,
+                         std::byte *dst) noexcept {
+    std::size_t done = 0;
+    while (done < len) {
+      const auto pos = byte_off + done;
+      const auto in_word = pos % kWordBytes;
+      const auto chunk = std::min(kWordBytes - in_word, len - done);
+      const auto value = words[pos / kWordBytes].load(std::memory_order_relaxed);
+      std::byte buf[kWordBytes];
+      std::memcpy(buf, &value, kWordBytes);
+      std::memcpy(dst + done, buf + in_word, chunk);
+      done += chunk;
+    }
+  }
+
+  // Writes a whole frame from src. Relaxed stores, for the same reason.
+  static void write_frame(std::atomic<std::uint64_t> *words,
+                          const std::byte *src) noexcept {
+    for (std::size_t w = 0; w < kWordsPerFrame; ++w) {
+      std::uint64_t value = 0;
+      std::memcpy(&value, src + w * kWordBytes, kWordBytes);
+      words[w].store(value, std::memory_order_relaxed);
+    }
   }
 
   [[nodiscard]] static auto hash_key(std::uint64_t k) noexcept -> std::size_t {
@@ -322,9 +346,9 @@ private:
       }
       if (m.key.load(std::memory_order_acquire) != key) return false;
 
-      std::memcpy(dst + (from - offset),
-                  arena_ + f * kPoolFrameBytes + (from - frame_start),
-                  static_cast<std::size_t>(to - from));
+      read_words(arena_.data() + f * kWordsPerFrame,
+                 static_cast<std::size_t>(from - frame_start),
+                 static_cast<std::size_t>(to - from), dst + (from - offset));
 
       std::atomic_thread_fence(std::memory_order_acquire);
       if (m.version.load(std::memory_order_relaxed) == v1) {
@@ -359,7 +383,7 @@ private:
       meta_[victim].key.store(kEmptyKey, std::memory_order_relaxed);
     }
 
-    std::memcpy(arena_ + victim * kPoolFrameBytes, src, kPoolFrameBytes);
+    write_frame(arena_.data() + victim * kWordsPerFrame, src);
 
     {
       std::lock_guard<std::mutex> lk{fill_mu_};
@@ -430,7 +454,13 @@ private:
   std::size_t oversize_limit_;
   std::size_t frame_count_{0};
   std::size_t table_mask_{0};
-  std::byte *arena_{nullptr};
+  // Frames hold atomic words, not plain bytes. A reader copying out of a
+  // frame races the fill writing into it — the seqlock decides whether the
+  // result is usable, but two plain memcpys racing is a data race and
+  // therefore UB whatever the version check proves. Relaxed atomic word
+  // accesses make it well-defined; on x86 they are plain movs. Confirmed by
+  // ThreadSanitizer, which flagged the memcpy pair.
+  std::vector<std::atomic<std::uint64_t>> arena_;
   std::vector<FrameMeta> meta_;
   mutable std::vector<Slot> table_;
   std::mutex fill_mu_;
