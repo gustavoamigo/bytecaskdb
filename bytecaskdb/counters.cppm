@@ -32,7 +32,9 @@ export struct Counters {
   std::atomic<std::int64_t> file_rotations{0};
   std::atomic<std::int64_t> fsyncs{0};
   // Writers that slept in commit_wait behind an in-flight flush. Zero for
-  // a lone writer, which always flushes on its own thread.
+  // a lone writer, which always flushes on its own thread. Together with
+  // group_writer_waits it bounds the sleeps per write: one, plus one for
+  // the writer handed leadership after a batch (at most one per batch).
   std::atomic<std::int64_t> commit_wait_blocked{0};
 
   // -- Read path --
