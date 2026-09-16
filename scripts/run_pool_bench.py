@@ -23,12 +23,16 @@ Usage:
 
 CAVEAT — what this measures. The pool runs each ratio twice: direct_io=1
 (O_DIRECT fills, the file's page-cache residency dropped at open) and
-direct_io=0 (fills through the page cache). Under direct_io=1 a miss is a real
-device read, while the pread and mmap baselines still hit a warm page cache
-that this machine cannot drop without root. That asymmetry is what the pool
-costs when it is doing its job, not a flaw in the comparison — but it does
-mean the baselines' tail numbers are a floor. Showing the pool's *benefit*
-needs a dataset larger than RAM or a cgroup limit, and neither is set up here.
+direct_io=0 (fills through the page cache). Without --cold every backend
+reads from a warm page cache, so the direct arm is the only one paying
+device reads and the comparison is one-sided. --cold fsyncs and drops every
+data file's pages before each run (no root needed: POSIX_FADV_DONTNEED on
+clean pages), and each run is done on its own thread so the engine's
+thread-local read snapshot — which pins an mmap run's mapping — dies before
+the next drop. Read cached_bytes (mincore over the data files after the run)
+against rss_bytes: bounding the first is what the pool is for. Showing the
+pool's *benefit* still needs a dataset larger than RAM or a cgroup limit,
+and neither is set up here.
 """
 
 import argparse
@@ -53,7 +57,8 @@ BENCH_COLUMNS = [
     "keys",
     "value_bytes",
     "ops", "zipf_s", "ops_per_sec", "p50_ns", "p99_ns", "p999_ns",
-    "hit_ratio", "u", "evictions", "optimistic_retries",
+    "hit_ratio", "u", "evictions", "optimistic_retries", "cached_bytes",
+    "rss_bytes",
 ]
 CSV_COLUMNS = ["git_commit", "timestamp", "host_name", "num_cpus",
                "memory_gb"] + BENCH_COLUMNS
@@ -90,6 +95,8 @@ def main() -> int:
     ap.add_argument("--max-file-bytes", type=int, default=1024 * 1024)
     ap.add_argument("--ratios", default="0.1,0.25,0.5,1.0,2.0")
     ap.add_argument("--tmpdir", default=str(REPO_ROOT / ".tmp"))
+    ap.add_argument("--cold", action="store_true",
+                    help="drop the data files' page cache before each run")
     ap.add_argument("--ryow", type=int, default=0,
                     help="put/get pairs for the read-your-own-writes arm")
     ap.add_argument("--mt-threads", default="",
@@ -124,6 +131,8 @@ def main() -> int:
         cmd += ["--mt-threads", args.mt_threads]
     if args.ryow:
         cmd += ["--ryow", str(args.ryow)]
+    if args.cold:
+        cmd += ["--cold"]
     print(" ".join(cmd), file=sys.stderr)
     try:
         out = subprocess.check_output(cmd, cwd=REPO_ROOT, text=True)

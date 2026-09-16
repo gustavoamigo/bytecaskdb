@@ -32,6 +32,10 @@
 
 #include <algorithm>
 #include <charconv>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -74,6 +78,11 @@ struct Config {
   // 0 skips it. Only the gets are timed.
   std::size_t ryow_pairs = 0;
   std::filesystem::path dir = ".tmp/pool_bench";
+  // Drop every data file's page cache before each single-thread run, so the
+  // baselines start as cold as an O_DIRECT pool does. Without this the
+  // pread and mmap rows read a page cache the dataset build left warm
+  // while the direct pool reads the device — one side handicapped.
+  bool cold = false;
 };
 
 auto key_for(std::size_t i) -> std::string { return std::format("key{:09d}", i); }
@@ -101,6 +110,53 @@ public:
 private:
   std::vector<double> cdf_;
 };
+
+// Page-cache residency of the data files, via mincore. This is the number
+// O_DIRECT exists to bound: memory the kernel holds for these files that the
+// operator never budgeted. RSS is reported beside it.
+auto cached_bytes(const std::filesystem::path &dir) -> std::uint64_t {
+  std::uint64_t total = 0;
+  for (const auto &e : std::filesystem::directory_iterator{dir}) {
+    if (e.path().extension() != ".data") continue;
+    const auto size = e.file_size();
+    if (size == 0) continue;
+    auto fd = ::open(e.path().c_str(), O_RDONLY);
+    if (fd == -1) continue;
+    auto *map = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+    if (map != MAP_FAILED) {
+      const auto pages = (size + 4095) / 4096;
+      std::vector<unsigned char> vec(pages);
+      if (::mincore(map, size, vec.data()) == 0) {
+        for (auto b : vec) total += (b & 1U) ? 4096 : 0;
+      }
+      ::munmap(map, size);
+    }
+    ::close(fd);
+  }
+  return total;
+}
+
+auto rss_bytes() -> std::uint64_t {
+  std::FILE *f = std::fopen("/proc/self/statm", "r");
+  if (f == nullptr) return 0;
+  unsigned long size = 0, resident = 0;
+  const auto n = std::fscanf(f, "%lu %lu", &size, &resident);
+  std::fclose(f);
+  return n == 2 ? resident * 4096ULL : 0;
+}
+
+// fsync then FADV_DONTNEED on every data file: only clean pages drop, and
+// the last active file of the build may still be dirty.
+void drop_cache(const std::filesystem::path &dir) {
+  for (const auto &e : std::filesystem::directory_iterator{dir}) {
+    if (e.path().extension() != ".data") continue;
+    auto fd = ::open(e.path().c_str(), O_RDONLY);
+    if (fd == -1) continue;
+    ::fsync(fd);
+    ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    ::close(fd);
+  }
+}
 
 auto dataset_bytes(const std::filesystem::path &dir) -> std::uint64_t {
   std::uint64_t total = 0;
@@ -133,6 +189,8 @@ struct Result {
   std::uint64_t p999_ns = 0;
   double hit_ratio = -1.0;     // -1 where the back-end has no pool
   double u = -1.0;             // fraction of an evicted frame that was read
+  std::uint64_t cached_bytes = 0;  // data files' page-cache residency after the run
+  std::uint64_t rss = 0;           // process RSS after the run
   std::int64_t evictions = 0;
   std::int64_t retries = 0;
 };
@@ -146,7 +204,7 @@ auto percentile(std::vector<std::uint64_t> &v, double p) -> std::uint64_t {
   return v[idx];
 }
 
-auto measure(const Config &cfg, bytecask::IoBackend backend,
+auto measure_impl(const Config &cfg, bytecask::IoBackend backend,
              std::uint64_t pool_bytes, double ratio, bool direct_io) -> Result {
   bytecask::Options opts{.max_file_bytes = cfg.max_file_bytes,
                          .io_backend = backend};
@@ -154,6 +212,7 @@ auto measure(const Config &cfg, bytecask::IoBackend backend,
     opts.buffer_pool.capacity_bytes = static_cast<std::size_t>(pool_bytes);
     opts.buffer_pool.direct_io = direct_io;
   }
+  if (cfg.cold) drop_cache(cfg.dir);
   // A fresh open gives every configuration a cold pool.
   auto db = bytecask::DB::open(cfg.dir, opts);
 
@@ -196,6 +255,8 @@ auto measure(const Config &cfg, bytecask::IoBackend backend,
   r.p99_ns = percentile(lat, 0.99);
   r.p999_ns = percentile(lat, 0.999);
 
+  r.cached_bytes = cached_bytes(cfg.dir);
+  r.rss = rss_bytes();
   if (backend == bytecask::IoBackend::BufferPool) {
     const auto hits = after.at("bytecask.pool_hits") -
                       before.at("bytecask.pool_hits");
@@ -219,10 +280,23 @@ auto measure(const Config &cfg, bytecask::IoBackend backend,
   return r;
 }
 
+// Every measurement runs on a fresh thread. The engine caches a read
+// snapshot thread-locally, and it outlives the DB it came from: an mmap
+// run's mapping stayed mapped into the next run, and mapped pages cannot be
+// dropped, so a "cold" start after mmap was warm. Thread-locals die with
+// the thread.
+auto measure(const Config &cfg, bytecask::IoBackend backend,
+             std::uint64_t pool_bytes, double ratio, bool direct_io) -> Result {
+  Result r;
+  std::thread t{[&] { r = measure_impl(cfg, backend, pool_bytes, ratio, direct_io); }};
+  t.join();
+  return r;
+}
+
 // Same workload as measure(), split across threads that share one DB and
 // one Zipf sampler. Reported throughput is aggregate over wall time; the
 // percentiles are over every thread's samples pooled.
-auto measure_mt(const Config &cfg, bytecask::IoBackend backend,
+auto measure_mt_impl(const Config &cfg, bytecask::IoBackend backend,
                 std::uint64_t pool_bytes, unsigned threads) -> Result {
   bytecask::Options opts{.max_file_bytes = cfg.max_file_bytes,
                          .io_backend = backend};
@@ -298,10 +372,18 @@ auto measure_mt(const Config &cfg, bytecask::IoBackend backend,
   return r;
 }
 
+auto measure_mt(const Config &cfg, bytecask::IoBackend backend,
+                std::uint64_t pool_bytes, unsigned threads) -> Result {
+  Result r;
+  std::thread t{[&] { r = measure_mt_impl(cfg, backend, pool_bytes, threads); }};
+  t.join();
+  return r;
+}
+
 // Put a fresh key, read it straight back, repeat. Under the pool the read
 // should be a hit on a frame the writer just filled; under pread and mmap it
 // is a page-cache read of bytes just written. Only the gets are timed.
-auto measure_ryow(const Config &cfg, bytecask::IoBackend backend,
+auto measure_ryow_impl(const Config &cfg, bytecask::IoBackend backend,
                   std::uint64_t pool_bytes) -> Result {
   bytecask::Options opts{.max_file_bytes = cfg.max_file_bytes,
                          .io_backend = backend};
@@ -347,6 +429,14 @@ auto measure_ryow(const Config &cfg, bytecask::IoBackend backend,
                       ? static_cast<double>(hits) / static_cast<double>(hits + misses)
                       : 0.0;
   }
+  return r;
+}
+
+auto measure_ryow(const Config &cfg, bytecask::IoBackend backend,
+                  std::uint64_t pool_bytes) -> Result {
+  Result r;
+  std::thread t{[&] { r = measure_ryow_impl(cfg, backend, pool_bytes); }};
+  t.join();
   return r;
 }
 
@@ -433,6 +523,8 @@ auto main(int argc, char **argv) -> int {
         if (comma == std::string::npos) break;
         pos = comma + 1;
       }
+    } else if (a == "--cold") {
+      cfg.cold = true;
     } else if (a == "--hit-probe") {
       hit_probe(cfg);
       return 0;
@@ -520,7 +612,7 @@ auto main(int argc, char **argv) -> int {
   std::printf(
       "backend,direct_io,threads,ryow,ratio,pool_bytes,dataset_bytes,keys,"
       "value_bytes,ops,zipf_s,ops_per_sec,p50_ns,p99_ns,p999_ns,hit_ratio,u,"
-      "evictions,optimistic_retries\n");
+      "evictions,optimistic_retries,cached_bytes,rss_bytes\n");
   for (const auto &r : results) {
     std::printf("%s,%d,%u,%d,%.3f,%llu,%llu,%zu,%zu,%zu,%.3f,%.1f,%llu,%llu,%llu,",
                 r.backend.c_str(), r.direct_io ? 1 : 0, r.threads, r.ryow ? 1 : 0,
@@ -532,14 +624,16 @@ auto main(int argc, char **argv) -> int {
                 static_cast<unsigned long long>(r.p99_ns),
                 static_cast<unsigned long long>(r.p999_ns));
     if (r.hit_ratio < 0.0) {
-      std::printf(",,,\n");  // no pool: these are absent, not zero
+      std::printf(",,,");  // no pool: these are absent, not zero
     } else {
       std::printf("%.4f,", r.hit_ratio);
       if (r.u < 0.0) std::printf(",");  // undefined without an eviction
       else std::printf("%.4f,", r.u);
-      std::printf("%lld,%lld\n", static_cast<long long>(r.evictions),
+      std::printf("%lld,%lld,", static_cast<long long>(r.evictions),
                   static_cast<long long>(r.retries));
     }
+    std::printf("%llu,%llu\n", static_cast<unsigned long long>(r.cached_bytes),
+                static_cast<unsigned long long>(r.rss));
   }
 
   std::filesystem::remove_all(cfg.dir);
