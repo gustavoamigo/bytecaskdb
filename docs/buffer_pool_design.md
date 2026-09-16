@@ -145,15 +145,51 @@ Each of the following is an independent decision. Section 9 turns every one of t
 - Strong readahead for sequential access.
 - Brutal read amplification for random point reads: a 100-byte value drags 64 KiB off the device. 640×. This is the workload the engine is *built* for.
 
-**A3. Block cache, device-sized frames (4 KiB) + large-value bypass (recommended).**
+**A3. Block cache, device-sized frames (4 KiB), multi-frame extents (recommended).**
 
 - 4 KiB is the `O_DIRECT` alignment unit and the minimum the device will transfer anyway. Amplification over a bare `pread` is therefore approximately zero — the kernel already reads a page minimum today.
 - Same trivial allocator as A2.
 - Keeps neighbours, which matters: in an append-only file, physical adjacency *is* temporal adjacency. Keys written together are read together in most real workloads. A1 throws this away.
-- Entries straddling a frame boundary need two frames. Under copy-out (R1) that is two memcpys — no special machinery.
-- Entries larger than a few frames should not go through the pool at all: a 4 MiB value would evict 1024 frames to be read once. Bypass above a threshold and `pread` straight into `out`.
+- **Every entry uses the same path regardless of size.** An entry occupying frames `F..F+N` is read by resolving each frame, filling the missing ones, and copying each frame's slice into `out` in order. A 100-byte value touches one or two frames; a 4 MiB value touches 1024. One mechanism, no threshold.
 
-**Recommendation: A3**, frame size configurable, default 4096, bypass threshold configurable (default: a small multiple of the frame size).
+#### Why not a large-value bypass
+
+An earlier draft of this document proposed reading entries above a size threshold directly with `pread`, skipping the pool. That was wrong, for three reasons:
+
+1. **It makes the pool useless for the workload that most needs it.** A store of 1 MiB values would get a 0 % hit ratio by construction. The whole point of the subsystem is to cut I/O, and a bypass switches it off exactly where each avoided read is worth the most.
+2. **It makes latency bimodal in value size.** Two entries differing by one byte across the threshold get different orders of magnitude of read latency, and a large value pays full disk cost on *every* read, forever, no matter how hot it is. Tenet 3 asks for latency that is predictable; a size cliff is the opposite.
+3. **`bypass_above_bytes` is a knob with no defensible setting.** Nobody can pick it from first principles, and it would be tuned by whoever last got bitten.
+
+Uniformity is the correct default. The bypass survives only in the degenerate form described under *Guard rail* below, where it stops being a performance threshold and becomes a structural invariant.
+
+#### Frames are the unit of memory; extents are the unit of admission
+
+A multi-frame entry does **not** need a linked list to be *found*. Frames are keyed by `(file_id, frame_index)`, so the frames covering an entry are N independent hash lookups, and a contiguous run of misses coalesces into a single batched fill — which the fill interface in Axis D already provides. That alone gives uniformity with no extra machinery.
+
+Chaining earns its place for a different reason: **partial residency of a multi-frame entry is close to worthless.** If any frame of a 1024-frame value is missing, the read still pays a device round trip, and the latency of that round trip is dominated by the seek, not the transfer. Holding 512 of those frames is memory spent for approximately no I/O saved — the worst possible state for the pool to be in, and the state an unaware CLOCK hand will naturally produce.
+
+So the two units are separated:
+
+- **Frame (4 KiB)** — the unit of *memory*. Fixed size, trivial allocator, `O_DIRECT`-aligned.
+- **Extent (the frames covering one entry)** — the unit of *admission, eviction and policy*. Admitted together, evicted together, carrying one reference bit rather than one per frame.
+
+Concretely, the chain is policy metadata: frames in an extent link to their successor, the policy operates on extent heads, and evicting a head releases the whole chain. Lookup still goes through the hash table, so a single-frame entry — the overwhelmingly common case — is exactly one lookup and an extent of one, with no chain to walk.
+
+This also fixes a second-order problem: with per-frame reference bits, a hot 1024-frame value sets 1024 bits and is 1024 separate eviction decisions. With one bit per extent, it is one object with one recency, which is what it actually is.
+
+#### Costs, stated honestly
+
+- **Eviction latency is no longer bounded.** Freeing one victim may release 1024 frames, and the thread that pays is the reader that took the miss. That is a tenet 3 problem, and it is the real price of dropping the bypass. Mitigations worth measuring: cap the work done per victim selection and continue the release incrementally, or hand large releases to the background worker. This needs a p99 measurement on a mixed small/large workload before it is called settled.
+- **Admission needs N frames at once.** For the default 4 MiB `max_value_bytes` against any sane pool size this is a rounding error — 1024 frames out of a 1 GiB pool is 0.4 %. It only becomes real at the packed ceiling (2^28−1, ≈256 MiB) against a small pool.
+- **Large values can still evict the working set**, bypass or not. That is now the eviction policy's problem rather than something special-cased away, which is where it belongs — see the scan-resistance discussion in Axis B and the scan bypass in Section 7.4.
+
+#### Guard rail
+
+One case genuinely cannot be served: an entry larger than the pool, or large enough that admitting it would evict most of the working set to cache a single value. That is not a tuning question, it is an invariant — so the limit is *derived from capacity*, not configured: an entry whose extent exceeds a fixed fraction of the pool (a starting proposal: one eighth) is read directly into `out` and never admitted.
+
+The distinction from the rejected bypass matters. This is not "large values are slow", it is "one value may not evict the cache to hold itself". With the default 4 MiB ceiling it never fires unless the pool is smaller than about 32 MiB, and if it fires often that is a misconfiguration the counters should surface (`pool_oversize_reads`), not a tuning opportunity.
+
+**Recommendation: A3**, frame size configurable with a default of 4096, extents as the admission and eviction unit, and no size-based bypass other than the capacity-derived guard rail.
 
 ### Axis B — eviction policy
 
@@ -266,7 +302,10 @@ Policy        CLOCK, test-then-set reference bit, liveness-biased victim choice
 CRC           C2: verified_from / verified_to watermark per frame
 Fill          batch interface; v1 backend = preadv, O_DIRECT on sealed files only
 Active file   buffered; frames inserted by the writer as they complete (Section 5)
-Large values  bypass the pool above a threshold; pread straight into out
+Entries       frames are memory, extents (frames covering one entry) are the
+              unit of admission, eviction and policy; no size-based bypass,
+              only a capacity-derived guard rail for entries that would
+              evict the working set to hold themselves
 Scans         bypass the pool (Section 7.4)
 Disabled      buffer_pool_bytes == 0 falls back to today's back-ends exactly
 ```
@@ -373,7 +412,7 @@ Every axis in Section 3 then becomes a field, so no axis is decided by argument:
 struct BufferPoolOptions {
   std::size_t capacity_bytes;          // 0 = disabled
   std::size_t frame_bytes;             // Axis A
-  std::size_t bypass_above_bytes;      // Axis A — large-value bypass
+  unsigned    oversize_guard_divisor;  // Axis A — entry > capacity/N is never admitted
   EvictionPolicy policy;               // Axis B: Clock | S3Fifo | Lru
   bool liveness_biased_eviction;       // Axis B
   CrcMode crc_mode;                    // Axis C: PerRead | OnFill
@@ -396,7 +435,8 @@ The combination matrix is then machine-enumerable, which is the point.
 
 ```
 pool_hits, pool_misses, pool_fills, pool_fill_bytes,
-pool_evictions, pool_bypass_reads, pool_straddle_reads,
+pool_evictions, pool_oversize_reads, pool_multi_frame_reads,
+pool_frames_released_per_eviction_max,
 pool_crc_verifications, pool_crc_bytes,
 pool_frames_resident, pool_frames_total,
 pool_optimistic_retries, pool_direct_io_fallbacks
