@@ -316,8 +316,12 @@ auto count_extents(const std::filesystem::path &path)
 // both file types, and shrink_to_fit must give the tail back.
 TEST_CASE("WritableDataFile: fresh file has no unwritten extents",
           "[data_file]") {
+  // BufferPool is included to pin the documented invariant that it changes
+  // nothing about the write path: the writable file it builds must behave
+  // exactly as Pread's.
   const auto io_backend =
-      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap);
+      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap,
+               bytecask::IoBackend::BufferPool);
   CAPTURE(static_cast<int>(io_backend));
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_zero_fill.data";

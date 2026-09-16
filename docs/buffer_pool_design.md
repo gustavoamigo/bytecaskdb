@@ -73,7 +73,11 @@ The five methods are enough to *serve* a read from the pool. They are not enough
 
 **The frame key.** Frames need a per-file identifier, and the engine's `file_id` is not available where files are opened: `openDataFileForRead` takes neither an id nor a pool handle, four of its five call sites have the id in hand, and **vacuum does not** — it opens the compacted file before `apply_vacuum` mints the id. That left a choice between reordering vacuum and giving a shared, lock-free-read type a mutable field.
 
-*Resolved — the premise was wrong.* The key only has to be **unique**, never equal to the engine's `file_id`, and conflating the two is what created the problem. The pool hands each file a **pool-local cache id** from its own monotonic counter when the file is opened (`BufferPool::acquire_cache_id`). Vacuum needs no reorder, no file carries a mutable id, and the orphan argument below is unchanged because pool-local ids are monotonic too. The factory still has to take the pool, so it grows one parameter rather than two.
+*Resolved — reserve before open.* Frames are keyed by the engine's `file_id`, and vacuum reserves its destination id before opening the compacted file, via `TransientEngineState::reserve_file_id()` under a short write barrier; `apply_vacuum` then consumes the reserved id instead of minting one. The barrier is what keeps the reservation disjoint from the id rotation mints on the same counter — reading `next_file_id_` outside it would race. A reserved id that is never used leaves a gap, which is harmless: ids are monotonic within a process and are reassigned from scratch at recovery.
+
+A pool-local cache id was tried first and rejected. It avoided the extra barrier, but it made the frame key a second identity for the same thing, and §10's liveness-biased eviction wants to pick victims by `file_stats`, which is keyed by `file_id` — a pool-local key would need a side map to get back there. One identifier is worth one barrier on a vacuum path that already takes one.
+
+The cost is honest: vacuum now takes two write barriers instead of one, so it quiesces writers twice per compaction.
 
 **A shared owner.** The pool is per-DB state, so the factory has to carry a pointer to it, which makes `openDataFileForRead` a member or a DB-bound factory rather than the free function it is today.
 
@@ -102,7 +106,9 @@ Disabled     capacity_bytes == 0 behaves exactly as today
 
 An entry spanning several frames is resolved as several independent lookups; contiguous misses coalesce into one fill. There is no size threshold and no bypass, with one exception: an entry whose extent exceeds a fixed fraction of the pool (proposed: one eighth) is read directly into `out` and never admitted, because admitting it would evict the working set to hold a single value. That is an invariant derived from capacity, not a tuning knob, and a counter surfaces it.
 
-Per-frame metadata is roughly 32 bytes — `file_id`, `frame_index`, seqlock version, reference byte, flags — about 1 % over a 4 KiB frame. There is no `generation` stamp: §7 shows file ids are never reused within a process, so there is nothing to invalidate.
+Per-frame metadata is roughly 32 bytes — `file_id`, `frame_index`, seqlock version, reference byte, flags — about 1 % over a 4 KiB frame.
+
+**Frames hold atomic words, not plain bytes.** A reader copying out of a frame runs concurrently with a fill writing into it. The seqlock decides whether the bytes the reader got are *usable*, but two plain `memcpy`s racing is a data race and therefore UB whatever the version check later proves — tenet 1 counts that as a correctness failure, not a theoretical one. The copy is done with relaxed atomic 64-bit loads and stores, which are well-defined and compile to plain `mov`s on x86. ThreadSanitizer flagged the original `memcpy` pair; this is the fix. There is no `generation` stamp: §7 shows file ids are never reused within a process, so there is nothing to invalidate.
 
 ### The bound is the contract
 

@@ -550,8 +550,21 @@ public:
 
   // State transition: remap keys after vacuum scan+copy.
   // Cannot fail.
+  // Mints the next file id without registering a file under it. Vacuum needs
+  // the id before it opens the compacted file, because the buffer pool keys
+  // frames by file_id and the file must carry its id from construction.
+  // Reserving under the write barrier is what keeps it disjoint from the id
+  // rotation mints on the same counter. A reserved id that is never used
+  // simply leaves a gap, which is harmless: ids are monotonic within a
+  // process and are reassigned from scratch at recovery.
+  [[nodiscard]] auto reserve_file_id() -> std::uint32_t;
+
+  // dest_file_id must have been reserved by reserve_file_id(); it is ignored
+  // when new_sealed_file is null, since the live entries then move into the
+  // active file.
   void apply_vacuum(std::uint32_t old_file_id, const VacuumScanResult &scan,
-                    std::shared_ptr<DataFile> new_sealed_file);
+                    std::shared_ptr<DataFile> new_sealed_file,
+                    std::uint32_t dest_file_id);
 
   // State transition: replay valid committed entries from a resume() scan.
   // Uses sequence-wins resolution to update key_dir and file_stats. Advances
@@ -922,7 +935,8 @@ private:
       std::uint32_t source_file_id) -> VacuumScanResult;
   // Remaps key_dir entries, updates file registry, publishes new state. Caller must hold write_mu_.
   void vacuum_commit(std::uint32_t old_file_id, const VacuumScanResult &scan,
-                     std::shared_ptr<DataFile> new_sealed_file);
+                     std::shared_ptr<DataFile> new_sealed_file,
+                     std::uint32_t dest_file_id);
   // Unlinks the old data and hint files. Open fds survive (POSIX).
   void vacuum_unlink_old_file(const std::shared_ptr<const EngineState> &snap,
                               std::uint32_t file_id);
@@ -1873,11 +1887,16 @@ void TransientEngineState::apply_rotate_file(
   file_stats_.set(active_file_id_, FileStats{});
 }
 
+auto TransientEngineState::reserve_file_id() -> std::uint32_t {
+  KeyDirEntry::check_file_id(next_file_id_);
+  return next_file_id_++;
+}
+
 void TransientEngineState::apply_vacuum(
     std::uint32_t old_file_id, const VacuumScanResult &scan,
-    std::shared_ptr<DataFile> new_sealed_file) {
+    std::shared_ptr<DataFile> new_sealed_file, std::uint32_t reserved_file_id) {
   const auto dest_file_id =
-      new_sealed_file ? next_file_id_++ : active_file_id_;
+      new_sealed_file ? reserved_file_id : active_file_id_;
 
   auto actual_live_bytes = scan.live_bytes;
   for (const auto &m : scan.mappings) {
@@ -2808,7 +2827,8 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 void DB::rotate_active_file(TransientEngineState &t,
                             const std::shared_ptr<const EngineState> &) {
   t.active_file().shrink_to_fit();
-  auto read_only_old = openDataFileForRead(t.active_file().path(), io_backend_, pool_.get());
+  auto read_only_old = openDataFileForRead(t.active_file().path(), io_backend_, pool_.get(),
+                                         t.active_file_id());
   const auto stem = make_data_file_stem();
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_rotate_file_creation);
@@ -2963,10 +2983,11 @@ auto DB::vacuum_scan_and_copy(
 // the active file's stats are incremented.
 void DB::vacuum_commit(std::uint32_t old_file_id,
                              const VacuumScanResult &scan,
-                             std::shared_ptr<DataFile> new_sealed_file) {
+                             std::shared_ptr<DataFile> new_sealed_file,
+                             std::uint32_t dest_file_id) {
   auto current = load_state_for_write();
   auto t = current->transient();
-  t.apply_vacuum(old_file_id, scan, std::move(new_sealed_file));
+  t.apply_vacuum(old_file_id, scan, std::move(new_sealed_file), dest_file_id);
 
   store_state(current, std::move(t).persistent());
 }
@@ -3015,12 +3036,28 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
   // between here and the staging create. renameDataFileExclusive refuses the
   // target instead of replacing it.
   renameDataFileExclusive(tmp_data_path, final_data_path);
-  auto new_file = openDataFileForRead(final_data_path, io_backend_, pool_.get());
+
+  // Reserve the destination id before opening the file, so the file carries
+  // its engine file_id from construction — the buffer pool keys frames by it.
+  // Reading next_file_id_ outside the barrier would race rotation, which
+  // mints from the same counter, so the reservation is published first and
+  // the commit below consumes it.
+  std::uint32_t dest_file_id = 0;
+  {
+    WriteBarrier barrier{*this};
+    auto current = load_state_for_write();
+    auto t = current->transient();
+    dest_file_id = t.reserve_file_id();
+    store_state(current, std::move(t).persistent());
+  }
+
+  auto new_file = openDataFileForRead(final_data_path, io_backend_, pool_.get(),
+                                      dest_file_id);
   flush_hints_for(new_file, dir_);
 
   {
     WriteBarrier barrier{*this};
-    vacuum_commit(file_id, scan, new_file);
+    vacuum_commit(file_id, scan, new_file, dest_file_id);
   }
   // Bytes reclaimed = old total - new live (compacted file is smaller).
   auto old_total = snap->file_stats.get(file_id)->total_bytes;
@@ -3039,7 +3076,8 @@ void DB::vacuum_remove_file(std::uint32_t file_id) {
   {
     WriteBarrier barrier{*this};
     VacuumScanResult empty{};
-    vacuum_commit(file_id, empty, nullptr);
+    // No new sealed file, so no id is consumed.
+    vacuum_commit(file_id, empty, nullptr, 0);
   }
   counters_.vacuum_bytes_reclaimed.fetch_add(
       static_cast<std::int64_t>(old_total), std::memory_order_relaxed);
@@ -3187,7 +3225,8 @@ void DB::resume() {
   file.sync();
 
   // Open the old active as read-only for hint generation.
-  auto read_only_old = openDataFileForRead(file.path(), io_backend_, pool_.get());
+  auto read_only_old = openDataFileForRead(file.path(), io_backend_, pool_.get(),
+                                         old_file_id);
 
   // Dispatch hint generation — idempotent (flush_hints_for skips files
   // whose .hint already exists).
@@ -3511,7 +3550,8 @@ auto DB::recovery_prepare_files(EngineState &s)
     }
 
     const auto file_id = s.next_file_id++;
-    auto data_file = openDataFileForRead(p, io_backend_, pool_.get());
+    auto data_file =
+        openDataFileForRead(p, io_backend_, pool_.get(), file_id);
 
     const auto hint_path = dir_ / (p.stem().string() + ".hint");
     if (!std::filesystem::exists(hint_path)) {
@@ -3524,7 +3564,12 @@ auto DB::recovery_prepare_files(EngineState &s)
       if (end && *end < std::filesystem::file_size(p)) {
         data_file.reset();
         std::filesystem::resize_file(p, *end);
-        data_file = openDataFileForRead(p, io_backend_, pool_.get());
+        // Same file_id as the open above, deliberately. Under the buffer
+        // pool that open's hint scan may have admitted frames under this id,
+        // but resize_file only drops a tail: every byte below *end is
+        // unchanged, and no reader addresses anything above it. Frames past
+        // the new end are orphans CLOCK reclaims.
+        data_file = openDataFileForRead(p, io_backend_, pool_.get(), file_id);
       }
     }
     files_t.set(file_id, data_file);

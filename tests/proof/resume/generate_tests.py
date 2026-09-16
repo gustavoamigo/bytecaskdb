@@ -36,8 +36,11 @@ def _build_open_opts(degrade: DegradeShape, max_file_bytes: int | None = None) -
     parts: List[str] = []
     if max_file_bytes is not None:
         parts.append(f".max_file_bytes = {max_file_bytes}")
-    if degrade.mmap_backend:
+    if degrade.io_backend == "mmap":
         parts.append(".io_backend = bytecask::IoBackend::Mmap")
+    elif degrade.io_backend == "buffer_pool":
+        parts.append(".io_backend = bytecask::IoBackend::BufferPool")
+        parts.append(".buffer_pool = {.capacity_bytes = 1048576}")
     return ", ".join(parts)
 
 
@@ -201,8 +204,8 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     name = f"prove_resume__{degrade.label}__{failure.value}"
 
     parts: List[str] = []
-    if degrade.mmap_backend:
-        # WASM/Emscripten builds reject IoBackend::Mmap outright (see
+    if degrade.io_backend != "pread":
+        # WASM/Emscripten builds reject every non-pread back-end (see
         # DB::open); these buffered/mmap variants only make sense natively.
         parts.append("#ifndef __EMSCRIPTEN__")
     parts.append(f'TEST_CASE("{name}", "[prove_resume]") {{')
@@ -228,7 +231,7 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     parts.append("  }")
     parts.append(gen_recovery_check(degrade, delta))
     parts.append("}")
-    if degrade.mmap_backend:
+    if degrade.io_backend != "pread":
         parts.append("#endif  // __EMSCRIPTEN__")
     return "\n".join(parts)
 

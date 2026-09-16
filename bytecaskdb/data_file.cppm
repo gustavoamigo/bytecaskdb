@@ -1170,8 +1170,9 @@ ReadOnlyMmapDataFile::~ReadOnlyMmapDataFile() {
 // Byte fetching goes to BufferPool::read_at; parsing and CRC verification use
 // the same free functions as every other back-end, so the decoded result is
 // identical by construction. The pool is owned by the DB and outlives every
-// file registered with it, and hands each file a cache id of its own — the
-// engine's file_id is never needed here.
+// file registered with it. Frames are keyed by the engine's file_id, which the
+// caller reserves before opening the file — see TransientEngineState::
+// reserve_file_id, which exists so vacuum can supply one here.
 //
 // Spans returned by read_entry / read_entry_unverified point into the caller's
 // io_buf, exactly as ReadOnlyPosixDataFile does — never into a frame. A frame
@@ -1180,7 +1181,7 @@ ReadOnlyMmapDataFile::~ReadOnlyMmapDataFile() {
 export class ReadOnlyBufferPoolDataFile : public DataFile {
 public:
   [[nodiscard]] static auto openForRead(std::filesystem::path path,
-                                        BufferPool &pool)
+                                        std::uint32_t file_id, BufferPool &pool)
       -> std::shared_ptr<ReadOnlyBufferPoolDataFile> {
     auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd == -1) {
@@ -1195,8 +1196,8 @@ public:
       file_size = static_cast<std::size_t>(st.st_size);
     }
     return std::shared_ptr<ReadOnlyBufferPoolDataFile>(
-        new ReadOnlyBufferPoolDataFile{std::move(path), fd, file_size,
-                                       pool.acquire_cache_id(), pool});
+        new ReadOnlyBufferPoolDataFile{std::move(path), fd, file_size, file_id,
+                                       pool});
   }
 
   ~ReadOnlyBufferPoolDataFile() override;
@@ -1270,18 +1271,18 @@ public:
 
 private:
   ReadOnlyBufferPoolDataFile(std::filesystem::path path, int fd,
-                             std::size_t file_size, std::uint32_t cache_id,
+                             std::size_t file_size, std::uint32_t file_id,
                              BufferPool &pool)
       : DataFile{std::move(path)}, fd_{fd}, file_size_{file_size},
-        cache_id_{cache_id}, pool_{&pool} {}
+        file_id_{file_id}, pool_{&pool} {}
 
   int fd_;
   std::size_t file_size_;
-  std::uint32_t cache_id_;
+  std::uint32_t file_id_;
   BufferPool *pool_;
 
   void fetch(Offset offset, std::size_t len, std::byte *dst) const {
-    pool_->read_at(cache_id_, fd_, offset, len, file_size_, dst);
+    pool_->read_at(file_id_, fd_, offset, len, file_size_, dst);
   }
 
   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
@@ -1317,7 +1318,8 @@ ReadOnlyBufferPoolDataFile::~ReadOnlyBufferPoolDataFile() {
 // BufferPool cannot reach here — DB::open rejects it until the pool lands.
 export [[nodiscard]] inline auto openDataFileForRead(
     std::filesystem::path path, IoBackend backend = IoBackend::Pread,
-    BufferPool *pool = nullptr) -> std::shared_ptr<DataFile> {
+    BufferPool *pool = nullptr, std::uint32_t file_id = 0)
+    -> std::shared_ptr<DataFile> {
 #ifndef __EMSCRIPTEN__
   if (backend == IoBackend::BufferPool) {
     if (pool == nullptr) {
@@ -1326,7 +1328,8 @@ export [[nodiscard]] inline auto openDataFileForRead(
       throw std::logic_error{
           "openDataFileForRead: IoBackend::BufferPool requires a pool"};
     }
-    return ReadOnlyBufferPoolDataFile::openForRead(std::move(path), *pool);
+    return ReadOnlyBufferPoolDataFile::openForRead(std::move(path), file_id,
+                                                   *pool);
   }
   if (backend == IoBackend::Mmap) {
     struct stat st {};

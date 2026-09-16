@@ -21,7 +21,7 @@ class DegradeVia(Enum):
 class DegradeShape:
     label: str
     degrade_via: DegradeVia
-    mmap_backend: bool = False
+    io_backend: str = "pread"  # pread | mmap | buffer_pool
 
 
 class ResumeFailureClass(Enum):
@@ -38,8 +38,10 @@ DEGRADE_SHAPES = [
     DegradeShape("degrade_C", DegradeVia.C),
     DegradeShape("degrade_F", DegradeVia.F),
     DegradeShape("degrade_G", DegradeVia.G),
-    DegradeShape("degrade_H_buffered", DegradeVia.H, mmap_backend=True),
-    DegradeShape("degrade_C_buffered", DegradeVia.C, mmap_backend=True),
+    DegradeShape("degrade_H_mmap", DegradeVia.H, io_backend="mmap"),
+    DegradeShape("degrade_C_mmap", DegradeVia.C, io_backend="mmap"),
+    DegradeShape("degrade_H_pool", DegradeVia.H, io_backend="buffer_pool"),
+    DegradeShape("degrade_C_pool", DegradeVia.C, io_backend="buffer_pool"),
 ]
 
 RESUME_FAILURE_CLASSES = list(ResumeFailureClass)

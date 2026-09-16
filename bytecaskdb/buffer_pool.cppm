@@ -55,7 +55,7 @@ export struct BufferPoolOptions {
 };
 
 // ---------------------------------------------------------------------------
-// BufferPool — fixed-size frame cache keyed by (cache_id, frame_index).
+// BufferPool — fixed-size frame cache keyed by (file_id, frame_index).
 //
 // Reads are lock-free: a probe of the index table with acquire loads, then a
 // seqlock-protected memcpy out of the frame. Nothing on the hit path writes
@@ -115,35 +115,13 @@ public:
     return frame_count_;
   }
 
-  // Identifies a file's frames within the pool. Deliberately not the engine's
-  // file_id: that is minted by the engine at points the file factory does not
-  // reach (vacuum assigns it only once the compacted file is already open), and
-  // borrowing it would force either a reordering of vacuum or a mutable field
-  // on a type lock-free readers share. A pool-local id needs neither, and only
-  // has to be unique — which is all the frame key ever asked of it.
-  //
-  // Monotonic and never reused, so a vacuumed file's frames are orphans that
-  // CLOCK reclaims on its next pass rather than stale entries needing
-  // invalidation.
-  [[nodiscard]] inline auto acquire_cache_id() -> std::uint32_t {
-    const auto id = next_cache_id_.fetch_add(1, std::memory_order_relaxed);
-    if (id == kMaxCacheId) {
-      // Wrapping would alias a live file's frames onto a new file and serve
-      // its bytes. Unreachable in practice — it needs 2^32 sealed files in one
-      // process — but silently wrong if it ever happened.
-      throw std::runtime_error{
-          "BufferPool: cache id space exhausted; reopen the database"};
-    }
-    return id;
-  }
-
-  // Reads exactly len bytes at offset of cache_id's file into dst, serving what is
+  // Reads exactly len bytes at offset of file_id's file into dst, serving what is
   // resident and filling the rest. file_size bounds admission: a frame that
   // extends past EOF is served directly and never cached, which is what lets a
   // frame's contents be fixed-length with no per-frame valid-length field.
   //
   // Throws std::system_error if the underlying read fails or comes up short.
-  void read_at(std::uint32_t cache_id, int fd, std::uint64_t offset,
+  void read_at(std::uint32_t file_id, int fd, std::uint64_t offset,
                std::size_t len, std::size_t file_size, std::byte *dst) {
     if (len == 0) return;
 
@@ -164,7 +142,7 @@ public:
     // fully-resident multi-frame read costs no I/O at all.
     bool all_hit = true;
     for (auto f = first; f <= last && all_hit; ++f) {
-      all_hit = copy_out_of_frame(make_key(cache_id, f), f, offset, len, dst);
+      all_hit = copy_out_of_frame(make_key(file_id, f), f, offset, len, dst);
     }
     if (all_hit) {
       counters_.pool_hits.fetch_add(1, std::memory_order_relaxed);
@@ -202,7 +180,7 @@ public:
           EIO, std::generic_category(),
           std::format("BufferPool::read_at: file {} is shorter than the "
                       "requested range [{}, {})",
-                      cache_id, offset, offset + len)};
+                      file_id, offset, offset + len)};
     }
     std::memcpy(dst, scratch.data() + copy_from, len);
 
@@ -210,7 +188,7 @@ public:
       const auto frame_start = f * kPoolFrameBytes;
       // Only whole frames are admitted; a short tail frame stays uncached.
       if (frame_start + kPoolFrameBytes > file_size) break;
-      admit(make_key(cache_id, f),
+      admit(make_key(file_id, f),
             scratch.data() + (frame_start - extent_start));
     }
   }
@@ -237,14 +215,13 @@ private:
   // Beyond this a racing eviction is likely pathological, and a direct read is
   // always correct — so the reader stops spinning and pays for the syscall.
   static constexpr int kMaxOptimisticRetries = 4;
-  static constexpr std::uint32_t kMaxCacheId = ~std::uint32_t{0};
   static constexpr std::size_t kWordBytes = sizeof(std::uint64_t);
   static constexpr std::size_t kWordsPerFrame = kPoolFrameBytes / kWordBytes;
 
-  [[nodiscard]] static auto make_key(std::uint32_t cache_id,
+  [[nodiscard]] static auto make_key(std::uint32_t file_id,
                                      std::uint64_t frame_index) noexcept
       -> std::uint64_t {
-    return (static_cast<std::uint64_t>(cache_id) << 32) |
+    return (static_cast<std::uint64_t>(file_id) << 32) |
            (frame_index & 0xFFFFFFFFULL);
   }
 
@@ -465,7 +442,6 @@ private:
   mutable std::vector<Slot> table_;
   std::mutex fill_mu_;
   std::size_t hand_{0};  // guarded by fill_mu_
-  std::atomic<std::uint32_t> next_cache_id_{0};
 };
 
 } // namespace bytecask

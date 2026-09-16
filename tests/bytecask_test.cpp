@@ -2172,11 +2172,15 @@ auto size_report(const bytecask::DB &db) -> SizeReport {
 TEST_CASE("Preallocated tail: sealed files shrink to their logical size",
           "[bytecask][filestats]") {
   const auto io_backend =
-      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap);
+      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap,
+               bytecask::IoBackend::BufferPool);
   CAPTURE(static_cast<int>(io_backend));
   constexpr std::uint64_t kCapacity = 4096;
-  const bytecask::Options opts{.max_file_bytes = kCapacity,
-                               .io_backend = io_backend};
+  bytecask::Options opts{.max_file_bytes = kCapacity,
+                         .io_backend = io_backend};
+  if (io_backend == bytecask::IoBackend::BufferPool) {
+    opts.buffer_pool.capacity_bytes = 1024 * 1024;
+  }
 
   TempDir td;
   const auto db_path = td.path / "db";

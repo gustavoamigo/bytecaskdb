@@ -693,7 +693,7 @@ TEST_CASE("prove_resume__degrade_G__cascade_r2_r3", "[prove_resume]") {
 }
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_resume__degrade_H_buffered__success", "[prove_resume]") {
+TEST_CASE("prove_resume__degrade_H_mmap__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
   {
@@ -720,7 +720,7 @@ TEST_CASE("prove_resume__degrade_H_buffered__success", "[prove_resume]") {
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_resume__degrade_H_buffered__file_creation_fails", "[prove_resume]") {
+TEST_CASE("prove_resume__degrade_H_mmap__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
   {
@@ -754,7 +754,7 @@ TEST_CASE("prove_resume__degrade_H_buffered__file_creation_fails", "[prove_resum
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_resume__degrade_H_buffered__double_resume", "[prove_resume]") {
+TEST_CASE("prove_resume__degrade_H_mmap__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
   {
@@ -788,7 +788,7 @@ TEST_CASE("prove_resume__degrade_H_buffered__double_resume", "[prove_resume]") {
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_resume__degrade_C_buffered__success", "[prove_resume]") {
+TEST_CASE("prove_resume__degrade_C_mmap__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
   {
@@ -821,7 +821,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__success", "[prove_resume]") {
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_resume__degrade_C_buffered__truncate_fails", "[prove_resume]") {
+TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
   {
@@ -861,7 +861,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__truncate_fails", "[prove_resume]") 
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_resume__degrade_C_buffered__sync_fails", "[prove_resume]") {
+TEST_CASE("prove_resume__degrade_C_mmap__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
   {
@@ -901,7 +901,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__sync_fails", "[prove_resume]") {
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_resume__degrade_C_buffered__file_creation_fails", "[prove_resume]") {
+TEST_CASE("prove_resume__degrade_C_mmap__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
   {
@@ -941,7 +941,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__file_creation_fails", "[prove_resum
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_resume__degrade_C_buffered__double_resume", "[prove_resume]") {
+TEST_CASE("prove_resume__degrade_C_mmap__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
   {
@@ -982,7 +982,7 @@ TEST_CASE("prove_resume__degrade_C_buffered__double_resume", "[prove_resume]") {
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_resume__degrade_C_buffered__cascade_r2_r3", "[prove_resume]") {
+TEST_CASE("prove_resume__degrade_C_mmap__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
   {
@@ -1025,5 +1025,341 @@ TEST_CASE("prove_resume__degrade_C_buffered__cascade_r2_r3", "[prove_resume]") {
     assert_consistent(db);
   }
   assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_resume__degrade_H_pool__success", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_H: write k0, then fault on rotation after p0.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // resume() succeeds on first attempt.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_resume__degrade_H_pool__file_creation_fails", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_H: write k0, then fault on rotation after p0.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject resume fault → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_file_creation"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_resume__degrade_H_pool__double_resume", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_H: write k0, then fault on rotation after p0.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // First resume() succeeds.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+
+    // Second resume() is a no-op — engine already healthy.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_resume__degrade_C_pool__success", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
+    // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
+    // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::testing::ScopedFaultInjector fi_degrade{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true}, std::move(plan)),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // resume() succeeds on first attempt.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_resume__degrade_C_pool__truncate_fails", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
+    // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
+    // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::testing::ScopedFaultInjector fi_degrade{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true}, std::move(plan)),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject resume fault → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_truncate"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_resume__degrade_C_pool__sync_fails", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
+    // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
+    // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::testing::ScopedFaultInjector fi_degrade{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true}, std::move(plan)),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject resume fault → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_sync"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_resume__degrade_C_pool__file_creation_fails", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
+    // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
+    // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::testing::ScopedFaultInjector fi_degrade{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true}, std::move(plan)),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject resume fault → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_file_creation"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_resume__degrade_C_pool__double_resume", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
+    // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
+    // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::testing::ScopedFaultInjector fi_degrade{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true}, std::move(plan)),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // First resume() succeeds.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
+    assert_consistent(db);
+
+    // Second resume() is a no-op — engine already healthy.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_resume__degrade_C_pool__cascade_r2_r3", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
+    // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
+    // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::testing::ScopedFaultInjector fi_degrade{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true}, std::move(plan)),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject io_resume_sync → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_sync"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: inject io_resume_file_creation → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_file_creation"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 4: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__

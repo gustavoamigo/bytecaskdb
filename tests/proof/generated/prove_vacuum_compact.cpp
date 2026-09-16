@@ -350,7 +350,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__rename_fails", "[prove_vacuum_comp
 }
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__success", "[prove_vacuum_compact]") {
+TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__success", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
   bytecask::testing::VacuumBaseline before;
@@ -375,7 +375,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__success", "[prove_v
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__tmp_create_fails", "[prove_vacuum_compact]") {
+TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__tmp_create_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
   bytecask::testing::VacuumBaseline before;
@@ -403,7 +403,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__tmp_create_fails", 
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__append_fails", "[prove_vacuum_compact]") {
+TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__append_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
   bytecask::testing::VacuumBaseline before;
@@ -431,7 +431,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__append_fails", "[pr
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__sync_fails", "[prove_vacuum_compact]") {
+TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__sync_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
   bytecask::testing::VacuumBaseline before;
@@ -459,7 +459,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__sync_fails", "[prov
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__rename_fails", "[prove_vacuum_compact]") {
+TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__rename_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
   bytecask::testing::VacuumBaseline before;
@@ -490,7 +490,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_buffered__rename_fails", "[pr
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__success", "[prove_vacuum_compact]") {
+TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__success", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
   bytecask::testing::VacuumBaseline before;
@@ -523,7 +523,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__success", "[prove_vacuum_
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__tmp_create_fails", "[prove_vacuum_compact]") {
+TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__tmp_create_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
   bytecask::testing::VacuumBaseline before;
@@ -559,7 +559,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__tmp_create_fails", "[prov
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__append_fails", "[prove_vacuum_compact]") {
+TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__append_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
   bytecask::testing::VacuumBaseline before;
@@ -595,7 +595,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__append_fails", "[prove_va
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__sync_fails", "[prove_vacuum_compact]") {
+TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__sync_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
   bytecask::testing::VacuumBaseline before;
@@ -631,7 +631,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__sync_fails", "[prove_vacu
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
-TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__rename_fails", "[prove_vacuum_compact]") {
+TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__rename_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
   bytecask::testing::VacuumBaseline before;
@@ -666,5 +666,325 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_buffered__rename_fails", "[prove_va
     CHECK_FALSE(db.is_degraded());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__success", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Delete ['k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+
+    assert_vacuum_success(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__tmp_create_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Delete ['k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_tmp_create"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__append_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Delete ['k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__sync_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Delete ['k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__rename_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Delete ['k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+    // VC4: rename succeeded — synced .data.tmp exists on disk but
+    // vacuum_commit never ran. Old file remains in state.
+    // assert_vacuum_recoverable confirms .data.tmp is not replayed.
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_vacuum_compact__mostly_dead_pool__success", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v_k3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v_k4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v_k5"));
+    // Delete ['k1', 'k2', 'k3', 'k4', 'k5'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+    (void)db.del({.sync = false}, to_bytes("k2"));
+    (void)db.del({.sync = false}, to_bytes("k3"));
+    (void)db.del({.sync = false}, to_bytes("k4"));
+    (void)db.del({.sync = false}, to_bytes("k5"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+
+    assert_vacuum_success(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_vacuum_compact__mostly_dead_pool__tmp_create_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v_k3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v_k4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v_k5"));
+    // Delete ['k1', 'k2', 'k3', 'k4', 'k5'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+    (void)db.del({.sync = false}, to_bytes("k2"));
+    (void)db.del({.sync = false}, to_bytes("k3"));
+    (void)db.del({.sync = false}, to_bytes("k4"));
+    (void)db.del({.sync = false}, to_bytes("k5"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_tmp_create"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_vacuum_compact__mostly_dead_pool__append_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v_k3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v_k4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v_k5"));
+    // Delete ['k1', 'k2', 'k3', 'k4', 'k5'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+    (void)db.del({.sync = false}, to_bytes("k2"));
+    (void)db.del({.sync = false}, to_bytes("k3"));
+    (void)db.del({.sync = false}, to_bytes("k4"));
+    (void)db.del({.sync = false}, to_bytes("k5"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_vacuum_compact__mostly_dead_pool__sync_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v_k3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v_k4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v_k5"));
+    // Delete ['k1', 'k2', 'k3', 'k4', 'k5'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+    (void)db.del({.sync = false}, to_bytes("k2"));
+    (void)db.del({.sync = false}, to_bytes("k3"));
+    (void)db.del({.sync = false}, to_bytes("k4"));
+    (void)db.del({.sync = false}, to_bytes("k5"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove_vacuum_compact__mostly_dead_pool__rename_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v_k3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v_k4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v_k5"));
+    // Delete ['k1', 'k2', 'k3', 'k4', 'k5'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+    (void)db.del({.sync = false}, to_bytes("k2"));
+    (void)db.del({.sync = false}, to_bytes("k3"));
+    (void)db.del({.sync = false}, to_bytes("k4"));
+    (void)db.del({.sync = false}, to_bytes("k5"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+    // VC4: rename succeeded — synced .data.tmp exists on disk but
+    // vacuum_commit never ran. Old file remains in state.
+    // assert_vacuum_recoverable confirms .data.tmp is not replayed.
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
