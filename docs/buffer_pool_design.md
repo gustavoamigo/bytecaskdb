@@ -13,13 +13,16 @@ ByteCaskDB currently has two read back-ends behind the `DataFile` contract, sele
 | `ReadOnlyPosixDataFile` / `WritablePosixDataFile` (default) | `pread` per read | Bytes live in the OS page cache; we pay a copy out of it |
 | `ReadOnlyMmapDataFile` / `WritableMmapDataFile` | memcpy from the mapping | Bytes live in the OS page cache; mapped into our address space |
 
-Both delegate caching to the kernel. That is a good default and it is free. It has three properties we do not control:
+Both delegate caching to the kernel. That is a good default and it is free. It has four properties we do not control:
 
 1. **Residency is not ours.** Under memory pressure — especially a cgroup memory limit, where page cache is charged to us — the kernel reclaims our hot pages on its own schedule. Tenet 3 is *predictable latency*; page-cache reclaim is the opposite of predictable.
 2. **Granularity is not ours.** The kernel caches in 4 KiB pages with its own readahead heuristics. We already fight this with `POSIX_FADV_RANDOM` and `MADV_RANDOM`.
-3. **We cannot see it.** `stats()` reports `disk_reads` and `disk_read_bytes`, but a "disk read" that the page cache served is indistinguishable from one that hit the device. There is no hit ratio to reason about, tune, or alert on.
+3. **Content is not ours.** The page cache stores raw file blocks, because it cannot know what is in them. It therefore caches three things we would never choose to keep: the 15-byte headers and 4-byte CRC trailers, the keys — which every caller of `read_value` already holds, and which are read from disk only to be stepped over — and, most of all, **superseded entries**. A data file accumulates overwritten and tombstoned entries until vacuum rewrites it, so a file sitting at 50 % live has half its cached pages holding bytes that no read can ever resolve to. The kernel has no way to know which half. Section 3, Axis A quantifies what a format-aware cache could do with that.
+4. **We cannot see it.** `stats()` reports `disk_reads` and `disk_read_bytes`, but a "disk read" that the page cache served is indistinguishable from one that hit the device. There is no hit ratio to reason about, tune, or alert on.
 
-A buffer pool fixes all three. The reason it is *tractable* here — and the reason this is worth doing in ByteCaskDB specifically rather than in a generic engine — is the observation in the request: **an append-only store does not need a real buffer pool.** It needs a cache.
+A buffer pool addresses all four — though the third only if it caches values rather than blocks, which is the open trade in Axis A.
+
+One claim to be careful about: this is **not** automatically less memory. Today the bytes live exactly once, in the page cache. A pool filled through buffered `pread` (Axis D, D1) makes it *two* copies — pool and page cache — which is strictly worse; only `O_DIRECT` returns to one. The dependable win is that the footprint becomes **bounded, single-copy and non-reclaimable**, not that it becomes smaller. A generously sized pool will use more RAM than a `pread` workload's steady state, and that is a legitimate configuration. The reason it is *tractable* here — and the reason this is worth doing in ByteCaskDB specifically rather than in a generic engine — is the observation in the request: **an append-only store does not need a real buffer pool.** It needs a cache.
 
 ### 1.1 What append-only removes
 
@@ -208,6 +211,10 @@ Worth keeping the size of this in proportion: the dominant saving is the avoided
 
 So a value-only cache is worth 1.5–3× the effective capacity for small values and rounds to nothing above about 256 bytes.
 
+That understates it, because entries are not the only waste. A block cache — like the page cache before it — also holds **superseded entries**: overwritten and tombstoned records that remain in the file until vacuum rewrites it. Those bytes are unreachable; no `KeyDirEntry` points at them. A file at 50 % live spends half its cached capacity on them. A cache keyed by requested entry holds none, by construction. Stacked with the header-and-key saving, for small values in a half-live file that is roughly **6× more useful data per byte of RAM** — and unlike the density figure above, this one is a capability the kernel cannot offer at all, since the page cache has no way to distinguish a live entry from a dead one.
+
+A block cache can only approximate it: the liveness-biased eviction in Axis B lets the policy prefer victims from low-live-ratio files, which reclaims the waste after the fact rather than never admitting it.
+
 Against that, the device transfer is 4 KiB whether we want it or not — that is the `O_DIRECT` alignment unit and the kernel's minimum besides. At 51 bytes per entry, one aligned read brings in roughly **80 entries**. A block cache keeps all 80 and can serve any of them; a value-only cache keeps one and discards 79 it has already paid to transfer. Whether that matters is entirely a question of whether the workload has spatial locality — and in an append-only file, physical adjacency *is* write-time adjacency, which is exactly the correlation that batch writes, event streams and session data produce.
 
 Density of 1.5–3× against up to 80 neighbours per I/O is not a trade that argument settles. It is Axis A's real content, and it belongs in the A/B rather than in this paragraph: A1 (entry/value cache) versus A3 (block cache) is precisely this question, and the counters in Section 9.2 are what decide it.
@@ -218,6 +225,7 @@ One coupling to note before anyone tries a values-only pool: `read_entry` / `rea
 
 - **Eviction latency is no longer bounded.** Freeing one victim may release 1024 frames, and the thread that pays is the reader that took the miss. That is a tenet 3 problem, and it is the real price of dropping the bypass. Mitigations worth measuring: cap the work done per victim selection and continue the release incrementally, or hand large releases to the background worker. This needs a p99 measurement on a mixed small/large workload before it is called settled.
 - **Admission needs N frames at once.** For the default 4 MiB `max_value_bytes` against any sane pool size this is a rounding error — 1024 frames out of a 1 GiB pool is 0.4 %. It only becomes real at the packed ceiling (2^28−1, ≈256 MiB) against a small pool.
+- **Against `mmap` specifically, there is a page-table saving.** A 100 GiB mapping costs on the order of 200 MiB of page-table entries and constant TLB pressure under random access. A pool arena on 2 MiB huge pages needs 512× fewer entries. `Options::use_mmap`'s own comment already concedes the shape of this — it describes `pread` as "avoiding virtual address space pressure under memory contention".
 - **Large values can still evict the working set**, bypass or not. That is now the eviction policy's problem rather than something special-cased away, which is where it belongs — see the scan-resistance discussion in Axis B and the scan bypass in Section 7.4.
 
 #### Guard rail
