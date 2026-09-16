@@ -3153,6 +3153,8 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.pool_multi_frame_reads.load(std::memory_order_relaxed)},
       {"bytecask.pool_optimistic_retries",
        counters_.pool_optimistic_retries.load(std::memory_order_relaxed)},
+      {"bytecask.pool_evicted_bytes_touched",
+       counters_.pool_evicted_bytes_touched.load(std::memory_order_relaxed)},
       {"bytecask.pool_frames_total", counters_.pool_frames_total},
       {"bytecask.pool_frames_resident",
        counters_.pool_frames_resident.load(std::memory_order_relaxed)},

@@ -371,6 +371,8 @@ What this benchmark still cannot show is the pool's *benefit*: a dataset larger 
 
 Against §12.1's proposed Phase 1 bar (measured on the buffered rows, which is what Phase 1 is): hit ratio 0.808 at ratio 0.25 passes; optimistic retries were zero, passes; p99 3.99 µs is 3.7x `mmap` against a bar of 2x, fails; the 32-thread `GetMT` criterion is still unmeasured. The bar was written before any numbers existed, and Phase 1 reads through the page cache on both sides, so it cannot structurally match `mmap` there — whether that means the bar was wrong or the miss path is, is the question §12.1 exists to settle before Phase 2 is judged.
 
+**`u` is 0.17–0.23 on this workload — under §12.2's threshold.** Measured at ratios 0.10 / 0.25 / 0.50 as 0.172 / 0.196 / 0.229, identical under buffered and direct fills, undefined at 1.00 and above where nothing is evicted. With 512-byte values a frame holds ~7.5 entries, so an evicted frame served about 1.3–1.7 of them before it went: the frames that get evicted are, by construction, the cold ones, filled for a single read whose neighbours were never asked for. Two things make the real figure lower still, not higher — the bitmap counts 32-byte slots, an overcount against entries, and this workload's Zipf rank *is* its disk order, so hot keys are physically adjacent, which is kinder to a block cache than a real key space would be. §12.2 says `u ≤ 0.3` reopens the storage layer, and only the storage layer. This measurement does that. It does not decide it: §10's estimate is that an entry cache has ~`0.9/u` of a block cache's effective capacity — about 4× here — against a slab-calcification failure mode that has no number attached, and one workload shape at one value size is not the evidence to settle that on. What it is, is the first number the question has ever had.
+
 The arena page-fault inversion found by the first version of this benchmark (p99 rising with pool size because the arena faulted in lazily on the read path) stays fixed: buffered p99 falls monotonically from 0.10 to 1.00.
 
 ---
@@ -389,4 +391,6 @@ The arena page-fault inversion found by the first version of this benchmark (p99
    Failing the first is a policy problem and does not block Phase 2. Failing either of the last two is a design problem and does.
 
 2. **Does measured `u` reopen Axis A?** See §10. `u ≥ 0.9` closes it permanently; `u ≤ 0.3` reopens the storage layer, and only the storage layer.
+
+   *Instrumented.* Each frame carries a 128-bit bitmap of the 32-byte slots hits have copied out of, set test-then-set so a hot slot writes once; at eviction its popcount is added to `pool_evicted_bytes_touched`, and `u = pool_evicted_bytes_touched / (pool_evictions × 4096)`. `pool_bench` reports it per run. It measures bytes read, not entries — a block cache does not know entry boundaries — so it is a slight overcount of §10's definition at the 32-byte granularity, which is the conservative direction for the question it answers.
 3. ~~Is the `resume()` / `truncate` mmap span hazard real?~~ Filed as [#87](https://github.com/gustavoamigo/bytecaskdb/issues/87). Pre-existing, independent of this work.

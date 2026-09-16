@@ -212,6 +212,43 @@ TEST_CASE("BufferPool: an oversize read bypasses admission", "[buffer_pool]") {
   CHECK(counters.pool_hits.load() == 0);
 }
 
+TEST_CASE("BufferPool: eviction reports how much of a frame was read",
+          "[buffer_pool]") {
+  // The design's `u`. A frame read end to end must account for all 4096
+  // bytes when it goes; a frame read once for a few bytes accounts for one
+  // 32-byte slot. Three frames force eviction on the fourth distinct frame.
+  ScratchFile file{64 * 1024};
+  bytecask::Counters counters;
+  const std::size_t capacity = 3 * (bytecask::kPoolFrameBytes + 64);
+  // Divisor 1: a whole-frame read must be admitted, not bypassed as
+  // oversize — at three frames the default guard would reject it.
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity,
+                                  .oversize_guard_divisor = 1},
+      counters};
+  REQUIRE(pool.frame_count() == 3);
+
+  std::vector<std::byte> got(bytecask::kPoolFrameBytes);
+  // Frame 0: filled, then read in full through the pool.
+  pool.read_at(1, file.fd(), 0, got.size(), file.size(), got.data());
+  pool.read_at(1, file.fd(), 0, got.size(), file.size(), got.data());
+  // Frames 1..4: one small read each; the pool holds three, so at least two
+  // evictions happen and frame 0 — oldest, reference bit cleared first — is
+  // among them.
+  for (std::uint64_t f = 1; f <= 4; ++f) {
+    pool.read_at(1, file.fd(), f * bytecask::kPoolFrameBytes, 10, file.size(),
+                 got.data());
+  }
+  const auto evictions = counters.pool_evictions.load();
+  const auto touched = counters.pool_evicted_bytes_touched.load();
+  REQUIRE(evictions >= 2);
+  CHECK(touched >= static_cast<std::int64_t>(bytecask::kPoolFrameBytes));
+  CHECK(touched <= evictions * static_cast<std::int64_t>(bytecask::kPoolFrameBytes));
+  // Every other evicted frame was read for 10 bytes: exactly one slot each.
+  CHECK(touched == static_cast<std::int64_t>(bytecask::kPoolFrameBytes) +
+                       32 * (evictions - 1));
+}
+
 TEST_CASE("BufferPool: differential against pread under constant eviction",
           "[buffer_pool]") {
   // The design's differential test: random reads compared byte-for-byte with

@@ -51,7 +51,7 @@ BENCH_COLUMNS = [
     "backend", "direct_io", "ratio", "pool_bytes", "dataset_bytes", "keys",
     "value_bytes",
     "ops", "zipf_s", "ops_per_sec", "p50_ns", "p99_ns", "p999_ns",
-    "hit_ratio", "evictions", "optimistic_retries",
+    "hit_ratio", "u", "evictions", "optimistic_retries",
 ]
 CSV_COLUMNS = ["git_commit", "timestamp", "host_name", "num_cpus",
                "memory_gb"] + BENCH_COLUMNS

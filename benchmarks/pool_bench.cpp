@@ -121,6 +121,7 @@ struct Result {
   std::uint64_t p99_ns = 0;
   std::uint64_t p999_ns = 0;
   double hit_ratio = -1.0;     // -1 where the back-end has no pool
+  double u = -1.0;             // fraction of an evicted frame that was read
   std::int64_t evictions = 0;
   std::int64_t retries = 0;
 };
@@ -195,6 +196,12 @@ auto measure(const Config &cfg, bytecask::IoBackend backend,
                             : 0.0;
     r.evictions = after.at("bytecask.pool_evictions") -
                   before.at("bytecask.pool_evictions");
+    const auto touched = after.at("bytecask.pool_evicted_bytes_touched") -
+                         before.at("bytecask.pool_evicted_bytes_touched");
+    r.u = r.evictions > 0
+              ? static_cast<double>(touched) /
+                    (static_cast<double>(r.evictions) * 4096.0)
+              : -1.0;  // nothing evicted: u is undefined, not zero
     r.retries = after.at("bytecask.pool_optimistic_retries") -
                 before.at("bytecask.pool_optimistic_retries");
   }
@@ -280,7 +287,7 @@ auto main(int argc, char **argv) -> int {
 
   std::printf(
       "backend,direct_io,ratio,pool_bytes,dataset_bytes,keys,value_bytes,ops,"
-      "zipf_s,ops_per_sec,p50_ns,p99_ns,p999_ns,hit_ratio,evictions,"
+      "zipf_s,ops_per_sec,p50_ns,p99_ns,p999_ns,hit_ratio,u,evictions,"
       "optimistic_retries\n");
   for (const auto &r : results) {
     std::printf("%s,%d,%.3f,%llu,%llu,%zu,%zu,%zu,%.3f,%.1f,%llu,%llu,%llu,",
@@ -292,10 +299,12 @@ auto main(int argc, char **argv) -> int {
                 static_cast<unsigned long long>(r.p99_ns),
                 static_cast<unsigned long long>(r.p999_ns));
     if (r.hit_ratio < 0.0) {
-      std::printf(",,\n");  // no pool: hit ratio and pool counters are not zero, they are absent
+      std::printf(",,,\n");  // no pool: these are absent, not zero
     } else {
-      std::printf("%.4f,%lld,%lld\n", r.hit_ratio,
-                  static_cast<long long>(r.evictions),
+      std::printf("%.4f,", r.hit_ratio);
+      if (r.u < 0.0) std::printf(",");  // undefined without an eviction
+      else std::printf("%.4f,", r.u);
+      std::printf("%lld,%lld\n", static_cast<long long>(r.evictions),
                   static_cast<long long>(r.retries));
     }
   }

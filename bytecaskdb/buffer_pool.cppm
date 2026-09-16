@@ -15,6 +15,7 @@
 module;
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -152,15 +153,24 @@ public:
   }
 
 private:
-  // Both are 16 bytes; the table is sized at a 0.7 load factor, so each frame
-  // carries 16/0.7 ≈ 23 bytes of table share inside the bound.
-  struct alignas(16) FrameMeta {
+  // FrameMeta is 32 bytes and Slot 16; the table is sized at a 0.7 load
+  // factor, so each frame carries 16/0.7 ≈ 23 bytes of table share inside
+  // the bound.
+  struct alignas(32) FrameMeta {
     std::atomic<std::uint64_t> key{kEmptyKey};
     // Even = readable, odd = being filled. Readers retry on odd or on change.
     std::atomic<std::uint32_t> version{0};
     // CLOCK reference bit, test-then-set so a hot frame stops writing.
     std::atomic<std::uint8_t> ref{0};
+    // Which 32-byte slots of the frame a hit has copied out of, for the
+    // design's `u`: at eviction the popcount says how much of the frame was
+    // ever read. Set test-then-set like ref, so a hot slot writes once.
+    std::atomic<std::uint64_t> touched_lo{0};
+    std::atomic<std::uint64_t> touched_hi{0};
   };
+  static constexpr std::size_t kTouchSlotBytes = 32;
+  static_assert(kPoolFrameBytes / kTouchSlotBytes == 128,
+                "touched bitmap is two 64-bit words");
 
   struct alignas(16) Slot {
     std::atomic<std::uint64_t> key{kEmptyKey};
@@ -279,6 +289,35 @@ private:
     return done >= r.len;
   }
 
+  // Sets the touched bits for [byte_off, byte_off + len) of a frame. Reads
+  // first: a slot already marked costs no write, which keeps §8.3's "no
+  // unconditional writes on a hit" intact for the common re-read.
+  static void mark_touched(FrameMeta &m, std::size_t byte_off,
+                           std::size_t len) noexcept {
+    if (len == 0) return;
+    const auto first = byte_off / kTouchSlotBytes;
+    const auto last = (byte_off + len - 1) / kTouchSlotBytes;  // inclusive
+    const auto mask_for = [](std::size_t lo, std::size_t hi) -> std::uint64_t {
+      // bits [lo, hi] inclusive within one word, lo <= hi <= 63
+      const auto width = hi - lo + 1;
+      const auto bits = width == 64 ? ~std::uint64_t{0}
+                                    : ((std::uint64_t{1} << width) - 1);
+      return bits << lo;
+    };
+    if (first < 64) {
+      const auto m_lo = mask_for(first, std::min<std::size_t>(last, 63));
+      if ((m.touched_lo.load(std::memory_order_relaxed) & m_lo) != m_lo) {
+        m.touched_lo.fetch_or(m_lo, std::memory_order_relaxed);
+      }
+    }
+    if (last >= 64) {
+      const auto m_hi = mask_for(std::max<std::size_t>(first, 64) - 64, last - 64);
+      if ((m.touched_hi.load(std::memory_order_relaxed) & m_hi) != m_hi) {
+        m.touched_hi.fetch_or(m_hi, std::memory_order_relaxed);
+      }
+    }
+  }
+
   [[nodiscard]] static constexpr auto align_up(std::size_t v,
                                                std::size_t a) noexcept
       -> std::size_t {
@@ -374,6 +413,8 @@ private:
         if (m.ref.load(std::memory_order_relaxed) == 0) {
           m.ref.store(1, std::memory_order_relaxed);
         }
+        mark_touched(m, static_cast<std::size_t>(from - frame_start),
+                     static_cast<std::size_t>(to - from));
         return true;
       }
       counters_.pool_optimistic_retries.fetch_add(1, std::memory_order_relaxed);
@@ -383,7 +424,12 @@ private:
 
   // Caches one whole frame. Best-effort: a duplicate or a full sweep drops it,
   // since the caller already holds the bytes.
-  void admit(std::uint64_t key, const std::byte *src) {
+  // touch_off/touch_len: the part of this frame the read that caused the
+  // fill asked for. Marked at publish so a frame filled for one read and
+  // never hit again still reports that read in `u` — a pure-miss workload
+  // must not measure as u = 0.
+  void admit(std::uint64_t key, const std::byte *src, std::size_t touch_off,
+             std::size_t touch_len) {
     std::size_t victim = 0;
     {
       std::lock_guard<std::mutex> lk{fill_mu_};
@@ -400,6 +446,18 @@ private:
       // copy below runs without the lock.
       meta_[victim].version.fetch_add(1, std::memory_order_release);
       meta_[victim].key.store(kEmptyKey, std::memory_order_relaxed);
+      // After the version flip, so a reader that raced the eviction fails
+      // its check and cannot mark a touch against the next occupant.
+      if (old != kEmptyKey) {
+        const auto slots =
+            std::popcount(meta_[victim].touched_lo.load(std::memory_order_relaxed)) +
+            std::popcount(meta_[victim].touched_hi.load(std::memory_order_relaxed));
+        counters_.pool_evicted_bytes_touched.fetch_add(
+            narrow<std::int64_t>(static_cast<std::size_t>(slots) * kTouchSlotBytes),
+            std::memory_order_relaxed);
+      }
+      meta_[victim].touched_lo.store(0, std::memory_order_relaxed);
+      meta_[victim].touched_hi.store(0, std::memory_order_relaxed);
     }
 
     write_frame(arena_.data() + victim * kWordsPerFrame, src);
@@ -410,6 +468,7 @@ private:
       // guaranteed to see the matching bytes.
       meta_[victim].key.store(key, std::memory_order_release);
       meta_[victim].ref.store(1, std::memory_order_relaxed);
+      mark_touched(meta_[victim], touch_off, touch_len);
       meta_[victim].version.fetch_add(1, std::memory_order_release);
       table_insert(key, victim);
     }
@@ -560,7 +619,12 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
     const auto frame_start = f * kPoolFrameBytes;
     // Only whole frames are admitted; a short tail frame stays uncached.
     if (frame_start + kPoolFrameBytes > file_size) break;
-    admit(make_key(file_id, f), buf + (frame_start - extent_start));
+    // The slice of this frame the caller's [offset, offset+len) covers.
+    const auto t_from = std::max(offset, frame_start);
+    const auto t_to = std::min(offset + len, frame_start + kPoolFrameBytes);
+    admit(make_key(file_id, f), buf + (frame_start - extent_start),
+          static_cast<std::size_t>(t_from - frame_start),
+          static_cast<std::size_t>(t_to - t_from));
   }
 }
 
