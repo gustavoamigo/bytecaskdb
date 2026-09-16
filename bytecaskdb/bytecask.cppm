@@ -928,6 +928,16 @@ private:
   void vacuum_remove_file(std::uint32_t file_id);
 
   // State access helpers — raw state_ / state_time_ access is confined here.
+  // Per-thread read cache behind load_state_for_read. One function-local
+  // thread_local shared by every DB the thread touches, so it records its
+  // owner. commit_wait seeds it with the state that covered the thread's
+  // own write — see there for why the timestamp alone is not enough.
+  struct ReadCache {
+    const DB *owner{nullptr};
+    std::shared_ptr<const EngineState> snapshot;
+    std::int64_t last_write_time{0};
+  };
+  [[nodiscard]] static auto read_cache() -> ReadCache &;
   // Read path: thread-local cached snapshot, may be slightly stale.
   [[nodiscard]] auto load_state_for_read(const ReadOptions &opts) const
       -> const std::shared_ptr<const EngineState> &;
@@ -1126,6 +1136,13 @@ public:
   // fdatasync. Lets a test hold a flush in flight while other writers
   // append behind it.
   std::function<void()> test_before_flush_sync_;
+  // Called by store_state on the publishing thread between the state store
+  // and the state_time_ store. Lets a test hold a publication in that gap.
+  std::function<void()> test_between_publish_stores_;
+  // Called by apply_batch on the writer thread after stage 1, just before
+  // commit_wait. Lets a test hold a writer whose entries are already in the
+  // head while another thread flushes and publishes them.
+  std::function<void()> test_before_commit_wait_;
   // Publishes s through the checked store_state under a write barrier, so
   // tests can drive the runtime invariant checks with a crafted state.
   void test_publish(std::shared_ptr<EngineState> s) {
@@ -2238,6 +2255,9 @@ auto DB::apply_batch(WriteOptions opts,
   // Stage 1 is done: the slot's entries are in the prepared head and the
   // page cache. Stage 2 — fdatasync (if sync) and publication — happens
   // here, on this thread when the flush role is free.
+#ifdef BYTECASK_TESTING
+  if (test_before_commit_wait_) test_before_commit_wait_();
+#endif
   if (slot.result && slot.result->sequence != 0) commit_wait(slot);
 
   return slot.result;
@@ -2571,6 +2591,17 @@ void DB::commit_wait(EngineSlot &slot) {
         : published->next_seq > target;
     if (covered) {
       result.durable = published->durable_seq >= target;
+      // Another thread may have published this state and not yet stored
+      // state_time_: a read on this thread would compare timestamps, find
+      // nothing new and serve its cached pre-write snapshot. Seed the
+      // cache with the covering state instead. last_write_time is left as
+      // is: once the timestamp lands the next read refreshes as usual.
+      auto &tl = read_cache();
+      if (tl.owner != this) {
+        tl.owner = this;
+        tl.last_write_time = 0;
+      }
+      tl.snapshot = std::move(published);
       return;
     }
     {
@@ -3253,22 +3284,21 @@ auto DB::create_manifest() -> FileManifest {
 // reference to the thread-local snapshot. The snapshot stays alive until
 // the same thread calls load_state_for_read again, so callers must not
 // stash the reference across a second load_state_for_read call.
-auto DB::load_state_for_read(const ReadOptions &opts) const
-    -> const std::shared_ptr<const EngineState> & {
-  struct TlState {
-    // Identifies which DB instance snapshot belongs to. The cache is a
-    // single function-local thread_local shared by every DB the calling
-    // thread touches, so without this a thread that reads from two DBs
-    // could see one DB's generation while querying the other.
-    const DB *owner{nullptr};
-    std::shared_ptr<const EngineState> snapshot;
-    std::int64_t last_write_time{0};
-  };
+auto DB::read_cache() -> ReadCache & {
   // Per-thread state cache — thread-exit destructor is intentional.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-  thread_local TlState tl;
+  thread_local ReadCache tl;
 #pragma clang diagnostic pop
+  return tl;
+}
+
+auto DB::load_state_for_read(const ReadOptions &opts) const
+    -> const std::shared_ptr<const EngineState> & {
+  auto &tl = read_cache();
+  // owner identifies which DB instance snapshot belongs to: without it a
+  // thread that reads from two DBs could see one DB's generation while
+  // querying the other.
   if (tl.owner != this) {
     // Cache holds another DB's generation (or is empty): drop it and
     // force a refresh below. Freed inline — this DB's reclaimer (if any)
@@ -3351,6 +3381,9 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
 #endif
 
   store_state(std::move(new_state));
+#ifdef BYTECASK_TESTING
+  if (test_between_publish_stores_) test_between_publish_stores_();
+#endif
   state_time_.store(now_ns(), std::memory_order_release);
 
   if (became_degraded) {
