@@ -517,3 +517,25 @@ TEST_CASE("BTree transient iteration and reverse base", "[btree]") {
   CHECK(r.base() == t2.begin());
   check_accounting({&t, &t2});
 }
+
+TEST_CASE("BTree sequential stream below other keys fills leaves", "[btree]") {
+  // An ascending stream inserted under a larger key family: the leaf that
+  // receives the stream also holds the first key of the next family, so a
+  // balanced split would leave every abandoned half small. Sequential-insert
+  // detection and outlier isolation keep the fill near a full node.
+  auto tr = Tree{}.transient();
+  tr.set(to_bytes("zzzz"), 0);
+  for (int i = 0; i < 20000; ++i) {
+    char tmp[64];
+    std::snprintf(tmp, sizeof tmp, "order::018f6e2c-0000-7000-8000-%012x", i);
+    tr.set(to_bytes(tmp), i);
+  }
+  auto t = std::move(tr).persistent();
+  const auto st = t.stats();
+  CHECK(st.entries == 20001U);
+  const auto fill = static_cast<double>(st.used_bytes) /
+                    static_cast<double>(st.capacity_bytes);
+  CHECK(fill > 0.6);
+  CHECK(st.leaf_prefix_bytes / st.leaves >= 38U);
+  check_accounting({&t});
+}

@@ -173,6 +173,23 @@ void profile_index_only(const key_generators::KeyShape &shape, std::size_t n) {
     }
     print_memory("after insert");
     std::printf("  keys: %zu\n", t.size());
+    if constexpr (requires { t.stats(); }) {
+      const auto st = t.stats();
+      std::printf("  nodes %zu (leaves %zu), height %zu, fill %.2f, "
+                  "dead %.3f, avg leaf prefix %.1f B, avg suffix %.1f B, "
+                  "capacity/key %.1f B\n",
+                  st.nodes, st.leaves, st.height,
+                  static_cast<double>(st.used_bytes) /
+                      static_cast<double>(st.capacity_bytes),
+                  static_cast<double>(st.dead_bytes) /
+                      static_cast<double>(st.capacity_bytes),
+                  static_cast<double>(st.leaf_prefix_bytes) /
+                      static_cast<double>(st.leaves),
+                  static_cast<double>(st.leaf_suffix_bytes) /
+                      static_cast<double>(st.entries),
+                  static_cast<double>(st.capacity_bytes) /
+                      static_cast<double>(st.entries));
+    }
   }
   print_memory("after close");
 }

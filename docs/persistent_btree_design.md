@@ -1,7 +1,9 @@
 # Persistent B+ tree key directory — design
 
-Status: **proposal, design phase**. Nothing in this document is implemented.
-Date: 2026-09-17
+Status: **first version implemented, not yet wired into the engine**. See
+[Implementation notes](#implementation-notes-first-version) for what was
+built, what differs from the design below, and what was measured.
+Date: 2026-09-17 (design), 2026-09-17 (first version)
 Replaces, if adopted: `docs/persistent_radix_tree_design.md` and
 `docs/radix_tree_epoch_reclamation_design.md` (PR #86).
 Baseline for every code reference: `main` at `5297632`, and
@@ -686,6 +688,195 @@ Each step is a reviewed commit with the suite green.
 5. **README figure.** The per-key RAM paragraph will read "50 to 75 bytes
    per key for structured keys, 60 to 130 for random keys" instead of the
    current "~50". Acceptable framing?
+
+## Implementation notes (first version)
+
+Built on branch `claude/btree-design-bytecaskdb-vqjnzm`, tracked in #102.
+The tree is exercised through its own tests, `map_bench` and an index-only
+mode of `memory_profile`; the engine still uses the radix tree.
+
+| Part | Where | Lines |
+|---|---|---:|
+| Tree: node layout, search, `BuildSession`, handles, iterators, merge | `bytecaskdb/btree.cppm` | 1,616 |
+| Reclaimer, lifted from #86 and abstracted over the node type | `bytecaskdb/version_chain.cppm` | 487 |
+| Tests: 14 cases, 790k assertions, clean under ASAN with leak detection | `tests/btree_test.cpp` | 554 |
+
+`btree.cppm` is under the 2,000-line gate (G7), with about 250 of its
+lines being the debug `validate()`, `stats()` and `visit_nodes()` support.
+There is no per-node-type dispatch anywhere.
+
+### What differs from the design above
+
+- **Slot and entry layout.** A slot is `head << 32 | offset` with a 32-bit
+  offset from the node end to the entry *start*, and the entry carries its
+  own 16-bit suffix length: `[payload][u16 len][suffix]`. The design's
+  16-bit offset could not address a 65,535-byte key's entry, and measuring
+  from the entry end instead would have made the entry unparseable without
+  its length. Cost: 2 bytes per key. The u16 length is the reason the tree
+  rejects keys above 65,535 bytes with `std::length_error`, the same
+  ceiling as the data file's `key_size` field.
+- **Oversized nodes hold as many entries as fit.** With 32-bit offsets the
+  "a node larger than `kNodeBytes` holds exactly one entry" rule is
+  unnecessary. A rebuild with a shorter prefix or a split among giant keys
+  allocates whatever the entries need, with no slack, so the next insert
+  into it splits.
+- **Split point.** Three rules, in order (`BuildSession::split`):
+  1. an entry at either end that alone shortens the node prefix by 8 bytes
+     or more is split off on its own;
+  2. an insert that continues the previous in-place insert into the same
+     node (the header records `last_pos`) splits at the insert point;
+  3. otherwise balanced by bytes.
+  Rule 2 replaces the design's "rightmost path" rule and covers it. Both
+  rules exist because of what the memory profile showed, below.
+- **Clone is two memcpys** when the value type is trivially copyable, the
+  prefix is unchanged and the node has no dead bytes (the common path copy).
+  Otherwise `pack()` copies entry by entry. This is lever 4 from the write
+  path analysis and it turned the single-version insert from 3× slower than
+  the radix tree to faster.
+- **`merge` is non-consuming.** It rebuilds a new lineage from two
+  iterators and leaves the inputs alone; since nothing is shared with them,
+  the consumption contract from #86 is not needed for it. It inserts through
+  the ordinary `set`, so each key costs a descent; a dedicated append
+  builder and the range-parallel recovery merge are still to do.
+- **In-node search** is the branch-free count over the slot array
+  (clang vectorises it at width 4, interleaved 4, on this host) followed by
+  the tie loop. A binary search over the heads for wide nodes was tried and
+  measured neutral, so it was not kept.
+- **Non-trivially-copyable values** (`std::shared_ptr<DataFile>` in the
+  file registry) are supported: entries are copy-constructed and destroyed
+  in place, never moved bitwise.
+
+### Memory, index only, 1M keys, `KeyDirEntry` values
+
+`BC_INDEX_ONLY=btree|radix ./memory_profile` builds only the tree from a
+key shape, one transient per 100 keys as the engine does, and reports the
+jemalloc heap delta. Bytes per key:
+
+| Key shape | Key | Fill | Leaf prefix / suffix | B+ tree | Radix | Ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| uniform `key_N` | 5–10 | 0.60 | 7.3 / 2.8 | 55 | 48 | 1.14 |
+| incremental | 1–7 | 0.60 | 3.3 / 2.8 | 55 | 48 | 1.15 |
+| prefixed UUIDv7 | 42 | 0.63 | 42.0 / 2.5 | 53 | 45 | 1.18 |
+| uuidv7 text | 36 | 1.00 | 11.9 / 24.1 | 58 | 52 | 1.11 |
+| hash_prefixed | 24 | 0.51 | 21.3 / 2.7 | 65 | 53 | 1.23 |
+| binary | 8 | 0.72 | 3.9 / 4.1 | 46 | 45 | 1.01 |
+| zipfian | 5–27 | 0.71 | 23.9 / 3.9 | 47 | 53 | 0.88 |
+| clustered | 16 | 0.68 | 13.5 / 3.3 | 49 | 62 | 0.78 |
+| many_partitions | 13 | 0.67 | 4.6 / 8.4 | 61 | 83 | 0.74 |
+| uuidv7_binary | 16 | 1.00 | 5.0 / 11.0 | 41 | 80 | 0.51 |
+| uuidv4_binary | 16 | 0.70 | 1.0 / 15.0 | 71 | 139 | 0.51 |
+| sha256_bin | 32 | 0.69 | 1.0 / 31.0 | 95 | 299 | 0.32 |
+| uuidv4_text | 36 | 0.69 | 2.8 / 33.2 | 95 | 313 | 0.30 |
+| uuidv4_prefixed | 42 | 0.70 | 10.2 / 33.9 | 95 | 333 | 0.28 |
+| sha256_hex | 64 | 0.70 | 2.9 / 61.1 | 130 | 628 | 0.21 |
+
+The radix column is the same index-only measurement, so the two are
+directly comparable (the estimate table earlier in this document used RSS
+figures from the radix design document, which are not).
+
+The first build measured `prefixed` at 127 B/key with leaves 28% full.
+Prefix truncation was working (42 of 44 bytes shared) but every leaf held
+32 keys. The cause: the shapes with several key families insert each
+family in ascending order, and the leaf receiving a family's stream also
+holds the first key of the next family, so its prefix is empty, its
+entries are three times larger, and it fills at 56 keys; a balanced split
+then leaves a 32-key half behind every time. This is the workload of
+several tables growing at once, which is what the MariaDB plugin does, so
+it had to be fixed in the split rather than dismissed as a benchmark
+artefact. Splitting the outlier off on its own gives the stream a leaf with
+the long prefix, and splitting at the insert point when inserts are
+sequential fills that leaf before moving on. Fill went from 0.15 to 0.68 on
+a synthetic probe and from 0.28 to 0.63 on `prefixed`.
+
+What remains on the structured shapes is the entry floor: a 16-byte value,
+a 2-byte length and a suffix, rounded to 8, plus an 8-byte slot, is 32
+bytes per key before fill, against the radix tree's 40-byte leaf that
+carries no key bytes at all for a compressed suffix. Fill of 0.60 on the
+mixed-order shapes (`uniform`, `incremental`: numeric insert order is not
+lexicographic order) is the other factor; random order gives 0.69.
+
+### `map_bench`, B+ tree over radix tree, same host
+
+| Benchmark | N | RadixTree | B+ tree | B+ / Radix |
+|---|---:|---:|---:|---:|
+| Get | 1000 | 33.9 ns | 68.9 ns | 2.03 |
+| Get | 10000 | 48 ns | 60.2 ns | 1.25 |
+| Get | 100000 | 59.2 ns | 97.9 ns | 1.65 |
+| Iterate | 1000 | 2.71e+04 ns | 7.96e+03 ns | 0.29 |
+| Iterate | 10000 | 2.71e+05 ns | 8.13e+04 ns | 0.30 |
+| IterateBinary | 1000 | 4.85e+04 ns | 6.29e+03 ns | 0.13 |
+| IterateBinary | 10000 | 3.06e+05 ns | 5.9e+04 ns | 0.19 |
+| LowerBound | 1000 | 213 ns | 135 ns | 0.63 |
+| LowerBound | 10000 | 247 ns | 127 ns | 0.51 |
+| LowerBound | 100000 | 296 ns | 162 ns | 0.55 |
+| LowerBoundBinary | 1000 | 367 ns | 95.3 ns | 0.26 |
+| LowerBoundBinary | 10000 | 385 ns | 176 ns | 0.46 |
+| LowerBoundBinary | 100000 | 574 ns | 197 ns | 0.34 |
+| MergeDisjoint | 1000 | 1.58e+04 ns | 1.08e+05 ns | 6.81 |
+| MergeDisjoint | 10000 | 1.57e+05 ns | 2.09e+06 ns | 13.32 |
+| MergeDisjoint | 100000 | 1.85e+06 ns | 2.82e+07 ns | 15.26 |
+| MergeOverlapping | 1000 | 4.11e+04 ns | 1.07e+05 ns | 2.60 |
+| MergeOverlapping | 10000 | 4.47e+05 ns | 2.11e+06 ns | 4.73 |
+| MergeOverlapping | 100000 | 5.46e+06 ns | 2.88e+07 ns | 5.28 |
+| MergeOverlappingBinary | 1000 | 5.67e+04 ns | 7.17e+04 ns | 1.26 |
+| MergeOverlappingBinary | 10000 | 4.78e+05 ns | 1.4e+06 ns | 2.94 |
+| MergeOverlappingBinary | 100000 | 1.46e+07 ns | 1.3e+07 ns | 0.90 |
+| PersistentSet | 1000 | 4.94e+05 ns | 4.25e+05 ns | 0.86 |
+| PersistentSet | 10000 | 6.71e+06 ns | 5.73e+06 ns | 0.85 |
+| PersistentSet | 100000 | 9.24e+07 ns | 5.72e+07 ns | 0.62 |
+| ReverseIterate | 1000 | 2.63e+04 ns | 8.07e+03 ns | 0.31 |
+| ReverseIterate | 10000 | 2.64e+05 ns | 8.05e+04 ns | 0.30 |
+| SplitBuildMerge | 1000 | 1.32e+05 ns | 2.35e+05 ns | 1.79 |
+| SplitBuildMerge | 10000 | 1.48e+06 ns | 3.61e+06 ns | 2.43 |
+| SplitBuildMerge | 100000 | 1.92e+07 ns | 4.99e+07 ns | 2.60 |
+| SplitBuildMergeOverlapping | 1000 | 1.61e+05 ns | 2.55e+05 ns | 1.58 |
+| SplitBuildMergeOverlapping | 10000 | 1.98e+06 ns | 3.99e+06 ns | 2.02 |
+| SplitBuildMergeOverlapping | 100000 | 2.51e+07 ns | 5.39e+07 ns | 2.14 |
+| SplitBuildMergePrefixed | 1000 | 2.16e+05 ns | 2.11e+05 ns | 0.98 |
+| SplitBuildMergePrefixed | 10000 | 2.23e+06 ns | 2.53e+06 ns | 1.14 |
+| SplitBuildMergePrefixed | 100000 | 2.69e+07 ns | 3.93e+07 ns | 1.46 |
+| TransientGet | 1000 | 35.4 ns | 70.8 ns | 2.00 |
+| TransientGet | 10000 | 47.7 ns | 61.9 ns | 1.30 |
+| TransientGet | 100000 | 57.5 ns | 97.9 ns | 1.70 |
+| TransientSet | 1000 | 1.15e+05 ns | 1.27e+05 ns | 1.10 |
+| TransientSet | 10000 | 1.42e+06 ns | 2.42e+06 ns | 1.71 |
+| TransientSet | 100000 | 2.41e+07 ns | 1.64e+07 ns | 0.68 |
+| TransientSetPrefixed | 1000 | 2.13e+05 ns | 1.16e+05 ns | 0.54 |
+| TransientSetPrefixed | 10000 | 2.31e+06 ns | 1.27e+06 ns | 0.55 |
+| TransientSetPrefixed | 100000 | 2.77e+07 ns | 2.02e+07 ns | 0.73 |
+| TransientUpdate | 1000 | 2.21e+05 ns | 5.88e+04 ns | 0.27 |
+| TransientUpdate | 10000 | 2.46e+06 ns | 9.8e+05 ns | 0.40 |
+| TransientUpdate | 100000 | 2.97e+07 ns | 1.07e+07 ns | 0.36 |
+| UpperBound | 1000 | 238 ns | 150 ns | 0.63 |
+| UpperBound | 10000 | 282 ns | 141 ns | 0.50 |
+| UpperBound | 100000 | 321 ns | 186 ns | 0.58 |
+
+Scans are where the design expected them: ordered iteration and
+lower/upper bound are 2 to 8× faster. The one-version-per-key
+`PersistentSet` is faster once the clone became a memcpy, `TransientUpdate`
+and `TransientSetPrefixed` are 1.5 to 3× faster, and `TransientSet` is
+mixed (slower at 1k and 10k keys, faster at 100k). Point lookup is the row
+behind: 1.3 to 2× the radix tree's time in the tree alone. Vectorisation is confirmed and a binary search did
+not help, so the cost is the fixed work per level (prefix compare, head,
+tie compare) times the depth. It is a minor fraction of the engine's
+728 ns `Get`, and the engine gate (G3) is the number that matters; the
+tree-level row is recorded here so the follow-up has a baseline.
+
+`merge` is 5 to 15× slower because it rebuilds instead of sharing
+subtrees, as the design said it would; `SplitBuildMerge`, the recovery
+shape, is 1.5 to 2.6× slower. The append builder and range-parallel merge
+from the design are the follow-up, gated by the recovery rows of
+`engine_bench`.
+
+### Next steps
+
+1. Engine integration behind the `KeyDir` alias, `u32_map` on the B+ tree,
+   full suite and `[model]` tests under ASAN and TSAN (plan step 2).
+2. Recovery merge (plan step 3), then `engine_bench`, `memory_profile` on
+   the whole engine and sysbench against `main` (step 4).
+3. Point lookup: cut the per-level fixed cost, and try 2 KiB leaves for the
+   short-key shapes where the scan is longest.
+4. Remove the radix tree and update the documents (step 5).
 
 ## References
 

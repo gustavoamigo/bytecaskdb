@@ -13,6 +13,7 @@
 module;
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +39,22 @@ export inline constexpr std::size_t kBTreeInnerBytes = 4096;
 // Entry lengths are 16-bit; the data file's key_size field has the same
 // ceiling, so no legal key or separator exceeds it.
 export inline constexpr std::size_t kBTreeMaxKeyBytes = 65535;
+
+// Shape statistics for one version (debug and benchmark support).
+export struct BTreeStats {
+  std::size_t nodes{0};
+  std::size_t leaves{0};
+  std::size_t entries{0};         // keys in leaves
+  std::size_t capacity_bytes{0};  // sum of node capacities
+  std::size_t used_bytes{0};      // capacity minus free space
+  std::size_t dead_bytes{0};      // erased entries not yet compacted
+  std::size_t leaf_prefix_bytes{0}; // sum over leaves of prefix_len
+  std::size_t leaf_suffix_bytes{0}; // sum over leaf entries of suffix length
+  std::size_t height{0};
+  std::vector<std::uint32_t> leaf_counts; // entries per leaf, in visit order
+  std::vector<std::uint32_t> leaf_prefix_lens;
+  std::vector<std::uint32_t> leaf_free_bytes;
+};
 
 export template <typename V> class PersistentBTree;
 export template <typename V> class TransientBTree;
@@ -98,6 +115,21 @@ inline auto compare_bytes(Bytes a, Bytes b) noexcept -> int {
 inline auto common_prefix_length(Bytes a, Bytes b) noexcept -> std::size_t {
   const auto n = std::min(a.size(), b.size());
   std::size_t i = 0;
+  // Eight bytes at a time: the first differing byte is the lowest set bit
+  // of the xor on a little-endian host, the highest on a big-endian one.
+  for (; i + 8 <= n; i += 8) {
+    std::uint64_t x = 0;
+    std::uint64_t y = 0;
+    std::memcpy(&x, a.data() + i, 8);
+    std::memcpy(&y, b.data() + i, 8);
+    if (x != y) {
+      const auto diff = x ^ y;
+      if constexpr (std::endian::native == std::endian::little)
+        return i + static_cast<std::size_t>(std::countr_zero(diff)) / 8;
+      else
+        return i + static_cast<std::size_t>(std::countl_zero(diff)) / 8;
+    }
+  }
   while (i < n && a[i] == b[i])
     ++i;
   return i;
@@ -108,11 +140,18 @@ inline auto common_prefix_length(Bytes a, Bytes b) noexcept -> std::size_t {
 // a > b; equal heads decide nothing.
 inline auto head_of(Bytes suffix) noexcept -> std::uint32_t {
   std::uint32_t h = 0;
-  const auto n = std::min<std::size_t>(4, suffix.size());
-  for (std::size_t i = 0; i < n; ++i)
-    h |= static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(suffix[i]))
-         << (24 - 8 * i);
-  return h;
+  if (suffix.size() >= 4) {
+    std::memcpy(&h, suffix.data(), 4);
+  } else {
+    for (std::size_t i = 0; i < suffix.size(); ++i)
+      h |= static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(suffix[i]))
+           << (24 - 8 * i);
+    return h;
+  }
+  if constexpr (std::endian::native == std::endian::little)
+    return std::byteswap(h);
+  else
+    return h;
 }
 
 // A full key as two pieces — a node prefix and an entry suffix, or a flat
@@ -170,7 +209,10 @@ template <typename V> struct Node {
   std::uint32_t dead_bytes{0}; // erased entries still occupying the heap
   std::uint32_t count{0};      // entries
   std::uint16_t prefix_len{0}; // bytes every key in the node shares
+  std::uint16_t last_pos{kNoLastPos}; // where the last in-place insert went
   std::uint8_t is_leaf{1};
+
+  static constexpr std::uint16_t kNoLastPos = 0xFFFF;
 
   static constexpr std::size_t kAlign =
       std::max({alignof(V), alignof(void *), std::size_t{8}});
@@ -328,6 +370,7 @@ template <typename V> struct Node {
     const auto target = std::uint64_t{head} << 32;
     const auto *s = slots();
     std::uint32_t pos = 0;
+    // Branch-free count; the compiler vectorises it.
     for (std::uint32_t i = 0; i < count; ++i)
       pos += s[i] < target ? 1u : 0u;
     for (; pos < count && slot_head(s[pos]) == head; ++pos) {
@@ -360,6 +403,7 @@ template <typename V> struct Node {
     std::memmove(s + pos + 1, s + pos, (count - pos) * kSlotBytes);
     s[pos] = (std::uint64_t{head_of(suf)} << 32) | off;
     ++count;
+    last_pos = pos < kNoLastPos ? static_cast<std::uint16_t>(pos) : kNoLastPos;
   }
 
   void remove_entry(std::uint32_t pos) noexcept {
@@ -509,7 +553,7 @@ public:
           0);
       return {leaf, nullptr, true, true};
     }
-    return upsert_rec(root, key, val, should_replace, true);
+    return upsert_rec(root, key, val, should_replace);
   }
 
   auto erase(N *root, Bytes key) -> Result {
@@ -604,6 +648,26 @@ private:
   // discarded. The one function behind cloning a foreign node, compacting
   // an owned one and changing a node's prefix.
   [[nodiscard]] auto rebuild(N *node, std::size_t prefix) -> N * {
+    if constexpr (std::is_trivially_copyable_v<V>) {
+      if (prefix == node->prefix_len && node->dead_bytes == 0) {
+        // Same layout: the slot array and the heap are position-independent
+        // within a node of the same capacity, so two memcpys clone it.
+        auto *fresh = N::allocate(node->capacity, node->is_leaf != 0, tag_,
+                                  node->prefix());
+        const auto slots_off = N::slots_offset_for(node->prefix_len);
+        std::memcpy(fresh->bytes() + slots_off, node->bytes() + slots_off,
+                    node->count * N::kSlotBytes);
+        std::memcpy(fresh->bytes() + node->capacity - node->heap_floor,
+                    node->bytes() + node->capacity - node->heap_floor,
+                    node->heap_floor);
+        fresh->count = node->count;
+        fresh->heap_floor = node->heap_floor;
+        fresh->first_child = node->first_child;
+        fresh->last_pos = node->last_pos;
+        discard(node);
+        return fresh;
+      }
+    }
     auto *fresh = pack(
         node->is_leaf != 0, node->count,
         [node](std::uint32_t i) {
@@ -638,13 +702,10 @@ private:
   }
 
   // Inserts (key, payload) at entry position `pos` of `node`, which may be
-  // foreign. Shrinks the prefix, compacts, or splits as needed. `rightmost`
-  // is true when `node` is on the rightmost path of the tree: an insert past
-  // the last entry then splits off only the new entry, so ascending inserts
-  // fill nodes instead of leaving them half empty.
+  // foreign. Shrinks the prefix, compacts, or splits as needed.
   template <typename P>
-  auto place(N *node, std::uint32_t pos, Bytes key, const P &payload,
-             bool rightmost) -> Result {
+  auto place(N *node, std::uint32_t pos, Bytes key, const P &payload)
+      -> Result {
     const auto cpl = common_prefix_length(node->prefix(), key);
     if (cpl < node->prefix_len)
       node = rebuild(node, cpl);
@@ -661,7 +722,7 @@ private:
       node->insert_entry(pos, suf, payload);
       return {node, nullptr, true, true};
     }
-    return split(node, pos, key, payload, rightmost);
+    return split(node, pos, key, payload);
   }
 
   // Splits `node` plus the new entry into two nodes. A leaf keeps every
@@ -670,8 +731,8 @@ private:
   // right half's first child. `key` may alias sep_: it is consumed before
   // sep_ is rewritten.
   template <typename P>
-  auto split(N *node, std::uint32_t pos, Bytes key, const P &payload,
-             bool rightmost) -> Result {
+  auto split(N *node, std::uint32_t pos, Bytes key, const P &payload)
+      -> Result {
     const bool leaf = node->is_leaf != 0;
     const auto total = static_cast<std::uint32_t>(node->count + 1);
     const auto *payload_bytes = payload_bytes_of(payload);
@@ -683,11 +744,27 @@ private:
       return {node->key(i - 1), node->payload_raw(i - 1)};
     };
     // Split index: for a leaf, the first entry of the right half; for an
-    // inner node, the separator pushed up. Balanced by bytes unless this is
-    // an append on the rightmost path.
+    // inner node, the separator pushed up. In order of preference:
+    //   1. an entry at either end that alone shortens the node prefix by
+    //      8 bytes or more is split off on its own — a boundary between two
+    //      key families otherwise keeps the whole node at that short prefix;
+    //   2. inserts arriving in order split at the insert point, so a
+    //      sequential stream fills nodes instead of leaving them half empty
+    //      (the previous in-place insert into this node tells);
+    //   3. otherwise balanced by bytes.
     std::uint32_t m = 0;
-    if (rightmost && pos == node->count) {
+    const auto p_all = common_prefix_length(item(0).key, item(total - 1).key);
+    if (total >= 3 &&
+        common_prefix_length(item(0).key, item(total - 2).key) >= p_all + 8) {
       m = total - 1;
+    } else if (total >= 3 &&
+               common_prefix_length(item(1).key, item(total - 1).key) >=
+                   p_all + 8) {
+      m = 1;
+    } else if (node->last_pos != N::kNoLastPos && pos == node->last_pos + 1u) {
+      m = pos; // ascending stream: the new entry starts the right node
+    } else if (pos == 0 && node->last_pos == 0) {
+      m = 1; // descending stream: the new entry ends the left node
     } else {
       std::size_t sum = 0;
       for (std::uint32_t i = 0; i < total; ++i)
@@ -698,8 +775,8 @@ private:
         if (acc >= sum / 2)
           break;
       }
-      m = std::clamp<std::uint32_t>(m, 1, total - 1);
     }
+    m = std::clamp<std::uint32_t>(m, 1, total - 1);
     N *left = nullptr;
     N *right = nullptr;
     if (leaf) {
@@ -734,8 +811,8 @@ private:
   }
 
   template <typename Pred>
-  auto upsert_rec(N *node, Bytes key, const V &val, Pred &should_replace,
-                  bool rightmost) -> Result {
+  auto upsert_rec(N *node, Bytes key, const V &val, Pred &should_replace)
+      -> Result {
     if (node->is_leaf) {
       const auto p = node->search(key);
       if (p.exact) {
@@ -749,12 +826,11 @@ private:
         std::construct_at(slot, val);
         return {n, nullptr, true, false};
       }
-      return place(node, p.idx, key, val, rightmost);
+      return place(node, p.idx, key, val);
     }
     const auto idx = node->child_index(key);
     auto *child = node->child(idx);
-    const auto r = upsert_rec(child, key, val, should_replace,
-                              rightmost && idx == node->count);
+    const auto r = upsert_rec(child, key, val, should_replace);
     if (!r.changed)
       return {node, nullptr, false, false};
     auto *n = own(node);
@@ -763,7 +839,7 @@ private:
       return {n, nullptr, true, r.inserted};
     // The child split: its separator sits in sep_ and its right half goes
     // in as entry idx, whose payload is the child to the right of it.
-    auto placed = place(n, idx, sep_, r.right, rightmost);
+    auto placed = place(n, idx, sep_, r.right);
     placed.inserted = r.inserted;
     return placed;
   }
@@ -1208,6 +1284,35 @@ public:
       n->for_each_child([&](N *c) { stack.push_back(c); });
     }
   }
+  [[nodiscard]] auto stats() const -> BTreeStats {
+    BTreeStats st;
+    std::vector<std::pair<const N *, std::size_t>> stack;
+    if (root_)
+      stack.emplace_back(root_, 1);
+    while (!stack.empty()) {
+      const auto [n, depth] = stack.back();
+      stack.pop_back();
+      ++st.nodes;
+      st.capacity_bytes += n->capacity;
+      st.used_bytes += n->capacity - n->free_bytes();
+      st.dead_bytes += n->dead_bytes;
+      st.height = std::max(st.height, depth);
+      if (n->is_leaf) {
+        ++st.leaves;
+        st.entries += n->count;
+        st.leaf_counts.push_back(n->count);
+        st.leaf_prefix_lens.push_back(n->prefix_len);
+        st.leaf_free_bytes.push_back(static_cast<std::uint32_t>(n->free_bytes()));
+        st.leaf_prefix_bytes += n->prefix_len;
+        for (std::uint32_t i = 0; i < n->count; ++i)
+          st.leaf_suffix_bytes += n->suffix(i).size();
+        continue;
+      }
+      n->for_each_child([&](N *c) { stack.emplace_back(c, depth + 1); });
+    }
+    return st;
+  }
+
   // Checks every structural invariant; throws std::logic_error on the first
   // violation. Returns the tree height (0 for an empty tree).
   auto validate() const -> std::size_t {
