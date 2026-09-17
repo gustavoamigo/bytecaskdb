@@ -818,7 +818,7 @@ carries no key bytes at all for a compressed suffix. Fill of 0.60 on the
 mixed-order shapes (`uniform`, `incremental`: numeric insert order is not
 lexicographic order) is the other factor; random order gives 0.69.
 
-### `map_bench`, B+ tree over radix tree, same host
+### `map_bench`, B+ tree over radix tree on `main`, before the search hints
 
 | Benchmark | N | RadixTree | B+ tree | B+ / Radix |
 |---|---:|---:|---:|---:|
@@ -897,50 +897,50 @@ from the design are the follow-up, gated by the recovery rows of
 and is the fairer write baseline. Built from `radix-epoch-reclamation`
 with the same `TransientInsertBatch` added (branch
 `claude/pr86-map-bench-insert-batch`), run back to back with this branch's
-binary on the same host. `TransientInsertBatch` is the engine's write
-shape: a transient on an existing tree, a lookup then a set for each of
-100 new keys, publish.
+binary on the same host, after the hints and the split-rule fixes.
+`TransientInsertBatch` is the engine's write shape: a transient on an
+existing tree, a lookup then a set for each of 100 new keys, publish.
 
 | Benchmark | N | Radix main | Radix #86 | B+ tree | B+ / #86 |
 |---|---:|---:|---:|---:|---:|
-| Get | 1000 | 40.5 ns | 41.7 ns | 69.3 ns | 1.66 |
-| Get | 10000 | 53.5 ns | 52.3 ns | 62.8 ns | 1.20 |
-| Get | 100000 | 67.4 ns | 61.6 ns | 98 ns | 1.59 |
-| Iterate | 1000 | 27.1 us | 16.2 us | 8.21e+03 ns | 0.51 |
-| Iterate | 10000 | 270 us | 164 us | 84.3 us | 0.52 |
-| LowerBound | 1000 | 209 ns | 113 ns | 132 ns | 1.17 |
-| LowerBound | 10000 | 247 ns | 136 ns | 128 ns | 0.94 |
-| LowerBound | 100000 | 299 ns | 147 ns | 167 ns | 1.14 |
-| PersistentSet | 1000 | 495 us | 325 us | 444 us | 1.37 |
-| PersistentSet | 10000 | 6.82e+03 us | 3.71e+03 us | 5.87e+03 us | 1.58 |
-| PersistentSet | 100000 | 9.75e+04 us | 5.19e+04 us | 6.05e+04 us | 1.17 |
-| SplitBuildMerge | 1000 | 133 us | 87.3 us | 240 us | 2.75 |
-| SplitBuildMerge | 10000 | 1.51e+03 us | 1.26e+03 us | 3.62e+03 us | 2.87 |
-| SplitBuildMerge | 100000 | 2.03e+04 us | 1.44e+04 us | 5.06e+04 us | 3.51 |
-| TransientGet | 1000 | 40.4 ns | 40.2 ns | 71.9 ns | 1.79 |
-| TransientGet | 10000 | 53.5 ns | 52.4 ns | 65.2 ns | 1.24 |
-| TransientGet | 100000 | 66.4 ns | 60.5 ns | 100 ns | 1.65 |
-| TransientInsertBatch | 1000 | 20.1 us | 15.1 us | 31.4 us | 2.08 |
-| TransientInsertBatch | 10000 | 22.6 us | 16.8 us | 28.3 us | 1.69 |
-| TransientInsertBatch | 100000 | 25.1 us | 19.4 us | 25.5 us | 1.31 |
-| TransientSet | 1000 | 116 us | 91.9 us | 131 us | 1.42 |
-| TransientSet | 10000 | 1.48e+03 us | 1.1e+03 us | 2.48e+03 us | 2.25 |
-| TransientSet | 100000 | 2.55e+04 us | 1.96e+04 us | 1.63e+04 us | 0.83 |
-| TransientSetPrefixed | 1000 | 212 us | 158 us | 117 us | 0.74 |
-| TransientSetPrefixed | 10000 | 2.33e+03 us | 1.6e+03 us | 1.29e+03 us | 0.81 |
-| TransientSetPrefixed | 100000 | 2.8e+04 us | 1.69e+04 us | 2.03e+04 us | 1.20 |
-| TransientUpdate | 1000 | 225 us | 157 us | 60.9 us | 0.39 |
-| TransientUpdate | 10000 | 2.48e+03 us | 1.65e+03 us | 1.01e+03 us | 0.61 |
-| TransientUpdate | 100000 | 3.04e+04 us | 2.11e+04 us | 1.15e+04 us | 0.54 |
+| Get | 1000 | 43.2 ns | 39.1 ns | 70.7 ns | 1.81 |
+| Get | 10000 | 55.8 ns | 50.3 ns | 43.4 ns | 0.86 |
+| Get | 100000 | 68.5 ns | 60.8 ns | 76.9 ns | 1.26 |
+| Iterate | 1000 | 28.1 us | 16.2 us | 8.38e+03 ns | 0.52 |
+| Iterate | 10000 | 278 us | 160 us | 84.2 us | 0.53 |
+| LowerBound | 1000 | 211 ns | 110 ns | 130 ns | 1.18 |
+| LowerBound | 10000 | 252 ns | 133 ns | 113 ns | 0.85 |
+| LowerBound | 100000 | 307 ns | 149 ns | 140 ns | 0.94 |
+| PersistentSet | 1000 | 489 us | 315 us | 428 us | 1.36 |
+| PersistentSet | 10000 | 6.79e+03 us | 3.56e+03 us | 5.84e+03 us | 1.64 |
+| PersistentSet | 100000 | 9.72e+04 us | 4.67e+04 us | 5.65e+04 us | 1.21 |
+| SplitBuildMerge | 1000 | 129 us | 98.1 us | 239 us | 2.43 |
+| SplitBuildMerge | 10000 | 1.59e+03 us | 1.18e+03 us | 3.86e+03 us | 3.27 |
+| SplitBuildMerge | 100000 | 1.98e+04 us | 1.33e+04 us | 5.04e+04 us | 3.78 |
+| TransientGet | 1000 | 41.1 ns | 38.6 ns | 68.8 ns | 1.78 |
+| TransientGet | 10000 | 54.4 ns | 50.7 ns | 44.2 ns | 0.87 |
+| TransientGet | 100000 | 65.9 ns | 60.8 ns | 76.9 ns | 1.26 |
+| TransientInsertBatch | 1000 | 21.4 us | 14.2 us | 31 us | 2.18 |
+| TransientInsertBatch | 10000 | 23 us | 16.4 us | 21.7 us | 1.33 |
+| TransientInsertBatch | 100000 | 23.7 us | 17.9 us | 20.5 us | 1.15 |
+| TransientSet | 1000 | 117 us | 74.5 us | 122 us | 1.64 |
+| TransientSet | 10000 | 1.46e+03 us | 951 us | 2.33e+03 us | 2.45 |
+| TransientSet | 100000 | 2.55e+04 us | 1.78e+04 us | 1.46e+04 us | 0.82 |
+| TransientSetPrefixed | 1000 | 213 us | 124 us | 101 us | 0.81 |
+| TransientSetPrefixed | 10000 | 2.28e+03 us | 1.4e+03 us | 1.28e+03 us | 0.91 |
+| TransientSetPrefixed | 100000 | 2.73e+04 us | 1.57e+04 us | 1.93e+04 us | 1.23 |
+| TransientUpdate | 1000 | 221 us | 148 us | 53.3 us | 0.36 |
+| TransientUpdate | 10000 | 2.51e+03 us | 1.56e+03 us | 911 us | 0.59 |
+| TransientUpdate | 100000 | 3.05e+04 us | 1.87e+04 us | 9.23e+03 us | 0.49 |
 
-Against #86 the B+ tree is behind on inserting new keys: 1.2 to 1.6× on
-the one-version-per-key path and 1.3 to 2.1× on the batched path, with
-the gap narrowing as the tree grows. It is ahead on overwrites
-(`TransientUpdate`, 0.4 to 0.6×), on scans (0.5×) and on prefixed builds
-at small sizes, and level on `LowerBound`. Half of the batched-insert
-cost is the lookup that precedes each set, so the point-lookup gap is the
-write gap too; closing it is the next piece of tree work before the engine
-gates are run.
+Against #86 the B+ tree is level or ahead on most of the tree at engine
+scale and behind on two things. Behind: inserting new keys one version at
+a time (1.2 to 1.6×) and the batched insert at small trees (2.2× at 1k
+keys, 1.15× at 100k), both of which are the point lookup plus the slot
+shift in a wide leaf; and `merge`, by design. Ahead: overwrites (0.4 to
+0.6×), scans (0.5×), prefixed builds at small sizes, `LowerBound` at 10k
+and 100k, and `Get` at 10k. `Get` at 100k is 1.26× and at 1k 1.8×; the
+1k case is two levels and is not understood yet.
 
 ### Next steps
 
