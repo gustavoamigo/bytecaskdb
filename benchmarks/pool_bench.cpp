@@ -34,6 +34,7 @@
 #include <charconv>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <chrono>
@@ -83,6 +84,19 @@ struct Config {
   // pread and mmap rows read a page cache the dataset build left warm
   // while the direct pool reads the device — one side handicapped.
   bool cold = false;
+  // Keep the dataset on disk and skip the build when it is already there, so
+  // one 10 GB build can serve many runs — in particular runs inside a memory
+  // cgroup, where the build itself would be throttled by the limit.
+  bool reuse = false;
+  bool build_only = false;
+  // Absolute pool sizes, as an alternative to ratios: with a dataset far
+  // larger than memory, "0.025 of the data" says less than "256 MiB".
+  std::vector<std::uint64_t> pool_sizes;
+  // Skip the buffered-fill pool rows. Under a memory limit those measure a
+  // pool in front of the kernel's page cache — two caches, and the bound the
+  // pool exists to enforce is not the real footprint — so a pool-versus-
+  // page-cache comparison wants O_DIRECT only.
+  bool direct_only = false;
   // Back-ends to run; empty means all. Lets one back-end be profiled alone.
   std::vector<std::string> backends;
   [[nodiscard]] auto wants(std::string_view b) const -> bool {
@@ -197,7 +211,15 @@ struct Result {
   std::uint64_t cached_bytes = 0;  // data files' page-cache residency after the run
   std::uint64_t rss = 0;           // process RSS after the run
   std::int64_t evictions = 0;
+  // Major page faults during the measured loop: every one is a device read
+  // taken inside a get. Under a memory limit this is what the limit costs.
+  long major_faults = 0;
 };
+
+auto major_faults_now() -> long {
+  struct rusage ru {};
+  return ::getrusage(RUSAGE_SELF, &ru) == 0 ? ru.ru_majflt : 0;
+}
 
 auto percentile(std::vector<std::uint64_t> &v, double p) -> std::uint64_t {
   if (v.empty()) return 0;
@@ -231,6 +253,7 @@ auto measure_impl(const Config &cfg, bytecask::IoBackend backend,
   }
 
   const auto before = db.stats();
+  const auto faults_before = major_faults_now();
   std::vector<std::uint64_t> lat;
   lat.reserve(cfg.ops);
   const auto start = std::chrono::steady_clock::now();
@@ -252,6 +275,7 @@ auto measure_impl(const Config &cfg, bytecask::IoBackend backend,
   r.direct_io = direct_io;
   r.ratio = ratio;
   r.pool_bytes = pool_bytes;
+  r.major_faults = major_faults_now() - faults_before;
   const auto secs =
       std::chrono::duration_cast<std::chrono::duration<double>>(elapsed).count();
   r.ops_per_sec = secs > 0 ? static_cast<double>(cfg.ops) / secs : 0.0;
@@ -516,6 +540,23 @@ auto main(int argc, char **argv) -> int {
       }
     } else if (a == "--cold") {
       cfg.cold = true;
+    } else if (a == "--reuse") {
+      cfg.reuse = true;
+    } else if (a == "--direct-only") {
+      cfg.direct_only = true;
+    } else if (a == "--build-only") {
+      cfg.build_only = true;
+    } else if (a == "--pool-bytes") {
+      cfg.ratios.clear();
+      std::string list{next()};
+      std::size_t pos = 0;
+      while (pos <= list.size()) {
+        const auto comma = list.find(',', pos);
+        const auto tok = list.substr(pos, comma - pos);
+        if (!tok.empty()) cfg.pool_sizes.push_back(parse_size(tok));
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+      }
     } else if (a == "--backends") {
       std::string list{next()};
       std::size_t pos = 0;
@@ -548,15 +589,30 @@ auto main(int argc, char **argv) -> int {
           "           [--max-file-bytes N] [--ratios a,b,c] [--dir PATH]\n"
           "           [--mt-threads a,b,c]  (multi-reader arm at ratio 1.0)\n"
           "           [--ryow N]            (N put/get pairs; gets timed)\n"
-          "           [--backends a,b]      (pread, mmap, buffer_pool; default all)");
+          "           [--backends a,b]      (pread, mmap, buffer_pool; default all)\n"
+          "           [--pool-bytes a,b]    (absolute pool sizes, instead of --ratios)\n"
+          "           [--reuse]             (keep the dataset; skip the build if present)\n"
+          "           [--direct-only]       (pool rows with O_DIRECT fills only)\n"
+          "           [--build-only]        (build the dataset and exit)");
       return 0;
     }
   }
 
-  std::fprintf(stderr, "building dataset: %zu keys x %zu B\n", cfg.keys,
-               cfg.value_bytes);
-  build_dataset(cfg);
+  const bool have_data =
+      std::filesystem::exists(cfg.dir) && dataset_bytes(cfg.dir) > 0;
+  if (cfg.reuse && have_data) {
+    std::fprintf(stderr, "reusing dataset in %s\n", cfg.dir.c_str());
+  } else {
+    std::fprintf(stderr, "building dataset: %zu keys x %zu B\n", cfg.keys,
+                 cfg.value_bytes);
+    build_dataset(cfg);
+  }
   const auto bytes = dataset_bytes(cfg.dir);
+  if (cfg.build_only) {
+    std::fprintf(stderr, "dataset on disk: %.1f MiB; --build-only, done\n",
+                 static_cast<double>(bytes) / (1024.0 * 1024.0));
+    return 0;
+  }
   std::fprintf(stderr, "dataset on disk: %.1f MiB\n",
                static_cast<double>(bytes) / (1024.0 * 1024.0));
 
@@ -600,11 +656,19 @@ auto main(int argc, char **argv) -> int {
   // this order the buffered arms and the baselines all see the page cache
   // the dataset build left warm, and the direct arms — which never use it —
   // can drop it freely.
+  // Either explicit sizes or ratios of the dataset; both become (bytes, ratio).
+  std::vector<std::pair<std::uint64_t, double>> pool_points;
+  for (const auto pb : cfg.pool_sizes) {
+    pool_points.emplace_back(pb, static_cast<double>(pb) / static_cast<double>(bytes));
+  }
+  for (const auto ratio : cfg.ratios) {
+    pool_points.emplace_back(
+        static_cast<std::uint64_t>(static_cast<double>(bytes) * ratio), ratio);
+  }
   for (const bool direct_io : {false, true}) {
     if (!cfg.wants("buffer_pool")) break;
-    for (const auto ratio : cfg.ratios) {
-      auto pool_bytes = static_cast<std::uint64_t>(
-          static_cast<double>(bytes) * ratio);
+    if (cfg.direct_only && !direct_io) continue;
+    for (const auto &[pool_bytes, ratio] : pool_points) {
       // DB::open rejects a pool below 2 x max_file_bytes; a ratio that lands
       // under the floor is reported rather than silently clamped.
       if (pool_bytes < 2 * cfg.max_file_bytes) {
@@ -623,7 +687,7 @@ auto main(int argc, char **argv) -> int {
   std::printf(
       "backend,direct_io,threads,ryow,ratio,pool_bytes,dataset_bytes,keys,"
       "value_bytes,ops,zipf_s,ops_per_sec,p50_ns,p99_ns,p999_ns,hit_ratio,"
-      "evictions,cached_bytes,rss_bytes\n");
+      "evictions,cached_bytes,rss_bytes,major_faults\n");
   for (const auto &r : results) {
     std::printf("%s,%d,%u,%d,%.3f,%llu,%llu,%zu,%zu,%zu,%.3f,%.1f,%llu,%llu,%llu,",
                 r.backend.c_str(), r.direct_io ? 1 : 0, r.threads, r.ryow ? 1 : 0,
@@ -640,10 +704,10 @@ auto main(int argc, char **argv) -> int {
       std::printf("%.4f,%lld,", r.hit_ratio,
                   static_cast<long long>(r.evictions));
     }
-    std::printf("%llu,%llu\n", static_cast<unsigned long long>(r.cached_bytes),
-                static_cast<unsigned long long>(r.rss));
+    std::printf("%llu,%llu,%ld\n", static_cast<unsigned long long>(r.cached_bytes),
+                static_cast<unsigned long long>(r.rss), r.major_faults);
   }
 
-  std::filesystem::remove_all(cfg.dir);
+  if (!cfg.reuse) std::filesystem::remove_all(cfg.dir);
   return 0;
 }
