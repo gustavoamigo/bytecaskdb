@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Memory pressure benchmark: InnoDB vs ByteCaskDB
+# Memory pressure benchmark: InnoDB vs ByteCaskDB (mmap) vs ByteCaskDB (buffer pool)
 #
-# Runs sysbench OLTP workloads against both engines under 1GB memory limits.
+# Runs sysbench OLTP workloads against all three under the compose memory
+# limits. TABLE_SIZE is taken from the environment; at 3 M rows the whole
+# dataset fits a 2 GB limit, so use 10 M rows or more to see real pressure.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-TABLE_SIZE=3000000
+TABLE_SIZE="${TABLE_SIZE:-3000000}"
 THREADS="1 8 16"
 WARMUP=30
 DURATION=60
@@ -15,6 +17,7 @@ WORKLOADS="oltp_point_select oltp_read_only oltp_write_only oltp_read_write"
 
 INNODB_HOST=innodb
 BYTECASKDB_HOST=bytecaskdb
+BYTECASKDB_POOL_HOST=bytecaskdb-pool
 DB_PORT=3306
 DB_USER=root
 DB_NAME=sbtest
@@ -63,7 +66,7 @@ run_measurement() {
   output="$(sysbench "$workload" $args --time=$DURATION run 2>&1)"
 
   local tps avg_lat p95
-  tps="$(echo "$output" | grep "transactions:" | awk -F'[( ]+' '{print $3}')"
+  tps="$(echo "$output" | grep "transactions:" | awk -F'[( ]+' '{print $4}')"  # per-second figure, not the run total
   avg_lat="$(echo "$output" | grep "avg:" | tail -1 | awk '{print $2}')"
   p95="$(echo "$output" | grep "95th percentile:" | awk '{print $NF}')"
 
@@ -83,7 +86,9 @@ log "Waiting for InnoDB..."
 wait_for_db "$INNODB_HOST"
 log "Waiting for ByteCaskDB..."
 wait_for_db "$BYTECASKDB_HOST"
-log "Both databases ready."
+log "Waiting for ByteCaskDB (buffer pool)..."
+wait_for_db "$BYTECASKDB_POOL_HOST"
+log "All databases ready."
 
 
 # ---------------------------------------------------------------------------
@@ -98,37 +103,43 @@ sysbench oltp_read_write $(sysbench_args "$INNODB_HOST" 4) \
 # Creates the table WITH the secondary index upfront, then inserts in batches.
 # Each batch is a separate transaction (~10MB write buffer), avoiding the giant
 # single-transaction copy-ALTER that sysbench's default prepare triggers.
-log "Preparing ByteCaskDB (${TABLE_SIZE} rows)..."
-mariadb -h "$BYTECASKDB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" -e "
-  DROP TABLE IF EXISTS sbtest1;
-  CREATE TABLE sbtest1 (
-    id INT NOT NULL AUTO_INCREMENT,
-    k INT NOT NULL DEFAULT 0,
-    c CHAR(120) NOT NULL DEFAULT '',
-    pad CHAR(60) NOT NULL DEFAULT '',
-    PRIMARY KEY (id),
-    KEY k_1 (k)
-  ) ENGINE=bytecaskdb;"
+prepare_bytecaskdb() {
+  local host="$1"
+  log "Preparing $host (${TABLE_SIZE} rows)..."
+  mariadb -h "$host" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" -e "
+    DROP TABLE IF EXISTS sbtest1;
+    CREATE TABLE sbtest1 (
+      id INT NOT NULL AUTO_INCREMENT,
+      k INT NOT NULL DEFAULT 0,
+      c CHAR(120) NOT NULL DEFAULT '',
+      pad CHAR(60) NOT NULL DEFAULT '',
+      PRIMARY KEY (id),
+      KEY k_1 (k)
+    ) ENGINE=bytecaskdb;"
 
-BATCH_SIZE=50000
-inserted=0
-while [ $inserted -lt $TABLE_SIZE ]; do
-  remaining=$((TABLE_SIZE - inserted))
-  this_batch=$BATCH_SIZE
-  if [ $this_batch -gt $remaining ]; then this_batch=$remaining; fi
-  seq_from=$((inserted + 1))
-  seq_to=$((inserted + this_batch))
-  mariadb -h "$BYTECASKDB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" -e "
-    INSERT INTO sbtest1 (k, c, pad)
-    SELECT FLOOR(RAND() * $TABLE_SIZE),
-           LPAD(FLOOR(RAND() * 1e18), 120, '0'),
-           LPAD(FLOOR(RAND() * 1e18), 60, '0')
-    FROM seq_${seq_from}_to_${seq_to};"
-  inserted=$((inserted + this_batch))
-  if [ $((inserted % 500000)) -eq 0 ]; then
-    log "  ByteCaskDB: $inserted / $TABLE_SIZE rows"
-  fi
-done
+  BATCH_SIZE=50000
+  inserted=0
+  while [ $inserted -lt $TABLE_SIZE ]; do
+    remaining=$((TABLE_SIZE - inserted))
+    this_batch=$BATCH_SIZE
+    if [ $this_batch -gt $remaining ]; then this_batch=$remaining; fi
+    seq_from=$((inserted + 1))
+    seq_to=$((inserted + this_batch))
+    mariadb -h "$host" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" -e "
+      INSERT INTO sbtest1 (k, c, pad)
+      SELECT FLOOR(RAND() * $TABLE_SIZE),
+             LPAD(FLOOR(RAND() * 1e18), 120, '0'),
+             LPAD(FLOOR(RAND() * 1e18), 60, '0')
+      FROM seq_${seq_from}_to_${seq_to};"
+    inserted=$((inserted + this_batch))
+    if [ $((inserted % 500000)) -eq 0 ]; then
+      log "  $host: $inserted / $TABLE_SIZE rows"
+    fi
+  done
+
+}
+prepare_bytecaskdb "$BYTECASKDB_HOST"
+prepare_bytecaskdb "$BYTECASKDB_POOL_HOST"
 
 log "Data preparation complete."
 
@@ -157,6 +168,12 @@ for workload in $WORKLOADS; do
     ALL_RESULTS+=("$result_bc")
     log "  ByteCaskDB: $(echo "$result_bc" | cut -d, -f4) tps"
 
+    log "  ByteCaskDB (buffer pool): running (warmup=${WARMUP}s, measure=${DURATION}s)..."
+    result_bp="$(run_measurement bytecaskdb-pool "$workload" "$BYTECASKDB_POOL_HOST" "$t")"
+    echo "$result_bp" >> "$RESULTS_CSV"
+    ALL_RESULTS+=("$result_bp")
+    log "  ByteCaskDB (buffer pool): $(echo "$result_bp" | cut -d, -f4) tps"
+
     echo ""
   done
 done
@@ -166,13 +183,13 @@ done
 # ---------------------------------------------------------------------------
 log "=== Results ==="
 echo ""
-printf "%-20s %4s | %10s %8s %8s | %10s %8s %8s | %6s\n" \
-  "Workload" "Thr" "InnoDB tps" "avg" "p95" "BC tps" "avg" "p95" "Ratio"
-printf "%s\n" "$(printf '%.0s-' {1..100})"
+printf "%-20s %4s | %10s %8s %8s | %10s %8s %8s | %10s %8s %8s\n" \
+  "Workload" "Thr" "InnoDB tps" "avg" "p95" "BC mmap" "avg" "p95" "BC pool" "avg" "p95"
+printf "%s\n" "$(printf '%.0s-' {1..110})"
 
 for workload in $WORKLOADS; do
   for t in $THREADS; do
-    in_line="" bc_line=""
+    in_line="" bc_line="" bp_line=""
     for r in "${ALL_RESULTS[@]}"; do
       eng="$(echo "$r" | cut -d, -f1)"
       wl="$(echo "$r" | cut -d, -f2)"
@@ -180,6 +197,7 @@ for workload in $WORKLOADS; do
       if [[ "$wl" == "$workload" && "$thr" == "$t" ]]; then
         if [[ "$eng" == "innodb" ]]; then in_line="$r"; fi
         if [[ "$eng" == "bytecaskdb" ]]; then bc_line="$r"; fi
+        if [[ "$eng" == "bytecaskdb-pool" ]]; then bp_line="$r"; fi
       fi
     done
 
@@ -189,14 +207,12 @@ for workload in $WORKLOADS; do
     bc_tps="$(echo "$bc_line" | cut -d, -f4)"
     bc_avg="$(echo "$bc_line" | cut -d, -f5)"
     bc_p95="$(echo "$bc_line" | cut -d, -f6)"
+    bp_tps="$(echo "$bp_line" | cut -d, -f4)"
+    bp_avg="$(echo "$bp_line" | cut -d, -f5)"
+    bp_p95="$(echo "$bp_line" | cut -d, -f6)"
 
-    ratio="n/a"
-    if [[ -n "$in_tps" && "$in_tps" != "0" && -n "$bc_tps" ]]; then
-      ratio="$(echo "scale=2; $bc_tps / $in_tps" | bc)x"
-    fi
-
-    printf "%-20s %4s | %10s %8s %8s | %10s %8s %8s | %6s\n" \
-      "$workload" "$t" "$in_tps" "$in_avg" "$in_p95" "$bc_tps" "$bc_avg" "$bc_p95" "$ratio"
+    printf "%-20s %4s | %10s %8s %8s | %10s %8s %8s | %10s %8s %8s\n" \
+      "$workload" "$t" "$in_tps" "$in_avg" "$in_p95" "$bc_tps" "$bc_avg" "$bc_p95" "$bp_tps" "$bp_avg" "$bp_p95"
   done
 done
 

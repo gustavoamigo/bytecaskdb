@@ -6904,7 +6904,6 @@ TEST_CASE("stats: all expected keys are present in dump",
   auto s = db.stats();
   std::vector<std::string> expected = {
       "bytecask.keydir_keys",
-      "bytecask.keydir_bytes_estimate",
       "bytecask.bytes_written",
       "bytecask.group_writer_batches",
       "bytecask.group_writer_coalesced",
@@ -6916,15 +6915,8 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.pool_hits",
       "bytecask.pool_misses",
       "bytecask.pool_fills",
-      "bytecask.pool_fill_bytes",
       "bytecask.pool_evictions",
-      "bytecask.pool_oversize_reads",
-      "bytecask.pool_multi_frame_reads",
-      "bytecask.pool_optimistic_retries",
-      "bytecask.pool_evicted_bytes_touched",
       "bytecask.pool_frames_total",
-      "bytecask.pool_frames_pinned",
-      "bytecask.pool_writer_inserts",
       "bytecask.pool_frames_resident",
       "bytecask.pool_direct_io_fallbacks",
       "bytecask.vacuum_bytes_reclaimed",
@@ -7147,7 +7139,6 @@ TEST_CASE("io_backend=BufferPool: vacuum does not pollute the pool",
   const auto before = db.stats();
   REQUIRE(before.at("bytecask.pool_frames_resident") > 0);
   const auto fills_before = before.at("bytecask.pool_fills");
-  const auto inserts_before = before.at("bytecask.pool_writer_inserts");
 
   bool vacuumed = false;
   // Threshold 0 so a pass definitely runs — a no-op vacuum would prove nothing.
@@ -7161,7 +7152,6 @@ TEST_CASE("io_backend=BufferPool: vacuum does not pollute the pool",
   // a pool on purpose.
   const auto after = db.stats();
   CHECK(after.at("bytecask.pool_fills") == fills_before);
-  CHECK(after.at("bytecask.pool_writer_inserts") == inserts_before);
 
   // ... and the data is still correct afterwards.
   for (int i = 1; i < kCount; i += 2) {
@@ -7294,24 +7284,16 @@ TEST_CASE("stats: keydir gauges track the live key count",
   TempDir td;
   auto db = bytecask::DB::open(td.path);
   CHECK(db.stats().at("bytecask.keydir_keys") == 0);
-  CHECK(db.stats().at("bytecask.keydir_bytes_estimate") == 0);
   for (int i = 0; i < 100; ++i) {
     db.put({.sync = false}, to_bytes(std::format("k{:03d}", i)), to_bytes("v"));
   }
   auto st = db.stats();
   CHECK(st.at("bytecask.keydir_keys") == 100);
-  // The estimate is a per-key constant; what matters is that it is derived
-  // from the live count, so it must move with deletes too.
-  CHECK(st.at("bytecask.keydir_bytes_estimate") ==
-        100 * (st.at("bytecask.keydir_bytes_estimate") / 100));
-  CHECK(st.at("bytecask.keydir_bytes_estimate") > 100 * 16);  // > sizeof(KeyDirEntry)
   for (int i = 0; i < 40; ++i) {
     (void)db.del({.sync = false}, to_bytes(std::format("k{:03d}", i)));
   }
   st = db.stats();
   CHECK(st.at("bytecask.keydir_keys") == 60);
-  CHECK(st.at("bytecask.keydir_bytes_estimate") ==
-        60 * (st.at("bytecask.keydir_bytes_estimate") / 60));
 }
 
 TEST_CASE("io_backend=BufferPool: the active file is resident on write",
@@ -7335,9 +7317,7 @@ TEST_CASE("io_backend=BufferPool: the active file is resident on write",
   }
   auto st = db.stats();
   REQUIRE(st.at("bytecask.file_rotations") == 0);  // all in the active file
-  CHECK(st.at("bytecask.pool_writer_inserts") > 0);
-  CHECK(st.at("bytecask.pool_frames_pinned") > 0);
-  CHECK(st.at("bytecask.pool_frames_pinned") == st.at("bytecask.pool_frames_resident"));
+  CHECK(st.at("bytecask.pool_frames_resident") > 0);
 
   bytecask::Bytes out;
   for (int i = 0; i < kCount; ++i) {
@@ -7369,7 +7349,7 @@ TEST_CASE("io_backend=BufferPool: rotation releases the previous active file",
   // The pool is barely larger than the 2 x max_file_bytes floor, so it can
   // hold the active file and about one sealed one. Writing through several
   // rotations must evict sealed frames — never pinned ones — and every read
-  // must still be right. The pinned count can never exceed one file.
+  // must still be right.
   TempDir td;
   constexpr std::uint64_t kFile = 64 * 1024;
   auto db = bytecask::DB::open(
@@ -7384,10 +7364,6 @@ TEST_CASE("io_backend=BufferPool: rotation releases the previous active file",
   for (int i = 0; i < kCount; ++i) {
     db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
            to_bytes(value_for(i)));
-    const auto st = db.stats();
-    // Pinned frames never exceed what one active file can occupy.
-    CHECK(st.at("bytecask.pool_frames_pinned") <=
-          static_cast<std::int64_t>(kFile / bytecask::kPoolFrameBytes) + 1);
   }
   const auto st = db.stats();
   REQUIRE(st.at("bytecask.file_rotations") >= 4);

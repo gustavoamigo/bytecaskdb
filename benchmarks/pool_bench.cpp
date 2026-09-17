@@ -83,6 +83,12 @@ struct Config {
   // pread and mmap rows read a page cache the dataset build left warm
   // while the direct pool reads the device — one side handicapped.
   bool cold = false;
+  // Back-ends to run; empty means all. Lets one back-end be profiled alone.
+  std::vector<std::string> backends;
+  [[nodiscard]] auto wants(std::string_view b) const -> bool {
+    return backends.empty() ||
+           std::find(backends.begin(), backends.end(), b) != backends.end();
+  }
 };
 
 auto key_for(std::size_t i) -> std::string { return std::format("key{:09d}", i); }
@@ -188,11 +194,9 @@ struct Result {
   std::uint64_t p99_ns = 0;
   std::uint64_t p999_ns = 0;
   double hit_ratio = -1.0;     // -1 where the back-end has no pool
-  double u = -1.0;             // fraction of an evicted frame that was read
   std::uint64_t cached_bytes = 0;  // data files' page-cache residency after the run
   std::uint64_t rss = 0;           // process RSS after the run
   std::int64_t evictions = 0;
-  std::int64_t retries = 0;
 };
 
 auto percentile(std::vector<std::uint64_t> &v, double p) -> std::uint64_t {
@@ -268,14 +272,6 @@ auto measure_impl(const Config &cfg, bytecask::IoBackend backend,
                             : 0.0;
     r.evictions = after.at("bytecask.pool_evictions") -
                   before.at("bytecask.pool_evictions");
-    const auto touched = after.at("bytecask.pool_evicted_bytes_touched") -
-                         before.at("bytecask.pool_evicted_bytes_touched");
-    r.u = r.evictions > 0
-              ? static_cast<double>(touched) /
-                    (static_cast<double>(r.evictions) * 4096.0)
-              : -1.0;  // nothing evicted: u is undefined, not zero
-    r.retries = after.at("bytecask.pool_optimistic_retries") -
-                before.at("bytecask.pool_optimistic_retries");
   }
   return r;
 }
@@ -366,8 +362,6 @@ auto measure_mt_impl(const Config &cfg, bytecask::IoBackend backend,
     r.hit_ratio = hits + misses > 0
                       ? static_cast<double>(hits) / static_cast<double>(hits + misses)
                       : 0.0;
-    r.retries = after.at("bytecask.pool_optimistic_retries") -
-                before.at("bytecask.pool_optimistic_retries");
   }
   return r;
 }
@@ -459,9 +453,8 @@ void hit_probe(const Config &cfg) {
            to_bytes(value));
   }
   const auto st = db.stats();
-  std::fprintf(stderr, "hit_probe: rotations=%lld pinned=%lld resident=%lld\n",
+  std::fprintf(stderr, "hit_probe: rotations=%lld resident=%lld\n",
                static_cast<long long>(st.at("bytecask.file_rotations")),
-               static_cast<long long>(st.at("bytecask.pool_frames_pinned")),
                static_cast<long long>(st.at("bytecask.pool_frames_resident")));
   const auto time_key = [&](const char *label, std::size_t idx) {
     const auto key = key_for(idx);
@@ -477,13 +470,11 @@ void hit_probe(const Config &cfg) {
           std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
     }
     const auto after = db.stats();
-    std::printf("hit_probe %-8s p50=%llu ns  p99=%llu ns  hits=%lld misses=%lld retries=%lld\n",
+    std::printf("hit_probe %-8s p50=%llu ns  p99=%llu ns  hits=%lld misses=%lld\n",
                 label, static_cast<unsigned long long>(percentile(lat, 0.5)),
                 static_cast<unsigned long long>(percentile(lat, 0.99)),
                 static_cast<long long>(after.at("bytecask.pool_hits") - before.at("bytecask.pool_hits")),
-                static_cast<long long>(after.at("bytecask.pool_misses") - before.at("bytecask.pool_misses")),
-                static_cast<long long>(after.at("bytecask.pool_optimistic_retries") -
-                                       before.at("bytecask.pool_optimistic_retries")));
+                static_cast<long long>(after.at("bytecask.pool_misses") - before.at("bytecask.pool_misses")));
   };
   time_key("sealed", 0);
   time_key("active", kEntries - 1);
@@ -525,6 +516,16 @@ auto main(int argc, char **argv) -> int {
       }
     } else if (a == "--cold") {
       cfg.cold = true;
+    } else if (a == "--backends") {
+      std::string list{next()};
+      std::size_t pos = 0;
+      while (pos <= list.size()) {
+        const auto comma = list.find(',', pos);
+        const auto tok = list.substr(pos, comma - pos);
+        if (!tok.empty()) cfg.backends.push_back(tok);
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+      }
     } else if (a == "--hit-probe") {
       hit_probe(cfg);
       return 0;
@@ -546,7 +547,8 @@ auto main(int argc, char **argv) -> int {
           "pool_bench [--keys N] [--value-bytes N] [--ops N] [--zipf S]\n"
           "           [--max-file-bytes N] [--ratios a,b,c] [--dir PATH]\n"
           "           [--mt-threads a,b,c]  (multi-reader arm at ratio 1.0)\n"
-          "           [--ryow N]            (N put/get pairs; gets timed)");
+          "           [--ryow N]            (N put/get pairs; gets timed)\n"
+          "           [--backends a,b]      (pread, mmap, buffer_pool; default all)");
       return 0;
     }
   }
@@ -561,15 +563,20 @@ auto main(int argc, char **argv) -> int {
   std::vector<Result> results;
   // Baselines first, so a regression in the pool is read against them rather
   // than against an absolute number that says nothing on its own.
-  results.push_back(measure(cfg, bytecask::IoBackend::Pread, 0, 0.0, false));
-  results.push_back(measure(cfg, bytecask::IoBackend::Mmap, 0, 0.0, false));
+  if (cfg.wants("pread"))
+    results.push_back(measure(cfg, bytecask::IoBackend::Pread, 0, 0.0, false));
+  if (cfg.wants("mmap"))
+    results.push_back(measure(cfg, bytecask::IoBackend::Mmap, 0, 0.0, false));
 
   // Read-your-own-writes arm. Before any direct arm, like the one below.
   if (cfg.ryow_pairs > 0) {
-    results.push_back(measure_ryow(cfg, bytecask::IoBackend::Pread, 0));
-    results.push_back(measure_ryow(cfg, bytecask::IoBackend::Mmap, 0));
-    results.push_back(measure_ryow(cfg, bytecask::IoBackend::BufferPool,
-                                   bytes + 2 * cfg.max_file_bytes));
+    if (cfg.wants("pread"))
+      results.push_back(measure_ryow(cfg, bytecask::IoBackend::Pread, 0));
+    if (cfg.wants("mmap"))
+      results.push_back(measure_ryow(cfg, bytecask::IoBackend::Mmap, 0));
+    if (cfg.wants("buffer_pool"))
+      results.push_back(measure_ryow(cfg, bytecask::IoBackend::BufferPool,
+                                     bytes + 2 * cfg.max_file_bytes));
   }
 
   // Multi-reader arm: is the pool's lock-free read path still lock-free
@@ -578,10 +585,13 @@ auto main(int argc, char **argv) -> int {
   // the page cache and every row in this arm depends on it being warm.
   for (const auto threads : cfg.mt_threads) {
     if (threads == 0) continue;
-    results.push_back(measure_mt(cfg, bytecask::IoBackend::Pread, 0, threads));
-    results.push_back(measure_mt(cfg, bytecask::IoBackend::Mmap, 0, threads));
-    results.push_back(measure_mt(cfg, bytecask::IoBackend::BufferPool,
-                                 bytes + 2 * cfg.max_file_bytes, threads));
+    if (cfg.wants("pread"))
+      results.push_back(measure_mt(cfg, bytecask::IoBackend::Pread, 0, threads));
+    if (cfg.wants("mmap"))
+      results.push_back(measure_mt(cfg, bytecask::IoBackend::Mmap, 0, threads));
+    if (cfg.wants("buffer_pool"))
+      results.push_back(measure_mt(cfg, bytecask::IoBackend::BufferPool,
+                                   bytes + 2 * cfg.max_file_bytes, threads));
   }
 
   // Every buffered arm runs before any direct arm. A direct open drops the
@@ -591,6 +601,7 @@ auto main(int argc, char **argv) -> int {
   // the dataset build left warm, and the direct arms — which never use it —
   // can drop it freely.
   for (const bool direct_io : {false, true}) {
+    if (!cfg.wants("buffer_pool")) break;
     for (const auto ratio : cfg.ratios) {
       auto pool_bytes = static_cast<std::uint64_t>(
           static_cast<double>(bytes) * ratio);
@@ -611,8 +622,8 @@ auto main(int argc, char **argv) -> int {
 
   std::printf(
       "backend,direct_io,threads,ryow,ratio,pool_bytes,dataset_bytes,keys,"
-      "value_bytes,ops,zipf_s,ops_per_sec,p50_ns,p99_ns,p999_ns,hit_ratio,u,"
-      "evictions,optimistic_retries,cached_bytes,rss_bytes\n");
+      "value_bytes,ops,zipf_s,ops_per_sec,p50_ns,p99_ns,p999_ns,hit_ratio,"
+      "evictions,cached_bytes,rss_bytes\n");
   for (const auto &r : results) {
     std::printf("%s,%d,%u,%d,%.3f,%llu,%llu,%zu,%zu,%zu,%.3f,%.1f,%llu,%llu,%llu,",
                 r.backend.c_str(), r.direct_io ? 1 : 0, r.threads, r.ryow ? 1 : 0,
@@ -624,13 +635,10 @@ auto main(int argc, char **argv) -> int {
                 static_cast<unsigned long long>(r.p99_ns),
                 static_cast<unsigned long long>(r.p999_ns));
     if (r.hit_ratio < 0.0) {
-      std::printf(",,,");  // no pool: these are absent, not zero
+      std::printf(",,");  // no pool: these are absent, not zero
     } else {
-      std::printf("%.4f,", r.hit_ratio);
-      if (r.u < 0.0) std::printf(",");  // undefined without an eviction
-      else std::printf("%.4f,", r.u);
-      std::printf("%lld,%lld,", static_cast<long long>(r.evictions),
-                  static_cast<long long>(r.retries));
+      std::printf("%.4f,%lld,", r.hit_ratio,
+                  static_cast<long long>(r.evictions));
     }
     std::printf("%llu,%llu\n", static_cast<unsigned long long>(r.cached_bytes),
                 static_cast<unsigned long long>(r.rss));

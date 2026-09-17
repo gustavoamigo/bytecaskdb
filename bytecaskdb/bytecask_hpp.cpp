@@ -85,7 +85,7 @@ auto to_module(bytecask::internal::IoBackend b) noexcept -> bytecask::IoBackend 
 
 auto to_module(bytecask::internal::BufferPoolOptions o) noexcept
     -> bytecask::BufferPoolOptions {
-  return {o.capacity_bytes, o.oversize_guard_divisor, o.direct_io};
+  return {o.capacity_bytes, o.direct_io};
 }
 
 auto to_module(bytecask::internal::Options o) noexcept -> bytecask::Options {

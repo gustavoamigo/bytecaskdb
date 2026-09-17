@@ -3109,27 +3109,16 @@ auto DB::degraded_reason() const noexcept -> std::string {
   return load_state()->degraded_reason;
 }
 
-// Key directory bytes per key, as measured by scripts/run_memory_profile.py
-// on this tree (jemalloc heap allocated, DB overhead only): 47 B/key for
-// 42-byte prefixed keys at 500 k, 55 at 100 k; 61 and 77 for 8-byte binary
-// keys, which share less prefix. A single constant is therefore an estimate
-// within about ±30 % by key shape. keydir_keys is exact and sits beside it
-// so an operator who has profiled their own keys can multiply for
-// themselves. The tree keeps no byte accounting, and adding it to the
-// persistent clone/release path is not worth its risk for a gauge.
-constexpr std::int64_t kKeyDirBytesPerKeyEstimate = 50;
-
 auto DB::stats() const -> std::map<std::string, std::int64_t> {
   auto s = load_state();
   std::int64_t open_files = 0;
   for (auto it = s->files.begin(); it != std::default_sentinel; ++it)
     ++open_files;
-  const auto keys = narrow<std::int64_t>(s->key_dir.size());
   return {
-      // What the pool's capacity has to be sized against: the key directory
-      // is resident and not a cache, so pool = total - this - slack.
-      {"bytecask.keydir_keys", keys},
-      {"bytecask.keydir_bytes_estimate", keys * kKeyDirBytesPerKeyEstimate},
+      // What a pool has to be sized against: the key directory is resident
+      // and not a cache. Multiply by the bytes/key your key shape measures
+      // (scripts/run_memory_profile.py; about 50 for typical keys).
+      {"bytecask.keydir_keys", narrow<std::int64_t>(s->key_dir.size())},
       {"bytecask.bytes_written",
        counters_.bytes_written.load(std::memory_order_relaxed)},
       {"bytecask.group_writer_batches",
@@ -3152,22 +3141,9 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.pool_misses.load(std::memory_order_relaxed)},
       {"bytecask.pool_fills",
        counters_.pool_fills.load(std::memory_order_relaxed)},
-      {"bytecask.pool_fill_bytes",
-       counters_.pool_fill_bytes.load(std::memory_order_relaxed)},
       {"bytecask.pool_evictions",
        counters_.pool_evictions.load(std::memory_order_relaxed)},
-      {"bytecask.pool_oversize_reads",
-       counters_.pool_oversize_reads.load(std::memory_order_relaxed)},
-      {"bytecask.pool_multi_frame_reads",
-       counters_.pool_multi_frame_reads.load(std::memory_order_relaxed)},
-      {"bytecask.pool_optimistic_retries",
-       counters_.pool_optimistic_retries.load(std::memory_order_relaxed)},
-      {"bytecask.pool_evicted_bytes_touched",
-       counters_.pool_evicted_bytes_touched.load(std::memory_order_relaxed)},
       {"bytecask.pool_frames_total", counters_.pool_frames_total},
-      {"bytecask.pool_frames_pinned", pool_ ? pool_->pinned_frames() : 0},
-      {"bytecask.pool_writer_inserts",
-       counters_.pool_writer_inserts.load(std::memory_order_relaxed)},
       {"bytecask.pool_frames_resident",
        counters_.pool_frames_resident.load(std::memory_order_relaxed)},
       {"bytecask.pool_direct_io_fallbacks",

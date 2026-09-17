@@ -40,29 +40,14 @@ export struct Counters {
   std::atomic<std::int64_t> disk_read_bytes{0};
 
   // -- Buffer pool (all zero when IoBackend != BufferPool) --
-  // hits/misses are the primary A/B metric: unlike disk_reads, a miss here
-  // is known to have left the pool, which is the visibility §1 of the design
-  // says the page cache cannot give.
+  // hits/misses are the primary metric: unlike disk_reads, a miss here is
+  // known to have left the pool, which the page cache cannot tell you.
   std::atomic<std::int64_t> pool_hits{0};
   std::atomic<std::int64_t> pool_misses{0};
+  // Frames admitted by a read miss. The writer's inserts on append are not
+  // fills: they cost no I/O.
   std::atomic<std::int64_t> pool_fills{0};
-  std::atomic<std::int64_t> pool_fill_bytes{0};
   std::atomic<std::int64_t> pool_evictions{0};
-  // Entries larger than capacity/oversize_guard_divisor: read straight to the
-  // caller and never admitted, so one value cannot evict the working set.
-  std::atomic<std::int64_t> pool_oversize_reads{0};
-  std::atomic<std::int64_t> pool_multi_frame_reads{0};
-  // Seqlock read raced an eviction and retried. Early warning that eviction
-  // is fighting readers.
-  std::atomic<std::int64_t> pool_optimistic_retries{0};
-  // Bytes of evicted frames that were actually read while resident, at
-  // 32-byte granularity. Divided by pool_evictions x 4096 this is the
-  // design's `u`: how much of a frame earns its place before it goes. Low u
-  // is the number that would reopen the entry-cache decision (§10, §12.2).
-  std::atomic<std::int64_t> pool_evicted_bytes_touched{0};
-  // Frames the writer put into the pool on append (active-file residency),
-  // as opposed to pool_fills, which a read miss caused.
-  std::atomic<std::int64_t> pool_writer_inserts{0};
   std::int64_t pool_frames_total{0};
   // Gauge: frames currently holding a file's bytes. Resident / total is the
   // fill level an operator sizes against.

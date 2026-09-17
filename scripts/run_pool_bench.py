@@ -57,7 +57,7 @@ BENCH_COLUMNS = [
     "keys",
     "value_bytes",
     "ops", "zipf_s", "ops_per_sec", "p50_ns", "p99_ns", "p999_ns",
-    "hit_ratio", "u", "evictions", "optimistic_retries", "cached_bytes",
+    "hit_ratio", "evictions", "cached_bytes",
     "rss_bytes",
 ]
 CSV_COLUMNS = ["git_commit", "timestamp", "host_name", "num_cpus",

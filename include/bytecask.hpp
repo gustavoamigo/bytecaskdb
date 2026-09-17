@@ -66,7 +66,6 @@ enum class IoBackend { Pread, Mmap, BufferPool };
 // Mirrors bytecask::BufferPoolOptions.
 struct BufferPoolOptions {
   std::size_t capacity_bytes{0};
-  unsigned oversize_guard_divisor{8};
   bool direct_io{true};
 };
 

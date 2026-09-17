@@ -177,24 +177,17 @@ struct WritableFileOps {
   BufferPool *pool_{nullptr};
   std::uint32_t file_id_{0};
 
-  // After a successful pwritev of iov at start. The pool wants the bytes
-  // contiguous; gathering them is one memcpy of the entry, which is the
-  // price of not re-reading what was just written.
-  void publish_appended(Offset start, std::span<const ::iovec> iov,
-                        std::size_t total) {
+  // After a successful pwritev of iov at start: hands the pool the bytes it
+  // just wrote, one iovec at a time, so nothing is re-read or gathered.
+  void publish_appended(Offset start, std::span<const ::iovec> iov) const {
     if (pool_ == nullptr) return;
-    // Thread-exit destructor is intentional; suppress the Clang diagnostic.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wexit-time-destructors"
-    thread_local std::vector<std::byte> gather;
-#pragma clang diagnostic pop
-    gather.resize(total);
-    std::size_t done = 0;
+    auto at = static_cast<std::uint64_t>(start);
     for (const auto &v : iov) {
-      std::memcpy(gather.data() + done, v.iov_base, v.iov_len);
-      done += v.iov_len;
+      pool_->append_resident(
+          file_id_, at,
+          std::span{static_cast<const std::byte *>(v.iov_base), v.iov_len});
+      at += v.iov_len;
     }
-    pool_->append_resident(file_id_, start, std::span<const std::byte>{gather});
   }
 
   [[nodiscard]] auto append_entry(std::uint64_t sequence, EntryType entry_type,
@@ -227,7 +220,7 @@ struct WritableFileOps {
                               "WritableFileOps::append_entry: pwritev failed"};
     }
 
-    publish_appended(offset_, iov, total);
+    publish_appended(offset_, iov);
     offset_ += static_cast<Offset>(total);
     return entry_offset;
   }
@@ -305,7 +298,7 @@ struct WritableFileOps {
                                 "WritableFileOps::append_entries: pwritev failed"};
       }
 
-      publish_appended(offset_, std::span<const ::iovec>{iov}, total_bytes);
+      publish_appended(offset_, std::span<const ::iovec>{iov});
       offset_ += static_cast<Offset>(total_bytes);
     }
   }
