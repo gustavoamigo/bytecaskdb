@@ -3,8 +3,8 @@ services:
     security_opt:
       - seccomp:unconfined
     image: docker.io/library/mariadb:10.11
-    mem_limit: 2g
-    memswap_limit: 2g
+    mem_limit: 2560m
+    memswap_limit: 2560m
     cpus: 8
     volumes:
       - ./innodb.cnf:/etc/mysql/mariadb.conf.d/90-benchmark.cnf:ro,Z
@@ -24,8 +24,8 @@ services:
     build:
       context: ../../..
       dockerfile: bytecaskdb-mariadb-plugin/Dockerfile
-    mem_limit: 2g
-    memswap_limit: 2g
+    mem_limit: 2560m
+    memswap_limit: 2560m
     cpus: 8
     restart: on-failure:3
     volumes:
@@ -46,8 +46,8 @@ services:
     build:
       context: ../../..
       dockerfile: bytecaskdb-mariadb-plugin/Dockerfile
-    mem_limit: 2g
-    memswap_limit: 2g
+    mem_limit: 2560m
+    memswap_limit: 2560m
     cpus: 8
     restart: on-failure:3
     volumes:
@@ -79,7 +79,7 @@ services:
       bytecaskdb-pool:
         condition: service_healthy
     environment:
-      TABLE_SIZE: ${TABLE_SIZE:-3000000}
+      TABLE_SIZE: ${TABLE_SIZE:-10000000}
     volumes:
       - ./run-benchmark.sh:/benchmark/run-benchmark.sh:ro,Z
       - ./results:/results:Z

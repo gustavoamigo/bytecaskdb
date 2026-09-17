@@ -2,14 +2,17 @@
 # Memory pressure benchmark: InnoDB vs ByteCaskDB (mmap) vs ByteCaskDB (buffer pool)
 #
 # Runs sysbench OLTP workloads against all three under the compose memory
-# limits. TABLE_SIZE is taken from the environment; at 3 M rows the whole
-# dataset fits a 2 GB limit, so use 10 M rows or more to see real pressure.
+# limit of 2.5 GiB per server. The default 10 M rows are ~3.2 GB of
+# ByteCaskDB data files plus ~1.1 GB of key directory, so the page cache
+# has about 1.2 GB for 3.2 GB of files: the pool (512 MiB) is the only
+# back-end whose memory the kernel cannot reclaim. TABLE_SIZE is taken from
+# the environment; below ~6 M rows everything fits and nothing is measured.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-TABLE_SIZE="${TABLE_SIZE:-3000000}"
+TABLE_SIZE="${TABLE_SIZE:-10000000}"
 THREADS="1 8 16"
 WARMUP=30
 DURATION=60
