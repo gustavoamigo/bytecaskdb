@@ -481,7 +481,9 @@ The writer performs two separate stores in sequence:
   state_time_.store(T1, release)  ← step B: publish new timestamp
 ```
 
-A reader that samples `state_time_` between steps A and B sees the old timestamp `T0`, computes `T0 − T0 = 0 > 0` as false, and returns the old snapshot — even though `S1` is already visible in `state_`. This window is a few nanoseconds wide (two consecutive stores on the same CPU). `memory_order_release` on step B ensures that once a reader observes `T1`, `state_.load()` is guaranteed to see `S1` (via acquire semantics). This window can only be observed by reader threads running concurrently on other CPUs, not by the writer thread itself.
+A reader that samples `state_time_` between steps A and B sees the old timestamp `T0`, computes `T0 − T0 = 0 > 0` as false, and returns the old snapshot — even though `S1` is already visible in `state_`. This window is a few nanoseconds wide (two consecutive stores on the same CPU). `memory_order_release` on step B ensures that once a reader observes `T1`, `state_.load()` is guaranteed to see `S1` (via acquire semantics).
+
+The writer thread is not protected by this argument on its own. With the commit pipeline the thread that publishes `S1` is whichever thread holds the flush role, and a writer waiting in `commit_wait` learns that its write is covered by polling `state_` directly — it can return to its caller between steps A and B, and its next read would then compare timestamps, find nothing new, and serve the cached pre-write snapshot. So `commit_wait` seeds the calling thread's read cache with the covering state it observed before returning: the next read on that thread serves at least `S1` whether or not `T1` has landed, and refreshes as usual once it has. The cached timestamp is left alone, so bounded staleness gains no extra refreshes from this. The remaining window is cross-thread only: a concurrent reader on another CPU may miss `S1` for the few nanoseconds between the stores.
 
 With `staleness_tolerance > 0` the window is irrelevant: the snapshot is held for at least `staleness_tolerance` regardless.
 
