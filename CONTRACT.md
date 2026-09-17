@@ -5,7 +5,9 @@ in the engine. It is the source of truth for both the implementation
 and the proof infrastructure. The invariant checker and fault injection
 harness prove this contract, not the implementation.
 
-One section per write function. Plain language.
+One section per write function, then one for the read path: what the
+engine promises about the views and spans it lends out, and how long.
+Plain language.
 
 ---
 
@@ -371,9 +373,18 @@ written and renamed:
 
 ### Stale File Safety
 
-The old data file must not be deleted while any in-flight reader
-(snapshot or iterator) holds a shared reference to it. Deletion must
-be deferred until no external references remain.
+The old data file must remain readable through any in-flight reader
+(snapshot or iterator) that holds a shared reference to it. Vacuum
+unlinks the path as soon as the new file is published; the inode
+survives because the `DataFile` object — and with it the open
+descriptor and any mapping — is reference-counted and outlives the
+unlink. Readers continue through their open descriptor; POSIX keeps an
+unlinked file readable until the last one closes. What must never
+happen is the object being destroyed while a reader still references
+it.
+
+This is one row of a general rule. See **View and span lifetimes** for
+every other event that touches a file under a live reader.
 
 ### Consistency
 
@@ -638,3 +649,261 @@ tests, not through standalone `changes_since` proof tests.
 | **Batch integrity** | Incomplete batches (orphaned `BulkBegin` without `BulkEnd`) are excluded. `BulkBegin`/`BulkEnd` markers are preserved in the output. |
 | **Vacuum transparency** | After `vacuum_compact_file`, entries retain original sequences and batch markers. `changes_since` over a vacuumed file yields the same logical content as the pre-vacuum file. |
 | **Snapshot safety** | The iterator holds a `Snapshot` reference, keeping file descriptors open. Safe to run concurrently with vacuum (reads via fd, not path). |
+
+---
+
+## View and span lifetimes
+
+Every read API either copies bytes out or lends a view of them. A lent
+view — `std::span`, a reference into an iterator's cache — is correct
+only while the memory behind it is still owned and still holds what it
+held. This section says, for each view the engine hands out and each
+event that can move a file underneath it, whether the view stays valid.
+
+Its scope is memory safety and byte stability, not visibility. A view
+is frozen at the moment it was taken: a concurrent write never changes
+what a live view shows, and never invalidates it either.
+
+### The views
+
+| View | Handed out by | The bytes live in |
+|------|---------------|-------------------|
+| `Bytes& out` | `DB::get`, `Snapshot::get` | The caller's own vector — a copy, not a view |
+| `EntryView` (`key`, `value`) | `EntryIterator`, `ReverseEntryIterator` — `iter_from`, `riter_from` | The producing iterator's `io_buf_`, or a data file's mapping |
+| `const Key&` | `KeyIterator`, `ReverseKeyIterator` — `keys_from`, `rkeys_from` | An owning `Key` member of the producing iterator |
+| `DataEntryView` (`key`, `value`) | `ChangeIterator` — `changes_since` | The producing iterator's scan buffer — owning `DataEntry` storage |
+| `Snapshot` | `DB::snapshot`, `create_manifest` | A reference-counted engine state |
+
+### What holds a view up
+
+Four mechanisms account for every answer below. Where a cell is valid,
+it is valid because of one of these, and the grid names which.
+
+**A — Owned copy.** The bytes are in storage the view's owner
+allocated. `get` copies the value into the caller's `Bytes`.
+`KeyIterator` materialises an owning `Key`. `ChangeIterator` reads
+through `CommittedEntryIterator`, whose scan buffer holds owning
+`DataEntry` values. No file event can reach any of them.
+
+**B — Iterator-pinned state.** `EntryIterator`,
+`ReverseEntryIterator` and `ChangeIterator` each hold their own
+`shared_ptr<const EngineState>`, which holds a `shared_ptr<DataFile>`
+per file. Every descriptor and mapping the iterator can reach stays
+open for as long as the iterator lives — independently of the `DB`, of
+the `Snapshot` it came from, and of what the engine publishes next.
+
+**C — Tree-pinned nodes.** `KeyIterator` holds a reference-counted
+pointer to the key-directory root it was created from. A write mutates
+a node in place only when it holds the sole reference to it, so no node
+reachable from a published root is ever modified. The subtree an
+iterator walks is immutable for the iterator's life.
+
+**D — Fixed mapping address.** The active file's mapping is
+established once, in `WritableMmapDataFile`'s constructor, and released
+once, in its destructor. No engine operation unmaps and remaps it. Only
+`mmap_end_` — the prefix still backed by the file — moves, and only
+downwards, and only in step with the file's length.
+
+### Offset containment
+
+One invariant carries the mmap answers, and is stated here so the rest
+can refer to it:
+
+> **P.** Every offset published in `key_dir` lies below the committed
+> extent of the file it names.
+
+P holds by construction: an entry becomes visible only after its bytes
+are complete on disk, and the scan that establishes a committed extent
+stops at the first incomplete or corrupt entry, which is always past
+everything already published. P is what lets `resume()` shorten the
+active file under a live reader without taking anything away from it.
+P is currently an argument, not a checked invariant — #108 tracks
+asserting it at state publication.
+
+### Sealed `MAP_PRIVATE` versus active `MAP_SHARED`
+
+The two mappings give different guarantees, and a span into one is not
+governed by the same rules as a span into the other.
+
+**Sealed files** (`ReadOnlyMmapDataFile`, `MAP_PRIVATE`) are immutable
+for their whole life. Nothing rewrites them, nothing shortens them, and
+vacuum's unlink does not disturb the mapping. A span into a sealed file
+is bounded by one thing only: the lifetime of the `DataFile` object,
+which mechanism B pins.
+
+**The active file** (`WritableMmapDataFile`, `MAP_SHARED`) is written
+while it is mapped, so `MAP_SHARED` is required for a reader to see
+what `pwritev` wrote. Two consequences follow, and both are guarantees,
+not accidents:
+
+- *Contents are stable.* Data files are append-only. `pwritev` writes
+  at the logical end and zero-fill only ever writes at or past the
+  zeroed end, both of which are at or above every published offset. No
+  byte under a live span is ever rewritten.
+- *The file can shorten under the mapping.* `resume()` truncates to the
+  last committed offset and sealing releases the zero-filled tail.
+  Neither touches the mapping; both lower `mmap_end_` with the file. By
+  P, neither can take away a page a published offset points into, so no
+  live span loses its backing. A read at or past the new bound takes
+  the `pread` fallback and fails as a clean short read rather than
+  faulting on a page beyond end of file.
+
+With `use_mmap` off, neither case arises: every span an iterator hands
+out points into that iterator's own `io_buf_`.
+
+### The grid
+
+One row per (view, event). **Valid** means the view still addresses
+live memory and still holds the bytes it held. **Invalid** means it
+does not, and nothing reports that. **Invalid, detected** means the
+engine reports it rather than letting the caller read freed memory.
+
+No cell below is *invalid, detected*. Nothing in the engine notices
+that a lent view has gone stale — where a view becomes invalid it does
+so silently. That is what makes these rules worth writing down rather
+than relying on a check to catch a mistake.
+
+The rows below the rule in each table are the producing iterator's own
+lifecycle. They are the only rows that invalidate anything.
+
+*Seal* is not a public call. It is the step that turns the active file
+into a read-only one — release the zero-filled tail, reopen the path
+read-only, swap the registry entry — and it runs inside file rotation,
+`create_manifest`, `resume()` and vacuum's staging copy. It appears as
+its own row because it shortens a file, which is the property that
+matters here.
+
+#### `Bytes& out` from `get`
+
+| Event | Verdict | Why |
+|-------|---------|-----|
+| `resume()` | Valid | A — the caller owns the bytes |
+| `vacuum()` | Valid | A |
+| File rotation | Valid | A |
+| Seal | Valid | A |
+| `set_mode()` | Valid | A |
+| Originating `Snapshot` destroyed | Valid | A |
+| Concurrent write | Valid | A — a later write never reaches a value already copied out |
+| `DB` destruction | Valid | A — the value outlives the engine |
+| — | | |
+| Next `get` into the same `Bytes` | Overwritten | The vector is reused by design; copy it out first if the previous value is still needed |
+
+#### `EntryView` spans, `use_mmap` off
+
+| Event | Verdict | Why |
+|-------|---------|-----|
+| `resume()` | Valid | B — the span is in the iterator's `io_buf_`; truncation cannot reach it |
+| `vacuum()` | Valid | B — the file object outlives the unlink |
+| File rotation | Valid | B — rotation registers a new object; the old one stays alive for anyone holding it |
+| Seal | Valid | B |
+| `set_mode()` | Valid | In-memory transition only |
+| Originating `Snapshot` destroyed | Valid | B — the iterator carries its own state reference |
+| Concurrent write | Valid | B |
+| `DB` destruction | Valid | B — see **`DB` destruction** below |
+| — | | |
+| Next `operator++()` | Invalid | The buffer is reused for the next entry |
+| Iterator destroyed | Invalid | The buffer goes with it |
+| Iterator moved | Valid | The buffer moves with the iterator; the span keeps addressing it |
+| Iterator copied after dereference | Invalid | Defect, tracked as #107 — the copy's spans address the source's buffer |
+
+#### `EntryView` spans, `use_mmap` on
+
+Spans point into a file's mapping when the entry is inside it, and into
+the iterator's `io_buf_` otherwise. Both are covered below.
+
+| Event | Verdict | Why |
+|-------|---------|-----|
+| `resume()` | Valid | B + D + P — the mapping is never replaced; truncation lowers `mmap_end_` but cannot reach a published offset |
+| `vacuum()` | Valid | B + D — the mapping outlives the unlink, sealed bytes are immutable |
+| File rotation | Valid | B + D — the sealed reopen is a second, independent mapping; the old one is untouched |
+| Seal | Valid | B + D + P — releasing the zero tail removes no published byte |
+| `set_mode()` | Valid | In-memory transition only |
+| Originating `Snapshot` destroyed | Valid | B |
+| Concurrent write | Valid | B + D — appends and zero-fill never rewrite a published byte |
+| `DB` destruction | Valid | B + D + P — the destructor's `shrink_to_fit` releases only the zero tail |
+| — | | |
+| Next `operator++()` | Invalid | Same as above |
+| Iterator destroyed | Invalid | Same as above |
+| Iterator moved | Valid | Same as above |
+| Iterator copied after dereference | Invalid | #107, on the `pread` fallback path |
+
+#### `const Key&` from `keys_from` / `rkeys_from`
+
+| Event | Verdict | Why |
+|-------|---------|-----|
+| `resume()` | Valid | A + C — key iteration touches no file |
+| `vacuum()` | Valid | A + C |
+| File rotation | Valid | A + C |
+| Seal | Valid | A + C |
+| `set_mode()` | Valid | A + C |
+| Originating `Snapshot` destroyed | Valid | C — the iterator pins the key-directory root itself |
+| Concurrent write | Valid | C — a write path-copies; it never mutates a published node |
+| `DB` destruction | Valid | A + C |
+| — | | |
+| Next `operator++()` | Contents replaced | The reference stays bound to the iterator's member; the bytes in it change |
+| Iterator destroyed | Invalid | The member goes with it |
+
+#### `DataEntryView` from `changes_since`
+
+| Event | Verdict | Why |
+|-------|---------|-----|
+| `resume()` | Valid | A + B — the spans are in owning scan storage |
+| `vacuum()` | Valid | A + B |
+| File rotation | Valid | A + B |
+| Seal | Valid | A + B |
+| `set_mode()` | Valid | A + B |
+| `Snapshot` passed to `changes_since` destroyed | Valid | B — the iterator copies the state reference out of it |
+| Concurrent write | Valid | A + B — the stream's upper bound is fixed at construction |
+| `DB` destruction | Valid | A + B |
+| — | | |
+| Next `operator++()` | Invalid | The scan buffer is cleared before the next entry is read |
+| Iterator destroyed | Invalid | The buffer goes with it |
+| Iterator copied | Not possible | `ChangeIterator` is move-only |
+
+#### `Snapshot`
+
+| Event | Verdict | Why |
+|-------|---------|-----|
+| `resume()` | Valid | Holds a reference-counted state; a later publication does not disturb it |
+| `vacuum()` | Valid | Pins every file it names — vacuum's unlink leaves them readable |
+| File rotation | Valid | Pins the pre-rotation file set |
+| Seal | Valid | Reads published offsets only |
+| `set_mode()` | Valid | The snapshot carries the mode it captured |
+| Concurrent write | Valid | A snapshot is a frozen state; writes publish a new one |
+| `DB` destruction | Valid | Carries no reference to the `DB` |
+| — | | |
+| Moved from | Invalid | A moved-from `Snapshot` holds no state. Only destruction and assignment are supported on it — the same rule the standard library applies to its own move-only types |
+
+### A view may outlive the `Snapshot` it came from
+
+`Snapshot::iter_from`, `keys_from`, `riter_from` and `rkeys_from` hand
+the iterator its own reference to the engine state, and `changes_since`
+copies the reference out of the `Snapshot` it is given. The binding is
+to the iterator, not to the snapshot. Destroying or moving the
+`Snapshot` mid-iteration is safe, and so is returning an iterator from
+a scope where the `Snapshot` was a local.
+
+The reverse is not true: a span belongs to the iterator that produced
+it, and does not outlive it.
+
+### `DB` destruction
+
+No operation may be in flight when `~DB` runs. That is a caller
+precondition, not something the engine enforces.
+
+Views already taken stay valid. An iterator, a `Snapshot`, and the
+spans they hand out hold their own references to the engine state and
+to every data file it names, so they remain valid and remain readable
+after the `DB` is gone.
+
+An operation *racing* the destructor is undefined: a read may throw,
+and a write may be truncated away by the destructor's final release of
+the zero-filled tail and lost. Undefined here does not extend to data
+already written. Data files are append-only and the destructor's only
+destructive act is truncating the active file to its logical end, so
+the worst on-disk outcome is a shorter valid prefix of the committed
+history — every surviving entry keeps its CRC, and a cut that lands
+mid-entry is cleaned at the next `open`, which rescans a hint-less data
+file and resizes it to its committed end. The directory lock is
+released only after that truncation completes, so no second process can
+open the directory while teardown is still writing.

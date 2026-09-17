@@ -303,7 +303,7 @@ When this happens, the engine calls `deem_as_degraded(reason)` with a diagnostic
   1. Acquires the write lock.
   2. Scans the active file using `CommittedEntryIterator` to find the last valid committed offset. Orphaned `BulkBegin` batches are excluded — if a `BulkBegin` has no matching `BulkEnd`, `committed_offset` is reset to before the batch start.
   3. Replays valid committed entries into the key directory using sequence-wins resolution: for each Put whose sequence exceeds the current key_dir entry (or the key is absent), update key_dir and file_stats; for each Delete whose sequence exceeds the current entry, erase the key. This recovers entries that were written to the data file but never published to EngineState (e.g. sync-failure paths where only next_seq was advanced, or degraded-state transitions that occurred between IO and state publication). Also advances `next_seq` past the highest sequence seen on disk.
-  4. Calls `ftruncate` to remove garbage bytes and orphaned batch markers up to `valid_offset`. In mmap mode this leaves the mapping untouched — readers are not quiesced and may hold spans into it (see *DataFile mmap*).
+  4. Calls `ftruncate` to remove garbage bytes and orphaned batch markers up to `valid_offset`. In mmap mode this leaves the mapping untouched — readers are not quiesced and may hold spans into it (see *DataFile mmap*, and *View and span lifetimes* in [`CONTRACT.md`](../CONTRACT.md) for what a reader is owed across this call).
   5. Calls `fdatasync` to persist the truncation.
   6. Seals the active file and dispatches hint generation (both idempotent).
   7. Creates a new active file and publishes the new engine state.
@@ -897,7 +897,10 @@ Contrast with `HintFile`, which uses `OpenForWrite` / `OpenForRead` factory func
 
 ### DataFile mmap
 
-Two mmap strategies are used depending on the file's lifecycle:
+Two mmap strategies are used depending on the file's lifecycle. What a
+reader is owed across each of them — and across every other event that
+moves a file under a live view — is stated in *View and span lifetimes*
+in [`CONTRACT.md`](../CONTRACT.md); this section covers the mechanism.
 
 **Active (writable) file — `WritableMmapDataFile`**: When `Options::use_mmap` is set, the active file is mapped at the rotation threshold with `mmap(PROT_READ, MAP_SHARED)` and zero-filled in chunks ahead of the write cursor (see *Zero-fill ahead of the write cursor*). MAP_SHARED is required so that `pwritev` writes through the fd update the same pages that mmap readers see. Reads within the mapped region are zero-syscall memcpy; reads beyond (rare: file grew past pre-allocated size) fall back to `pread`.
 
@@ -1223,6 +1226,7 @@ for (auto& key : db.rkeys_from(opts, prefix))              { ... }
 - **Lazy**: each dereference reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries.
 - **`KeyIterator` is in-memory only**: walks the radix tree key directory without touching any data file.
 - **Error handling**: throws `std::system_error` on I/O failure.
+- **Self-anchored**: `EntryIterator` and `ReverseEntryIterator` each hold their own `shared_ptr<const EngineState>`, and `KeyIterator` holds the key-directory root it was built from. An iterator therefore keeps every data file it can reach open, and the subtree it walks immutable, independently of the `DB` and of the `Snapshot` it came from — which is why a span may outlive that `Snapshot` but never the iterator. The full per-event table is *View and span lifetimes* in [`CONTRACT.md`](../CONTRACT.md).
 
 ### WriteOptions and ReadOptions
 

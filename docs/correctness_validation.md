@@ -333,27 +333,43 @@ to callers. Degrading forces `resume()` before further writes are accepted;
 
 ## Proof Test Generator
 
-### apply_batch — 492 tests
+### apply_batch — 800 tests
 
-492 generated Catch2 tests (`[prove_apply_batch]` tag) cover every valid
+800 generated Catch2 tests (`[prove]` tag) cover every valid
 (StateShape, PlanShape, FailureClass) combination for `apply_batch`.
-The scenario matrix is 5 state shapes × 17 plan shapes × 9 failure
-classes; 4 elimination rules reduce this to 492 valid tests.
+The scenario matrix is 8 state shapes × 17 plan shapes × 9 failure
+classes; 4 elimination rules reduce this to 800 valid tests.
 
 #### State shapes
 
-| Shape | `num_keys` | `max_file_bytes` | What it tests |
-|-------|-----------|-----------------|---------------|
-| `empty_db` | 0 | — | Plan applied to a fresh database with no existing keys |
-| `single_key` | 1 | — | Overwrites, deletes, and guards against a single existing key |
-| `populated_db` | 10 | — | Multiple existing keys; exercises range guards and multi-key interactions |
-| `rotation_threshold` | 1 | 1 | Forces file rotation after the plan's writes — required for classes G and H |
-| `deleted_key` | 1 (deleted) | — | k0 created then deleted — tombstone in write history, no live keys at baseline |
+| Shape | `num_keys` | `max_file_bytes` | `use_mmap` | What it tests |
+|-------|-----------|-----------------|-----------|---------------|
+| `empty_db` | 0 | — | — | Plan applied to a fresh database with no existing keys |
+| `single_key` | 1 | — | — | Overwrites, deletes, and guards against a single existing key |
+| `populated_db` | 10 | — | — | Multiple existing keys; exercises range guards and multi-key interactions |
+| `rotation_threshold` | 1 | 1 | — | Forces file rotation after the plan's writes — required for classes G and H |
+| `deleted_key` | 1 (deleted) | — | — | k0 created then deleted — tombstone in write history, no live keys at baseline |
+| `single_key_buffered` | 1 | — | yes | The mmap read path over a single key |
+| `populated_db_buffered` | 10 | — | yes | The mmap read path with multiple keys and cross-key interactions |
+| `rotation_threshold_buffered` | 1 | 1 | yes | Rotation with the active file mapped — sealing and remapping under classes G and H |
+
+The three `_buffered` shapes set `Options::use_mmap`, so the active file
+is mapped `MAP_SHARED` and sealed files `MAP_PRIVATE` (see *DataFile
+mmap* in `bytecask_design.md`). They account for 308 of the 800 cells,
+257 of which reach `resume()` — and through it
+`WritableMmapDataFile::truncate` — via `assert_resumable`. That is the
+path #87 broke: the cells ran it on every CI run, ASan included, and
+none of them could fail on it, because a cell can only assert what the
+contract states and the contract said nothing about the span a reader
+holds across that call. `CONTRACT.md` now does, under *View and span
+lifetimes*; the observer that would let these cells act on it is tracked
+in #103. On Emscripten builds the `_buffered` cells are compiled out —
+mmap is unavailable there and `DB::open` rejects the option outright.
 
 Shapes not currently covered: mid-vacuum (vacuum-in-flight during `apply_batch`),
 post-resume (DB that has been degraded and resumed), and multiple sealed files with
 cross-file tombstone interactions. These are deferred — the current shapes cover the
-five structurally distinct starting conditions for the write path.
+structurally distinct starting conditions for the write path, with and without mmap.
 
 #### Plan shapes
 
@@ -421,12 +437,12 @@ Each test follows the same structure:
 7. `assert_recoverable(dir, before, expected)` — validates persistence
    invariant via fresh recovery (where applicable)
 
-### resume() — 21 tests
+### resume() — 28 tests
 
-21 generated Catch2 tests (`[prove_resume]` tag) cover every valid
+28 generated Catch2 tests (`[prove_resume]` tag) cover every valid
 (DegradeShape, ResumeFailureClass) combination.
 
-Four degrade shapes establish a degraded DB before resume is called:
+Six degrade shapes establish a degraded DB before resume is called:
 
 - **degrade_H** — `io_rotate_file_creation` fires on a put at the
   rotation threshold. The write committed (both keys are in key_dir),
@@ -442,6 +458,12 @@ Four degrade shapes establish a degraded DB before resume is called:
 - **degrade_G** — `io_data_file_sync` fires on a `put(sync=false)`
   with `max_file_bytes=1`. The pre-rotation sync fails. Same page-cache
   state as F — `resume()` replays the entry.
+- **degrade_H_buffered**, **degrade_C_buffered** — H and C with
+  `Options::use_mmap` set. These are the shapes where `resume()`
+  truncates the active file while it is mapped and lock-free readers are
+  not quiesced; the mapping must survive it (see *View and span
+  lifetimes* in `CONTRACT.md`, and *DataFile mmap* in
+  `bytecask_design.md`). Compiled out on Emscripten builds.
 
 Six resume failure classes:
 
@@ -452,13 +474,19 @@ Six resume failure classes:
 - **DOUBLE** — resume succeeds, then a second resume is called (no-op).
 - **CASCADE** — R2 fails, then R3 fails, then clean resume succeeds.
 
-R1 is filtered for degrade_H, degrade_F, and degrade_G: these shapes
-have no orphaned or partial bytes in the active file, so
-`file.size() == valid_offset` and `resume()` skips the truncation
-branch entirely (see `bytecask.cpp` resume path: `if (file.size() !=
-valid_offset) { ... truncate ... }`). R1 is only valid for degrade_C.
+Two elimination rules apply:
 
-4 shapes × 6 classes = 24 minus 3 filtered = **21 tests**.
+1. **R1 requires orphaned bytes.** degrade_H, degrade_F and degrade_G
+   have none in the active file, so `file.size() == valid_offset` and
+   `resume()` skips the truncation branch entirely (`if (file.size() !=
+   valid_offset) { ... truncate ... }`). R1 is valid only for the
+   degrade_C shapes — 4 combinations filtered.
+2. **R2 and CASCADE require an unsealed file.** The degrade_H shapes
+   seal the active file during rotation before the fault fires, so
+   `resume()` never enters the truncate/sync/seal block and the sync
+   fault point is unreachable — 4 more combinations filtered.
+
+6 shapes × 6 classes = 36 minus 8 filtered = **28 tests**.
 
 Each R1/R2/R3 test uses a multi-phase pattern:
 1. Establish degraded state
@@ -473,15 +501,20 @@ fault points.
 
 This directly proves: *resume always eventually recovers once the underlying fault clears.*
 
-### vacuum_compact — 10 tests
+### vacuum_compact — 20 tests
 
-10 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover two state
+20 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover four state
 shapes × five failure classes (SUCCESS, VC1–VC4).
 
 State shapes create a DB with exactly one sealed file having fragmentation > 0:
 
 - **low_fragmentation** — sealed file with 2 entries, 1 dead (50% frag)  
 - **mostly_dead** — sealed file with 6 entries, 5 dead (~83% frag)
+- **low_fragmentation_buffered**, **mostly_dead_buffered** — the same
+  two shapes with `Options::use_mmap` set, so the file being compacted
+  is read through its `MAP_PRIVATE` mapping and the staged copy is
+  written through a mapped active file. Compiled out on Emscripten
+  builds.
 
 Files with live entries always use the compact path (sealed→sealed).
 `mostly_dead` uses `max_file_bytes=150` to pack all 6 keys into one
@@ -661,6 +694,10 @@ I/O checkpoints:
 - `assert_consistent(db)` — validates five structural invariants:
   live_bytes matches key_dir, no dangling file references, active file
   exists, file_stats covers all files, next_lsn ahead of all sequences.
+  All five are properties of the published state. None concerns a view
+  the engine has lent to a reader, so no generated cell can currently
+  fail on one — see *View and span lifetimes* in `CONTRACT.md` for the
+  guarantees, and #103 for the observer axis that would assert them.
 - `assert_delta(before, db, expected)` — validates key membership, LSN
   advancement, structural consistency, and degraded state against the
   reference model's expected delta.
@@ -709,24 +746,27 @@ smoke-test the helpers themselves.
 
 ### Test coverage
 
-All eleven failure classes for `apply_batch` are covered by the 172
-`[prove_apply_batch]` tests. Each class is exercised across all valid
-(StateShape, PlanShape) combinations.
+All nine failure classes for `apply_batch` (SUCCESS, A, B1, B2, B3, C,
+F, G, H) are covered by the 800 `[prove]` tests. Each class is exercised
+across all valid (StateShape, PlanShape) combinations, with and without
+mmap.
 
 All three resume failure classes (R1–R3) plus DOUBLE and CASCADE across
-all four degrade shapes (H, C, F, G) are covered by the 21
-`[prove_resume]` tests. R1 is correctly excluded for degrade_H, degrade_F,
-and degrade_G (no orphaned bytes to truncate — fault point unreachable).
+all six degrade shapes (H, C, F, G and the two `_buffered` variants) are
+covered by the 28 `[prove_resume]` tests. R1 is correctly excluded for
+the degrade_H, degrade_F and degrade_G shapes (no orphaned bytes to
+truncate — fault point unreachable), and R2/CASCADE for degrade_H (file
+already sealed).
 
-All five vacuum_compact failure classes across both state shapes are
-covered by the 10 `[prove_vacuum_compact]` tests.
+All five vacuum_compact failure classes across all four state shapes are
+covered by the 20 `[prove_vacuum_compact]` tests.
 
 All seven ingest failure classes across 11 state shapes and 5 ops shapes
 are covered by the 178 `[prove_repl]` tests. All three manifest failure
 classes across 11 state shapes are covered by the 33 `[prove_manifest]`
 tests. Four elimination rules reduce the full matrix to 211 valid tests.
 
-Total generated proof tests: **734**.
+Total generated proof tests: **1059**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
