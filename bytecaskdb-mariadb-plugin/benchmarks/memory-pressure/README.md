@@ -55,6 +55,7 @@ across runs and across the three ByteCaskDB back-ends (InnoDB has its own);
 | `--workloads=LIST` | 4 OLTP mixes | sysbench `oltp_*` workloads. |
 | `--threads=LIST` | 1,8,16 | |
 | `--warmup=S` / `--time=S` | 30 / 60 | unmeasured run, then the measured run, per cell. |
+| `--no-secondary-index` | off | build `sbtest1` with only the primary key. sysbench's secondary index is on a random integer, so it doubles the key count and inserts at random positions in the key directory: it drives both the memory pressure and the locality. |
 | `--recovery-threads=N` | 4 | threads replaying hint files at startup. Each builds a partial key directory and the results are merged, so more threads also mean more peak memory during recovery; under a tight limit fewer can be faster. |
 | `--start-timeout=S` | 900 | how long to wait for `mariadbd` to accept connections. Recovery takes seconds with memory to spare and minutes when the key directory is being swapped. |
 | `--out=FILE` | `<data-root>/memory_pressure_<timestamp>.csv` | |
@@ -87,7 +88,7 @@ One CSV row per engine × workload × thread count:
 `engine, workload, threads, rows, mem_limit_bytes, swap_limit, pool_bytes,
 tps, avg_ms, p95_ms, pool_hit_ratio, rss_bytes, cgroup_memory_bytes,
 cgroup_swap_bytes, major_faults, oom_kills, startup_s, recovery_ms,
-recovery_threads`
+recovery_threads, secondary_index`
 
 `major_faults` is how many pages the cgroup read back from swap during the
 measured run; divided by the transactions in it, that is the per-query cost of

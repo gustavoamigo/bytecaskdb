@@ -13,7 +13,7 @@
 #   ./run-memory-pressure.sh [--rows=N] [--mem-limit=BYTES] [--swap-limit=BYTES|max]
 #       [--pool-bytes=BYTES] [--engines=LIST] [--workloads=LIST] [--threads=LIST]
 #       [--warmup=S] [--time=S] [--start-timeout=S] [--recovery-threads=N]
-#       [--data-root=DIR] [--fresh] [--out=FILE]
+#       [--no-secondary-index] [--data-root=DIR] [--fresh] [--out=FILE]
 #
 #   --engines    default bytecaskdb-pool,bytecaskdb-mmap,bytecaskdb-pread,innodb
 #   --rows       default 10 M: ~3.2 GB of ByteCaskDB data files plus ~1.1 GB of
@@ -33,6 +33,11 @@
 #                merged, so more threads also mean more peak memory during
 #                recovery; under a tight limit fewer can be faster. The
 #                engine's own measurement is recorded as recovery_ms.
+#   --no-secondary-index  build sbtest1 with only the primary key. sysbench's
+#                secondary index is on a random integer, so it doubles the key
+#                count and inserts at random positions in the key directory —
+#                it drives both the memory pressure and the locality. Without
+#                it the same row count is half the keys, inserted in order.
 #   --pool-bytes default 512 MiB for bytecaskdb-pool; InnoDB gets 1.5 GiB.
 #   --start-timeout how long to wait for mariadbd to accept connections
 #                (default 900 s). Recovery of the key directory takes seconds
@@ -59,6 +64,7 @@ WARMUP=30
 DURATION=60
 START_TIMEOUT=900
 RECOVERY_THREADS=4
+CREATE_SECONDARY=on
 FRESH=0
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATA_ROOT="$SCRIPT_DIR/results"
@@ -80,6 +86,7 @@ for arg in "$@"; do
     --time=*)       DURATION="${arg#*=}" ;;
     --start-timeout=*) START_TIMEOUT="${arg#*=}" ;;
     --recovery-threads=*) RECOVERY_THREADS="${arg#*=}" ;;
+    --no-secondary-index) CREATE_SECONDARY=off ;;
     --data-root=*)  DATA_ROOT="${arg#*=}" ;;
     --out=*)        OUT="${arg#*=}" ;;
     --fresh)        FRESH=1 ;;
@@ -215,12 +222,13 @@ engine_stat() {  # <counter name without the bytecask. prefix>
 
 prepare() {  # <storage engine> <base dir>
   local engine="$1" base="$2"
-  if [[ -f $base/prepared && -d $base/data/sbtest && $FRESH == 0 ]] && (( $(cat "$base/prepared") == ROWS )); then
-    log "$engine: reusing prepared data in $base ($ROWS rows)"
+  if [[ -f $base/prepared && -d $base/data/sbtest && $FRESH == 0 ]] &&
+     [[ "$(cat "$base/prepared")" == "$ROWS $CREATE_SECONDARY" ]]; then
+    log "$engine: reusing prepared data in $base ($ROWS rows, secondary index $CREATE_SECONDARY)"
     return
   fi
   rm -rf "$base"
-  log "$engine: preparing $ROWS rows in $base"
+  log "$engine: preparing $ROWS rows in $base (secondary index $CREATE_SECONDARY)"
   if [[ $engine == bytecaskdb ]]; then
     start_db bytecaskdb pread 0 0 "$base"
     # Table with the secondary index up front and batched inserts. sysbench's
@@ -230,7 +238,7 @@ prepare() {  # <storage engine> <base dir>
       CREATE TABLE sbtest1 (
         id INT NOT NULL AUTO_INCREMENT, k INT NOT NULL DEFAULT 0,
         c CHAR(120) NOT NULL DEFAULT '', pad CHAR(60) NOT NULL DEFAULT '',
-        PRIMARY KEY (id), KEY k_1 (k)) ENGINE=bytecaskdb;"
+        PRIMARY KEY (id)$([[ $CREATE_SECONDARY == on ]] && echo ", KEY k_1 (k)")) ENGINE=bytecaskdb;"
     local done_rows=0 batch=50000 n
     while (( done_rows < ROWS )); do
       n=$(( ROWS - done_rows < batch ? ROWS - done_rows : batch ))
@@ -244,10 +252,11 @@ prepare() {  # <storage engine> <base dir>
     done
   else
     start_db innodb innodb $((4 * 1024 * 1024 * 1024)) 0 "$base"
-    sysbench oltp_read_write $(sysbench_args 4) --mysql_storage_engine=innodb prepare >/dev/null
+    sysbench oltp_read_write $(sysbench_args 4) --mysql_storage_engine=innodb \
+      --create_secondary="$CREATE_SECONDARY" prepare >/dev/null
   fi
   stop_db
-  echo "$ROWS" > "$base/prepared"
+  echo "$ROWS $CREATE_SECONDARY" > "$base/prepared"
   log "$engine: data size $(du -sh "$base/data" | cut -f1)"
 }
 
@@ -293,7 +302,7 @@ run_engine() {  # <engine label>
         log "  [FAILED] $label $wl threads=$t"; echo "$out" | tail -5
         tps=0; avg=0; p95=0
       fi
-      echo "$label,$wl,$t,$ROWS,$MEM_LIMIT,$SWAP_LIMIT,$pool,${tps},${avg},${p95},${hit},${rss:-0},${cur:-0},${swp:-0},${majf:-0},${oom:-0},$STARTUP_S,${RECOVERY_MS:-0},$RECOVERY_THREADS" | tee -a "$OUT"
+      echo "$label,$wl,$t,$ROWS,$MEM_LIMIT,$SWAP_LIMIT,$pool,${tps},${avg},${p95},${hit},${rss:-0},${cur:-0},${swp:-0},${majf:-0},${oom:-0},$STARTUP_S,${RECOVERY_MS:-0},$RECOVERY_THREADS,$CREATE_SECONDARY" | tee -a "$OUT"
     done
   done
   stop_db
@@ -302,11 +311,11 @@ run_engine() {  # <engine label>
 build_bytecaskdb_plugin >/dev/null
 symlink_providers "$PLUGIN_DIR"
 
-echo "engine,workload,threads,rows,mem_limit_bytes,swap_limit,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,cgroup_swap_bytes,major_faults,oom_kills,startup_s,recovery_ms,recovery_threads" > "$OUT"
+echo "engine,workload,threads,rows,mem_limit_bytes,swap_limit,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,cgroup_swap_bytes,major_faults,oom_kills,startup_s,recovery_ms,recovery_threads,secondary_index" > "$OUT"
 for e in ${ENGINES//,/ }; do run_engine "$e"; done
 
 echo
-log "=== Results (memory.max=$MEM_LIMIT, memory.swap.max=$SWAP_LIMIT, $ROWS rows) ==="
+log "=== Results (memory.max=$MEM_LIMIT, memory.swap.max=$SWAP_LIMIT, $ROWS rows, secondary index $CREATE_SECONDARY) ==="
 printf "%-17s %-18s %4s %10s %8s %8s %6s %7s %7s %9s %4s %6s %7s\n" engine workload thr tps "avg ms" "p95 ms" "hit" "RSS MB" "swp MB" "majf/tx" OOM "start" "recov"
 tail -n +2 "$OUT" | awk -F, -v dur="$DURATION" '{printf "%-17s %-18s %4s %10.0f %8s %8s %6s %7d %7d %9.2f %4s %5ss %6.1fs\n", $1, $2, $3, $8, $9, $10, ($11 == "" ? "-" : substr($11, 1, 5)), $12 / 1048576, $14 / 1048576, ($8 > 0 ? $15 / ($8 * dur) : 0), $16, $17, $18 / 1000}'
 log "Results saved to: $OUT"
