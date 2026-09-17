@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Memory-pressure benchmark: ByteCaskDB (buffer pool, mmap, pread) and InnoDB,
-# each run as one mariadbd inside a cgroup with memory.max set, so the page
-# cache, the key directory and the buffer pool all have to fit the same limit.
+# each run as one mariadbd inside a cgroup with memory.max (and optionally
+# memory.swap.max) set, so the page cache, the key directory and the buffer
+# pool all have to fit the same limit.
 #
 # Requirements: mariadbd, mariadb and sysbench on the PATH; the plugin built
 # (this script builds it); passwordless sudo, for the cgroup and for dropping
@@ -9,9 +10,9 @@
 # at the root (`cat /sys/fs/cgroup/cgroup.subtree_control` lists `memory`).
 #
 # Usage:
-#   ./run-memory-pressure.sh [--rows=N] [--mem-limit=BYTES] [--pool-bytes=BYTES]
-#       [--engines=LIST] [--workloads=LIST] [--threads=LIST] [--warmup=S] [--time=S]
-#       [--data-root=DIR] [--fresh] [--out=FILE]
+#   ./run-memory-pressure.sh [--rows=N] [--mem-limit=BYTES] [--swap-limit=BYTES|max]
+#       [--pool-bytes=BYTES] [--engines=LIST] [--workloads=LIST] [--threads=LIST]
+#       [--warmup=S] [--time=S] [--data-root=DIR] [--fresh] [--out=FILE]
 #
 #   --engines    default bytecaskdb-pool,bytecaskdb-mmap,bytecaskdb-pread,innodb
 #   --rows       default 10 M: ~3.2 GB of ByteCaskDB data files plus ~1.1 GB of
@@ -21,6 +22,11 @@
 #                kernel cannot reclaim without swap, so the limit has to hold
 #                it plus the pool plus ~300 MB of server; the page cache gets
 #                what is left, ~1.2 GB for 3.2 GB of files at the defaults.
+#   --swap-limit the cgroup's memory.swap.max: 0 (default) means anonymous
+#                memory such as the key directory can never be swapped, so
+#                exceeding the limit is an OOM kill; a byte count or `max`
+#                lets the kernel swap it instead, which is the slower failure.
+#                Only matters on a host that has swap configured.
 #   --pool-bytes default 512 MiB for bytecaskdb-pool; InnoDB gets 1.5 GiB.
 #   --data-root  where the data directories live (default: this directory's
 #                results/). Prepared data is reused across runs and across the
@@ -33,6 +39,7 @@ set -uo pipefail
 
 ROWS=10000000
 MEM_LIMIT=$((2560 * 1024 * 1024))
+SWAP_LIMIT=0
 POOL_BYTES=$((512 * 1024 * 1024))
 INNODB_POOL_BYTES=$((1536 * 1024 * 1024))
 ENGINES="bytecaskdb-pool,bytecaskdb-mmap,bytecaskdb-pread,innodb"
@@ -52,6 +59,7 @@ for arg in "$@"; do
   case "$arg" in
     --rows=*)       ROWS="${arg#*=}" ;;
     --mem-limit=*)  MEM_LIMIT="${arg#*=}" ;;
+    --swap-limit=*) SWAP_LIMIT="${arg#*=}" ;;
     --pool-bytes=*) POOL_BYTES="${arg#*=}" ;;
     --engines=*)    ENGINES="${arg#*=}" ;;
     --workloads=*)  WORKLOADS="${arg#*=}" ;;
@@ -131,7 +139,7 @@ CNF
   if (( limit > 0 )); then
     sudo mkdir -p "$CG"
     echo "$limit" | sudo tee "$CG/memory.max" >/dev/null
-    echo 0 | sudo tee "$CG/memory.swap.max" >/dev/null
+    echo "$SWAP_LIMIT" | sudo tee "$CG/memory.swap.max" >/dev/null
   fi
   mariadbd --defaults-extra-file="$cnf" --datadir="$data" --socket="$SOCKET" --port=$PORT \
     --pid-file="$base/mariadbd.pid" --skip-grant-tables --tmpdir="$base/tmp" \
@@ -244,7 +252,7 @@ run_engine() {  # <engine label>
         log "  [FAILED] $label $wl threads=$t"; echo "$out" | tail -5
         tps=0; avg=0; p95=0
       fi
-      echo "$label,$wl,$t,$ROWS,$MEM_LIMIT,$pool,${tps},${avg},${p95},${hit},${rss:-0},${cur:-0},${oom:-0}" | tee -a "$OUT"
+      echo "$label,$wl,$t,$ROWS,$MEM_LIMIT,$SWAP_LIMIT,$pool,${tps},${avg},${p95},${hit},${rss:-0},${cur:-0},${oom:-0}" | tee -a "$OUT"
     done
   done
   stop_db
@@ -253,11 +261,11 @@ run_engine() {  # <engine label>
 build_bytecaskdb_plugin >/dev/null
 symlink_providers "$PLUGIN_DIR"
 
-echo "engine,workload,threads,rows,mem_limit_bytes,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,oom_kills" > "$OUT"
+echo "engine,workload,threads,rows,mem_limit_bytes,swap_limit,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,oom_kills" > "$OUT"
 for e in ${ENGINES//,/ }; do run_engine "$e"; done
 
 echo
-log "=== Results (memory.max=$MEM_LIMIT, $ROWS rows) ==="
+log "=== Results (memory.max=$MEM_LIMIT, memory.swap.max=$SWAP_LIMIT, $ROWS rows) ==="
 printf "%-17s %-18s %4s %10s %8s %8s %6s %7s %5s\n" engine workload thr tps "avg ms" "p95 ms" "hit" "RSS MB" OOM
-tail -n +2 "$OUT" | awk -F, '{printf "%-17s %-18s %4s %10.0f %8s %8s %6s %7d %5s\n", $1, $2, $3, $7, $8, $9, ($10 == "" ? "-" : substr($10, 1, 5)), $11 / 1048576, $13}'
+tail -n +2 "$OUT" | awk -F, '{printf "%-17s %-18s %4s %10.0f %8s %8s %6s %7d %5s\n", $1, $2, $3, $8, $9, $10, ($11 == "" ? "-" : substr($11, 1, 5)), $12 / 1048576, $14}'
 log "Results saved to: $OUT"
