@@ -207,6 +207,11 @@ Sysbench: 1 table, `--report-interval=0`, `--time=10`.
 
 # Custom parameters
 ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh --engines=bytecaskdb,innodb --table-size=1000000 --threads=1,4,16 --time=30
+
+# Under a memory limit: each engine's mariadbd in a cgroup with memory.max
+# (default 2.5 GiB, 10 M rows; needs passwordless sudo). Compares the three
+# ByteCaskDB back-ends (buffer_pool, mmap, pread) with InnoDB.
+./bytecaskdb-mariadb-plugin/benchmarks/memory-pressure/run-memory-pressure.sh
 ```
 
 ---
