@@ -568,15 +568,25 @@ too expensive for release builds.
 ### Cold-path checks (open, resume — always on)
 
 `validate_state_consistency` runs the full structural check on the
-published state after `DB::open()` and `resume()`:
+published state after `DB::open()` and `resume()`. The O(n) key
+directory walk is too expensive for release builds, so the invariants
+that need it run in test builds only:
 
-| Invariant | Cost |
-|-----------|------|
-| Active file exists in files registry | O(1) |
-| No dangling file references in key_dir | O(n) |
-| `next_seq > max(all key_dir sequences)` | O(n) |
-| `file_stats` covers all files | O(f) |
-| `live_bytes` matches key_dir | O(n) |
+| Invariant | Cost | Build |
+|-----------|------|-------|
+| Active file exists in files registry | O(1) | always |
+| `sync_requested_seq <= durable_seq` | O(1) | always |
+| `file_stats` covers all files | O(f) | always |
+| `min_sequence` / `max_sequence` coherence | O(f) | always |
+| No dangling file references in key_dir | O(n) | test builds |
+| `next_seq > max(all key_dir sequences)` | O(n) | test builds |
+| `live_bytes` matches key_dir | O(n) | test builds |
+| Every entry lies inside its file's committed extent (**P**) | O(n) | test builds |
+
+P is the invariant the mmap read path depends on — see *Offset
+containment* under **View and span lifetimes**. It is checked after
+`resume()` specifically because `resume()` is the operation that
+shortens a file that published offsets point into.
 
 On violation: throws `std::runtime_error`. The DB does not open or
 `resume()` fails. This is intentional — if recovery produces
@@ -717,8 +727,13 @@ are complete on disk, and the scan that establishes a committed extent
 stops at the first incomplete or corrupt entry, which is always past
 everything already published. P is what lets `resume()` shorten the
 active file under a live reader without taking anything away from it.
-P is currently an argument, not a checked invariant — #108 tracks
-asserting it at state publication.
+
+Test builds check P rather than assume it: `validate_state_consistency`
+verifies that every published entry ends at or before its file's
+`total_bytes`, on the state published by `DB::open()` and by `resume()`
+— the latter being the operation that moves a committed extent
+downwards. It is not checked on every publication; rotation and vacuum
+publish without it.
 
 ### Sealed `MAP_PRIVATE` versus active `MAP_SHARED`
 

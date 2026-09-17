@@ -3453,8 +3453,22 @@ void DB::validate_state_consistency(const EngineState &s) const {
           "state consistency: key references file_id {} not in registry",
           entry.file_id())};
     }
-    computed_live[entry.file_id()] +=
-        entry_size(key_span.size(), entry.value_size());
+    // Offset containment: a published entry must lie inside the committed
+    // extent of the file it names. This is what lets resume() shorten the
+    // active file under lock-free readers — with use_mmap the mapping stays
+    // put and only mmap_end_ moves, so an entry above the new extent would
+    // leave a reader's span addressing a page beyond EOF. See "View and span
+    // lifetimes" in CONTRACT.md.
+    const auto size = entry_size(key_span.size(), entry.value_size());
+    const auto entry_end = entry.file_offset() + size;
+    if (const auto *fs = s.file_stats.get(entry.file_id());
+        fs != nullptr && entry_end > fs->total_bytes) {
+      throw std::runtime_error{std::format(
+          "state consistency: key in file_id {} ends at {} but the file's "
+          "committed extent is {}",
+          entry.file_id(), entry_end, fs->total_bytes)};
+    }
+    computed_live[entry.file_id()] += size;
     if (entry.sequence() > max_seq) max_seq = entry.sequence();
   }
 
