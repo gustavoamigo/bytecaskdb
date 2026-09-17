@@ -122,7 +122,7 @@ ceiling 65,535 from the u16 wire field). The layout has to admit a key of
 |---|---|---|---|
 | D1 | Variant | B+ tree: values only in leaves, inner nodes hold suffix-truncated separators, **no sibling links** | Sibling links break structural sharing (updating a leaf would touch its neighbour). Iteration keeps a stack of `(node, index)` like today. |
 | D2 | Node shape | One slotted node: 32-byte header, node prefix, `u64` slot array growing up, entry heap growing down. A leaf entry is `V + key suffix`; an inner entry is `Node* + separator suffix`. `is_leaf` picks the payload size, nothing else differs. | One layout means one search, one insert, one erase, one pack, one clone. |
-| D3 | Node size | `kNodeBytes = 4096`, compile-time. A node is larger only when a single key needs it, and such a node holds exactly one entry. | 3 levels at 1M keys and 4 at 100M for 36-byte keys. Reads are the priority (§Performance). 2 KiB is the one alternative to benchmark (§Plan step 4). |
+| D3 | Node size | `kLeafBytes = kInnerBytes = 4096`, compile-time, two constants read from the per-node `capacity` field. A node is larger only when a single key needs it, and such a node holds exactly one entry. | 3 levels at 1M keys and 4 at 100M for 36-byte keys; every level removed is a DRAM round trip removed from every read. Smaller inner nodes (1 or 2 KiB) and 2 KiB leaves are the alternatives to benchmark (§Performance, §Plan step 4). |
 | D4 | Node prefix | Every key in a node shares `prefix_len` bytes, stored once. Recomputed on split and rebuild from the first and last key. | What keeps structured keys dense (§Memory) and makes heads discriminating. |
 | D5 | In-node search | 4-byte key heads in the high half of each `u64` slot; lower bound = count of slots below `head << 32`, a branch-free loop clang vectorises; ties resolved by full compare. | Avoids touching the heap for most keys and avoids branch mispredicts. No intrinsics unless `-Rpass=loop-vectorize` shows the loop is scalar. |
 | D6 | Deletion | Lazy: no rebalancing. An emptied node is unlinked and freed; the root collapses when it has one child. | A B+ tree stays correct at any fill. Sibling merge is a follow-up gated by the churn memory tests. |
@@ -493,30 +493,73 @@ interval rule bounds by what the snapshot reaches, as today.
 
 Stated before measuring so the benchmark can disagree.
 
-**Point lookup.** Three dependent node visits at 1M keys, four at 100M,
-against five to twelve for the radix tree on text keys (one per prefix
-chunk of 7 bytes plus one per branch). Each visit is a prefix compare, one
-pass over the slot array and usually one suffix compare: about three
-cache lines per level. Expect `Get` equal or better; the tree is a minor
-part of the 728 ns p50, most of which is the `pread`.
+**Point lookup.** The cost of a lookup is its chain of dependent cache
+misses, not the bytes it touches. The B+ tree's chain is three nodes at 1M
+keys and four at 100M. The top two levels are a few hundred to a few
+thousand nodes touched by every operation, so they stay in cache; what
+goes to DRAM is the leaf and, at 100M, the level above it. Inside a node
+the slot array is contiguous and prefetched, so a level costs about two
+dependent misses: the slots, then the one entry the head selected. That
+is 2 to 4 DRAM round trips per `get`. The radix tree's chain for a
+36-byte text key is 5 to 12 nodes (one per 7-byte prefix chunk plus one
+per branch), each a serialized miss into a node allocated nowhere near
+its siblings; its cached upper half does not shorten the cold lower half.
+Expect `Get` equal or better; the tree is a minor part of the 728 ns p50,
+most of which is the `pread`.
 
 **Single-key commit.** The path copy is three or four packed nodes of
-about 2.5 KiB each: 8 to 10 KiB of copy and four 4 KiB allocations,
-against a few 40 to 176 byte nodes today. About 0.3 µs more per commit.
-`Put/Sync` (7 ms per op) does not see it; `Put/NoSync` (7.5 µs per op) is
-expected 3 to 5% slower. This is the one row expected to regress and the
-gate allows it up to 5%.
+about 2.8 KiB each. The bytes are not the cost: a 2.8 KiB memcpy from
+cache is about 30 ns. The cost is the cold leaf, 44 contiguous lines the
+prefetcher streams from DRAM in 150 to 200 ns, plus three or four
+allocations. The radix tree pays the same random write as five to eight
+small clones, each a dependent miss into a cold node: the same 300 ns or
+more, spent in a chain of misses instead of a streaming copy. Expect
+`Put/NoSync` within noise and `Put/Sync` (7 ms per op) unaffected. The
+gate allows −5% on `Put/NoSync` as the bound for acting, not as the
+prediction.
+
+Where the size constants matter is the copy volume per commit, which is
+`depth × fill × node size`, for 36-byte keys and fill 0.69:
+
+| Leaf / inner size | Depth 1M / 100M | Copied per commit 1M / 100M |
+|---|---|---|
+| 4 KiB / 4 KiB (default) | 3 / 4 | 8.5 / 11.3 KiB |
+| 4 KiB / 2 KiB | 4 / 5 | 7.0 / 8.4 KiB |
+| 4 KiB / 1 KiB | 4 / 6 | 4.9 / 6.3 KiB |
+| 2 KiB / 2 KiB | 4 / 5 | 5.6 / 7.0 KiB |
+| 2 KiB / 1 KiB | 5 / 6 | 4.2 / 4.9 KiB |
+
+Copy volume scales as `size × log(N) / log(size)`, so smaller nodes help
+slowly, and every step adds one level to every read. The inner size is
+the cheaper lever: inner nodes are about 2% of nodes, so memory does not
+move, and `capacity` is already a per-node header field, so a second
+constant is not a second code path. The leaf size is the lever for
+batched random writes (below). Both stay constants and the step 4 matrix
+decides; the default is the read-first choice.
+
+**Allocation.** Nodes are allocated with plain `new` and freed with
+`delete`. A bounded freelist of whole nodes fed by reclamation (LMDB's
+page freelist, in memory) is the first thing to try if `Put/NoSync`
+misses its gate and `perf` attributes it to `malloc`/`free`, ahead of
+changing node sizes. It is not in the design until that measurement
+asks for it. An arena shared below node granularity is ruled out: it
+would bring per-entry lifetime back.
 
 **Batched writes.** After the first touch a node is owned and edited in
-place with a slot shift and an entry write. A batch of random keys copies
-one leaf per distinct leaf touched, about 2.5 KiB each; a batch of nearby
-keys copies almost nothing. Expect `MixedBatch`, `PutMT/Sync` and sysbench
+place with a slot shift and an entry write. Inner nodes are copied once
+per batch; a batch of random keys copies one leaf per distinct leaf
+touched, so the per-key cost is one cold leaf regardless of batch size,
+and the leaf size is what halves it. A batch of nearby keys copies almost
+nothing. Expect `MixedBatch`, `PutMT/Sync` and sysbench
 within noise of #86, and `TransientSet` in `map_bench` faster: no node
 promotion, no chain splitting.
 
-**Range scans.** Keys inside a leaf are adjacent; one leaf hop per 60
-keys. Expect `Range50` and `Iterate` well ahead. `LowerBound` ahead by the
-same argument as `Get`.
+**Range scans.** Keys inside a leaf are adjacent, one contiguous block
+read sequentially, with one hop per 60 keys. The radix DFS visits at
+least one scattered node per key. `Range50` gained 43% on the #86 branch
+from removing refcount traffic alone; the B+ tree removes the walk.
+Expect `Range50` and `Iterate` well ahead, `LowerBound` ahead by the same
+argument as `Get`.
 
 **Recovery.** Partition build per thread is an insert workload, roughly as
 today. The fan-in merge is the risk (§merge) and has its own row in the
@@ -608,8 +651,9 @@ against the baseline (`main` after #86 merges).
 | G6 | sysbench oltp_insert and oltp_write_only not worse than the #86 branch |
 | G7 | `btree.cppm` under 2,000 lines, no per-node-type dispatch anywhere |
 
-If G3's `Put/NoSync` or G2 fails, the 2 KiB node is tried before anything
-else is changed; it halves the copy per level and adds one level at 100M.
+If G3's `Put/NoSync` fails: first a node freelist if `perf` shows
+`malloc`/`free`, then a smaller inner node. If G2 fails: 2 KiB leaves.
+Each is one constant or one small class, tried one at a time.
 
 ## Plan
 
@@ -626,9 +670,10 @@ Each step is a reviewed commit with the suite green.
 
 ## Open questions
 
-1. **Node size.** 4 KiB is proposed for read depth; 2 KiB is the fallback
-   if the single-key write cost or memory misses its gate. Accept 4 KiB as
-   the default with the comparison in step 4?
+1. **Node sizes.** 4 KiB leaves and 4 KiB inner nodes are proposed for
+   read depth; 4K/1K and 2K/1K are in the step 4 matrix, judged on `Get`
+   at 10M keys and batched random writes together. Accept the default
+   with the comparison in step 4?
 2. **Lazy deletion.** No sibling merge in the first version. Accept, with
    the churn memory tests as the trigger for adding it?
 3. **Order with #86.** Merge #86 first and build on its chain (proposed),
