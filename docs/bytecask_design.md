@@ -1227,6 +1227,7 @@ for (auto& key : db.rkeys_from(opts, prefix))              { ... }
 - **`KeyIterator` is in-memory only**: walks the radix tree key directory without touching any data file.
 - **Error handling**: throws `std::system_error` on I/O failure.
 - **Self-anchored**: `EntryIterator` and `ReverseEntryIterator` each hold their own `shared_ptr<const EngineState>`, and `KeyIterator` holds the key-directory root it was built from. An iterator therefore keeps every data file it can reach open, and the subtree it walks immutable, independently of the `DB` and of the `Snapshot` it came from — which is why a span may outlive that `Snapshot` but never the iterator. The full per-event table is *View and span lifetimes* in [`CONTRACT.md`](../CONTRACT.md).
+- **Move-only (entry iterators)**: `EntryIterator` and `ReverseEntryIterator` cache the spans `operator*` returns, and on the `pread` path those spans address the iterator's own `io_buf_`. Copying would deep-copy the buffer while carrying the spans unchanged, leaving the copy pointing into the source's storage — so the copy operations are deleted and the hazard is a compile error rather than a comment. Moving is safe: the buffer travels with the spans. `ChangeIterator` is move-only for the same reason. `KeyIterator` materializes an owning `Key` and stays copyable, which `ReverseIterator<KeyIterator>` requires.
 
 ### WriteOptions and ReadOptions
 

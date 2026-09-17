@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <concepts>
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
 #endif
@@ -18,6 +19,7 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <random>
@@ -275,6 +277,42 @@ TEST_CASE("DB iter_from returns entries in ascending order",
   CHECK(values[0] == "av");
   CHECK(values[1] == "bv");
   CHECK(values[2] == "cv");
+}
+
+// ---------------------------------------------------------------------------
+// Entry iterators are move-only: operator* caches spans into the iterator's
+// own io_buf_, so a copy would carry spans addressing the source's storage.
+// Deleting the copy makes that unrepresentable instead of merely documented.
+// See "View and span lifetimes" in CONTRACT.md.
+// ---------------------------------------------------------------------------
+TEST_CASE("entry iterators are move-only and still model input_iterator",
+          "[bytecask]") {
+  static_assert(!std::copyable<bytecask::EntryIterator>);
+  static_assert(!std::copyable<bytecask::ReverseEntryIterator>);
+  static_assert(std::movable<bytecask::EntryIterator>);
+  static_assert(std::movable<bytecask::ReverseEntryIterator>);
+  static_assert(std::input_iterator<bytecask::EntryIterator>);
+  static_assert(std::input_iterator<bytecask::ReverseEntryIterator>);
+
+  // Key iterators materialize an owning Key, so a copy owns its own bytes
+  // and stays copyable — ReverseIterator<KeyIterator> needs that.
+  static_assert(std::copyable<bytecask::KeyIterator>);
+  static_assert(std::copyable<bytecask::ReverseKeyIterator>);
+
+  // A moved-from iterator hands its buffer to the destination, so spans
+  // taken before the move keep addressing live memory.
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("av"));
+
+  bytecask::ReadOptions ro;
+  auto range = db.iter_from(ro);
+  auto it = range.begin();
+  const auto value = (*it).value;
+  auto moved = std::move(it);
+  CHECK(to_string(value) == "av");
+  CHECK(to_string((*moved).value) == "av");
+  CHECK(value.data() == (*moved).value.data());
 }
 
 // ---------------------------------------------------------------------------

@@ -804,7 +804,7 @@ matters here.
 | Next `operator++()` | Invalid | The buffer is reused for the next entry |
 | Iterator destroyed | Invalid | The buffer goes with it |
 | Iterator moved | Valid | The buffer moves with the iterator; the span keeps addressing it |
-| Iterator copied after dereference | Invalid | Defect, tracked as #107 — the copy's spans address the source's buffer |
+| Iterator copied | Not possible | The iterators are move-only. A copy would carry spans addressing the source's buffer while deep-copying that buffer, so the copy is deleted rather than documented |
 
 #### `EntryView` spans, `use_mmap` on
 
@@ -825,7 +825,7 @@ the iterator's `io_buf_` otherwise. Both are covered below.
 | Next `operator++()` | Invalid | Same as above |
 | Iterator destroyed | Invalid | Same as above |
 | Iterator moved | Valid | Same as above |
-| Iterator copied after dereference | Invalid | #107, on the `pread` fallback path |
+| Iterator copied | Not possible | Move-only, same as above |
 
 #### `const Key&` from `keys_from` / `rkeys_from`
 
@@ -884,7 +884,11 @@ to the iterator, not to the snapshot. Destroying or moving the
 a scope where the `Snapshot` was a local.
 
 The reverse is not true: a span belongs to the iterator that produced
-it, and does not outlive it.
+it, and does not outlive it. That binding is enforced, not just stated:
+`EntryIterator`, `ReverseEntryIterator` and `ChangeIterator` are
+move-only, so a span can never be separated from the buffer it
+addresses by copying the iterator. Moving is safe — the buffer travels
+with the spans.
 
 ### `DB` destruction
 

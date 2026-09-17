@@ -296,6 +296,15 @@ public:
 
   EntryIterator() = default;
 
+  // Move-only: operator* caches spans into io_buf_, and a copy would carry
+  // those spans while deep-copying the buffer they address — the copy would
+  // point into the source's storage. Moving is safe (the buffer moves with
+  // the spans). Same reasoning as ChangeIterator.
+  EntryIterator(const EntryIterator &) = delete;
+  auto operator=(const EntryIterator &) -> EntryIterator & = delete;
+  EntryIterator(EntryIterator &&) noexcept = default;
+  auto operator=(EntryIterator &&) noexcept -> EntryIterator & = default;
+
   EntryIterator(std::shared_ptr<const EngineState> state,
                 ValueIterator<KeyDirEntry> cur,
                 bool verify_checksums = true)
@@ -404,6 +413,14 @@ public:
   using difference_type = std::ptrdiff_t;
 
   ReverseEntryIterator() = default;
+
+  // Move-only for the same reason as EntryIterator — see there.
+  ReverseEntryIterator(const ReverseEntryIterator &) = delete;
+  auto operator=(const ReverseEntryIterator &)
+      -> ReverseEntryIterator & = delete;
+  ReverseEntryIterator(ReverseEntryIterator &&) noexcept = default;
+  auto operator=(ReverseEntryIterator &&) noexcept
+      -> ReverseEntryIterator & = default;
 
   ReverseEntryIterator(std::shared_ptr<const EngineState> state,
                        ReverseValueIterator<KeyDirEntry> cur,
