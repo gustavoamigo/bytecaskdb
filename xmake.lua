@@ -157,6 +157,12 @@ target("bytecask_tests")
         -- third_party/catch2_amalgamated/README.md.
         add_files("third_party/catch2_amalgamated/catch_amalgamated.cpp")
         add_includedirs("third_party/catch2_amalgamated")
+        -- xmake probes for a system "std"/"std.compat" module by scanning
+        -- GCC's bits/std.cc against this target's own cxflags. With
+        -- -nostdinc++ in effect (see apply_sanitizer), that probe can't find
+        -- GCC's headers and fatally errors instead of just warning "not
+        -- found" — the project doesn't use `import std;` at all, so skip it.
+        set_policy("build.c++.modules.std", false)
     else
         add_packages("catch2")
     end
