@@ -190,6 +190,10 @@ sysbench_args() {  # <threads>
   echo "--db-driver=mysql --mysql-host=127.0.0.1 --mysql-port=$PORT --mysql-socket=$SOCKET --mysql-user=root --mysql-db=sbtest --tables=1 --table_size=$ROWS --threads=$1 --report-interval=0 --mysql-ignore-errors=1180,1213"
 }
 
+cg_stat() {  # <field in memory.stat>
+  awk -v f="$1" '$1 == f {print $2}' "$CG/memory.stat" 2>/dev/null
+}
+
 engine_stat() {  # <counter name without the bytecask. prefix>
   mariadb --socket="$SOCKET" -u root -N -e "SHOW ENGINE BYTECASKDB STATUS" 2>/dev/null \
     | tr '\n' ' ' | grep -o "bytecask\.$1: [0-9]*" | awk '{print $2}'
@@ -253,11 +257,16 @@ run_engine() {  # <engine label>
       log "  $label $wl threads=$t (warm-up ${WARMUP}s, measure ${DURATION}s)"
       sysbench "$wl" $(sysbench_args "$t") --time="$WARMUP" run >/dev/null 2>&1
       h0=$(engine_stat pool_hits); m0=$(engine_stat pool_misses)
+      # Major faults are what swap actually costs: each one is a page read
+      # back from disk in the middle of a query. Sampled around the measured
+      # run only, so the warm-up's faults are not counted.
+      f0=$(cg_stat pgmajfault)
       out="$(sysbench "$wl" $(sysbench_args "$t") --time="$DURATION" run 2>&1)"
       tps="$(echo "$out" | grep "transactions:" | awk -F'[( ]+' '{print $4}')"
       avg="$(echo "$out" | grep "avg:" | tail -1 | awk '{print $2}')"
       p95="$(echo "$out" | grep "95th percentile:" | awk '{print $NF}')"
       h1=$(engine_stat pool_hits); m1=$(engine_stat pool_misses)
+      majf=$(( $(cg_stat pgmajfault) - ${f0:-0} ))
       hit=""
       if [[ -n $h1 && -n $m1 ]] && (( h1 - h0 + m1 - m0 > 0 )); then
         hit="$(echo "scale=4; ($h1 - $h0) / ($h1 - $h0 + $m1 - $m0)" | bc)"
@@ -270,7 +279,7 @@ run_engine() {  # <engine label>
         log "  [FAILED] $label $wl threads=$t"; echo "$out" | tail -5
         tps=0; avg=0; p95=0
       fi
-      echo "$label,$wl,$t,$ROWS,$MEM_LIMIT,$SWAP_LIMIT,$pool,${tps},${avg},${p95},${hit},${rss:-0},${cur:-0},${swp:-0},${oom:-0},$STARTUP_S" | tee -a "$OUT"
+      echo "$label,$wl,$t,$ROWS,$MEM_LIMIT,$SWAP_LIMIT,$pool,${tps},${avg},${p95},${hit},${rss:-0},${cur:-0},${swp:-0},${majf:-0},${oom:-0},$STARTUP_S" | tee -a "$OUT"
     done
   done
   stop_db
@@ -279,11 +288,11 @@ run_engine() {  # <engine label>
 build_bytecaskdb_plugin >/dev/null
 symlink_providers "$PLUGIN_DIR"
 
-echo "engine,workload,threads,rows,mem_limit_bytes,swap_limit,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,cgroup_swap_bytes,oom_kills,startup_s" > "$OUT"
+echo "engine,workload,threads,rows,mem_limit_bytes,swap_limit,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,cgroup_swap_bytes,major_faults,oom_kills,startup_s" > "$OUT"
 for e in ${ENGINES//,/ }; do run_engine "$e"; done
 
 echo
 log "=== Results (memory.max=$MEM_LIMIT, memory.swap.max=$SWAP_LIMIT, $ROWS rows) ==="
-printf "%-17s %-18s %4s %10s %8s %8s %6s %7s %7s %5s %6s\n" engine workload thr tps "avg ms" "p95 ms" "hit" "RSS MB" "swp MB" OOM "start"
-tail -n +2 "$OUT" | awk -F, '{printf "%-17s %-18s %4s %10.0f %8s %8s %6s %7d %7d %5s %5ss\n", $1, $2, $3, $8, $9, $10, ($11 == "" ? "-" : substr($11, 1, 5)), $12 / 1048576, $14 / 1048576, $15, $16}'
+printf "%-17s %-18s %4s %10s %8s %8s %6s %7s %7s %9s %4s %6s\n" engine workload thr tps "avg ms" "p95 ms" "hit" "RSS MB" "swp MB" "majf/tx" OOM "start"
+tail -n +2 "$OUT" | awk -F, -v dur="$DURATION" '{printf "%-17s %-18s %4s %10.0f %8s %8s %6s %7d %7d %9.2f %4s %5ss\n", $1, $2, $3, $8, $9, $10, ($11 == "" ? "-" : substr($11, 1, 5)), $12 / 1048576, $14 / 1048576, ($8 > 0 ? $15 / ($8 * dur) : 0), $16, $17}'
 log "Results saved to: $OUT"
