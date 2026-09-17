@@ -87,6 +87,11 @@ for tool in mariadbd mariadb sysbench sudo; do
 done
 sudo -n true 2>/dev/null || { echo "ERROR: passwordless sudo is required (cgroup, drop_caches)"; exit 1; }
 grep -qw memory /sys/fs/cgroup/cgroup.subtree_control || { echo "ERROR: cgroup v2 memory controller not enabled at the root"; exit 1; }
+if [[ $SWAP_LIMIT != 0 ]] && [[ -z "$(swapon --show --noheadings 2>/dev/null)" ]]; then
+  echo "ERROR: --swap-limit=$SWAP_LIMIT but the host has no active swap device; the limit would do nothing"
+  echo "       and anything over memory.max is an OOM kill. Enable swap (e.g. a swapfile) or use --swap-limit=0."
+  exit 1
+fi
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
@@ -153,7 +158,11 @@ CNF
     sleep 1; tries=$((tries + 1))
     if (( tries > 120 )) || ! kill -0 "$DB_PID" 2>/dev/null; then
       echo "ERROR: mariadbd ($engine/$backend) did not start; see $base/error.log"
-      tail -20 "$base/error.log"
+      if [[ -f $CG/memory.events ]] && (( $(awk '/^oom_kill /{print $2}' "$CG/memory.events") > 0 )); then
+        echo "       The cgroup OOM killer ended it: memory.max=$limit is below what recovery of the"
+        echo "       key directory needs (anonymous memory; ~50 bytes per key, and 2 keys per row here)."
+      fi
+      tail -5 "$base/error.log"
       exit 1
     fi
   done
