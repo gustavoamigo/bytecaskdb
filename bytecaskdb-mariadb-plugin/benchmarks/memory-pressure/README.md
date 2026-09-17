@@ -100,6 +100,15 @@ the server took to accept connections inside the cgroup; `recovery_ms` is the
 engine's own measurement of rebuilding the key directory, which is nearly all
 of it under a tight limit.
 
+## Findings
+
+[`FINDINGS.md`](FINDINGS.md) is the write-up of a full day of these runs:
+swap as a guardrail, the refcounted tree against the epoch tree under
+pressure, recovery thread counts, buffer pool against `mmap` and `pread`,
+and InnoDB at its best size on the same limit. [`experiments/`](experiments/)
+holds the drivers that produced each section and
+[`data/`](data/) the raw rows.
+
 ## Measured so far (4-vCPU Azure VM, 10 M rows, 3.2 GB of data files)
 
 `memory.max = 2.5 GiB`, no swap, 16 threads:
