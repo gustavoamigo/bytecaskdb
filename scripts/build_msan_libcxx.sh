@@ -41,11 +41,15 @@ echo "==> Using llvm-project branch $BRANCH"
 rm -rf "$SRC_DIR" "$BUILD_DIR"
 
 # Partial clone (no blobs until checkout) + sparse-checkout: llvm-project is
-# too large to clone in full just for libcxx/libcxxabi.
+# too large to clone in full just for libcxx/libcxxabi. `libc` is needed too —
+# libcxx's charconv implementation (from_chars/to_chars for floating point)
+# includes LLVM libc's header-only "shared" FP bit-manipulation helpers
+# (transitively, several more libc/src/__support and libc/hdr headers), even
+# though libc itself is never built.
 git clone --filter=blob:none --depth 1 --branch "$BRANCH" --no-checkout \
     https://github.com/llvm/llvm-project.git "$SRC_DIR"
 git -C "$SRC_DIR" sparse-checkout init --no-cone
-git -C "$SRC_DIR" sparse-checkout set cmake llvm/cmake llvm/utils/llvm-lit runtimes libcxx libcxxabi
+git -C "$SRC_DIR" sparse-checkout set cmake llvm/cmake llvm/utils/llvm-lit runtimes libcxx libcxxabi libc libc
 git -C "$SRC_DIR" checkout "$BRANCH"
 
 echo "==> Configuring libcxx/libcxxabi (MemoryWithOrigins)..."

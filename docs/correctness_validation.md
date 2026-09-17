@@ -788,7 +788,9 @@ positives — this is standard, documented MSan behavior, not specific to this
 project. `scripts/build_msan_libcxx.sh` builds an instrumented
 `libc++`/`libc++abi` from the `llvm-project` release branch matching the
 installed Clang's major version (sparse, shallow checkout of just
-`libcxx`/`libcxxabi`/`runtimes`) and installs it to `.msan-libcxx/`. CI caches
+`libcxx`/`libcxxabi`/`runtimes`/`libc` — the last only for header-only helpers
+`libcxx`'s `charconv` implementation pulls in, `libc` itself is never built)
+and installs it to `.msan-libcxx/`. CI caches
 this build (`actions/cache`, keyed on the script's contents) since it takes
 several minutes; it's idempotent locally too — reruns skip the build if the
 prefix is already populated.
