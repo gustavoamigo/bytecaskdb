@@ -47,6 +47,11 @@ lcov.info
 # Fuzz corpus (evolving; seed/ is committed, corpus/ is runtime-only)
 tests/fuzz/corpus/
 
+# MSan-instrumented libc++ build output (scripts/build_msan_libcxx.sh)
+.msan-libcxx/
+.msan-libcxx-src/
+.msan-libcxx-build/
+
 # Local MariaDB instance for plugin smoke tests
 .mariadb_local/
 

@@ -15,6 +15,10 @@ export CLANG_TARGET_TRIPLE
 CLANG_TARGET_TRIPLE="$(clang --print-target-triple)"
 echo "==> Clang target triple: $CLANG_TARGET_TRIPLE"
 
+if [ "$SANITIZER" = "memory" ]; then
+    bash "$SCRIPT_DIR/build_msan_libcxx.sh"
+fi
+
 echo "==> Configuring with -fsanitize=$SANITIZER..."
 xmake f --sanitizer="$SANITIZER" -m debug -y
 
@@ -39,6 +43,10 @@ elif [ "$SANITIZER" = "address" ]; then
     OPTS="halt_on_error=0 detect_leaks=1"
     export ASAN_OPTIONS="$OPTS"
     echo "    ASAN_OPTIONS=$OPTS"
+elif [ "$SANITIZER" = "memory" ]; then
+    OPTS="halt_on_error=0"
+    export MSAN_OPTIONS="$OPTS"
+    echo "    MSAN_OPTIONS=$OPTS"
 fi
 echo ""
 
