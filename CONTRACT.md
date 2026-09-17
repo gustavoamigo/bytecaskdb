@@ -607,6 +607,10 @@ that need it run in test builds only:
 | `live_bytes` matches key_dir | O(n) | test builds |
 | Every entry lies inside its file's committed extent (**P**) | O(n) | test builds |
 
+The same containment check runs in `store_state`'s debug walk, so it
+covers every publication — rotation and vacuum included — not only the
+two cold paths.
+
 P is the invariant the mmap read path depends on — see *Offset
 containment* under **View and span lifetimes**. It is checked after
 `resume()` specifically because `resume()` is the operation that
@@ -752,12 +756,12 @@ stops at the first incomplete or corrupt entry, which is always past
 everything already published. P is what lets `resume()` shorten the
 active file under a live reader without taking anything away from it.
 
-Test builds check P rather than assume it: `validate_state_consistency`
-verifies that every published entry ends at or before its file's
-`total_bytes`, on the state published by `DB::open()` and by `resume()`
-— the latter being the operation that moves a committed extent
-downwards. It is not checked on every publication; rotation and vacuum
-publish without it.
+Test builds check P rather than assume it, on every published state:
+`store_state` verifies that each entry ends at or before its file's
+`total_bytes` as part of the key-directory walk it already performs,
+and `validate_state_consistency` repeats the check at `DB::open()` and
+after `resume()` — the latter being the operation that moves a
+committed extent downwards.
 
 ### Sealed `MAP_PRIVATE` versus active `MAP_SHARED`
 
