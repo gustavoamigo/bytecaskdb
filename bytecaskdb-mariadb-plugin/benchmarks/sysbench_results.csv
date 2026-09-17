@@ -1,5 +1,0 @@
-engine,workload,threads,tps,qps,avg_lat_ms,p95_ms,err_per_s
-bytecaskdb,oltp_read_write,8,1490.16,29829.22,5.37,7.84,82
-innodb,oltp_read_write,8,1619.55,32390.91,4.94,7.43,0
-bytecaskdb,oltp_point_select,8,60134.53,60134.53,0.13,0.24,0
-innodb,oltp_point_select,8,57073.46,57073.46,0.14,0.25,0
