@@ -868,14 +868,66 @@ shape, is 1.5 to 2.6× slower. The append builder and range-parallel merge
 from the design are the follow-up, gated by the recovery rows of
 `engine_bench`.
 
+### Against the radix tree of PR #86
+
+`main`'s radix tree carries per-child reference counts; #86 removes them
+and is the fairer write baseline. Built from `radix-epoch-reclamation`
+with the same `TransientInsertBatch` added (branch
+`claude/pr86-map-bench-insert-batch`), run back to back with this branch's
+binary on the same host. `TransientInsertBatch` is the engine's write
+shape: a transient on an existing tree, a lookup then a set for each of
+100 new keys, publish.
+
+| Benchmark | N | Radix main | Radix #86 | B+ tree | B+ / #86 |
+|---|---:|---:|---:|---:|---:|
+| Get | 1000 | 40.5 ns | 41.7 ns | 69.3 ns | 1.66 |
+| Get | 10000 | 53.5 ns | 52.3 ns | 62.8 ns | 1.20 |
+| Get | 100000 | 67.4 ns | 61.6 ns | 98 ns | 1.59 |
+| Iterate | 1000 | 27.1 us | 16.2 us | 8.21e+03 ns | 0.51 |
+| Iterate | 10000 | 270 us | 164 us | 84.3 us | 0.52 |
+| LowerBound | 1000 | 209 ns | 113 ns | 132 ns | 1.17 |
+| LowerBound | 10000 | 247 ns | 136 ns | 128 ns | 0.94 |
+| LowerBound | 100000 | 299 ns | 147 ns | 167 ns | 1.14 |
+| PersistentSet | 1000 | 495 us | 325 us | 444 us | 1.37 |
+| PersistentSet | 10000 | 6.82e+03 us | 3.71e+03 us | 5.87e+03 us | 1.58 |
+| PersistentSet | 100000 | 9.75e+04 us | 5.19e+04 us | 6.05e+04 us | 1.17 |
+| SplitBuildMerge | 1000 | 133 us | 87.3 us | 240 us | 2.75 |
+| SplitBuildMerge | 10000 | 1.51e+03 us | 1.26e+03 us | 3.62e+03 us | 2.87 |
+| SplitBuildMerge | 100000 | 2.03e+04 us | 1.44e+04 us | 5.06e+04 us | 3.51 |
+| TransientGet | 1000 | 40.4 ns | 40.2 ns | 71.9 ns | 1.79 |
+| TransientGet | 10000 | 53.5 ns | 52.4 ns | 65.2 ns | 1.24 |
+| TransientGet | 100000 | 66.4 ns | 60.5 ns | 100 ns | 1.65 |
+| TransientInsertBatch | 1000 | 20.1 us | 15.1 us | 31.4 us | 2.08 |
+| TransientInsertBatch | 10000 | 22.6 us | 16.8 us | 28.3 us | 1.69 |
+| TransientInsertBatch | 100000 | 25.1 us | 19.4 us | 25.5 us | 1.31 |
+| TransientSet | 1000 | 116 us | 91.9 us | 131 us | 1.42 |
+| TransientSet | 10000 | 1.48e+03 us | 1.1e+03 us | 2.48e+03 us | 2.25 |
+| TransientSet | 100000 | 2.55e+04 us | 1.96e+04 us | 1.63e+04 us | 0.83 |
+| TransientSetPrefixed | 1000 | 212 us | 158 us | 117 us | 0.74 |
+| TransientSetPrefixed | 10000 | 2.33e+03 us | 1.6e+03 us | 1.29e+03 us | 0.81 |
+| TransientSetPrefixed | 100000 | 2.8e+04 us | 1.69e+04 us | 2.03e+04 us | 1.20 |
+| TransientUpdate | 1000 | 225 us | 157 us | 60.9 us | 0.39 |
+| TransientUpdate | 10000 | 2.48e+03 us | 1.65e+03 us | 1.01e+03 us | 0.61 |
+| TransientUpdate | 100000 | 3.04e+04 us | 2.11e+04 us | 1.15e+04 us | 0.54 |
+
+Against #86 the B+ tree is behind on inserting new keys: 1.2 to 1.6× on
+the one-version-per-key path and 1.3 to 2.1× on the batched path, with
+the gap narrowing as the tree grows. It is ahead on overwrites
+(`TransientUpdate`, 0.4 to 0.6×), on scans (0.5×) and on prefixed builds
+at small sizes, and level on `LowerBound`. Half of the batched-insert
+cost is the lookup that precedes each set, so the point-lookup gap is the
+write gap too; closing it is the next piece of tree work before the engine
+gates are run.
+
 ### Next steps
 
 1. Engine integration behind the `KeyDir` alias, `u32_map` on the B+ tree,
    full suite and `[model]` tests under ASAN and TSAN (plan step 2).
 2. Recovery merge (plan step 3), then `engine_bench`, `memory_profile` on
    the whole engine and sysbench against `main` (step 4).
-3. Point lookup: cut the per-level fixed cost, and try 2 KiB leaves for the
-   short-key shapes where the scan is longest.
+3. Point lookup, which also sets the insert cost against #86: cut the
+   per-level fixed cost, and try 2 KiB leaves for the short-key shapes
+   where the scan and the slot shift are longest.
 4. Remove the radix tree and update the documents (step 5).
 
 ## References
