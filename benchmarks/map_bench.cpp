@@ -280,6 +280,31 @@ template <typename A> void BM_TransientUpdate(benchmark::State &state) {
     benchmark::DoNotOptimize(A::transient_update(base, keys));
 }
 
+// The engine's write path: a transient on a large existing tree, a lookup
+// then a set for each key of a small batch of new keys, publish. Measures
+// the tree's share of a group commit, not a build from scratch.
+template <typename A> void BM_TransientInsertBatch(benchmark::State &state) {
+  constexpr std::size_t kBatch = 100;
+  auto n = static_cast<std::size_t>(state.range(0));
+  auto keys = A::make_keys(generate_uniform_keys(n));
+  auto base = A::transient_build(keys);
+  std::size_t next = n;
+  std::vector<std::string> batch(kBatch);
+  for (auto _ : state) {
+    state.PauseTiming();
+    for (auto &k : batch)
+      k = "key_" + std::to_string(next++);
+    state.ResumeTiming();
+    auto tr = base.transient();
+    for (std::size_t i = 0; i < kBatch; ++i) {
+      benchmark::DoNotOptimize(A::transient_get(tr, batch[i]));
+      tr.set(to_bytes(batch[i]), bytecask::KeyDirEntry::make(i, 0, 0, 0));
+    }
+    benchmark::DoNotOptimize(std::move(tr).persistent());
+  }
+  state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations() * kBatch));
+}
+
 template <typename A> void BM_Get(benchmark::State &state) {
   auto keys =
       A::make_keys(generate_uniform_keys(static_cast<std::size_t>(state.range(0))));
@@ -545,6 +570,7 @@ BENCHMARK(BM_Build<RTreeAdapter>)         ->Name("RadixTree/PersistentSet")     
 BENCHMARK(BM_TransientBuild<RTreeAdapter>)->Name("RadixTree/TransientSet")         SIZES;
 BENCHMARK(BM_TransientBuildPrefixed<RTreeAdapter>)->Name("RadixTree/TransientSetPrefixed") SIZES;
 BENCHMARK(BM_TransientUpdate<RTreeAdapter>)->Name("RadixTree/TransientUpdate")      SIZES;
+BENCHMARK(BM_TransientInsertBatch<RTreeAdapter>)->Name("RadixTree/TransientInsertBatch") SIZES;
 BENCHMARK(BM_Build<StdMapAdapter>)        ->Name("StdMap/Set")                     SIZES;
 
 // Memory footprint
@@ -595,6 +621,7 @@ BENCHMARK(BM_Build<BTreeAdapter>)         ->Name("BTree/PersistentSet")        S
 BENCHMARK(BM_TransientBuild<BTreeAdapter>)->Name("BTree/TransientSet")         SIZES;
 BENCHMARK(BM_TransientBuildPrefixed<BTreeAdapter>)->Name("BTree/TransientSetPrefixed") SIZES;
 BENCHMARK(BM_TransientUpdate<BTreeAdapter>)->Name("BTree/TransientUpdate")      SIZES;
+BENCHMARK(BM_TransientInsertBatch<BTreeAdapter>)->Name("BTree/TransientInsertBatch") SIZES;
 BENCHMARK(BM_MemoryFootprint<BTreeAdapter>)->Name("BTree/Memory")  SIZES;
 BENCHMARK(BM_Get<BTreeAdapter>)           ->Name("BTree/Get")            SIZES;
 BENCHMARK(BM_TransientGet<BTreeAdapter>)  ->Name("BTree/TransientGet")   SIZES;
