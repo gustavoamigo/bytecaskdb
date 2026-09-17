@@ -513,59 +513,76 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
   const auto first = offset / kPoolFrameBytes;
   const auto last = (offset + len - 1) / kPoolFrameBytes;
 
-  // Serve every frame from cache before touching the device, so a fully
-  // resident multi-frame read costs no I/O at all.
-  bool all_hit = true;
-  for (auto f = first; f <= last && all_hit; ++f) {
-    all_hit = copy_out(make_key(file_id, f), f, offset, len, dst);
-  }
-  if (all_hit) {
-    counters_.pool_hits.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-  counters_.pool_misses.fetch_add(1, std::memory_order_relaxed);
-
-  // One read of the frame-aligned extent, then admit each whole frame it
-  // covered. The caller's bytes come from this buffer, not from the frames:
-  // a frame admitted here can be evicted before we would copy out of it.
-  const auto extent_start = first * kPoolFrameBytes;
-  const auto extent_end =
-      std::min<std::uint64_t>((last + 1) * kPoolFrameBytes, file_size);
-  if (extent_end <= extent_start) {
-    pread_exact(file.buffered, dst, len, offset);
-    return;
-  }
-  const auto extent_len = static_cast<std::size_t>(extent_end - extent_start);
   // Thread-exit destructor is intentional; suppress the Clang diagnostic.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   thread_local AlignedScratch scratch;
 #pragma clang diagnostic pop
-  auto *buf = scratch.ensure(align_up(extent_len, kPoolFrameBytes));
-  if (file.direct < 0 || !pread_direct(file.direct, buf, extent_len, extent_start)) {
-    pread_exact(file.buffered, buf, extent_len, extent_start);
-  }
 
-  const auto copy_from = static_cast<std::size_t>(offset - extent_start);
-  if (copy_from + len > extent_len) {
-    throw std::system_error{
-        EIO, std::generic_category(),
-        std::format("BufferPool::read_at: file {} is shorter than the "
-                    "requested range [{}, {})",
-                    file_id, offset, offset + len)};
-  }
-  std::memcpy(dst, buf + copy_from, len);
+  // Reads frames [a, b] in one I/O, copies their overlap with the request
+  // into dst, and admits each whole frame. The caller's bytes come from the
+  // read buffer, not from the frames: a frame admitted here can be evicted
+  // before we would copy out of it.
+  const auto fill_run = [&](std::uint64_t a, std::uint64_t b) {
+    const auto run_start = a * kPoolFrameBytes;
+    const auto run_end =
+        std::min<std::uint64_t>((b + 1) * kPoolFrameBytes, file_size);
+    const auto from = std::max(offset, run_start);
+    const auto to = std::min<std::uint64_t>(offset + len, (b + 1) * kPoolFrameBytes);
+    if (run_end <= run_start) {  // entirely past the size we were given
+      pread_exact(file.buffered, dst + (from - offset),
+                  static_cast<std::size_t>(to - from), from);
+      return;
+    }
+    const auto run_len = static_cast<std::size_t>(run_end - run_start);
+    auto *buf = scratch.ensure(align_up(run_len, kPoolFrameBytes));
+    if (file.direct < 0 || !pread_direct(file.direct, buf, run_len, run_start)) {
+      pread_exact(file.buffered, buf, run_len, run_start);
+    }
+    if (to > run_end) {
+      throw std::system_error{
+          EIO, std::generic_category(),
+          std::format("BufferPool::read_at: file {} is shorter than the "
+                      "requested range [{}, {})",
+                      file_id, offset, offset + len)};
+    }
+    std::memcpy(dst + (from - offset), buf + (from - run_start),
+                static_cast<std::size_t>(to - from));
 
-  std::lock_guard<std::mutex> lk{mu_};
+    std::lock_guard<std::mutex> lk{mu_};
+    for (auto f = a; f <= b; ++f) {
+      const auto frame_start = f * kPoolFrameBytes;
+      // Only whole frames are admitted; a short tail frame stays uncached.
+      if (frame_start + kPoolFrameBytes > file_size) break;
+      if (admit(make_key(file_id, f), buf + (frame_start - run_start),
+                kPoolFrameBytes)) {
+        counters_.pool_fills.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  };
+
+  // Serve every resident frame from the pool and read only the runs of
+  // frames that are not. A value of many frames with one evicted costs one
+  // small read, not the whole value again — which matters exactly when
+  // values are large, since CLOCK evicts frames, not values.
+  bool any_miss = false;
+  bool in_run = false;
+  std::uint64_t run_start = 0;
   for (auto f = first; f <= last; ++f) {
-    const auto frame_start = f * kPoolFrameBytes;
-    // Only whole frames are admitted; a short tail frame stays uncached.
-    if (frame_start + kPoolFrameBytes > file_size) break;
-    if (admit(make_key(file_id, f), buf + (frame_start - extent_start),
-              kPoolFrameBytes)) {
-      counters_.pool_fills.fetch_add(1, std::memory_order_relaxed);
+    if (copy_out(make_key(file_id, f), f, offset, len, dst)) {
+      if (in_run) {
+        fill_run(run_start, f - 1);
+        in_run = false;
+      }
+    } else if (!in_run) {
+      run_start = f;
+      in_run = true;
+      any_miss = true;
     }
   }
+  if (in_run) fill_run(run_start, last);
+  (any_miss ? counters_.pool_misses : counters_.pool_hits)
+      .fetch_add(1, std::memory_order_relaxed);
 }
 
 void BufferPool::append_resident(std::uint32_t file_id, std::uint64_t offset,

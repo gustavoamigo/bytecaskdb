@@ -168,25 +168,26 @@ struct BufferPoolOptions {
 
 Without a limit the three back-ends are within a few percent of each other: MariaDB's SQL layer, not the value read, sets the pace on four vCPUs. Under the limit the page cache is the thing being reclaimed, and both `pread` and `mmap` lose 20–30 % on point selects and fall apart on the read-write mix, where the same memory also has to absorb the writes; `mmap` at 16 threads is a sixth of its unlimited throughput with a 117 ms p95. The pool keeps 84–90 % of its unlimited throughput, because the memory it uses is the memory it was given and the kernel has nothing of its to reclaim — the same reason InnoDB with its own buffer pool keeps 87 % of its throughput under the limit. Against InnoDB the pool-backed plugin is level on point selects and ahead on the write mix, mostly in the tail (p95 22 ms against 44 ms). Read-write is `fdatasync`-bound at ~1 ms per commit on this disk, which is why its absolute numbers are small everywhere.
 
-**Large values, where the design is supposed to win — and does not.** `scripts/run_pool_bench_cgroup.sh`: 5 000 keys × 2 MiB (10 GB on disk), so the key directory is ~250 KB and trivially resident, run inside a cgroup with `memory.max = 512 MiB` and no swap, every back-end started cold, Zipf(0.99), 4 000 gets. The pool rows are `O_DIRECT` fills only; a pool filled through the page cache under a limit is two caches and says nothing about the pool. Raw rows in `benchmarks/pool_bench_cgroup_results.csv`.
+**Large values.** `scripts/run_pool_bench_cgroup.sh`: 5 000 keys × 2 MiB (10 GB on disk), so the key directory is ~250 KB and trivially resident, run inside a cgroup with `memory.max = 512 MiB` and no swap, every back-end started cold, Zipf(0.99), 4 000 gets. The pool rows are `O_DIRECT` fills only; a pool filled through the page cache under a limit is two caches and says nothing about the pool. Raw rows in `benchmarks/pool_bench_cgroup_results.csv`.
 
-| back-end | cache | ops/s | p50 | p99 | hit ratio | page faults |
-|---|---:|---:|---:|---:|---:|---:|
-| `pread` | ~500 MiB page cache | **378** | **0.50 ms** | 34 ms | — | 0 |
-| pool | 448 MiB | 280 | 1.02 ms | 50 ms | 31 % | 0 |
-| pool | 256 MiB | 254 | 1.07 ms | 51 ms | 24 % | 0 |
-| pool | 128 MiB | 230 | 1.07 ms | 51 ms | 16 % | 0 |
-| `mmap` | ~500 MiB page cache | 26 | 68.6 ms | 84 ms | — | 1 047 411 |
+The first version of `read_at` lost this comparison, and the reason is worth keeping. A 2 MiB value is 512 frames, CLOCK evicts frames rather than values, and a value that had lost one frame was treated as a full miss: the whole 2 MiB was read again and all 512 frames re-admitted, evicting 511 more frames to make room for bytes the pool already held. `read_at` now serves every resident frame and reads only the runs that are missing; a one-frame loss is one 4 KiB read. Same dataset, same limit, before and after:
 
-The page cache wins by a third on throughput and 2× on hit latency, for three reasons that are all in this design:
+| back-end | cache | ops/s | p50 | p99 | hit ratio |
+|---|---:|---:|---:|---:|---:|
+| `pread` | ~500 MiB page cache | 378 | 0.5–1.1 ms | 34 ms | — |
+| pool, whole-value refill | 448 MiB | 280 | 1.02 ms | 50 ms | 31 % |
+| **pool, missing-runs refill** | 448 MiB | **399** | 1.17 ms | **18.7 ms** | 44 % |
+| pool, missing-runs refill | 256 MiB | 341 | 1.18 ms | 24.3 ms | 37 % |
+| pool, missing-runs refill | 128 MiB | 293 | 1.21 ms | 33.9 ms | 28 % |
+| `mmap` | ~500 MiB page cache | 26 | 68.6 ms | 84 ms | — |
 
-1. **Frame-granular eviction shreds large values.** A 2 MiB value is 512 frames. CLOCK walks the index, whose order is random with respect to values, so admitting one miss evicts 512 frames scattered across hundreds of *other* values, each now partially resident and therefore a full miss on its next read. 448 MiB holds 224 values and a value-granular cache of that size would hit about 60 % on this Zipf; the pool hits 31 %. The kernel's LRU gets the grouping for free, because pages read together sit together in its list and leave together. §9's "extent chaining" is not deferrable for large values.
-2. **The per-word copy is 2× a memcpy at megabyte sizes.** The relaxed 8-byte loads that make a hit data-race-free cost ~50 ns on a 512-byte value and ~0.5 ms on a 2 MiB one: 262 144 scalar loads the compiler will not vectorise, against one `copy_to_user`.
-3. **A single 2 MiB `O_DIRECT` read misses readahead pipelining**: 50 ms against 34 ms buffered on this virtual disk.
+At equal memory the pool now leads `pread` by 5 % on throughput — within this VM's run-to-run noise (`pread`'s own p50 moved 2× between runs) — and by 45 % on the tail, which is not noise. Three things remain on the pool's side of the ledger:
+
+1. **CLOCK still evicts frames, not values.** 448 MiB holds 224 values and a value-granular cache of that size would hit about 60 % on this Zipf; the pool hits 44 %, because a miss's 512 admissions evict frames scattered across other values in hash order. §9's extent chaining, or a frame size set near the value size, is what closes the rest.
+2. **The per-word copy is ~2× a memcpy at megabyte sizes.** The relaxed 8-byte loads that make a hit data-race-free cost ~50 ns on a 512-byte value and ~0.5 ms on a 2 MiB one: 262 144 scalar loads the compiler will not vectorise, against one `copy_to_user`.
+3. **A single 2 MiB `O_DIRECT` read misses readahead pipelining** on this virtual disk.
 
 `mmap` is unusable here at 26 ops/s: every 4 KiB page of every value faults separately under pressure.
-
-So the pool's case is the small-value one in §8 above, where it refuses to degrade; for large values a 4 KiB frame is the wrong unit. The fixes are §9's extent chaining, or a configurable frame size set near the value size, which collapses the 512 probes and the scattered evictions to one — a knob the first draft had and this version removed as unmeasured. It now has a measurement.
 
 ## 9. Not built
 

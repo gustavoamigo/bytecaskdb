@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <thread>
@@ -238,6 +239,69 @@ TEST_CASE("BufferPool: differential against pread under constant eviction",
   }
   // The point of the sizing: eviction must actually have run.
   CHECK(counters.pool_evictions.load() > 0);
+}
+
+// Bytes this process has passed through read(2)-family syscalls, cached or
+// not: the direct measure of what a read cost the pool in I/O.
+auto rchar() -> long long {
+  std::ifstream io{"/proc/self/io"};
+  std::string key;
+  long long value = 0;
+  while (io >> key >> value) {
+    if (key == "rchar:") return value;
+  }
+  return 0;
+}
+
+TEST_CASE("BufferPool: a partial miss reads only the missing frames",
+          "[buffer_pool]") {
+  // CLOCK evicts frames, not values, so a multi-frame value routinely loses
+  // one frame while the rest stay resident. Re-reading it must fetch the
+  // frames that are gone and no others; the first version re-read the whole
+  // value, which at 2 MiB a value was the difference between a 4 KiB read
+  // and a 2 MiB one on every partial miss.
+  ScratchFile file{1024 * 1024};
+  bytecask::Counters counters;
+  // ~64 frames; the oversize guard admits a value up to an eighth of that.
+  const std::size_t capacity = 64 * (bytecask::kPoolFrameBytes + 64);
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}, counters};
+  const auto frames = pool.frame_count();
+  REQUIRE(frames >= 32);
+
+  // V: eight whole frames at the start of the file.
+  constexpr std::size_t kVFrames = 8;
+  const std::size_t v_len = kVFrames * bytecask::kPoolFrameBytes;
+  std::vector<std::byte> v(v_len);
+  pool.read_at(1, file.fd(), 0, v_len, file.size(), v.data());
+  REQUIRE(counters.pool_fills.load() == kVFrames);
+
+  // Fill the rest of the pool with one frame each, then keep going so
+  // CLOCK evicts a good fraction of everything — including some of V.
+  std::vector<std::byte> one(16);
+  const auto singles = (frames - kVFrames) + frames * 3 / 8;
+  for (std::size_t i = 0; i < singles; ++i) {
+    const auto off = (kVFrames + 1 + i) * bytecask::kPoolFrameBytes;
+    pool.read_at(1, file.fd(), off, one.size(), file.size(), one.data());
+  }
+  REQUIRE(counters.pool_evictions.load() > 0);
+
+  const auto fills_before = counters.pool_fills.load();
+  const auto bytes_before = rchar();
+  std::fill(v.begin(), v.end(), std::byte{0});
+  pool.read_at(1, file.fd(), 0, v_len, file.size(), v.data());
+  const auto refilled = counters.pool_fills.load() - fills_before;
+  const auto bytes_read = rchar() - bytes_before;
+
+  CHECK(v == file.expected(0, v_len));
+  // The case this test exists for: some of V went, some stayed. If either
+  // bound fails, the eviction pattern changed and the counts below need
+  // re-tuning, not the pool.
+  REQUIRE(refilled >= 1);
+  REQUIRE(refilled < static_cast<std::int64_t>(kVFrames));
+  INFO("frames of V refilled: " << refilled << " of " << kVFrames);
+  // Only the missing frames were read (+ the /proc read that measured it).
+  CHECK(bytes_read <= refilled * static_cast<long long>(bytecask::kPoolFrameBytes) + 4096);
 }
 
 TEST_CASE("BufferPool: concurrent readers never observe a torn frame",
