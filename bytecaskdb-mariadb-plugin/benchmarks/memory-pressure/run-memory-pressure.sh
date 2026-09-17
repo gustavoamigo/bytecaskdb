@@ -190,7 +190,7 @@ engine_stat() {  # <counter name without the bytecask. prefix>
 
 prepare() {  # <storage engine> <base dir>
   local engine="$1" base="$2"
-  if [[ -f $base/prepared && $FRESH == 0 ]] && (( $(cat "$base/prepared") == ROWS )); then
+  if [[ -f $base/prepared && -d $base/data/sbtest && $FRESH == 0 ]] && (( $(cat "$base/prepared") == ROWS )); then
     log "$engine: reusing prepared data in $base ($ROWS rows)"
     return
   fi
