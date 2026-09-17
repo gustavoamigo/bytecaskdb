@@ -333,12 +333,13 @@ to callers. Degrading forces `resume()` before further writes are accepted;
 
 ## Proof Test Generator
 
-### apply_batch — 800 tests
+### apply_batch — 1116 tests
 
-800 generated Catch2 tests (`[prove]` tag) cover every valid
-(StateShape, PlanShape, FailureClass) combination for `apply_batch`.
-The scenario matrix is 8 state shapes × 17 plan shapes × 9 failure
-classes; 4 elimination rules reduce this to 800 valid tests.
+1116 generated Catch2 tests (`[prove]` tag) cover every valid
+(StateShape, PlanShape, FailureClass, Observer) combination for
+`apply_batch`. The scenario matrix is 8 state shapes × 17 plan shapes ×
+9 failure classes; 4 elimination rules reduce this to 800 observer-free
+cells, and the observer axis adds 316 more.
 
 #### State shapes
 
@@ -370,6 +371,76 @@ Shapes not currently covered: mid-vacuum (vacuum-in-flight during `apply_batch`)
 post-resume (DB that has been degraded and resumed), and multiple sealed files with
 cross-file tombstone interactions. These are deferred — the current shapes cover the
 structurally distinct starting conditions for the write path, with and without mmap.
+
+#### Observers
+
+Every other assertion in the matrix reads the DB *after* the transition,
+so the read path appears only as the oracle's instrument, never as the
+subject. An observer inverts that: it takes a view **before** the
+transition and checks it afterwards — once after `assert_delta`, and
+again after `assert_resumable`, so the view is checked across `resume()`
+as well as across the failure itself. What each view is owed is stated
+in *View and span lifetimes* in [`CONTRACT.md`](../CONTRACT.md); the
+observer is how a generated cell can act on it.
+
+| Observer | Acquired before the transition | Catches |
+|----------|-------------------------------|---------|
+| `none` | — | (every cell; the 800 observer-free cells) |
+| `held_value` | `get` into a `Bytes` kept alive | value-path invalidation |
+| `held_iter_span` | a span from `iter_from`, held across the call | #87, BC-122 |
+| `held_snapshot` | `db.snapshot()` kept open | pinned-file / vacuum interaction |
+| `second_instance` | a second `DB` open on the same thread | BC-243 |
+
+`assert_view_stable(held, expected)` is the check for the two span-based
+observers. It probes with `mincore` (via `tests/mapping_probe.h`) and
+then compares bytes. The byte comparison is what discriminates:
+`mmap(nullptr, …)` often returns the address `munmap` just released, so
+an unmap-and-remap can look identical to never having unmapped.
+
+Two elimination rules keep the axis affordable — a naive cross product
+would be 4000 cells:
+
+1. **An observer needs a transition that can disturb a view.** It is
+   crossed only where the failure class degrades (B1, B2, B3, C, F, G,
+   H — every cell that reaches `assert_resumable`, and through it
+   `resume()`'s truncate) or the state shape maps the active file.
+   Class A returns before any I/O, so `none` is the only observer there.
+2. **Two plan shapes carry the observers per (state, failure).** What a
+   transition does to a lent view is decided by the failure class and the
+   state shape — which file is written, whether it is mapped, whether
+   `resume()` truncates it — plus one property of the plan: whether its
+   write set touches the key being observed. So each (state, failure)
+   elects two representatives:
+
+   - **disjoint** — `multi_put`, which writes fresh keys `p0`/`p1` and
+     emits the `BulkBegin`/`BulkEnd` pair #87 was found in.
+   - **colliding** — `sequential_overwrite` (a put on `k0`), or
+     `causality_del_put` for classes needing two or more operations.
+     Every observer reads `k0`, so these are the cells where the
+     transition overwrites the very key being observed. That is what
+     makes `held_snapshot` assert isolation rather than mere survival —
+     after the write commits, `assert_delta` sees the new value and the
+     held snapshot must still return the old one — and what asserts that
+     a superseded entry's bytes stay put on an append-only file.
+
+   Everything else a plan shape varies — entry count, solo versus group
+   commit, guard vocabulary — is invisible to a held view, so crossing
+   all 17 with every observer would multiply the matrix without asking a
+   new question.
+
+Observers that read a key (`held_value`, `held_iter_span`,
+`held_snapshot`) also require a state shape that leaves one behind, so
+they skip `empty_db` and `deleted_key`.
+
+Reverting #90 — restoring the `munmap` / `mmap` in
+`WritableMmapDataFile::truncate` — makes 20 of these cells fail, every
+one of them on the byte comparison rather than only under ASan, and none
+by crashing. The `mincore` probe passes in all 20: `mmap` hands back the
+address `munmap` just released, which is exactly the blind spot that
+motivated comparing bytes. The
+`rotation_threshold_buffered` cells correctly keep passing: at
+`max_file_bytes = 1` every write rotates, so their span points into a
+sealed `MAP_PRIVATE` file that `truncate()` never touches.
 
 #### Plan shapes
 
@@ -694,13 +765,16 @@ I/O checkpoints:
 - `assert_consistent(db)` — validates five structural invariants:
   live_bytes matches key_dir, no dangling file references, active file
   exists, file_stats covers all files, next_lsn ahead of all sequences.
-  All five are properties of the published state. None concerns a view
-  the engine has lent to a reader, so no generated cell can currently
-  fail on one — see *View and span lifetimes* in `CONTRACT.md` for the
-  guarantees, and #103 for the observer axis that would assert them.
+  All five are properties of the published state; none concerns a view
+  the engine has lent to a reader. That is what the observer axis adds —
+  see *Observers* above, and *View and span lifetimes* in `CONTRACT.md`
+  for the guarantees it asserts.
 - `assert_delta(before, db, expected)` — validates key membership, LSN
   advancement, structural consistency, and degraded state against the
   reference model's expected delta.
+- `assert_view_stable(held, expected)` — the view handed out before the
+  transition still addresses live memory (`mincore`) and still holds the
+  bytes it had. Used by the `held_value` and `held_iter_span` observers.
 - `assert_resumable(db)` — calls `resume()` and verifies the engine clears
   the degraded flag and passes `assert_consistent`. Inserted immediately
   after `assert_delta` for all degraded failure classes (B1, B2, B3, C, F, G, H).
@@ -747,9 +821,10 @@ smoke-test the helpers themselves.
 ### Test coverage
 
 All nine failure classes for `apply_batch` (SUCCESS, A, B1, B2, B3, C,
-F, G, H) are covered by the 800 `[prove]` tests. Each class is exercised
+F, G, H) are covered by the 1116 `[prove]` tests. Each class is exercised
 across all valid (StateShape, PlanShape) combinations, with and without
-mmap.
+mmap, and — for every class that can disturb a lent view — against each
+of the four observers.
 
 All three resume failure classes (R1–R3) plus DOUBLE and CASCADE across
 all six degrade shapes (H, C, F, G and the two `_buffered` variants) are
@@ -766,7 +841,7 @@ are covered by the 178 `[prove_repl]` tests. All three manifest failure
 classes across 11 state shapes are covered by the 33 `[prove_manifest]`
 tests. Four elimination rules reduce the full matrix to 211 valid tests.
 
-Total generated proof tests: **1059**.
+Total generated proof tests: **1375**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:

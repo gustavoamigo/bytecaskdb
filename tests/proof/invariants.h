@@ -10,6 +10,7 @@
 #ifdef BYTECASK_TESTING
 
 #include <catch2/catch_test_macros.hpp>
+#include "mapping_probe.h"
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
@@ -151,6 +152,24 @@ inline void assert_delta(const Baseline &before, const DB &db,
 
   // Degraded state.
   CHECK(db.is_degraded() == expected.degraded);
+}
+
+// The view handed out before the transition still addresses live memory and
+// still holds the bytes it had.
+//
+// Comparing addresses is not enough: mmap(nullptr, ...) often returns the
+// address munmap just released, so an unmap-and-remap can look identical to
+// never having unmapped. mincore() answers whether the range is still mapped
+// at all; the byte comparison is what actually discriminates, because a
+// remapped region is mapped but need not hold the same file bytes at the
+// same offset. See "View and span lifetimes" in CONTRACT.md.
+inline void assert_view_stable(std::span<const std::byte> held,
+                               std::span<const std::byte> expected) {
+  REQUIRE(held.size() == expected.size());
+#ifndef __EMSCRIPTEN__
+  CHECK(is_mapped(held.data(), held.size()));
+#endif
+  CHECK(std::ranges::equal(held, expected));
 }
 
 // Calls resume() and verifies the engine recovers fully.

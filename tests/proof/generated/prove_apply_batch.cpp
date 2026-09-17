@@ -25,10 +25,12 @@ using bytecask::testing::assert_consistent;
 using bytecask::testing::assert_delta;
 using bytecask::testing::assert_recoverable;
 using bytecask::testing::assert_resumable;
+using bytecask::testing::assert_view_stable;
 using bytecask::testing::Baseline;
 using bytecask::testing::capture_baseline;
 using bytecask::testing::ExpectedDelta;
 using bytecask::testing::to_bytes;
+using bytecask::testing::to_string;
 
 struct TempDir {
   std::filesystem::path path;
@@ -447,6 +449,60 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_nothing_written", "[prove]")
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__empty_db__multi_put__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__empty_db__multi_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -478,6 +534,61 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_partial_write", "[prove]") {
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__multi_put__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected);
 }
@@ -517,6 +628,61 @@ TEST_CASE("prove__empty_db__multi_put__append_fails_after_full_write", "[prove]"
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__empty_db__multi_put__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__empty_db__multi_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -551,6 +717,60 @@ TEST_CASE("prove__empty_db__multi_put__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__empty_db__multi_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__empty_db__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -581,6 +801,62 @@ TEST_CASE("prove__empty_db__multi_put__commit_sync_fails", "[prove]") {
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__empty_db__multi_put__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -1792,6 +2068,60 @@ TEST_CASE("prove__empty_db__causality_del_put__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__empty_db__causality_del_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__empty_db__causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -2928,6 +3258,59 @@ TEST_CASE("prove__empty_db__sequential_overwrite__append_fails_nothing_written",
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__empty_db__sequential_overwrite__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__empty_db__sequential_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -2958,6 +3341,60 @@ TEST_CASE("prove__empty_db__sequential_overwrite__append_fails_partial_write", "
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__sequential_overwrite__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected);
 }
@@ -2996,6 +3433,60 @@ TEST_CASE("prove__empty_db__sequential_overwrite__append_fails_after_full_write"
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__empty_db__sequential_overwrite__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__empty_db__sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -3025,6 +3516,61 @@ TEST_CASE("prove__empty_db__sequential_overwrite__commit_sync_fails", "[prove]")
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__empty_db__sequential_overwrite__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -3606,6 +4152,210 @@ TEST_CASE("prove__single_key__multi_put__append_fails_nothing_written", "[prove]
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__single_key__multi_put__append_fails_nothing_written__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__append_fails_nothing_written__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__append_fails_nothing_written__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__single_key__multi_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -3638,6 +4388,214 @@ TEST_CASE("prove__single_key__multi_put__append_fails_partial_write", "[prove]")
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__append_fails_partial_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__append_fails_partial_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__append_fails_partial_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected);
 }
@@ -3678,6 +4636,214 @@ TEST_CASE("prove__single_key__multi_put__append_fails_after_full_write", "[prove
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__single_key__multi_put__append_fails_after_full_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__append_fails_after_full_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__append_fails_after_full_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__single_key__multi_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -3713,6 +4879,210 @@ TEST_CASE("prove__single_key__multi_put__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__single_key__multi_put__on_bulk_end_append__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__on_bulk_end_append__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__on_bulk_end_append__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__multi_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__single_key__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -3744,6 +5114,218 @@ TEST_CASE("prove__single_key__multi_put__commit_sync_fails", "[prove]") {
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__single_key__multi_put__commit_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__single_key__multi_put__commit_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__single_key__multi_put__commit_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__single_key__multi_put__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -4995,6 +6577,210 @@ TEST_CASE("prove__single_key__causality_del_put__on_bulk_end_append", "[prove]")
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__single_key__causality_del_put__on_bulk_end_append__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__causality_del_put__on_bulk_end_append__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__causality_del_put__on_bulk_end_append__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__causality_del_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__single_key__causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -6164,6 +7950,206 @@ TEST_CASE("prove__single_key__sequential_overwrite__append_fails_nothing_written
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__single_key__sequential_overwrite__append_fails_nothing_written__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__append_fails_nothing_written__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__append_fails_nothing_written__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__single_key__sequential_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -6195,6 +8181,210 @@ TEST_CASE("prove__single_key__sequential_overwrite__append_fails_partial_write",
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__append_fails_partial_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__append_fails_partial_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__append_fails_partial_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected);
 }
@@ -6234,6 +8424,210 @@ TEST_CASE("prove__single_key__sequential_overwrite__append_fails_after_full_writ
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__single_key__sequential_overwrite__append_fails_after_full_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__append_fails_after_full_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__append_fails_after_full_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__single_key__sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -6264,6 +8658,214 @@ TEST_CASE("prove__single_key__sequential_overwrite__commit_sync_fails", "[prove]
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__commit_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__commit_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__commit_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__single_key__sequential_overwrite__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -6958,6 +9560,246 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_nothing_written", "[prov
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__populated_db__multi_put__append_fails_nothing_written__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__append_fails_nothing_written__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__append_fails_nothing_written__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__populated_db__multi_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -6999,6 +9841,250 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_partial_write", "[prove]
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__append_fails_partial_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__append_fails_partial_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__append_fails_partial_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected);
 }
@@ -7048,6 +10134,250 @@ TEST_CASE("prove__populated_db__multi_put__append_fails_after_full_write", "[pro
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__populated_db__multi_put__append_fails_after_full_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__append_fails_after_full_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__append_fails_after_full_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__populated_db__multi_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -7092,6 +10422,246 @@ TEST_CASE("prove__populated_db__multi_put__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__populated_db__multi_put__on_bulk_end_append__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__on_bulk_end_append__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__on_bulk_end_append__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__multi_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__populated_db__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -7132,6 +10702,254 @@ TEST_CASE("prove__populated_db__multi_put__commit_sync_fails", "[prove]") {
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__populated_db__multi_put__commit_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__populated_db__multi_put__commit_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__populated_db__multi_put__commit_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__populated_db__multi_put__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -8698,6 +12516,246 @@ TEST_CASE("prove__populated_db__causality_del_put__on_bulk_end_append", "[prove]
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__populated_db__causality_del_put__on_bulk_end_append__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__causality_del_put__on_bulk_end_append__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__causality_del_put__on_bulk_end_append__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__causality_del_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__populated_db__causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -10164,6 +14222,242 @@ TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_nothing_writt
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_nothing_written__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_nothing_written__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_nothing_written__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -10204,6 +14498,246 @@ TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_partial_write
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_partial_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_partial_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_partial_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected);
 }
@@ -10252,6 +14786,246 @@ TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_after_full_wr
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_after_full_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_after_full_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_after_full_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__populated_db__sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -10291,6 +15065,250 @@ TEST_CASE("prove__populated_db__sequential_overwrite__commit_sync_fails", "[prov
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__commit_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__commit_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__commit_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__populated_db__sequential_overwrite__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -11062,6 +16080,210 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_nothing_written", 
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
 }
 
+TEST_CASE("prove__rotation_threshold__multi_put__append_fails_nothing_written__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__append_fails_nothing_written__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__append_fails_nothing_written__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
 TEST_CASE("prove__rotation_threshold__multi_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -11094,6 +16316,214 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_partial_write", "[
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__append_fails_partial_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__append_fails_partial_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__append_fails_partial_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
 }
@@ -11134,6 +16564,214 @@ TEST_CASE("prove__rotation_threshold__multi_put__append_fails_after_full_write",
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
 }
 
+TEST_CASE("prove__rotation_threshold__multi_put__append_fails_after_full_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__append_fails_after_full_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__append_fails_after_full_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
 TEST_CASE("prove__rotation_threshold__multi_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -11169,6 +16807,210 @@ TEST_CASE("prove__rotation_threshold__multi_put__on_bulk_end_append", "[prove]")
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
 }
 
+TEST_CASE("prove__rotation_threshold__multi_put__on_bulk_end_append__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__on_bulk_end_append__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__on_bulk_end_append__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
 TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -11200,6 +17042,218 @@ TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails", "[prove]") 
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -11243,6 +17297,218 @@ TEST_CASE("prove__rotation_threshold__multi_put__rotation_sync_fails", "[prove]"
   // the in-process recovery path.
 }
 
+TEST_CASE("prove__rotation_threshold__multi_put__rotation_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__rotation_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__rotation_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__rotation_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
 TEST_CASE("prove__rotation_threshold__multi_put__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -11274,6 +17540,210 @@ TEST_CASE("prove__rotation_threshold__multi_put__rotation_file_creation_fails", 
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__rotation_file_creation_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__rotation_file_creation_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__rotation_file_creation_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__multi_put__rotation_file_creation_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
 }
@@ -12889,6 +19359,210 @@ TEST_CASE("prove__rotation_threshold__causality_del_put__on_bulk_end_append", "[
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
 }
 
+TEST_CASE("prove__rotation_threshold__causality_del_put__on_bulk_end_append__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__causality_del_put__on_bulk_end_append__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__causality_del_put__on_bulk_end_append__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__causality_del_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
 TEST_CASE("prove__rotation_threshold__causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -14494,6 +21168,206 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_nothing
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
 }
 
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_nothing_written__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_nothing_written__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_nothing_written__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
 TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -14525,6 +21399,210 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_partial
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_partial_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_partial_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_partial_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
 }
@@ -14564,6 +21642,210 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_after_f
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
 }
 
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_after_full_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_after_full_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_after_full_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
 TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -14594,6 +21876,214 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails", 
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -14636,6 +22126,214 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__rotation_sync_fails"
   // the in-process recovery path.
 }
 
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__rotation_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__rotation_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__rotation_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__rotation_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
 TEST_CASE("prove__rotation_threshold__sequential_overwrite__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -14666,6 +22364,206 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__rotation_file_creati
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__rotation_file_creation_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__rotation_file_creation_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__rotation_file_creation_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__sequential_overwrite__rotation_file_creation_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
 }
@@ -15332,6 +23230,62 @@ TEST_CASE("prove__deleted_key__multi_put__append_fails_nothing_written", "[prove
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__deleted_key__multi_put__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__deleted_key__multi_put__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -15365,6 +23319,63 @@ TEST_CASE("prove__deleted_key__multi_put__append_fails_partial_write", "[prove]"
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__multi_put__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected);
 }
@@ -15406,6 +23417,63 @@ TEST_CASE("prove__deleted_key__multi_put__append_fails_after_full_write", "[prov
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__deleted_key__multi_put__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__deleted_key__multi_put__on_bulk_end_append", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -15442,6 +23510,62 @@ TEST_CASE("prove__deleted_key__multi_put__on_bulk_end_append", "[prove]") {
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__deleted_key__multi_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__deleted_key__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -15474,6 +23598,64 @@ TEST_CASE("prove__deleted_key__multi_put__commit_sync_fails", "[prove]") {
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__deleted_key__multi_put__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -16760,6 +24942,62 @@ TEST_CASE("prove__deleted_key__causality_del_put__on_bulk_end_append", "[prove]"
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__deleted_key__causality_del_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__deleted_key__causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -17962,6 +26200,61 @@ TEST_CASE("prove__deleted_key__sequential_overwrite__append_fails_nothing_writte
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__deleted_key__sequential_overwrite__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__deleted_key__sequential_overwrite__append_fails_partial_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -17994,6 +26287,62 @@ TEST_CASE("prove__deleted_key__sequential_overwrite__append_fails_partial_write"
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__sequential_overwrite__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected);
 }
@@ -18034,6 +26383,62 @@ TEST_CASE("prove__deleted_key__sequential_overwrite__append_fails_after_full_wri
   assert_recoverable(dir, before, expected);
 }
 
+TEST_CASE("prove__deleted_key__sequential_overwrite__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected);
+}
+
 TEST_CASE("prove__deleted_key__sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18065,6 +26470,63 @@ TEST_CASE("prove__deleted_key__sequential_overwrite__commit_sync_fails", "[prove
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__deleted_key__sequential_overwrite__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -18644,6 +27106,186 @@ TEST_CASE("prove__single_key_buffered__multi_put__success", "[prove]") {
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__success__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__success__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__success__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__success__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__multi_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18675,6 +27317,218 @@ TEST_CASE("prove__single_key_buffered__multi_put__append_fails_nothing_written",
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__append_fails_nothing_written__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__append_fails_nothing_written__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__append_fails_nothing_written__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
@@ -18719,6 +27573,222 @@ TEST_CASE("prove__single_key_buffered__multi_put__append_fails_partial_write", "
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__append_fails_partial_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__append_fails_partial_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__append_fails_partial_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__multi_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18751,6 +27821,222 @@ TEST_CASE("prove__single_key_buffered__multi_put__append_fails_after_full_write"
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__append_fails_after_full_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__append_fails_after_full_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__append_fails_after_full_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
@@ -18794,6 +28080,218 @@ TEST_CASE("prove__single_key_buffered__multi_put__on_bulk_end_append", "[prove]"
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__on_bulk_end_append__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__on_bulk_end_append__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__on_bulk_end_append__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -18825,6 +28323,226 @@ TEST_CASE("prove__single_key_buffered__multi_put__commit_sync_fails", "[prove]")
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__commit_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__commit_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__commit_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__multi_put__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -20148,6 +29866,218 @@ TEST_CASE("prove__single_key_buffered__causality_del_put__on_bulk_end_append", "
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__causality_del_put__on_bulk_end_append__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__causality_del_put__on_bulk_end_append__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__causality_del_put__on_bulk_end_append__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__causality_del_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21347,6 +31277,182 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__success", "[prove]"
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__success__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__success__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__success__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__success__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21377,6 +31483,214 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_nothin
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_nothing_written__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_nothing_written__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_nothing_written__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
@@ -21420,6 +31734,218 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_partia
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_partial_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_partial_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_partial_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21457,6 +31983,218 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_after_
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_after_full_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_after_full_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_after_full_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_buffered__sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -21487,6 +32225,222 @@ TEST_CASE("prove__single_key_buffered__sequential_overwrite__commit_sync_fails",
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__commit_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__commit_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__commit_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_buffered__sequential_overwrite__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -22171,6 +33125,222 @@ TEST_CASE("prove__populated_db_buffered__multi_put__success", "[prove]") {
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__success__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__success__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__success__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__success__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22211,6 +33381,254 @@ TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_nothing_written
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_nothing_written__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_nothing_written__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_nothing_written__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
@@ -22264,6 +33682,258 @@ TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_partial_write",
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_partial_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_partial_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_partial_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22305,6 +33975,258 @@ TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_after_full_writ
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_after_full_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_after_full_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_after_full_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
@@ -22357,6 +34279,254 @@ TEST_CASE("prove__populated_db_buffered__multi_put__on_bulk_end_append", "[prove
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__on_bulk_end_append__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__on_bulk_end_append__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__on_bulk_end_append__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -22397,6 +34567,262 @@ TEST_CASE("prove__populated_db_buffered__multi_put__commit_sync_fails", "[prove]
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__commit_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__commit_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__commit_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__multi_put__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -24035,6 +36461,254 @@ TEST_CASE("prove__populated_db_buffered__causality_del_put__on_bulk_end_append",
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__causality_del_put__on_bulk_end_append__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__causality_del_put__on_bulk_end_append__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__causality_del_put__on_bulk_end_append__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__causality_del_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25522,6 +38196,218 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__success", "[prove
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__success__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__success__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__success__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__success__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25561,6 +38447,250 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_noth
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_nothing_written__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_nothing_written__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_nothing_written__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.use_mmap = true});
 }
@@ -25613,6 +38743,254 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_part
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_partial_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_partial_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_partial_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25659,6 +39037,254 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_afte
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_after_full_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_after_full_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_after_full_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__populated_db_buffered__sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -25698,6 +39324,258 @@ TEST_CASE("prove__populated_db_buffered__sequential_overwrite__commit_sync_fails
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__commit_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__commit_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__commit_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_buffered__sequential_overwrite__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -26476,6 +40354,186 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__success", "[prove]") {
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__success__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__success__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__success__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__success__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26507,6 +40565,218 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_nothing_w
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_nothing_written__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_nothing_written__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_nothing_written__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
@@ -26551,6 +40821,222 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_partial_w
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_partial_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_partial_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_partial_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26583,6 +41069,222 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_after_ful
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_after_full_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_after_full_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_after_full_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
@@ -26626,6 +41328,218 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__on_bulk_end_append", "
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__on_bulk_end_append__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__on_bulk_end_append__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__on_bulk_end_append__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26657,6 +41571,226 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__commit_sync_fails", "[
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__commit_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__commit_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__commit_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -26704,6 +41838,226 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_sync_fails", 
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -26735,6 +42089,218 @@ TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_file_creation
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_file_creation_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_file_creation_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_file_creation_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__multi_put__rotation_file_creation_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0", "p1"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}, {"p1", "new1"}},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+    plan.put(to_bytes("p1"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
@@ -28442,6 +44008,218 @@ TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__on_bulk_end_ap
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__on_bulk_end_append__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__on_bulk_end_append__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__on_bulk_end_append__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__on_bulk_end_append__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__causality_del_put__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -30101,6 +45879,182 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__success", "
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__success__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__success__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__success__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__success__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_nothing_written", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -30131,6 +46085,214 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fail
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_nothing_written__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_nothing_written__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_nothing_written__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_nothing_written__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
@@ -30174,6 +46336,218 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fail
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_partial_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_partial_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_partial_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_partial_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_after_full_write", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -30211,6 +46585,218 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fail
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_after_full_write__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_after_full_write__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_after_full_write__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__append_fails_after_full_write__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__commit_sync_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -30241,6 +46827,222 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__commit_sync
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__commit_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__commit_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__commit_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__commit_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   // Recovery skipped: sync failed — page-cache bytes may survive
   // to resume() and be committed then. assert_resumable covers
@@ -30287,6 +47089,222 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_sy
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_sync_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_sync_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_sync_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_sync_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_file_creation_fails", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -30317,6 +47335,214 @@ TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_fi
 
     assert_delta(before, db, expected);
     assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_file_creation_fails__held_value", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    bytecask::Bytes obs_value;
+    REQUIRE(db.get({}, to_bytes("k0"), obs_value));
+    const bytecask::Bytes obs_value_at_acquire = obs_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_value — after the transition
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_value — after resume()
+    {
+      assert_view_stable(obs_value, obs_value_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_file_creation_fails__held_iter_span", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_range = db.iter_from({});
+    auto obs_it = obs_range.begin();
+    REQUIRE_FALSE(obs_it == std::default_sentinel);
+    const auto obs_span = (*obs_it).value;
+    const bytecask::Bytes obs_span_at_acquire{
+        obs_span.begin(), obs_span.end()};
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_iter_span — after the transition
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_iter_span — after resume()
+    {
+      assert_view_stable(obs_span, obs_span_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_file_creation_fails__held_snapshot", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    auto obs_snap = db.snapshot();
+    bytecask::Bytes obs_snap_value;
+    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));
+    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: held_snapshot — after the transition
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+    assert_resumable(db);
+    // observer: held_snapshot — after resume()
+    {
+      bytecask::Bytes obs_snap_now;
+      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));
+      CHECK(obs_snap_now == obs_snap_at_acquire);
+    }
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_buffered__sequential_overwrite__rotation_file_creation_fails__second_instance", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new0"}},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .use_mmap = true});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    TempDir obs_td;
+    auto obs_db = bytecask::DB::open(obs_td.path / "other");
+    obs_db.put({.sync = false}, to_bytes("other"),
+               to_bytes("other_value"));
+    bytecask::Bytes obs_other;
+    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));
+    REQUIRE(to_string(obs_other) == "other_value");
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    // observer: second_instance — after the transition
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
+    assert_resumable(db);
+    // observer: second_instance — after resume()
+    {
+      bytecask::Bytes obs_other_now;
+      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));
+      CHECK(to_string(obs_other_now) == "other_value");
+    }
   }
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .use_mmap = true});
 }
