@@ -12,7 +12,7 @@
 # Usage:
 #   ./run-memory-pressure.sh [--rows=N] [--mem-limit=BYTES] [--swap-limit=BYTES|max]
 #       [--pool-bytes=BYTES] [--engines=LIST] [--workloads=LIST] [--threads=LIST]
-#       [--warmup=S] [--time=S] [--data-root=DIR] [--fresh] [--out=FILE]
+#       [--warmup=S] [--time=S] [--start-timeout=S] [--data-root=DIR] [--fresh] [--out=FILE]
 #
 #   --engines    default bytecaskdb-pool,bytecaskdb-mmap,bytecaskdb-pread,innodb
 #   --rows       default 10 M: ~3.2 GB of ByteCaskDB data files plus ~1.1 GB of
@@ -28,6 +28,10 @@
 #                lets the kernel swap it instead, which is the slower failure.
 #                Only matters on a host that has swap configured.
 #   --pool-bytes default 512 MiB for bytecaskdb-pool; InnoDB gets 1.5 GiB.
+#   --start-timeout how long to wait for mariadbd to accept connections
+#                (default 900 s). Recovery of the key directory takes seconds
+#                with memory to spare and minutes once it is being swapped;
+#                the time it took is recorded per run as startup_s.
 #   --data-root  where the data directories live (default: this directory's
 #                results/). Prepared data is reused across runs and across the
 #                three ByteCaskDB back-ends; --fresh wipes it first.
@@ -47,6 +51,7 @@ WORKLOADS="oltp_point_select,oltp_read_only,oltp_write_only,oltp_read_write"
 THREADS="1,8,16"
 WARMUP=30
 DURATION=60
+START_TIMEOUT=900
 FRESH=0
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATA_ROOT="$SCRIPT_DIR/results"
@@ -66,6 +71,7 @@ for arg in "$@"; do
     --threads=*)    THREADS="${arg#*=}" ;;
     --warmup=*)     WARMUP="${arg#*=}" ;;
     --time=*)       DURATION="${arg#*=}" ;;
+    --start-timeout=*) START_TIMEOUT="${arg#*=}" ;;
     --data-root=*)  DATA_ROOT="${arg#*=}" ;;
     --out=*)        OUT="${arg#*=}" ;;
     --fresh)        FRESH=1 ;;
@@ -154,9 +160,10 @@ CNF
     echo $DB_PID | sudo tee "$CG/cgroup.procs" >/dev/null
   fi
   local tries=0
+  STARTUP_S=0
   while ! mariadb --socket="$SOCKET" -u root -e "SELECT 1" >/dev/null 2>&1; do
-    sleep 1; tries=$((tries + 1))
-    if (( tries > 120 )) || ! kill -0 "$DB_PID" 2>/dev/null; then
+    sleep 1; tries=$((tries + 1)); STARTUP_S=$tries
+    if (( tries > START_TIMEOUT )) || ! kill -0 "$DB_PID" 2>/dev/null; then
       echo "ERROR: mariadbd ($engine/$backend) did not start; see $base/error.log"
       if [[ -f $CG/memory.events ]] && (( $(awk '/^oom_kill /{print $2}' "$CG/memory.events") > 0 )); then
         echo "       The cgroup OOM killer ended it: memory.max=$limit is below what recovery of the"
@@ -239,6 +246,7 @@ run_engine() {  # <engine label>
   prepare "$engine" "$base"
   log "$label: starting under memory.max=$MEM_LIMIT"
   start_db "$engine" "$backend" "$pool" "$MEM_LIMIT" "$base"
+  log "$label: accepting connections after ${STARTUP_S}s"
   local wl t out tps avg p95 h0 m0 h1 m1 hit rss cur oom
   for wl in ${WORKLOADS//,/ }; do
     for t in ${THREADS//,/ }; do
@@ -262,7 +270,7 @@ run_engine() {  # <engine label>
         log "  [FAILED] $label $wl threads=$t"; echo "$out" | tail -5
         tps=0; avg=0; p95=0
       fi
-      echo "$label,$wl,$t,$ROWS,$MEM_LIMIT,$SWAP_LIMIT,$pool,${tps},${avg},${p95},${hit},${rss:-0},${cur:-0},${swp:-0},${oom:-0}" | tee -a "$OUT"
+      echo "$label,$wl,$t,$ROWS,$MEM_LIMIT,$SWAP_LIMIT,$pool,${tps},${avg},${p95},${hit},${rss:-0},${cur:-0},${swp:-0},${oom:-0},$STARTUP_S" | tee -a "$OUT"
     done
   done
   stop_db
@@ -271,11 +279,11 @@ run_engine() {  # <engine label>
 build_bytecaskdb_plugin >/dev/null
 symlink_providers "$PLUGIN_DIR"
 
-echo "engine,workload,threads,rows,mem_limit_bytes,swap_limit,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,cgroup_swap_bytes,oom_kills" > "$OUT"
+echo "engine,workload,threads,rows,mem_limit_bytes,swap_limit,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,cgroup_swap_bytes,oom_kills,startup_s" > "$OUT"
 for e in ${ENGINES//,/ }; do run_engine "$e"; done
 
 echo
 log "=== Results (memory.max=$MEM_LIMIT, memory.swap.max=$SWAP_LIMIT, $ROWS rows) ==="
-printf "%-17s %-18s %4s %10s %8s %8s %6s %7s %7s %5s\n" engine workload thr tps "avg ms" "p95 ms" "hit" "RSS MB" "swp MB" OOM
-tail -n +2 "$OUT" | awk -F, '{printf "%-17s %-18s %4s %10.0f %8s %8s %6s %7d %7d %5s\n", $1, $2, $3, $8, $9, $10, ($11 == "" ? "-" : substr($11, 1, 5)), $12 / 1048576, $14 / 1048576, $15}'
+printf "%-17s %-18s %4s %10s %8s %8s %6s %7s %7s %5s %6s\n" engine workload thr tps "avg ms" "p95 ms" "hit" "RSS MB" "swp MB" OOM "start"
+tail -n +2 "$OUT" | awk -F, '{printf "%-17s %-18s %4s %10.0f %8s %8s %6s %7d %7d %5s %5ss\n", $1, $2, $3, $8, $9, $10, ($11 == "" ? "-" : substr($11, 1, 5)), $12 / 1048576, $14 / 1048576, $15, $16}'
 log "Results saved to: $OUT"
