@@ -25,6 +25,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
+#include <utility>
 #include <span>
 #include <string>
 #include <vector>
@@ -189,6 +191,21 @@ void profile_index_only(const key_generators::KeyShape &shape, std::size_t n) {
                       static_cast<double>(st.entries),
                   static_cast<double>(st.capacity_bytes) /
                       static_cast<double>(st.entries));
+      std::map<std::uint32_t, std::size_t> hist;
+      for (auto c : st.leaf_counts)
+        ++hist[c];
+      std::vector<std::pair<std::size_t, std::uint32_t>> top;
+      for (const auto &[c, n_leaves] : hist)
+        top.emplace_back(n_leaves, c);
+      std::sort(top.rbegin(), top.rend());
+      std::printf("  splits by rule (outlier-last, outlier-first, seq-asc, seq-desc, balanced):");
+      for (auto &c : bytecask::btree_detail::split_rule_counts)
+        std::printf(" %lu", static_cast<unsigned long>(c.load()));
+      std::printf("\n");
+      std::printf("  leaf sizes (keys: leaves):");
+      for (std::size_t i = 0; i < std::min<std::size_t>(6, top.size()); ++i)
+        std::printf(" %u:%zu", top[i].second, top[i].first);
+      std::printf("\n");
     }
   }
   print_memory("after close");

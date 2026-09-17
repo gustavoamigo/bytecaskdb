@@ -91,6 +91,10 @@ template <typename V> void account_free() noexcept {}
 template <typename V> void account_retired(std::int64_t) noexcept {}
 #endif
 
+// Test-only: how many splits each rule decided (outlier-last, outlier-first,
+// sequential-ascending, sequential-descending, balanced).
+export inline std::atomic<std::uint64_t> split_rule_counts[5]{};
+
 constexpr auto align_up(std::size_t n, std::size_t a) noexcept -> std::size_t {
   return (n + a - 1) / a * a;
 }
@@ -209,10 +213,16 @@ template <typename V> struct Node {
   std::uint32_t dead_bytes{0}; // erased entries still occupying the heap
   std::uint32_t count{0};      // entries
   std::uint16_t prefix_len{0}; // bytes every key in the node shares
+  static constexpr std::uint16_t kNoLastPos = 0xFFFF;
+  static constexpr std::uint32_t kHints = 16;
+  static constexpr std::uint32_t kHintMinCount = 2 * (kHints + 1);
+
   std::uint16_t last_pos{kNoLastPos}; // where the last in-place insert went
   std::uint8_t is_leaf{1};
-
-  static constexpr std::uint16_t kNoLastPos = 0xFFFF;
+  // Heads sampled every count/(kHints+1) slots. A search scans the hints
+  // (64 bytes) to find the run of slots that can hold the key, then scans
+  // that run: a few slots instead of the whole array.
+  std::uint32_t hints[kHints]{};
 
   static constexpr std::size_t kAlign =
       std::max({alignof(V), alignof(void *), std::size_t{8}});
@@ -369,9 +379,21 @@ template <typename V> struct Node {
     const auto head = head_of(suf);
     const auto target = std::uint64_t{head} << 32;
     const auto *s = slots();
-    std::uint32_t pos = 0;
-    // Branch-free count; the compiler vectorises it.
-    for (std::uint32_t i = 0; i < count; ++i)
+    std::uint32_t lo = 0;
+    std::uint32_t hi = count;
+    if (count >= kHintMinCount) {
+      // Hints below the head are runs of slots entirely below the key; the
+      // first hint at or above it bounds the run that can hold it.
+      std::uint32_t k = 0;
+      for (std::uint32_t i = 0; i < kHints; ++i)
+        k += hints[i] < head ? 1u : 0u;
+      const auto dist = count / (kHints + 1);
+      lo = k == 0 ? 0 : k * dist + 1;
+      hi = k == kHints ? count : (k + 1) * dist + 1;
+    }
+    // Branch-free count over the run; the compiler vectorises it.
+    std::uint32_t pos = lo;
+    for (std::uint32_t i = lo; i < hi; ++i)
       pos += s[i] < target ? 1u : 0u;
     for (; pos < count && slot_head(s[pos]) == head; ++pos) {
       const auto c = compare_bytes(suffix(pos), suf);
@@ -404,6 +426,18 @@ template <typename V> struct Node {
     s[pos] = (std::uint64_t{head_of(suf)} << 32) | off;
     ++count;
     last_pos = pos < kNoLastPos ? static_cast<std::uint16_t>(pos) : kNoLastPos;
+    update_hints();
+  }
+
+  // Rebuilds the hints from the slot array. O(kHints); called after every
+  // change to the slot array.
+  void update_hints() noexcept {
+    if (count < kHintMinCount)
+      return;
+    const auto dist = count / (kHints + 1);
+    const auto *s = slots();
+    for (std::uint32_t i = 0; i < kHints; ++i)
+      hints[i] = slot_head(s[(i + 1) * dist]);
   }
 
   void remove_entry(std::uint32_t pos) noexcept {
@@ -417,6 +451,7 @@ template <typename V> struct Node {
     auto *s = slots();
     std::memmove(s + pos, s + pos + 1, (count - pos - 1) * kSlotBytes);
     --count;
+    update_hints();
   }
 
   template <typename F> void for_each_child(F &&f) const {
@@ -641,6 +676,7 @@ private:
       s[i] = (std::uint64_t{head_of({suf, len})} << 32) | off;
     }
     n->count = n_items;
+    n->update_hints();
     return n;
   }
 
@@ -664,6 +700,7 @@ private:
         fresh->heap_floor = node->heap_floor;
         fresh->first_child = node->first_child;
         fresh->last_pos = node->last_pos;
+        std::memcpy(fresh->hints, node->hints, sizeof(node->hints));
         discard(node);
         return fresh;
       }
@@ -675,6 +712,10 @@ private:
         },
         prefix);
     fresh->first_child = node->first_child;
+    // A rebuild keeps the entries and their order, so the sequential-insert
+    // evidence stays valid; losing it here made every prefix shrink on a
+    // filling node end in a balanced split.
+    fresh->last_pos = node->last_pos;
     discard(node);
     return fresh;
   }
@@ -753,18 +794,35 @@ private:
     //      (the previous in-place insert into this node tells);
     //   3. otherwise balanced by bytes.
     std::uint32_t m = 0;
+    std::size_t rule = 4;
     const auto p_all = common_prefix_length(item(0).key, item(total - 1).key);
     if (total >= 3 &&
         common_prefix_length(item(0).key, item(total - 2).key) >= p_all + 8) {
       m = total - 1;
+      rule = 0;
     } else if (total >= 3 &&
                common_prefix_length(item(1).key, item(total - 1).key) >=
                    p_all + 8) {
       m = 1;
+      rule = 1;
     } else if (node->last_pos != N::kNoLastPos && pos == node->last_pos + 1u) {
       m = pos; // ascending stream: the new entry starts the right node
+      rule = 2;
+      // Entries after the insert point that share far less with the new
+      // key than its predecessor does are another key family: give them a
+      // node of their own instead of carrying them along with the stream,
+      // which would leave a short node behind at every split.
+      if (pos >= 1 && pos + 1 < total) {
+        const auto with_prev =
+            common_prefix_length(item(pos - 1).key, item(pos).key);
+        const auto with_next =
+            common_prefix_length(item(pos).key, item(pos + 1).key);
+        if (with_next + 8 <= with_prev)
+          m = pos + 1;
+      }
     } else if (pos == 0 && node->last_pos == 0) {
       m = 1; // descending stream: the new entry ends the left node
+      rule = 3;
     } else {
       std::size_t sum = 0;
       for (std::uint32_t i = 0; i < total; ++i)
@@ -777,6 +835,11 @@ private:
       }
     }
     m = std::clamp<std::uint32_t>(m, 1, total - 1);
+#ifdef BYTECASK_TESTING
+    split_rule_counts[rule].fetch_add(1, std::memory_order_relaxed);
+#else
+    (void)rule;
+#endif
     N *left = nullptr;
     N *right = nullptr;
     if (leaf) {

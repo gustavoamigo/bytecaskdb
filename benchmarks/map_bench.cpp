@@ -302,7 +302,7 @@ template <typename A> void BM_TransientInsertBatch(benchmark::State &state) {
     }
     benchmark::DoNotOptimize(std::move(tr).persistent());
   }
-  state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations() * kBatch));
+  state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(kBatch));
 }
 
 template <typename A> void BM_Get(benchmark::State &state) {

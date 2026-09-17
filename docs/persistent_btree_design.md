@@ -738,10 +738,19 @@ There is no per-node-type dispatch anywhere.
   the consumption contract from #86 is not needed for it. It inserts through
   the ordinary `set`, so each key costs a descent; a dedicated append
   builder and the range-parallel recovery merge are still to do.
-- **In-node search** is the branch-free count over the slot array
-  (clang vectorises it at width 4, interleaved 4, on this host) followed by
-  the tie loop. A binary search over the heads for wide nodes was tried and
-  measured neutral, so it was not kept.
+- **In-node search** samples 16 heads per node into a `hints` array in the
+  header (64 bytes, the LeanStore technique the design mentions): the
+  hints locate the run of about `count/17` slots that can hold the key,
+  and only that run is scanned with the branch-free count (clang
+  vectorises it at width 4, interleaved 4). `perf` had put the full-array
+  scan at 35% of a lookup and 25% of an insert; a binary search over the
+  heads traded it for branch misses and measured neutral, the hints cut
+  lookups by 10 to 30%. A word-sized compare for short suffixes was tried
+  in the same round and made lookups 3× slower at small sizes; reverted.
+- **Split rules** grew from the two in the design to: outlier at either
+  end alone; sequential insert splits at the insert point, and hands a
+  foreign tail after the insert point its own node; balanced otherwise.
+  `last_pos` survives rebuilds. See the fill story below.
 - **Non-trivially-copyable values** (`std::shared_ptr<DataFile>` in the
   file registry) are supported: entries are copy-constructed and destroyed
   in place, never moved bitwise.
@@ -754,39 +763,53 @@ jemalloc heap delta. Bytes per key:
 
 | Key shape | Key | Fill | Leaf prefix / suffix | B+ tree | Radix | Ratio |
 |---|---:|---:|---:|---:|---:|---:|
-| uniform `key_N` | 5–10 | 0.60 | 7.3 / 2.8 | 55 | 48 | 1.14 |
-| incremental | 1–7 | 0.60 | 3.3 / 2.8 | 55 | 48 | 1.15 |
-| prefixed UUIDv7 | 42 | 0.63 | 42.0 / 2.5 | 53 | 45 | 1.18 |
-| uuidv7 text | 36 | 1.00 | 11.9 / 24.1 | 58 | 52 | 1.11 |
-| hash_prefixed | 24 | 0.51 | 21.3 / 2.7 | 65 | 53 | 1.23 |
-| binary | 8 | 0.72 | 3.9 / 4.1 | 46 | 45 | 1.01 |
-| zipfian | 5–27 | 0.71 | 23.9 / 3.9 | 47 | 53 | 0.88 |
-| clustered | 16 | 0.68 | 13.5 / 3.3 | 49 | 62 | 0.78 |
-| many_partitions | 13 | 0.67 | 4.6 / 8.4 | 61 | 83 | 0.74 |
-| uuidv7_binary | 16 | 1.00 | 5.0 / 11.0 | 41 | 80 | 0.51 |
+| uniform `key_N` | 5–10 | 0.60 | 7.3 / 2.8 | 57 | 48 | 1.18 |
+| incremental | 1–7 | 0.60 | 3.3 / 2.7 | 56 | 48 | 1.17 |
+| uuidv7 text | 36 | 1.00 | 11.9 / 24.1 | 58 | 52 | 1.12 |
+| binary | 8 | 0.71 | 3.9 / 4.1 | 47 | 45 | 1.05 |
+| prefixed UUIDv7 | 42 | 0.99 | 41.5 / 2.5 | 34 | 45 | 0.76 |
+| many_partitions | 13 | 0.67 | 4.6 / 8.4 | 63 | 83 | 0.76 |
+| zipfian | 5–27 | 0.95 | 23.3 / 4.1 | 35 | 53 | 0.66 |
+| hash_prefixed | 24 | 0.99 | 20.9 / 3.1 | 33 | 53 | 0.63 |
+| clustered | 16 | 0.99 | 13.3 / 3.4 | 33 | 62 | 0.53 |
+| uuidv7_binary | 16 | 0.99 | 5.0 / 11.0 | 42 | 80 | 0.52 |
 | uuidv4_binary | 16 | 0.70 | 1.0 / 15.0 | 71 | 139 | 0.51 |
-| sha256_bin | 32 | 0.69 | 1.0 / 31.0 | 95 | 299 | 0.32 |
-| uuidv4_text | 36 | 0.69 | 2.8 / 33.2 | 95 | 313 | 0.30 |
-| uuidv4_prefixed | 42 | 0.70 | 10.2 / 33.9 | 95 | 333 | 0.28 |
-| sha256_hex | 64 | 0.70 | 2.9 / 61.1 | 130 | 628 | 0.21 |
+| sha256_bin | 32 | 0.70 | 1.0 / 31.0 | 96 | 299 | 0.32 |
+| uuidv4_text | 36 | 0.70 | 2.8 / 33.2 | 96 | 313 | 0.31 |
+| uuidv4_prefixed | 42 | 0.70 | 10.2 / 33.8 | 96 | 333 | 0.29 |
+| sha256_hex | 64 | 0.70 | 2.9 / 61.1 | 133 | 628 | 0.21 |
 
 The radix column is the same index-only measurement, so the two are
 directly comparable (the estimate table earlier in this document used RSS
 figures from the radix design document, which are not).
 
-The first build measured `prefixed` at 127 B/key with leaves 28% full.
-Prefix truncation was working (42 of 44 bytes shared) but every leaf held
-32 keys. The cause: the shapes with several key families insert each
-family in ascending order, and the leaf receiving a family's stream also
-holds the first key of the next family, so its prefix is empty, its
-entries are three times larger, and it fills at 56 keys; a balanced split
-then leaves a 32-key half behind every time. This is the workload of
-several tables growing at once, which is what the MariaDB plugin does, so
-it had to be fixed in the split rather than dismissed as a benchmark
-artefact. Splitting the outlier off on its own gives the stream a leaf with
-the long prefix, and splitting at the insert point when inserts are
-sequential fills that leaf before moving on. Fill went from 0.15 to 0.68 on
-a synthetic probe and from 0.28 to 0.63 on `prefixed`.
+The first build measured `prefixed` at 127 B/key with leaves 28% full,
+and the fix took three rounds, each found by printing the leaf-size
+histogram and, in the end, logging every split:
+
+1. The leaf receiving one key family's ascending stream also holds the
+   first key of the next family, so its prefix is empty, its entries three
+   times larger, and it fills at 56 keys; every balanced split then leaves
+   a 32-key half behind. Split rules 1 and 2 (outlier isolation, split at
+   the insert point on sequential inserts) took this to 63% fill.
+2. A prefix-shrink rebuild (the hex counter rolling a digit) produced a
+   fresh node that had forgotten `last_pos`, so the next split on it was
+   balanced. `rebuild` now preserves `last_pos`; the entries and their
+   order are unchanged by a rebuild, so the evidence is still valid.
+3. The split log then showed the real residue: a leaf of 55 keys splitting
+   at position 31, thousands of times. A 24-key tail of the *next* family
+   was travelling along in the right node of every sequential split, and
+   each split abandoned a 31-key leaf. Rule 2 now checks whether the
+   entries after the insert point share far less with the new key than its
+   predecessor does, and if so gives them a node of their own. `prefixed`
+   went to 99% fill and 34 B/key, and `hash_prefixed`, `zipfian` and
+   `clustered`, which have the same structure, from 47–65 to 33–35.
+
+These shapes are the workload of several tables growing at once, which
+is what the MariaDB plugin does, so they had to be fixed in the split
+rather than dismissed as benchmark artefacts. A consequence to know about:
+a leaf filled by a sequential stream is 100% full, so a later random
+insert into it splits at once, as in any B-tree without a fill reserve.
 
 What remains on the structured shapes is the entry floor: a 16-byte value,
 a 2-byte length and a suffix, rounded to 8, plus an 8-byte slot, is 32
