@@ -85,7 +85,11 @@ One CSV row per engine × workload × thread count:
 
 `engine, workload, threads, rows, mem_limit_bytes, swap_limit, pool_bytes,
 tps, avg_ms, p95_ms, pool_hit_ratio, rss_bytes, cgroup_memory_bytes,
-cgroup_swap_bytes, oom_kills, startup_s`
+cgroup_swap_bytes, major_faults, oom_kills, startup_s`
+
+`major_faults` is how many pages the cgroup read back from swap during the
+measured run; divided by the transactions in it, that is the per-query cost of
+not being resident, and it is zero without swap.
 
 `tps` is sysbench's transactions per second (not the run total).
 `pool_hit_ratio` is empty for engines without a pool. `startup_s` is how long
