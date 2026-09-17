@@ -256,12 +256,13 @@ run_engine() {  # <engine label>
       fi
       rss="$(awk '/VmRSS/{print $2 * 1024}' "/proc/$DB_PID/status" 2>/dev/null)"
       cur="$(cat "$CG/memory.current" 2>/dev/null)"
+      swp="$(cat "$CG/memory.swap.current" 2>/dev/null)"
       oom="$(awk '/^oom_kill /{print $2}' "$CG/memory.events" 2>/dev/null)"
       if [[ -z $tps ]]; then
         log "  [FAILED] $label $wl threads=$t"; echo "$out" | tail -5
         tps=0; avg=0; p95=0
       fi
-      echo "$label,$wl,$t,$ROWS,$MEM_LIMIT,$SWAP_LIMIT,$pool,${tps},${avg},${p95},${hit},${rss:-0},${cur:-0},${oom:-0}" | tee -a "$OUT"
+      echo "$label,$wl,$t,$ROWS,$MEM_LIMIT,$SWAP_LIMIT,$pool,${tps},${avg},${p95},${hit},${rss:-0},${cur:-0},${swp:-0},${oom:-0}" | tee -a "$OUT"
     done
   done
   stop_db
@@ -270,11 +271,11 @@ run_engine() {  # <engine label>
 build_bytecaskdb_plugin >/dev/null
 symlink_providers "$PLUGIN_DIR"
 
-echo "engine,workload,threads,rows,mem_limit_bytes,swap_limit,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,oom_kills" > "$OUT"
+echo "engine,workload,threads,rows,mem_limit_bytes,swap_limit,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,cgroup_swap_bytes,oom_kills" > "$OUT"
 for e in ${ENGINES//,/ }; do run_engine "$e"; done
 
 echo
 log "=== Results (memory.max=$MEM_LIMIT, memory.swap.max=$SWAP_LIMIT, $ROWS rows) ==="
-printf "%-17s %-18s %4s %10s %8s %8s %6s %7s %5s\n" engine workload thr tps "avg ms" "p95 ms" "hit" "RSS MB" OOM
-tail -n +2 "$OUT" | awk -F, '{printf "%-17s %-18s %4s %10.0f %8s %8s %6s %7d %5s\n", $1, $2, $3, $8, $9, $10, ($11 == "" ? "-" : substr($11, 1, 5)), $12 / 1048576, $14}'
+printf "%-17s %-18s %4s %10s %8s %8s %6s %7s %7s %5s\n" engine workload thr tps "avg ms" "p95 ms" "hit" "RSS MB" "swp MB" OOM
+tail -n +2 "$OUT" | awk -F, '{printf "%-17s %-18s %4s %10.0f %8s %8s %6s %7d %7d %5s\n", $1, $2, $3, $8, $9, $10, ($11 == "" ? "-" : substr($11, 1, 5)), $12 / 1048576, $14 / 1048576, $15}'
 log "Results saved to: $OUT"
