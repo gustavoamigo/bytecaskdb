@@ -12,12 +12,19 @@ add_requires("benchmark", {optional = true})
 -- add_requires("leveldb", {optional = true})
 add_requires("rocksdb", {system = true, optional = true})
 
--- Sanitizer option: `xmake f --sanitizer=address` or `--sanitizer=thread`
+-- Sanitizer option: `xmake f --sanitizer=address`, `--sanitizer=thread`, or `--sanitizer=memory`
 option("sanitizer")
     set_default("")
     set_showmenu(true)
-    set_description("Enable sanitizer (address, thread, or empty to disable)")
+    set_description("Enable sanitizer (address, thread, memory, or empty to disable)")
 option_end()
+
+-- MemorySanitizer requires every translation unit — including the C++
+-- standard library — to be compiled with -fsanitize=memory, or MSan cannot
+-- track initialization state across the call and reports false positives.
+-- scripts/build_msan_libcxx.sh builds an instrumented libc++/libc++abi into
+-- this prefix; MSAN_LIBCXX_PREFIX overrides it (e.g. for a cached CI path).
+local msan_libcxx_prefix = os.getenv("MSAN_LIBCXX_PREFIX") or path.join(os.projectdir(), ".msan-libcxx")
 
 -- Coverage option: `xmake f --coverage=true`
 option("coverage")
@@ -62,6 +69,23 @@ local function apply_sanitizer(t)
         end
         if san == "address" then
             t:add("cxflags", "-fno-omit-frame-pointer", {force = true})
+        end
+        if san:find("memory", 1, true) then
+            -- Track allocation-site origins for actionable reports; see
+            -- docs/correctness_validation.md for the cost/benefit tradeoff.
+            t:add("cxflags", "-fsanitize-memory-track-origins=2", {force = true})
+            t:add("cxflags", "-stdlib=libc++", "-nostdinc++",
+                -- std::jthread/std::stop_token are gated behind this flag by
+                -- libc++ (still marked a Library TS-style "experimental"
+                -- feature upstream even though it's ISO C++20).
+                "-fexperimental-library",
+                "-isystem" .. path.join(msan_libcxx_prefix, "include", "c++", "v1"),
+                {force = true})
+            t:add("ldflags", "-stdlib=libc++", "-nostdlib++",
+                "-L" .. path.join(msan_libcxx_prefix, "lib"),
+                "-Wl,-rpath," .. path.join(msan_libcxx_prefix, "lib"),
+                "-lc++", "-lc++abi", "-lc++experimental",
+                {force = true})
         end
     end
 end
@@ -122,7 +146,20 @@ target("bytecask_tests")
     remove_files("tests/radix_tree_memory_test.cpp")
     remove_files("tests/bytecask_c_test.cpp")
     add_includedirs("bytecaskdb", "tests")
-    add_packages("catch2", "crc32c")
+    add_packages("crc32c")
+    if (get_config("sanitizer") or ""):find("memory", 1, true) then
+        -- The prebuilt catch2 package is compiled against the system's
+        -- default libstdc++; linking its libstdc++-mangled symbols into an
+        -- MSan binary built against libc++ fails at link time. Compiling
+        -- Catch2 from source as ordinary translation units of this target
+        -- puts it under the same -stdlib=libc++ invocation as everything
+        -- else, so there is no ABI boundary to cross. See
+        -- third_party/catch2_amalgamated/README.md.
+        add_files("third_party/catch2_amalgamated/catch_amalgamated.cpp")
+        add_includedirs("third_party/catch2_amalgamated")
+    else
+        add_packages("catch2")
+    end
     add_defines("BYTECASK_TESTING")
     on_config(function(t)
         add_native_syslinks(t)

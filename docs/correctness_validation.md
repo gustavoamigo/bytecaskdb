@@ -768,7 +768,53 @@ Concurrency code paths exercised:
 | Radix tree refcount | `atomic<uint32_t>` intrusive refcount |
 | Edit tag counter | `atomic<uint64_t>` relaxed fetch_add |
 
-Run: `scripts/run_sanitizer.sh thread` (or `address` for ASan).
+Run: `scripts/run_sanitizer.sh thread` (or `address` for ASan, `memory` for MSan).
+
+### MemorySanitizer (MSan)
+
+The full test suite runs clean under Clang MemorySanitizer with
+`-fsanitize-memory-track-origins=2` (full allocation-site origin tracking).
+MSan instruments every load at compile time and reports a use of any value
+that hasn't been written, catching bugs ASan and TSan don't: reads of
+uninitialized stack or heap memory that happen to produce a plausible-looking
+value on the current allocator/compiler/optimization level but are UB and can
+flip to garbage under a different build.
+
+**Why a custom libc++ is required**: MSan needs initialization state tracked
+through every call, including into the C++ standard library. The system's
+`libcxx-devel` package (used as-is by ASan and TSan above) is not built with
+`-fsanitize=memory`, and linking it into an MSan binary causes constant false
+positives — this is standard, documented MSan behavior, not specific to this
+project. `scripts/build_msan_libcxx.sh` builds an instrumented
+`libc++`/`libc++abi` from the `llvm-project` release branch matching the
+installed Clang's major version (sparse, shallow checkout of just
+`libcxx`/`libcxxabi`/`runtimes`) and installs it to `.msan-libcxx/`. CI caches
+this build (`actions/cache`, keyed on the script's contents) since it takes
+several minutes; it's idempotent locally too — reruns skip the build if the
+prefix is already populated.
+
+**Catch2 is compiled from source for this build only**: the prebuilt `catch2`
+xrepo package is compiled against the system's default libstdc++, and linking
+its libstdc++-mangled symbols into a `-stdlib=libc++` binary fails at link
+time (or worse, silently mismatches ABI, for symbols that happen to resolve).
+`third_party/catch2_amalgamated/` vendors Catch2's official amalgamated
+distribution (a single `.hpp`/`.cpp` pair); `bytecask_tests` compiles it
+directly as ordinary translation units — under the same `-stdlib=libc++
+-fsanitize=memory` flags as everything else — only when configured with
+`--sanitizer=memory`. Every other build configuration is unaffected and keeps
+using the normal `catch2` package.
+
+**Known reduced-sensitivity area**: `crc32c` (the only other linked
+dependency) is *not* rebuilt with MSan. Its public API takes only pointers
+and primitive integers — no standard-library types cross the boundary — so
+this doesn't cause false positives (LLVM's MSan treats a call into
+uninstrumented code as producing fully-initialized output by design); it just
+means bugs inside `crc32c` itself, if any, wouldn't be caught by this MSan
+run.
+
+Run: `scripts/run_sanitizer.sh memory`. Scope matches the ASan/TSan jobs
+above: `bytecask_tests` only, not `radix_tree_memory_tests` or
+`unordered_view_tests`.
 
 ### Fuzz testing (libFuzzer)
 
