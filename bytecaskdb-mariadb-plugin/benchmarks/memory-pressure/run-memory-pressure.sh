@@ -38,7 +38,14 @@
 #                count and inserts at random positions in the key directory —
 #                it drives both the memory pressure and the locality. Without
 #                it the same row count is half the keys, inserted in order.
-#   --pool-bytes default 512 MiB for bytecaskdb-pool; InnoDB gets 1.5 GiB.
+#   --pool-bytes default 512 MiB. Sets bytecaskdb_buffer_pool_size ONLY.
+#   --innodb-pool-bytes default 1.5 GiB. Sets innodb_buffer_pool_size. It is a
+#                separate knob because the two are not comparable: ByteCaskDB
+#                must hold every key resident and the pool is only its value
+#                cache, while InnoDB's buffer pool holds index and data
+#                together. Note InnoDB needs roughly 10 % above this for its
+#                own structures plus ~150 MB of server, so a value near
+#                --mem-limit puts the process over it.
 #   --start-timeout how long to wait for mariadbd to accept connections
 #                (default 900 s). Recovery of the key directory takes seconds
 #                with memory to spare and minutes once it is being swapped;
@@ -56,7 +63,7 @@ ROWS=10000000
 MEM_LIMIT=$((2560 * 1024 * 1024))
 SWAP_LIMIT=0
 POOL_BYTES=$((512 * 1024 * 1024))
-INNODB_POOL_BYTES=$((1536 * 1024 * 1024))
+INNODB_POOL_BYTES=$((1536 * 1024 * 1024))  # override with --innodb-pool-bytes
 ENGINES="bytecaskdb-pool,bytecaskdb-mmap,bytecaskdb-pread,innodb"
 WORKLOADS="oltp_point_select,oltp_read_only,oltp_write_only,oltp_read_write"
 THREADS="1,8,16"
@@ -79,6 +86,7 @@ for arg in "$@"; do
     --mem-limit=*)  MEM_LIMIT="${arg#*=}" ;;
     --swap-limit=*) SWAP_LIMIT="${arg#*=}" ;;
     --pool-bytes=*) POOL_BYTES="${arg#*=}" ;;
+    --innodb-pool-bytes=*) INNODB_POOL_BYTES="${arg#*=}" ;;
     --engines=*)    ENGINES="${arg#*=}" ;;
     --workloads=*)  WORKLOADS="${arg#*=}" ;;
     --threads=*)    THREADS="${arg#*=}" ;;
