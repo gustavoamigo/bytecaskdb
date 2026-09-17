@@ -12,7 +12,8 @@
 # Usage:
 #   ./run-memory-pressure.sh [--rows=N] [--mem-limit=BYTES] [--swap-limit=BYTES|max]
 #       [--pool-bytes=BYTES] [--engines=LIST] [--workloads=LIST] [--threads=LIST]
-#       [--warmup=S] [--time=S] [--start-timeout=S] [--data-root=DIR] [--fresh] [--out=FILE]
+#       [--warmup=S] [--time=S] [--start-timeout=S] [--recovery-threads=N]
+#       [--data-root=DIR] [--fresh] [--out=FILE]
 #
 #   --engines    default bytecaskdb-pool,bytecaskdb-mmap,bytecaskdb-pread,innodb
 #   --rows       default 10 M: ~3.2 GB of ByteCaskDB data files plus ~1.1 GB of
@@ -27,6 +28,11 @@
 #                exceeding the limit is an OOM kill; a byte count or `max`
 #                lets the kernel swap it instead, which is the slower failure.
 #                Only matters on a host that has swap configured.
+#   --recovery-threads threads replaying hint files at startup (default 4).
+#                Each builds a partial key directory and the results are
+#                merged, so more threads also mean more peak memory during
+#                recovery; under a tight limit fewer can be faster. The
+#                engine's own measurement is recorded as recovery_ms.
 #   --pool-bytes default 512 MiB for bytecaskdb-pool; InnoDB gets 1.5 GiB.
 #   --start-timeout how long to wait for mariadbd to accept connections
 #                (default 900 s). Recovery of the key directory takes seconds
@@ -52,6 +58,7 @@ THREADS="1,8,16"
 WARMUP=30
 DURATION=60
 START_TIMEOUT=900
+RECOVERY_THREADS=4
 FRESH=0
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATA_ROOT="$SCRIPT_DIR/results"
@@ -72,6 +79,7 @@ for arg in "$@"; do
     --warmup=*)     WARMUP="${arg#*=}" ;;
     --time=*)       DURATION="${arg#*=}" ;;
     --start-timeout=*) START_TIMEOUT="${arg#*=}" ;;
+    --recovery-threads=*) RECOVERY_THREADS="${arg#*=}" ;;
     --data-root=*)  DATA_ROOT="${arg#*=}" ;;
     --out=*)        OUT="${arg#*=}" ;;
     --fresh)        FRESH=1 ;;
@@ -124,6 +132,7 @@ sql_mode = STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER
 bytecaskdb_io_backend = $backend
 bytecaskdb_buffer_pool_size = $pool
 bytecaskdb_max_file_bytes = 67108864
+bytecaskdb_recovery_threads = $RECOVERY_THREADS
 bytecaskdb_verify_checksums = OFF
 bytecaskdb_vacuum_fragmentation_threshold = 0.9
 CNF
@@ -174,6 +183,11 @@ CNF
     fi
   done
   mariadb --socket="$SOCKET" -u root -e "CREATE DATABASE IF NOT EXISTS sbtest"
+  # What the engine itself spent rebuilding the key directory, as opposed to
+  # STARTUP_S, which is the whole mariadbd boot.
+  # Empty for InnoDB, which has no such counter.
+  local rec; rec="$(engine_stat recovery_duration_us)"
+  RECOVERY_MS=$(( ${rec:-0} / 1000 ))
 }
 
 stop_db() {
@@ -250,7 +264,7 @@ run_engine() {  # <engine label>
   prepare "$engine" "$base"
   log "$label: starting under memory.max=$MEM_LIMIT"
   start_db "$engine" "$backend" "$pool" "$MEM_LIMIT" "$base"
-  log "$label: accepting connections after ${STARTUP_S}s"
+  log "$label: accepting connections after ${STARTUP_S}s (engine recovery ${RECOVERY_MS}ms, $RECOVERY_THREADS threads)"
   local wl t out tps avg p95 h0 m0 h1 m1 hit rss cur oom
   for wl in ${WORKLOADS//,/ }; do
     for t in ${THREADS//,/ }; do
@@ -279,7 +293,7 @@ run_engine() {  # <engine label>
         log "  [FAILED] $label $wl threads=$t"; echo "$out" | tail -5
         tps=0; avg=0; p95=0
       fi
-      echo "$label,$wl,$t,$ROWS,$MEM_LIMIT,$SWAP_LIMIT,$pool,${tps},${avg},${p95},${hit},${rss:-0},${cur:-0},${swp:-0},${majf:-0},${oom:-0},$STARTUP_S" | tee -a "$OUT"
+      echo "$label,$wl,$t,$ROWS,$MEM_LIMIT,$SWAP_LIMIT,$pool,${tps},${avg},${p95},${hit},${rss:-0},${cur:-0},${swp:-0},${majf:-0},${oom:-0},$STARTUP_S,${RECOVERY_MS:-0},$RECOVERY_THREADS" | tee -a "$OUT"
     done
   done
   stop_db
@@ -288,11 +302,11 @@ run_engine() {  # <engine label>
 build_bytecaskdb_plugin >/dev/null
 symlink_providers "$PLUGIN_DIR"
 
-echo "engine,workload,threads,rows,mem_limit_bytes,swap_limit,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,cgroup_swap_bytes,major_faults,oom_kills,startup_s" > "$OUT"
+echo "engine,workload,threads,rows,mem_limit_bytes,swap_limit,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,cgroup_swap_bytes,major_faults,oom_kills,startup_s,recovery_ms,recovery_threads" > "$OUT"
 for e in ${ENGINES//,/ }; do run_engine "$e"; done
 
 echo
 log "=== Results (memory.max=$MEM_LIMIT, memory.swap.max=$SWAP_LIMIT, $ROWS rows) ==="
-printf "%-17s %-18s %4s %10s %8s %8s %6s %7s %7s %9s %4s %6s\n" engine workload thr tps "avg ms" "p95 ms" "hit" "RSS MB" "swp MB" "majf/tx" OOM "start"
-tail -n +2 "$OUT" | awk -F, -v dur="$DURATION" '{printf "%-17s %-18s %4s %10.0f %8s %8s %6s %7d %7d %9.2f %4s %5ss\n", $1, $2, $3, $8, $9, $10, ($11 == "" ? "-" : substr($11, 1, 5)), $12 / 1048576, $14 / 1048576, ($8 > 0 ? $15 / ($8 * dur) : 0), $16, $17}'
+printf "%-17s %-18s %4s %10s %8s %8s %6s %7s %7s %9s %4s %6s %7s\n" engine workload thr tps "avg ms" "p95 ms" "hit" "RSS MB" "swp MB" "majf/tx" OOM "start" "recov"
+tail -n +2 "$OUT" | awk -F, -v dur="$DURATION" '{printf "%-17s %-18s %4s %10.0f %8s %8s %6s %7d %7d %9.2f %4s %5ss %6.1fs\n", $1, $2, $3, $8, $9, $10, ($11 == "" ? "-" : substr($11, 1, 5)), $12 / 1048576, $14 / 1048576, ($8 > 0 ? $15 / ($8 * dur) : 0), $16, $17, $18 / 1000}'
 log "Results saved to: $OUT"

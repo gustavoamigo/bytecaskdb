@@ -55,6 +55,7 @@ across runs and across the three ByteCaskDB back-ends (InnoDB has its own);
 | `--workloads=LIST` | 4 OLTP mixes | sysbench `oltp_*` workloads. |
 | `--threads=LIST` | 1,8,16 | |
 | `--warmup=S` / `--time=S` | 30 / 60 | unmeasured run, then the measured run, per cell. |
+| `--recovery-threads=N` | 4 | threads replaying hint files at startup. Each builds a partial key directory and the results are merged, so more threads also mean more peak memory during recovery; under a tight limit fewer can be faster. |
 | `--start-timeout=S` | 900 | how long to wait for `mariadbd` to accept connections. Recovery takes seconds with memory to spare and minutes when the key directory is being swapped. |
 | `--out=FILE` | `<data-root>/memory_pressure_<timestamp>.csv` | |
 
@@ -85,7 +86,8 @@ One CSV row per engine × workload × thread count:
 
 `engine, workload, threads, rows, mem_limit_bytes, swap_limit, pool_bytes,
 tps, avg_ms, p95_ms, pool_hit_ratio, rss_bytes, cgroup_memory_bytes,
-cgroup_swap_bytes, major_faults, oom_kills, startup_s`
+cgroup_swap_bytes, major_faults, oom_kills, startup_s, recovery_ms,
+recovery_threads`
 
 `major_faults` is how many pages the cgroup read back from swap during the
 measured run; divided by the transactions in it, that is the per-query cost of
@@ -93,7 +95,9 @@ not being resident, and it is zero without swap.
 
 `tps` is sysbench's transactions per second (not the run total).
 `pool_hit_ratio` is empty for engines without a pool. `startup_s` is how long
-the server took to accept connections inside the cgroup.
+the server took to accept connections inside the cgroup; `recovery_ms` is the
+engine's own measurement of rebuilding the key directory, which is nearly all
+of it under a tight limit.
 
 ## Measured so far (4-vCPU Azure VM, 10 M rows, 3.2 GB of data files)
 

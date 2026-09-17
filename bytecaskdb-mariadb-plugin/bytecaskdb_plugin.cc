@@ -87,6 +87,15 @@ static MYSQL_SYSVAR_BOOL(buffer_pool_direct_io, sysvar_buffer_pool_direct_io,
     "to buffered fills per file.",
     nullptr, nullptr, TRUE);
 
+static unsigned long sysvar_recovery_threads = 4;
+static MYSQL_SYSVAR_ULONG(recovery_threads, sysvar_recovery_threads,
+    PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+    "Threads replaying hint files when the engine opens (default 4). Affects "
+    "startup only. Each thread builds a partial key directory and the results "
+    "are merged, so more threads also mean more peak memory during recovery: "
+    "under a tight memory limit, fewer can be faster.",
+    nullptr, nullptr, 4, 1, 64, 0);
+
 static unsigned long long sysvar_max_file_bytes = 64ULL * 1024 * 1024;
 static MYSQL_SYSVAR_ULONGLONG(max_file_bytes, sysvar_max_file_bytes,
     PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
@@ -184,6 +193,7 @@ static struct st_mysql_sys_var *bytecaskdb_system_variables[] = {
     MYSQL_SYSVAR(buffer_pool_size),
     MYSQL_SYSVAR(buffer_pool_direct_io),
     MYSQL_SYSVAR(max_file_bytes),
+    MYSQL_SYSVAR(recovery_threads),
     MYSQL_SYSVAR(bulk_copy_flush_bytes),
     MYSQL_SYSVAR(verify_checksums),
     MYSQL_SYSVAR(vacuum_fragmentation_threshold),
@@ -882,7 +892,7 @@ static int bytecaskdb_init(void *p) {
   apply_backup_manifest(db_path);
 
   bytecask::Options opts;
-  opts.recovery_threads = 4;
+  opts.recovery_threads = static_cast<unsigned>(sysvar_recovery_threads);
   opts.max_value_bytes = 16 * 1024 * 1024;  // MEDIUMBLOB (16 MiB)
   opts.max_key_bytes = 8192;  // secondary index key + PK suffix can exceed 4096
   opts.io_backend = static_cast<bytecask::IoBackend>(sysvar_io_backend);
@@ -910,9 +920,10 @@ static int bytecaskdb_init(void *p) {
   sql_print_information("ByteCaskDB: opened global DB at '%s'",
           db_path.c_str());
   sql_print_information(
-          "ByteCaskDB: io_backend=%s max_file_bytes=%llu buffer_pool_size=%llu",
+          "ByteCaskDB: io_backend=%s max_file_bytes=%llu buffer_pool_size=%llu "
+          "recovery_threads=%lu",
           io_backend_names[sysvar_io_backend], sysvar_max_file_bytes,
-          sysvar_buffer_pool_size);
+          sysvar_buffer_pool_size, sysvar_recovery_threads);
 
   s_vacuum_stop = false;
   s_vacuum_pause_count = 0;
