@@ -940,7 +940,7 @@ private:
   void vacuum_unlink_old_file(const std::shared_ptr<const EngineState> &snap,
                               std::uint32_t file_id);
   // Rewrites a sealed file into a new sealed file containing only live entries.
-  void vacuum_compact_file(std::uint32_t file_id);
+  [[nodiscard]] auto vacuum_compact_file(std::uint32_t file_id) -> bool;
   // Appends live entries from a sealed file into the active file, then removes the sealed file.
   void vacuum_remove_file(std::uint32_t file_id);
 
@@ -2815,9 +2815,9 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
     return true;
   }
 
-  // All files with live entries are compacted (sealed→sealed).
-  vacuum_compact_file(target_id);
-  return true;
+  // All files with live entries are compacted (sealed→sealed). Returns false
+  // when the scan finds nothing to reclaim.
+  return vacuum_compact_file(target_id);
 }
 
 #pragma endregion
@@ -2965,6 +2965,11 @@ auto DB::vacuum_scan_and_copy(
     case EntryType::BulkEnd:
       std::ignore =
           dest_file.append_entry(entry.sequence, entry.entry_type, {}, {});
+      // A marker occupies a header and a CRC in the compacted file, exactly
+      // as it did in the file the write path produced. Counting it keeps
+      // total_bytes equal to the file's size on disk — which is what
+      // recovery seeds it from — and keeps every published offset inside it.
+      result.total_bytes += kHeaderSize + kCrcSize;
       track_seq(entry.sequence);
       break;
     }
@@ -3009,7 +3014,7 @@ void DB::vacuum_unlink_old_file(
 // entries and tombstones. Called under vacuum_mu_, not write_mu_.
 // The new data file is written to .data.tmp, then renamed atomically.
 // The old file is deferred for cleanup when no readers reference it.
-void DB::vacuum_compact_file(std::uint32_t file_id) {
+auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
   auto snap = load_state_for_write();
   const auto &old_file = **snap->files.get(file_id);
 
@@ -3029,6 +3034,20 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
     tmp_file->shrink_to_fit();
   }
 
+  // Nothing to reclaim: every byte in this file is live data, a tombstone or
+  // a batch marker, and compaction must preserve all three. Publishing an
+  // identical file would churn I/O, and at fragmentation_threshold 0 the file
+  // would qualify again on the next call and never converge — fragmentation
+  // is measured against live_bytes, which tombstones and markers can never
+  // count towards (hint files have no marker concept, so recovery could not
+  // reproduce it if they did).
+  const auto old_total = snap->file_stats.get(file_id)->total_bytes;
+  if (scan.total_bytes >= old_total) {
+    std::error_code ec;
+    std::filesystem::remove(tmp_data_path, ec);
+    return false;
+  }
+
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_vacuum_compact_rename);
 #endif
@@ -3044,13 +3063,14 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
     WriteBarrier barrier{*this};
     vacuum_commit(file_id, scan, new_file);
   }
-  // Bytes reclaimed = old total - new live (compacted file is smaller).
-  auto old_total = snap->file_stats.get(file_id)->total_bytes;
+  // Bytes reclaimed = the shrinkage, not old_total - live_bytes: the compacted
+  // file also carries the tombstones and markers that had to be preserved.
   counters_.vacuum_bytes_reclaimed.fetch_add(
-      static_cast<std::int64_t>(old_total - scan.live_bytes),
+      static_cast<std::int64_t>(old_total - scan.total_bytes),
       std::memory_order_relaxed);
   counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
   vacuum_unlink_old_file(snap, file_id);
+  return true;
 }
 
 // Removes a sealed file that has no live keys. No I/O scan needed — just

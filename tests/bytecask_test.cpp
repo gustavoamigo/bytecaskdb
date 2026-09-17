@@ -2503,7 +2503,12 @@ TEST_CASE("vacuum loop reclaims all fragmentation", "[vacuum]") {
   db.put({}, to_bytes("y"), to_bytes("4")); // kills y=2
 
   // Run vacuum until nothing qualifies.
-  while (db.vacuum({.fragmentation_threshold = 0.0})) {}
+  {
+    int spins = 0;
+    while (db.vacuum({.fragmentation_threshold = 0.0})) {
+      REQUIRE(++spins < 200);  // vacuum must converge, not spin
+    }
+  }
 
   CHECK(to_string(*get_val(db, to_bytes("x"))) == "3");
   CHECK(to_string(*get_val(db, to_bytes("y"))) == "4");
@@ -2572,7 +2577,12 @@ TEST_CASE("vacuum compact handles batch entries", "[vacuum]") {
   (void)db.apply_batch({}, std::move(plan));
 
   // Vacuum — the file with the batch should be compacted.
-  while (db.vacuum({.fragmentation_threshold = 0.0})) {}
+  {
+    int spins = 0;
+    while (db.vacuum({.fragmentation_threshold = 0.0})) {
+      REQUIRE(++spins < 200);  // vacuum must converge, not spin
+    }
+  }
 
   // Both keys should have the batch values.
   auto va = get_val(db, to_bytes("a"));
@@ -2608,13 +2618,67 @@ TEST_CASE("vacuum compact handles batch with mixed put/del", "[vacuum]") {
   plan.del(to_bytes("gone"));
   (void)db.apply_batch({}, std::move(plan));
 
-  // Vacuum until stable (limit iterations to avoid infinite loop).
-  for (int i = 0; i < 10 && db.vacuum({.fragmentation_threshold = 0.0}); ++i) {}
+  // Vacuum until stable. Convergence is the assertion: the compacted file
+  // keeps a tombstone, which can never be live_bytes, so at threshold 0 it
+  // stays eligible forever unless vacuum declines a file it cannot shrink.
+  int spins = 0;
+  while (db.vacuum({.fragmentation_threshold = 0.0})) {
+    REQUIRE(++spins < 200);
+  }
 
   auto vk = get_val(db, to_bytes("keep"));
   REQUIRE(vk.has_value());
   CHECK(to_string(*vk) == "updated");
   CHECK_FALSE(db.contains_key({}, to_bytes("gone")));
+}
+
+// ---------------------------------------------------------------------------
+// A compacted file's total_bytes must equal its size on disk, because that is
+// what recovery seeds total_bytes from. Batch markers are preserved by
+// compaction, so their bytes have to be counted like every other entry's —
+// otherwise file_stats() reports one number before a restart and another
+// after, and published offsets fall outside the extent the engine believes
+// the file has.
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum keeps total_bytes equal to the compacted file's size",
+          "[vacuum][batch]") {
+  TempDir td;
+  auto db_path = td.path / "db";
+
+  auto stats_shape = [](const bytecask::DB &db) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> out;
+    for (const auto &[fid, fs] : db.file_stats()) {
+      if (fs.total_bytes > 0) out.emplace_back(fs.live_bytes, fs.total_bytes);
+    }
+    std::ranges::sort(out);
+    return out;
+  };
+
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> before;
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+    db.put({}, to_bytes("a"), to_bytes("old_a"));
+    db.put({}, to_bytes("b"), to_bytes("old_b"));
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("a"), to_bytes("new_a"));
+    plan.put(to_bytes("b"), to_bytes("new_b"));
+    (void)db.apply_batch({}, std::move(plan));
+
+    int spins = 0;
+    while (db.vacuum({.fragmentation_threshold = 0.0})) {
+      REQUIRE(++spins < 10);
+    }
+    before = stats_shape(db);
+  }
+
+  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+  // Recovery computes total_bytes from the file's actual size. If vacuum
+  // undercounted, these disagree by kHeaderSize + kCrcSize per marker.
+  CHECK(stats_shape(db) == before);
+
+  // And the file must not be re-compacted: there is nothing in it to reclaim.
+  CHECK_FALSE(db.vacuum({.fragmentation_threshold = 0.0}));
 }
 
 // ---------------------------------------------------------------------------
@@ -6843,7 +6907,12 @@ TEST_CASE("stats: vacuum counters", "[bytecask][stats]") {
     db.put({.sync = false}, to_bytes(key), to_bytes("updated"));
   }
   // Run vacuum until nothing qualifies.
-  while (db.vacuum({.fragmentation_threshold = 0.0})) {}
+  {
+    int spins = 0;
+    while (db.vacuum({.fragmentation_threshold = 0.0})) {
+      REQUIRE(++spins < 200);  // vacuum must converge, not spin
+    }
+  }
   auto s = db.stats();
   CHECK(s.at("bytecask.vacuum_files_unlinked") > 0);
   CHECK(s.at("bytecask.vacuum_bytes_reclaimed") > 0);
@@ -7035,7 +7104,12 @@ TEST_CASE("use_mmap=false: vacuum reclaims space",
     auto key = std::format("k{:04d}", i);
     db.put({.sync = false}, to_bytes(key), to_bytes("updated"));
   }
-  while (db.vacuum({.fragmentation_threshold = 0.0})) {}
+  {
+    int spins = 0;
+    while (db.vacuum({.fragmentation_threshold = 0.0})) {
+      REQUIRE(++spins < 200);  // vacuum must converge, not spin
+    }
+  }
   bytecask::Bytes out;
   for (int i = 0; i < 30; ++i) {
     auto key = std::format("k{:04d}", i);

@@ -346,6 +346,30 @@ Every key-value pair readable before `vacuum_compact` is called must
 be readable after it returns, with the same value. The engine must not
 lose data or introduce phantom entries. Tombstones must be preserved.
 
+### Size Accounting
+
+A published file's `total_bytes` equals its size on disk. Recovery
+seeds `total_bytes` from the file's length, so anything the compacted
+file contains has to be counted as it is written — including the
+`BulkBegin` / `BulkEnd` markers, which compaction preserves like any
+other entry. A `file_stats()` reading must not change across a restart.
+
+### Progress
+
+`vacuum()` returns `true` only when a file was actually reclaimed.
+A file whose every byte is live data, a tombstone or a batch marker
+cannot be made smaller, because compaction must preserve all three;
+the engine discards the staged copy and returns `false` rather than
+publishing an identical file.
+
+This is a termination guarantee, not only an efficiency one. Fragmentation
+is measured against `live_bytes`, and tombstones and markers can never
+count towards it — hint files have no marker concept, so recovery could
+not reproduce a `live_bytes` that included them. Without this rule a
+file holding either one stays eligible at `fragmentation_threshold = 0`
+forever, and `while (db.vacuum({.fragmentation_threshold = 0.0})) {}`
+never terminates.
+
 ### Atomicity
 
 The compacted file must replace the old file in the published state

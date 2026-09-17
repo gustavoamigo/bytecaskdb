@@ -541,6 +541,7 @@ ByteeCask implements a **conservative online vacuum**: the engine continues to s
 - Only sealed (immutable) data files are considered — the active file is never touched.
 - Only files whose fragmentation exceeds a configurable threshold are processed; files below the threshold are left alone.
 - One file is processed per `vacuum()` call. Callers that want to process multiple files call in a loop.
+- A file that compaction cannot shrink is declined: the staged copy is discarded and `vacuum()` returns `false`. Tombstones and batch markers are preserved by every compaction but can never count towards `live_bytes` (hint files carry no markers, so recovery could not reproduce it), so a file holding either would otherwise stay eligible at `fragmentation_threshold = 0` forever and a vacuum-to-convergence loop would never terminate.
 - Tombstones (Delete entries) are never dropped during partial compaction (see **Tombstone handling** below).
 - A new compacted file is fully written and `fdatasync`-ed before any old file is removed.
 - **Sequence-disjoint files**: vacuum must preserve the invariant that all data files have non-overlapping sequence ranges. Compacted files maintain disjoint sequence ranges from other files.
