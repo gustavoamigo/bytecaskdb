@@ -1332,7 +1332,20 @@ void BM_RecoveryParallel(benchmark::State &state) {
 
   std::unique_ptr<Handle> handle;
 
+  // BC_DROP_CACHES=1 evicts the page cache before each timed open, so the
+  // hint files are read from the device instead of from RAM. Without it a
+  // dataset that fits in memory measures parsing and index build only.
+  static const bool drop_caches = [] {
+    const char *e = std::getenv("BC_DROP_CACHES");
+    return e && *e == '1';
+  }();
+
   for (auto _ : state) {
+    state.PauseTiming();
+    if (drop_caches) {
+      std::system("sync; echo 3 > /proc/sys/vm/drop_caches");
+    }
+    state.ResumeTiming();
     handle = std::make_unique<Handle>(setup.dir.path,
                                      kParRecoveryThreshold, threads);
     state.PauseTiming();
