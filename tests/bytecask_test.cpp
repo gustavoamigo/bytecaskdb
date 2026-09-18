@@ -313,6 +313,56 @@ TEST_CASE("entry iterators are move-only and still model input_iterator",
   CHECK(to_string(value) == "av");
   CHECK(to_string((*moved).value) == "av");
   CHECK(value.data() == (*moved).value.data());
+
+  // Move assignment carries the buffer too, so the span stays addressed at
+  // the same storage rather than at the moved-from iterator's.
+  bytecask::EntryIterator sink;
+  sink = std::move(moved);
+  CHECK(to_string((*sink).value) == "av");
+  CHECK(value.data() == (*sink).value.data());
+
+  auto rrange = db.riter_from(ro);
+  auto rit = rrange.begin();
+  const auto rvalue = (*rit).value;
+  bytecask::ReverseEntryIterator rsink;
+  rsink = std::move(rit);
+  CHECK(to_string((*rsink).value) == "av");
+  CHECK(rvalue.data() == (*rsink).value.data());
+}
+
+// ---------------------------------------------------------------------------
+// Invariant P: every published entry lies inside the committed extent of the
+// file it names. This is what lets resume() shorten the active file under
+// lock-free readers — see "View and span lifetimes" in CONTRACT.md. The check
+// only fires on a violation the engine cannot currently produce, so the seam
+// is exercised directly on a hand-built state.
+// ---------------------------------------------------------------------------
+TEST_CASE("state consistency rejects an entry outside its file's extent",
+          "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k0"), to_bytes("v0"));
+
+  auto good = *db.engine_state();
+  REQUIRE_NOTHROW(db.test_validate_state_consistency(good));
+
+  // Shrink the active file's committed extent below the entry that points
+  // into it — the shape a truncation past a published offset would leave.
+  auto bad = good;
+  {
+    auto t = bad.file_stats.transient();
+    t.update(bad.active_file_id,
+             [](bytecask::FileStats &fs) { fs.total_bytes = 1; });
+    bad.file_stats = std::move(t).persistent();
+  }
+  bool threw = false;
+  try {
+    db.test_validate_state_consistency(bad);
+  } catch (const std::runtime_error &e) {
+    threw = true;
+    CHECK(std::string{e.what()}.find("committed extent") != std::string::npos);
+  }
+  CHECK(threw);
 }
 
 // ---------------------------------------------------------------------------
