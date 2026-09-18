@@ -1025,30 +1025,48 @@ slower than two are slower for both trees, so that is the host and not a
 property of either structure. When the host behaves, both scale about
 1.3x.
 
-Recovery, same run, single iteration each but long enough to be signal:
+Recovery, 1M keys, interleaved rounds on tmpfs with `taskset -c 0-3`,
+best of two rounds (the two rounds agree within 3% on every cell). The
+middle column is the first integration, where `merge` rebuilt its result
+by calling `set()` per key; the fourth is the same code with `merge` built
+through the bulk loader instead.
 
-| Threads | Radix | B+ tree | B+ / Radix |
-|---|---:|---:|---:|
-| 1 | 0.445 s | 0.425 s | 0.96 |
-| 2 | 0.220 s | 0.532 s | 2.42 |
-| 4 | 0.141 s | 0.809 s | 5.74 |
-| 8 | 0.147 s | 1.260 s | 8.57 |
-| 16 | 0.135 s | 2.290 s | 16.96 |
+| Threads | Radix | B+ rebuild merge | B+ bulk merge | bulk / radix |
+|---:|---:|---:|---:|---:|
+| 1 | 414 ms | 425 ms | 377 ms | 0.91 |
+| 2 | 216 ms | 532 ms | 259 ms | 1.20 |
+| 4 | 128 ms | 809 ms | 244 ms | 1.91 |
+| 8 | 139 ms | 1260 ms | 350 ms | 2.52 |
+| 16 | 136 ms | 2290 ms | 578 ms | 4.25 |
 
-This is the predicted failure and it is worse than predicted. At one thread
-there is no fan-in and the two trees are level. Every added thread creates
-another partition and therefore another level of pairwise merges, and a B+
-tree merge rebuilds rather than adopting subtrees, so the B+ tree gets
-*slower* with more threads while the radix tree speeds up 3.3x. Gate G4
-fails outright. Recovery cannot ship on the current rebuild-merge; it needs
-the range-partitioned design in the recovery section above, where the fan-in
-disappears entirely.
+The bulk loader is worth 3.3x at four threads and 4.0x at sixteen, and it
+changes the shape of the curve: recovery now improves from one to four
+threads where before it got monotonically worse. The radix column moved
+less than 7% from the earlier non-interleaved run, so the middle and right
+columns are comparable.
+
+It still fails gate G4, and the curve still turns upward past four
+threads, which is the fan-in and nothing else. Sixteen threads means
+sixteen partitions and four merge levels, each passing every key through
+an iterator and an append at about 145 ns per key per level. Two things
+are left, in order of value:
+
+1. **Remove the fan-in.** The range-partitioned design in the recovery
+   section above replaces log2(W) levels with one, run in parallel across
+   T ranges, so the merge work per thread falls from 4N to N/T at sixteen
+   threads. This is the change that should reach parity or better, and it
+   is engine surgery in `recovery_load_parallel`, not tree work.
+2. **The merge inner loop.** 145 ns per key per level is higher than the
+   50 to 60 ns the components suggest. The forward iterator rebuilds its
+   key buffer on every advance, and `BulkLoader::append` copies the key
+   again into its arena; a merge that hands the loader the iterator's
+   buffer directly would avoid one of those copies.
 
 ### Next steps
 
-1. Recovery: the bulk loader plus the range-partitioned merge. This is now
-   the blocking item, not a follow-up: gate G4 fails by 17x at 16 threads
-   and no amount of tree tuning fixes it.
+1. Recovery: the range-partitioned merge. The bulk loader landed and took
+   G4's gap from 17x to 4.25x at sixteen threads; removing the fan-in is
+   what remains.
 2. Point lookup, worth 10% of `Get` at the engine level.
 3. `u32_map` on the B+ tree, `[model]` tests under ASAN and TSAN, sysbench
    against `main`.
