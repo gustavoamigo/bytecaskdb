@@ -11,6 +11,7 @@ module;
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
@@ -1051,6 +1052,14 @@ private:
   // when recovery_threads > 1; single-threaded otherwise.
   auto recovery_load_parallel(EngineState s, unsigned recovery_threads,
                                bool strict) -> EngineState;
+#ifdef BYTECASK_USE_BTREE
+  // Reconstructs key_dir from hint files by range merge. Coupled to the B+
+  // tree: it needs the tree to sample its own separators and to bulk-build
+  // and concatenate range-disjoint slices. See the definition for why the
+  // radix tree wants a different strategy.
+  auto recovery_load_ranged(EngineState s, unsigned recovery_threads,
+                            bool strict) -> EngineState;
+#endif
 
   // Portable atomic load/store for shared_ptr. The C++20 specialization
   // std::atomic<std::shared_ptr<T>> is not yet available in all libc++
@@ -2081,8 +2090,13 @@ DB::DB(std::filesystem::path dir, Options opts)
   try {
     EngineState s;
     const auto recovery_start = std::chrono::steady_clock::now();
+#ifdef BYTECASK_USE_BTREE
+    s = recovery_load_ranged(std::move(s), opts.recovery_threads,
+                             opts.fail_recovery_on_crc_errors);
+#else
     s = recovery_load_parallel(std::move(s), opts.recovery_threads,
                                opts.fail_recovery_on_crc_errors);
+#endif
     const auto recovery_end = std::chrono::steady_clock::now();
     counters_.recovery_duration_us =
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3845,6 +3859,291 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
   s.file_stats = std::move(final_result.file_stats);
   return s;
 }
+
+#ifdef BYTECASK_USE_BTREE
+// Lexicographic order over raw keys, matching the tree's own order.
+static auto recovery_key_cmp(std::span<const std::byte> a,
+                             std::span<const std::byte> b) noexcept -> int {
+  const auto n = std::min(a.size(), b.size());
+  if (n != 0) {
+    const auto c = std::memcmp(a.data(), b.data(), n);
+    if (c != 0) return c;
+  }
+  if (a.size() == b.size()) return 0;
+  return a.size() < b.size() ? -1 : 1;
+}
+
+static auto recovery_span_of(const Key &k) noexcept
+    -> std::span<const std::byte> {
+  return {k.begin(), k.size()};
+}
+
+// ---------------------------------------------------------------------------
+// Range-partitioned recovery — the B+ tree path.
+//
+// recovery_load_parallel folds the W per-worker trees together pairwise, so
+// every surviving key is rewritten once per level of the fan-in: log2(W)
+// passes over the key set, the last of them serial. That fold is what stops
+// recovery scaling past a few threads.
+//
+// Here the fold is replaced by a partition. The workers' trees are cut at the
+// same splitters, each range is merged by one thread straight into a bulk
+// loader, and the results — disjoint and already in order — are concatenated.
+// Every key is written exactly once, in parallel, and the serial tail
+// rebuilds only the levels above the leaves.
+//
+// The splitters are free: a B+ tree's inner separators are already a uniform
+// one-per-leaf sample of its keys, so each worker offers a few hundred of
+// them and the pooled sample is cut into R even parts. Only the *output* has
+// to be disjoint — each worker still reads whatever keys its own files held —
+// so nothing is shuffled and the phase costs two barriers.
+//
+// This is not a strategy the radix tree would want. A trie is canonical: two
+// radix trees agree on the shape of any subtree whose key set they agree on,
+// so their merge adopts whole subtrees by pointer and does work proportional
+// to the overlap rather than to N. Rebuilding the key set into range slices
+// would throw that away, which is why the radix path keeps the pairwise fold.
+// ---------------------------------------------------------------------------
+auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
+                              bool strict) -> EngineState {
+  auto files = recovery_prepare_files(s);
+  if (files.empty()) {
+    return s;
+  }
+
+#ifdef BYTECASK_SINGLE_THREADED
+  const auto W = 1u;
+  (void)recovery_threads;
+#else
+  auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
+  if (W == 0) W = 1;
+#endif
+
+  auto parallel_for = [](unsigned n, auto &&body) {
+#ifdef BYTECASK_SINGLE_THREADED
+    for (unsigned i = 0; i < n; ++i) body(i);
+#else
+    if (n <= 1) {
+      if (n == 1) body(0);
+      return;
+    }
+    std::vector<std::jthread> threads;
+    threads.reserve(n);
+    for (unsigned i = 0; i < n; ++i)
+      threads.emplace_back([&body, i] { body(i); });
+#endif
+  };
+
+  // Phase 1: round-robin file assignment.
+  std::vector<std::vector<RecoveredFile>> worker_files(W);
+  for (unsigned i = 0; i < files.size(); ++i) {
+    worker_files[i % W].push_back(std::move(files[i]));
+  }
+
+  // Phase 2: one tree per worker, in parallel.
+  std::vector<RecoveryResult> parts(W);
+  std::vector<std::exception_ptr> worker_errors(W, nullptr);
+  parallel_for(W, [&](unsigned i) {
+    try {
+      parts[i] = recovery_build_from_hints(worker_files[i], strict);
+    } catch (...) {
+      worker_errors[i] = std::current_exception();
+    }
+  });
+  for (const auto &err : worker_errors) {
+    if (err) {
+      if (strict) std::rethrow_exception(err);
+      // lenient: warning already emitted inside recovery_build_from_hints
+    }
+  }
+
+  // Phase 3: union the parts' metadata, and pool their separators into R
+  // splitters. Both are O(W × files) or O(W × R) — nothing here touches a key.
+  std::map<Key, std::uint64_t> tombstones;
+  std::vector<RangeTombstone> range_tombstones;
+  std::unordered_map<std::uint32_t, FileStats> fstats;
+  std::uint64_t max_seq = 0;
+  for (auto &part : parts) {
+    max_seq = std::max(max_seq, part.max_seq);
+    for (const auto &[key, seq] : part.tombstones) {
+      auto &existing = tombstones[key];
+      if (seq > existing) existing = seq;
+    }
+    range_tombstones.insert(
+        range_tombstones.end(),
+        std::make_move_iterator(part.range_tombstones.begin()),
+        std::make_move_iterator(part.range_tombstones.end()));
+    part.range_tombstones.clear();
+    // Files are assigned round-robin, so no two parts report the same one.
+    for (const auto [fid, fs] : part.file_stats) fstats.emplace(fid, fs);
+  }
+
+  const auto R = W;
+  std::vector<std::vector<std::byte>> splitters;
+  if (R > 1) {
+    // Oversampling smooths over the leaves a worker happens to leave short.
+    constexpr std::size_t kOversample = 8;
+    std::vector<std::vector<std::byte>> pool;
+    for (const auto &part : parts) {
+      auto seps = part.key_dir.sample_separators(R * kOversample);
+      pool.insert(pool.end(), std::make_move_iterator(seps.begin()),
+                  std::make_move_iterator(seps.end()));
+    }
+    std::sort(pool.begin(), pool.end());
+    splitters.reserve(R - 1);
+    for (unsigned r = 1; r < R && !pool.empty(); ++r) {
+      const auto idx = static_cast<std::size_t>(r) * pool.size() / R;
+      if (idx < pool.size()) splitters.push_back(pool[idx]);
+    }
+    // Repeated splitters would only produce empty ranges.
+    splitters.erase(std::unique(splitters.begin(), splitters.end()),
+                    splitters.end());
+  }
+  const auto ranges = static_cast<unsigned>(splitters.size()) + 1;
+
+  // Phase 4: one thread per range. Each merges that slice of every part,
+  // resolves by sequence, applies the pooled tombstones, and bulk-loads the
+  // survivors. live_bytes is accumulated here rather than in a pass of its
+  // own — the keys are already in hand.
+  struct RangeOut {
+    KeyDirLeafRun run;
+    std::unordered_map<std::uint32_t, std::uint64_t> live;
+  };
+  std::vector<RangeOut> outs(ranges);
+
+  parallel_for(ranges, [&](unsigned r) {
+    const auto lo = r == 0 ? std::span<const std::byte>{}
+                           : std::span<const std::byte>{splitters[r - 1]};
+    const auto *hi = r + 1 < ranges ? &splitters[r] : nullptr;
+    const auto hi_span =
+        hi ? std::span<const std::byte>{*hi} : std::span<const std::byte>{};
+
+    // Only the range tombstones that reach into this slice can matter.
+    std::vector<const RangeTombstone *> rts;
+    for (const auto &rt : range_tombstones) {
+      const auto start = recovery_span_of(rt.start);
+      const auto end = recovery_span_of(rt.end);
+      const auto starts_below_hi =
+          hi == nullptr || recovery_key_cmp(start, hi_span) < 0;
+      const auto ends_above_lo =
+          lo.empty() || recovery_key_cmp(end, lo) > 0;
+      if (starts_below_hi && ends_above_lo) rts.push_back(&rt);
+    }
+
+    // Point tombstones are sorted the way this merge emits keys, so one
+    // cursor walks them in lockstep instead of a lookup per key.
+    auto tomb = lo.empty() ? tombstones.begin()
+                           : tombstones.lower_bound(Key{lo});
+
+    // One cursor per part, each holding the key it currently sits on. The
+    // key spans into the iterator's own buffer and stays valid until that
+    // iterator advances, so a cursor is only refreshed right after its own
+    // increment.
+    struct Cursor {
+      KeyDirIter it;
+      std::span<const std::byte> key;
+      KeyDirEntry entry{};
+      bool live{false};
+    };
+    auto refresh = [&](Cursor &c) {
+      c.live = false;
+      if (c.it == std::default_sentinel) return;
+      const auto [k, e] = *c.it;
+      if (hi != nullptr && recovery_key_cmp(k, hi_span) >= 0) return;
+      c.key = k;
+      c.entry = e;
+      c.live = true;
+    };
+    std::vector<Cursor> cursors;
+    cursors.reserve(parts.size());
+    for (const auto &part : parts) {
+      cursors.push_back(Cursor{part.key_dir.lower_bound(lo), {}, {}, false});
+      refresh(cursors.back());
+    }
+
+    KeyDirBulkLoader out;
+    auto &live = outs[r].live;
+    std::vector<std::size_t> matches;
+    matches.reserve(cursors.size());
+
+    // A linear scan picks the smallest key: W comparisons per emitted key,
+    // where W is bounded by Options::recovery_threads. A loser tree would
+    // make it log2(W), which is only worth the code at thread counts far
+    // above a core count.
+    while (true) {
+      auto best = cursors.size();
+      for (std::size_t i = 0; i < cursors.size(); ++i) {
+        if (!cursors[i].live) continue;
+        if (best == cursors.size() ||
+            recovery_key_cmp(cursors[i].key, cursors[best].key) < 0)
+          best = i;
+      }
+      if (best == cursors.size()) break;
+
+      const auto key = cursors[best].key;
+      auto winner = cursors[best].entry;
+      matches.clear();
+      matches.push_back(best);
+      for (std::size_t i = 0; i < cursors.size(); ++i) {
+        if (i == best || !cursors[i].live) continue;
+        if (recovery_key_cmp(cursors[i].key, key) != 0) continue;
+        matches.push_back(i);
+        if (kde_newer(cursors[i].entry, winner)) winner = cursors[i].entry;
+      }
+
+      while (tomb != tombstones.end() &&
+             recovery_key_cmp(recovery_span_of(tomb->first), key) < 0)
+        ++tomb;
+      auto drop = tomb != tombstones.end() &&
+                  recovery_key_cmp(recovery_span_of(tomb->first), key) == 0 &&
+                  winner.sequence() < tomb->second;
+      if (!drop) {
+        for (const auto *rt : rts) {
+          if (winner.sequence() >= rt->seq) continue;
+          if (recovery_key_cmp(key, recovery_span_of(rt->start)) < 0) continue;
+          if (recovery_key_cmp(key, recovery_span_of(rt->end)) >= 0) continue;
+          drop = true;
+          break;
+        }
+      }
+      if (!drop) {
+        out.append(key, winner);
+        live[winner.file_id()] += entry_size(key.size(), winner.value_size());
+      }
+
+      // `key` points into cursors[best]'s buffer — nothing advances until here.
+      for (const auto i : matches) {
+        ++cursors[i].it;
+        refresh(cursors[i]);
+      }
+    }
+
+    outs[r].run = std::move(out).seal();
+  });
+
+  // Phase 5: concatenate the range-disjoint slices and fold in live_bytes.
+  std::vector<KeyDirLeafRun> runs;
+  runs.reserve(outs.size());
+  std::unordered_map<std::uint32_t, std::uint64_t> live_accum;
+  for (auto &o : outs) {
+    for (const auto &[fid, bytes] : o.live) live_accum[fid] += bytes;
+    runs.push_back(std::move(o.run));
+  }
+  auto key_dir = KeyDirBulkLoader::concat(std::move(runs));
+
+  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
+  for (auto &[fid, fs] : fstats) {
+    const auto it = live_accum.find(fid);
+    fs.live_bytes = it != live_accum.end() ? it->second : 0ULL;
+    fstats_t.set(fid, fs);
+  }
+
+  s.key_dir = std::move(key_dir);
+  s.next_seq = max_seq + 1;
+  s.file_stats = std::move(fstats_t).persistent();
+  return s;
+}
+#endif  // BYTECASK_USE_BTREE
 
 #pragma endregion
 

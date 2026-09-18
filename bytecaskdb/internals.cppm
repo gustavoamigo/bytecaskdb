@@ -171,6 +171,10 @@ export using KeyDirTransient = TransientBTree<KeyDirEntry>;
 export using KeyDirIter = BTreeIterator<KeyDirEntry>;
 export using KeyDirValueIter = BTreeValueIterator<KeyDirEntry>;
 export using KeyDirReverseValueIter = ReverseBTreeValueIterator<KeyDirEntry>;
+// Bulk build of a key directory from ascending keys, and the concatenation
+// of the slices several threads built — what recovery_load_ranged uses.
+export using KeyDirBulkLoader = btree_detail::BulkLoader<KeyDirEntry>;
+export using KeyDirLeafRun = btree_detail::LeafRun<KeyDirEntry>;
 #else
 export using KeyDirTree = PersistentRadixTree<KeyDirEntry>;
 export using KeyDirTransient = TransientRadixTree<KeyDirEntry>;

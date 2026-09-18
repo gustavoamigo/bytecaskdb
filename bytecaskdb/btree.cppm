@@ -1661,13 +1661,17 @@ public:
   // order. Taken from the inner separators, which sit one per leaf boundary:
   // the sample is uniform in leaves without reading a single leaf, and the
   // leaves of a bulk-loaded tree hold within a few percent of each other, so
-  // it is uniform in keys too. The keys are separators, not necessarily keys
-  // of the tree — use them as range bounds, not as lookups.
+  // it is uniform in keys too. A tree small enough to be one leaf has no
+  // separators, so its own keys are sampled instead — the same cut points,
+  // one level down. The result is separators, not necessarily keys of the
+  // tree: use them as range bounds, not as lookups.
   [[nodiscard]] auto sample_separators(std::size_t n) const
       -> std::vector<std::vector<std::byte>> {
     std::vector<std::vector<std::byte>> out;
     if (!root_ || n == 0)
       return out;
+    if (root_->is_leaf)
+      return sample_leaf_keys(root_, n);
     std::size_t total = 0;
     count_separators(root_, total);
     if (total == 0)
@@ -1760,6 +1764,29 @@ private:
   friend class btree_detail::BulkLoader<V>;
 
   static auto chain() -> Chain & { return Chain::instance(); }
+
+  // A single-leaf tree: its own keys are the only cut points available. The
+  // first key is skipped, so every cut leaves something below it.
+  [[nodiscard]] static auto sample_leaf_keys(const N *leaf, std::size_t n)
+      -> std::vector<std::vector<std::byte>> {
+    std::vector<std::vector<std::byte>> out;
+    if (leaf->count < 2)
+      return out;
+    const std::size_t cuts = leaf->count - 1;
+    const auto groups = std::min(n + 1, cuts + 1);
+    out.reserve(groups - 1);
+    for (std::size_t j = 1; j < groups; ++j) {
+      const auto i = static_cast<std::uint32_t>(j * (cuts + 1) / groups);
+      const auto pre = leaf->prefix();
+      const auto suf = leaf->suffix(i);
+      std::vector<std::byte> key;
+      key.reserve(pre.size() + suf.size());
+      key.insert(key.end(), pre.begin(), pre.end());
+      key.insert(key.end(), suf.begin(), suf.end());
+      out.push_back(std::move(key));
+    }
+    return out;
+  }
 
   static void count_separators(const N *n, std::size_t &total) noexcept {
     if (n->is_leaf)

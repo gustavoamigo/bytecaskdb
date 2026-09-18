@@ -606,6 +606,20 @@ TEST_CASE("BTree sample_separators cuts the key space evenly", "[btree]") {
   CHECK(Tree{}.sample_separators(16).empty());
   CHECK(t.sample_separators(0).empty());
 
+  // A tree small enough to be one leaf has no separators, so its own keys
+  // stand in. Recovery leans on this: a worker handed one small hint file
+  // must still offer cut points.
+  CHECK(build({"only"}).sample_separators(8).empty());
+  auto tiny = build({"a", "b", "c", "d", "e", "f", "g", "h"});
+  REQUIRE(tiny.stats().leaves == 1U);
+  auto tiny_seps = tiny.sample_separators(3);
+  CHECK(tiny_seps.size() == 3U);
+  for (std::size_t i = 0; i < tiny_seps.size(); ++i) {
+    CHECK(to_string(tiny_seps[i]) > "a");
+    if (i > 0) CHECK(to_string(tiny_seps[i - 1]) < to_string(tiny_seps[i]));
+  }
+  CHECK(tiny.sample_separators(100).size() == 7U);
+
   for (std::size_t n : {4U, 16U, 64U, 256U}) {
     auto seps = t.sample_separators(n);
     INFO("n " << n << " got " << seps.size());
@@ -638,7 +652,7 @@ TEST_CASE("BTree sample_separators cuts the key space evenly", "[btree]") {
     INFO("max/mean " << max / mean);
     CHECK(max / mean < 1.35);
   }
-  check_accounting({&t});
+  check_accounting({&t, &tiny});
 }
 
 TEST_CASE("BTree concat of range-disjoint runs", "[btree]") {

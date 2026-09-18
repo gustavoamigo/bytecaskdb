@@ -352,18 +352,52 @@ equal keys, and an append builder that fills leaves to capacity and stacks
 inner levels as it goes. The result shares no node with either input, and
 the inputs are freed when their handles are dropped.
 
-The engine merges partitions pairwise, `log2(W)` levels deep
-(`recovery_merge_results`, `bytecask.cppm:3640`). With sequential rebuild
-the critical path is the last merge, all 10M keys on one thread, about
-1 s at 100 ns per key. That misses the recovery numbers in the README
-(0.51 s at 10M with 16 threads). The follow-up, if the gate in §Plan
-demands it, is one range-partitioned k-way merge: sample `T` split keys
-from the partition trees, have each of `T` threads merge its range from
-all `W` partitions into a subtree with the append builder, and join the
-subtrees under one root, padding shorter subtrees with single-child inner
-nodes, which the invariants already allow. Each thread then does `10M/T`
-appends; at 16 threads that is under 100 ms. This changes
-`recovery_load_parallel`, not the tree.
+`merge` is what `recovery_merge_results` calls, and the engine used to
+fold its `W` partitions together with it pairwise, `log2(W)` levels deep.
+Every surviving key is rewritten once per level, and the last level is
+serial, so recovery got *worse* with more threads past four. That path is
+now the radix tree's; the B+ tree takes §Range-partitioned recovery
+instead, and `merge` is left as the two-way primitive the API promises.
+
+### Range-partitioned recovery
+
+`DB::recovery_load_ranged` (`bytecask.cppm`, selected by
+`BYTECASK_USE_BTREE`) replaces the fold with a partition:
+
+1. Round-robin the hint files to `W` workers; each builds its own tree,
+   exactly as before.
+2. Pool the workers' separators and cut them into `R = W` splitters.
+3. One thread per range merges that slice of all `W` trees, resolves by
+   sequence, applies the pooled tombstones and bulk-loads the survivors.
+4. Concatenate the `R` range-disjoint results.
+
+Every surviving key is written once, in parallel, and the serial tail
+rebuilds only the levels above the leaves — `O(entries / fanout)`.
+
+Step 2 is what makes this cheap, and it is a property of the tree rather
+than of the engine: a B+ tree's inner separators are *already* a uniform
+one-per-leaf sample of its keys, so `sample_separators(n)` reads a few
+hundred of them without touching a leaf. Only the *output* has to be
+disjoint — each worker still reads whatever keys its own files held — so
+nothing is shuffled and the phase costs two barriers. Measured bucket
+balance is within 4% of even (max/mean 1.01–1.04) across every key shape
+in `memory_profile`, at both 16 and 64 ranges.
+
+Step 4 needs `BulkLoader::seal()`, which hands over a `LeafRun` — the
+sealed leaves and the separators between them — instead of finishing a
+tree, and `BulkLoader::concat()`, which stitches runs into one tree and
+publishes under the highest tag among them (the chain frees a dead
+version by tag interval, so a node tagged above the published version
+would be taken for a later version's garbage).
+
+This is deliberately *not* shared with the radix tree. A trie is
+canonical: two radix trees agree on the shape of any subtree whose key
+set they agree on, so their merge adopts whole subtrees by pointer and
+does work proportional to the overlap rather than to `N`. Rebuilding the
+key set into range slices would throw that away. A radix-native version
+would merge structurally within a prefix range and would need per-node
+subtree counts to pick balanced splitters — worth doing, but it is a
+different algorithm and belongs to `main`, not here.
 
 ## Versions, transients and reclamation
 
@@ -666,7 +700,7 @@ Each step is a reviewed commit with the suite green.
 | 0 | Review this document; settle the open questions below. Merge #86 first: its engine changes and `VersionChain` are the base. | Design approved, issue filed |
 | 1 | `version_chain.cppm` lifted out with node traits; `btree.cppm` with layout, search, `BuildSession`, handles, iterators, append builder, `merge`; ported and new tests; accounting tests. Radix tree untouched. | Tree tests and `[accounting]` green under ASAN/TSAN |
 | 2 | `KeyDir` alias in `internals.cppm`; `u32_map` on the B+ tree; engine on the alias. | Full suite, `[model]`, sanitizers green (G1) |
-| 3 | Recovery: measure fan-in; implement the range-parallel merge if G4 fails. | G4 |
+| 3 | Recovery: measure fan-in; implement the range-parallel merge if G4 fails. ✅ done — `recovery_load_ranged` | G4 ✅ |
 | 4 | Benchmarks and memory profile against the baseline; the 2 KiB node comparison; record rows in the CSVs and here. | G2, G3, G5, G6 |
 | 5 | Remove `radix_tree.cppm`, its tests, benchmarks adapters and the two radix design documents; update `bytecask_design.md`, README, intro; close #84, #85 (or re-scope to the chain), #86's follow-ups. | G7; docs match the code |
 
@@ -682,9 +716,11 @@ Each step is a reviewed commit with the suite green.
    or keep #86 open and lift `VersionChain` from the branch directly? The
    first gives the engine its gains now and a clean baseline for the
    gates.
-4. **Recovery merge scope.** Sequential consuming merge in step 2 and the
-   parallel merge only if G4 fails (proposed), or design the parallel merge
-   in from the start?
+4. ~~**Recovery merge scope.**~~ Settled: the sequential consuming merge
+   shipped in step 2, G4 failed, and the range-partitioned merge landed as
+   `recovery_load_ranged` in step 3. It is a separate function selected by
+   `BYTECASK_USE_BTREE`, not a replacement for `recovery_load_parallel`,
+   because the two trees want different merge strategies.
 5. **README figure.** The per-key RAM paragraph will read "50 to 75 bytes
    per key for structured keys, 60 to 130 for random keys" instead of the
    current "~50". Acceptable framing?
@@ -697,13 +733,17 @@ mode of `memory_profile`; the engine still uses the radix tree.
 
 | Part | Where | Lines |
 |---|---|---:|
-| Tree: node layout, search, `BuildSession`, handles, iterators, merge | `bytecaskdb/btree.cppm` | 1,616 |
+| Tree: node layout, search, `BuildSession`, handles, iterators, merge, bulk load | `bytecaskdb/btree.cppm` | 2,073 |
 | Reclaimer, lifted from #86 and abstracted over the node type | `bytecaskdb/version_chain.cppm` | 487 |
-| Tests: 14 cases, 790k assertions, clean under ASAN with leak detection | `tests/btree_test.cpp` | 554 |
+| Tests: 18 cases, 1.3M assertions, clean under ASAN with leak detection | `tests/btree_test.cpp` | 755 |
 
-`btree.cppm` is under the 2,000-line gate (G7), with about 250 of its
-lines being the debug `validate()`, `stats()` and `visit_nodes()` support.
-There is no per-node-type dispatch anywhere.
+`btree.cppm` is 73 lines over the 2,000-line gate (G7) after the bulk
+loader and the two range-merge primitives. About 250 of its lines are the
+debug `validate()`, `stats()`, `sample_separators()` and `visit_nodes()`
+support; moving the first two to a test-only header would put it back
+under, and that is the intended fix rather than compressing the algorithms.
+The second half of G7 holds unconditionally: there is no per-node-type
+dispatch anywhere.
 
 ### What differs from the design above
 
@@ -1045,35 +1085,59 @@ threads where before it got monotonically worse. The radix column moved
 less than 7% from the earlier non-interleaved run, so the middle and right
 columns are comparable.
 
-It still fails gate G4, and the curve still turns upward past four
-threads, which is the fan-in and nothing else. Sixteen threads means
+It still failed gate G4, and the curve still turned upward past four
+threads, which was the fan-in and nothing else: sixteen threads meant
 sixteen partitions and four merge levels, each passing every key through
-an iterator and an append at about 145 ns per key per level. Two things
-are left, in order of value:
+an iterator and an append at about 145 ns per key per level.
 
-1. **Remove the fan-in.** The range-partitioned design in the recovery
-   section above replaces log2(W) levels with one, run in parallel across
-   T ranges, so the merge work per thread falls from 4N to N/T at sixteen
-   threads. This is the change that should reach parity or better, and it
-   is engine surgery in `recovery_load_parallel`, not tree work.
-2. **The merge inner loop.** 145 ns per key per level is higher than the
-   50 to 60 ns the components suggest. The forward iterator rebuilds its
-   key buffer on every advance, and `BulkLoader::append` copies the key
-   again into its arena; a merge that hands the loader the iterator's
-   buffer directly would avoid one of those copies.
+### Recovery after the range partition
+
+`recovery_load_ranged` removes the fan-in (see §Range-partitioned
+recovery). Three interleaved rounds, 1M keys, data directory on tmpfs,
+`taskset -c 0-3`, three iterations per cell, median within a round. The
+ratio is radix over B+, so above 1 the B+ tree is faster:
+
+| Threads | R1 radix | R1 B+ | R2 radix | R2 B+ | R3 radix | R3 B+ | median ratio |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 395 ms | 406 ms | 402 ms | 410 ms | 407 ms | 400 ms | 0.98 |
+| 2 | 225 ms | 227 ms | 233 ms | 228 ms | 225 ms | 222 ms | 1.01 |
+| 4 | 135 ms | 126 ms | 146 ms | 119 ms | 145 ms | 119 ms | **1.22** |
+| 8 | 137 ms | 125 ms | 143 ms | 128 ms | 132 ms | 128 ms | 1.09 |
+| 16 | 139 ms | 128 ms | 130 ms | 127 ms | 124 ms | 134 ms | 1.03 |
+
+**G4 passes**: −2% at one thread, +22% at four, +3% at sixteen, all
+inside the ±10% band or better. Against the bulk-merge column above, the
+same B+ binary went from 244 ms to 119 ms at four threads and from 578 ms
+to 128 ms at sixteen. The curve no longer turns upward; it now has the
+same shape as the radix tree's, because both are bounded by the same
+thing — this host has four cores, so eight and sixteen threads
+oversubscribe and neither tree improves past four.
+
+That last point is the caveat on the sixteen-thread rows. The fan-in
+removal is supposed to pay most where `log2(W)` is largest, and four
+cores cannot show that. The README's recovery table was measured on a
+16-thread machine; re-running there is what would confirm the shape.
+
+Note the numbers above come from `engine_bench` run directly, under
+`BYTECASK_KEYDIR=btree` and `BYTECASK_NO_ROCKSDB=1`. They are not written
+to `benchmarks/engine_bench_results.csv`: that file tracks the default
+build on `main`, and rows from a different key directory would not be
+comparable with the history in it.
 
 ### Next steps
 
-1. Recovery: the range-partitioned merge. The bulk loader landed and took
-   G4's gap from 17x to 4.25x at sixteen threads; removing the fan-in is
-   what remains.
-2. Point lookup, worth 10% of `Get` at the engine level.
-3. `u32_map` on the B+ tree, `[model]` tests under ASAN and TSAN, sysbench
-   against `main`.
-3. Point lookup, which also sets the insert cost against #86: cut the
-   per-level fixed cost, and try 2 KiB leaves for the short-key shapes
-   where the scan and the slot shift are longest.
-4. Remove the radix tree and update the documents (step 5).
+1. Point lookup, worth 10% of `Get` at the engine level, and the same
+   work sets the insert cost against #86: cut the per-level fixed cost,
+   and try 2 KiB leaves for the short-key shapes where the scan and the
+   slot shift are longest.
+2. The merge inner loop, which the range merge inherits: 145 ns per key
+   is higher than the 50 to 60 ns the components suggest. The forward
+   iterator rebuilds its key buffer on every advance and
+   `BulkLoader::append` copies the key again into its arena; handing the
+   loader the iterator's buffer directly would avoid one of those copies.
+3. Re-run recovery on a 16-thread host.
+4. `u32_map` on the B+ tree, sysbench against `main`.
+5. Remove the radix tree and update the documents.
 
 ## References
 
