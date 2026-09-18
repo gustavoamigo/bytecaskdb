@@ -137,6 +137,10 @@ jobs:
             xmake \
             python3-pip python3-devel \
             git ninja-build
+          # bytecaskdb_python's on_load() asks nanobind for its include dir, and
+          # xmake f loads every target — so this job needs it even though it
+          # only builds bytecask_tests.
+          pip3 install nanobind
 
       - name: Configure xmake
         run: |
