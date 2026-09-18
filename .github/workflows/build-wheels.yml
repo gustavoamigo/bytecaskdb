@@ -11,6 +11,14 @@
 # Linux builds run inside the manylinux container with LLVM 20.
 # macOS builds use Homebrew LLVM (latest, currently 20) on Apple Silicon
 # (`macos-14`). GitHub no longer provides x86_64 macOS hosted runners.
+#
+# On pull_request, only a single Python version per OS is built, as a
+# sanity check that the extension still builds and its tests pass — not to
+# produce publishable wheels (publish only runs on push to main). The
+# C++ engine build+test step is skipped on pull_request since ci.yml's
+# build-and-test job already covers it. On push to main and on
+# workflow_dispatch, the full version matrix builds (needed for the
+# actual release, or to check matrix-sensitive changes before merging).
 
 name: Build Python wheels
 
@@ -44,7 +52,7 @@ jobs:
       BYTECASK_MARCH: x86-64-v3
     strategy:
       matrix:
-        python: ["cp312-cp312", "cp313-cp313", "cp314-cp314", "cp314-cp314t", "cp315-cp315", "cp315-cp315t"]
+        python: ${{ fromJSON(github.event_name == 'pull_request' && '["cp312-cp312"]' || '["cp312-cp312", "cp313-cp313", "cp314-cp314", "cp314-cp314t", "cp315-cp315", "cp315-cp315t"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -97,6 +105,7 @@ jobs:
             -y -v
 
       - name: Build and test C++ engine
+        if: github.event_name != 'pull_request'
         run: |
           export XMAKE_ROOT=y
           source ~/.xmake/profile
@@ -142,7 +151,7 @@ jobs:
     runs-on: macos-14
     strategy:
       matrix:
-        python-version: ["3.12", "3.13", "3.14", "3.14t"]
+        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.12"]' || '["3.12", "3.13", "3.14", "3.14t"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -163,6 +172,7 @@ jobs:
           xmake f --toolchain=llvm --sdk="$LLVM_PREFIX" -m release -y -v
 
       - name: Build and test C++ engine
+        if: github.event_name != 'pull_request'
         run: |
           xmake build bytecask_tests
           xmake run bytecask_tests
