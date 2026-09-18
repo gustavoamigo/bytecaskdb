@@ -220,6 +220,18 @@ export struct EngineState {
   // Creates a mutable working copy for the write path.
   // Defined in bytecask.cpp (needs TransientEngineState's full definition).
   [[nodiscard]] auto transient() const -> TransientEngineState;
+
+  // The same state marked degraded. A handle copy, not a derived version:
+  // the key directory's version history stays linear even when the state
+  // being degraded is the published one and an unpublished head derived
+  // from it is still alive (a failed flush).
+  [[nodiscard]] auto degraded_copy(std::string reason) const
+      -> std::shared_ptr<EngineState> {
+    auto s = std::make_shared<EngineState>(*this);
+    s->degraded = true;
+    s->degraded_reason = std::move(reason);
+    return s;
+  }
 };
 
 // ---------------------------------------------------------------------------
