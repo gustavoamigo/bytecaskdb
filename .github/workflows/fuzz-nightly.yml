@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: MIT
+# Nightly fuzz run (libFuzzer + ASan), 5 minutes per target.
+#
+# ci.yml's `fuzz` job only compiles these targets on every push/PR — a
+# meaningful fuzzing budget doesn't fit a per-PR job, so the timed run lives
+# here instead, on a schedule plus manual dispatch.
+
+name: Fuzz (nightly)
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+      CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_data_entry, fuzz_hint_entry]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel \
+            xmake \
+            python3-pip python3-devel \
+            git ninja-build
+          pip3 install nanobind pytest hypothesis
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            --sanitizer=fuzzer,address \
+            -m debug -y
+
+      - name: Generate seed corpus
+        run: |
+          xmake build gen_fuzz_corpus
+          xmake run gen_fuzz_corpus
+
+      - name: Build fuzz target
+        run: xmake build ${{ matrix.target }}
+
+      - name: Run ${{ matrix.target }} (5 min)
+        run: |
+          TARGET=${{ matrix.target }}
+          NAME="${TARGET#fuzz_}"
+          CORPUS="tests/fuzz/corpus/$NAME/"
+          SEED="tests/fuzz/seed/$NAME/"
+          mkdir -p "$CORPUS"
+          BIN="build/linux/x86_64/debug/$TARGET"
+          "$BIN" "$CORPUS" "$SEED" -max_total_time=300 -max_len=65536
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: tests/fuzz/corpus/*/crash-*
+          if-no-files-found: ignore

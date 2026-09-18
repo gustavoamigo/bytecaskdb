@@ -10,7 +10,7 @@ These instructions apply to every repository work request in this workspace.
 ## Required workflow for every implementation request
 
 1. Update `docs/bytecask_design.md` to reflect any behavior, architecture, constraints, or invariants changed by the work.
-2. Track the task, status, and any follow-up work as a GitHub issue.
+2. Track any follow-up work as a GitHub issue. Don't open an issue for the PR's own task — the PR is its own record; use an issue when work is being deferred, discovered mid-implementation, or otherwise won't be covered by a PR opened now.
 3. Update `README.md` to keep it in sync with the project: if a feature is added or changed, update the Features list, Quick Start examples, API Reference, and Architecture sections as needed. The README targets an external audience — avoid internal implementation details; focus on user-visible characteristics and behavior.
 4. Always validate design before moving to implementation
 5. After design approval, move to the implementation
@@ -21,9 +21,9 @@ These instructions apply to every repository work request in this workspace.
 
 ## Issue tracking rules
 
-GitHub Issues are the repository's task tracker.
+GitHub Issues are the repository's task tracker, for work not already captured by an open PR.
 
-- Track active and follow-up work as GitHub issues rather than in a repo file.
+- Track follow-up work as GitHub issues rather than in a repo file. Don't open one just to mirror a PR that's already tracking its own task.
 - Add follow-up work discovered during implementation as a new issue.
 - Target the current milestone when the work is planned for the next release.
 
