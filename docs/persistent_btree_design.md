@@ -682,7 +682,7 @@ against the baseline (`main` after #86 merges).
 | G1 | Full suite green; ASAN with leak detection and TSAN clean; accounting invariant holds |
 | G2 | `memory_profile`: every shape within 15% of the estimate table, none above 1.5× the radix figure |
 | G3 | `engine_bench` 1M: `Get` and `Range50` not worse; `Put/Sync`, `Del/Sync`, `MixedBatch/Sync`, `PutMT/Sync` 2–16 threads within ±3%; `Put/NoSync` not worse than −5% |
-| G4 | Recovery 1M and 10M at 1/4/16 threads within ±10% (step 3 decides whether the parallel merge is needed) |
+| G4 | Recovery 1M and 10M at 1/4/16 threads within ±10% (step 3 decides whether the parallel merge is needed) — **FAILS**: 1.31–1.56× slower than #86's radix tree |
 | G5 | `map_bench`: `TransientSet`, `Get`, `LowerBound`, `Iterate` not worse; `PersistentSet` within ±10% |
 | G6 | sysbench oltp_insert and oltp_write_only not worse than the #86 branch |
 | G7 | `btree.cppm` under 2,000 lines, no per-node-type dispatch anywhere |
@@ -700,7 +700,7 @@ Each step is a reviewed commit with the suite green.
 | 0 | Review this document; settle the open questions below. Merge #86 first: its engine changes and `VersionChain` are the base. | Design approved, issue filed |
 | 1 | `version_chain.cppm` lifted out with node traits; `btree.cppm` with layout, search, `BuildSession`, handles, iterators, append builder, `merge`; ported and new tests; accounting tests. Radix tree untouched. | Tree tests and `[accounting]` green under ASAN/TSAN |
 | 2 | `KeyDir` alias in `internals.cppm`; `u32_map` on the B+ tree; engine on the alias. | Full suite, `[model]`, sanitizers green (G1) |
-| 3 | Recovery: measure fan-in; implement the range-parallel merge if G4 fails. ✅ done — `recovery_load_ranged` | G4 ✅ |
+| 3 | Recovery: measure fan-in; implement the range-parallel merge if G4 fails. Done — `recovery_load_ranged` | G4 ❌ against #86 |
 | 4 | Benchmarks and memory profile against the baseline; the 2 KiB node comparison; record rows in the CSVs and here. | G2, G3, G5, G6 |
 | 5 | Remove `radix_tree.cppm`, its tests, benchmarks adapters and the two radix design documents; update `bytecask_design.md`, README, intro; close #84, #85 (or re-scope to the chain), #86's follow-ups. | G7; docs match the code |
 
@@ -1105,15 +1105,68 @@ ratio is radix over B+, so above 1 the B+ tree is faster:
 | 8 | 137 ms | 125 ms | 143 ms | 128 ms | 132 ms | 128 ms | 1.09 |
 | 16 | 139 ms | 128 ms | 130 ms | 127 ms | 124 ms | 134 ms | 1.03 |
 
-**G4 passes**: −2% at one thread, +22% at four, +3% at sixteen, all
-inside the ±10% band or better. Against the bulk-merge column above, the
+**This table uses the wrong baseline, and the conclusion drawn from it
+was wrong.** It compares against `main`'s radix tree. #86 is the branch
+that matters — its headline change is removing per-child refcounts, and
+subtree adoption is exactly what the recovery fan-in does `log2(W)` times
+over. Measured against it (see §Against #86's radix tree), the B+ tree is
+30–60% slower at every thread count and **G4 fails**. The rest of this
+subsection is kept as the record of the intermediate step, not as a
+result. Read against `main`'s radix tree it said: −2% at one thread, +22%
+at four, +3% at sixteen. Against the bulk-merge column above, the
 same B+ binary went from 244 ms to 119 ms at four threads and from 578 ms
 to 128 ms at sixteen. The curve no longer turns upward; it now has the
 same shape as the radix tree's, because both are bounded by the same
 thing — this host has four cores, so eight and sixteen threads
 oversubscribe and neither tree improves past four.
 
-That last point is the caveat on the sixteen-thread rows. The fan-in
+### Against #86's radix tree
+
+`main`'s radix tree is not the baseline this work has to beat: #86 is.
+To compare the trees rather than two branches that also differ in engine
+code, #86 was merged onto this branch so both key directories build from
+one engine, selected by `BYTECASK_KEYDIR`. Three interleaved rounds, 1M
+keys, same protocol as above, median of three rounds:
+
+| Threads | `main` radix | #86 radix | B+ tree | B+ / #86 |
+|---:|---:|---:|---:|---:|
+| 1 | 400 ms | **269 ms** | 402 ms | 1.49 |
+| 2 | 217 ms | **141 ms** | 222 ms | 1.56 |
+| 4 | 131 ms | **87 ms** | 120 ms | 1.38 |
+| 8 | 137 ms | **92 ms** | 118 ms | 1.31 |
+| 16 | 128 ms | **95 ms** | 123 ms | 1.38 |
+
+The per-round ratios are 1.38–1.52, 1.51–1.63, 1.38–1.43, 1.13–1.36 and
+1.30–1.39 — every round at every thread count, so this is not variance.
+
+**G4 fails.** The B+ tree is 30 to 60% slower than the key directory it
+would replace, and the range partition does not close the gap: #86's
+radix tree beats it while still running the *pairwise fan-in* this branch
+replaced. Two things follow.
+
+First, the fan-in was never the radix tree's problem. #86 recovers in
+87/92/95 ms at 4/8/16 threads — already flat — because a trie is
+canonical and its merge adopts disjoint subtrees by pointer, so each
+fan-in level costs overlap rather than `N`. Removing per-child refcounts
+made that adoption nearly free. The range partition was a fix for a
+weakness the B+ tree has and the radix tree does not.
+
+Second, the earlier conclusion confounded two variables. It compared the
+B+ tree on a new algorithm against the radix tree on the old one, and
+credited the tree for what was partly the algorithm. The controlled
+comparison is the table above: best available algorithm per tree, one
+engine, interleaved. On that basis recovery is a clear loss for the B+
+tree, and it is the one gate where the two structures differ by more than
+noise.
+
+What is still unmeasured is the radix tree under the range partition. It
+would need per-node subtree counts to pick balanced splitters, and the
+numbers above suggest it has little to gain, but that is an argument, not
+a measurement.
+
+### The four-core caveat
+
+The four-core caveat on the sixteen-thread rows. The fan-in
 removal is supposed to pay most where `log2(W)` is largest, and four
 cores cannot show that. The README's recovery table was measured on a
 16-thread machine; re-running there is what would confirm the shape.
