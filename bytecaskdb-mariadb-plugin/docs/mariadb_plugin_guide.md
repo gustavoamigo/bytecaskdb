@@ -358,7 +358,7 @@ See `SMOKE_TEST.md` for the end-to-end MariaDB test procedure.
 Declared in `bytecaskdb_plugin.cc`; the user-facing table with defaults and
 ranges is in the plugin `README.md`. Two kinds:
 
-- **Read-only** (`bytecaskdb_use_mmap`, `bytecaskdb_max_file_bytes`) feed
+- **Read-only** (`bytecaskdb_io_backend`, `bytecaskdb_max_file_bytes`) feed
   `bytecask::Options` in `bytecaskdb_init()` and need a server restart.
 - **Dynamic** (`verify_checksums`, the three `vacuum_*` variables,
   `bulk_copy_flush_bytes`) are read from hot paths on query and vacuum

@@ -11,8 +11,14 @@
 #   - sysbench installed
 #
 # Usage:
-#   ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh [--table-size=N] [--threads=LIST] [--time=S] [--engines=LIST] [--workloads=LIST] [--data-root=PATH]
+#   ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh [--table-size=N] [--threads=LIST] [--time=S] [--warmup=S] [--engines=LIST] [--workloads=LIST] [--data-root=PATH]
 #
+#   --warmup: seconds of unmeasured load run before each measured run (default: 60).
+#             Every cell starts from a freshly dropped and re-prepared table, and
+#             InnoDB's first minute after a bulk load is spent flushing the dirty
+#             pages and redo it left behind — a 60 s run that starts right away
+#             measures that transient, not steady state. sysbench 1.0 has no
+#             --warmup-time, so the warm-up is a separate run whose output is dropped.
 #   --engines: comma-separated list of engines to benchmark (default: bytecaskdb,innodb,rocksdb)
 #              e.g. --engines=bytecaskdb or --engines=bytecaskdb,innodb
 #   --workloads: comma-separated list of sysbench workloads (default: common OLTP mix)
@@ -28,8 +34,9 @@ set -euo pipefail
 # Defaults
 # ---------------------------------------------------------------------------
 TABLE_SIZE=5000000
-THREADS="8"
-DURATION=20
+THREADS="16"
+DURATION=60
+WARMUP=60
 ENGINES="bytecaskdb,innodb,rocksdb"
 # WORKLOADS="oltp_point_select oltp_read_only oltp_write_only oltp_insert oltp_read_write"
 WORKLOADS="oltp_point_select oltp_read_write oltp_insert oltp_write_only"
@@ -50,12 +57,13 @@ for arg in "$@"; do
     --table-size=*) TABLE_SIZE="${arg#*=}" ;;
     --threads=*)    THREADS="${arg#*=}" ;;
     --time=*)       DURATION="${arg#*=}" ;;
+    --warmup=*)     WARMUP="${arg#*=}" ;;
     --engines=*)    ENGINES="${arg#*=}" ;;
     --workloads=*)  WORKLOADS="${arg#*=}" ;;
     --data-root=*)  DATA_ROOT="${arg#*=}" ;;
     --no-secondary-index) CREATE_SECONDARY="off" ;;
     --help|-h)
-      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--engines=bytecaskdb,innodb,rocksdb] [--workloads=oltp_insert] [--data-root=PATH] [--no-secondary-index]"
+      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--warmup=60] [--engines=bytecaskdb,innodb,rocksdb] [--workloads=oltp_insert] [--data-root=PATH] [--no-secondary-index]"
       exit 0
       ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -171,7 +179,7 @@ common_args() {
   local port="$1"
   local socket="$2"
   local threads="$3"
-  echo "$(sysbench_conn_args "$port" "$socket" "$threads" "$TABLE_SIZE") --time=$DURATION --report-interval=0"
+  echo "$(sysbench_conn_args "$port" "$socket" "$threads" "$TABLE_SIZE") --report-interval=0"
 }
 
 # ---------------------------------------------------------------------------
@@ -206,13 +214,23 @@ run_bench() {
   local args
   args="$(common_args "$port" "$socket" "$threads")"
 
-  # Prepare
-  sysbench "$base_workload" $args --mysql_storage_engine="$storage_engine" \
-    --create_secondary="$CREATE_SECONDARY" prepare >/dev/null 2>&1
+  # Fresh table per cell. sysbench's prepare is a bare CREATE TABLE and fails
+  # on an existing one, so without the cleanup every cell after the first
+  # would silently reuse whatever the previous workloads left behind.
+  sysbench "$base_workload" $args cleanup >/dev/null 2>&1 || true
+  if ! sysbench "$base_workload" $args --mysql_storage_engine="$storage_engine" \
+      --create_secondary="$CREATE_SECONDARY" prepare >/dev/null 2>&1; then
+    echo "  [FAILED] sysbench prepare for $engine/$workload" >&2
+  fi
 
-  # Run and capture output
+  # Unmeasured warm-up, then the measured run.
+  if (( WARMUP > 0 )); then
+    sysbench "$base_workload" $args $variant_args --time="$WARMUP" \
+      --mysql-ignore-errors=1180,1213 run >/dev/null 2>&1 || true
+  fi
   local output
-  output="$(sysbench "$base_workload" $args $variant_args --mysql-ignore-errors=1180,1213 run 2>&1)"
+  output="$(sysbench "$base_workload" $args $variant_args --time="$DURATION" \
+    --mysql-ignore-errors=1180,1213 run 2>&1)"
 
   # Cleanup (skip — keep data for EXPLAIN)
   # sysbench "$base_workload" $args cleanup >/dev/null 2>&1
@@ -243,7 +261,7 @@ run_bench() {
 echo ""
 echo "=== Sysbench OLTP Benchmark ==="
 echo "    Engines: ${ENGINES}"
-echo "    Table size: $TABLE_SIZE rows | Duration: ${DURATION}s per run"
+echo "    Table size: $TABLE_SIZE rows | Warm-up: ${WARMUP}s | Duration: ${DURATION}s per run"
 echo "    Threads: ${THREADS}"
 echo "    Workloads: $WORKLOADS"
 echo "    Data root: $DATA_ROOT"

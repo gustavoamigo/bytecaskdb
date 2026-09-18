@@ -39,6 +39,23 @@ export struct Counters {
   std::atomic<std::int64_t> disk_reads{0};
   std::atomic<std::int64_t> disk_read_bytes{0};
 
+  // -- Buffer pool (all zero when IoBackend != BufferPool) --
+  // hits/misses are the primary metric: unlike disk_reads, a miss here is
+  // known to have left the pool, which the page cache cannot tell you.
+  std::atomic<std::int64_t> pool_hits{0};
+  std::atomic<std::int64_t> pool_misses{0};
+  // Frames admitted by a read miss. The writer's inserts on append are not
+  // fills: they cost no I/O.
+  std::atomic<std::int64_t> pool_fills{0};
+  std::atomic<std::int64_t> pool_evictions{0};
+  std::int64_t pool_frames_total{0};
+  // Gauge: frames currently holding a file's bytes. Resident / total is the
+  // fill level an operator sizes against.
+  std::atomic<std::int64_t> pool_frames_resident{0};
+  // Files whose filesystem refused O_DIRECT and fill through the page cache
+  // instead. Catches a CI mount that would otherwise measure the wrong thing.
+  std::atomic<std::int64_t> pool_direct_io_fallbacks{0};
+
   // -- Vacuum --
   std::atomic<std::int64_t> vacuum_bytes_reclaimed{0};
   std::atomic<std::int64_t> vacuum_files_unlinked{0};

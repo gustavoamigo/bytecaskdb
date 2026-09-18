@@ -55,6 +55,13 @@ def test_options_defaults():
     assert opts.max_file_bytes == 64 * 1024 * 1024
     assert opts.recovery_threads == 4
     assert opts.fail_recovery_on_crc_errors is True
+    assert opts.io_backend == bc.IoBackend.Pread
+
+
+def test_buffer_pool_options_defaults():
+    opts = bc.BufferPoolOptions()
+    assert opts.capacity_bytes == 0
+    assert opts.direct_io is True
 
 
 def test_write_options_defaults():

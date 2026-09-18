@@ -9,6 +9,25 @@ export interface Disposable {
 
 export type EntryType = 'put' | 'delete' | 'bulkBegin' | 'bulkEnd' | 'rangeDel';
 
+// Selects how data files are read. 'pread' (default) issues pread(2) per
+// read; 'mmap' memory-maps sealed files for zero-copy reads; 'bufferPool'
+// serves sealed files from a bounded, engine-owned cache — see
+// BufferPoolOptions. The WASM backend only supports 'pread': open() throws
+// for 'mmap' or 'bufferPool' there (mmap emulation and MEMFS both make the
+// alternative backends pointless on that platform — see
+// docs/buffer_pool_design.md).
+export type IoBackend = 'pread' | 'mmap' | 'bufferPool';
+
+export interface BufferPoolOptions {
+  /** Total pool footprint in bytes (frames plus index). Must be at least
+   * 2x maxFileBytes. Required when ioBackend is 'bufferPool'. */
+  capacityBytes: number;
+  /** Fill frames with O_DIRECT so the pool is the only consumer of memory
+   * for sealed-file data (default true). Falls back to buffered fills per
+   * file when the filesystem refuses O_DIRECT. */
+  directIo?: boolean;
+}
+
 export interface OpenOptions {
   maxFileBytes?: number;
   failOnCrcErrors?: boolean;
@@ -18,6 +37,10 @@ export interface OpenOptions {
   maxValueBytes?: number;
   /** Initial engine mode (default 'leader'). */
   initialMode?: Mode;
+  /** How data files are read (default 'pread'). */
+  ioBackend?: IoBackend;
+  /** Only read when ioBackend is 'bufferPool'. */
+  bufferPool?: BufferPoolOptions;
 }
 
 export interface WriteOptions {
