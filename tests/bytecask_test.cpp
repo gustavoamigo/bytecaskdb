@@ -7876,6 +7876,53 @@ TEST_CASE("pipeline: many concurrent sync writers, every commit durable and "
   }
 }
 
+TEST_CASE("pipeline: a writer whose write another thread published sees it "
+          "on its next read, even before state_time_ is stored",
+          "[pipeline][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+
+  // T runs stage 1 and parks before commit_wait, so its entry is in the
+  // head. F appends behind it, wins the flush role and publishes a state
+  // covering both, then parks between the state store and the state_time_
+  // store. T is released into that gap: commit_wait finds its sequence
+  // covered and returns while state_time_ still carries the timestamp T's
+  // read cache was warmed with.
+  FlushGate before_wait;
+  FlushGate between_stores;
+  db.test_before_commit_wait_ = before_wait.hook();
+  db.test_between_publish_stores_ = between_stores.hook();
+
+  std::optional<bytecask::CommitResult> rt;
+  bool t_saw_own_write = false;
+  std::thread tt([&] {
+    // Warm this thread's read cache with the pre-put state.
+    (void)db.contains_key({}, to_bytes("seed"));
+    rt = db.put({.sync = true}, to_bytes("t"), to_bytes("vt"));
+    t_saw_own_write = get_val(db, to_bytes("t")).has_value();
+  });
+  before_wait.wait_in_flush();
+
+  std::optional<bytecask::CommitResult> rf;
+  std::thread tf([&] { rf = db.put({.sync = true}, to_bytes("f"), to_bytes("vf")); });
+  between_stores.wait_in_flush();
+
+  before_wait.open();
+  tt.join();
+  between_stores.open();
+  tf.join();
+  db.test_before_commit_wait_ = nullptr;
+  db.test_between_publish_stores_ = nullptr;
+
+  REQUIRE(rt.has_value());
+  REQUIRE(rf.has_value());
+  CHECK(rt->durable);
+  CHECK(rf->sequence > rt->sequence);
+  CHECK(t_saw_own_write);
+  CHECK(db.contains_key({}, to_bytes("t")));
+}
+
 TEST_CASE("pipeline: a batch admitted before a flush failure is rejected as "
           "degraded, not appended",
           "[pipeline][degraded][concurrency]") {
