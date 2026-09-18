@@ -991,14 +991,39 @@ reported as wins when they are parity. Repeat variance within one run was
 at or below 6% throughout, which measures only that a run is
 self-consistent, not that two separately scheduled runs are comparable.
 
-Concurrent reads (`GetMT`) cannot be measured on this host. The same
-binary on the same row swings up to 2.2x between rounds, larger than any
-difference between the trees, because the container has four shared vCPUs
-and the benchmark spends most of its wall time populating before a two
-second window. Three interleaved rounds put the B+ tree ahead at four
-threads in all three (1.48x, 1.51x, 2.34x) and disagree at two threads
-(0.72x, 1.16x, 1.37x). No number from it belongs in this document; it
-needs the eight-core machine the README figures came from.
+Concurrent reads (`GetMT`) need care on this host but are measurable.
+Five interleaved rounds, data directory on tmpfs, threads pinned with
+`taskset -c 0-3`, five-second windows, five repetitions per round, and the
+directory cleared between runs. Absolute throughput still swings about 2x
+round to round, but the per-round ratio is steady, because the two
+binaries run adjacent in time and see the same machine state:
+
+| Round | 2T radix | 2T B+ | ratio | 4T radix | 4T B+ | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 4.93 M | 4.82 M | 0.98 | 3.35 M | 3.82 M | 1.14 |
+| 2 | 4.96 M | 4.72 M | 0.95 | 3.45 M | 3.50 M | 1.01 |
+| 3 | 2.55 M | 2.72 M | 1.07 | 3.12 M | 3.76 M | 1.21 |
+| 4 | 2.68 M | 2.61 M | 0.98 | 3.34 M | 3.73 M | 1.12 |
+| 5 | 4.90 M | 4.59 M | 0.94 | 6.40 M | 5.93 M | 0.93 |
+
+Concurrent reads are level at two threads (median ratio 0.98) and about
+12% faster on the B+ tree at four (median 1.12). Note this is the opposite
+sign to the single-threaded `Get` row, which is 7% slower, so no single
+explanation covers both and neither gap is large.
+
+The statistic matters more than the setup here. An earlier three-round
+pass took best-of per binary and reported the B+ tree 27% slower; those
+two maxima came from different rounds and different machine states, and
+the number was wrong. Interleaving exists so that the two binaries share
+a machine state, and aggregating across rounds throws that away. Compare
+within a round, then summarise the ratios.
+
+Scaling from two to four threads, measured within a round because both
+thread counts run in one process, ranges from 0.68x to 1.31x for the radix
+tree and 0.74x to 1.43x for the B+ tree. The rounds where four threads are
+slower than two are slower for both trees, so that is the host and not a
+property of either structure. When the host behaves, both scale about
+1.3x.
 
 Recovery, same run, single iteration each but long enough to be signal:
 
