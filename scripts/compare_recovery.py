@@ -75,7 +75,34 @@ CONFIG_SPEC = {
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     print("+ " + " ".join(cmd))
-    return subprocess.run(cmd, cwd=REPO_ROOT, check=True, **kw)
+    try:
+        return subprocess.run(cmd, cwd=REPO_ROOT, check=True, **kw)
+    except subprocess.CalledProcessError as e:
+        print(f"error: command failed (exit {e.returncode}): "
+              f"{' '.join(cmd)}", file=sys.stderr)
+        sys.exit(1)
+
+
+def clang_config_flags() -> list[str]:
+    """--toolchain=clang plus an explicit -resource-dir.
+
+    Without -resource-dir, clang's module dependency scanner can fail to
+    find its own builtin headers (stdarg.h and friends) when scanning the
+    std module — this repo's own CI hits exactly this and works around it
+    the same way (.github/workflows/ci.yml); it is not optional, only
+    silent on hosts where some other mechanism happens to paper over it.
+    Falls back to bare defaults if `clang` is not on PATH; the resulting
+    xmake error will at least be the real one instead of a masked one.
+    """
+    try:
+        clang = shutil.which("clang") or "clang"
+        resource_dir = subprocess.run(
+            [clang, "--print-resource-dir"], capture_output=True, text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return ["--toolchain=clang", f"--cxflags=-resource-dir={resource_dir}"]
 
 
 def build_binaries(no_rocksdb: bool) -> None:
@@ -85,18 +112,19 @@ def build_binaries(no_rocksdb: bool) -> None:
     env_base = os.environ.copy()
     if no_rocksdb:
         env_base["BYTECASK_NO_ROCKSDB"] = "1"
+    config_flags = clang_config_flags()
 
     # Radix tree (default).
     env = env_base.copy()
     env.pop("BYTECASK_KEYDIR", None)
-    run(["xmake", "f", "-m", "release", "--sanitizer="], env=env)
+    run(["xmake", "f", "-m", "release", "--sanitizer="] + config_flags, env=env)
     run(["xmake", "build", BENCH_TARGET], env=env)
     shutil.copy(BUILD_DIR / "engine_bench", BUILD_DIR / "eb_radix")
 
     # B+ tree.
     env = env_base.copy()
     env["BYTECASK_KEYDIR"] = "btree"
-    run(["xmake", "f", "-m", "release", "--sanitizer="], env=env)
+    run(["xmake", "f", "-m", "release", "--sanitizer="] + config_flags, env=env)
     run(["xmake", "build", BENCH_TARGET], env=env)
     shutil.copy(BUILD_DIR / "engine_bench", BUILD_DIR / "eb_btree")
 
