@@ -767,6 +767,21 @@ private:
       node->insert_entry(pos, suf, payload);
       return {node, nullptr, true, true};
     }
+    if (node->count == 0) {
+      // Nothing to split. An empty node whose one new entry does not fit the
+      // standard capacity is the "a node is larger only when a single key
+      // needs it" case, and such a node holds exactly that entry. pack()
+      // sizes a node to its contents, so build it directly; falling through
+      // to split() would ask for a split index in [1, 0].
+      const auto *payload_bytes = payload_bytes_of(payload);
+      auto *fresh = pack(
+          leaf, 1,
+          [&](std::uint32_t) { return Item{KeyParts{key, {}}, payload_bytes}; },
+          0);
+      fresh->first_child = node->first_child;
+      discard(node);
+      return {fresh, nullptr, true, true};
+    }
     return split(node, pos, key, payload);
   }
 
