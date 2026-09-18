@@ -957,25 +957,48 @@ drops the failed flush's heads before it derives. Without them 87 proof
 cases failed with `a version that already has a successor cannot be derived
 from again`. Both are no-ops on the radix tree.
 
-`engine_bench`, 1M keys, 4 vCPUs, median of 3 repetitions at 2s each,
-built without the RocksDB comparison rows:
+`engine_bench`, 1M keys, 4 vCPUs, built without the RocksDB comparison
+rows. Three interleaved rounds, radix then B+ tree inside each round so
+host drift hits both sides, each round the median of 3 repetitions at 2s.
+The spread column is the largest round-to-round ratio over the smallest,
+and is what decides whether a row means anything.
 
-| Benchmark | Radix | B+ tree | B+ / Radix |
-|---|---:|---:|---:|
-| Range50 | 2,991 ns | 1,648 ns | 0.55 |
-| Put/NoSync | 5,769 ns | 5,268 ns | 0.91 |
-| MixedBatch/Sync | 334 us | 302 us | 0.90 |
-| Put/Sync | 135 us | 143 us | 1.06 |
-| Get | 204 ns | 224 ns | 1.10 |
-| Del/Sync | 516 ns | 558 ns | (170% rsd, unusable) |
+| Operation | Radix | B+ tree | B+ / Radix | spread |
+|---|---:|---:|---:|---:|
+| Range-50 | 333 Kscans/s | 608 Kscans/s | 1.82 | 1.01x |
+| Put (NoSync) | 172 Kops/s | 190 Kops/s | 1.10 | 1.01x |
+| Put (Sync) | 7.3 Kops/s | 7.3 Kops/s | 1.02 | 1.20x |
+| MixedBatch (Sync) | 305 Kops/s | 313 Kops/s | 0.99 | 1.19x |
+| Get | 4.87 Mops/s | 4.51 Mops/s | 0.93 | 1.03x |
 
-Against gate G3: `Range50` passes comfortably, `Put/NoSync` is better than
-its −5% bound and in fact faster, `MixedBatch` passes, `Put/Sync` misses
-±3% by 3 points, and `Get` is 10% slower and fails. The engine's `Get` gap
-is far smaller than the tree's own 26 to 80%, because the `pread` dominates
-a point read; only about a fifth of the tree's disadvantage survives to the
-engine. Writes are at parity or better, which the tree-level numbers had
-already suggested and the path-copy analysis predicted.
+A ratio above 1 favours the B+ tree. The three rows with a 1 to 3% spread
+are real: range scans 82% faster, no-sync puts 10% faster, point reads 7%
+slower. The two sync rows have a 20% spread from fdatasync variance and
+support nothing stronger than parity. `Del/Sync` is excluded entirely,
+because its repetitions after the first delete keys that are already gone,
+so it reports 1.9 Mops/s at 170% variance and measures nothing.
+
+Against gate G3: `Range50` passes comfortably and `Put/NoSync` is better
+than its −5% bound. `Put/Sync` and `MixedBatch` sit inside ±3% once
+interleaved. `Get` is 7% slower and fails. That gap is far smaller than
+the tree's own 26 to 80%, because the `pread` dominates a point read, so
+only about a quarter of the tree's disadvantage reaches the engine.
+
+Method matters here and cost a correction. The first pass ran every radix
+row, then every B+ row. Its three low-spread rows came out the same, but
+both sync rows drifted about 10 points in the B+ tree's favour and were
+reported as wins when they are parity. Repeat variance within one run was
+at or below 6% throughout, which measures only that a run is
+self-consistent, not that two separately scheduled runs are comparable.
+
+Concurrent reads (`GetMT`) cannot be measured on this host. The same
+binary on the same row swings up to 2.2x between rounds, larger than any
+difference between the trees, because the container has four shared vCPUs
+and the benchmark spends most of its wall time populating before a two
+second window. Three interleaved rounds put the B+ tree ahead at four
+threads in all three (1.48x, 1.51x, 2.34x) and disagree at two threads
+(0.72x, 1.16x, 1.37x). No number from it belongs in this document; it
+needs the eight-core machine the README figures came from.
 
 Recovery, same run, single iteration each but long enough to be signal:
 
