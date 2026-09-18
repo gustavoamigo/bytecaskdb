@@ -70,6 +70,16 @@ void free_node_subtree_if(typename Traits::Node *root, Pred is_garbage) {
 // NodeVersionChain<Traits> — owns node lifetime for every persistent tree of one
 // value type.
 //
+// Named NodeVersionChain, not VersionChain, because radix_tree.cppm still
+// declares its own `VersionChain` and the two cannot both be
+// bytecask::VersionChain in one import graph. This class is that one lifted
+// out and made generic over a Traits type, so the two are the same design in
+// two copies. Collapsing them — deleting the radix tree's copy and giving it
+// a ChainTraits over this one — is the follow-up this rename is holding a
+// place for, and is what docs/persistent_btree_design.md proposes; it is left
+// out of this change so the B+ tree lands without also rewriting the radix
+// tree's reclamation.
+//
 // A persistent tree is a *version*, identified by the tag of the session
 // that built it, and registered here while any handle to it lives. The
 // session retires the base nodes it makes unreachable — the ones it clones
