@@ -2435,12 +2435,11 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     // Publishing needs the flush role: an in-flight flush must land (or
     // fail) first, so its publication cannot overwrite the degraded state.
     auto role = quiesce();
-    auto err_t = load_state()->transient();
-    err_t.apply_degrade(std::format(
+    auto err_s = load_state()->degraded_copy(std::format(
         "append IO error on '{}': call resume() to recover.",
         file.path().string()));
     counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-    store_state(std::move(err_t).persistent());
+    store_state(std::move(err_s));
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
@@ -2474,13 +2473,12 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     t.apply_sync(batch_max_seq);
   } catch (...) {
     auto ex = std::current_exception();
-    auto err_t = published->transient();
-    err_t.apply_degrade(std::format(
+    auto err_s = published->degraded_copy(std::format(
         "rotation fdatasync failed on '{}': bytes in page cache but "
         "durability not confirmed. Call resume() to recover.",
         file.path().string()));
     counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-    store_state(std::move(err_t).persistent());
+    store_state(std::move(err_s));
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
@@ -2511,13 +2509,12 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
       t.apply_sync(batch_max_seq);
     } catch (...) {
       auto ex = std::current_exception();
-      auto err_t = published->transient();
-      err_t.apply_degrade(std::format(
+      auto err_s = published->degraded_copy(std::format(
           "commit fdatasync failed on '{}': bytes in page cache but "
           "durability not confirmed. Call resume() to recover.",
           file.path().string()));
       counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-      store_state(std::move(err_t).persistent());
+      store_state(std::move(err_s));
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
       }
@@ -2571,8 +2568,7 @@ void DB::flush_pending() {
 void DB::flush_failed(std::exception_ptr ex,
                       const std::shared_ptr<const EngineState> &published,
                       const std::filesystem::path &active_path) {
-  auto err_t = published->transient();
-  err_t.apply_degrade(std::format(
+  auto err_s = published->degraded_copy(std::format(
       "commit fdatasync failed on '{}': bytes in page cache but "
       "durability not confirmed. Call resume() to recover.",
       active_path.string()));
@@ -2583,7 +2579,7 @@ void DB::flush_failed(std::exception_ptr ex,
   // promises the I/O error. (Raw store: the checked store_state takes
   // durable_mu_ itself.)
   std::lock_guard<std::mutex> lk{durable_mu_};
-  store_state(std::move(err_t).persistent());
+  store_state(std::move(err_s));
   flush_error_ = std::move(ex);
 }
 
@@ -3209,10 +3205,7 @@ void DB::set_mode(Mode mode) {
 }
 
 void DB::deem_as_degraded(std::string reason) {
-  auto current = load_state();
-  auto t = current->transient();
-  t.apply_degrade(std::move(reason));
-  store_state(std::move(t).persistent());
+  store_state(load_state()->degraded_copy(std::move(reason)));
 }
 
 void DB::resume() {
@@ -3221,6 +3214,13 @@ void DB::resume() {
   WriteBarrier barrier{*this};
   auto current = load_state_for_write();
   if (!current->degraded) return;  // re-check under lock
+
+  // The failed flush left one or two heads derived from the published
+  // state alive in head_. The key directory derives a version only from
+  // the end of its chain, so drop them now — ~FlushRole would only do it at
+  // the end of the barrier — and the resumed state is derived from the
+  // published one with those heads already reclaimed.
+  store_head(current);
 
   auto t = current->transient();
   const auto old_file_id = t.active_file_id();
@@ -3750,8 +3750,9 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
     return kde_newer(x, y) ? x : y;
   };
 
-  auto merged =
-      PersistentRadixTree<KeyDirEntry>::merge(a.key_dir, b.key_dir, seq_resolver);
+  // merge consumes both inputs; a and b are ours, moved in by the caller.
+  auto merged = PersistentRadixTree<KeyDirEntry>::merge(
+      std::move(a.key_dir), std::move(b.key_dir), seq_resolver);
 
   for (const auto &[key, tomb_seq] : b.tombstones) {
     std::span<const std::byte> key_span{key.begin(), key.size()};
@@ -4184,10 +4185,9 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     } catch (...) {
       auto ex = std::current_exception();
       try { file.sync(); } catch (...) {}
-      auto err_t = current->transient();
-      err_t.apply_degrade(
+      auto err_s = current->degraded_copy(
           "ingest append IO error: call resume() to recover.");
-      store_state(std::move(err_t).persistent());
+      store_state(std::move(err_s));
       std::rethrow_exception(ex);
     }
 
@@ -4197,10 +4197,9 @@ void DB::ingest(std::span<const DataEntryView> entries) {
         file.sync();
         t.apply_sync(chunk_max_seq);
       } catch (...) {
-        auto err_t = current->transient();
-        err_t.apply_degrade(
+        auto err_s = current->degraded_copy(
             "ingest rotation fdatasync failed: call resume() to recover.");
-        store_state(std::move(err_t).persistent());
+        store_state(std::move(err_s));
         throw;
       }
       try {
@@ -4223,10 +4222,9 @@ void DB::ingest(std::span<const DataEntryView> entries) {
       t.active_file().sync();
       t.apply_sync(t.next_seq() - 1);
     } catch (...) {
-      auto err_t = current->transient();
-      err_t.apply_degrade(
+      auto err_s = current->degraded_copy(
           "ingest rotation fdatasync failed: call resume() to recover.");
-      store_state(std::move(err_t).persistent());
+      store_state(std::move(err_s));
       throw;
     }
     try {
@@ -4244,10 +4242,9 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     t.active_file().sync();
     t.apply_sync(t.next_seq() - 1);
   } catch (...) {
-    auto err_t = current->transient();
-    err_t.apply_degrade(
+    auto err_s = current->degraded_copy(
         "ingest fdatasync failed: call resume() to recover.");
-    store_state(std::move(err_t).persistent());
+    store_state(std::move(err_s));
     throw;
   }
 
