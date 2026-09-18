@@ -300,6 +300,15 @@ public:
 
   EntryIterator() = default;
 
+  // Move-only: operator* caches spans into io_buf_, and a copy would carry
+  // those spans while deep-copying the buffer they address — the copy would
+  // point into the source's storage. Moving is safe (the buffer moves with
+  // the spans). Same reasoning as ChangeIterator.
+  EntryIterator(const EntryIterator &) = delete;
+  auto operator=(const EntryIterator &) -> EntryIterator & = delete;
+  EntryIterator(EntryIterator &&) noexcept = default;
+  auto operator=(EntryIterator &&) noexcept -> EntryIterator & = default;
+
   EntryIterator(std::shared_ptr<const EngineState> state,
                 ValueIterator<KeyDirEntry> cur,
                 bool verify_checksums = true)
@@ -408,6 +417,14 @@ public:
   using difference_type = std::ptrdiff_t;
 
   ReverseEntryIterator() = default;
+
+  // Move-only for the same reason as EntryIterator — see there.
+  ReverseEntryIterator(const ReverseEntryIterator &) = delete;
+  auto operator=(const ReverseEntryIterator &)
+      -> ReverseEntryIterator & = delete;
+  ReverseEntryIterator(ReverseEntryIterator &&) noexcept = default;
+  auto operator=(ReverseEntryIterator &&) noexcept
+      -> ReverseEntryIterator & = default;
 
   ReverseEntryIterator(std::shared_ptr<const EngineState> state,
                        ReverseValueIterator<KeyDirEntry> cur,
@@ -945,7 +962,7 @@ private:
   void vacuum_unlink_old_file(const std::shared_ptr<const EngineState> &snap,
                               std::uint32_t file_id);
   // Rewrites a sealed file into a new sealed file containing only live entries.
-  void vacuum_compact_file(std::uint32_t file_id);
+  [[nodiscard]] auto vacuum_compact_file(std::uint32_t file_id) -> bool;
   // Appends live entries from a sealed file into the active file, then removes the sealed file.
   void vacuum_remove_file(std::uint32_t file_id);
 
@@ -2844,9 +2861,9 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
     return true;
   }
 
-  // All files with live entries are compacted (sealed→sealed).
-  vacuum_compact_file(target_id);
-  return true;
+  // All files with live entries are compacted (sealed→sealed). Returns false
+  // when the scan finds nothing to reclaim.
+  return vacuum_compact_file(target_id);
 }
 
 #pragma endregion
@@ -2999,6 +3016,11 @@ auto DB::vacuum_scan_and_copy(
     case EntryType::BulkEnd:
       std::ignore =
           dest_file.append_entry(entry.sequence, entry.entry_type, {}, {});
+      // A marker occupies a header and a CRC in the compacted file, exactly
+      // as it did in the file the write path produced. Counting it keeps
+      // total_bytes equal to the file's size on disk — which is what
+      // recovery seeds it from — and keeps every published offset inside it.
+      result.total_bytes += kHeaderSize + kCrcSize;
       track_seq(entry.sequence);
       break;
     }
@@ -3044,7 +3066,7 @@ void DB::vacuum_unlink_old_file(
 // entries and tombstones. Called under vacuum_mu_, not write_mu_.
 // The new data file is written to .data.tmp, then renamed atomically.
 // The old file is deferred for cleanup when no readers reference it.
-void DB::vacuum_compact_file(std::uint32_t file_id) {
+auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
   auto snap = load_state_for_write();
   const auto &old_file = **snap->files.get(file_id);
 
@@ -3062,6 +3084,20 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id);
     tmp_file->sync();
     tmp_file->shrink_to_fit();
+  }
+
+  // Nothing to reclaim: every byte in this file is live data, a tombstone or
+  // a batch marker, and compaction must preserve all three. Publishing an
+  // identical file would churn I/O, and at fragmentation_threshold 0 the file
+  // would qualify again on the next call and never converge — fragmentation
+  // is measured against live_bytes, which tombstones and markers can never
+  // count towards (hint files have no marker concept, so recovery could not
+  // reproduce it if they did).
+  const auto old_total = snap->file_stats.get(file_id)->total_bytes;
+  if (scan.total_bytes >= old_total) {
+    std::error_code ec;
+    std::filesystem::remove(tmp_data_path, ec);
+    return false;
   }
 
 #ifdef BYTECASK_TESTING
@@ -3095,13 +3131,14 @@ void DB::vacuum_compact_file(std::uint32_t file_id) {
     WriteBarrier barrier{*this};
     vacuum_commit(file_id, scan, new_file, dest_file_id);
   }
-  // Bytes reclaimed = old total - new live (compacted file is smaller).
-  auto old_total = snap->file_stats.get(file_id)->total_bytes;
+  // Bytes reclaimed = the shrinkage, not old_total - live_bytes: the compacted
+  // file also carries the tombstones and markers that had to be preserved.
   counters_.vacuum_bytes_reclaimed.fetch_add(
-      static_cast<std::int64_t>(old_total - scan.live_bytes),
+      static_cast<std::int64_t>(old_total - scan.total_bytes),
       std::memory_order_relaxed);
   counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
   vacuum_unlink_old_file(snap, file_id);
+  return true;
 }
 
 // Removes a sealed file that has no live keys. No I/O scan needed — just
@@ -3461,11 +3498,23 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
       new_state->degraded && !old_state->degraded;
 
 #ifndef NDEBUG
-  // Debug-only O(n) check: next_seq > max(all key_dir sequences).
+  // Debug-only O(n) checks, sharing one walk: next_seq > max(all key_dir
+  // sequences), and every entry inside its file's committed extent
+  // (invariant P — see "View and span lifetimes" in CONTRACT.md).
   std::uint64_t max_seq = 0;
   for (auto it = new_state->key_dir.begin(); it != std::default_sentinel; ++it) {
     auto [key_span, entry] = *it;
     if (entry.sequence() > max_seq) max_seq = entry.sequence();
+    const auto entry_end = entry.file_offset() +
+                           entry_size(key_span.size(), entry.value_size());
+    if (const auto *fs = new_state->file_stats.get(entry.file_id());
+        fs != nullptr && entry_end > fs->total_bytes) {
+      deem_as_degraded(std::format(
+          "invariant violation: key in file_id {} ends at {} but the file's "
+          "committed extent is {}",
+          entry.file_id(), entry_end, fs->total_bytes));
+      return;
+    }
   }
   if (max_seq > 0 && new_state->next_seq <= max_seq) {
     deem_as_degraded(std::format(
@@ -3531,8 +3580,22 @@ void DB::validate_state_consistency(const EngineState &s) const {
           "state consistency: key references file_id {} not in registry",
           entry.file_id())};
     }
-    computed_live[entry.file_id()] +=
-        entry_size(key_span.size(), entry.value_size());
+    // Offset containment: a published entry must lie inside the committed
+    // extent of the file it names. This is what lets resume() shorten the
+    // active file under lock-free readers — with use_mmap the mapping stays
+    // put and only mmap_end_ moves, so an entry above the new extent would
+    // leave a reader's span addressing a page beyond EOF. See "View and span
+    // lifetimes" in CONTRACT.md.
+    const auto size = entry_size(key_span.size(), entry.value_size());
+    const auto entry_end = entry.file_offset() + size;
+    if (const auto *fs = s.file_stats.get(entry.file_id());
+        fs != nullptr && entry_end > fs->total_bytes) {
+      throw std::runtime_error{std::format(
+          "state consistency: key in file_id {} ends at {} but the file's "
+          "committed extent is {}",
+          entry.file_id(), entry_end, fs->total_bytes)};
+    }
+    computed_live[entry.file_id()] += size;
     if (entry.sequence() > max_seq) max_seq = entry.sequence();
   }
 
