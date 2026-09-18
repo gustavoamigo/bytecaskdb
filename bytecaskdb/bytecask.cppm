@@ -2847,6 +2847,19 @@ void DB::rotate_active_file(TransientEngineState &t,
 // and written only when BulkEnd is seen; an incomplete batch (crash
 // mid-write) is silently discarded. Idempotent: skips files whose .hint
 // already exists.
+// Lexicographic order over raw keys, matching the key directory's order.
+// Used both by sorted hint generation and by the ranged recovery merge.
+static auto recovery_key_cmp(std::span<const std::byte> a,
+                             std::span<const std::byte> b) noexcept -> int {
+  const auto n = std::min(a.size(), b.size());
+  if (n != 0) {
+    const auto c = std::memcmp(a.data(), b.data(), n);
+    if (c != 0) return c;
+  }
+  if (a.size() == b.size()) return 0;
+  return a.size() < b.size() ? -1 : 1;
+}
+
 auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
                               const std::filesystem::path &dir)
     -> std::optional<Offset> {
@@ -2860,22 +2873,82 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
 
   auto hint = HintFile::OpenForWrite(tmp_path);
 
+  // BC_SORT_HINTS=1 restores the sorted, deduplicated hint file BC-088
+  // introduced and 45d0e90 traded away for O(1) working memory. Sorting
+  // costs one buffer per data file — bounded by max_file_bytes, not by the
+  // database — and lets recovery bulk-load a B+ tree instead of inserting
+  // key by key. Experimental: it is a build-time choice about which key
+  // directory the format serves, and is off by default.
+  static const bool sort_hints = [] {
+    const char *e = std::getenv("BC_SORT_HINTS");
+    return e && *e == '1';
+  }();
+
+  // Put and Delete entries, staged so they can be sorted by key. Keys live
+  // in one arena: the scanner's key span dies on the next advance, and a
+  // vector per entry would cost an allocation per key.
+  struct Staged {
+    std::uint64_t seq;
+    std::uint64_t file_off;
+    std::uint32_t val_size;
+    std::uint32_t key_off;
+    std::uint32_t key_len;
+    EntryType type;
+  };
+  std::vector<Staged> staged;
+  std::vector<std::byte> key_arena;
+
   auto committed = scan_committed(*file);
   auto it = committed.begin();
   for (; it != std::default_sentinel; ++it) {
     const auto &[entry, entry_off] = *it;
     if (entry.entry_type == EntryType::BulkBegin ||
         entry.entry_type == EntryType::BulkEnd) {
+      // Structural markers carry no key; recovery ignores them. They stay in
+      // scan order ahead of the sorted run.
       hint.append(entry.sequence, entry.entry_type, entry_off, {}, 0);
       continue;
     }
     if (entry.entry_type == EntryType::RangeDel) {
+      // A range tombstone's key is a range bound, not a key of the file, so
+      // it must not join the sorted run — deduplicating by key would let it
+      // collide with a real key. Recovery's tombstone handling is order
+      // independent, so writing these first is safe.
       hint.append_range_del(entry.sequence, entry_off, entry.key,
                             entry.value);
-    } else {
+    } else if (!sort_hints) {
       hint.append(entry.sequence, entry.entry_type, entry_off, entry.key,
                   narrow<std::uint32_t>(entry.value.size()));
+    } else {
+      staged.push_back({entry.sequence, entry_off,
+                        narrow<std::uint32_t>(entry.value.size()),
+                        narrow<std::uint32_t>(key_arena.size()),
+                        narrow<std::uint32_t>(entry.key.size()),
+                        entry.entry_type});
+      key_arena.insert(key_arena.end(), entry.key.begin(), entry.key.end());
     }
+  }
+
+  if (sort_hints) {
+    auto key_of = [&](const Staged &e) {
+      return std::span<const std::byte>{key_arena.data() + e.key_off,
+                                        e.key_len};
+    };
+    // Key ascending, and within a key sequence descending, so the first
+    // entry for each key is the authoritative one.
+    std::ranges::sort(staged, [&](const Staged &a, const Staged &b) {
+      const auto c = recovery_key_cmp(key_of(a), key_of(b));
+      return c < 0 || (c == 0 && a.seq > b.seq);
+    });
+    // Within one data file the highest-sequence entry per key wins, so the
+    // rest are dead weight at recovery.
+    const auto tail = std::ranges::unique(staged,
+        [&](const Staged &a, const Staged &b) {
+          return recovery_key_cmp(key_of(a), key_of(b)) == 0;
+        }).begin();
+    staged.erase(tail, staged.end());
+    for (const auto &e : staged)
+      hint.append(e.seq, e.type, e.file_off, key_of(e), e.val_size);
   }
 
   hint.close();
@@ -3889,18 +3962,6 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
 }
 
 #ifdef BYTECASK_USE_BTREE
-// Lexicographic order over raw keys, matching the tree's own order.
-static auto recovery_key_cmp(std::span<const std::byte> a,
-                             std::span<const std::byte> b) noexcept -> int {
-  const auto n = std::min(a.size(), b.size());
-  if (n != 0) {
-    const auto c = std::memcmp(a.data(), b.data(), n);
-    if (c != 0) return c;
-  }
-  if (a.size() == b.size()) return 0;
-  return a.size() < b.size() ? -1 : 1;
-}
-
 static auto recovery_span_of(const Key &k) noexcept
     -> std::span<const std::byte> {
   return {k.begin(), k.size()};
