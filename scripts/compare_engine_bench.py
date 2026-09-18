@@ -223,6 +223,17 @@ def fmt_time(ns: float) -> str:
     return f"{ns / 1e9:.2f} s"
 
 
+def fmt_ops(ops: float) -> str:
+    """README-style ops/sec: Kops/s, Mops/s — the unit the project's own
+    performance tables use, so a reader can compare these numbers directly
+    against README.md without converting."""
+    if ops < 1e3:
+        return f"{ops:.0f} ops/s"
+    if ops < 1e6:
+        return f"{ops / 1e3:.2f} Kops/s"
+    return f"{ops / 1e6:.2f} Mops/s"
+
+
 def main() -> None:
     run_id = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     p = argparse.ArgumentParser(
@@ -268,7 +279,15 @@ def main() -> None:
         print("[skip-build] using existing eb_radix / eb_btree binaries")
 
     # results[key][config][threads] -> list of real_time_ns.
+    # ops_results mirrors it with items_per_second — Google Benchmark's own
+    # throughput counter (thread-aware for the MT benchmarks via
+    # SetItemsProcessed in engine_bench.cpp), not derived from real_time_ns
+    # here, since 1/real_time would undercount a multi-threaded benchmark's
+    # aggregate throughput.
     results: dict[str, dict[str, dict[int, list[float]]]] = {
+        k: {c: {} for c in CONFIGS} for k in keys
+    }
+    ops_results: dict[str, dict[str, dict[int, list[float]]]] = {
         k: {c: {} for c in CONFIGS} for k in keys
     }
     csv_rows: list[dict] = []
@@ -290,10 +309,14 @@ def main() -> None:
                     ns = b["real_time"] * _TIME_UNIT_TO_NS.get(
                         b.get("time_unit", "ns"), 1.0)
                     results[key][config].setdefault(threads, []).append(ns)
+                    ops = b.get("items_per_second")
+                    if ops is not None:
+                        ops_results[key][config].setdefault(threads, []).append(ops)
                     csv_rows.append({
                         "run_id": run_id, "benchmark": key, "config": config,
                         "threads": threads, "round": r,
                         "dataset_size": args.dataset_size, "real_time_ns": ns,
+                        "ops_per_sec": ops,
                     })
     finally:
         if os.path.isdir(args.bench_dir) and args.bench_dir.startswith(str(REPO_ROOT)):
@@ -306,42 +329,51 @@ def main() -> None:
         with open(path, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=[
                 "run_id", "benchmark", "config", "threads", "round",
-                "dataset_size", "real_time_ns"])
+                "dataset_size", "real_time_ns", "ops_per_sec"])
             if write_header:
                 w.writeheader()
             w.writerows(csv_rows)
         print(f"Appended {len(csv_rows)} rows to {path}")
 
-    print_tables(results, keys, args.dataset_size, args.rounds)
+    print_tables(results, ops_results, keys, args.dataset_size, args.rounds)
 
 
 def print_tables(
     results: dict[str, dict[str, dict[int, list[float]]]],
+    ops_results: dict[str, dict[str, dict[int, list[float]]]],
     keys: list[str],
     dataset_size: int,
     rounds: int,
 ) -> None:
     print()
     print(f"engine_bench, {dataset_size:,} keys, {rounds} interleaved rounds")
-    print("(ratio = B+ tree / radix tree; below 1.0 = B+ tree faster)")
+    print("(ratio = B+ tree / radix tree, by time; below 1.0 = B+ tree faster.")
+    print(" ops/sec is Google Benchmark's own items_per_second, in the")
+    print(" README's own unit — thread-aware for the MT benchmarks, so it is")
+    print(" not simply 1/time.)")
 
     single = [k for k in keys if not BENCHMARKS[k][2]]
     multi = [k for k in keys if BENCHMARKS[k][2]]
 
+    def ops_cell(k: str, cfg: str, threads: int) -> str:
+        vals = ops_results[k][cfg].get(threads, [])
+        return fmt_ops(statistics.median(vals)) if vals else "-"
+
     if single:
         print()
-        print("| Benchmark | radix | B+ tree | ratio |")
-        print("|---|---:|---:|---:|")
+        print("| Benchmark | radix | radix ops/sec | B+ tree | B+ tree ops/sec | ratio |")
+        print("|---|---:|---:|---:|---:|---:|")
         for k in single:
             label = BENCHMARKS[k][0]
             r_vals = results[k]["radix"].get(0, [])
             b_vals = results[k]["btree"].get(0, [])
             if not r_vals or not b_vals:
-                print(f"| {label} | - | - | - |")
+                print(f"| {label} | - | - | - | - | - |")
                 continue
             r_med = statistics.median(r_vals)
             b_med = statistics.median(b_vals)
-            print(f"| {label} | {fmt_time(r_med)} | {fmt_time(b_med)} | "
+            print(f"| {label} | {fmt_time(r_med)} | {ops_cell(k, 'radix', 0)} | "
+                  f"{fmt_time(b_med)} | {ops_cell(k, 'btree', 0)} | "
                   f"{b_med / r_med:.2f} |")
 
     for k in multi:
@@ -354,17 +386,18 @@ def print_tables(
         print()
         print(f"### {label}")
         print()
-        print("| Threads | radix | B+ tree | ratio |")
-        print("|---:|---:|---:|---:|")
+        print("| Threads | radix | radix ops/sec | B+ tree | B+ tree ops/sec | ratio |")
+        print("|---:|---:|---:|---:|---:|---:|")
         for t in all_threads:
             r_vals = results[k]["radix"].get(t, [])
             b_vals = results[k]["btree"].get(t, [])
             if not r_vals or not b_vals:
-                print(f"| {t} | - | - | - |")
+                print(f"| {t} | - | - | - | - | - |")
                 continue
             r_med = statistics.median(r_vals)
             b_med = statistics.median(b_vals)
-            print(f"| {t} | {fmt_time(r_med)} | {fmt_time(b_med)} | "
+            print(f"| {t} | {fmt_time(r_med)} | {ops_cell(k, 'radix', t)} | "
+                  f"{fmt_time(b_med)} | {ops_cell(k, 'btree', t)} | "
                   f"{b_med / r_med:.2f} |")
 
 
