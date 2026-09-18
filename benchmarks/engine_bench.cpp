@@ -1341,11 +1341,14 @@ void BM_RecoveryParallel(benchmark::State &state) {
   }();
 
   for (auto _ : state) {
-    state.PauseTiming();
+    // Only pause when there is something to do: an unconditional
+    // PauseTiming/ResumeTiming pair here costs 30-45 ms per measurement at
+    // these iteration counts, which is a third of the thing being measured.
     if (drop_caches) {
+      state.PauseTiming();
       std::system("sync; echo 3 > /proc/sys/vm/drop_caches");
+      state.ResumeTiming();
     }
-    state.ResumeTiming();
     handle = std::make_unique<Handle>(setup.dir.path,
                                      kParRecoveryThreshold, threads);
     state.PauseTiming();
