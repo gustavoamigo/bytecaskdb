@@ -942,12 +942,68 @@ shift in a wide leaf; and `merge`, by design. Ahead: overwrites (0.4 to
 and 100k, and `Get` at 10k. `Get` at 100k is 1.26× and at 1k 1.8×; the
 1k case is two levels and is not understood yet.
 
+### Engine benchmarks, first integration
+
+The engine builds and runs on either tree (`BYTECASK_KEYDIR=btree`), and the
+full suite passes on both: 1494 cases, 11.4M assertions on the radix tree
+and 8.7M on the B+ tree. Not one line of the engine needed a B+ tree
+specific change; the tree's surface matched `EngineState`'s use as designed.
+
+Two engine paths did need fixing, both ported from #86, because the B+ tree
+enforces the version chain contract that the radix tree never has:
+`EngineState::degraded_copy` marks a plain copy instead of deriving a
+version from a state that may already have a successor, and `DB::resume`
+drops the failed flush's heads before it derives. Without them 87 proof
+cases failed with `a version that already has a successor cannot be derived
+from again`. Both are no-ops on the radix tree.
+
+`engine_bench`, 1M keys, 4 vCPUs, median of 3 repetitions at 2s each,
+built without the RocksDB comparison rows:
+
+| Benchmark | Radix | B+ tree | B+ / Radix |
+|---|---:|---:|---:|
+| Range50 | 2,991 ns | 1,648 ns | 0.55 |
+| Put/NoSync | 5,769 ns | 5,268 ns | 0.91 |
+| MixedBatch/Sync | 334 us | 302 us | 0.90 |
+| Put/Sync | 135 us | 143 us | 1.06 |
+| Get | 204 ns | 224 ns | 1.10 |
+| Del/Sync | 516 ns | 558 ns | (170% rsd, unusable) |
+
+Against gate G3: `Range50` passes comfortably, `Put/NoSync` is better than
+its −5% bound and in fact faster, `MixedBatch` passes, `Put/Sync` misses
+±3% by 3 points, and `Get` is 10% slower and fails. The engine's `Get` gap
+is far smaller than the tree's own 26 to 80%, because the `pread` dominates
+a point read; only about a fifth of the tree's disadvantage survives to the
+engine. Writes are at parity or better, which the tree-level numbers had
+already suggested and the path-copy analysis predicted.
+
+Recovery, same run, single iteration each but long enough to be signal:
+
+| Threads | Radix | B+ tree | B+ / Radix |
+|---|---:|---:|---:|
+| 1 | 0.445 s | 0.425 s | 0.96 |
+| 2 | 0.220 s | 0.532 s | 2.42 |
+| 4 | 0.141 s | 0.809 s | 5.74 |
+| 8 | 0.147 s | 1.260 s | 8.57 |
+| 16 | 0.135 s | 2.290 s | 16.96 |
+
+This is the predicted failure and it is worse than predicted. At one thread
+there is no fan-in and the two trees are level. Every added thread creates
+another partition and therefore another level of pairwise merges, and a B+
+tree merge rebuilds rather than adopting subtrees, so the B+ tree gets
+*slower* with more threads while the radix tree speeds up 3.3x. Gate G4
+fails outright. Recovery cannot ship on the current rebuild-merge; it needs
+the range-partitioned design in the recovery section above, where the fan-in
+disappears entirely.
+
 ### Next steps
 
-1. Engine integration behind the `KeyDir` alias, `u32_map` on the B+ tree,
-   full suite and `[model]` tests under ASAN and TSAN (plan step 2).
-2. Recovery merge (plan step 3), then `engine_bench`, `memory_profile` on
-   the whole engine and sysbench against `main` (step 4).
+1. Recovery: the bulk loader plus the range-partitioned merge. This is now
+   the blocking item, not a follow-up: gate G4 fails by 17x at 16 threads
+   and no amount of tree tuning fixes it.
+2. Point lookup, worth 10% of `Get` at the engine level.
+3. `u32_map` on the B+ tree, `[model]` tests under ASAN and TSAN, sysbench
+   against `main`.
 3. Point lookup, which also sets the insert cost against #86: cut the
    per-level fixed cost, and try 2 KiB leaves for the short-key shapes
    where the scan and the slot shift are longest.
