@@ -791,9 +791,11 @@ installed Clang's major version (sparse, shallow checkout of just
 `libcxx`/`libcxxabi`/`runtimes`/`libc` — the last only for header-only helpers
 `libcxx`'s `charconv` implementation pulls in, `libc` itself is never built)
 and installs it to `.msan-libcxx/`. CI caches
-this build (`actions/cache`, keyed on the script's contents) since it takes
-several minutes; it's idempotent locally too — reruns skip the build if the
-prefix is already populated.
+this build (`actions/cache`) since it takes several minutes; the key covers
+both the script's contents and the installed Clang's major version, so a
+Fedora LLVM bump rebuilds rather than restoring a libc++ built from the
+previous release branch. The script is idempotent — CI reruns and local
+reruns alike skip the build if the prefix is already populated.
 
 **Catch2 is compiled from source for this build only**: the prebuilt `catch2`
 xrepo package is compiled against the system's default libstdc++, and linking
@@ -814,9 +816,12 @@ uninstrumented code as producing fully-initialized output by design); it just
 means bugs inside `crc32c` itself, if any, wouldn't be caught by this MSan
 run.
 
-Run: `scripts/run_sanitizer.sh memory`. Scope matches the ASan/TSan jobs
-above: `bytecask_tests` only, not `radix_tree_memory_tests` or
-`unordered_view_tests`.
+Run: `scripts/run_sanitizer.sh memory`. Target scope matches the ASan/TSan
+jobs above: `bytecask_tests` only, not `radix_tree_memory_tests` or
+`unordered_view_tests`. Trigger scope does not — origin tracking makes the
+MSan test run roughly 6x longer than ASan's or TSan's, so it is excluded
+from the `pull_request` matrix and runs on push to `main` and on
+`workflow_dispatch`.
 
 ### Fuzz testing (libFuzzer)
 
