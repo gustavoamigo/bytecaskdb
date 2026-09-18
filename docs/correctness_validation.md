@@ -333,39 +333,48 @@ to callers. Degrading forces `resume()` before further writes are accepted;
 
 ## Proof Test Generator
 
-### apply_batch — 1190 tests
+### apply_batch — 1668 tests
 
-1190 generated Catch2 tests (`[prove]` tag) cover every valid
+1668 generated Catch2 tests (`[prove]` tag) cover every valid
 (StateShape, PlanShape, FailureClass, Observer) combination for
-`apply_batch`. The scenario matrix is 8 state shapes × 17 plan shapes ×
-9 failure classes; 4 elimination rules reduce this to 800 observer-free
-cells, and the observer axis adds 390 more.
+`apply_batch`. The scenario matrix is 11 state shapes × 17 plan shapes ×
+9 failure classes; 4 elimination rules reduce this to 1108 observer-free
+cells, and the observer axis adds 560 more.
 
 #### State shapes
 
-| Shape | `num_keys` | `max_file_bytes` | `use_mmap` | What it tests |
-|-------|-----------|-----------------|-----------|---------------|
-| `empty_db` | 0 | — | — | Plan applied to a fresh database with no existing keys |
-| `single_key` | 1 | — | — | Overwrites, deletes, and guards against a single existing key |
-| `populated_db` | 10 | — | — | Multiple existing keys; exercises range guards and multi-key interactions |
-| `rotation_threshold` | 1 | 1 | — | Forces file rotation after the plan's writes — required for classes G and H |
-| `deleted_key` | 1 (deleted) | — | — | k0 created then deleted — tombstone in write history, no live keys at baseline |
-| `single_key_buffered` | 1 | — | yes | The mmap read path over a single key |
-| `populated_db_buffered` | 10 | — | yes | The mmap read path with multiple keys and cross-key interactions |
-| `rotation_threshold_buffered` | 1 | 1 | yes | Rotation with the active file mapped — sealing and remapping under classes G and H |
+| Shape | `num_keys` | `max_file_bytes` | `io_backend` | What it tests |
+|-------|-----------|-----------------|-------------|---------------|
+| `empty_db` | 0 | — | pread | Plan applied to a fresh database with no existing keys |
+| `single_key` | 1 | — | pread | Overwrites, deletes, and guards against a single existing key |
+| `populated_db` | 10 | — | pread | Multiple existing keys; exercises range guards and multi-key interactions |
+| `rotation_threshold` | 1 | 1 | pread | Forces file rotation after the plan's writes — required for classes G and H |
+| `deleted_key` | 1 (deleted) | — | pread | k0 created then deleted — tombstone in write history, no live keys at baseline |
+| `single_key_mmap` | 1 | — | mmap | The mmap read path over a single key |
+| `populated_db_mmap` | 10 | — | mmap | The mmap read path with multiple keys and cross-key interactions |
+| `rotation_threshold_mmap` | 1 | 1 | mmap | Rotation with the active file mapped — sealing under classes G and H |
+| `single_key_pool` | 1 | — | buffer_pool | The buffer-pool read path over a single key |
+| `populated_db_pool` | 10 | — | buffer_pool | The buffer-pool read path with multiple keys |
+| `rotation_threshold_pool` | 1 | 1 | buffer_pool | Rotation with a pooled file — fill and eviction under classes G and H |
 
-The three `_buffered` shapes set `Options::use_mmap`, so the active file
-is mapped `MAP_SHARED` and sealed files `MAP_PRIVATE` (see *DataFile
-mmap* in `bytecask_design.md`). They account for 308 of the 800 cells,
-257 of which reach `resume()` — and through it
-`WritableMmapDataFile::truncate` — via `assert_resumable`. That is the
-path #87 broke: the cells ran it on every CI run, ASan included, and
-none of them could fail on it, because a cell can only assert what the
-contract states and the contract said nothing about the span a reader
-holds across that call. `CONTRACT.md` now does, under *View and span
-lifetimes*; the observer that would let these cells act on it is tracked
-in #103. On Emscripten builds the `_buffered` cells are compiled out —
-mmap is unavailable there and `DB::open` rejects the option outright.
+The three `_mmap` shapes map the active file `MAP_SHARED` and sealed
+files `MAP_PRIVATE` (see *DataFile mmap* in `bytecask_design.md`). They
+are the shapes that reach `WritableMmapDataFile::truncate` through
+`assert_resumable`, which is the path #87 broke: those cells ran it on
+every CI run, ASan included, and none of them could fail on it, because
+a cell can only assert what the contract states and the contract said
+nothing about the span a reader holds across that call. `CONTRACT.md`
+now does, under *View and span lifetimes*, and the observer axis below
+is what lets a cell act on it.
+
+The three `_pool` shapes serve sealed reads from the engine-owned buffer
+pool. For a lent view they behave like `pread` rather than like `mmap`:
+the pool copies each value out of its frames into the iterator's own
+`io_buf_`, so no span ever points into a frame and no fill or eviction
+can reach one.
+
+On Emscripten builds both groups are compiled out — neither back-end is
+available there, and `DB::open` rejects the option outright.
 
 Shapes not currently covered: mid-vacuum (vacuum-in-flight during `apply_batch`),
 post-resume (DB that has been degraded and resumed), and multiple sealed files with
@@ -385,7 +394,7 @@ observer is how a generated cell can act on it.
 
 | Observer | Acquired before the transition | Catches |
 |----------|-------------------------------|---------|
-| `none` | — | (every cell; the 800 observer-free cells) |
+| `none` | — | (every cell; the 1108 observer-free cells) |
 | `held_value` | `get` into a `Bytes` kept alive | value-path invalidation |
 | `held_iter_span` | a span from `iter_from`, held across the call | #87 |
 | `held_riter_span` | a span from `riter_from`, held across the call | the reverse read path |
@@ -406,6 +415,12 @@ would be 4000 cells:
    H — every cell that reaches `assert_resumable`, and through it
    `resume()`'s truncate) or the state shape maps the active file.
    Class A returns before any I/O, so `none` is the only observer there.
+   Only `io_backend = mmap` satisfies the second arm: under `pread` and
+   `buffer_pool` a lent span points into the iterator's own buffer, which
+   no file event can reach, so those shapes are crossed through the
+   degrading arm alone. That is why the `_mmap` shapes carry 60 / 60 / 80
+   observer cells where their `pread` and `_pool` counterparts carry
+   50 / 50 / 70 — the difference is the SUCCESS-class cells.
 2. **Two plan shapes carry the observers per (state, failure).** What a
    transition does to a lent view is decided by the failure class and the
    state shape — which file is written, whether it is mapped, whether
@@ -430,16 +445,18 @@ would be 4000 cells:
    new question.
 
 Observers that read a key (`held_value`, `held_iter_span`,
-`held_snapshot`) also require a state shape that leaves one behind, so
-they skip `empty_db` and `deleted_key`.
+`held_riter_span`, `held_snapshot`) also require a state shape that
+leaves one behind, so they skip `empty_db` and `deleted_key`.
 
 Reverting #90 — restoring the `munmap` / `mmap` in
-`WritableMmapDataFile::truncate` — makes 20 of these cells fail, every
+`WritableMmapDataFile::truncate` — makes 40 of these cells fail, every
 one of them on the byte comparison rather than only under ASan, and none
-by crashing. The `mincore` probe passes in all 20: `mmap` hands back the
+by crashing. The `mincore` probe passes in all 40: `mmap` hands back the
 address `munmap` just released, which is exactly the blind spot that
-motivated comparing bytes. The
-`rotation_threshold_buffered` cells correctly keep passing: at
+motivated comparing bytes. Half are `held_iter_span` and half
+`held_riter_span` — the reverse iterator's span points into the same
+mapping. The
+`rotation_threshold_mmap` cells correctly keep passing: at
 `max_file_bytes = 1` every write rotates, so their span points into a
 sealed `MAP_PRIVATE` file that `truncate()` never touches.
 
@@ -532,12 +549,12 @@ Each test follows the same structure:
 7. `assert_recoverable(dir, before, expected)` — validates persistence
    invariant via fresh recovery (where applicable)
 
-### resume() — 28 tests
+### resume() — 37 tests
 
-28 generated Catch2 tests (`[prove_resume]` tag) cover every valid
+37 generated Catch2 tests (`[prove_resume]` tag) cover every valid
 (DegradeShape, ResumeFailureClass) combination.
 
-Six degrade shapes establish a degraded DB before resume is called:
+Eight degrade shapes establish a degraded DB before resume is called:
 
 - **degrade_H** — `io_rotate_file_creation` fires on a put at the
   rotation threshold. The write committed (both keys are in key_dir),
@@ -553,12 +570,13 @@ Six degrade shapes establish a degraded DB before resume is called:
 - **degrade_G** — `io_data_file_sync` fires on a `put(sync=false)`
   with `max_file_bytes=1`. The pre-rotation sync fails. Same page-cache
   state as F — `resume()` replays the entry.
-- **degrade_H_buffered**, **degrade_C_buffered** — H and C with
-  `Options::use_mmap` set. These are the shapes where `resume()`
-  truncates the active file while it is mapped and lock-free readers are
-  not quiesced; the mapping must survive it (see *View and span
-  lifetimes* in `CONTRACT.md`, and *DataFile mmap* in
-  `bytecask_design.md`). Compiled out on Emscripten builds.
+- **degrade_H_mmap**, **degrade_C_mmap** — H and C with
+  `io_backend = mmap`. These are the shapes where `resume()` truncates
+  the active file while it is mapped and lock-free readers are not
+  quiesced; the mapping must survive it (see *View and span lifetimes*
+  in `CONTRACT.md`, and *DataFile mmap* in `bytecask_design.md`).
+- **degrade_H_pool**, **degrade_C_pool** — the same two through the
+  buffer pool. All four are compiled out on Emscripten builds.
 
 Six resume failure classes:
 
@@ -575,13 +593,13 @@ Two elimination rules apply:
    have none in the active file, so `file.size() == valid_offset` and
    `resume()` skips the truncation branch entirely (`if (file.size() !=
    valid_offset) { ... truncate ... }`). R1 is valid only for the
-   degrade_C shapes — 4 combinations filtered.
+   degrade_C shapes — 5 combinations filtered.
 2. **R2 and CASCADE require an unsealed file.** The degrade_H shapes
    seal the active file during rotation before the fault fires, so
    `resume()` never enters the truncate/sync/seal block and the sync
-   fault point is unreachable — 4 more combinations filtered.
+   fault point is unreachable — 6 more combinations filtered.
 
-6 shapes × 6 classes = 36 minus 8 filtered = **28 tests**.
+8 shapes × 6 classes = 48 minus 11 filtered = **37 tests**.
 
 Each R1/R2/R3 test uses a multi-phase pattern:
 1. Establish degraded state
@@ -596,19 +614,21 @@ fault points.
 
 This directly proves: *resume always eventually recovers once the underlying fault clears.*
 
-### vacuum_compact — 20 tests
+### vacuum_compact — 30 tests
 
-20 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover four state
+30 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover six state
 shapes × five failure classes (SUCCESS, VC1–VC4).
 
 State shapes create a DB with exactly one sealed file having fragmentation > 0:
 
 - **low_fragmentation** — sealed file with 2 entries, 1 dead (50% frag)  
 - **mostly_dead** — sealed file with 6 entries, 5 dead (~83% frag)
-- **low_fragmentation_buffered**, **mostly_dead_buffered** — the same
-  two shapes with `Options::use_mmap` set, so the file being compacted
-  is read through its `MAP_PRIVATE` mapping and the staged copy is
-  written through a mapped active file. Compiled out on Emscripten
+- **low_fragmentation_mmap**, **mostly_dead_mmap** — the same two
+  shapes with `io_backend = mmap`, so the file being compacted is read
+  through its `MAP_PRIVATE` mapping and the staged copy is written
+  through a mapped active file.
+- **low_fragmentation_pool**, **mostly_dead_pool** — the same two
+  through the buffer pool. All four are compiled out on Emscripten
   builds.
 
 Files with live entries always use the compact path (sealed→sealed).
@@ -845,27 +865,27 @@ smoke-test the helpers themselves.
 ### Test coverage
 
 All nine failure classes for `apply_batch` (SUCCESS, A, B1, B2, B3, C,
-F, G, H) are covered by the 1190 `[prove]` tests. Each class is exercised
+F, G, H) are covered by the 1668 `[prove]` tests. Each class is exercised
 across all valid (StateShape, PlanShape) combinations, with and without
-mmap, and — for every class that can disturb a lent view — against each
-of the four observers.
+back-end, and — for every class that can disturb a lent view — against
+each of the five observers.
 
 All three resume failure classes (R1–R3) plus DOUBLE and CASCADE across
-all six degrade shapes (H, C, F, G and the two `_buffered` variants) are
-covered by the 28 `[prove_resume]` tests. R1 is correctly excluded for
+all eight degrade shapes (H, C, F, G, and H and C again through mmap and
+the buffer pool) are covered by the 37 `[prove_resume]` tests. R1 is correctly excluded for
 the degrade_H, degrade_F and degrade_G shapes (no orphaned bytes to
 truncate — fault point unreachable), and R2/CASCADE for degrade_H (file
 already sealed).
 
-All five vacuum_compact failure classes across all four state shapes are
-covered by the 20 `[prove_vacuum_compact]` tests.
+All five vacuum_compact failure classes across all six state shapes are
+covered by the 30 `[prove_vacuum_compact]` tests.
 
 All seven ingest failure classes across 11 state shapes and 5 ops shapes
 are covered by the 178 `[prove_repl]` tests. All three manifest failure
 classes across 11 state shapes are covered by the 33 `[prove_manifest]`
 tests. Four elimination rules reduce the full matrix to 211 valid tests.
 
-Total generated proof tests: **1449**.
+Total generated proof tests: **1946**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
@@ -907,7 +927,55 @@ Concurrency code paths exercised:
 | Radix tree refcount | `atomic<uint32_t>` intrusive refcount |
 | Edit tag counter | `atomic<uint64_t>` relaxed fetch_add |
 
-Run: `scripts/run_sanitizer.sh thread` (or `address` for ASan).
+Run: `scripts/run_sanitizer.sh thread` (or `address` for ASan, `memory` for MSan).
+
+### MemorySanitizer (MSan)
+
+The full test suite runs clean under Clang MemorySanitizer with
+`-fsanitize-memory-track-origins=2` (full allocation-site origin tracking).
+MSan instruments every load at compile time and reports a use of any value
+that hasn't been written, catching bugs ASan and TSan don't: reads of
+uninitialized stack or heap memory that happen to produce a plausible-looking
+value on the current allocator/compiler/optimization level but are UB and can
+flip to garbage under a different build.
+
+**Why a custom libc++ is required**: MSan needs initialization state tracked
+through every call, including into the C++ standard library. The system's
+`libcxx-devel` package (used as-is by ASan and TSan above) is not built with
+`-fsanitize=memory`, and linking it into an MSan binary causes constant false
+positives — this is standard, documented MSan behavior, not specific to this
+project. `scripts/build_msan_libcxx.sh` builds an instrumented
+`libc++`/`libc++abi` from the `llvm-project` release branch matching the
+installed Clang's major version (sparse, shallow checkout of just
+`libcxx`/`libcxxabi`/`runtimes`/`libc` — the last only for header-only helpers
+`libcxx`'s `charconv` implementation pulls in, `libc` itself is never built)
+and installs it to `.msan-libcxx/`. CI caches
+this build (`actions/cache`, keyed on the script's contents) since it takes
+several minutes; it's idempotent locally too — reruns skip the build if the
+prefix is already populated.
+
+**Catch2 is compiled from source for this build only**: the prebuilt `catch2`
+xrepo package is compiled against the system's default libstdc++, and linking
+its libstdc++-mangled symbols into a `-stdlib=libc++` binary fails at link
+time (or worse, silently mismatches ABI, for symbols that happen to resolve).
+`third_party/catch2_amalgamated/` vendors Catch2's official amalgamated
+distribution (a single `.hpp`/`.cpp` pair); `bytecask_tests` compiles it
+directly as ordinary translation units — under the same `-stdlib=libc++
+-fsanitize=memory` flags as everything else — only when configured with
+`--sanitizer=memory`. Every other build configuration is unaffected and keeps
+using the normal `catch2` package.
+
+**Known reduced-sensitivity area**: `crc32c` (the only other linked
+dependency) is *not* rebuilt with MSan. Its public API takes only pointers
+and primitive integers — no standard-library types cross the boundary — so
+this doesn't cause false positives (LLVM's MSan treats a call into
+uninstrumented code as producing fully-initialized output by design); it just
+means bugs inside `crc32c` itself, if any, wouldn't be caught by this MSan
+run.
+
+Run: `scripts/run_sanitizer.sh memory`. Scope matches the ASan/TSan jobs
+above: `bytecask_tests` only, not `radix_tree_memory_tests` or
+`unordered_view_tests`.
 
 ### Fuzz testing (libFuzzer)
 

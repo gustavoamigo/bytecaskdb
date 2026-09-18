@@ -36,8 +36,11 @@ from tests.proof.vacuum_compact.scenario_matrix import (
 def _build_open_opts(state: CompactStateShape) -> str:
     """Build the C++ designated-initializer list for Options from state fields."""
     parts = [f".max_file_bytes = {state.max_file_bytes}"]
-    if state.use_mmap:
-        parts.append(".use_mmap = true")
+    if state.io_backend == "mmap":
+        parts.append(".io_backend = bytecask::IoBackend::Mmap")
+    elif state.io_backend == "buffer_pool":
+        parts.append(".io_backend = bytecask::IoBackend::BufferPool")
+        parts.append(".buffer_pool = {.capacity_bytes = 1048576}")
     return ", ".join(parts)
 
 
@@ -113,8 +116,8 @@ def gen_test(
     name = f"prove_vacuum_compact__{state.label}__{failure.value}"
 
     parts: List[str] = []
-    if state.use_mmap:
-        # WASM/Emscripten builds reject Options::use_mmap outright (see
+    if state.io_backend != "pread":
+        # WASM/Emscripten builds reject every non-pread back-end (see
         # DB::open); these buffered/mmap variants only make sense natively.
         parts.append("#ifndef __EMSCRIPTEN__")
     parts.append(f'TEST_CASE("{name}", "[prove_vacuum_compact]") {{')
@@ -134,7 +137,7 @@ def gen_test(
     opts = _build_open_opts(state)
     parts.append(f"  assert_vacuum_recoverable(dir, before, {{{opts}}});")
     parts.append("}")
-    if state.use_mmap:
+    if state.io_backend != "pread":
         parts.append("#endif  // __EMSCRIPTEN__")
     return "\n".join(parts)
 

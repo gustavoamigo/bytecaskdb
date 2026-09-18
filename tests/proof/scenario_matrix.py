@@ -34,7 +34,7 @@ class StateShape:
     num_keys: int
     max_file_bytes: Optional[int] = None
     delete_after_create: bool = False  # create keys then delete them (tombstone state)
-    use_mmap: bool = False
+    io_backend: str = "pread"  # pread | mmap | buffer_pool
 
     @property
     def at_rotation(self) -> bool:
@@ -71,13 +71,21 @@ STATE_SHAPES = [
     StateShape("populated_db", num_keys=10),
     StateShape("rotation_threshold", num_keys=1, max_file_bytes=1),
     StateShape("deleted_key", num_keys=1, delete_after_create=True),
-    StateShape("single_key_buffered", num_keys=1, use_mmap=True),
-    StateShape("populated_db_buffered", num_keys=10, use_mmap=True),
+    StateShape("single_key_mmap", num_keys=1, io_backend="mmap"),
+    StateShape("populated_db_mmap", num_keys=10, io_backend="mmap"),
     StateShape(
-        "rotation_threshold_buffered",
+        "rotation_threshold_mmap",
         num_keys=1,
         max_file_bytes=1,
-        use_mmap=True,
+        io_backend="mmap",
+    ),
+    StateShape("single_key_pool", num_keys=1, io_backend="buffer_pool"),
+    StateShape("populated_db_pool", num_keys=10, io_backend="buffer_pool"),
+    StateShape(
+        "rotation_threshold_pool",
+        num_keys=1,
+        max_file_bytes=1,
+        io_backend="buffer_pool",
     ),
 ]
 
@@ -240,15 +248,21 @@ def is_valid_observer(
     where the transition can actually disturb a view: the failure degrades
     (so the cell reaches resume(), which truncates the active file under a
     live reader), or the state maps that file. Class A returns before any
-    I/O and cannot invalidate anything. Within that, one representative plan
+    I/O and cannot invalidate anything. Within that, two representative plan
     shapes carry the observers, one disjoint from the observed key and
     one colliding with it — see observer_plans_for.
+
+    Only the mmap back-end adds the second arm. Under pread and buffer_pool
+    a lent span points into the iterator's own io_buf_ — the pool copies
+    each value out of its frames rather than lending one — so no file event
+    can reach it, and those shapes are crossed through the degrading arm
+    alone.
     """
     if observer == Observer.NONE:
         return True
     if failure == FailureClass.A:
         return False
-    if not (failure in DEGRADING_CLASSES or state.use_mmap):
+    if not (failure in DEGRADING_CLASSES or state.io_backend == "mmap"):
         return False
     if plan not in observer_plans_for(state, failure):
         return False

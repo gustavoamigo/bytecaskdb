@@ -707,7 +707,7 @@ what a live view shows, and never invalidates it either.
 | View | Handed out by | The bytes live in |
 |------|---------------|-------------------|
 | `Bytes& out` | `DB::get`, `Snapshot::get` | The caller's own vector — a copy, not a view |
-| `EntryView` (`key`, `value`) | `EntryIterator`, `ReverseEntryIterator` — `iter_from`, `riter_from` | The producing iterator's `io_buf_`, or a data file's mapping |
+| `EntryView` (`key`, `value`) | `EntryIterator`, `ReverseEntryIterator` — `iter_from`, `riter_from` | The producing iterator's `io_buf_`, or a data file's mapping under `io_backend = mmap` |
 | `const Key&` | `KeyIterator`, `ReverseKeyIterator` — `keys_from`, `rkeys_from` | An owning `Key` member of the producing iterator |
 | `DataEntryView` (`key`, `value`) | `ChangeIterator` — `changes_since` | The producing iterator's scan buffer — owning `DataEntry` storage |
 | `Snapshot` | `DB::snapshot`, `create_manifest` | A reference-counted engine state |
@@ -791,8 +791,10 @@ not accidents:
   the `pread` fallback and fails as a clean short read rather than
   faulting on a page beyond end of file.
 
-With `use_mmap` off, neither case arises: every span an iterator hands
-out points into that iterator's own `io_buf_`.
+The other two back-ends raise neither case: under `pread`, and under
+the buffer pool — which copies each value out of its frames rather than
+lending one — every span an iterator hands out points into that
+iterator's own `io_buf_`, which no file event can reach.
 
 ### The grid
 
@@ -831,7 +833,7 @@ matters here.
 | — | | |
 | Next `get` into the same `Bytes` | Overwritten | The vector is reused by design; copy it out first if the previous value is still needed |
 
-#### `EntryView` spans, `use_mmap` off
+#### `EntryView` spans, `io_backend` = `pread` or `buffer_pool`
 
 | Event | Verdict | Why |
 |-------|---------|-----|
@@ -849,7 +851,7 @@ matters here.
 | Iterator moved | Valid | The buffer moves with the iterator; the span keeps addressing it |
 | Iterator copied | Not possible | The iterators are move-only. A copy would carry spans addressing the source's buffer while deep-copying that buffer, so the copy is deleted rather than documented |
 
-#### `EntryView` spans, `use_mmap` on
+#### `EntryView` spans, `io_backend` = `mmap`
 
 Spans point into a file's mapping when the entry is inside it, and into
 the iterator's `io_buf_` otherwise. Both are covered below.

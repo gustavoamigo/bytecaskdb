@@ -259,6 +259,27 @@ static auto string_to_mode(const std::string &s) -> bytecask::Mode {
   throw std::invalid_argument("Invalid mode: " + s + " (expected 'leader' or 'follower')");
 }
 
+// 'mmap' and 'bufferPool' parse here like any other backend, but DB::open
+// rejects both on Emscripten builds (see bytecask.cppm) — there is no page
+// cache to bound (MEMFS is already memory) and mmap emulation would only add
+// a second copy of the data file into the WASM heap.
+static auto string_to_io_backend(const std::string &s) -> bytecask::IoBackend {
+  if (s == "pread") return bytecask::IoBackend::Pread;
+  if (s == "mmap") return bytecask::IoBackend::Mmap;
+  if (s == "bufferPool") return bytecask::IoBackend::BufferPool;
+  throw std::invalid_argument(
+      "Invalid ioBackend: " + s + " (expected 'pread', 'mmap', or 'bufferPool')");
+}
+
+static auto extract_buffer_pool_options(const val &opts) -> bytecask::BufferPoolOptions {
+  bytecask::BufferPoolOptions bpo;
+  if (has_prop(opts, "capacityBytes"))
+    bpo.capacity_bytes = static_cast<std::size_t>(opts["capacityBytes"].as<uint64_t>());
+  if (has_prop(opts, "directIo"))
+    bpo.direct_io = opts["directIo"].as<bool>();
+  return bpo;
+}
+
 static auto mode_to_string(bytecask::Mode m) -> const char * {
   switch (m) {
     case bytecask::Mode::Leader: return "leader";
@@ -319,6 +340,10 @@ static auto jsdb_open(const std::string &path, val opts) -> JsDB * {
     o.max_value_bytes = opts["maxValueBytes"].as<uint32_t>();
   if (has_prop(opts, "initialMode"))
     o.initial_mode = string_to_mode(opts["initialMode"].as<std::string>());
+  if (has_prop(opts, "ioBackend"))
+    o.io_backend = string_to_io_backend(opts["ioBackend"].as<std::string>());
+  if (has_prop(opts, "bufferPool"))
+    o.buffer_pool = extract_buffer_pool_options(opts["bufferPool"]);
   return new JsDB{std::filesystem::path{path}, std::move(o)};
 }
 

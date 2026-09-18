@@ -416,7 +416,11 @@ for (const entry of db.entries('prefix:')) {
 |--------|-------|------|---------|---------|
 | `OpenOptions` | `maxFileBytes` | `number` | `67108864` | `open` |
 | `OpenOptions` | `failOnCrcErrors` | `boolean` | `true` | `open` |
+| `OpenOptions` | `ioBackend` | `'pread' \| 'mmap' \| 'bufferPool'` | `'pread'` | `open` |
+| `OpenOptions` | `bufferPool` | `{ capacityBytes: number, directIo?: boolean }` | — | `open` |
 | `WriteOptions` | `sync` | `boolean` | `true` | `put`, `del`, `delRange`, `applyBatch` |
 | `ReadOptions` | `verifyChecksums` | `boolean` | `false` | `get`, `entries`, `keys`, `entriesReverse`, `keysReverse` |
 
 All options objects are optional. Omitting them uses the defaults shown above.
+
+**WASM only supports `ioBackend: 'pread'`.** `'mmap'` and `'bufferPool'` are the native backend's — `open` throws for either on this backend: mmap emulation would double-buffer the data file into the WASM heap instead of avoiding a copy, and MEMFS is already memory, so there's no page cache for a bounded pool to protect against.

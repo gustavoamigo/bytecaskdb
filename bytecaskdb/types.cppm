@@ -26,6 +26,16 @@ export enum class EntryType : std::uint8_t {
 
 export enum class Mode { Leader, Follower };
 
+// Selects how data files are read. The choice applies to sealed files: the
+// writable active file is built identically for Pread and BufferPool, because
+// O_DIRECT never touches the write path and the buffer pool keeps the active
+// file resident by inserting on append, not by changing how it is written.
+export enum class IoBackend {
+  Pread,      // pread(2) per read. Default — no virtual address space pressure.
+  Mmap,       // sealed files memory-mapped; zero-copy reads, unbounded page cache.
+  BufferPool, // sealed files served from a bounded, engine-owned cache.
+};
+
 export struct DataEntryView {
   std::uint64_t sequence;
   EntryType entry_type;

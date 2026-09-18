@@ -58,6 +58,17 @@ using BytesView = std::span<const std::byte>;
 
 enum class Mode { Leader, Follower };
 
+// Mirrors bytecask::IoBackend. Selects how data files are read; the choice
+// applies to sealed files, the writable active file being identical for
+// Pread and BufferPool.
+enum class IoBackend { Pread, Mmap, BufferPool };
+
+// Mirrors bytecask::BufferPoolOptions.
+struct BufferPoolOptions {
+  std::size_t capacity_bytes{0};
+  bool direct_io{true};
+};
+
 enum class EntryType : std::uint8_t {
   Put       = 0x01,
   Delete    = 0x02,
@@ -99,7 +110,8 @@ struct Options {
   Mode initial_mode{Mode::Leader};
   std::uint32_t max_key_bytes{4096};
   std::uint32_t max_value_bytes{4U * 1024 * 1024};
-  bool use_mmap{false};
+  IoBackend io_backend{IoBackend::Pread};
+  BufferPoolOptions buffer_pool{};
 };
 
 struct SizeLimits {
@@ -500,6 +512,8 @@ namespace bytecask {
 using Bytes                = internal::Bytes;
 using BytesView            = internal::BytesView;
 using Mode                 = internal::Mode;
+using IoBackend            = internal::IoBackend;
+using BufferPoolOptions    = internal::BufferPoolOptions;
 using EntryType            = internal::EntryType;
 using WriteOptions         = internal::WriteOptions;
 using CommitResult         = internal::CommitResult;
