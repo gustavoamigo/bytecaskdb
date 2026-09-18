@@ -21,6 +21,12 @@ Usage:
     --no-rocksdb             Build with BYTECASK_NO_ROCKSDB=1.
     --json-out DIR            Save each run's raw benchmark JSON into DIR.
     --csv-out FILE             Append a flat CSV of every reading to FILE.
+                                Each invocation stamps its rows with a
+                                run_id (UTC timestamp): round numbers
+                                reset to 1 on every run, so two runs
+                                appended to the same file collide on round
+                                alone — group by (run_id, round) if
+                                aggregating across multiple invocations.
     Extra flags after '--' are forwarded to the benchmark binary
     (e.g. -- --benchmark_min_time=5x).
 
@@ -43,6 +49,7 @@ Read the column header, not your memory of the other script.
 """
 
 import argparse
+import datetime
 import json
 import os
 import shutil
@@ -217,6 +224,7 @@ def fmt_time(ns: float) -> str:
 
 
 def main() -> None:
+    run_id = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     p = argparse.ArgumentParser(
         description="Compare radix vs B+ tree across the engine_bench suite.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -283,9 +291,9 @@ def main() -> None:
                         b.get("time_unit", "ns"), 1.0)
                     results[key][config].setdefault(threads, []).append(ns)
                     csv_rows.append({
-                        "benchmark": key, "config": config, "threads": threads,
-                        "round": r, "dataset_size": args.dataset_size,
-                        "real_time_ns": ns,
+                        "run_id": run_id, "benchmark": key, "config": config,
+                        "threads": threads, "round": r,
+                        "dataset_size": args.dataset_size, "real_time_ns": ns,
                     })
     finally:
         if os.path.isdir(args.bench_dir) and args.bench_dir.startswith(str(REPO_ROOT)):
@@ -297,8 +305,8 @@ def main() -> None:
         write_header = not path.exists()
         with open(path, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=[
-                "benchmark", "config", "threads", "round", "dataset_size",
-                "real_time_ns"])
+                "run_id", "benchmark", "config", "threads", "round",
+                "dataset_size", "real_time_ns"])
             if write_header:
                 w.writeheader()
             w.writerows(csv_rows)
