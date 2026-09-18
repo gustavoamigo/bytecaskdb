@@ -10,6 +10,7 @@
 #include <initializer_list>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <set>
@@ -594,4 +595,161 @@ TEST_CASE("BTree merge of empty and giant-key inputs", "[btree]") {
   CHECK(m4.size() == 6U);
   CHECK(m4.contains(to_bytes(giant)));
   check_accounting({&t, &m1, &m2, &m3, &big, &m4});
+}
+
+TEST_CASE("BTree sample_separators cuts the key space evenly", "[btree]") {
+  std::vector<std::string> keys;
+  for (int i = 0; i < 200000; ++i)
+    keys.push_back("key_" + std::to_string(1'000'000 + i));
+  auto t = build(keys);
+
+  CHECK(Tree{}.sample_separators(16).empty());
+  CHECK(t.sample_separators(0).empty());
+
+  for (std::size_t n : {4U, 16U, 64U, 256U}) {
+    auto seps = t.sample_separators(n);
+    INFO("n " << n << " got " << seps.size());
+    CHECK(seps.size() <= n);
+    CHECK(seps.size() >= n / 2);
+
+    // Strictly ascending, so they are usable as range bounds as they stand.
+    for (std::size_t i = 1; i < seps.size(); ++i)
+      CHECK(to_string(seps[i - 1]) < to_string(seps[i]));
+
+    // Every key lands in exactly one [sep[i-1], sep[i]) bucket; the buckets
+    // are what a parallel range merge would hand to its workers, so their
+    // sizes decide how well that merge balances.
+    std::vector<std::size_t> bucket(seps.size() + 1, 0);
+    for (auto it = t.begin(); it != t.end(); ++it) {
+      auto [k, v] = *it;
+      auto key = to_string(k);
+      std::size_t b = 0;
+      while (b < seps.size() && key >= to_string(seps[b]))
+        ++b;
+      ++bucket[b];
+    }
+    const auto total = std::accumulate(bucket.begin(), bucket.end(),
+                                       std::size_t{0});
+    CHECK(total == keys.size());
+    const auto mean = static_cast<double>(total) /
+                      static_cast<double>(bucket.size());
+    const auto max = static_cast<double>(
+        *std::max_element(bucket.begin(), bucket.end()));
+    INFO("max/mean " << max / mean);
+    CHECK(max / mean < 1.35);
+  }
+  check_accounting({&t});
+}
+
+TEST_CASE("BTree concat of range-disjoint runs", "[btree]") {
+  using Loader = bytecask::btree_detail::BulkLoader<int>;
+
+  SECTION("empty input") {
+    auto t = Loader::concat({});
+    CHECK(t.empty());
+    (void)t.validate();
+    check_accounting({&t});
+  }
+
+  SECTION("runs with nothing in them are skipped") {
+    std::vector<bytecask::btree_detail::LeafRun<int>> runs;
+    runs.push_back(Loader{}.seal());
+    Loader mid;
+    mid.append(to_bytes("b"), 2);
+    runs.push_back(std::move(mid).seal());
+    runs.push_back(Loader{}.seal());
+    auto t = Loader::concat(std::move(runs));
+    (void)t.validate();
+    REQUIRE(t.size() == 1U);
+    CHECK(t.get(to_bytes("b")) == 2);
+    check_accounting({&t});
+  }
+
+  SECTION("a run abandoned without concat frees its leaves") {
+    {
+      Loader l;
+      for (int i = 0; i < 5000; ++i)
+        l.append(to_bytes("k" + std::to_string(100000 + i)), i);
+      auto run = std::move(l).seal();
+      CHECK(run.size() == 5000U);
+      CHECK(!run.empty());
+    }
+    check_accounting({});
+  }
+
+  SECTION("concatenated tree matches one built in a single pass") {
+    std::vector<std::string> keys;
+    for (int i = 0; i < 120000; ++i)
+      keys.push_back("key_" + std::to_string(1'000'000 + i));
+
+    Loader whole;
+    for (std::size_t i = 0; i < keys.size(); ++i)
+      whole.append(to_bytes(keys[i]), static_cast<int>(i));
+    auto single = std::move(whole).finish();
+
+    // Four workers, each over a contiguous slice — the shape a range-merge
+    // recovery produces.
+    std::vector<bytecask::btree_detail::LeafRun<int>> runs;
+    const auto step = keys.size() / 4;
+    for (std::size_t r = 0; r < 4; ++r) {
+      const auto lo = r * step;
+      const auto hi = r == 3 ? keys.size() : lo + step;
+      Loader l;
+      for (auto i = lo; i < hi; ++i)
+        l.append(to_bytes(keys[i]), static_cast<int>(i));
+      runs.push_back(std::move(l).seal());
+    }
+    auto joined = Loader::concat(std::move(runs));
+    (void)joined.validate();
+
+    REQUIRE(joined.size() == single.size());
+    auto a = single.begin();
+    auto b = joined.begin();
+    for (; a != single.end(); ++a, ++b) {
+      REQUIRE(b != joined.end());
+      auto [ka, va] = *a;
+      auto [kb, vb] = *b;
+      CHECK(to_string(ka) == to_string(kb));
+      CHECK(va == vb);
+    }
+    CHECK(b == joined.end());
+
+    // Concat reuses the leaves as sealed, so the fill matches the one-pass
+    // build except for the partial leaf each run boundary can leave behind.
+    const auto s1 = single.stats();
+    const auto s2 = joined.stats();
+    INFO("leaves " << s2.leaves << " vs " << s1.leaves);
+    CHECK(s2.leaves >= s1.leaves);
+    CHECK(s2.leaves <= s1.leaves + 3);
+    CHECK(s2.height == s1.height);
+    check_accounting({&single, &joined});
+  }
+
+  SECTION("a concatenated tree is editable and reclaims cleanly") {
+    std::vector<bytecask::btree_detail::LeafRun<int>> runs;
+    for (int r = 0; r < 3; ++r) {
+      Loader l;
+      for (int i = 0; i < 4000; ++i)
+        l.append(to_bytes(std::string(1, static_cast<char>('a' + r)) +
+                          std::to_string(100000 + i)),
+                 i);
+      runs.push_back(std::move(l).seal());
+    }
+    auto base = Loader::concat(std::move(runs));
+    (void)base.validate();
+    REQUIRE(base.size() == 12000U);
+
+    auto next = base.set(to_bytes("a100000"), 999);
+    (void)next.validate();
+    CHECK(next.get(to_bytes("a100000")) == 999);
+    CHECK(base.get(to_bytes("a100000")) == 0);
+    check_accounting({&base, &next});
+
+    // Dropping the derived version retracts it: the base's nodes, which carry
+    // tags below the published tag, must survive.
+    next = Tree{};
+    (void)base.validate();
+    CHECK(base.get(to_bytes("a100000")) == 0);
+    check_accounting({&base});
+  }
 }

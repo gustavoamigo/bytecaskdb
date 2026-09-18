@@ -463,7 +463,8 @@ template <typename V> struct Node {
   }
 };
 
-template <typename V> class BulkLoader;
+export template <typename V> class BulkLoader;
+export template <typename V> class LeafRun;
 
 template <typename V> struct ChainTraits {
   using Node = btree_detail::Node<V>;
@@ -949,6 +950,64 @@ private:
 
 
 // ---------------------------------------------------------------------------
+// LeafRun<V> — the sealed leaves of one BulkLoader, in ascending key order.
+//
+// A loader over one slice of the key space hands its leaves over instead of
+// finishing a tree, so several loaders that ran in parallel over disjoint,
+// ordered slices can be stitched into one tree by BulkLoader::concat. Owns
+// the leaves until concat takes them: a run destroyed on an error path frees
+// them, so an abandoned parallel build leaks nothing.
+// ---------------------------------------------------------------------------
+export template <typename V> class LeafRun {
+public:
+  LeafRun() = default;
+  LeafRun(const LeafRun &) = delete;
+  auto operator=(const LeafRun &) -> LeafRun & = delete;
+  LeafRun(LeafRun &&other) noexcept
+      : leaves_{std::move(other.leaves_)}, seps_{std::move(other.seps_)},
+        first_key_{std::move(other.first_key_)},
+        last_key_{std::move(other.last_key_)},
+        size_{std::exchange(other.size_, 0)},
+        tag_{std::exchange(other.tag_, 0)} {
+    other.leaves_.clear();
+  }
+  auto operator=(LeafRun &&other) noexcept -> LeafRun & {
+    if (this != &other) {
+      free_leaves();
+      leaves_ = std::move(other.leaves_);
+      other.leaves_.clear();
+      seps_ = std::move(other.seps_);
+      first_key_ = std::move(other.first_key_);
+      last_key_ = std::move(other.last_key_);
+      size_ = std::exchange(other.size_, 0);
+      tag_ = std::exchange(other.tag_, 0);
+    }
+    return *this;
+  }
+  ~LeafRun() { free_leaves(); }
+
+  [[nodiscard]] auto size() const noexcept -> std::size_t { return size_; }
+  [[nodiscard]] auto empty() const noexcept -> bool { return leaves_.empty(); }
+
+private:
+  friend class BulkLoader<V>;
+
+  void free_leaves() noexcept {
+    for (auto *leaf : leaves_)
+      Node<V>::destroy(leaf);
+    leaves_.clear();
+  }
+
+  std::vector<Node<V> *> leaves_;
+  // seps_[i] separates leaves_[i] from leaves_[i + 1].
+  std::vector<std::vector<std::byte>> seps_;
+  std::vector<std::byte> first_key_;
+  std::vector<std::byte> last_key_;
+  std::size_t size_{0};
+  std::uint64_t tag_{0};
+};
+
+// ---------------------------------------------------------------------------
 // BulkLoader<V> — builds a tree from entries appended in ascending key order.
 //
 // Leaves are filled to capacity and sealed, then the inner levels are built
@@ -960,7 +1019,7 @@ private:
 // The result starts its own lineage in the version chain. Keys must arrive
 // strictly ascending; the caller owns that (an ordered merge does).
 // ---------------------------------------------------------------------------
-template <typename V> class BulkLoader {
+export template <typename V> class BulkLoader {
 public:
   using N = Node<V>;
 
@@ -975,6 +1034,8 @@ public:
     if (!leaf_lens_.empty() && !fits(key)) {
       seal_leaf();
     }
+    if (size_ == 0)
+      first_key_.assign(key.begin(), key.end());
     admit(key);
     leaf_vals_.push_back(value);
     ++size_;
@@ -984,19 +1045,54 @@ public:
 
   [[nodiscard]] auto finish() && -> PersistentBTree<V> {
     seal_leaf();
-    if (levels_.empty())
-      return {};
-    std::size_t lvl = 0;
-    while (levels_[lvl].children.size() > 1) {
-      build_parent(lvl);
-      ++lvl;
+    const auto tag = session_.tag();
+    return std::move(*this).assemble(tag);
+  }
+
+  // Seals the leaves without building the tree above them, so this loader's
+  // slice can be concatenated with the slices other threads built.
+  [[nodiscard]] auto seal() && -> LeafRun<V> {
+    seal_leaf();
+    LeafRun<V> run;
+    if (!levels_.empty()) {
+      run.leaves_ = std::move(levels_[0].children);
+      run.seps_ = std::move(levels_[0].seps);
+      levels_.clear();
     }
-    auto *root = levels_[lvl].children.front();
-    PersistentBTree<V>::chain().publish(session_.tag(), 0,
-                                        session_.retired_list());
-    const auto version = session_.tag();
+    run.first_key_ = std::move(first_key_);
+    run.last_key_ = std::move(prev_last_);
+    run.size_ = size_;
+    run.tag_ = session_.tag();
     session_.finish();
-    return PersistentBTree<V>{root, size_, version};
+    return run;
+  }
+
+  // Stitches runs built over disjoint, ascending slices into one tree. Only
+  // the levels above the leaves are built here — O(entries / fanout) — so the
+  // serial tail of a parallel build stays proportional to the leaf count.
+  // The caller owns the ordering: run r's keys must all sort below run r + 1's.
+  [[nodiscard]] static auto concat(std::vector<LeafRun<V>> runs)
+      -> PersistentBTree<V> {
+    BulkLoader<V> out;
+    auto publish_tag = out.session_.tag();
+    std::vector<std::byte> prev_last;
+    for (auto &run : runs) {
+      if (run.leaves_.empty())
+        continue;
+      publish_tag = std::max(publish_tag, run.tag_);
+      for (std::size_t i = 0; i < run.leaves_.size(); ++i) {
+        auto sep = i > 0 ? std::move(run.seps_[i - 1])
+                         : out.first_leaf()
+                               ? std::vector<std::byte>{}
+                               : separator(Bytes{prev_last},
+                                           Bytes{run.first_key_});
+        out.add_child(0, run.leaves_[i], sep);
+      }
+      run.leaves_.clear();  // ownership moved to `out`
+      prev_last = std::move(run.last_key_);
+      out.size_ += run.size_;
+    }
+    return std::move(out).assemble(publish_tag);
   }
 
 private:
@@ -1016,6 +1112,7 @@ private:
   std::vector<V> leaf_vals_;
   std::size_t leaf_prefix_{0};
   std::size_t leaf_heap_{0};
+  std::vector<std::byte> first_key_;  // first key appended to this loader
   std::vector<std::byte> prev_last_;  // last key of the previous leaf
   std::vector<std::byte> pending_sep_; // separator before the leaf being filled
   std::vector<Level> levels_;
@@ -1023,6 +1120,30 @@ private:
 
   [[nodiscard]] auto key_at(std::size_t i) const noexcept -> Bytes {
     return {leaf_arena_.data() + leaf_spans_[i].first, leaf_spans_[i].second};
+  }
+
+  // True while no leaf has been added yet — the first one needs no separator.
+  [[nodiscard]] auto first_leaf() const noexcept -> bool {
+    return levels_.empty() || levels_[0].children.empty();
+  }
+
+  // Builds the levels above the sealed leaves and publishes the version.
+  // `publish_tag` must be at or above the tag of every node in the tree: the
+  // chain frees a dead version by tag interval, and a node tagged above the
+  // published version would be taken for a later version's garbage.
+  [[nodiscard]] auto assemble(std::uint64_t publish_tag) && -> PersistentBTree<V> {
+    if (first_leaf())
+      return {};
+    std::size_t lvl = 0;
+    while (levels_[lvl].children.size() > 1) {
+      build_parent(lvl);
+      ++lvl;
+    }
+    auto *root = levels_[lvl].children.front();
+    PersistentBTree<V>::chain().publish(publish_tag, 0, session_.retired_list());
+    session_.finish();
+    levels_.clear();
+    return PersistentBTree<V>{root, size_, publish_tag};
   }
 
   // Would `key` still fit in the leaf being filled? A shorter shared prefix
@@ -1536,6 +1657,36 @@ public:
     return ReverseBTreeValueIterator<V>{std::move(fwd)};
   }
 
+  // Up to `n` keys that cut the tree into roughly equal parts, in ascending
+  // order. Taken from the inner separators, which sit one per leaf boundary:
+  // the sample is uniform in leaves without reading a single leaf, and the
+  // leaves of a bulk-loaded tree hold within a few percent of each other, so
+  // it is uniform in keys too. The keys are separators, not necessarily keys
+  // of the tree — use them as range bounds, not as lookups.
+  [[nodiscard]] auto sample_separators(std::size_t n) const
+      -> std::vector<std::vector<std::byte>> {
+    std::vector<std::vector<std::byte>> out;
+    if (!root_ || n == 0)
+      return out;
+    std::size_t total = 0;
+    count_separators(root_, total);
+    if (total == 0)
+      return out;
+    // total separators sit between total + 1 leaves. Cutting those leaves
+    // into `groups` even runs puts the j-th cut at separator index
+    // j * (total + 1) / groups - 1.
+    const auto groups = std::min(n + 1, total + 1);
+    std::vector<std::size_t> targets;
+    targets.reserve(groups - 1);
+    for (std::size_t j = 1; j < groups; ++j)
+      targets.push_back(j * (total + 1) / groups - 1);
+    out.reserve(targets.size());
+    std::size_t seen = 0;
+    std::size_t next = 0;
+    emit_separators(root_, targets, seen, next, out);
+    return out;
+  }
+
   // -- Test and debug support --------------------------------------------
 
   // Every retired node still waiting on a live version.
@@ -1609,6 +1760,41 @@ private:
   friend class btree_detail::BulkLoader<V>;
 
   static auto chain() -> Chain & { return Chain::instance(); }
+
+  static void count_separators(const N *n, std::size_t &total) noexcept {
+    if (n->is_leaf)
+      return;
+    total += n->count;
+    n->for_each_child([&](N *c) { count_separators(c, total); });
+  }
+
+  // In-order walk of the inner nodes: the separators of one node interleave
+  // with its subtrees, so this yields them in ascending key order.
+  static void emit_separators(const N *n,
+                              const std::vector<std::size_t> &targets,
+                              std::size_t &seen, std::size_t &next,
+                              std::vector<std::vector<std::byte>> &out) {
+    if (n->is_leaf || next == targets.size())
+      return;
+    for (std::uint32_t i = 0; i <= n->count; ++i) {
+      emit_separators(n->child(i), targets, seen, next, out);
+      if (i == n->count)
+        break;
+      if (next < targets.size() && seen == targets[next]) {
+        ++next;
+        const auto pre = n->prefix();
+        const auto suf = n->suffix(i);
+        std::vector<std::byte> key;
+        key.reserve(pre.size() + suf.size());
+        key.insert(key.end(), pre.begin(), pre.end());
+        key.insert(key.end(), suf.begin(), suf.end());
+        out.push_back(std::move(key));
+      }
+      ++seen;
+      if (next == targets.size())
+        return;
+    }
+  }
 
   void release() noexcept {
     if (version_)
