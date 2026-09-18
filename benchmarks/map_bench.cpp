@@ -305,28 +305,6 @@ template <typename A> void BM_TransientInsertBatch(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(kBatch));
 }
 
-template <typename A> void BM_TransientInsertBatch(benchmark::State &state) {
-  constexpr std::size_t kBatch = 100;
-  auto n = static_cast<std::size_t>(state.range(0));
-  auto keys = A::make_keys(generate_uniform_keys(n));
-  auto base = A::transient_build(keys);
-  std::size_t next = n;
-  std::vector<std::string> batch(kBatch);
-  for (auto _ : state) {
-    state.PauseTiming();
-    for (auto &k : batch)
-      k = "key_" + std::to_string(next++);
-    state.ResumeTiming();
-    auto tr = base.transient();
-    for (std::size_t i = 0; i < kBatch; ++i) {
-      benchmark::DoNotOptimize(A::transient_get(tr, batch[i]));
-      tr.set(to_bytes(batch[i]), bytecask::KeyDirEntry::make(i, 0, 0, 0));
-    }
-    benchmark::DoNotOptimize(std::move(tr).persistent());
-  }
-  state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations() * kBatch));
-}
-
 template <typename A> void BM_Get(benchmark::State &state) {
   auto keys =
       A::make_keys(generate_uniform_keys(static_cast<std::size_t>(state.range(0))));
