@@ -881,16 +881,32 @@ template <typename A, bool Sync> void BM_Del(benchmark::State &state) {
   static auto val = make_value();
   static auto db = A::open_populated("del", keys, val);
 
-  std::size_t idx = 0;
+  // idx must be static, not a local: db is static and its deleted/present
+  // state carries across --benchmark_repetitions, so idx has to carry the
+  // matching cursor or the two desync. A local idx resets to 0 every
+  // repetition while db does not, so a later repetition can start by
+  // re-deleting keys the previous repetition already removed — del on an
+  // absent key is a documented no-op fast path (no write, no fsync), so
+  // those iterations report near-zero cost instead of a real synced delete.
+  // That produced exactly the bimodal, wildly-varying Del/Sync numbers this
+  // fixes: median far below the mean, stddev larger than the mean.
+  static std::size_t idx = 0;
   std::vector<double> samples;
   samples.reserve(kMaxSamples);
 
   for (auto _ : state) {
     const auto &k = keys[idx % keys.size()];
     // Re-insert if we've cycled through all keys so del always has something.
+    // Paused: an unpaused refill dumps a full dataset's worth of Put calls
+    // into whichever single iteration happens to trigger it, and Google
+    // Benchmark's own real_time/cpu_time average that iteration's cost over
+    // every iteration in the repetition — the fewer iterations that
+    // repetition ran, the larger the resulting outlier.
     if (idx > 0 && idx % keys.size() == 0) {
+      state.PauseTiming();
       for (const auto &rk : keys)
         A::put(db, rk, val, false);
+      state.ResumeTiming();
     }
     const auto t0 = std::chrono::high_resolution_clock::now();
     A::del(db, k, Sync);
@@ -946,7 +962,10 @@ template <typename A, bool Sync> void BM_Mixed(benchmark::State &state) {
   static auto val = make_value();
   static auto db = A::open_populated("mixed", keys, val);
 
-  std::size_t idx = 0;
+  // idx must be static — see the identical fix and rationale in BM_Del.
+  // Currently unregistered (no BENCHMARK(BM_Mixed<...>) call), so this has
+  // not corrupted a published number, but the bug is the same shape.
+  static std::size_t idx = 0;
   std::vector<double> samples;
   samples.reserve(kMaxSamples);
 
