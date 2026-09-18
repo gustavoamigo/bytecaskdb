@@ -199,8 +199,15 @@ target("engine_bench")
     set_default(false)
     add_files("benchmarks/engine_bench.cpp", "bytecaskdb/*.cppm")
     add_cxflags("-Wno-global-constructors")
-    add_packages("benchmark", "crc32c", "rocksdb")
     add_defines("BENCH_NO_LEVELDB")
+    -- BYTECASK_NO_ROCKSDB=1 drops the RocksDB comparison rows, for hosts
+    -- without the library (the ByteCaskDB rows are unaffected).
+    if os.getenv("BYTECASK_NO_ROCKSDB") then
+        add_packages("benchmark", "crc32c")
+        add_defines("BENCH_NO_ROCKSDB")
+    else
+        add_packages("benchmark", "crc32c", "rocksdb")
+    end
     on_config(function(t)
         add_native_syslinks(t)
         apply_sanitizer(t)
