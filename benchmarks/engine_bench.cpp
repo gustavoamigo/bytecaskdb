@@ -296,7 +296,7 @@ struct BcAdapterBase {
 
     Db(std::string_view tag, const std::vector<std::string> *populate_keys,
        const std::vector<std::byte> *populate_val)
-        : dir{tag}, engine{bytecask::DB::open(dir.path, {.use_mmap = UseMmap})} {
+        : dir{tag}, engine{bytecask::DB::open(dir.path, {.io_backend = UseMmap ? bytecask::IoBackend::Mmap : bytecask::IoBackend::Pread})} {
       if (populate_keys) {
         static constexpr std::size_t kPopulateBatchSize = 100;
         bytecask::WriteOptions wo;

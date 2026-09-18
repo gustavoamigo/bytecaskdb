@@ -4,9 +4,11 @@
 export type {
   ByteCaskDB,
   ByteCaskFactory,
+  BufferPoolOptions,
   CloseableIterator,
   CommitResult,
   Entry,
+  IoBackend,
   OpenOptions,
   ReadOptions,
   Snapshot,

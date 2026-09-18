@@ -28,7 +28,8 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex for their in-memory phase, with group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost. The commit is pipelined: while one flush is in flight, the next batch is validated, applied and appended, so the disk never waits on in-memory work. On the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
 - **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a degraded state: reads remain available, all writes throw `DbDegraded`, and the service calls `resume()` to recover without a restart.
-- **Operational counters** — `stats()` returns a flat `map<string, int64_t>` of monotonic counters (bytes written, fsyncs, group writer batches, vacuum bytes reclaimed, CRC failures, I/O errors, degraded transitions) and gauges (degraded state, open files). Designed for pull-based scraping (Prometheus, logging). Counters only track what the engine can see internally — request counts and latency are the caller's responsibility.
+- **Bounded value cache** — `IoBackend::BufferPool` serves data files from a frame cache whose size the operator sets, filled with `O_DIRECT`, for deployments where the dataset far exceeds RAM and the footprint has to be a number rather than whatever the kernel's page cache settles on. Reads stay lock-free; the active file is resident from the moment its bytes are written. `capacity_bytes` is the total footprint, and `stats()` reports a hit ratio to size against — something a page cache cannot give. On a resident dataset a hit is within ~80 ns of `mmap`; it is off by default, and worth turning on when there is a memory budget to enforce.
+- **Operational counters** — `stats()` returns a flat `map<string, int64_t>` of monotonic counters (bytes written, fsyncs, group writer batches, vacuum bytes reclaimed, CRC failures, I/O errors, degraded transitions) and gauges (degraded state, open files, live key count, buffer pool hit/miss and residency). Designed for pull-based scraping (Prometheus, logging). Counters only track what the engine can see internally — request counts and latency are the caller's responsibility.
 - **Replication transport in Python** — Python bindings expose a `DataEntry(sequence, entry_type, key, value)` constructor accepting bytes-like payloads, so `changes_since()` output can be serialized over the wire and reconstructed before `ingest()`.
 
 ## Performance
@@ -216,6 +217,24 @@ struct Options {
     Mode initial_mode{Mode::Leader};             // leader allows normal writes; follower allows ingest
     uint32_t max_key_bytes{4096};                // max key size (hard ceiling: 65,535 — u16 wire format)
     uint32_t max_value_bytes{4 * 1024 * 1024};   // max value size (hard ceiling: 256 MiB — packed KeyDirEntry)
+    IoBackend io_backend{IoBackend::Pread};      // how sealed files are read
+    BufferPoolOptions buffer_pool{};             // only read when io_backend == BufferPool
+};
+
+// Selects how sealed data files are read. The active file is written the same
+// way in every mode.
+enum class IoBackend {
+    Pread,       // pread(2) per read (default)
+    Mmap,        // sealed files memory-mapped; zero-copy reads
+    BufferPool,  // sealed files served from a bounded, engine-owned cache
+};
+
+struct BufferPoolOptions {
+    size_t capacity_bytes{0};          // TOTAL pool footprint, frames plus index.
+                                       // Must be >= 2 x max_file_bytes.
+    bool direct_io{true};              // O_DIRECT fills: the pool, not the page cache,
+                                       // holds sealed-file data. Falls back per file
+                                       // where the filesystem refuses.
 };
 
 struct WriteOptions {
@@ -492,6 +511,7 @@ If you want to take it in a different direction and fork it into your own thing,
 | [`docs/correctness_validation.md`](docs/correctness_validation.md) | Write-path correctness validation: failure classes, proof test matrix, fault injection framework |
 | [`docs/failure_mode_comparison.md`](docs/failure_mode_comparison.md) | Write-path failure mode comparison: ByteCaskDB vs RocksDB, LevelDB, SQLite WAL, LMDB, WiredTiger |
 | [`docs/replication_primitives_design.md`](docs/replication_primitives_design.md) | Replication primitives: minimal API surface for building leader-follower replication on top of ByteCaskDB |
+| [`docs/buffer_pool_design.md`](docs/buffer_pool_design.md) | Buffer pool: bounded, `O_DIRECT`-filled value cache for memory-constrained deployments, with measurements |
 | [`docs/xa_support_design.md`](docs/xa_support_design.md) | XA / two-phase commit: generic 2PC primitives (`BulkPrepare`, `Bulk2PCCommit`, `Bulk2PCRollback`) for external coordinators |
 | [`bytecaskdb-node/`](bytecaskdb-node/) | Node.js package: WASM (Embind) and native (N-API) backends behind one TypeScript API |
 | [`CONTRACT.md`](CONTRACT.md) | Per-function behavioral contracts: atomicity, durability, I/O failure safety, sequence invariants |

@@ -79,6 +79,15 @@ auto to_module(bytecask::internal::VacuumOptions o) noexcept -> bytecask::Vacuum
   return {o.fragmentation_threshold};
 }
 
+auto to_module(bytecask::internal::IoBackend b) noexcept -> bytecask::IoBackend {
+  return static_cast<bytecask::IoBackend>(b);
+}
+
+auto to_module(bytecask::internal::BufferPoolOptions o) noexcept
+    -> bytecask::BufferPoolOptions {
+  return {o.capacity_bytes, o.direct_io};
+}
+
 auto to_module(bytecask::internal::Options o) noexcept -> bytecask::Options {
   return {
     o.max_file_bytes,
@@ -87,7 +96,8 @@ auto to_module(bytecask::internal::Options o) noexcept -> bytecask::Options {
     static_cast<bytecask::Mode>(o.initial_mode),
     o.max_key_bytes,
     o.max_value_bytes,
-    o.use_mmap,
+    to_module(o.io_backend),
+    to_module(o.buffer_pool),
   };
 }
 

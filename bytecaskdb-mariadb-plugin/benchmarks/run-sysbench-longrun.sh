@@ -32,6 +32,9 @@
 #   create their data/tmp/socket files (default: repository root). Point it at
 #   a filesystem that supports native fdatasync/O_DIRECT when the repo lives on
 #   a bind mount or overlay that doesn't, e.g. --data-root=/mnt/nvme.
+# ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench-longrun.sh \
+#      --duration=10m --report-interval=30s] \
+#       --threads=8 --workload=oltp_read_write --engines=bytecaskdb --out=sysbench_longrun_results.csv --data-root=/mnt/data
 
 set -uo pipefail  # not -e: one sysbench hiccup mid-run shouldn't abort everything
 
