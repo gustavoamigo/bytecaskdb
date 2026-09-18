@@ -50,6 +50,7 @@ import bytecask.concurrency;
 export import bytecask.counters;
 import bytecask.data_entry;
 import bytecask.data_file;
+import bytecask.hint_entry;
 import bytecask.hint_file;
 import bytecask.radix_tree;
 export import bytecask.types;
@@ -1060,6 +1061,10 @@ private:
   // radix tree wants a different strategy.
   auto recovery_load_ranged(EngineState s, unsigned recovery_threads,
                             bool strict) -> EngineState;
+  // Builds a RecoveryResult by merging sorted hint runs into a bulk loader.
+  // Requires hints written with BC_SORT_HINTS=1.
+  static auto recovery_build_sorted(std::span<RecoveredFile> files,
+                                    bool strict) -> RecoveryResult;
 #endif
 
   // Portable atomic load/store for shared_ptr. The C++20 specialization
@@ -2873,7 +2878,7 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
 
   auto hint = HintFile::OpenForWrite(tmp_path);
 
-  // BC_SORT_HINTS=1 restores the sorted, deduplicated hint file BC-088
+  // BC_SORT_HINTS=1 restores the sorted hint file BC-088
   // introduced and 45d0e90 traded away for O(1) working memory. Sorting
   // costs one buffer per data file — bounded by max_file_bytes, not by the
   // database — and lets recovery bulk-load a B+ tree instead of inserting
@@ -2940,13 +2945,13 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
       const auto c = recovery_key_cmp(key_of(a), key_of(b));
       return c < 0 || (c == 0 && a.seq > b.seq);
     });
-    // Within one data file the highest-sequence entry per key wins, so the
-    // rest are dead weight at recovery.
-    const auto tail = std::ranges::unique(staged,
-        [&](const Staged &a, const Staged &b) {
-          return recovery_key_cmp(key_of(a), key_of(b)) == 0;
-        }).begin();
-    staged.erase(tail, staged.end());
+    // BC-088 also deduplicated, keeping the highest-sequence entry per key.
+    // That is not done here: file_stats.min_sequence and max_sequence are
+    // rebuilt at recovery from the entries the hint file still holds, and
+    // ChangeIterator selects data files by that range. Dropping an entry can
+    // raise min_sequence above a sequence the data file really contains, and
+    // replication would then skip the file. Recovering it needs the bounds in
+    // the hint header, which is a format change.
     for (const auto &e : staged)
       hint.append(e.seq, e.type, e.file_off, key_of(e), e.val_size);
   }
@@ -3967,6 +3972,203 @@ static auto recovery_span_of(const Key &k) noexcept
   return {k.begin(), k.size()};
 }
 
+
+// Builds a RecoveryResult by merging sorted hint runs straight into a bulk
+// loader, instead of inserting key by key into a transient.
+//
+// recovery_build_from_hints costs a descent, a slot shift and a split every
+// fanout inserts, per key; per-phase timing put it at 90 of the B+ tree's
+// 128 ms at 1M keys and 4 threads, which is the whole of its deficit against
+// the radix tree. A bulk loader writes each key exactly once with no descent
+// and no split, but it needs its keys in ascending order — which is what a
+// sorted hint file gives.
+//
+// Requires hint files written with BC_SORT_HINTS=1. A sorted hint file is
+// (batch markers and range tombstones, in scan order) followed by one run of
+// Put and Delete entries sorted by key. The merge checks the order it is
+// given and throws rather than handing a bulk loader keys it cannot take.
+auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
+    -> RecoveryResult {
+  std::uint64_t max_seq = 0;
+  std::map<Key, std::uint64_t> tombstones;
+  std::vector<RangeTombstone> range_tombstones;
+  std::unordered_map<std::uint32_t, FileStats> fstats_scratch;
+  for (const auto &rf : files)
+    fstats_scratch.emplace(rf.file_id, FileStats{0, rf.total_bytes});
+
+  auto note = [&](std::uint32_t file_id, std::uint64_t seq) {
+    if (seq > max_seq) max_seq = seq;
+    auto &fs = fstats_scratch[file_id];
+    if (fs.min_sequence == 0 || seq < fs.min_sequence) fs.min_sequence = seq;
+    if (seq > fs.max_sequence) fs.max_sequence = seq;
+  };
+
+  // One cursor per hint file, parked on its next Put or Delete. The scanner
+  // spans into the hint file's own buffer, so the files must outlive the
+  // merge and the vector must not reallocate under them.
+  struct Cursor {
+    HintFile::Scanner scanner;
+    std::optional<HintEntry> cur;       // best entry for the key it sits on
+    std::optional<HintEntry> lookahead; // first entry of the following key
+    std::uint32_t file_id;
+  };
+  std::vector<HintFile> open_hints;
+  std::vector<Cursor> cursors;
+  open_hints.reserve(files.size());
+  cursors.reserve(files.size());
+
+  // Phase A: the head of each file — markers and range tombstones — is read
+  // up front, so every range tombstone this worker owns is known before any
+  // Put is admitted.
+  for (auto &[file_id, data_file, hint_path, tb] : files) {
+    try {
+      open_hints.push_back(HintFile::OpenForRead(hint_path));
+      auto scanner = open_hints.back().make_scanner();
+      std::optional<HintEntry> first;
+      while (auto he = scanner.next()) {
+        note(file_id, he->sequence);
+        if (he->entry_type == EntryType::RangeDel) {
+          range_tombstones.push_back(
+              {Key{he->key}, Key{he->end_key}, he->sequence});
+          continue;
+        }
+        if (he->entry_type == EntryType::BulkBegin ||
+            he->entry_type == EntryType::BulkEnd) {
+          continue;
+        }
+        first = *he;
+        break;
+      }
+      cursors.push_back({std::move(scanner), std::nullopt, first, file_id});
+    } catch (const std::exception &e) {
+      if (strict) throw;
+      std::fprintf(stderr,
+                   "bytecask: skipping hint file '%s' due to CRC error: %s\n",
+                   hint_path.string().c_str(), e.what());
+    }
+  }
+
+  // Phase B: merge the runs. For each key the highest sequence across every
+  // file decides; a Delete that wins drops the key, and every Delete is
+  // recorded so other workers' entries for that key are suppressed too.
+  KeyDirBulkLoader out;
+  std::vector<std::size_t> matches;
+  matches.reserve(cursors.size());
+  std::vector<std::byte> prev_key;
+  bool have_prev = false;
+
+  // The next Put or Delete in this file, counting every entry it steps over
+  // towards the file's sequence bounds.
+  auto next_data = [&](Cursor &c) -> std::optional<HintEntry> {
+    while (auto he = c.scanner.next()) {
+      note(c.file_id, he->sequence);
+      if (he->entry_type == EntryType::BulkBegin ||
+          he->entry_type == EntryType::BulkEnd)
+        continue;
+      if (he->entry_type == EntryType::RangeDel) {
+        // Range tombstones only ever sit in the head of a sorted file.
+        throw std::runtime_error{
+            "bytecask: range tombstone inside a sorted hint run"};
+      }
+      return *he;
+    }
+    return std::nullopt;
+  };
+
+  // Parks the cursor on the highest-sequence entry of its next distinct key.
+  // Hints are no longer deduplicated, so one key can repeat within a run;
+  // collapsing here is what keeps the merged stream strictly ascending.
+  auto load = [&](Cursor &c) {
+    auto best = c.lookahead ? c.lookahead : next_data(c);
+    c.lookahead.reset();
+    if (!best) {
+      c.cur.reset();
+      return;
+    }
+    while (auto he = next_data(c)) {
+      const auto ord = recovery_key_cmp(he->key, best->key);
+      if (ord < 0) {
+        throw std::runtime_error{
+            "bytecask: hint file is not sorted — recovery_build_sorted needs "
+            "hints written with BC_SORT_HINTS=1"};
+      }
+      if (ord == 0) {
+        if (he->sequence > best->sequence) best = he;
+        continue;
+      }
+      c.lookahead = he;
+      break;
+    }
+    c.cur = best;
+  };
+  for (auto &c : cursors) load(c);
+
+  while (true) {
+    auto best = cursors.size();
+    for (std::size_t i = 0; i < cursors.size(); ++i) {
+      if (!cursors[i].cur) continue;
+      if (best == cursors.size() ||
+          recovery_key_cmp(cursors[i].cur->key, cursors[best].cur->key) < 0)
+        best = i;
+    }
+    if (best == cursors.size()) break;
+
+    const auto key = cursors[best].cur->key;
+    auto winner = *cursors[best].cur;
+    auto winner_file = cursors[best].file_id;
+    matches.clear();
+    matches.push_back(best);
+    for (std::size_t i = 0; i < cursors.size(); ++i) {
+      if (i == best || !cursors[i].cur) continue;
+      if (recovery_key_cmp(cursors[i].cur->key, key) != 0) continue;
+      matches.push_back(i);
+      if (cursors[i].cur->sequence > winner.sequence) {
+        winner = *cursors[i].cur;
+        winner_file = cursors[i].file_id;
+      }
+    }
+    // A Delete that wins its file is recorded even when another file's Put
+    // outranks it here, so workers that never saw this key still learn of it.
+    // A Delete that loses within its own file cannot matter: the entry that
+    // beat it is newer and lives in the same file.
+    for (const auto i : matches) {
+      if (cursors[i].cur->entry_type != EntryType::Delete) continue;
+      auto &slot = tombstones[Key{key}];
+      if (cursors[i].cur->sequence > slot) slot = cursors[i].cur->sequence;
+    }
+
+    if (winner.entry_type == EntryType::Put) {
+      auto suppressed = false;
+      for (const auto &rt : range_tombstones) {
+        if (winner.sequence >= rt.seq) continue;
+        if (recovery_key_cmp(key, recovery_span_of(rt.start)) < 0) continue;
+        if (recovery_key_cmp(key, recovery_span_of(rt.end)) >= 0) continue;
+        suppressed = true;
+        break;
+      }
+      if (!suppressed) {
+        if (have_prev && recovery_key_cmp(key, prev_key) <= 0) {
+          throw std::runtime_error{
+              "bytecask: merged hint keys are not ascending"};
+        }
+        prev_key.assign(key.begin(), key.end());
+        have_prev = true;
+        out.append(key, KeyDirEntry::make(winner.sequence, winner.file_offset,
+                                          winner_file, winner.value_size));
+      }
+    }
+
+    for (const auto i : matches) load(cursors[i]);
+  }
+
+  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
+  for (const auto &[id, fs] : fstats_scratch) fstats_t.set(id, fs);
+
+  return {std::move(out).finish(), std::move(tombstones),
+          std::move(range_tombstones), max_seq,
+          std::move(fstats_t).persistent()};
+}
+
 // ---------------------------------------------------------------------------
 // Range-partitioned recovery — the B+ tree path.
 //
@@ -4034,9 +4236,17 @@ auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
   // Phase 2: one tree per worker, in parallel.
   std::vector<RecoveryResult> parts(W);
   std::vector<std::exception_ptr> worker_errors(W, nullptr);
+  // Sorted hints let a worker merge its files' runs straight into a bulk
+  // loader; unsorted ones leave it inserting key by key.
+  static const bool sorted_hints = [] {
+    const char *e = std::getenv("BC_SORT_HINTS");
+    return e && *e == '1';
+  }();
   parallel_for(W, [&](unsigned i) {
     try {
-      parts[i] = recovery_build_from_hints(worker_files[i], strict);
+      parts[i] = sorted_hints ? recovery_build_sorted(worker_files[i], strict)
+                              : recovery_build_from_hints(worker_files[i],
+                                                          strict);
     } catch (...) {
       worker_errors[i] = std::current_exception();
     }
