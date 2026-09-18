@@ -14,6 +14,7 @@ module;
 #include <optional>
 #include <ranges>
 #include <span>
+#include <utility>
 #include <stdexcept>
 #include <sys/mman.h>
 #include <system_error>
@@ -179,7 +180,18 @@ public:
           "HintFile: '{}' is too small to contain a CRC trailer",
           path.string())};
     }
-    auto *addr = ::mmap(nullptr, file_sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    // file_size() is 64-bit everywhere; std::size_t is 32-bit on wasm32, so
+    // the mapping length needs checking rather than casting. Checked here
+    // rather than through narrow<> because the fd has to be closed before
+    // throwing.
+    if (!std::in_range<std::size_t>(file_sz)) {
+      ::close(fd);
+      throw std::runtime_error{
+          std::format("HintFile: '{}' is too large to map on this platform",
+                      path.string())};
+    }
+    const auto map_size = static_cast<std::size_t>(file_sz);
+    auto *addr = ::mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
     ::close(fd);  // the mapping keeps the file alive
     if (addr == MAP_FAILED) {
       throw std::system_error{
@@ -187,20 +199,20 @@ public:
           std::format("HintFile: cannot map '{}'", path.string())};
     }
     auto map = std::span<const std::byte>{
-        static_cast<const std::byte *>(addr), file_sz};
+        static_cast<const std::byte *>(addr), map_size};
     // The merge walks each file front to back exactly once.
-    ::madvise(addr, file_sz, MADV_SEQUENTIAL);
+    ::madvise(addr, map_size, MADV_SEQUENTIAL);
 
     Crc32 crc{};
     crc.update(map.subspan(0, map.size() - kFileCrcSize));
     const auto computed = crc.finalize();
     const auto stored = read_le<std::uint32_t>(map, map.size() - kFileCrcSize);
     if (computed != stored) {
-      ::munmap(addr, file_sz);
+      ::munmap(addr, map_size);
       throw std::runtime_error{
           std::format("HintFile: CRC mismatch in '{}'", path.string())};
     }
-    return HintFile{std::move(path), addr, file_sz};
+    return HintFile{std::move(path), addr, map_size};
   }
 
   ~HintFile() {
