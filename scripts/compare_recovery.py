@@ -120,9 +120,10 @@ def build_binaries(no_rocksdb: bool) -> None:
         env_base["BYTECASK_NO_ROCKSDB"] = "1"
     config_flags = clang_config_flags()
 
-    # Radix tree (default).
+    # Radix tree. Both arms name the tree explicitly: the B+ tree is the
+    # default build, so leaving BYTECASK_KEYDIR unset would build it twice.
     env = env_base.copy()
-    env.pop("BYTECASK_KEYDIR", None)
+    env["BYTECASK_KEYDIR"] = "radix"
     run(["xmake", "f", "-m", "release", "--sanitizer="] + config_flags, env=env)
     run(["xmake", "build", BENCH_TARGET], env=env)
     shutil.copy(BUILD_DIR / "engine_bench", BUILD_DIR / "eb_radix")

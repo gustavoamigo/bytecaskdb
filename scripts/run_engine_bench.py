@@ -18,7 +18,7 @@ CSV columns:
     cpu_scaling_enabled, memory_gb, load_avg_1m, dataset_size,
     bench_name, run_type, aggregate_name, iterations,
     real_time_ns, cpu_time_ns,
-    ops_per_us, scans_per_us, lat_p50_ns, lat_p99_ns
+    ops_per_us, scans_per_us, lat_p50_ns, lat_p99_ns, key_dir
 """
 
 import csv
@@ -55,6 +55,10 @@ CSV_COLUMNS = [
     "scans_per_us",
     "lat_p50_ns",
     "lat_p99_ns",
+    # Which key directory the engine was built on. Appended last so rows
+    # written before this column existed still parse; those rows are all
+    # radix, which was the default until the B+ tree replaced it.
+    "key_dir",
 ]
 
 # Multiplier to convert from the benchmark's time_unit to nanoseconds.
@@ -138,11 +142,11 @@ def run_benchmark(extra_flags: list[str], dataset_size: int, tmpdir: str) -> dic
 
 
 def _migrate_csv_header() -> None:
-    """Insert 'dataset_size' into the CSV header if it is absent.
+    """Brings an older CSV header up to the current CSV_COLUMNS list.
 
-    Rewrites the file in-place: replaces the first line (header) with the
-    current CSV_COLUMNS list, leaving all data rows unchanged. Old rows will
-    have an empty dataset_size cell when read back.
+    Rewrites the first line in place and leaves every data row untouched.
+    Only ever adds columns, and new ones are appended, so an old row simply
+    reads back with those cells empty.
     """
     if not CSV_PATH.exists():
         return
@@ -151,13 +155,13 @@ def _migrate_csv_header() -> None:
     if not lines:
         return
     existing_header = lines[0].rstrip("\r\n").split(",")
-    if "dataset_size" in existing_header:
-        return  # already migrated
-    new_header = ",".join(CSV_COLUMNS) + "\n"
+    missing = [c for c in CSV_COLUMNS if c not in existing_header]
+    if not missing:
+        return
     with open(CSV_PATH, "w", encoding="utf-8") as f:
-        f.write(new_header)
+        f.write(",".join(CSV_COLUMNS) + "\n")
         f.writelines(lines[1:])
-    print("Migrated CSV header to include 'dataset_size'.")
+    print(f"Migrated CSV header to include: {', '.join(missing)}.")
 
 
 def append_results(data: dict, git_commit: str, memory_gb: float) -> None:
@@ -173,6 +177,7 @@ def append_results(data: dict, git_commit: str, memory_gb: float) -> None:
         "memory_gb": memory_gb,
         "load_avg_1m": load_avg[0] if load_avg else "",
         "dataset_size": ctx.get("dataset_size", ""),
+        "key_dir": os.environ.get("BYTECASK_KEYDIR", "btree"),
     }
 
     _migrate_csv_header()

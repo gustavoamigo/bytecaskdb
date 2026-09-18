@@ -162,8 +162,9 @@ export class TransientEngineState;
 
 // ---------------------------------------------------------------------------
 // The key directory's tree. Both implementations offer the same surface, so
-// the engine names only these aliases. Build with BYTECASK_KEYDIR=btree to
-// select the B+ tree (docs/persistent_btree_design.md) over the radix tree.
+// the engine names only these aliases. The B+ tree
+// (docs/persistent_btree_design.md) is the default; BYTECASK_KEYDIR=radix
+// builds the engine on the radix tree instead.
 // ---------------------------------------------------------------------------
 #ifdef BYTECASK_USE_BTREE
 export using KeyDirTree = PersistentBTree<KeyDirEntry>;

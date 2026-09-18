@@ -1,5 +1,7 @@
 # Parallel Recovery Design
 
+> This describes `recovery_load_parallel`, the file-partitioned path with a fan-in merge, which both key directories use. The B+ tree has a second path, `recovery_load_ranged`, which partitions by key range and has no fan-in at all; it needs sorted hint files and is described in `docs/bytecask_design.md` and `docs/persistent_btree_design.md`.
+
 ## 1. Motivation
 
 ByteCaskDB recovery rebuilds the in-memory key directory by scanning hint files

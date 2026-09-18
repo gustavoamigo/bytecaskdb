@@ -1,11 +1,15 @@
 # Persistent B+ tree key directory — design
 
-Status: **first version implemented, not yet wired into the engine**. See
+Status: **implemented and the engine's default key directory**. See
 [Implementation notes](#implementation-notes-first-version) for what was
 built, what differs from the design below, and what was measured.
-Date: 2026-09-17 (design), 2026-09-17 (first version)
-Replaces, if adopted: `docs/persistent_radix_tree_design.md` and
-`docs/radix_tree_epoch_reclamation_design.md` (PR #86).
+Date: 2026-09-17 (design), 2026-09-17 (first version), 2026-09-18 (made default)
+The radix tree is not removed: it offers the same surface, builds from the
+same engine under `BYTECASK_KEYDIR=radix`, and CI runs the full engine suite
+on both. `docs/persistent_radix_tree_design.md` and
+`docs/radix_tree_epoch_reclamation_design.md` (PR #86) therefore still
+describe live code — except for the reclaimer, which is now one
+implementation shared by both trees (`bytecaskdb/version_chain.cppm`).
 Baseline for every code reference: `main` at `5297632`, and
 `radix-epoch-reclamation` at `9023a58` for the reclaimer.
 
@@ -984,7 +988,8 @@ and 100k, and `Get` at 10k. `Get` at 100k is 1.26× and at 1k 1.8×; the
 
 ### Engine benchmarks, first integration
 
-The engine builds and runs on either tree (`BYTECASK_KEYDIR=btree`), and the
+The engine builds and runs on either tree (`BYTECASK_KEYDIR=radix` selects
+the radix tree; the B+ tree is the default), and the
 full suite passes on both: 1494 cases, 11.4M assertions on the radix tree
 and 8.7M on the B+ tree. Not one line of the engine needed a B+ tree
 specific change; the tree's surface matched `EngineState`'s use as designed.
@@ -1173,9 +1178,12 @@ cores cannot show that. The README's recovery table was measured on a
 
 Note the numbers above come from `engine_bench` run directly, under
 `BYTECASK_KEYDIR=btree` and `BYTECASK_NO_ROCKSDB=1`. They are not written
-to `benchmarks/engine_bench_results.csv`: that file tracks the default
-build on `main`, and rows from a different key directory would not be
-comparable with the history in it.
+to `benchmarks/engine_bench_results.csv`: at the time they were taken that
+file tracked the default build on `main` — the radix tree — and rows from a
+different key directory would not have been comparable with the history in
+it. The default has since changed, so new rows written to that file describe
+the B+ tree and are not comparable with the rows above them either. The file
+needs a key-directory column before it can hold both.
 
 ### Next steps
 
@@ -1189,8 +1197,11 @@ comparable with the history in it.
    `BulkLoader::append` copies the key again into its arena; handing the
    loader the iterator's buffer directly would avoid one of those copies.
 3. Re-run recovery on a 16-thread host.
-4. `u32_map` on the B+ tree, sysbench against `main`.
-5. Remove the radix tree and update the documents.
+4. `u32_map` on the B+ tree, sysbench against `main`. `u32_map` still builds
+   on the radix tree; it backs `file_stats`, not the key directory.
+5. Make `BC_SORT_HINTS` the default, which needs a sortedness marker in the
+   hint header or a per-file fallback so a database written before the flag
+   existed still opens on the ranged path.
 
 ## References
 

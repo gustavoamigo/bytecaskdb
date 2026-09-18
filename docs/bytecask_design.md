@@ -2,9 +2,9 @@
 
 ## Purpose
 
-ByteCaskDB is a [Bitcask](https://riak.com/assets/bitcask-intro.pdf) implementation with a key architectural difference: it uses an immutable **persistent radix tree** for the Key Directory instead of a Hash Table. This design choice enables efficient **range queries** and **prefix searches** while maintaining Bitcask's core strengths of fast writes and simple recovery. The name "ByteCaskDB" reflects this hybrid approach: **Bitcask algorithm** + **tree index** = **ByteCaskDB**.
+ByteCaskDB is a [Bitcask](https://riak.com/assets/bitcask-intro.pdf) implementation with a key architectural difference: it uses an immutable **persistent B+ tree** for the Key Directory instead of a Hash Table. This design choice enables efficient **range queries** and **prefix searches** while maintaining Bitcask's core strengths of fast writes and simple recovery. The name "ByteCaskDB" reflects this hybrid approach: **Bitcask algorithm** + **tree index** = **ByteCaskDB**.
 
-**Core design choice**: all keys live in memory at all times. This eliminates disk-bound index lookups entirely — every point read is O(1) from the radix tree, every range scan is a pure in-memory walk. Database size is bounded by available RAM: at ~70 bytes per unique key (key data + metadata + tree structure overhead), 10 million keys require around 700 MB.
+**Core design choice**: all keys live in memory at all times. This eliminates disk-bound index lookups entirely — every point read resolves in the key directory, every range scan is a pure in-memory walk. Database size is bounded by available RAM: at ~70 bytes per unique key (key data + metadata + tree structure overhead), 10 million keys require around 700 MB.
 
 This document is the living design reference for the repository. It should track the current implementation state, the intended architecture, and important constraints.
 
@@ -100,21 +100,31 @@ The design follows these core tenets in order of priority:
 
 ### Key Directory
 
-ByteCaskDB uses `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times.
+ByteCaskDB uses `PersistentBTree<KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times.
+
+The engine names the tree only through the aliases in `bytecaskdb/internals.cppm` (`KeyDirTree`, `KeyDirTransient`, `KeyDirIter`, …), so both implementations present the same surface to it. `BYTECASK_KEYDIR=radix` builds the engine on the radix tree instead; CI runs the full engine suite on both.
+
+The key directory is a persistent (immutable) B+ tree. Values live only in leaves, inner nodes hold suffix-truncated separators, and there are no sibling links — a sibling pointer would force a leaf update to touch its neighbour, which is exactly what structural sharing cannot afford. One slotted node layout serves leaves and inner nodes alike: a 32-byte header, the prefix every key in the node shares stored once, a `u64` slot array growing up from the front and an entry heap growing down from the end. Each slot packs the first four suffix bytes into its high half, so a lower bound within a node is a branch-free count over the slot array that never touches the heap for most keys; ties fall back to a full compare. Nodes are 4 KiB, which is three levels at 1M keys and four at 100M for 36-byte keys — a node exceeds that only to hold a single oversized key, and then holds exactly that one entry. Deletion is lazy: no rebalancing, an emptied node is unlinked and freed, and the root collapses when it has one child. The tree provides get/set/erase/upsert, `lower_bound()` / `upper_bound()`, forward and reverse ordered iteration over `(key, value)` or values alone, and a `transient()` / `persistent()` API for batch mutations. Iterators hold a stack of `(node, index)` sized to the tree height plus a key buffer rebuilt on each advance, so a dereferenced key is a span valid until the next advance. Implemented in `bytecask.btree` (`bytecaskdb/btree.cppm`); `docs/persistent_btree_design.md` is the full design, including the node layout, the reclamation windows and the measurements against the radix tree.
+
+Both trees' transients are intentionally single-use. `persistent() &&` retires the builder, and any later read or write on a consumed or moved-from transient throws `std::logic_error` in release builds instead of relying on debug-only assertions.
+
+Tree nodes carry no reference count, in either implementation. Lifetime is decided per version instead of per pointer: the session that builds a new version retires the base nodes it makes unreachable, and the version chain frees a retired node once no live version can still reach it. A `Snapshot` therefore holds exactly the nodes it can reach, as it did under reference counting. Versions form a chain — a state may be derived only from the end of it — which the commit pipeline satisfies by construction and `resume()` restores by dropping the unpublished heads of a failed flush before it derives the resumed state.
+
+That reclaimer is one implementation, `VersionChain<Traits>` in `bytecask.version_chain` (`bytecaskdb/version_chain.cppm`), instantiated by both trees. `Traits` is all it needs of a node: its version tag, its children, how to destroy it, and the accounting hook the memory tests read — `btree_detail::ChainTraits` for the B+ tree, `RadixChainTraits` for the radix tree. It began as the radix tree's own class; see `docs/persistent_radix_tree_design.md` §3.3 for the free rule and `docs/persistent_btree_design.md` §Versions for where a B+ node becomes garbage.
+
+`upsert(key, val, should_replace)`, on either transient, performs a single-traversal conditional insert-or-replace: it walks from root to leaf once, inserting if the key is absent, or replacing if `should_replace(existing, incoming)` returns true. Returns the displaced old value when a replacement occurs, enabling callers to track side-effects (e.g. file_stats adjustment). Used by parallel recovery's `recovery_build_from_hints` to eliminate the separate `get()` + `set()` dual traversal that profiling (perf, Recovery/Parallel/16) showed consuming ~49% of recovery time.
+
+Keys are stored as byte sequences inside the tree's nodes. Both tree APIs accept `std::span<const std::byte>` for all key parameters — no intermediate `Key` wrapper is needed for internal operations. The public `Key` class (backed by `std::vector<std::byte>`) is retained for the external iterator API (`KeyIterator`, `EntryIterator`) and for the recovery tombstone tracking map. `Key` provides `operator<=>` (lexicographic over raw byte values) and `begin()`/`end()`/`size()` accessors. Keys have a hard upper bound of 65 535 bytes (the `u16 key_size` field in the data file header).
+
+#### The radix key directory (`BYTECASK_KEYDIR=radix`)
 
 The key directory is a persistent (immutable) radix tree with path-compressed nodes and structural sharing across versions. It provides O(k) get/set/erase (where k = key length), bidirectional ordered iteration via DFS, `lower_bound()` / `upper_bound()` for range queries, `rbegin()` / `rend()` for safe reverse iteration via `ReverseRadixTreeIterator`, and a `transient()` / `persistent()` API for batch mutations. `RadixTreeIterator` satisfies `std::bidirectional_iterator` — `operator--` walks the tree in reverse with O(1) amortized cost per step. `ReverseRadixTreeIterator` wraps `RadixTreeIterator` with pre-decrement at construction so `operator*` always returns a span into a live iterator buffer — no dangling references. It also tracks a `past_rend_` flag so `++rend()` is a no-op (never wraps back to the last element) and `rend().base() == begin()` holds (standard reverse_iterator semantics). Implemented in `bytecask.radix_tree` (`bytecaskdb/radix_tree.cppm`).
 
-`TransientRadixTree` is intentionally single-use. `persistent() &&` retires the builder, and any later read or write on a consumed or moved-from transient throws `std::logic_error` in release builds instead of relying on debug-only assertions.
-
-Tree nodes carry no reference count. Child slots are raw pointers, so cloning a node on the write path is a `memcpy` of its child array and releasing a version is a counter decrement — where before, a wide node's clone wrote to all 256 of its children and its release wrote to them again, every one a cache miss on a large tree. Lifetime is decided per version instead of per pointer: the session that builds a new version retires the base nodes it makes unreachable, and the version chain frees a retired node once no live version can still reach it. A `Snapshot` therefore holds exactly the nodes it can reach, as it did under reference counting. Versions form a chain — a state may be derived only from the end of it — which the commit pipeline satisfies by construction and `resume()` restores by dropping the unpublished heads of a failed flush before it derives the resumed state. See `docs/persistent_radix_tree_design.md` §3.3.
-
-`TransientRadixTree::upsert(key, val, should_replace)` performs a single-traversal conditional insert-or-replace: it walks from root to leaf once, inserting if the key is absent, or replacing if `should_replace(existing, incoming)` returns true. Returns the displaced old value when a replacement occurs, enabling callers to track side-effects (e.g. file_stats adjustment). Used by parallel recovery's `recovery_build_from_hints` to eliminate the separate `get()` + `set()` dual traversal that profiling (perf, Recovery/Parallel/16) showed consuming ~49% of recovery time.
-
 Internal (non-leaf) nodes are tiered by fanout across four fixed-capacity tiers, with no unbounded fallback: `Node4` embeds up to 4 children inline in a single allocation, `Node16` embeds up to 16 (same sorted-array-plus-linear-scan shape as `Node4`, just a bigger array), `Node48` embeds up to 48 (same sorted array, plus a 256-byte `child_index_` mapping a transition byte directly to its slot so `find_child` is O(1) instead of a scan), and `Node256` — the terminal tier — is direct-mapped by transition byte (`children_[b]`, no stored key array) and covers 49–256 children, which is the ceiling: a transition is a single byte, so 256 slots is the most any node can ever need. `Node4` promotes to `Node16` on its 5th child, `Node16` promotes to `Node48` on its 17th, and `Node48` promotes to `Node256` on its 49th; `Node16`↔`Node4` demotes symmetrically at the same boundary, while `Node48`↔`Node16` and `Node256`↔`Node48` both use proportional hysteresis (demote at ≤12/≤36, i.e. 75% of the lower tier's capacity, not ≤16/≤48, matching DuckDB's ART) so a node fluctuating near a tier boundary doesn't thrash. This tiering targets the fanout distribution actually seen in practice: chain-compression routing nodes (created whenever a key exceeds `CompactPrefix`'s 7-byte inline cap) have exactly 1 child and prefix splits start at 2 — where `Node4` wins — `Node16` picks up the next band, which matters most for dense, sequential-suffix keys (the officially tracked `map_bench` shapes); `Node48` measured flat everywhere (the 17–48 band is numerically thin on every shape tested); `Node256` measured flat on most shapes but a small real win (−0.3 to −1.2% at 100K keys) on full-byte-range random shapes (`uuidv4_binary`, `binary`), where some nodes genuinely approach full 256-way occupancy — exactly the range where `Node256`'s fixed one-allocation cost beats the old variable-cost design it replaced. `child_count`, `child_at`, `find_child`, and the mutation helpers funnel through checked accessors (`as_node4()`, `as_node16()`, `as_node48()`, `as_node256()`) that read `node_type()` once and dispatch on it via a single `switch` — not a chain of independent `as_nodeX()` calls, each re-deriving the type — and return safe defaults for leaf nodes. Ordered traversal of one node's children goes through `Node::next_child(ChildCursor&)` rather than the ordinal `child_at(i)`: the cursor holds both an ordinal and a slot probe so each tier reads whichever is O(1) for its layout, which keeps a full walk O(count) on the packed tiers and O(256) on `Node256`. That matters because `Node256` stores no key array and so must rescan its slots to turn an ordinal into a byte, which made ordinal-driven walks quadratic in fanout — an unamortised cost on every `lower_bound`/`upper_bound`/`iter_from` descent and on the recovery fan-in merge, invisible to the tracked benchmarks because the sequential key shapes never build a node wide enough to reach that tier. `Node::insert_child` / `Node::remove_child` are the only two places that know about tier promotion/demotion — every other call site just sees "insert a child, get back the (possibly reallocated) node." The earlier `InternalNode`/`ChildStore` "Large" catch-all tier has been fully removed now that `Node256` covers what it used to. Building this tiering surfaced and fixed two real performance bugs that benefit every tier: the then-existing refcounted release loop was value-initializing a fixed-capacity stack array on every single node release regardless of tier (cost scaling with the array's static size, not the work done), and the `as_nodeX()` accessor chain's redundant per-tier dispatch. A third such bug was found later by code review rather than by a failing test — the ordinal-walk cost described above — and fixing it made `lower_bound` on full-byte-range keys roughly 9× faster while leaving the sequential shapes 5–7% faster. See `docs/persistent_radix_tree_design.md` §7.7–§7.8 for the measured memory impact by key shape and the ordered-traversal design.
 
-Keys are stored as byte sequences within the radix tree's prefix-compressed nodes. The radix tree API accepts `std::span<const std::byte>` for all key parameters — no intermediate `Key` wrapper is needed for internal operations. The public `Key` class (backed by `std::vector<std::byte>`) is retained for the external iterator API (`KeyIterator`, `EntryIterator`) and for the recovery tombstone tracking map. `Key` provides `operator<=>` (lexicographic over raw byte values) and `begin()`/`end()`/`size()` accessors. Keys have a hard upper bound of 65 535 bytes (the `u16 key_size` field in the data file header).
-
 **Historical note**: the original key directory used `PersistentOrderedMap<Key, KeyDirEntry>`, backed by `immer::flex_vector<Entry>`. The radix tree replacement (BC-030) delivers O(k) lookups vs O(n log n) binary search, lower memory overhead via prefix compression and intrusive refcounting, and faster batch mutations via the transient API's in-place path copying. `PersistentOrderedMap` is retained in the codebase for benchmarking purposes (`benchmarks/map_bench.cpp`).
+
+The radix tree replaced that map (BC-030) and was in turn replaced as the default by the B+ tree, which measured faster on point reads, range scans and batched writes, and — given sorted hint files (`BC_SORT_HINTS=1`) — rebuilds the key directory from them faster as well. It remains in the codebase, builds from the same engine under `BYTECASK_KEYDIR=radix`, and passes the same engine suite in CI. `docs/persistent_btree_design.md` records the head-to-head measurements, including where the B+ tree is behind: unsynced single puts.
 
 ### Size Limits
 
@@ -135,7 +145,7 @@ Configurable limits are enforced at the API boundary — before any data is copi
 
 | Limit | Default | Hard ceiling | Rationale |
 |-------|---------|-------------|-----------|
-| `Options::max_key_bytes` | 4,096 (4 KiB) | 65,535 | Keys live in memory (radix tree). Large keys bloat RAM and slow traversal. |
+| `Options::max_key_bytes` | 4,096 (4 KiB) | 65,535 | Keys live in memory (key directory). Large keys bloat RAM and slow traversal. |
 | `Options::max_value_bytes` | 4,194,304 (4 MiB) | 4,294,967,295 | Values go to disk. Oversized values cause pathological file rotation. |
 
 Violations throw `std::invalid_argument`. `WritePlan` carries the limits from `Snapshot` (which inherits them from `DB`) or uses the defaults when constructed without a snapshot. `DB::put`, `DB::del`, `DB::del_range`, and `DB::ingest` all validate before proceeding.
@@ -178,7 +188,7 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
 
   EngineState  (heap, reference-counted, never mutated in place)
   ┌──────────────────────────────────────────────────┐
-  │  key_dir         PersistentRadixTree<KeyDirEntry> │  key → (file_id, offset, seq)
+  │  key_dir         PersistentBTree<KeyDirEntry>     │  key → (file_id, offset, seq)
   │  files           shared_ptr<FileMap>              │  file_id → open DataFile fd
   │  file_stats      map<uint32_t, FileStats>         │  per-file live/total bytes
   │  active_file_id  uint32_t                         │
@@ -273,7 +283,7 @@ Range deletes are supported on `DB::del_range` and `WritePlan::del_range`. Insid
 
 ##### TransientEngineState
 
-`TransientEngineState` is the mutable working copy for all write-path state transitions. It follows the same `transient()` / `persistent()` pattern as `PersistentRadixTree` / `TransientRadixTree`.
+`TransientEngineState` is the mutable working copy for all write-path state transitions. It follows the same `transient()` / `persistent()` pattern as the key directory tree.
 
 The coordinator (step 5 above) only performs IO. It never touches `key_dir`, `file_stats`, or sequence directly. The transient owns all state logic:
 
@@ -393,7 +403,7 @@ Consequences:
      └─ stateless, no synchronisation.
 ```
 
-The read path never acquires `write_mu_`. `load_state` returns a `const&` to a thread-local `shared_ptr<const EngineState>`, avoiding the refcount increment/decrement that `atomic<shared_ptr>::load()` would impose on every read. The radix tree lookup walks raw `const Node*` pointers and the nodes themselves hold no counters, so a lookup does no atomic writes at all. Both are safe because the thread-local snapshot pins the tree version for the duration of the `get()` call.
+The read path never acquires `write_mu_`. `load_state` returns a `const&` to a thread-local `shared_ptr<const EngineState>`, avoiding the refcount increment/decrement that `atomic<shared_ptr>::load()` would impose on every read. The key directory lookup walks raw `const Node*` pointers and the nodes themselves hold no counters, so a lookup does no atomic writes at all. Both are safe because the thread-local snapshot pins the tree version for the duration of the `get()` call.
 
 **Same-thread guarantee**: a `put` followed by a `get` on the **same thread** always observes the put — the `store()` in step [4] is sequenced before the `load()` in the subsequent `get()`.
 
@@ -877,7 +887,9 @@ We use fine-grained C++20 modules:
 - `bytecask.hint_entry`: `HintEntry`, `serialize_entry()`, `deserialize_entry()` — symmetric read/write for hint entries.
 - `bytecask.hint_file`: Hint file writer and reader (`HintFile`).
 - `bytecask.persistent_ordered_map`: Immutable sorted map (`PersistentOrderedMap<K,V>`, `OrderedMapTransient<K,V>`) backed by `immer::flex_vector`; retained for benchmarking.
-- `bytecask.radix_tree`: Persistent radix tree (`PersistentRadixTree<V>`, `TransientRadixTree<V>`, `RadixTreeIterator<V>`) with path compression and version-based node reclamation; used as the key directory.
+- `bytecask.btree`: Persistent B+ tree (`PersistentBTree<V>`, `TransientBTree<V>`, `BTreeIterator<V>`) with one slotted node layout, suffix-truncated separators and version-based node reclamation; the key directory.
+- `bytecask.radix_tree`: Persistent radix tree (`PersistentRadixTree<V>`, `TransientRadixTree<V>`, `RadixTreeIterator<V>`) with path compression and version-based node reclamation; the alternate key directory, selected by `BYTECASK_KEYDIR=radix`.
+- `bytecask.version_chain`: `VersionChain<Traits>` — per-version node reclamation shared by both trees.
 - `bytecask.engine`: Public engine API (`Bytecask`, `EngineState`, `KeyIterator`, `EntryIterator`, `FileRegistry`, type aliases).
 
 ### Current scope boundaries
@@ -1003,7 +1015,7 @@ This is a single code path: `flush_hints_for()` is the same function used by rot
 
 1. **Phase 1 (serial, shared)**: same as above — open files, generate missing hints. Factored into `open_and_prepare_files()`, shared by both paths.
 2. **Phase 2 (parallel build)**: round-robin assign files to W workers. Each builds a `RecoveryResult{key_dir, tombstones, max_seq, file_stats}` independently.
-3. **Phase 3 (sequential accumulator merge)**: workers push finished `RecoveryResult`s into a thread-safe queue. A single merge thread pops results and merges each into a growing accumulator using `PersistentRadixTree::merge(acc, incoming, seq_resolver)`, then cross-applies tombstones. Each ~N/W-key tree is merged once; disjoint subtrees are shared O(1) by the persistent tree, so total merge work is proportional to overlap, not N × log₂(W).
+3. **Phase 3 (sequential accumulator merge)**: workers push finished `RecoveryResult`s into a thread-safe queue. A single merge thread pops results and merges each into a growing accumulator using `merge(acc, incoming, seq_resolver)`, then cross-applies tombstones. Each ~N/W-key tree is merged once. On the radix tree the merge adopts disjoint subtrees by pointer, so its work is proportional to overlap rather than N × log₂(W); a B+ tree is not canonical — its shape depends on insertion history, not on the key set alone — so nothing can be adopted and the merge moves every key. `recovery_load_ranged` exists because of that (see below).
 4. **Phase 4 (serial assembly)**: `s.key_dir = final.key_dir; s.next_seq = final.max_seq + 1`.
 
 See `docs/parallel_recovery_design.md` §11 for the full v1 algorithm.
@@ -1019,6 +1031,28 @@ See `docs/parallel_recovery_design.md` §11 for the full v1 algorithm.
 | 16      | 52          | 5.04×   | 503          | 5.68×   |
 
 Scaling is sub-linear due to fan-in merge overhead and memory bandwidth saturation beyond 8 threads. At 10M keys, recovery drops from 2.86s (serial) to 503ms (16 threads).
+
+### Range-Partitioned Recovery (B+ tree)
+
+`recovery_load_parallel` above splits the work by *file* and pays for it at the fan-in: every worker's tree must be merged into one. That merge is cheap on a radix tree, which can adopt a disjoint subtree by pointer, and is not cheap on a B+ tree, which has to move every key. `recovery_load_ranged` replaces the fold with a partition, and is compiled only under `BYTECASK_USE_BTREE` — it is coupled to the tree it builds, not a tree-agnostic engine phase.
+
+1. **Sample** separators from each file's hint run, and merge the samples to pick `W - 1` boundaries that cut the key space into W roughly equal ranges.
+2. **Build** each range in parallel. A worker k-way merges the slice of every hint run that falls in its range straight into a `BulkLoader`, which packs full leaves in key order — no descent, no split, no slot shift per key.
+3. **Concat**. The runs are disjoint and already in order, so assembly is a spine built over them, not a merge.
+
+There is no fan-in: worker k's keys belong to worker k and to nobody else. Step 2 is the reason this path needs **sorted hint files**, and `recovery_build_sorted` throws if it is handed an unsorted one.
+
+Two invariants matter in step 3. The merge collapses duplicate keys within a run to the highest sequence, because hint files are no longer deduplicated and one key can repeat inside a run. And `concat` publishes the assembled tree under the maximum of the session tag and every run's tag: the version chain frees a dead version by tag interval, so a node tagged above the published version would later be taken for a *different* version's garbage and freed while still reachable.
+
+Cursors are held in a heap rather than scanned linearly. A worker in the ranged path has one cursor per hint file — not one per recovery thread — so at 10M keys across many files the linear scan dominated: 8.37s against 2.44s for the heap at one thread.
+
+### Sorted Hint Files (`BC_SORT_HINTS=1`)
+
+Off by default. When set, `flush_hints_for` writes each hint file's Put and Delete entries sorted by key ascending, sequence descending. Range tombstones and `BulkBegin`/`BulkEnd` markers are written first, in scan order: a range tombstone's key is a range *bound*, not a key of the file, so it must not join the sorted run, and recovery's tombstone handling is order independent anyway.
+
+Sorting costs one buffer per data file — bounded by `max_file_bytes`, not by the database — and is what lets recovery bulk-load a B+ tree instead of inserting key by key. It is not a format change: every recovery path resolves entries by sequence, never by position, so a sorted hint file and an unsorted one describe the same key directory and either reader accepts either file. The one asymmetry is `recovery_build_sorted`, which *requires* sorted input and rejects anything else — which is why the flag is not yet the default: a database written before it was set would still hold unsorted hint files. Making it the default needs a sortedness marker in the hint header or a per-file fallback.
+
+Unlike BC-088, the sorted writer does **not** deduplicate. `file_stats.min_sequence` / `max_sequence` are rebuilt at recovery from the entries the hint file still holds, and `ChangeIterator` selects data files by that range; dropping an entry can raise `min_sequence` above a sequence the data file really contains, and replication would then skip the file.
 
 ### Incomplete Batch Recovery
 
@@ -1073,7 +1107,7 @@ Read API:
 
 `iter_from` returns a lazy input range of `(Key, Bytes)` pairs in ascending key order. Each dereference issues a single `pread` via `DataFile::read_value_into()` — the caller-supplied `key_size` and `value_size` (from `KeyDirEntry`) let the engine compute the total entry size upfront, halving the syscall count compared to the recovery path (`scan()`, which needs two preads because sizes are unknown). The iterator reuses an internal I/O buffer and the cached value vector across advances, so sequential scans incur zero allocations after the first dereference.
 
-Results are always in ascending key order (radix tree iteration order).
+Results are always in ascending key order (key directory iteration order).
 
 `ReadOptions` is currently an empty struct reserved for future knobs (e.g. `verify_checksums`).
 
@@ -1225,7 +1259,7 @@ for (auto& key : db.rkeys_from(opts, prefix))              { ... }
 ```
 
 - **Lazy**: each dereference reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries.
-- **`KeyIterator` is in-memory only**: walks the radix tree key directory without touching any data file.
+- **`KeyIterator` is in-memory only**: walks the in-memory key directory without touching any data file.
 - **Error handling**: throws `std::system_error` on I/O failure.
 
 ### WriteOptions and ReadOptions
@@ -1350,7 +1384,7 @@ for (auto& [key, value] : db.iter_from(as_bytes("user:"))) {
     // Iterates all keys >= "user:" in ascending order.
 }
 
-// Keys-only scan (no disk I/O — radix tree walk only).
+// Keys-only scan (no disk I/O — key directory walk only).
 for (auto& key : db.keys_from(as_bytes("user:"))) { ... }
 
 // Reverse scan (descending).

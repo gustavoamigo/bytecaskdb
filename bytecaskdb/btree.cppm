@@ -8,7 +8,7 @@
 // entry heap growing down from the end. A leaf entry is V + key suffix; an
 // inner entry is Node* + separator suffix. Versions share structure by path
 // copying; a transient edits the nodes it created in place; node lifetime
-// belongs to NodeVersionChain. See docs/persistent_btree_design.md.
+// belongs to VersionChain. See docs/persistent_btree_design.md.
 
 module;
 #include <algorithm>
@@ -1534,13 +1534,13 @@ using ReverseBTreeValueIterator = BasicReverseBTreeIterator<V, false>;
 // PersistentBTree<V> — a handle to one immutable version.
 //
 // Copies are O(1): a root pointer, a size and a pin on the version. Node
-// lifetime belongs to NodeVersionChain; this class only pins and unpins. set()
+// lifetime belongs to VersionChain; this class only pins and unpins. set()
 // and erase() are one-operation transients.
 // ---------------------------------------------------------------------------
 export template <typename V> class PersistentBTree {
   using N = btree_detail::Node<V>;
   using Bytes = btree_detail::Bytes;
-  using Chain = NodeVersionChain<btree_detail::ChainTraits<V>>;
+  using Chain = VersionChain<btree_detail::ChainTraits<V>>;
 
 public:
   PersistentBTree() = default;

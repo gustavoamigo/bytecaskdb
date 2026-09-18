@@ -67,18 +67,14 @@ void free_node_subtree_if(typename Traits::Node *root, Pred is_garbage) {
 }
 
 // ---------------------------------------------------------------------------
-// NodeVersionChain<Traits> — owns node lifetime for every persistent tree of one
-// value type.
+// VersionChain<Traits> — owns node lifetime for every persistent tree built
+// over one Traits type.
 //
-// Named NodeVersionChain, not VersionChain, because radix_tree.cppm still
-// declares its own `VersionChain` and the two cannot both be
-// bytecask::VersionChain in one import graph. This class is that one lifted
-// out and made generic over a Traits type, so the two are the same design in
-// two copies. Collapsing them — deleting the radix tree's copy and giving it
-// a ChainTraits over this one — is the follow-up this rename is holding a
-// place for, and is what docs/persistent_btree_design.md proposes; it is left
-// out of this change so the B+ tree lands without also rewriting the radix
-// tree's reclamation.
+// Both trees instantiate this: the B+ tree over btree_detail::ChainTraits and
+// the radix tree over RadixChainTraits. It began as the radix tree's own
+// class and was lifted out and made generic over Traits, which needs only a
+// node's version tag, its children, how to destroy it, and the accounting
+// hook the memory tests read.
 //
 // A persistent tree is a *version*, identified by the tag of the session
 // that built it, and registered here while any handle to it lives. The
@@ -138,17 +134,17 @@ void free_node_subtree_if(typename Traits::Node *root, Pred is_garbage) {
 // publishes one per batch. The buffers are handed back when the last
 // version of this value type goes.
 // ---------------------------------------------------------------------------
-export template <typename Traits> class NodeVersionChain {
+export template <typename Traits> class VersionChain {
 public:
   using Node = typename Traits::Node;
 
-  static auto instance() -> NodeVersionChain & {
+  static auto instance() -> VersionChain & {
     // Immortal: a tree can outlive static destruction, so the chain is
     // constructed once in static storage and never destroyed. Static
     // storage rather than the heap, so a leak checker sees nothing left
     // behind at exit.
-    alignas(NodeVersionChain) static std::byte storage[sizeof(NodeVersionChain)];
-    static auto *chain = new (storage) NodeVersionChain();
+    alignas(VersionChain) static std::byte storage[sizeof(VersionChain)];
+    static auto *chain = new (storage) VersionChain();
     return *chain;
   }
 
@@ -167,7 +163,7 @@ public:
         auto *b = find(base);
         if (b->successor != 0)
           throw std::logic_error{
-              "NodeVersionChain: a version that already has a successor cannot "
+              "VersionChain: a version that already has a successor cannot "
               "be derived from again"};
         b->successor = tag;
         lineage = b->lineage;
@@ -321,13 +317,13 @@ private:
     const auto *rec = find(tag);
     if (rec->live != 1)
       throw std::logic_error{
-          "NodeVersionChain::merge: an input is held by another handle"};
+          "VersionChain::merge: an input is held by another handle"};
     if (rec->successor != 0)
-      throw std::logic_error{"NodeVersionChain::merge: an input has a successor"};
+      throw std::logic_error{"VersionChain::merge: an input has a successor"};
     for (const auto &r : records_) {
       if (r.lineage == rec->lineage && r.tag != tag)
         throw std::logic_error{
-            "NodeVersionChain::merge: an input has a live predecessor"};
+            "VersionChain::merge: an input has a live predecessor"};
     }
     // Nothing can be parked on the only version of a lineage.
     assert(rec->parked.nodes.empty() && rec->more.empty());
