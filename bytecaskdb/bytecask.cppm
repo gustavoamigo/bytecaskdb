@@ -4022,7 +4022,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   // Put is admitted.
   for (auto &[file_id, data_file, hint_path, tb] : files) {
     try {
-      open_hints.push_back(HintFile::OpenForRead(hint_path));
+      open_hints.push_back(HintFile::OpenForMerge(hint_path));
       auto scanner = open_hints.back().make_scanner();
       std::optional<HintEntry> first;
       while (auto he = scanner.next()) {
@@ -4103,24 +4103,36 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   };
   for (auto &c : cursors) load(c);
 
-  while (true) {
-    auto best = cursors.size();
-    for (std::size_t i = 0; i < cursors.size(); ++i) {
-      if (!cursors[i].cur) continue;
-      if (best == cursors.size() ||
-          recovery_key_cmp(cursors[i].cur->key, cursors[best].cur->key) < 0)
-        best = i;
-    }
-    if (best == cursors.size()) break;
+  // A heap, not a scan over the cursors: there is one cursor per hint file
+  // this worker owns, and at one recovery thread that is every file in the
+  // database. A linear scan costs O(files) per key, which at 10M keys and
+  // ~180 files made recovery 3x slower than the radix tree; the heap makes
+  // it O(log files).
+  const auto ahead = [&](std::size_t a, std::size_t b) {
+    return recovery_key_cmp(cursors[a].cur->key, cursors[b].cur->key) > 0;
+  };
+  std::vector<std::size_t> heap;
+  heap.reserve(cursors.size());
+  for (std::size_t i = 0; i < cursors.size(); ++i)
+    if (cursors[i].cur) heap.push_back(i);
+  std::ranges::make_heap(heap, ahead);
+
+  while (!heap.empty()) {
+    std::ranges::pop_heap(heap, ahead);
+    const auto best = heap.back();
+    heap.pop_back();
 
     const auto key = cursors[best].cur->key;
     auto winner = *cursors[best].cur;
     auto winner_file = cursors[best].file_id;
     matches.clear();
     matches.push_back(best);
-    for (std::size_t i = 0; i < cursors.size(); ++i) {
-      if (i == best || !cursors[i].cur) continue;
-      if (recovery_key_cmp(cursors[i].cur->key, key) != 0) continue;
+    // Every other cursor sitting on the same key is adjacent at the top.
+    while (!heap.empty() &&
+           recovery_key_cmp(cursors[heap.front()].cur->key, key) == 0) {
+      std::ranges::pop_heap(heap, ahead);
+      const auto i = heap.back();
+      heap.pop_back();
       matches.push_back(i);
       if (cursors[i].cur->sequence > winner.sequence) {
         winner = *cursors[i].cur;
@@ -4158,7 +4170,13 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
       }
     }
 
-    for (const auto i : matches) load(cursors[i]);
+    for (const auto i : matches) {
+      load(cursors[i]);
+      if (cursors[i].cur) {
+        heap.push_back(i);
+        std::ranges::push_heap(heap, ahead);
+      }
+    }
   }
 
   auto fstats_t = PersistentU32Map<FileStats>{}.transient();

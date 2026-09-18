@@ -15,6 +15,7 @@ module;
 #include <ranges>
 #include <span>
 #include <stdexcept>
+#include <sys/mman.h>
 #include <system_error>
 #include <unistd.h>
 #include <vector>
@@ -156,7 +157,56 @@ public:
     return HintFile{std::move(path), std::move(buf)};
   }
 
+  // Read mode backed by a shared, read-only mapping instead of a heap copy.
+  //
+  // A k-way merge has to hold every file it merges open at once, and slurping
+  // each one makes recovery's working set grow with the database: one worker
+  // at recovery_threads = 1 owns every hint file there is. Mapping keeps the
+  // bytes in the page cache, where they are file-backed and reclaimable, so
+  // the anonymous memory recovery needs stays bounded by the tree it builds.
+  [[nodiscard]] static auto OpenForMerge(std::filesystem::path path)
+      -> HintFile {
+    auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("HintFile: cannot open '{}' for read", path.string())};
+    }
+    const auto file_sz = std::filesystem::file_size(path);
+    if (file_sz < kFileCrcSize) {
+      ::close(fd);
+      throw std::runtime_error{std::format(
+          "HintFile: '{}' is too small to contain a CRC trailer",
+          path.string())};
+    }
+    auto *addr = ::mmap(nullptr, file_sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);  // the mapping keeps the file alive
+    if (addr == MAP_FAILED) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("HintFile: cannot map '{}'", path.string())};
+    }
+    auto map = std::span<const std::byte>{
+        static_cast<const std::byte *>(addr), file_sz};
+    // The merge walks each file front to back exactly once.
+    ::madvise(addr, file_sz, MADV_SEQUENTIAL);
+
+    Crc32 crc{};
+    crc.update(map.subspan(0, map.size() - kFileCrcSize));
+    const auto computed = crc.finalize();
+    const auto stored = read_le<std::uint32_t>(map, map.size() - kFileCrcSize);
+    if (computed != stored) {
+      ::munmap(addr, file_sz);
+      throw std::runtime_error{
+          std::format("HintFile: CRC mismatch in '{}'", path.string())};
+    }
+    return HintFile{std::move(path), addr, file_sz};
+  }
+
   ~HintFile() {
+    if (map_ != nullptr) {
+      ::munmap(map_, map_size_);
+    }
     // If the write fd is still open (close() was not called — e.g. exception
     // path), close without writing CRC. The .hint.tmp file will be cleaned
     // up on next startup.
@@ -171,19 +221,28 @@ public:
   HintFile(HintFile &&other) noexcept
       : path_{std::move(other.path_)},
         buf_{std::move(other.buf_)},
+        map_{other.map_},
+        map_size_{other.map_size_},
         write_fd_{other.write_fd_},
         crc_{other.crc_} {
     other.write_fd_ = -1;
+    other.map_ = nullptr;
+    other.map_size_ = 0;
   }
 
   HintFile &operator=(HintFile &&other) noexcept {
     if (this != &other) {
       if (write_fd_ != -1) ::close(write_fd_);
+      if (map_ != nullptr) ::munmap(map_, map_size_);
       path_ = std::move(other.path_);
       buf_ = std::move(other.buf_);
+      map_ = other.map_;
+      map_size_ = other.map_size_;
       write_fd_ = other.write_fd_;
       crc_ = other.crc_;
       other.write_fd_ = -1;
+      other.map_ = nullptr;
+      other.map_size_ = 0;
     }
     return *this;
   }
@@ -255,6 +314,10 @@ private:
   explicit HintFile(std::filesystem::path path, std::vector<std::byte> buf)
       : path_{std::move(path)}, buf_{std::move(buf)} {}
 
+  // Merge-mode constructor: holds the mapping, unmapped by the destructor.
+  explicit HintFile(std::filesystem::path path, void *addr, std::size_t size)
+      : path_{std::move(path)}, map_{addr}, map_size_{size} {}
+
   void write_bytes(std::span<const std::byte> data) {
     if (::write(write_fd_, data.data(), data.size()) !=
         std::ssize(data)) {
@@ -268,11 +331,15 @@ private:
   }
 
   [[nodiscard]] auto view() const noexcept -> std::span<const std::byte> {
+    if (map_ != nullptr)
+      return {static_cast<const std::byte *>(map_), map_size_};
     return {buf_.data(), buf_.size()};
   }
 
   std::filesystem::path path_;
   std::vector<std::byte> buf_;   // read mode only
+  void *map_{nullptr};           // merge mode only; owns the mapping
+  std::size_t map_size_{0};
   int write_fd_{-1};             // write mode only; -1 when closed or read mode
   Crc32 crc_{};                  // write mode only; running CRC accumulator
 };
