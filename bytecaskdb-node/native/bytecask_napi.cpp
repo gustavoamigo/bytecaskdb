@@ -117,6 +117,24 @@ auto string_to_mode(const std::string& s) -> bytecask::Mode {
   throw std::invalid_argument("Invalid mode: " + s + " (expected 'leader' or 'follower')");
 }
 
+auto string_to_io_backend(const std::string& s) -> bytecask::IoBackend {
+  if (s == "pread") return bytecask::IoBackend::Pread;
+  if (s == "mmap") return bytecask::IoBackend::Mmap;
+  if (s == "bufferPool") return bytecask::IoBackend::BufferPool;
+  throw std::invalid_argument(
+      "Invalid ioBackend: " + s + " (expected 'pread', 'mmap', or 'bufferPool')");
+}
+
+auto extract_buffer_pool_options(const Napi::Value& opts) -> bytecask::BufferPoolOptions {
+  bytecask::BufferPoolOptions bpo;
+  if (has_prop(opts, "capacityBytes"))
+    bpo.capacity_bytes = static_cast<std::size_t>(
+        opt_prop(opts, "capacityBytes").As<Napi::Number>().DoubleValue());
+  if (has_prop(opts, "directIo"))
+    bpo.direct_io = opt_prop(opts, "directIo").As<Napi::Boolean>();
+  return bpo;
+}
+
 auto mode_to_string(bytecask::Mode m) -> const char* {
   switch (m) {
     case bytecask::Mode::Leader: return "leader";
@@ -461,6 +479,11 @@ auto parse_open_options(const Napi::Value& opts) -> bytecask::Options {
   if (has_prop(opts, "initialMode"))
     o.initial_mode =
         string_to_mode(opt_prop(opts, "initialMode").As<Napi::String>().Utf8Value());
+  if (has_prop(opts, "ioBackend"))
+    o.io_backend =
+        string_to_io_backend(opt_prop(opts, "ioBackend").As<Napi::String>().Utf8Value());
+  if (has_prop(opts, "bufferPool"))
+    o.buffer_pool = extract_buffer_pool_options(opt_prop(opts, "bufferPool"));
   return o;
 }
 

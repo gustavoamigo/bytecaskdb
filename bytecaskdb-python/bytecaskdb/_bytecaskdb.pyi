@@ -40,9 +40,39 @@ class EntryType(enum.Enum):
     BulkEnd = ...
     RangeDel = ...
 
+class IoBackend(enum.Enum):
+    """Selects how data files are read.
+
+    ``Pread`` (default) issues ``pread(2)`` per read; ``Mmap`` memory-maps
+    sealed files for zero-copy reads; ``BufferPool`` serves sealed files
+    from a bounded, engine-owned cache (see ``BufferPoolOptions``).
+    """
+
+    Pread = ...
+    Mmap = ...
+    BufferPool = ...
+
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
+
+class BufferPoolOptions:
+    """Configuration for ``Options.buffer_pool``.
+
+    Only read when ``Options.io_backend`` is ``IoBackend.BufferPool``.
+    """
+
+    capacity_bytes: int
+    """Total pool footprint in bytes (frames plus index). Must be at least
+    2x ``max_file_bytes``. 0 (default) is rejected by ``DB.open()`` when
+    ``io_backend`` is ``IoBackend.BufferPool``."""
+
+    direct_io: bool
+    """If True (default), fill frames with O_DIRECT so the pool is the only
+    consumer of memory for sealed-file data. Falls back to buffered fills
+    per file when the filesystem refuses O_DIRECT."""
+
+    def __init__(self) -> None: ...
 
 class Options:
     """Configuration for ``DB.open()``."""
@@ -65,6 +95,12 @@ class Options:
 
     initial_mode: Mode
     """Initial engine mode (default Mode.Leader)."""
+
+    io_backend: IoBackend
+    """How data files are read (default IoBackend.Pread)."""
+
+    buffer_pool: BufferPoolOptions
+    """Only read when ``io_backend`` is ``IoBackend.BufferPool``."""
 
     def __init__(self) -> None: ...
 
@@ -471,4 +507,10 @@ class DB:
 
     def ingest(self, entries: list[DataEntry]) -> None:
         """Ingest pre-sequenced entries from a leader (follower mode only)."""
+        ...
+
+    def stats(self) -> dict[str, int]:
+        """Return all operational counters and gauges (bytes written,
+        fsyncs, buffer pool hits/misses, degraded state, open files, etc.)
+        as a dict. Designed for pull-based scraping."""
         ...

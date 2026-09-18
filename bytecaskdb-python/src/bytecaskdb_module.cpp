@@ -21,6 +21,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>
+#include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
@@ -375,9 +376,32 @@ NB_MODULE(_bytecaskdb, m) {
       .value("BulkEnd", bytecask::EntryType::BulkEnd)
       .value("RangeDel", bytecask::EntryType::RangeDel);
 
+  nb::enum_<bytecask::IoBackend>(m, "IoBackend",
+      "Selects how data files are read. Pread (default) issues pread(2) per "
+      "read; Mmap memory-maps sealed files for zero-copy reads; BufferPool "
+      "serves sealed files from a bounded, engine-owned cache (see "
+      "BufferPoolOptions).")
+      .value("Pread", bytecask::IoBackend::Pread)
+      .value("Mmap", bytecask::IoBackend::Mmap)
+      .value("BufferPool", bytecask::IoBackend::BufferPool);
+
   // -------------------------------------------------------------------------
   // Options
   // -------------------------------------------------------------------------
+
+  nb::class_<bytecask::BufferPoolOptions>(m, "BufferPoolOptions",
+      "Configuration for Options.buffer_pool, read only when "
+      "Options.io_backend is IoBackend.BufferPool.")
+      .def(nb::init<>())
+      .def_rw("capacity_bytes", &bytecask::BufferPoolOptions::capacity_bytes,
+              "Total pool footprint in bytes (frames plus index). Must be "
+              "at least 2x max_file_bytes. 0 (default) is rejected by "
+              "DB.open() when io_backend is IoBackend.BufferPool.")
+      .def_rw("direct_io", &bytecask::BufferPoolOptions::direct_io,
+              "If True (default), fill frames with O_DIRECT so the pool is "
+              "the only consumer of memory for sealed-file data. Falls back "
+              "to buffered fills per file when the filesystem refuses "
+              "O_DIRECT.");
 
   nb::class_<bytecask::Options>(m, "Options",
       "Configuration for DB.open().")
@@ -394,7 +418,11 @@ NB_MODULE(_bytecaskdb, m) {
       .def_rw("max_value_bytes", &bytecask::Options::max_value_bytes,
               "Max value size in bytes (default 4 MiB; hard ceiling ~4 GiB).")
       .def_rw("initial_mode", &bytecask::Options::initial_mode,
-              "Initial engine mode (default Mode.Leader).");
+              "Initial engine mode (default Mode.Leader).")
+      .def_rw("io_backend", &bytecask::Options::io_backend,
+              "How data files are read (default IoBackend.Pread).")
+      .def_rw("buffer_pool", &bytecask::Options::buffer_pool,
+              "Only read when io_backend is IoBackend.BufferPool.");
 
   nb::class_<bytecask::WriteOptions>(m, "WriteOptions",
       "Per-write options for put, del_, apply_batch, etc.")
@@ -880,5 +908,14 @@ NB_MODULE(_bytecaskdb, m) {
             self.db.ingest(views);
           },
           "Ingest pre-sequenced entries from a leader (follower mode only).",
-          "entries"_a);
+          "entries"_a)
+      .def(
+          "stats",
+          [](PyDB &self) -> std::map<std::string, std::int64_t> {
+            BC_GIL_RELEASE;
+            return self.db.stats();
+          },
+          "Return all operational counters and gauges as a dict (bytes "
+          "written, fsyncs, buffer pool hits/misses, degraded state, "
+          "open files, etc.). Designed for pull-based scraping.");
 }
