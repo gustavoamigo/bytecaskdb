@@ -333,13 +333,13 @@ to callers. Degrading forces `resume()` before further writes are accepted;
 
 ## Proof Test Generator
 
-### apply_batch — 1116 tests
+### apply_batch — 1190 tests
 
-1116 generated Catch2 tests (`[prove]` tag) cover every valid
+1190 generated Catch2 tests (`[prove]` tag) cover every valid
 (StateShape, PlanShape, FailureClass, Observer) combination for
 `apply_batch`. The scenario matrix is 8 state shapes × 17 plan shapes ×
 9 failure classes; 4 elimination rules reduce this to 800 observer-free
-cells, and the observer axis adds 316 more.
+cells, and the observer axis adds 390 more.
 
 #### State shapes
 
@@ -387,12 +387,13 @@ observer is how a generated cell can act on it.
 |----------|-------------------------------|---------|
 | `none` | — | (every cell; the 800 observer-free cells) |
 | `held_value` | `get` into a `Bytes` kept alive | value-path invalidation |
-| `held_iter_span` | a span from `iter_from`, held across the call | #87, BC-122 |
+| `held_iter_span` | a span from `iter_from`, held across the call | #87 |
+| `held_riter_span` | a span from `riter_from`, held across the call | the reverse read path |
 | `held_snapshot` | `db.snapshot()` kept open | pinned-file / vacuum interaction |
 | `second_instance` | a second `DB` open on the same thread | BC-243 |
 
 `assert_view_stable(held, expected)` is the check for the two span-based
-observers. It probes with `mincore` (via `tests/mapping_probe.h`) and
+observers (`held_iter_span`, `held_riter_span`). It probes with `mincore` (via `tests/mapping_probe.h`) and
 then compares bytes. The byte comparison is what discriminates:
 `mmap(nullptr, …)` often returns the address `munmap` just released, so
 an unmap-and-remap can look identical to never having unmapped.
@@ -441,6 +442,29 @@ motivated comparing bytes. The
 `rotation_threshold_buffered` cells correctly keep passing: at
 `max_file_bytes = 1` every write rotates, so their span points into a
 sealed `MAP_PRIVATE` file that `truncate()` never touches.
+
+Reverting BC-243 — dropping the owner check from
+`DB::load_state_for_read` — fails 10 `second_instance` cells on
+`obs_db.get(...)` returning false: the second DB's read is served the
+primary's cached generation, in which that key does not exist.
+
+#### What the axis does not reach
+
+Reverting BC-122 — giving `ReverseRadixTreeIterator::operator*` back the
+`std::reverse_iterator` shape, where it dereferences a temporary copy and
+returns a span into it — leaves **all 1190 cells passing**. Four
+`radix_tree_test.cpp` cases catch it instead.
+
+That is structural, not a coverage gap to close by adding cells. The
+reverted class is reached only through `key_dir.rbegin()`, and no public
+read path lends a caller a span that comes from it: `riter_from` goes
+through `ReverseValueIterator`, which yields a `KeyDirEntry` by
+reference, and the span the caller actually receives is built afterwards
+by `ReverseEntryIterator` from the data file. `rkeys_from` uses
+`rbegin().base()` only as a starting position and materialises an owning
+`Key`. An observer sits at the DB API, so it cannot see a class the DB
+API does not lend from — the radix tree's own tests are the right place
+for that one, and they hold it.
 
 #### Plan shapes
 
@@ -821,7 +845,7 @@ smoke-test the helpers themselves.
 ### Test coverage
 
 All nine failure classes for `apply_batch` (SUCCESS, A, B1, B2, B3, C,
-F, G, H) are covered by the 1116 `[prove]` tests. Each class is exercised
+F, G, H) are covered by the 1190 `[prove]` tests. Each class is exercised
 across all valid (StateShape, PlanShape) combinations, with and without
 mmap, and — for every class that can disturb a lent view — against each
 of the four observers.
@@ -841,7 +865,7 @@ are covered by the 178 `[prove_repl]` tests. All three manifest failure
 classes across 11 state shapes are covered by the 33 `[prove_manifest]`
 tests. Four elimination rules reduce the full matrix to 211 valid tests.
 
-Total generated proof tests: **1375**.
+Total generated proof tests: **1449**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:

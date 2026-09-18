@@ -197,6 +197,15 @@ def gen_observer_acquire(observer: Observer) -> str:
             "    const bytecask::Bytes obs_span_at_acquire{",
             "        obs_span.begin(), obs_span.end()};",
         ])
+    if observer == Observer.HELD_RITER_SPAN:
+        return "\n".join([
+            "    auto obs_rrange = db.riter_from({});",
+            "    auto obs_rit = obs_rrange.begin();",
+            "    REQUIRE_FALSE(obs_rit == std::default_sentinel);",
+            "    const auto obs_rspan = (*obs_rit).value;",
+            "    const bytecask::Bytes obs_rspan_at_acquire{",
+            "        obs_rspan.begin(), obs_rspan.end()};",
+        ])
     if observer == Observer.HELD_SNAPSHOT:
         return "\n".join([
             "    auto obs_snap = db.snapshot();",
@@ -226,6 +235,8 @@ def gen_observer_verify(observer: Observer, moment: str) -> str:
         lines.append("      assert_view_stable(obs_value, obs_value_at_acquire);")
     elif observer == Observer.HELD_ITER_SPAN:
         lines.append("      assert_view_stable(obs_span, obs_span_at_acquire);")
+    elif observer == Observer.HELD_RITER_SPAN:
+        lines.append("      assert_view_stable(obs_rspan, obs_rspan_at_acquire);")
     elif observer == Observer.HELD_SNAPSHOT:
         lines += [
             "      bytecask::Bytes obs_snap_now;",

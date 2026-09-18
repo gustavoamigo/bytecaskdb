@@ -156,6 +156,7 @@ class Observer(Enum):
     NONE = "none"
     HELD_VALUE = "held_value"            # Bytes filled by get(), kept alive
     HELD_ITER_SPAN = "held_iter_span"    # span from iter_from(), held across
+    HELD_RITER_SPAN = "held_riter_span"  # span from riter_from(), held across
     HELD_SNAPSHOT = "held_snapshot"      # db.snapshot() kept open
     SECOND_INSTANCE = "second_instance"  # a second DB open on this thread
 
@@ -166,6 +167,7 @@ OBSERVERS = list(Observer)
 _NEEDS_A_LIVE_KEY = {
     Observer.HELD_VALUE,
     Observer.HELD_ITER_SPAN,
+    Observer.HELD_RITER_SPAN,
     Observer.HELD_SNAPSHOT,
 }
 
