@@ -67,6 +67,15 @@ jobs:
           build/linux/x86_64/release/unordered_view_tests --reporter junit --out test-results/unordered_view_tests.xml || status=1
           exit "$status"
 
+      # The sorted-hint recovery path (flush_hints_for's sorted run,
+      # recovery_build_sorted, recovery_load_ranged, HintFile::OpenForMerge)
+      # only executes when BC_SORT_HINTS is set, so the run above never
+      # reaches it. Same binary, second run.
+      - name: Run the engine suite over sorted hint files
+        env:
+          BC_SORT_HINTS: "1"
+        run: build/linux/x86_64/release/bytecask_tests
+
       - name: Run proof independence tests (Hypothesis)
         run: |
           xmake build bytecaskdb_python
