@@ -8,7 +8,7 @@
 // entry heap growing down from the end. A leaf entry is V + key suffix; an
 // inner entry is Node* + separator suffix. Versions share structure by path
 // copying; a transient edits the nodes it created in place; node lifetime
-// belongs to VersionChain. See docs/persistent_btree_design.md.
+// belongs to NodeVersionChain. See docs/persistent_btree_design.md.
 
 module;
 #include <algorithm>
@@ -560,7 +560,7 @@ public:
   void discard_all(N *root) noexcept {
     const auto tag = tag_;
     if (tag != 0)
-      free_subtree_if<ChainTraits<V>>(root,
+      free_node_subtree_if<ChainTraits<V>>(root,
                                       [tag](N *n) { return n->tag == tag; });
     forget_retired();
     tag_ = 0;
@@ -1534,13 +1534,13 @@ using ReverseBTreeValueIterator = BasicReverseBTreeIterator<V, false>;
 // PersistentBTree<V> — a handle to one immutable version.
 //
 // Copies are O(1): a root pointer, a size and a pin on the version. Node
-// lifetime belongs to VersionChain; this class only pins and unpins. set()
+// lifetime belongs to NodeVersionChain; this class only pins and unpins. set()
 // and erase() are one-operation transients.
 // ---------------------------------------------------------------------------
 export template <typename V> class PersistentBTree {
   using N = btree_detail::Node<V>;
   using Bytes = btree_detail::Bytes;
-  using Chain = VersionChain<btree_detail::ChainTraits<V>>;
+  using Chain = NodeVersionChain<btree_detail::ChainTraits<V>>;
 
 public:
   PersistentBTree() = default;
@@ -1598,10 +1598,11 @@ public:
 
   // A new tree with every key of `a` and `b`; on a key in both,
   // resolve(a_val, b_val) picks the value. The result shares no node with
-  // its inputs and starts a lineage of its own; the inputs are untouched.
+  // its inputs and starts a lineage of its own. Consuming, matching the
+  // radix tree's contract: the inputs are taken by value and released here,
+  // so one engine call site serves either key directory.
   template <typename ResolveFunc>
-  [[nodiscard]] static auto merge(const PersistentBTree &a,
-                                  const PersistentBTree &b,
+  [[nodiscard]] static auto merge(PersistentBTree a, PersistentBTree b,
                                   ResolveFunc &&resolve) -> PersistentBTree;
 
   [[nodiscard]] auto begin() const -> BTreeIterator<V> {
@@ -2061,8 +2062,7 @@ auto PersistentBTree<V>::erase(Bytes key) const -> PersistentBTree {
 
 template <typename V>
 template <typename ResolveFunc>
-auto PersistentBTree<V>::merge(const PersistentBTree &a,
-                               const PersistentBTree &b,
+auto PersistentBTree<V>::merge(PersistentBTree a, PersistentBTree b,
                                ResolveFunc &&resolve) -> PersistentBTree {
   // Ordered merge into a bulk loader: each key is written once, with no
   // descent and no split. Rebuilding with set() in a loop costs a full
@@ -2094,7 +2094,13 @@ auto PersistentBTree<V>::merge(const PersistentBTree &a,
     auto [k, v] = *ib;
     out.append(k, v);
   }
-  return std::move(out).finish();
+  auto merged = std::move(out).finish();
+  // The iterators pin the inputs, so they are released only now.
+  ia = {};
+  ib = {};
+  a = {};
+  b = {};
+  return merged;
 }
 
 } // namespace bytecask

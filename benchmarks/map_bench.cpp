@@ -112,9 +112,9 @@ struct RTreeAdapter {
   }
 
   template <typename Resolve>
-  static auto merge(const map_type &a, const map_type &b, Resolve &&resolve)
-      -> map_type {
-    return map_type::merge(a, b, std::forward<Resolve>(resolve));
+  static auto merge(map_type a, map_type b, Resolve &&resolve) -> map_type {
+    return map_type::merge(std::move(a), std::move(b),
+                           std::forward<Resolve>(resolve));
   }
 };
 
@@ -195,9 +195,9 @@ struct BTreeAdapter {
   }
 
   template <typename Resolve>
-  static auto merge(const map_type &a, const map_type &b, Resolve &&resolve)
-      -> map_type {
-    return map_type::merge(a, b, std::forward<Resolve>(resolve));
+  static auto merge(map_type a, map_type b, Resolve &&resolve) -> map_type {
+    return map_type::merge(std::move(a), std::move(b),
+                           std::forward<Resolve>(resolve));
   }
 };
 
@@ -303,6 +303,28 @@ template <typename A> void BM_TransientInsertBatch(benchmark::State &state) {
     benchmark::DoNotOptimize(std::move(tr).persistent());
   }
   state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(kBatch));
+}
+
+template <typename A> void BM_TransientInsertBatch(benchmark::State &state) {
+  constexpr std::size_t kBatch = 100;
+  auto n = static_cast<std::size_t>(state.range(0));
+  auto keys = A::make_keys(generate_uniform_keys(n));
+  auto base = A::transient_build(keys);
+  std::size_t next = n;
+  std::vector<std::string> batch(kBatch);
+  for (auto _ : state) {
+    state.PauseTiming();
+    for (auto &k : batch)
+      k = "key_" + std::to_string(next++);
+    state.ResumeTiming();
+    auto tr = base.transient();
+    for (std::size_t i = 0; i < kBatch; ++i) {
+      benchmark::DoNotOptimize(A::transient_get(tr, batch[i]));
+      tr.set(to_bytes(batch[i]), bytecask::KeyDirEntry::make(i, 0, 0, 0));
+    }
+    benchmark::DoNotOptimize(std::move(tr).persistent());
+  }
+  state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations() * kBatch));
 }
 
 template <typename A> void BM_Get(benchmark::State &state) {
@@ -451,18 +473,27 @@ template <typename A> void BM_PrefixedMemory(benchmark::State &state) {
 
 // Merge-only: two disjoint N/2-key trees (zero overlap).
 // Measures the cost of structural merge when all subtrees are adopted by
-// pointer (best case — no conflict resolution).
+// pointer (best case — no conflict resolution). merge consumes its inputs,
+// so the merge-only benchmarks rebuild them each iteration, and free the
+// previous result, with the timer paused; what is timed is the merge and
+// the freeing of the input nodes it does not reuse.
 template <typename A> void BM_MergeDisjoint(benchmark::State &state) {
   auto n = static_cast<std::size_t>(state.range(0));
   auto all = generate_uniform_keys(n);
   std::vector<std::string> ka(all.begin(), all.begin() + std::ssize(all) / 2);
   std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
-  auto ta = A::transient_build(ka);
-  auto tb = A::transient_build(kb);
   auto resolve = [](const bytecask::KeyDirEntry &,
                     const bytecask::KeyDirEntry &b) { return b; };
-  for (auto _ : state)
-    benchmark::DoNotOptimize(A::merge(ta, tb, resolve));
+  typename A::map_type merged;
+  for (auto _ : state) {
+    state.PauseTiming();
+    merged = {}; // free the previous result off the clock
+    auto ta = A::transient_build(ka);
+    auto tb = A::transient_build(kb);
+    state.ResumeTiming();
+    merged = A::merge(std::move(ta), std::move(tb), resolve);
+    benchmark::DoNotOptimize(merged);
+  }
 }
 
 // Merge-only: two N/2-key trees with ~50% key overlap (worst realistic case).
@@ -473,12 +504,18 @@ template <typename A> void BM_MergeOverlapping(benchmark::State &state) {
   auto quarter = std::ssize(all) / 4;
   std::vector<std::string> ka(all.begin(), all.begin() + quarter * 3);
   std::vector<std::string> kb(all.begin() + quarter, all.end());
-  auto ta = A::transient_build(ka);
-  auto tb = A::transient_build(kb);
   auto resolve = [](const bytecask::KeyDirEntry &,
                     const bytecask::KeyDirEntry &b) { return b; };
-  for (auto _ : state)
-    benchmark::DoNotOptimize(A::merge(ta, tb, resolve));
+  typename A::map_type merged;
+  for (auto _ : state) {
+    state.PauseTiming();
+    merged = {}; // free the previous result off the clock
+    auto ta = A::transient_build(ka);
+    auto tb = A::transient_build(kb);
+    state.ResumeTiming();
+    merged = A::merge(std::move(ta), std::move(tb), resolve);
+    benchmark::DoNotOptimize(merged);
+  }
 }
 
 // Merge-only on binary keys — same ~50% overlap as BM_MergeOverlapping, but
@@ -491,12 +528,18 @@ template <typename A> void BM_MergeOverlappingBinary(benchmark::State &state) {
   auto quarter = std::ssize(all) / 4;
   std::vector<std::string> ka(all.begin(), all.begin() + quarter * 3);
   std::vector<std::string> kb(all.begin() + quarter, all.end());
-  auto ta = A::transient_build(ka);
-  auto tb = A::transient_build(kb);
   auto resolve = [](const bytecask::KeyDirEntry &,
                     const bytecask::KeyDirEntry &b) { return b; };
-  for (auto _ : state)
-    benchmark::DoNotOptimize(A::merge(ta, tb, resolve));
+  typename A::map_type merged;
+  for (auto _ : state) {
+    state.PauseTiming();
+    merged = {}; // free the previous result off the clock
+    auto ta = A::transient_build(ka);
+    auto tb = A::transient_build(kb);
+    state.ResumeTiming();
+    merged = A::merge(std::move(ta), std::move(tb), resolve);
+    benchmark::DoNotOptimize(merged);
+  }
 }
 
 // Full parallel-recovery simulation (measured sequentially):
@@ -514,7 +557,7 @@ template <typename A> void BM_SplitBuildMerge(benchmark::State &state) {
   for (auto _ : state) {
     auto ta = A::transient_build(ka);
     auto tb = A::transient_build(kb);
-    benchmark::DoNotOptimize(A::merge(ta, tb, resolve));
+    benchmark::DoNotOptimize(A::merge(std::move(ta), std::move(tb), resolve));
   }
 }
 
@@ -534,7 +577,7 @@ template <typename A> void BM_SplitBuildMergeOverlapping(benchmark::State &state
   for (auto _ : state) {
     auto ta = A::transient_build(ka);
     auto tb = A::transient_build(kb);
-    benchmark::DoNotOptimize(A::merge(ta, tb, resolve));
+    benchmark::DoNotOptimize(A::merge(std::move(ta), std::move(tb), resolve));
   }
 }
 
@@ -549,7 +592,7 @@ template <typename A> void BM_SplitBuildMergePrefixed(benchmark::State &state) {
   for (auto _ : state) {
     auto ta = A::transient_build(ka);
     auto tb = A::transient_build(kb);
-    benchmark::DoNotOptimize(A::merge(ta, tb, resolve));
+    benchmark::DoNotOptimize(A::merge(std::move(ta), std::move(tb), resolve));
   }
 }
 

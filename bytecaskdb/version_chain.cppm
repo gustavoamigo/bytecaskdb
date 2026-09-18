@@ -49,7 +49,7 @@ export inline auto new_version_tag() noexcept -> std::uint64_t {
 // children are never newer than the node itself: a session links new
 // children only into nodes it owns. Iterative — no recursion on tree depth.
 export template <typename Traits, typename Pred>
-void free_subtree_if(typename Traits::Node *root, Pred is_garbage) {
+void free_node_subtree_if(typename Traits::Node *root, Pred is_garbage) {
   using Node = typename Traits::Node;
   if (!root || !is_garbage(root))
     return;
@@ -67,7 +67,7 @@ void free_subtree_if(typename Traits::Node *root, Pred is_garbage) {
 }
 
 // ---------------------------------------------------------------------------
-// VersionChain<Traits> — owns node lifetime for every persistent tree of one
+// NodeVersionChain<Traits> — owns node lifetime for every persistent tree of one
 // value type.
 //
 // A persistent tree is a *version*, identified by the tag of the session
@@ -128,17 +128,17 @@ void free_subtree_if(typename Traits::Node *root, Pred is_garbage) {
 // publishes one per batch. The buffers are handed back when the last
 // version of this value type goes.
 // ---------------------------------------------------------------------------
-export template <typename Traits> class VersionChain {
+export template <typename Traits> class NodeVersionChain {
 public:
   using Node = typename Traits::Node;
 
-  static auto instance() -> VersionChain & {
+  static auto instance() -> NodeVersionChain & {
     // Immortal: a tree can outlive static destruction, so the chain is
     // constructed once in static storage and never destroyed. Static
     // storage rather than the heap, so a leak checker sees nothing left
     // behind at exit.
-    alignas(VersionChain) static std::byte storage[sizeof(VersionChain)];
-    static auto *chain = new (storage) VersionChain();
+    alignas(NodeVersionChain) static std::byte storage[sizeof(NodeVersionChain)];
+    static auto *chain = new (storage) NodeVersionChain();
     return *chain;
   }
 
@@ -157,7 +157,7 @@ public:
         auto *b = find(base);
         if (b->successor != 0)
           throw std::logic_error{
-              "VersionChain: a version that already has a successor cannot "
+              "NodeVersionChain: a version that already has a successor cannot "
               "be derived from again"};
         b->successor = tag;
         lineage = b->lineage;
@@ -311,13 +311,13 @@ private:
     const auto *rec = find(tag);
     if (rec->live != 1)
       throw std::logic_error{
-          "VersionChain::merge: an input is held by another handle"};
+          "NodeVersionChain::merge: an input is held by another handle"};
     if (rec->successor != 0)
-      throw std::logic_error{"VersionChain::merge: an input has a successor"};
+      throw std::logic_error{"NodeVersionChain::merge: an input has a successor"};
     for (const auto &r : records_) {
       if (r.lineage == rec->lineage && r.tag != tag)
         throw std::logic_error{
-            "VersionChain::merge: an input has a live predecessor"};
+            "NodeVersionChain::merge: an input has a live predecessor"};
     }
     // Nothing can be parked on the only version of a lineage.
     assert(rec->parked.nodes.empty() && rec->more.empty());
@@ -343,7 +343,7 @@ private:
     // Under the lock: once this version leaves the chain another thread may
     // decide that what it reached is free while this walk is still stepping
     // through those nodes to reach the ones below them.
-    free_subtree_if<Traits>(root, [floor](Node *n) {
+    free_node_subtree_if<Traits>(root, [floor](Node *n) {
       return Traits::tag(n) > floor;
     });
     // What the segment retired is parked on versions of this lineage at or

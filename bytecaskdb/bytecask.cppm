@@ -3139,11 +3139,11 @@ void DB::resume() {
   auto current = load_state_for_write();
   if (!current->degraded) return;  // re-check under lock
 
-  // A failed flush left one or two heads derived from the published state
-  // alive in head_. The key directory derives a version only from the end
-  // of its chain, so drop them now rather than at the end of the barrier,
-  // and the resumed state derives from the published one with those heads
-  // already reclaimed.
+  // The failed flush left one or two heads derived from the published
+  // state alive in head_. The key directory derives a version only from
+  // the end of its chain, so drop them now — ~FlushRole would only do it at
+  // the end of the barrier — and the resumed state is derived from the
+  // published one with those heads already reclaimed.
   store_head(current);
 
   auto t = current->transient();
@@ -3663,8 +3663,9 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
     return kde_newer(x, y) ? x : y;
   };
 
-  auto merged =
-      KeyDirTree::merge(a.key_dir, b.key_dir, seq_resolver);
+  // merge consumes both inputs; a and b are ours, moved in by the caller.
+  auto merged = KeyDirTree::merge(std::move(a.key_dir), std::move(b.key_dir),
+                                  seq_resolver);
 
   for (const auto &[key, tomb_seq] : b.tombstones) {
     std::span<const std::byte> key_span{key.begin(), key.size()};
@@ -4394,10 +4395,9 @@ void DB::ingest(std::span<const DataEntryView> entries) {
         file.sync();
         t.apply_sync(chunk_max_seq);
       } catch (...) {
-        auto err_t = current->transient();
-        err_t.apply_degrade(
+        auto err_s = current->degraded_copy(
             "ingest rotation fdatasync failed: call resume() to recover.");
-        store_state(std::move(err_t).persistent());
+        store_state(std::move(err_s));
         throw;
       }
       try {
@@ -4420,10 +4420,9 @@ void DB::ingest(std::span<const DataEntryView> entries) {
       t.active_file().sync();
       t.apply_sync(t.next_seq() - 1);
     } catch (...) {
-      auto err_t = current->transient();
-      err_t.apply_degrade(
+      auto err_s = current->degraded_copy(
           "ingest rotation fdatasync failed: call resume() to recover.");
-      store_state(std::move(err_t).persistent());
+      store_state(std::move(err_s));
       throw;
     }
     try {
@@ -4441,10 +4440,9 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     t.active_file().sync();
     t.apply_sync(t.next_seq() - 1);
   } catch (...) {
-    auto err_t = current->transient();
-    err_t.apply_degrade(
+    auto err_s = current->degraded_copy(
         "ingest fdatasync failed: call resume() to recover.");
-    store_state(std::move(err_t).persistent());
+    store_state(std::move(err_s));
     throw;
   }
 
