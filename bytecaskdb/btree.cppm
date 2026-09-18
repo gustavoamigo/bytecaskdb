@@ -463,6 +463,8 @@ template <typename V> struct Node {
   }
 };
 
+template <typename V> class BulkLoader;
+
 template <typename V> struct ChainTraits {
   using Node = btree_detail::Node<V>;
   static auto tag(const Node *n) noexcept -> std::uint64_t { return n->tag; }
@@ -502,6 +504,7 @@ auto find_ptr(const Node<V> *cur, Bytes key) noexcept -> const V * {
 template <typename V> class BuildSession {
 public:
   using N = Node<V>;
+  friend class BulkLoader<V>;
 
   struct Result {
     N *node{nullptr};  // the subtree root, or null if it emptied
@@ -942,6 +945,210 @@ private:
     }
     return {n, nullptr, true, false};
   }
+};
+
+
+// ---------------------------------------------------------------------------
+// BulkLoader<V> — builds a tree from entries appended in ascending key order.
+//
+// Leaves are filled to capacity and sealed, then the inner levels are built
+// bottom-up from the sealed children, so there is no descent, no split and no
+// path copy: each key is written exactly once. This is what a merge or a
+// recovery rebuild should use; `set()` in a loop pays a full descent per key
+// and splits a leaf every fanout inserts.
+//
+// The result starts its own lineage in the version chain. Keys must arrive
+// strictly ascending; the caller owns that (an ordered merge does).
+// ---------------------------------------------------------------------------
+template <typename V> class BulkLoader {
+public:
+  using N = Node<V>;
+
+  BulkLoader() = default;
+  BulkLoader(const BulkLoader &) = delete;
+  auto operator=(const BulkLoader &) -> BulkLoader & = delete;
+
+  void append(Bytes key, const V &value) {
+    if (key.size() > kBTreeMaxKeyBytes)
+      throw std::length_error{"BulkLoader: key exceeds 65535 bytes"};
+    // Sealing the current leaf first keeps the size estimate exact.
+    if (!leaf_lens_.empty() && !fits(key)) {
+      seal_leaf();
+    }
+    admit(key);
+    leaf_vals_.push_back(value);
+    ++size_;
+  }
+
+  [[nodiscard]] auto size() const noexcept -> std::size_t { return size_; }
+
+  [[nodiscard]] auto finish() && -> PersistentBTree<V> {
+    seal_leaf();
+    if (levels_.empty())
+      return {};
+    std::size_t lvl = 0;
+    while (levels_[lvl].children.size() > 1) {
+      build_parent(lvl);
+      ++lvl;
+    }
+    auto *root = levels_[lvl].children.front();
+    PersistentBTree<V>::chain().publish(session_.tag(), 0,
+                                        session_.retired_list());
+    const auto version = session_.tag();
+    session_.finish();
+    return PersistentBTree<V>{root, size_, version};
+  }
+
+private:
+  // One built level: the children produced for it, and the separator that
+  // sits between each child and the one before it (so seps[i] separates
+  // children[i] from children[i + 1], and there are children.size() - 1).
+  struct Level {
+    std::vector<N *> children;
+    std::vector<std::vector<std::byte>> seps;
+  };
+
+  BuildSession<V> session_;
+  // The leaf being filled: key bytes packed into one arena, plus the values.
+  std::vector<std::byte> leaf_arena_;
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> leaf_spans_;
+  std::vector<std::uint32_t> leaf_lens_;
+  std::vector<V> leaf_vals_;
+  std::size_t leaf_prefix_{0};
+  std::size_t leaf_heap_{0};
+  std::vector<std::byte> prev_last_;  // last key of the previous leaf
+  std::vector<std::byte> pending_sep_; // separator before the leaf being filled
+  std::vector<Level> levels_;
+  std::size_t size_{0};
+
+  [[nodiscard]] auto key_at(std::size_t i) const noexcept -> Bytes {
+    return {leaf_arena_.data() + leaf_spans_[i].first, leaf_spans_[i].second};
+  }
+
+  // Would `key` still fit in the leaf being filled? A shorter shared prefix
+  // grows every entry, so the heap is recomputed when the prefix moves.
+  [[nodiscard]] auto fits(Bytes key) -> bool {
+    const auto p = std::min<std::size_t>(
+        leaf_prefix_, common_prefix_length(key_at(0), key));
+    auto heap = leaf_heap_;
+    if (p != leaf_prefix_) {
+      heap = 0;
+      for (auto len : leaf_lens_)
+        heap += N::entry_size(true, len - p);
+    }
+    heap += N::entry_size(true, key.size() - p);
+    const auto total = N::slots_offset_for(p) +
+                       (leaf_lens_.size() + 1) * N::kSlotBytes + heap;
+    if (total > N::node_bytes(true))
+      return false;
+    leaf_prefix_ = p;
+    leaf_heap_ = heap - N::entry_size(true, key.size() - p);
+    return true;
+  }
+
+  void admit(Bytes key) {
+    if (leaf_lens_.empty()) {
+      leaf_prefix_ = key.size();
+      if (!prev_last_.empty() || !levels_.empty())
+        pending_sep_ = separator(Bytes{prev_last_}, key);
+    }
+    const auto off = static_cast<std::uint32_t>(leaf_arena_.size());
+    leaf_arena_.insert(leaf_arena_.end(), key.begin(), key.end());
+    leaf_spans_.emplace_back(off, static_cast<std::uint32_t>(key.size()));
+    leaf_lens_.push_back(static_cast<std::uint32_t>(key.size()));
+    leaf_heap_ += N::entry_size(true, key.size() - leaf_prefix_);
+  }
+
+  void seal_leaf() {
+    if (leaf_lens_.empty())
+      return;
+    auto item = [this](std::uint32_t i) {
+      return typename BuildSession<V>::Item{
+          KeyParts{key_at(i), {}},
+          BuildSession<V>::payload_bytes_of(leaf_vals_[i])};
+    };
+    auto *leaf = session_.pack(
+        true, static_cast<std::uint32_t>(leaf_lens_.size()), item, leaf_prefix_);
+    const auto last = key_at(leaf_lens_.size() - 1);
+    std::vector<std::byte> last_copy{last.begin(), last.end()};
+    add_child(0, leaf, pending_sep_);
+    prev_last_ = std::move(last_copy);
+    leaf_arena_.clear();
+    leaf_spans_.clear();
+    leaf_lens_.clear();
+    leaf_vals_.clear();
+    leaf_prefix_ = 0;
+    leaf_heap_ = 0;
+    pending_sep_.clear();
+  }
+
+  void add_child(std::size_t lvl, N *child, const std::vector<std::byte> &sep) {
+    if (levels_.size() <= lvl)
+      levels_.emplace_back();
+    auto &L = levels_[lvl];
+    if (!L.children.empty())
+      L.seps.push_back(sep);
+    L.children.push_back(child);
+  }
+
+  // The shortest key that sorts above `prev` and at or below `next`.
+  [[nodiscard]] static auto separator(Bytes prev, Bytes next)
+      -> std::vector<std::byte> {
+    const auto cut = std::min(common_prefix_length(prev, next) + 1, next.size());
+    return {next.begin(), next.begin() + static_cast<std::ptrdiff_t>(cut)};
+  }
+
+  // Packs level `lvl`'s children into inner nodes one level up. Each inner
+  // node takes a child as first_child, then (separator, child) entries until
+  // full; the separator that would have started the next node is pushed up.
+  void build_parent(std::size_t lvl) {
+    auto src = std::move(levels_[lvl]);
+    if (levels_.size() <= lvl + 1)
+      levels_.emplace_back();
+    std::size_t i = 0;
+    while (i < src.children.size()) {
+      const auto up_sep = i == 0 ? std::vector<std::byte>{} : src.seps[i - 1];
+      auto *first = src.children[i];
+      std::vector<Bytes> keys;
+      std::vector<N *> kids;
+      std::size_t prefix = 0;
+      std::size_t heap = 0;
+      std::size_t j = i + 1;
+      for (; j < src.children.size(); ++j) {
+        const Bytes sep{src.seps[j - 1]};
+        const auto p = keys.empty()
+                           ? sep.size()
+                           : std::min(prefix, common_prefix_length(keys[0], sep));
+        auto h = heap;
+        if (p != prefix) {
+          h = 0;
+          for (auto k : keys)
+            h += N::entry_size(false, k.size() - p);
+        }
+        h += N::entry_size(false, sep.size() - p);
+        const auto total =
+            N::slots_offset_for(p) + (keys.size() + 1) * N::kSlotBytes + h;
+        if (!keys.empty() && total > N::node_bytes(false))
+          break;
+        prefix = p;
+        heap = h;
+        keys.push_back(sep);
+        kids.push_back(src.children[j]);
+      }
+      auto item = [&](std::uint32_t k) {
+        return typename BuildSession<V>::Item{
+            KeyParts{keys[k], {}}, BuildSession<V>::payload_bytes_of(kids[k])};
+      };
+      auto *inner = session_.pack(
+          false, static_cast<std::uint32_t>(keys.size()), item, prefix);
+      inner->first_child = first;
+      add_child(lvl + 1, inner, up_sep);
+      i = j;
+    }
+    levels_[lvl] = Level{};
+  }
+
+  friend class PersistentBTree<V>;
 };
 
 } // namespace btree_detail
@@ -1399,6 +1606,8 @@ private:
   PersistentBTree(N *root, std::size_t size, std::uint64_t version) noexcept
       : root_{root}, size_{size}, version_{version} {}
 
+  friend class btree_detail::BulkLoader<V>;
+
   static auto chain() -> Chain & { return Chain::instance(); }
 
   void release() noexcept {
@@ -1642,38 +1851,37 @@ template <typename ResolveFunc>
 auto PersistentBTree<V>::merge(const PersistentBTree &a,
                                const PersistentBTree &b,
                                ResolveFunc &&resolve) -> PersistentBTree {
-  auto t = PersistentBTree{}.transient();
+  // Ordered merge into a bulk loader: each key is written once, with no
+  // descent and no split. Rebuilding with set() in a loop costs a full
+  // descent per key and was the whole cost of recovery's fan-in.
+  btree_detail::BulkLoader<V> out;
   auto ia = a.begin();
   auto ib = b.begin();
-  while (ia != std::default_sentinel || ib != std::default_sentinel) {
-    if (ib == std::default_sentinel) {
-      auto [k, v] = *ia;
-      t.set(k, v);
-      ++ia;
-      continue;
-    }
-    if (ia == std::default_sentinel) {
-      auto [k, v] = *ib;
-      t.set(k, v);
-      ++ib;
-      continue;
-    }
+  while (ia != std::default_sentinel && ib != std::default_sentinel) {
     auto [ka, va] = *ia;
     auto [kb, vb] = *ib;
     const auto c = btree_detail::compare_bytes(ka, kb);
     if (c < 0) {
-      t.set(ka, va);
+      out.append(ka, va);
       ++ia;
     } else if (c > 0) {
-      t.set(kb, vb);
+      out.append(kb, vb);
       ++ib;
     } else {
-      t.set(ka, resolve(va, vb));
+      out.append(ka, resolve(va, vb));
       ++ia;
       ++ib;
     }
   }
-  return std::move(t).persistent();
+  for (; ia != std::default_sentinel; ++ia) {
+    auto [k, v] = *ia;
+    out.append(k, v);
+  }
+  for (; ib != std::default_sentinel; ++ib) {
+    auto [k, v] = *ib;
+    out.append(k, v);
+  }
+  return std::move(out).finish();
 }
 
 } // namespace bytecask
