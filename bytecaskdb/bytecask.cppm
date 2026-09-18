@@ -230,7 +230,7 @@ public:
 
   KeyIterator() = default;
 
-  explicit KeyIterator(RadixTreeIterator<KeyDirEntry> cur)
+  explicit KeyIterator(KeyDirIter cur)
       : cur_{std::move(cur)} {
     cache_key();
   }
@@ -277,7 +277,7 @@ private:
     }
   }
 
-  RadixTreeIterator<KeyDirEntry> cur_;
+  KeyDirIter cur_;
   Key cached_key_;
 };
 
@@ -297,7 +297,7 @@ public:
   EntryIterator() = default;
 
   EntryIterator(std::shared_ptr<const EngineState> state,
-                ValueIterator<KeyDirEntry> cur,
+                KeyDirValueIter cur,
                 bool verify_checksums = true)
       : state_{std::move(state)}, cur_{std::move(cur)},
         verify_checksums_{verify_checksums} {}
@@ -333,7 +333,7 @@ public:
 
 private:
   std::shared_ptr<const EngineState> state_;
-  ValueIterator<KeyDirEntry> cur_;
+  KeyDirValueIter cur_;
   bool verify_checksums_{true};
   mutable DataEntryView raw_cached_;
   mutable EntryView cached_;
@@ -406,7 +406,7 @@ public:
   ReverseEntryIterator() = default;
 
   ReverseEntryIterator(std::shared_ptr<const EngineState> state,
-                       ReverseValueIterator<KeyDirEntry> cur,
+                       KeyDirReverseValueIter cur,
                        bool verify_checksums = true)
       : state_{std::move(state)}, cur_{std::move(cur)},
         verify_checksums_{verify_checksums} {}
@@ -442,7 +442,7 @@ public:
 
 private:
   std::shared_ptr<const EngineState> state_;
-  ReverseValueIterator<KeyDirEntry> cur_;
+  KeyDirReverseValueIter cur_;
   bool verify_checksums_{true};
   mutable DataEntryView raw_cached_;
   mutable EntryView cached_;
@@ -505,7 +505,7 @@ export class WritePlan;
 // and sequencing but never touches key_dir, file_stats, or sequence directly.
 //
 // Follows the same transient/persistent discipline as
-// TransientRadixTree/PersistentRadixTree: mutations are batched on a
+// the key directory tree: mutations are batched on a
 // mutable copy, then committed back to an immutable shared_ptr<EngineState>
 // via persistent().
 // ---------------------------------------------------------------------------
@@ -619,7 +619,7 @@ public:
 private:
   friend class DB;
   friend struct EngineState;
-  TransientEngineState(TransientRadixTree<KeyDirEntry> key_dir,
+  TransientEngineState(KeyDirTransient key_dir,
                        TransientU32Map<std::shared_ptr<DataFile>> files,
                        TransientU32Map<FileStats> file_stats,
                        std::uint32_t active_file_id,
@@ -631,7 +631,7 @@ private:
                        bool degraded,
                        std::string degraded_reason);
 
-  TransientRadixTree<KeyDirEntry> key_dir_;
+  KeyDirTransient key_dir_;
   TransientU32Map<std::shared_ptr<DataFile>> files_;
   TransientU32Map<FileStats> file_stats_;
   std::uint32_t active_file_id_;
@@ -1481,7 +1481,7 @@ auto now_ns() -> std::int64_t {
 #pragma region TransientEngineState
 
 TransientEngineState::TransientEngineState(
-    TransientRadixTree<KeyDirEntry> key_dir,
+    KeyDirTransient key_dir,
     TransientU32Map<std::shared_ptr<DataFile>> files,
     TransientU32Map<FileStats> file_stats,
     std::uint32_t active_file_id, std::uint32_t next_file_id,
@@ -3534,7 +3534,7 @@ auto DB::recovery_prepare_files(EngineState &s)
 auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
     -> RecoveryResult {
   std::uint64_t max_seq = 0;
-  auto t = PersistentRadixTree<KeyDirEntry>{}.transient();
+  auto t = KeyDirTree{}.transient();
   std::map<Key, std::uint64_t> tombstones;
   std::vector<RangeTombstone> range_tombstones;
 
@@ -3650,7 +3650,7 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
   };
 
   auto merged =
-      PersistentRadixTree<KeyDirEntry>::merge(a.key_dir, b.key_dir, seq_resolver);
+      KeyDirTree::merge(a.key_dir, b.key_dir, seq_resolver);
 
   for (const auto &[key, tomb_seq] : b.tombstones) {
     std::span<const std::byte> key_span{key.begin(), key.size()};
@@ -3676,7 +3676,7 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 
   // Cross-apply range tombstones from both sides.
   auto cross_apply_range_tombs =
-      [](PersistentRadixTree<KeyDirEntry> &tree,
+      [](KeyDirTree &tree,
          const std::vector<RangeTombstone> &rts) {
         for (const auto &rt : rts) {
           std::vector<Key> to_erase;

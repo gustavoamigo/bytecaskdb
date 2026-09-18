@@ -101,6 +101,13 @@ end
 -- LTO and target CPU applied per-target to avoid polluting dependency package builds.
 -- Set BYTECASK_MARCH to override (e.g. "x86-64-v3" for portable wheels).
 -- Defaults to "native" for local development.
+-- Key directory tree selection: BYTECASK_KEYDIR=btree builds the engine on
+-- the persistent B+ tree instead of the radix tree. Applies to every target
+-- so tests and benchmarks agree.
+if os.getenv("BYTECASK_KEYDIR") == "btree" then
+    add_defines("BYTECASK_USE_BTREE")
+end
+
 local march = os.getenv("BYTECASK_MARCH") or "native"
 local function add_release_opts(t)
     if is_mode("release") then
