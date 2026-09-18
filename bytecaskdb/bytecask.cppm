@@ -12,6 +12,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <exception>
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
@@ -3541,6 +3542,28 @@ auto DB::recovery_prepare_files(EngineState &s)
   return files;
 }
 
+
+// BC_RECOVERY_PHASES=1 prints how long each recovery phase took, so the two
+// key directories can be compared phase by phase rather than in total.
+namespace {
+struct RecoveryPhaseLog {
+  bool on{};
+  std::chrono::steady_clock::time_point last{};
+  explicit RecoveryPhaseLog() {
+    const char *e = std::getenv("BC_RECOVERY_PHASES");
+    on = e && *e == '1';
+    last = std::chrono::steady_clock::now();
+  }
+  void mark(const char *name) {
+    if (!on) return;
+    const auto now = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "  phase %-22s %7.1f ms\n", name,
+                 std::chrono::duration<double, std::milli>(now - last).count());
+    last = now;
+  }
+};
+} // namespace
+
 // Builds a RecoveryResult from a subset of hint files.
 // Each worker calls this independently — no shared mutable state.
 // When strict is false, corrupt or unreadable hint files are skipped
@@ -3728,7 +3751,9 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 // then results are merged one-at-a-time into an accumulator as workers finish.
 auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
                                 bool strict) -> EngineState {
+  RecoveryPhaseLog plog;
   auto files = recovery_prepare_files(s);
+  plog.mark("prepare_files");
 
   if (files.empty()) {
     return s;
@@ -3835,6 +3860,7 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
 #endif
 
   auto &final_result = queue[0];
+  plog.mark("build + fan-in merge");
 
   // Phase 4: recompute live_bytes once from the fully-merged tree.
   // Accumulate into a hash map (O(1) in-place), then apply to PersistentU32Map
@@ -3853,6 +3879,7 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
     fstats_t.update(fid, [live](FileStats &fs) { fs.live_bytes = live; });
   }
   final_result.file_stats = std::move(fstats_t).persistent();
+  plog.mark("live_bytes pass");
 
   // Phase 5: assembly.
   s.key_dir = std::move(final_result.key_dir);
@@ -3907,7 +3934,9 @@ static auto recovery_span_of(const Key &k) noexcept
 // ---------------------------------------------------------------------------
 auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
                               bool strict) -> EngineState {
+  RecoveryPhaseLog plog;
   auto files = recovery_prepare_files(s);
+  plog.mark("prepare_files");
   if (files.empty()) {
     return s;
   }
@@ -3957,6 +3986,7 @@ auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
       // lenient: warning already emitted inside recovery_build_from_hints
     }
   }
+  plog.mark("build_from_hints");
 
   // Phase 3: union the parts' metadata, and pool their separators into R
   // splitters. Both are O(W × files) or O(W × R) — nothing here touches a key.
@@ -4001,6 +4031,7 @@ auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
                     splitters.end());
   }
   const auto ranges = static_cast<unsigned>(splitters.size()) + 1;
+  plog.mark("union + splitters");
 
   // Phase 4: one thread per range. Each merges that slice of every part,
   // resolves by sequence, applies the pooled tombstones, and bulk-loads the
@@ -4122,6 +4153,8 @@ auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
     outs[r].run = std::move(out).seal();
   });
 
+  plog.mark("range merge");
+
   // Phase 5: concatenate the range-disjoint slices and fold in live_bytes.
   std::vector<KeyDirLeafRun> runs;
   runs.reserve(outs.size());
@@ -4131,6 +4164,7 @@ auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
     runs.push_back(std::move(o.run));
   }
   auto key_dir = KeyDirBulkLoader::concat(std::move(runs));
+  plog.mark("concat");
 
   auto fstats_t = PersistentU32Map<FileStats>{}.transient();
   for (auto &[fid, fs] : fstats) {
