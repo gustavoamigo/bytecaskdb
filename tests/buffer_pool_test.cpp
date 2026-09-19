@@ -43,11 +43,9 @@ public:
     REQUIRE(std::fclose(f) == 0);
     fd_ = ::open(path_.c_str(), O_RDONLY);
     REQUIRE(fd_ != -1);
-    // -1 where the filesystem refuses O_DIRECT; the pool then fills buffered,
-    // which is the same fallback a real sealed file takes.
-#ifdef O_DIRECT
-    direct_fd_ = ::open(path_.c_str(), O_RDONLY | O_DIRECT);
-#endif
+    // -1 where the platform or the filesystem will not serve uncached reads;
+    // the pool then fills buffered, the same fallback a real sealed file takes.
+    direct_fd_ = bytecask::open_uncached(path_, size);
   }
 
   ~ScratchFile() {

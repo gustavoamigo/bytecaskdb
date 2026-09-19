@@ -25,6 +25,8 @@ module;
 #include <vector>
 
 #include <cerrno>
+#include <fcntl.h>
+#include <filesystem>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -61,6 +63,53 @@ export struct PoolFile {
   int buffered{-1};
   int direct{-1};
 };
+
+// Opens path read-only on a descriptor whose reads bypass the page cache, so
+// the pool is the only consumer of memory for this file's data. Returns -1
+// where the platform or the filesystem will not serve one; the caller counts
+// the fallback and fills through an ordinary descriptor instead.
+//
+// This is the codebase's only place that names a platform's uncached-read
+// mechanism. Everything else — the engine, the pool, the tests — asks here and
+// branches on the -1.
+//
+// The descriptor is proved with one aligned read before it is handed back:
+// some filesystems accept the flag at open and fail at read, so the open alone
+// proves nothing.
+export [[nodiscard]] inline auto open_uncached(
+    const std::filesystem::path &path, std::size_t file_size) -> int {
+#if defined(O_DIRECT)
+  auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+  if (fd == -1) return -1;
+#elif defined(F_NOCACHE)
+  // macOS: no O_DIRECT. F_NOCACHE is the analogue the design names — reads
+  // bypass the buffer cache, with no alignment requirement, so the aligned
+  // fills below are simply valid reads.
+  auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd == -1) return -1;
+  if (::fcntl(fd, F_NOCACHE, 1) == -1) {
+    ::close(fd);
+    return -1;
+  }
+#else
+  (void)path;
+  (void)file_size;
+  return -1;  // no uncached read on this platform: every file falls back
+#endif
+  if (file_size == 0) return fd;  // nothing to probe, nothing to fill
+  void *probe = std::aligned_alloc(kPoolFrameBytes, kPoolFrameBytes);
+  if (probe == nullptr) {
+    ::close(fd);
+    return -1;
+  }
+  const auto n = ::pread(fd, probe, kPoolFrameBytes, 0);
+  std::free(probe);
+  if (n <= 0) {
+    ::close(fd);
+    return -1;
+  }
+  return fd;
+}
 
 // ---------------------------------------------------------------------------
 // BufferPool — fixed-size frame cache keyed by (file_id, frame_index).

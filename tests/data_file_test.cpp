@@ -39,6 +39,8 @@
 import bytecask.data_file;
 import bytecask.data_entry;
 import bytecask.types;
+import bytecask.buffer_pool;
+import bytecask.counters;
 
 namespace {
 
@@ -317,8 +319,8 @@ auto count_extents(const std::filesystem::path &path)
 TEST_CASE("WritableDataFile: fresh file has no unwritten extents",
           "[data_file]") {
   // BufferPool is included to pin the documented invariant that it changes
-  // nothing about the write path: the writable file it builds must behave
-  // exactly as Pread's.
+  // nothing about the write path: the writable file it builds is a distinct
+  // implementation, and it must zero-fill and seal exactly as Pread's does.
   const auto io_backend =
       GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap,
                bytecask::IoBackend::BufferPool);
@@ -328,9 +330,13 @@ TEST_CASE("WritableDataFile: fresh file has no unwritten extents",
   std::filesystem::remove(path);
 
   constexpr std::size_t kCapacity = 8 * 1024 * 1024;
+  // Required by the BufferPool back-end, ignored by the other two.
+  bytecask::Counters counters;
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = 4 * kCapacity}, counters};
   auto file = bytecask::createDataFileForWrite(
       std::filesystem::temp_directory_path(), "bc_test_zero_fill", ".data",
-      kCapacity, io_backend);
+      kCapacity, io_backend, &pool, /*file_id=*/1);
   CHECK(file->size() == 0);
   // Zero-filled one chunk ahead, not to capacity.
   CHECK(std::filesystem::file_size(path) == bytecask::kZeroFillChunkBytes);
