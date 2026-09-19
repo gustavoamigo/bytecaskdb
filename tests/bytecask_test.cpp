@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <concepts>
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
 #endif
@@ -18,6 +19,7 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <random>
@@ -278,6 +280,92 @@ TEST_CASE("DB iter_from returns entries in ascending order",
   CHECK(values[0] == "av");
   CHECK(values[1] == "bv");
   CHECK(values[2] == "cv");
+}
+
+// ---------------------------------------------------------------------------
+// Entry iterators are move-only: operator* caches spans into the iterator's
+// own io_buf_, so a copy would carry spans addressing the source's storage.
+// Deleting the copy makes that unrepresentable instead of merely documented.
+// See "View and span lifetimes" in CONTRACT.md.
+// ---------------------------------------------------------------------------
+TEST_CASE("entry iterators are move-only and still model input_iterator",
+          "[bytecask]") {
+  static_assert(!std::copyable<bytecask::EntryIterator>);
+  static_assert(!std::copyable<bytecask::ReverseEntryIterator>);
+  static_assert(std::movable<bytecask::EntryIterator>);
+  static_assert(std::movable<bytecask::ReverseEntryIterator>);
+  static_assert(std::input_iterator<bytecask::EntryIterator>);
+  static_assert(std::input_iterator<bytecask::ReverseEntryIterator>);
+
+  // Key iterators materialize an owning Key, so a copy owns its own bytes
+  // and stays copyable — ReverseIterator<KeyIterator> needs that.
+  static_assert(std::copyable<bytecask::KeyIterator>);
+  static_assert(std::copyable<bytecask::ReverseKeyIterator>);
+
+  // A moved-from iterator hands its buffer to the destination, so spans
+  // taken before the move keep addressing live memory.
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("av"));
+
+  bytecask::ReadOptions ro;
+  auto range = db.iter_from(ro);
+  auto it = range.begin();
+  const auto value = (*it).value;
+  auto moved = std::move(it);
+  CHECK(to_string(value) == "av");
+  CHECK(to_string((*moved).value) == "av");
+  CHECK(value.data() == (*moved).value.data());
+
+  // Move assignment carries the buffer too, so the span stays addressed at
+  // the same storage rather than at the moved-from iterator's.
+  bytecask::EntryIterator sink;
+  sink = std::move(moved);
+  CHECK(to_string((*sink).value) == "av");
+  CHECK(value.data() == (*sink).value.data());
+
+  auto rrange = db.riter_from(ro);
+  auto rit = rrange.begin();
+  const auto rvalue = (*rit).value;
+  bytecask::ReverseEntryIterator rsink;
+  rsink = std::move(rit);
+  CHECK(to_string((*rsink).value) == "av");
+  CHECK(rvalue.data() == (*rsink).value.data());
+}
+
+// ---------------------------------------------------------------------------
+// Invariant P: every published entry lies inside the committed extent of the
+// file it names. This is what lets resume() shorten the active file under
+// lock-free readers — see "View and span lifetimes" in CONTRACT.md. The check
+// only fires on a violation the engine cannot currently produce, so the seam
+// is exercised directly on a hand-built state.
+// ---------------------------------------------------------------------------
+TEST_CASE("state consistency rejects an entry outside its file's extent",
+          "[bytecask]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k0"), to_bytes("v0"));
+
+  auto good = *db.engine_state();
+  REQUIRE_NOTHROW(db.test_validate_state_consistency(good));
+
+  // Shrink the active file's committed extent below the entry that points
+  // into it — the shape a truncation past a published offset would leave.
+  auto bad = good;
+  {
+    auto t = bad.file_stats.transient();
+    t.update(bad.active_file_id,
+             [](bytecask::FileStats &fs) { fs.total_bytes = 1; });
+    bad.file_stats = std::move(t).persistent();
+  }
+  bool threw = false;
+  try {
+    db.test_validate_state_consistency(bad);
+  } catch (const std::runtime_error &e) {
+    threw = true;
+    CHECK(std::string{e.what()}.find("committed extent") != std::string::npos);
+  }
+  CHECK(threw);
 }
 
 // ---------------------------------------------------------------------------
@@ -2521,7 +2609,12 @@ TEST_CASE("vacuum loop reclaims all fragmentation", "[vacuum]") {
   db.put({}, to_bytes("y"), to_bytes("4")); // kills y=2
 
   // Run vacuum until nothing qualifies.
-  while (db.vacuum({.fragmentation_threshold = 0.0})) {}
+  {
+    int spins = 0;
+    while (db.vacuum({.fragmentation_threshold = 0.0})) {
+      REQUIRE(++spins < 200);  // vacuum must converge, not spin
+    }
+  }
 
   CHECK(to_string(*get_val(db, to_bytes("x"))) == "3");
   CHECK(to_string(*get_val(db, to_bytes("y"))) == "4");
@@ -2590,7 +2683,12 @@ TEST_CASE("vacuum compact handles batch entries", "[vacuum]") {
   (void)db.apply_batch({}, std::move(plan));
 
   // Vacuum — the file with the batch should be compacted.
-  while (db.vacuum({.fragmentation_threshold = 0.0})) {}
+  {
+    int spins = 0;
+    while (db.vacuum({.fragmentation_threshold = 0.0})) {
+      REQUIRE(++spins < 200);  // vacuum must converge, not spin
+    }
+  }
 
   // Both keys should have the batch values.
   auto va = get_val(db, to_bytes("a"));
@@ -2626,13 +2724,67 @@ TEST_CASE("vacuum compact handles batch with mixed put/del", "[vacuum]") {
   plan.del(to_bytes("gone"));
   (void)db.apply_batch({}, std::move(plan));
 
-  // Vacuum until stable (limit iterations to avoid infinite loop).
-  for (int i = 0; i < 10 && db.vacuum({.fragmentation_threshold = 0.0}); ++i) {}
+  // Vacuum until stable. Convergence is the assertion: the compacted file
+  // keeps a tombstone, which can never be live_bytes, so at threshold 0 it
+  // stays eligible forever unless vacuum declines a file it cannot shrink.
+  int spins = 0;
+  while (db.vacuum({.fragmentation_threshold = 0.0})) {
+    REQUIRE(++spins < 200);
+  }
 
   auto vk = get_val(db, to_bytes("keep"));
   REQUIRE(vk.has_value());
   CHECK(to_string(*vk) == "updated");
   CHECK_FALSE(db.contains_key({}, to_bytes("gone")));
+}
+
+// ---------------------------------------------------------------------------
+// A compacted file's total_bytes must equal its size on disk, because that is
+// what recovery seeds total_bytes from. Batch markers are preserved by
+// compaction, so their bytes have to be counted like every other entry's —
+// otherwise file_stats() reports one number before a restart and another
+// after, and published offsets fall outside the extent the engine believes
+// the file has.
+// ---------------------------------------------------------------------------
+TEST_CASE("vacuum keeps total_bytes equal to the compacted file's size",
+          "[vacuum][batch]") {
+  TempDir td;
+  auto db_path = td.path / "db";
+
+  auto stats_shape = [](const bytecask::DB &db) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> out;
+    for (const auto &[fid, fs] : db.file_stats()) {
+      if (fs.total_bytes > 0) out.emplace_back(fs.live_bytes, fs.total_bytes);
+    }
+    std::ranges::sort(out);
+    return out;
+  };
+
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> before;
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+    db.put({}, to_bytes("a"), to_bytes("old_a"));
+    db.put({}, to_bytes("b"), to_bytes("old_b"));
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("a"), to_bytes("new_a"));
+    plan.put(to_bytes("b"), to_bytes("new_b"));
+    (void)db.apply_batch({}, std::move(plan));
+
+    int spins = 0;
+    while (db.vacuum({.fragmentation_threshold = 0.0})) {
+      REQUIRE(++spins < 10);
+    }
+    before = stats_shape(db);
+  }
+
+  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+  // Recovery computes total_bytes from the file's actual size. If vacuum
+  // undercounted, these disagree by kHeaderSize + kCrcSize per marker.
+  CHECK(stats_shape(db) == before);
+
+  // And the file must not be re-compacted: there is nothing in it to reclaim.
+  CHECK_FALSE(db.vacuum({.fragmentation_threshold = 0.0}));
 }
 
 // ---------------------------------------------------------------------------
@@ -6878,7 +7030,12 @@ TEST_CASE("stats: vacuum counters", "[bytecask][stats]") {
     db.put({.sync = false}, to_bytes(key), to_bytes("updated"));
   }
   // Run vacuum until nothing qualifies.
-  while (db.vacuum({.fragmentation_threshold = 0.0})) {}
+  {
+    int spins = 0;
+    while (db.vacuum({.fragmentation_threshold = 0.0})) {
+      REQUIRE(++spins < 200);  // vacuum must converge, not spin
+    }
+  }
   auto s = db.stats();
   CHECK(s.at("bytecask.vacuum_files_unlinked") > 0);
   CHECK(s.at("bytecask.vacuum_bytes_reclaimed") > 0);
@@ -7465,7 +7622,12 @@ TEST_CASE("io_backend=Pread: vacuum reclaims space",
     auto key = std::format("k{:04d}", i);
     db.put({.sync = false}, to_bytes(key), to_bytes("updated"));
   }
-  while (db.vacuum({.fragmentation_threshold = 0.0})) {}
+  {
+    int spins = 0;
+    while (db.vacuum({.fragmentation_threshold = 0.0})) {
+      REQUIRE(++spins < 200);  // vacuum must converge, not spin
+    }
+  }
   bytecask::Bytes out;
   for (int i = 0; i < 30; ++i) {
     auto key = std::format("k{:04d}", i);
