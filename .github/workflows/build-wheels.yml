@@ -93,16 +93,30 @@ jobs:
           echo "/opt/python/${{ matrix.python }}/bin" >> $GITHUB_PATH
           pip install nanobind pytest hypothesis auditwheel
 
+      # `xmake f` clones/updates the xmake-repo package index (needed to
+      # resolve add_requires() packages like crc32c) from gitlab.com on
+      # first run. That clone has failed transiently in CI (SSL_ERROR_SYSCALL
+      # despite gitlab.com itself being reachable) even though the same
+      # config succeeded on the commit immediately before and after — retry
+      # it the same way the xmake installer download above is retried.
       - name: Configure xmake
         run: |
           export XMAKE_ROOT=y
           export RESOURCE_DIR=$(clang --print-resource-dir)
           source ~/.xmake/profile
-          xmake f --toolchain=llvm \
-            --sdk=/usr/lib64/llvm20 \
-            --cxflags="-resource-dir=${RESOURCE_DIR}" \
-            -m release \
-            -y -v
+          for attempt in 1 2 3 4; do
+            if xmake f --toolchain=llvm \
+              --sdk=/usr/lib64/llvm20 \
+              --cxflags="-resource-dir=${RESOURCE_DIR}" \
+              -m release \
+              -y -v; then
+              exit 0
+            fi
+            echo "xmake configure failed (attempt ${attempt})"
+            sleep $((attempt * 5))
+          done
+          echo "::error::xmake configure failed after 4 attempts"
+          exit 1
 
       - name: Build and test C++ engine
         if: github.event_name != 'pull_request'
