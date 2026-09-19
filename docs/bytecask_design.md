@@ -983,7 +983,9 @@ Total fixed overhead per entry: **23 bytes** (header). A single 4-byte CRC-32C t
 |------------------------|------|--------|--------|---------------------------------------------------|
 | end - 4                | 4    | CRC32  | u32 LE | CRC-32C (Castagnoli) over all preceding entry bytes |
 
-`OpenForRead` verifies the trailer CRC eagerly before parsing any entries. On mismatch the entire hint file is rejected by throwing `std::runtime_error`. Corrupt hint files cause the engine to regenerate the hint from the raw data file during recovery.
+`OpenForRead` and `OpenForMerge` both verify the trailer CRC eagerly, before parsing any entries, and reject the whole file by throwing `std::runtime_error` on mismatch. Verifying at open is what makes the file's replacement safe: the throw lands before any entry has been applied to the key directory, so the rebuild below has no partial state to undo.
+
+A hint file is a derived index, not the records it points at, so a CRC failure in one says the index is damaged and not that the data file behind it is. `open_hint_or_rebuild` therefore removes the damaged hint, regenerates it from its data file through `flush_hints_for` — the same scan a missing hint already takes — and opens the result, in both recovery modes. `fail_recovery_on_crc_errors` governs only what is left after that: a data file whose own entries fail their CRCs cannot be rescanned, and the file is then thrown on (strict) or skipped (lenient). Skipping is not free — a skipped file keeps its `total_bytes` while contributing no `live_bytes`, so the next vacuum sees it as entirely garbage and unlinks it, which is why a rebuildable hint must never reach that path.
 
 ### Size Constants
 
@@ -1005,7 +1007,7 @@ while (auto he = scanner.next()) { /* use he->key, he->sequence, … */ }
 On engine startup:
 
 1. Discard any `.hint.tmp` files — incomplete hint files from a crash mid-rotation.
-2. Open all `.data` files and seal them. For any data file without a companion `.hint`, generate one via `flush_hints_for()` (uses `CommittedEntryIterator`: buffers entries between BulkBegin/BulkEnd, discards incomplete batches, logs a warning). `BulkBegin`/`BulkEnd` markers are written to hint files with their sequence numbers (for accurate `next_seq` computation). Other hint entries are sorted by key (for prefix compression). Recovery's sequence-aware upsert handles duplicate keys across entries.
+2. Open all `.data` files and seal them. For any data file without a companion `.hint` — and, lazily, for any whose `.hint` will not open — generate one via `flush_hints_for()` (uses `CommittedEntryIterator`: buffers entries between BulkBegin/BulkEnd, discards incomplete batches, logs a warning). `BulkBegin`/`BulkEnd` markers are written to hint files with their sequence numbers (for accurate `next_seq` computation). Other hint entries are sorted by key (for prefix compression). Recovery's sequence-aware upsert handles duplicate keys across entries.
 3. Recover exclusively from hint files. For each hint entry:
    - `Put`: insert `(key → {sequence, file_id, file_offset, value_size})` only if `entry.sequence > dir[key].sequence` (skip if a fresher entry is already present).
    - `Delete`: remove the key from the tree if `entry.sequence > dir[key].sequence`; otherwise skip.
