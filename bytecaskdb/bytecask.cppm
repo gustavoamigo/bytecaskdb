@@ -3363,9 +3363,12 @@ void DB::resume() {
                              narrow<std::uint32_t>(entry.value.size()),
                              entry.key});
       }
+      // Every entry yielded lies below the iterator's committed offset, so
+      // recording it here keeps valid_offset in step with `committed` even
+      // when the next entry is corrupt and ++iter throws.
+      valid_offset = iter.committed_offset();
       ++iter;
     }
-    valid_offset = iter.committed_offset();
   } catch (...) {
     // Stop at first CRC error — valid_offset is the last known-good position.
   }

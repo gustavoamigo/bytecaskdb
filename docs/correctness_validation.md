@@ -1158,6 +1158,18 @@ control:
   entry detects this on recovery (the entry fails CRC and is truncated),
   which is the correct behavior — but the fault injector models failures
   at the `writev` boundary, not the sector boundary.
+- **Corrupt bytes in an otherwise healthy file** — every degrade shape in
+  the matrix leaves a *well-formed* active file: the orphaned bytes parse,
+  and their CRCs hold. A read that succeeds and returns wrong bytes is not
+  a failure class the taxonomy has (#104), so no generated case ever drove
+  `resume()`'s scan down its CRC-error branch. Both bugs found on that
+  branch — `valid_offset` left at 0 when the scan throws, and a read buffer
+  sized from an unverified `value_size` — were invisible to all 37 resume
+  proof tests while every one of them passed. The hand-written test that
+  was meant to cover it corrupted the file at `file_size - 5`, which on a
+  zero-filled active file is in the tail past the write cursor and is never
+  scanned. Corruption shapes belong in the matrix as a fault axis over the
+  *bytes*, orthogonal to the syscall-failure axis over the *calls*.
 - **Hardware-level fault injection** — kernel block-layer error injection
   (`dm-flakey`, `dm-dust`), power-cut testing rigs, or filesystem-
   specific fault tools. The fault injector operates at the application
