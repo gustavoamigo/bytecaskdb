@@ -22,6 +22,7 @@ from tests.proof.expected_delta import Delta, expected_delta
 from tests.proof.fault_point_resolver import FaultConfig, resolve_fault
 from tests.proof.scenario_matrix import (
     FailureClass,
+    Observer,
     OpType,
     PlanShape,
     StateShape,
@@ -180,6 +181,83 @@ def gen_fault_injector(config: FaultConfig) -> str:
     return ""
 
 
+def gen_observer_acquire(observer: Observer) -> str:
+    """C++ that takes a view before the fault-injected call."""
+    if observer == Observer.NONE:
+        return ""
+    if observer == Observer.HELD_VALUE:
+        return "\n".join([
+            "    bytecask::Bytes obs_value;",
+            '    REQUIRE(db.get({}, to_bytes("k0"), obs_value));',
+            "    const bytecask::Bytes obs_value_at_acquire = obs_value;",
+        ])
+    if observer == Observer.HELD_ITER_SPAN:
+        return "\n".join([
+            "    auto obs_range = db.iter_from({});",
+            "    auto obs_it = obs_range.begin();",
+            "    REQUIRE_FALSE(obs_it == std::default_sentinel);",
+            "    const auto obs_span = (*obs_it).value;",
+            "    const bytecask::Bytes obs_span_at_acquire{",
+            "        obs_span.begin(), obs_span.end()};",
+        ])
+    if observer == Observer.HELD_RITER_SPAN:
+        return "\n".join([
+            "    auto obs_rrange = db.riter_from({});",
+            "    auto obs_rit = obs_rrange.begin();",
+            "    REQUIRE_FALSE(obs_rit == std::default_sentinel);",
+            "    const auto obs_rspan = (*obs_rit).value;",
+            "    const bytecask::Bytes obs_rspan_at_acquire{",
+            "        obs_rspan.begin(), obs_rspan.end()};",
+        ])
+    if observer == Observer.HELD_SNAPSHOT:
+        return "\n".join([
+            "    auto obs_snap = db.snapshot();",
+            "    bytecask::Bytes obs_snap_value;",
+            '    REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_value));',
+            "    const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;",
+        ])
+    if observer == Observer.SECOND_INSTANCE:
+        return "\n".join([
+            "    TempDir obs_td;",
+            '    auto obs_db = bytecask::DB::open(obs_td.path / "other");',
+            '    obs_db.put({.sync = false}, to_bytes("other"),',
+            '               to_bytes("other_value"));',
+            "    bytecask::Bytes obs_other;",
+            '    REQUIRE(obs_db.get({}, to_bytes("other"), obs_other));',
+            '    REQUIRE(to_string(obs_other) == "other_value");',
+        ])
+    raise AssertionError(f"unhandled observer: {observer}")
+
+
+def gen_observer_verify(observer: Observer, moment: str) -> str:
+    """C++ that re-checks the view. `moment` names the call site."""
+    if observer == Observer.NONE:
+        return ""
+    lines = [f"    // observer: {observer.value} — {moment}", "    {"]
+    if observer == Observer.HELD_VALUE:
+        lines.append("      assert_view_stable(obs_value, obs_value_at_acquire);")
+    elif observer == Observer.HELD_ITER_SPAN:
+        lines.append("      assert_view_stable(obs_span, obs_span_at_acquire);")
+    elif observer == Observer.HELD_RITER_SPAN:
+        lines.append("      assert_view_stable(obs_rspan, obs_rspan_at_acquire);")
+    elif observer == Observer.HELD_SNAPSHOT:
+        lines += [
+            "      bytecask::Bytes obs_snap_now;",
+            '      REQUIRE(obs_snap.get({}, to_bytes("k0"), obs_snap_now));',
+            "      CHECK(obs_snap_now == obs_snap_at_acquire);",
+        ]
+    elif observer == Observer.SECOND_INSTANCE:
+        lines += [
+            "      bytecask::Bytes obs_other_now;",
+            '      REQUIRE(obs_db.get({}, to_bytes("other"), obs_other_now));',
+            '      CHECK(to_string(obs_other_now) == "other_value");',
+        ]
+    else:
+        raise AssertionError(f"unhandled observer: {observer}")
+    lines.append("    }")
+    return "\n".join(lines)
+
+
 def gen_execute(
     plan: PlanShape, config: FaultConfig, delta: Delta
 ) -> str:
@@ -242,6 +320,7 @@ def gen_test(
     state: StateShape,
     plan: PlanShape,
     failure: FailureClass,
+    observer: Observer = Observer.NONE,
 ) -> str:
     """Generate one complete TEST_CASE."""
     labels = key_labels_for(plan)
@@ -249,6 +328,9 @@ def gen_test(
     delta = expected_delta(plan, failure, labels, existing)
     config = resolve_fault(state, plan, failure)
     name = f"prove__{state.label}__{plan.label}__{failure.value}"
+    if observer != Observer.NONE:
+        # Observer-free cells keep their existing names.
+        name += f"__{observer.value}"
 
     parts: List[str] = []
     if state.io_backend != "pread":
@@ -279,6 +361,13 @@ def gen_test(
     parts.append(gen_plan(plan, state, labels))
     parts.append("")
 
+    # Observer acquires its view last, so nothing between it and the
+    # transition can refresh what it holds.
+    acquire = gen_observer_acquire(observer)
+    if acquire:
+        parts.append(acquire)
+        parts.append("")
+
     # Fault injection + execute
     fi_code = gen_fault_injector(config)
     if fi_code:
@@ -295,8 +384,16 @@ def gen_test(
 
     # In-process validation
     parts.append("    assert_delta(before, db, expected);")
+    verify = gen_observer_verify(observer, "after the transition")
+    if verify:
+        parts.append(verify)
     if delta.degraded:
         parts.append("    assert_resumable(db);")
+        # resume() truncates the active file while readers are not quiesced,
+        # so the view is checked across it as well as across the failure.
+        verify_after_resume = gen_observer_verify(observer, "after resume()")
+        if verify_after_resume:
+            parts.append(verify_after_resume)
     parts.append("  }")
 
     # Recovery
@@ -360,10 +457,12 @@ using bytecask::testing::assert_consistent;
 using bytecask::testing::assert_delta;
 using bytecask::testing::assert_recoverable;
 using bytecask::testing::assert_resumable;
+using bytecask::testing::assert_view_stable;
 using bytecask::testing::Baseline;
 using bytecask::testing::capture_baseline;
 using bytecask::testing::ExpectedDelta;
 using bytecask::testing::to_bytes;
+using bytecask::testing::to_string;
 
 struct TempDir {
   std::filesystem::path path;
@@ -391,8 +490,8 @@ struct TempDir {
 def generate_file() -> str:
     """Generate the complete .cpp file."""
     tests: List[str] = []
-    for state, plan, failure in generate_matrix():
-        tests.append(gen_test(state, plan, failure))
+    for state, plan, failure, observer in generate_matrix():
+        tests.append(gen_test(state, plan, failure, observer))
     return FILE_HEADER + "\n\n".join(tests) + "\n"
 
 

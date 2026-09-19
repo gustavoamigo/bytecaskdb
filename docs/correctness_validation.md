@@ -333,27 +333,155 @@ to callers. Degrading forces `resume()` before further writes are accepted;
 
 ## Proof Test Generator
 
-### apply_batch — 492 tests
+### apply_batch — 1668 tests
 
-492 generated Catch2 tests (`[prove_apply_batch]` tag) cover every valid
-(StateShape, PlanShape, FailureClass) combination for `apply_batch`.
-The scenario matrix is 5 state shapes × 17 plan shapes × 9 failure
-classes; 4 elimination rules reduce this to 492 valid tests.
+1668 generated Catch2 tests (`[prove]` tag) cover every valid
+(StateShape, PlanShape, FailureClass, Observer) combination for
+`apply_batch`. The scenario matrix is 11 state shapes × 17 plan shapes ×
+9 failure classes; 4 elimination rules reduce this to 1108 observer-free
+cells, and the observer axis adds 560 more.
 
 #### State shapes
 
-| Shape | `num_keys` | `max_file_bytes` | What it tests |
-|-------|-----------|-----------------|---------------|
-| `empty_db` | 0 | — | Plan applied to a fresh database with no existing keys |
-| `single_key` | 1 | — | Overwrites, deletes, and guards against a single existing key |
-| `populated_db` | 10 | — | Multiple existing keys; exercises range guards and multi-key interactions |
-| `rotation_threshold` | 1 | 1 | Forces file rotation after the plan's writes — required for classes G and H |
-| `deleted_key` | 1 (deleted) | — | k0 created then deleted — tombstone in write history, no live keys at baseline |
+| Shape | `num_keys` | `max_file_bytes` | `io_backend` | What it tests |
+|-------|-----------|-----------------|-------------|---------------|
+| `empty_db` | 0 | — | pread | Plan applied to a fresh database with no existing keys |
+| `single_key` | 1 | — | pread | Overwrites, deletes, and guards against a single existing key |
+| `populated_db` | 10 | — | pread | Multiple existing keys; exercises range guards and multi-key interactions |
+| `rotation_threshold` | 1 | 1 | pread | Forces file rotation after the plan's writes — required for classes G and H |
+| `deleted_key` | 1 (deleted) | — | pread | k0 created then deleted — tombstone in write history, no live keys at baseline |
+| `single_key_mmap` | 1 | — | mmap | The mmap read path over a single key |
+| `populated_db_mmap` | 10 | — | mmap | The mmap read path with multiple keys and cross-key interactions |
+| `rotation_threshold_mmap` | 1 | 1 | mmap | Rotation with the active file mapped — sealing under classes G and H |
+| `single_key_pool` | 1 | — | buffer_pool | The buffer-pool read path over a single key |
+| `populated_db_pool` | 10 | — | buffer_pool | The buffer-pool read path with multiple keys |
+| `rotation_threshold_pool` | 1 | 1 | buffer_pool | Rotation with a pooled file — fill and eviction under classes G and H |
+
+The three `_mmap` shapes map the active file `MAP_SHARED` and sealed
+files `MAP_PRIVATE` (see *DataFile mmap* in `bytecask_design.md`). They
+are the shapes that reach `WritableMmapDataFile::truncate` through
+`assert_resumable`, which is the path #87 broke: those cells ran it on
+every CI run, ASan included, and none of them could fail on it, because
+a cell can only assert what the contract states and the contract said
+nothing about the span a reader holds across that call. `CONTRACT.md`
+now does, under *View and span lifetimes*, and the observer axis below
+is what lets a cell act on it.
+
+The three `_pool` shapes serve sealed reads from the engine-owned buffer
+pool. For a lent view they behave like `pread` rather than like `mmap`:
+the pool copies each value out of its frames into the iterator's own
+`io_buf_`, so no span ever points into a frame and no fill or eviction
+can reach one.
+
+On Emscripten builds both groups are compiled out — neither back-end is
+available there, and `DB::open` rejects the option outright.
 
 Shapes not currently covered: mid-vacuum (vacuum-in-flight during `apply_batch`),
 post-resume (DB that has been degraded and resumed), and multiple sealed files with
 cross-file tombstone interactions. These are deferred — the current shapes cover the
-five structurally distinct starting conditions for the write path.
+structurally distinct starting conditions for the write path, with and without mmap.
+
+#### Observers
+
+Every other assertion in the matrix reads the DB *after* the transition,
+so the read path appears only as the oracle's instrument, never as the
+subject. An observer inverts that: it takes a view **before** the
+transition and checks it afterwards — once after `assert_delta`, and
+again after `assert_resumable`, so the view is checked across `resume()`
+as well as across the failure itself. What each view is owed is stated
+in *View and span lifetimes* in [`CONTRACT.md`](../CONTRACT.md); the
+observer is how a generated cell can act on it.
+
+| Observer | Acquired before the transition | Catches |
+|----------|-------------------------------|---------|
+| `none` | — | (every cell; the 1108 observer-free cells) |
+| `held_value` | `get` into a `Bytes` kept alive | value-path invalidation |
+| `held_iter_span` | a span from `iter_from`, held across the call | #87 |
+| `held_riter_span` | a span from `riter_from`, held across the call | the reverse read path |
+| `held_snapshot` | `db.snapshot()` kept open | pinned-file / vacuum interaction |
+| `second_instance` | a second `DB` open on the same thread | BC-243 |
+
+`assert_view_stable(held, expected)` is the check for the two span-based
+observers (`held_iter_span`, `held_riter_span`). It probes with `mincore` (via `tests/mapping_probe.h`) and
+then compares bytes. The byte comparison is what discriminates:
+`mmap(nullptr, …)` often returns the address `munmap` just released, so
+an unmap-and-remap can look identical to never having unmapped.
+
+Two elimination rules keep the axis affordable — a naive cross product
+would be 4000 cells:
+
+1. **An observer needs a transition that can disturb a view.** It is
+   crossed only where the failure class degrades (B1, B2, B3, C, F, G,
+   H — every cell that reaches `assert_resumable`, and through it
+   `resume()`'s truncate) or the state shape maps the active file.
+   Class A returns before any I/O, so `none` is the only observer there.
+   Only `io_backend = mmap` satisfies the second arm: under `pread` and
+   `buffer_pool` a lent span points into the iterator's own buffer, which
+   no file event can reach, so those shapes are crossed through the
+   degrading arm alone. That is why the `_mmap` shapes carry 60 / 60 / 80
+   observer cells where their `pread` and `_pool` counterparts carry
+   50 / 50 / 70 — the difference is the SUCCESS-class cells.
+2. **Two plan shapes carry the observers per (state, failure).** What a
+   transition does to a lent view is decided by the failure class and the
+   state shape — which file is written, whether it is mapped, whether
+   `resume()` truncates it — plus one property of the plan: whether its
+   write set touches the key being observed. So each (state, failure)
+   elects two representatives:
+
+   - **disjoint** — `multi_put`, which writes fresh keys `p0`/`p1` and
+     emits the `BulkBegin`/`BulkEnd` pair #87 was found in.
+   - **colliding** — `sequential_overwrite` (a put on `k0`), or
+     `causality_del_put` for classes needing two or more operations.
+     Every observer reads `k0`, so these are the cells where the
+     transition overwrites the very key being observed. That is what
+     makes `held_snapshot` assert isolation rather than mere survival —
+     after the write commits, `assert_delta` sees the new value and the
+     held snapshot must still return the old one — and what asserts that
+     a superseded entry's bytes stay put on an append-only file.
+
+   Everything else a plan shape varies — entry count, solo versus group
+   commit, guard vocabulary — is invisible to a held view, so crossing
+   all 17 with every observer would multiply the matrix without asking a
+   new question.
+
+Observers that read a key (`held_value`, `held_iter_span`,
+`held_riter_span`, `held_snapshot`) also require a state shape that
+leaves one behind, so they skip `empty_db` and `deleted_key`.
+
+Reverting #90 — restoring the `munmap` / `mmap` in
+`WritableMmapDataFile::truncate` — makes 40 of these cells fail, every
+one of them on the byte comparison rather than only under ASan, and none
+by crashing. The `mincore` probe passes in all 40: `mmap` hands back the
+address `munmap` just released, which is exactly the blind spot that
+motivated comparing bytes. Half are `held_iter_span` and half
+`held_riter_span` — the reverse iterator's span points into the same
+mapping. The
+`rotation_threshold_mmap` cells correctly keep passing: at
+`max_file_bytes = 1` every write rotates, so their span points into a
+sealed `MAP_PRIVATE` file that `truncate()` never touches.
+
+Reverting BC-243 — dropping the owner check from
+`DB::load_state_for_read` — fails 10 `second_instance` cells on
+`obs_db.get(...)` returning false: the second DB's read is served the
+primary's cached generation, in which that key does not exist.
+
+#### What the axis does not reach
+
+Reverting BC-122 — giving `ReverseRadixTreeIterator::operator*` back the
+`std::reverse_iterator` shape, where it dereferences a temporary copy and
+returns a span into it — leaves **all 1190 cells passing**. Four
+`radix_tree_test.cpp` cases catch it instead.
+
+That is structural, not a coverage gap to close by adding cells. The
+reverted class is reached only through `key_dir.rbegin()`, and no public
+read path lends a caller a span that comes from it: `riter_from` goes
+through `ReverseValueIterator`, which yields a `KeyDirEntry` by
+reference, and the span the caller actually receives is built afterwards
+by `ReverseEntryIterator` from the data file. `rkeys_from` uses
+`rbegin().base()` only as a starting position and materialises an owning
+`Key`. An observer sits at the DB API, so it cannot see a class the DB
+API does not lend from — the radix tree's own tests are the right place
+for that one, and they hold it.
 
 #### Plan shapes
 
@@ -421,12 +549,12 @@ Each test follows the same structure:
 7. `assert_recoverable(dir, before, expected)` — validates persistence
    invariant via fresh recovery (where applicable)
 
-### resume() — 21 tests
+### resume() — 37 tests
 
-21 generated Catch2 tests (`[prove_resume]` tag) cover every valid
+37 generated Catch2 tests (`[prove_resume]` tag) cover every valid
 (DegradeShape, ResumeFailureClass) combination.
 
-Four degrade shapes establish a degraded DB before resume is called:
+Eight degrade shapes establish a degraded DB before resume is called:
 
 - **degrade_H** — `io_rotate_file_creation` fires on a put at the
   rotation threshold. The write committed (both keys are in key_dir),
@@ -442,6 +570,13 @@ Four degrade shapes establish a degraded DB before resume is called:
 - **degrade_G** — `io_data_file_sync` fires on a `put(sync=false)`
   with `max_file_bytes=1`. The pre-rotation sync fails. Same page-cache
   state as F — `resume()` replays the entry.
+- **degrade_H_mmap**, **degrade_C_mmap** — H and C with
+  `io_backend = mmap`. These are the shapes where `resume()` truncates
+  the active file while it is mapped and lock-free readers are not
+  quiesced; the mapping must survive it (see *View and span lifetimes*
+  in `CONTRACT.md`, and *DataFile mmap* in `bytecask_design.md`).
+- **degrade_H_pool**, **degrade_C_pool** — the same two through the
+  buffer pool. All four are compiled out on Emscripten builds.
 
 Six resume failure classes:
 
@@ -452,13 +587,19 @@ Six resume failure classes:
 - **DOUBLE** — resume succeeds, then a second resume is called (no-op).
 - **CASCADE** — R2 fails, then R3 fails, then clean resume succeeds.
 
-R1 is filtered for degrade_H, degrade_F, and degrade_G: these shapes
-have no orphaned or partial bytes in the active file, so
-`file.size() == valid_offset` and `resume()` skips the truncation
-branch entirely (see `bytecask.cpp` resume path: `if (file.size() !=
-valid_offset) { ... truncate ... }`). R1 is only valid for degrade_C.
+Two elimination rules apply:
 
-4 shapes × 6 classes = 24 minus 3 filtered = **21 tests**.
+1. **R1 requires orphaned bytes.** degrade_H, degrade_F and degrade_G
+   have none in the active file, so `file.size() == valid_offset` and
+   `resume()` skips the truncation branch entirely (`if (file.size() !=
+   valid_offset) { ... truncate ... }`). R1 is valid only for the
+   degrade_C shapes — 5 combinations filtered.
+2. **R2 and CASCADE require an unsealed file.** The degrade_H shapes
+   seal the active file during rotation before the fault fires, so
+   `resume()` never enters the truncate/sync/seal block and the sync
+   fault point is unreachable — 6 more combinations filtered.
+
+8 shapes × 6 classes = 48 minus 11 filtered = **37 tests**.
 
 Each R1/R2/R3 test uses a multi-phase pattern:
 1. Establish degraded state
@@ -473,15 +614,22 @@ fault points.
 
 This directly proves: *resume always eventually recovers once the underlying fault clears.*
 
-### vacuum_compact — 10 tests
+### vacuum_compact — 30 tests
 
-10 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover two state
+30 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover six state
 shapes × five failure classes (SUCCESS, VC1–VC4).
 
 State shapes create a DB with exactly one sealed file having fragmentation > 0:
 
 - **low_fragmentation** — sealed file with 2 entries, 1 dead (50% frag)  
 - **mostly_dead** — sealed file with 6 entries, 5 dead (~83% frag)
+- **low_fragmentation_mmap**, **mostly_dead_mmap** — the same two
+  shapes with `io_backend = mmap`, so the file being compacted is read
+  through its `MAP_PRIVATE` mapping and the staged copy is written
+  through a mapped active file.
+- **low_fragmentation_pool**, **mostly_dead_pool** — the same two
+  through the buffer pool. All four are compiled out on Emscripten
+  builds.
 
 Files with live entries always use the compact path (sealed→sealed).
 `mostly_dead` uses `max_file_bytes=150` to pack all 6 keys into one
@@ -661,9 +809,16 @@ I/O checkpoints:
 - `assert_consistent(db)` — validates five structural invariants:
   live_bytes matches key_dir, no dangling file references, active file
   exists, file_stats covers all files, next_lsn ahead of all sequences.
+  All five are properties of the published state; none concerns a view
+  the engine has lent to a reader. That is what the observer axis adds —
+  see *Observers* above, and *View and span lifetimes* in `CONTRACT.md`
+  for the guarantees it asserts.
 - `assert_delta(before, db, expected)` — validates key membership, LSN
   advancement, structural consistency, and degraded state against the
   reference model's expected delta.
+- `assert_view_stable(held, expected)` — the view handed out before the
+  transition still addresses live memory (`mincore`) and still holds the
+  bytes it had. Used by the `held_value` and `held_iter_span` observers.
 - `assert_resumable(db)` — calls `resume()` and verifies the engine clears
   the degraded flag and passes `assert_consistent`. Inserted immediately
   after `assert_delta` for all degraded failure classes (B1, B2, B3, C, F, G, H).
@@ -709,24 +864,28 @@ smoke-test the helpers themselves.
 
 ### Test coverage
 
-All eleven failure classes for `apply_batch` are covered by the 172
-`[prove_apply_batch]` tests. Each class is exercised across all valid
-(StateShape, PlanShape) combinations.
+All nine failure classes for `apply_batch` (SUCCESS, A, B1, B2, B3, C,
+F, G, H) are covered by the 1668 `[prove]` tests. Each class is exercised
+across all valid (StateShape, PlanShape) combinations, with and without
+back-end, and — for every class that can disturb a lent view — against
+each of the five observers.
 
 All three resume failure classes (R1–R3) plus DOUBLE and CASCADE across
-all four degrade shapes (H, C, F, G) are covered by the 21
-`[prove_resume]` tests. R1 is correctly excluded for degrade_H, degrade_F,
-and degrade_G (no orphaned bytes to truncate — fault point unreachable).
+all eight degrade shapes (H, C, F, G, and H and C again through mmap and
+the buffer pool) are covered by the 37 `[prove_resume]` tests. R1 is correctly excluded for
+the degrade_H, degrade_F and degrade_G shapes (no orphaned bytes to
+truncate — fault point unreachable), and R2/CASCADE for degrade_H (file
+already sealed).
 
-All five vacuum_compact failure classes across both state shapes are
-covered by the 10 `[prove_vacuum_compact]` tests.
+All five vacuum_compact failure classes across all six state shapes are
+covered by the 30 `[prove_vacuum_compact]` tests.
 
 All seven ingest failure classes across 11 state shapes and 5 ops shapes
 are covered by the 178 `[prove_repl]` tests. All three manifest failure
 classes across 11 state shapes are covered by the 33 `[prove_manifest]`
 tests. Four elimination rules reduce the full matrix to 211 valid tests.
 
-Total generated proof tests: **734**.
+Total generated proof tests: **1946**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
@@ -791,9 +950,11 @@ installed Clang's major version (sparse, shallow checkout of just
 `libcxx`/`libcxxabi`/`runtimes`/`libc` — the last only for header-only helpers
 `libcxx`'s `charconv` implementation pulls in, `libc` itself is never built)
 and installs it to `.msan-libcxx/`. CI caches
-this build (`actions/cache`, keyed on the script's contents) since it takes
-several minutes; it's idempotent locally too — reruns skip the build if the
-prefix is already populated.
+this build (`actions/cache`) since it takes several minutes; the key covers
+both the script's contents and the installed Clang's major version, so a
+Fedora LLVM bump rebuilds rather than restoring a libc++ built from the
+previous release branch. The script is idempotent — CI reruns and local
+reruns alike skip the build if the prefix is already populated.
 
 **Catch2 is compiled from source for this build only**: the prebuilt `catch2`
 xrepo package is compiled against the system's default libstdc++, and linking
@@ -814,9 +975,15 @@ uninstrumented code as producing fully-initialized output by design); it just
 means bugs inside `crc32c` itself, if any, wouldn't be caught by this MSan
 run.
 
-Run: `scripts/run_sanitizer.sh memory`. Scope matches the ASan/TSan jobs
-above: `bytecask_tests` only, not `radix_tree_memory_tests` or
-`unordered_view_tests`.
+Run: `scripts/run_sanitizer.sh memory`. Target scope matches the ASan/TSan
+jobs above: `bytecask_tests` only, not `radix_tree_memory_tests` or
+`unordered_view_tests`. Trigger scope does not — origin tracking makes the
+MSan test step the slowest of the three and by far the least predictable
+(2m48s and 11m56s on two runs of the same commit, against a steady ~1m50s
+for ASan and TSan; per-job runners vary by ~1.8x and the seeded `[model]`
+workloads account for much of the rest), so it is excluded from the
+`pull_request` matrix and runs on push to `main` and on
+`workflow_dispatch`.
 
 ### Fuzz testing (libFuzzer)
 

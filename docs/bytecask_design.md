@@ -315,7 +315,7 @@ When this happens, the engine calls `deem_as_degraded(reason)` with a diagnostic
   1. Acquires the write lock and drops the heads the failed flush left unpublished (`head_ = state_`), so the resumed state is derived from the published one with those heads already reclaimed.
   2. Scans the active file using `CommittedEntryIterator` to find the last valid committed offset. Orphaned `BulkBegin` batches are excluded — if a `BulkBegin` has no matching `BulkEnd`, `committed_offset` is reset to before the batch start.
   3. Replays valid committed entries into the key directory using sequence-wins resolution: for each Put whose sequence exceeds the current key_dir entry (or the key is absent), update key_dir and file_stats; for each Delete whose sequence exceeds the current entry, erase the key. This recovers entries that were written to the data file but never published to EngineState (e.g. sync-failure paths where only next_seq was advanced, or degraded-state transitions that occurred between IO and state publication). Also advances `next_seq` past the highest sequence seen on disk.
-  4. Calls `ftruncate` to remove garbage bytes and orphaned batch markers up to `valid_offset`. In mmap mode this leaves the mapping untouched — readers are not quiesced and may hold spans into it (see *DataFile mmap*).
+  4. Calls `ftruncate` to remove garbage bytes and orphaned batch markers up to `valid_offset`. In mmap mode this leaves the mapping untouched — readers are not quiesced and may hold spans into it (see *DataFile mmap*, and *View and span lifetimes* in [`CONTRACT.md`](../CONTRACT.md) for what a reader is owed across this call).
   5. Calls `fdatasync` to persist the truncation.
   6. Seals the active file and dispatches hint generation (both idempotent).
   7. Creates a new active file and publishes the new engine state.
@@ -553,6 +553,7 @@ ByteeCask implements a **conservative online vacuum**: the engine continues to s
 - Only sealed (immutable) data files are considered — the active file is never touched.
 - Only files whose fragmentation exceeds a configurable threshold are processed; files below the threshold are left alone.
 - One file is processed per `vacuum()` call. Callers that want to process multiple files call in a loop.
+- A file that compaction cannot shrink is declined: the staged copy is discarded and `vacuum()` returns `false`. Tombstones and batch markers are preserved by every compaction but can never count towards `live_bytes` (hint files carry no markers, so recovery could not reproduce it), so a file holding either would otherwise stay eligible at `fragmentation_threshold = 0` forever and a vacuum-to-convergence loop would never terminate.
 - Tombstones (Delete entries) are never dropped during partial compaction (see **Tombstone handling** below).
 - A new compacted file is fully written and `fdatasync`-ed before any old file is removed.
 - **Sequence-disjoint files**: vacuum must preserve the invariant that all data files have non-overlapping sequence ranges. Compacted files maintain disjoint sequence ranges from other files.
@@ -911,7 +912,10 @@ Contrast with `HintFile`, which uses `OpenForWrite` / `OpenForRead` factory func
 
 ### DataFile mmap
 
-Two mmap strategies are used depending on the file's lifecycle:
+Two mmap strategies are used depending on the file's lifecycle. What a
+reader is owed across each of them — and across every other event that
+moves a file under a live view — is stated in *View and span lifetimes*
+in [`CONTRACT.md`](../CONTRACT.md); this section covers the mechanism.
 
 **Buffer pool — `ReadOnlyBufferPoolDataFile`**: When `Options::io_backend` is `IoBackend::BufferPool`, sealed files are served from a bounded frame cache owned by the DB (`BufferPool`, `bytecaskdb/buffer_pool.cppm`), and the writable active file inserts every byte it appends into the same pool so it is resident without a read. The cache is an arena of 4 KiB frames plus one open-addressed index of 16-byte slots — key `(file_id, frame_index)`, frame number with the CLOCK reference bit, seqlock version — so a hit is one lock-free probe and a copy out of the frame under relaxed atomic word accesses (the frame may be being written concurrently, so plain `memcpy` would be a data race). Every change to the index or a frame happens under one mutex, released across device reads, with each slot change bracketed by its version going odd then even; deletion is a backward shift, not a tombstone. Vacuum and rotation reserve the new file's `file_id` before opening it (`TransientEngineState::reserve_file_id`) because a file keys its frames by it from construction. Sealed frames are filled with `O_DIRECT` through a second descriptor, so the pool — not the page cache — holds sealed-file data; a filesystem that refuses falls back to buffered fills for that file, counted in `pool_direct_io_fallbacks`. Scans bypass the pool and oversize reads (over capacity/8) are never admitted. Values are always copied into the caller's buffer, never handed back as a span into a frame. `Options::buffer_pool.capacity_bytes` is the total footprint — frames and index both come out of it — and `DB::open` rejects a pool smaller than `2 x max_file_bytes`, since the pinned active file lives inside the budget. See [`buffer_pool_design.md`](buffer_pool_design.md).
 
@@ -1261,6 +1265,8 @@ for (auto& key : db.rkeys_from(opts, prefix))              { ... }
 - **Lazy**: each dereference reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries.
 - **`KeyIterator` is in-memory only**: walks the in-memory key directory without touching any data file.
 - **Error handling**: throws `std::system_error` on I/O failure.
+- **Self-anchored**: `EntryIterator` and `ReverseEntryIterator` each hold their own `shared_ptr<const EngineState>`, and `KeyIterator` holds the key-directory root it was built from. An iterator therefore keeps every data file it can reach open, and the subtree it walks immutable, independently of the `DB` and of the `Snapshot` it came from — which is why a span may outlive that `Snapshot` but never the iterator. The full per-event table is *View and span lifetimes* in [`CONTRACT.md`](../CONTRACT.md).
+- **Move-only (entry iterators)**: `EntryIterator` and `ReverseEntryIterator` cache the spans `operator*` returns, and on the `pread` path those spans address the iterator's own `io_buf_`. Copying would deep-copy the buffer while carrying the spans unchanged, leaving the copy pointing into the source's storage — so the copy operations are deleted and the hazard is a compile error rather than a comment. Moving is safe: the buffer travels with the spans. `ChangeIterator` is move-only for the same reason. `KeyIterator` materializes an owning `Key` and stays copyable, which `ReverseIterator<KeyIterator>` requires.
 
 ### WriteOptions and ReadOptions
 

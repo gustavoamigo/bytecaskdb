@@ -34,19 +34,19 @@ fi
 echo "==> Running tests under $SANITIZER sanitizer..."
 echo ""
 
+# halt_on_error=0 is only meaningful for TSan here: it reports every race and
+# exits nonzero at the end. ASan and MSan are built without
+# -fsanitize-recover=<san>, so Clang emits the noreturn report stubs and the
+# process dies on the first report whatever the option says.
 OPTS=""
 if [ "$SANITIZER" = "thread" ]; then
     OPTS="halt_on_error=0 history_size=4"
     export TSAN_OPTIONS="$OPTS"
     echo "    TSAN_OPTIONS=$OPTS"
 elif [ "$SANITIZER" = "address" ]; then
-    OPTS="halt_on_error=0 detect_leaks=1"
+    OPTS="detect_leaks=1"
     export ASAN_OPTIONS="$OPTS"
     echo "    ASAN_OPTIONS=$OPTS"
-elif [ "$SANITIZER" = "memory" ]; then
-    OPTS="halt_on_error=0"
-    export MSAN_OPTIONS="$OPTS"
-    echo "    MSAN_OPTIONS=$OPTS"
 fi
 echo ""
 

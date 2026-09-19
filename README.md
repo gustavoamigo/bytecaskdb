@@ -313,7 +313,9 @@ public:
     [[nodiscard]] auto rkeys_from(const ReadOptions& opts, BytesView from = {}) const
         -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 
-    // Returns true if a file was vacuumed, false if no file qualified.
+    // Returns true if a file was reclaimed. False when no file qualified, or
+    // when the file that qualified holds nothing reclaimable (its bytes are
+    // all live data, tombstones or batch markers, which compaction preserves).
     [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
 
     // The single sequence primitive — returns the highest sequence confirmed
