@@ -1,6 +1,6 @@
 # Parallel Recovery Design
 
-> This describes `recovery_load_parallel`, the file-partitioned path with a fan-in merge, which both key directories use. The B+ tree has a second path, `recovery_load_ranged`, which partitions by key range and has no fan-in at all; it needs sorted hint files and is described in `docs/bytecask_design.md` and `docs/persistent_btree_design.md`.
+> This describes `recovery_load_parallel`, the file-partitioned path with a fan-in merge. It is what the radix key directory (`BYTECASK_KEYDIR=radix`) recovers through. The B+ tree, which is the default, recovers through `recovery_load_ranged` instead: it partitions by key range, bulk-loads each range from the sorted hint files, and has no fan-in at all. See `docs/bytecask_design.md` and `docs/persistent_btree_design.md`.
 
 ## 1. Motivation
 

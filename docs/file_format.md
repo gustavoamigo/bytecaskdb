@@ -173,11 +173,23 @@ On disk: `entry_type = 0x05`, `key_size = start_key length`,
 
 Hint files are compact companion files to sealed data files. Each entry stores
 enough metadata and the full key to reconstruct the in-memory key directory
-without reading value bytes. Only `Put` and `Delete` entries are written —
-`BulkBegin` and `BulkEnd` are never included.
+without reading value bytes. `Put`, `Delete` and `RangeDel` entries are
+written, and `BulkBegin`/`BulkEnd` markers are carried through with no key.
 
-Entries are written in data-file append order (the order they appear in the
-companion `.data` file). Keys are stored in full — no prefix compression.
+Ordering: the keyless markers and the range tombstones come first, in
+data-file append order, then the `Put` and `Delete` entries sorted by key
+ascending and, within one key, by sequence descending. One key may appear more
+than once — the file is not deduplicated. Sorting is what lets recovery
+bulk-load the key directory instead of inserting key by key, and it costs one
+buffer per data file at hint-generation time, bounded by `max_file_bytes`.
+
+A range tombstone's key is a range bound rather than a key of the file, so it
+stays out of the sorted run where deduplicating by key could collide it with a
+real key. Nothing depends on the order regardless: every reader resolves
+entries by sequence, never by position, so a sorted hint file and an unsorted
+one describe the same key directory.
+
+Keys are stored in full — no prefix compression.
 
 ### File Layout
 

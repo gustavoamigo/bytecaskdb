@@ -20,8 +20,7 @@ Usage:
     --threads LIST       Comma-separated recovery_threads to test
                           (default: 1,2,4,8,16).
     --rounds N            Interleaved rounds (default 3).
-    --configs LIST        Comma-separated from {radix-plain, radix-sorted,
-                           btree-plain, btree-sorted} (default: all four).
+    --configs LIST        Comma-separated from {radix, btree} (default: both).
     --bench-dir DIR        Where the test DB is written (default: ./.tmp).
                            Point this at a real disk, not tmpfs, to see
                            genuine I/O rather than an in-memory measurement.
@@ -68,14 +67,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = REPO_ROOT / "build/linux/x86_64/release"
 BENCH_TARGET = "engine_bench"
 
-ALL_CONFIGS = ["radix-plain", "radix-sorted", "btree-plain", "btree-sorted"]
+ALL_CONFIGS = ["radix", "btree"]
 
-# Each config maps to (binary name, BC_SORT_HINTS value).
+# Each config maps to the binary built for that key directory. Hint files are
+# always written sorted now, so the plain/sorted split these configs used to
+# carry is gone — what differs between the two is only the tree.
 CONFIG_SPEC = {
-    "radix-plain": ("eb_radix", "0"),
-    "radix-sorted": ("eb_radix", "1"),
-    "btree-plain": ("eb_btree", "0"),
-    "btree-sorted": ("eb_btree", "1"),
+    "radix": "eb_radix",
+    "btree": "eb_btree",
 }
 
 
@@ -157,8 +156,7 @@ def run_one(
     json_out_dir: Path | None,
     round_num: int,
 ) -> dict:
-    binary_name, sort_hints = CONFIG_SPEC[config]
-    binary = BUILD_DIR / binary_name
+    binary = BUILD_DIR / CONFIG_SPEC[config]
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         out_path = tmp.name
 
@@ -178,7 +176,6 @@ def run_one(
     env = os.environ.copy()
     env["BC_DATASET_SIZE"] = str(dataset_size)
     env["BC_BENCH_DIR"] = bench_dir
-    env["BC_SORT_HINTS"] = sort_hints
     if drop_caches:
         env["BC_DROP_CACHES"] = "1"
 

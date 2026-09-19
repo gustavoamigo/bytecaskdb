@@ -1199,9 +1199,7 @@ needs a key-directory column before it can hold both.
 3. Re-run recovery on a 16-thread host.
 4. `u32_map` on the B+ tree, sysbench against `main`. `u32_map` still builds
    on the radix tree; it backs `file_stats`, not the key directory.
-5. Make `BC_SORT_HINTS` the default, which needs a sortedness marker in the
-   hint header or a per-file fallback so a database written before the flag
-   existed still opens on the ranged path.
+5. Sibling merge on delete, gated by the churn memory tests (D6).
 
 ## References
 

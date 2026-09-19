@@ -1084,7 +1084,7 @@ private:
   auto recovery_load_ranged(EngineState s, unsigned recovery_threads,
                             bool strict) -> EngineState;
   // Builds a RecoveryResult by merging sorted hint runs into a bulk loader.
-  // Requires hints written with BC_SORT_HINTS=1.
+  // Requires the sorted hint files flush_hints_for writes.
   static auto recovery_build_sorted(std::span<RecoveredFile> files,
                                     bool strict) -> RecoveryResult;
 #endif
@@ -2933,20 +2933,16 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
 
   auto hint = HintFile::OpenForWrite(tmp_path);
 
-  // BC_SORT_HINTS=1 restores the sorted hint file BC-088
-  // introduced and 45d0e90 traded away for O(1) working memory. Sorting
-  // costs one buffer per data file — bounded by max_file_bytes, not by the
-  // database — and lets recovery bulk-load a B+ tree instead of inserting
-  // key by key. Experimental: it is a build-time choice about which key
-  // directory the format serves, and is off by default.
-  static const bool sort_hints = [] {
-    const char *e = std::getenv("BC_SORT_HINTS");
-    return e && *e == '1';
-  }();
-
-  // Put and Delete entries, staged so they can be sorted by key. Keys live
-  // in one arena: the scanner's key span dies on the next advance, and a
-  // vector per entry would cost an allocation per key.
+  // Put and Delete entries go out sorted by key, restoring what BC-088
+  // introduced and 45d0e90 traded away for O(1) working memory. Sorting costs
+  // one buffer per data file — bounded by max_file_bytes, not by the database
+  // — and lets recovery bulk-load a B+ tree instead of inserting key by key.
+  // Every reader resolves entries by sequence rather than by position, so the
+  // order is free to serve the key directory being built.
+  //
+  // They are staged here first. Keys live in one arena: the scanner's key
+  // span dies on the next advance, and a vector per entry would cost an
+  // allocation per key.
   struct Staged {
     std::uint64_t seq;
     std::uint64_t file_off;
@@ -2976,9 +2972,6 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
       // independent, so writing these first is safe.
       hint.append_range_del(entry.sequence, entry_off, entry.key,
                             entry.value);
-    } else if (!sort_hints) {
-      hint.append(entry.sequence, entry.entry_type, entry_off, entry.key,
-                  narrow<std::uint32_t>(entry.value.size()));
     } else {
       staged.push_back({entry.sequence, entry_off,
                         narrow<std::uint32_t>(entry.value.size()),
@@ -2989,27 +2982,24 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
     }
   }
 
-  if (sort_hints) {
-    auto key_of = [&](const Staged &e) {
-      return std::span<const std::byte>{key_arena.data() + e.key_off,
-                                        e.key_len};
-    };
-    // Key ascending, and within a key sequence descending, so the first
-    // entry for each key is the authoritative one.
-    std::ranges::sort(staged, [&](const Staged &a, const Staged &b) {
-      const auto c = recovery_key_cmp(key_of(a), key_of(b));
-      return c < 0 || (c == 0 && a.seq > b.seq);
-    });
-    // BC-088 also deduplicated, keeping the highest-sequence entry per key.
-    // That is not done here: file_stats.min_sequence and max_sequence are
-    // rebuilt at recovery from the entries the hint file still holds, and
-    // ChangeIterator selects data files by that range. Dropping an entry can
-    // raise min_sequence above a sequence the data file really contains, and
-    // replication would then skip the file. Recovering it needs the bounds in
-    // the hint header, which is a format change.
-    for (const auto &e : staged)
-      hint.append(e.seq, e.type, e.file_off, key_of(e), e.val_size);
-  }
+  auto key_of = [&](const Staged &e) {
+    return std::span<const std::byte>{key_arena.data() + e.key_off, e.key_len};
+  };
+  // Key ascending, and within a key sequence descending, so the first entry
+  // for each key is the authoritative one.
+  std::ranges::sort(staged, [&](const Staged &a, const Staged &b) {
+    const auto c = recovery_key_cmp(key_of(a), key_of(b));
+    return c < 0 || (c == 0 && a.seq > b.seq);
+  });
+  // BC-088 also deduplicated, keeping the highest-sequence entry per key.
+  // That is not done here: file_stats.min_sequence and max_sequence are
+  // rebuilt at recovery from the entries the hint file still holds, and
+  // ChangeIterator selects data files by that range. Dropping an entry can
+  // raise min_sequence above a sequence the data file really contains, and
+  // replication would then skip the file. Recovering it needs the bounds in
+  // the hint header, which is a format change.
+  for (const auto &e : staged)
+    hint.append(e.seq, e.type, e.file_off, key_of(e), e.val_size);
 
   hint.close();
   std::filesystem::rename(tmp_path, hint_path);
@@ -4084,7 +4074,7 @@ static auto recovery_span_of(const Key &k) noexcept
 // and no split, but it needs its keys in ascending order — which is what a
 // sorted hint file gives.
 //
-// Requires hint files written with BC_SORT_HINTS=1. A sorted hint file is
+// Requires the sorted hint files flush_hints_for writes. A sorted hint file is
 // (batch markers and range tombstones, in scan order) followed by one run of
 // Put and Delete entries sorted by key. The merge checks the order it is
 // given and throws rather than handing a bulk loader keys it cannot take.
@@ -4191,7 +4181,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
       if (ord < 0) {
         throw std::runtime_error{
             "bytecask: hint file is not sorted — recovery_build_sorted needs "
-            "hints written with BC_SORT_HINTS=1"};
+            "the sorted hint files flush_hints_for writes"};
       }
       if (ord == 0) {
         if (he->sequence > best->sequence) best = he;
@@ -4355,17 +4345,11 @@ auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
   // Phase 2: one tree per worker, in parallel.
   std::vector<RecoveryResult> parts(W);
   std::vector<std::exception_ptr> worker_errors(W, nullptr);
-  // Sorted hints let a worker merge its files' runs straight into a bulk
-  // loader; unsorted ones leave it inserting key by key.
-  static const bool sorted_hints = [] {
-    const char *e = std::getenv("BC_SORT_HINTS");
-    return e && *e == '1';
-  }();
+  // Hint files are sorted, so a worker merges its files' runs straight into
+  // a bulk loader rather than inserting key by key.
   parallel_for(W, [&](unsigned i) {
     try {
-      parts[i] = sorted_hints ? recovery_build_sorted(worker_files[i], strict)
-                              : recovery_build_from_hints(worker_files[i],
-                                                          strict);
+      parts[i] = recovery_build_sorted(worker_files[i], strict);
     } catch (...) {
       worker_errors[i] = std::current_exception();
     }
@@ -4373,10 +4357,10 @@ auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
   for (const auto &err : worker_errors) {
     if (err) {
       if (strict) std::rethrow_exception(err);
-      // lenient: warning already emitted inside recovery_build_from_hints
+      // lenient: warning already emitted inside recovery_build_sorted
     }
   }
-  plog.mark("build_from_hints");
+  plog.mark("build_sorted");
 
   // Phase 3: union the parts' metadata, and pool their separators into R
   // splitters. Both are O(W × files) or O(W × R) — nothing here touches a key.

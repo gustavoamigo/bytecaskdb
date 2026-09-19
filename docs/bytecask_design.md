@@ -124,7 +124,7 @@ Internal (non-leaf) nodes are tiered by fanout across four fixed-capacity tiers,
 
 **Historical note**: the original key directory used `PersistentOrderedMap<Key, KeyDirEntry>`, backed by `immer::flex_vector<Entry>`. The radix tree replacement (BC-030) delivers O(k) lookups vs O(n log n) binary search, lower memory overhead via prefix compression and intrusive refcounting, and faster batch mutations via the transient API's in-place path copying. `PersistentOrderedMap` is retained in the codebase for benchmarking purposes (`benchmarks/map_bench.cpp`).
 
-The radix tree replaced that map (BC-030) and was in turn replaced as the default by the B+ tree, which measured faster on point reads, range scans and batched writes, and — given sorted hint files (`BC_SORT_HINTS=1`) — rebuilds the key directory from them faster as well. It remains in the codebase, builds from the same engine under `BYTECASK_KEYDIR=radix`, and passes the same engine suite in CI. `docs/persistent_btree_design.md` records the head-to-head measurements, including where the B+ tree is behind: unsynced single puts.
+The radix tree replaced that map (BC-030) and was in turn replaced as the default by the B+ tree, which measured faster on point reads, range scans and batched writes, and rebuilds the key directory from sorted hint files faster as well. It remains in the codebase, builds from the same engine under `BYTECASK_KEYDIR=radix`, and passes the same engine suite in CI. `docs/persistent_btree_design.md` records the head-to-head measurements, including where the B+ tree is behind: unsynced single puts.
 
 ### Size Limits
 
@@ -1040,17 +1040,17 @@ Scaling is sub-linear due to fan-in merge overhead and memory bandwidth saturati
 2. **Build** each range in parallel. A worker k-way merges the slice of every hint run that falls in its range straight into a `BulkLoader`, which packs full leaves in key order — no descent, no split, no slot shift per key.
 3. **Concat**. The runs are disjoint and already in order, so assembly is a spine built over them, not a merge.
 
-There is no fan-in: worker k's keys belong to worker k and to nobody else. Step 2 is the reason this path needs **sorted hint files**, and `recovery_build_sorted` throws if it is handed an unsorted one.
+There is no fan-in: worker k's keys belong to worker k and to nobody else. Step 2 is the reason hint files are written sorted, and `recovery_build_sorted` throws if it is handed an unsorted one.
 
 Two invariants matter in step 3. The merge collapses duplicate keys within a run to the highest sequence, because hint files are no longer deduplicated and one key can repeat inside a run. And `concat` publishes the assembled tree under the maximum of the session tag and every run's tag: the version chain frees a dead version by tag interval, so a node tagged above the published version would later be taken for a *different* version's garbage and freed while still reachable.
 
 Cursors are held in a heap rather than scanned linearly. A worker in the ranged path has one cursor per hint file — not one per recovery thread — so at 10M keys across many files the linear scan dominated: 8.37s against 2.44s for the heap at one thread.
 
-### Sorted Hint Files (`BC_SORT_HINTS=1`)
+### Sorted Hint Files
 
-Off by default. When set, `flush_hints_for` writes each hint file's Put and Delete entries sorted by key ascending, sequence descending. Range tombstones and `BulkBegin`/`BulkEnd` markers are written first, in scan order: a range tombstone's key is a range *bound*, not a key of the file, so it must not join the sorted run, and recovery's tombstone handling is order independent anyway.
+`flush_hints_for` writes each hint file's Put and Delete entries sorted by key ascending, sequence descending. Range tombstones and `BulkBegin`/`BulkEnd` markers are written first, in scan order: a range tombstone's key is a range *bound*, not a key of the file, so it must not join the sorted run, and recovery's tombstone handling is order independent anyway.
 
-Sorting costs one buffer per data file — bounded by `max_file_bytes`, not by the database — and is what lets recovery bulk-load a B+ tree instead of inserting key by key. It is not a format change: every recovery path resolves entries by sequence, never by position, so a sorted hint file and an unsorted one describe the same key directory and either reader accepts either file. The one asymmetry is `recovery_build_sorted`, which *requires* sorted input and rejects anything else — which is why the flag is not yet the default: a database written before it was set would still hold unsorted hint files. Making it the default needs a sortedness marker in the hint header or a per-file fallback.
+Sorting costs one buffer per data file — bounded by `max_file_bytes`, not by the database — and is what lets recovery bulk-load a B+ tree instead of inserting key by key. Order is not part of the contract: every recovery path resolves entries by sequence, never by position, so a sorted hint file and an unsorted one describe the same key directory and either reader accepts either file. That is why the radix path, which still inserts key by key through `recovery_build_from_hints`, reads these files unchanged. The one asymmetry runs the other way — `recovery_build_sorted` *requires* sorted input and throws on anything else, so it is reachable only from `recovery_load_ranged`.
 
 Unlike BC-088, the sorted writer does **not** deduplicate. `file_stats.min_sequence` / `max_sequence` are rebuilt at recovery from the entries the hint file still holds, and `ChangeIterator` selects data files by that range; dropping an entry can raise `min_sequence` above a sequence the data file really contains, and replication would then skip the file.
 
