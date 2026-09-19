@@ -189,8 +189,6 @@ real key. Nothing depends on the order regardless: every reader resolves
 entries by sequence, never by position, so a sorted hint file and an unsorted
 one describe the same key directory.
 
-Keys are stored in full — no prefix compression.
-
 ### File Layout
 
 ```

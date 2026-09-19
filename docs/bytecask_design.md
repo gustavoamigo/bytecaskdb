@@ -942,7 +942,7 @@ Hint files are compact companion files to sealed (rotated) data files. Each hint
 
 ### Entry Structure
 
-`flush_hints_for()` writes entries in data-file append order. Keys are stored in full — no prefix compression.
+`flush_hints_for()` writes the keyless batch markers and the range tombstones first in data-file append order, then the Put and Delete entries sorted by key. See [Sorted Hint Files](#sorted-hint-files).
 
 ```
 +------------------+
