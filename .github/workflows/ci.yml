@@ -217,6 +217,13 @@ jobs:
   # libcxx-devel package (used as-is by ASan/TSan) isn't instrumented, and
   # linking it into an MSan binary produces false positives. See
   # scripts/build_msan_libcxx.sh and docs/correctness_validation.md.
+  #
+  # ASan and TSan run on every PR. MSan runs only on push to main and on
+  # workflow_dispatch: origin tracking (-fsanitize-memory-track-origins=2)
+  # makes its test step both the slowest of the three and by far the least
+  # predictable — measured at 2m48s and 11m56s on two runs of the same
+  # commit, against a steady ~1m50s for ASan and TSan. A cold cache adds a
+  # ~30s libc++ build on top.
   sanitizers:
     runs-on: ubuntu-latest
     container:
@@ -228,7 +235,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sanitizer: [address, thread, memory]
+        sanitizer: ${{ fromJSON(github.event_name == 'pull_request' && '["address", "thread"]' || '["address", "thread", "memory"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -242,12 +249,22 @@ jobs:
             git ninja-build
           pip3 install nanobind pytest hypothesis
 
+      # build_msan_libcxx.sh picks its llvm-project release branch from the
+      # installed Clang's major version, so that version belongs in the key:
+      # without it a Fedora LLVM bump restores a libc++ built from the old
+      # branch, and the script's own "already installed" check then skips the
+      # rebuild, silently pairing it with the new clang and MSan runtime.
+      - name: Resolve Clang major version
+        if: matrix.sanitizer == 'memory'
+        id: clang
+        run: echo "major=$(clang -dumpversion | cut -d. -f1)" >> "$GITHUB_OUTPUT"
+
       - name: Cache MSan-instrumented libc++
         if: matrix.sanitizer == 'memory'
         uses: actions/cache@v4
         with:
           path: .msan-libcxx
-          key: msan-libcxx-fedora43-${{ hashFiles('scripts/build_msan_libcxx.sh') }}
+          key: msan-libcxx-fedora43-clang${{ steps.clang.outputs.major }}-${{ hashFiles('scripts/build_msan_libcxx.sh') }}
 
       - name: Build MSan-instrumented libc++
         if: matrix.sanitizer == 'memory'
@@ -265,10 +282,16 @@ jobs:
         run: xmake build bytecask_tests
 
       - name: Run tests under ${{ matrix.sanitizer }} sanitizer
+        # No halt_on_error=0 for ASan/MSan: without -fsanitize-recover=<san>
+        # Clang emits the noreturn report stubs (__asan_report_*, not
+        # *_noabort; __msan_warning_noreturn, not __msan_warning), so the
+        # setting is dead config that would quietly turn into a
+        # failure-masking one if a recover flag were ever added. TSan keeps
+        # it: it genuinely continues past a report and exits nonzero at the
+        # end if any race was found.
         env:
-          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'halt_on_error=0 detect_leaks=1' || '' }}
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
           TSAN_OPTIONS: ${{ matrix.sanitizer == 'thread' && 'halt_on_error=0 history_size=4' || '' }}
-          MSAN_OPTIONS: ${{ matrix.sanitizer == 'memory' && 'halt_on_error=0' || '' }}
         run: xmake run bytecask_tests
 
   # ---------------------------------------------------------------------------
