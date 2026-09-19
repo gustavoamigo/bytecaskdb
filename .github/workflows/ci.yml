@@ -220,8 +220,10 @@ jobs:
   #
   # ASan and TSan run on every PR. MSan runs only on push to main and on
   # workflow_dispatch: origin tracking (-fsanitize-memory-track-origins=2)
-  # makes its test run ~6x longer than the other two, and a cold cache adds
-  # a full libc++ build on top of that.
+  # makes its test step both the slowest of the three and by far the least
+  # predictable — measured at 2m48s and 11m56s on two runs of the same
+  # commit, against a steady ~1m50s for ASan and TSan. A cold cache adds a
+  # ~30s libc++ build on top.
   sanitizers:
     runs-on: ubuntu-latest
     container:

@@ -819,8 +819,11 @@ run.
 Run: `scripts/run_sanitizer.sh memory`. Target scope matches the ASan/TSan
 jobs above: `bytecask_tests` only, not `radix_tree_memory_tests` or
 `unordered_view_tests`. Trigger scope does not — origin tracking makes the
-MSan test run roughly 6x longer than ASan's or TSan's, so it is excluded
-from the `pull_request` matrix and runs on push to `main` and on
+MSan test step the slowest of the three and by far the least predictable
+(2m48s and 11m56s on two runs of the same commit, against a steady ~1m50s
+for ASan and TSan; per-job runners vary by ~1.8x and the seeded `[model]`
+workloads account for much of the rest), so it is excluded from the
+`pull_request` matrix and runs on push to `main` and on
 `workflow_dispatch`.
 
 ### Fuzz testing (libFuzzer)
