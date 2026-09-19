@@ -200,7 +200,8 @@ public:
     }
     auto map = std::span<const std::byte>{
         static_cast<const std::byte *>(addr), map_size};
-    // The merge walks each file front to back exactly once.
+    // Every pass over a hint file — the CRC check below, the shortfall check
+    // recovery runs next, the merge itself — goes front to back.
     ::madvise(addr, map_size, MADV_SEQUENTIAL);
 
     Crc32 crc{};

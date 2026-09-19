@@ -2971,6 +2971,38 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
   }
 }
 
+// A hint entry names where its record sits in the data file, so the end of the
+// furthest one is the extent the index depends on. Nothing else records what a
+// sealed data file's length should be: if the file is short rather than corrupt
+// — a torn tail, a partial restore, a copy that lost its last extent — then
+// scan_committed stops cleanly at the first entry that does not frame, so a
+// rebuild would produce a shorter hint and no CRC error is ever raised. Comparing
+// the readable index against the file it indexes is what turns that silent loss
+// into the visible outcome an unreadable file already gets.
+//
+// Throws on a shortfall, which both recovery paths hand to
+// fail_recovery_on_crc_errors. Every hint entry type is checked: a data file
+// entry is header + key + value + CRC for Put and Delete alike, and a RangeDel
+// carries its end key as the value, so value_size sizes all three exactly.
+// One walk over a buffer the CRC check just read, and no I/O of its own.
+static void check_data_file_covers_hint(
+    const HintFile &hint, std::uint64_t data_file_bytes,
+    const std::filesystem::path &hint_path) {
+  std::uint64_t index_end = 0;
+  auto scanner = hint.make_scanner();
+  while (auto he = scanner.next()) {
+    const auto end =
+        he->file_offset + entry_size(he->key.size(), he->value_size);
+    if (end > index_end) index_end = end;
+  }
+  if (index_end > data_file_bytes) {
+    throw std::runtime_error{std::format(
+        "bytecask: data file is shorter than its index — hint '{}' addresses "
+        "bytes up to {} but its data file holds {}",
+        hint_path.string(), index_end, data_file_bytes)};
+  }
+}
+
 auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
                               const std::filesystem::path &dir)
     -> std::optional<Offset> {
@@ -3863,6 +3895,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
     try {
       auto hint =
           open_hint_or_rebuild(data_file, hint_path, &HintFile::OpenForRead);
+      check_data_file_covers_hint(hint, tb, hint_path);
       auto scanner = hint.make_scanner();
       while (auto he = scanner.next()) {
         // Track per-file sequence bounds for ALL entries, including those
@@ -4215,8 +4248,12 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   // Put is admitted.
   for (auto &[file_id, data_file, hint_path, tb] : files) {
     try {
-      open_hints.push_back(
-          open_hint_or_rebuild(data_file, hint_path, &HintFile::OpenForMerge));
+      auto hint =
+          open_hint_or_rebuild(data_file, hint_path, &HintFile::OpenForMerge);
+      // Before the file contributes anything: Phase B feeds a bulk loader that
+      // cannot be unwound, so a file this rejects has to be rejected here.
+      check_data_file_covers_hint(hint, tb, hint_path);
+      open_hints.push_back(std::move(hint));
       auto scanner = open_hints.back().make_scanner();
       std::optional<HintEntry> first;
       while (auto he = scanner.next()) {

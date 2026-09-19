@@ -146,6 +146,30 @@ void corrupt_hint_beyond_rebuild(const std::filesystem::path &hint) {
                           (hint.stem().string() + ".data"));
 }
 
+// Drops bytes off the end of a data file, leaving its hint untouched: the
+// index still names records the file no longer holds. This is the shape a
+// torn tail, a partial restore, or a copy that lost its last extent leaves —
+// short rather than corrupt, so no CRC anywhere fails.
+void truncate_data_file(const std::filesystem::path &data,
+                        std::uint64_t drop) {
+  const auto size = std::filesystem::file_size(data);
+  REQUIRE(size > drop);
+  std::filesystem::resize_file(data, size - drop);
+}
+
+// True when opening dir throws the shortfall report specifically, rather than
+// any std::runtime_error a different defect might raise.
+auto open_reports_shortfall(const std::filesystem::path &dir,
+                            const bytecask::Options &opts) -> bool {
+  try {
+    (void)bytecask::DB::open(dir, opts);
+    return false;
+  } catch (const std::runtime_error &e) {
+    return std::string_view{e.what()}.find("shorter than its index") !=
+           std::string_view::npos;
+  }
+}
+
 // Returns .hint files in dir sorted by name (ascending creation-time order).
 auto list_hint_files(const std::filesystem::path &dir)
     -> std::vector<std::filesystem::path> {
@@ -1231,6 +1255,113 @@ TEST_CASE("DB recovery: vacuum keeps a data file whose hint was rebuilt",
   CHECK(get_str(db, to_bytes("key_first")) == "v1");
   CHECK(get_str(db, to_bytes("key_second")) == "v2");
   CHECK(get_str(db, to_bytes("key_third")) == "v3");
+}
+
+// ---------------------------------------------------------------------------
+// A short data file is not a corrupt one. scan_committed stops cleanly
+// at the first entry that does not frame, so rebuilding a hint from a
+// truncated file yields a shorter hint and no CRC error is raised anywhere —
+// recovery used to succeed and simply omit every key past the tear, which
+// then made those bytes garbage for the next vacuum to rewrite.
+//
+// A readable hint is the record of what the file should hold: the end of its
+// furthest entry is the extent the index depends on. Recovery compares the
+// two and reports a shortfall under fail_recovery_on_crc_errors, the same
+// visible outcome a file it cannot index already gets.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB recovery: strict mode reports a data file shorter than its hint",
+          "[bytecask][recovery][short_data_file]") {
+  const auto threads = GENERATE(1u, 4u);
+  CAPTURE(threads);
+
+  TempDir td;
+  const auto db_path = td.path / "db";
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+    db.put({}, to_bytes("key_first"), to_bytes("v1"));
+    db.put({}, to_bytes("key_second"), to_bytes("v2"));
+    db.put({}, to_bytes("key_third"), to_bytes("v3"));
+  }
+
+  // Every CRC in the database still holds; the middle data file is simply
+  // missing its last bytes.
+  const auto hints = list_hint_files(db_path);
+  REQUIRE(hints.size() >= 2);
+  truncate_data_file(db_path / (hints[1].stem().string() + ".data"), 5);
+
+  CHECK(open_reports_shortfall(db_path, {.max_file_bytes = 1,
+                                         .recovery_threads = threads}));
+}
+
+// ---------------------------------------------------------------------------
+// Lenient recovery treats the shortfall like any other file it cannot trust:
+// the file is skipped with a warning and the rest of the database opens.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB recovery: lenient mode skips a data file shorter than its hint",
+          "[bytecask][recovery][short_data_file][recovery_lenient]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+    db.put({}, to_bytes("key_first"), to_bytes("v1"));
+    db.put({}, to_bytes("key_second"), to_bytes("v2"));
+    db.put({}, to_bytes("key_third"), to_bytes("v3"));
+  }
+
+  const auto hints = list_hint_files(db_path);
+  REQUIRE(hints.size() >= 2);
+  truncate_data_file(db_path / (hints[1].stem().string() + ".data"), 5);
+
+  auto db = bytecask::DB::open(db_path,
+                               {.max_file_bytes = 1,
+                                .fail_recovery_on_crc_errors = false});
+  CHECK_FALSE(db.is_degraded());
+  // Filenames carry a random salt, so which key sits in the middle file is
+  // not known — exactly one of the three is gone.
+  int found = 0;
+  if (get_val(db, to_bytes("key_first")).has_value()) ++found;
+  if (get_val(db, to_bytes("key_second")).has_value()) ++found;
+  if (get_val(db, to_bytes("key_third")).has_value()) ++found;
+  CHECK(found == 2);
+}
+
+// ---------------------------------------------------------------------------
+// The realistic shape: one file holding several entries loses only its tail,
+// so the entries below the tear still frame and still pass their CRCs. The
+// check has to bound the furthest entry the index names, not just the last
+// one it happens to read — hint entries are ordered by key, not by offset.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB recovery: a torn tail in a multi-entry data file is reported",
+          "[bytecask][recovery][short_data_file]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  {
+    // One file for everything — no rotation, so all 12 entries share it.
+    auto db = bytecask::DB::open(db_path);
+    for (int i = 0; i < 12; ++i) {
+      db.put({}, to_bytes(std::format("key_{:02d}", i)),
+             to_bytes(std::format("value_{:02d}", i)));
+    }
+  }
+  // The active file at shutdown carries no hint. The next open drops its
+  // preallocated tail and generates one, which is the readable index this
+  // check reads the file's intended extent from.
+  {
+    auto db = bytecask::DB::open(db_path);
+    CHECK_FALSE(db.is_degraded());
+  }
+
+  const auto hints = list_hint_files(db_path);
+  REQUIRE(hints.size() == 1);
+  const auto data = db_path / (hints[0].stem().string() + ".data");
+  const auto before = std::filesystem::file_size(data);
+
+  // Losing one entry's worth of tail: the keys below it are intact and
+  // recovery would have reported them as the whole database.
+  truncate_data_file(data, 20);
+  CHECK(std::filesystem::file_size(data) < before);
+
+  CHECK(open_reports_shortfall(db_path, {}));
 }
 
 // ---------------------------------------------------------------------------
