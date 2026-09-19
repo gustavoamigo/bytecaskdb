@@ -1162,13 +1162,14 @@ control:
   rather than corrupt (a torn tail, a partial restore, a copy that lost
   its last extent). No CRC fails: the scan stops cleanly at the first
   entry that does not frame. Where the file's hint is readable, recovery
-  compares the end of the hint's furthest entry against the data file's
-  size and reports a shortfall through `fail_recovery_on_crc_errors`
-  (#124). Where the hint is *also* unreadable, the rebuild scans the
-  short file and produces a hint consistent with it; a sealed data file
-  carries no external record of its own length, so nothing is left to
-  check it against and the loss is silent. Sequence gaps are not a
-  signal — contiguity is not required (see "Gaps in LSN are safe"), so
+  tests every entry against the data file's size as it scans: strict
+  recovery throws, and lenient recovery drops the entries past the tear
+  and keeps every key below it, which is what a rescan of the short file
+  would produce (#124). Where the hint is *also* unreadable, the rebuild
+  scans the short file and produces a hint consistent with it; a sealed
+  data file carries no external record of its own length, so nothing is
+  left to check it against and the loss is silent. Sequence gaps are not
+  a signal — contiguity is not required (see "Gaps in LSN are safe"), so
   a missing run cannot be told from a legitimate gap.
 - **Corrupt bytes in an otherwise healthy file** — every degrade shape in
   the matrix leaves a *well-formed* active file: the orphaned bytes parse,

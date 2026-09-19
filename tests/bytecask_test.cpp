@@ -1365,6 +1365,65 @@ TEST_CASE("DB recovery: a torn tail in a multi-entry data file is reported",
 }
 
 // ---------------------------------------------------------------------------
+// Lenient recovery drops only the entries the data file no longer covers, not
+// the whole file. A data file is append-only, so those entries are its lost
+// tail and dropping them is exactly what a rescan of the short file produces —
+// every key below the tear is still recovered.
+//
+// Rejecting the whole file instead would recreate the loss #117 was about: the
+// file would keep its total_bytes while contributing no live_bytes, so the next
+// vacuum would see pure garbage and unlink it, turning a torn tail into the
+// loss of everything the file held.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB recovery: a torn tail costs only the entries past the tear",
+          "[bytecask][recovery][short_data_file][vacuum]") {
+  const auto threads = GENERATE(1u, 4u);
+  CAPTURE(threads);
+
+  TempDir td;
+  const auto db_path = td.path / "db";
+  {
+    auto db = bytecask::DB::open(db_path);
+    for (int i = 0; i < 12; ++i) {
+      db.put({}, to_bytes(std::format("key_{:02d}", i)),
+             to_bytes(std::format("value_{:02d}", i)));
+    }
+  }
+  {
+    auto db = bytecask::DB::open(db_path);
+    CHECK_FALSE(db.is_degraded());
+  }
+
+  const auto hints = list_hint_files(db_path);
+  REQUIRE(hints.size() == 1);
+  const auto data = db_path / (hints[0].stem().string() + ".data");
+  // Every entry here is the same width, so dropping one entry's worth of
+  // bytes costs exactly the last key.
+  const auto entry_bytes = std::filesystem::file_size(data) / 12;
+  truncate_data_file(data, entry_bytes);
+
+  auto db = bytecask::DB::open(db_path,
+                               {.recovery_threads = threads,
+                                .fail_recovery_on_crc_errors = false});
+  CHECK_FALSE(db.is_degraded());
+
+  // The eleven keys below the tear survive; only the last is gone.
+  for (int i = 0; i < 11; ++i) {
+    CHECK(get_str(db, to_bytes(std::format("key_{:02d}", i))) ==
+          std::format("value_{:02d}", i));
+  }
+  CHECK_FALSE(get_val(db, to_bytes("key_11")).has_value());
+
+  // Those keys are live bytes, so vacuum has no reason to reclaim the file.
+  for (int i = 0; i < 8 && db.vacuum(); ++i) {
+  }
+  for (int i = 0; i < 11; ++i) {
+    CHECK(get_str(db, to_bytes(std::format("key_{:02d}", i))) ==
+          std::format("value_{:02d}", i));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Model-based recovery: random workload with oracle comparison.
 //
 // A random sequence of puts, deletes, overwrites, and batches is applied to
