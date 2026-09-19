@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <filesystem>
+#include <array>
 #include <format>
 #include <fstream>
 #include <functional>
@@ -1588,6 +1589,141 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
     CHECK(collect_stats(db) == serial_stats_vals);
   }
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Model-based recovery: many keys per worker, with range deletes.
+//
+// The other model tests rotate on every write, so each worker ends up with a
+// handful of keys. This one gives every worker a tree several levels deep
+// spanning the whole key space, which is what a real recovery looks like and
+// what a range-partitioned merge needs in order to have more than one range:
+// the workers' key ranges overlap almost completely, tombstones and range
+// tombstones cross worker boundaries, and the winning entry for a key is as
+// likely to come from one worker as another.
+// ---------------------------------------------------------------------------
+TEST_CASE("Recovery model-based: wide workers with range deletes",
+          "[bytecask][recovery][parallel][model]") {
+  std::mt19937 gen(24680);
+
+  TempDir td;
+  const auto db_path = td.path / "db";
+  std::map<std::string, std::string> oracle;
+
+  // Keys interleave five prefixes so that no file holds a contiguous slice.
+  static constexpr std::array prefixes = {"alpha:", "bravo:", "delta:",
+                                          "gamma:", "omega:"};
+  auto key_at = [&](int i) {
+    return std::format("{}{:05d}",
+                       prefixes[static_cast<std::size_t>(i) % prefixes.size()],
+                       i);
+  };
+
+  {
+    // 16 KiB files: a dozen files, each holding enough keys that a worker's
+    // tree is several leaves deep and so has separators to offer.
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 16 * 1024});
+
+    // The setup is not what is under test and the close below seals and
+    // flushes everything, so it does not pay for an fdatasync per write.
+    const bytecask::WriteOptions wo{.sync = false};
+
+    for (int i = 0; i < 4000; ++i) {
+      auto key = key_at(i);
+      auto val = std::format("v{:06d}", i);
+      db.put(wo, to_bytes(key), to_bytes(val));
+      oracle[key] = val;
+    }
+    // Overwrite a third of them, so the winner for a key sits in a later file
+    // than the one the round-robin gave the same worker.
+    for (int i = 0; i < 4000; i += 3) {
+      auto key = key_at(i);
+      auto val = std::format("w{:06d}", i);
+      db.put(wo, to_bytes(key), to_bytes(val));
+      oracle[key] = val;
+    }
+    // Point deletes scattered across the space.
+    for (int i = 0; i < 4000; i += 7) {
+      auto key = key_at(i);
+      std::ignore = db.del(wo, to_bytes(key));
+      oracle.erase(key);
+    }
+    // Range deletes: two whole prefixes' worth of sub-ranges, so the
+    // tombstones span keys that several workers hold.
+    for (const auto *bounds : {"bravo:00600", "gamma:02000"}) {
+      const std::string from{bounds};
+      const auto to = from.substr(0, 6) + "02600";
+      db.del_range(wo, to_bytes(from), to_bytes(to));
+      for (auto it = oracle.lower_bound(from); it != oracle.end();)
+        it = it->first < to ? oracle.erase(it) : oracle.end();
+    }
+    // Writes after the range deletes must survive them.
+    for (int i = 0; i < 100; ++i) {
+      auto key = std::format("bravo:0{:04d}", 600 + i * 5);
+      auto val = std::format("late{:04d}", i);
+      db.put(wo, to_bytes(key), to_bytes(val));
+      oracle[key] = val;
+    }
+    std::ignore = gen;
+  }
+
+  auto collect = [](bytecask::DB &db) {
+    std::map<std::string, std::string> kv;
+    for (auto &entry : db.iter_from({}))
+      kv[to_string(entry.key)] = to_string(entry.value);
+    return kv;
+  };
+
+  auto verify = [&](const std::string &label,
+                    const std::map<std::string, std::string> &recovered) {
+    INFO(label);
+    REQUIRE(recovered.size() == oracle.size());
+    for (const auto &[k, v] : oracle) {
+      INFO("key=\"" << k << "\"");
+      auto it = recovered.find(k);
+      REQUIRE(it != recovered.end());
+      CHECK(it->second == v);
+    }
+  };
+
+  auto collect_stats = [](bytecask::DB &db) {
+    std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                           std::uint64_t, std::uint64_t>> vals;
+    for (const auto &[fid, fs] : db.file_stats())
+      vals.emplace_back(fs.live_bytes, fs.total_bytes,
+                        fs.min_sequence, fs.max_sequence);
+    std::ranges::sort(vals);
+    return vals;
+  };
+
+  int data_file_count = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path})
+    if (e.path().extension() == ".data") ++data_file_count;
+  REQUIRE(data_file_count > 8);
+
+  std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                         std::uint64_t, std::uint64_t>> serial_stats_vals;
+  {
+    const auto p = td.path / "serial_baseline";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.recovery_threads = 1});
+    verify("serial_baseline", collect(db));
+    serial_stats_vals = collect_stats(db);
+  }
+
+  // Every thread count changes both the partitioning and the number of
+  // ranges the merge runs over; all must land on the same directory.
+  for (const unsigned threads : {1U, 2U, 3U, 5U, 8U}) {
+    DYNAMIC_SECTION("recovery_threads = " << threads) {
+      const auto p = td.path / std::format("t{}", threads);
+      std::filesystem::copy(db_path, p,
+                            std::filesystem::copy_options::recursive);
+      auto db = bytecask::DB::open(p, {.recovery_threads = threads});
+      verify(std::format("threads/{}", threads), collect(db));
+      CHECK(collect_stats(db) == serial_stats_vals);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

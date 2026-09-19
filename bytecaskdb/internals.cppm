@@ -18,6 +18,7 @@ module;
 
 export module bytecask:internals;
 
+import bytecask.btree;
 import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.radix_tree;
@@ -160,13 +161,37 @@ export inline constexpr auto entry_size(std::size_t key_size,
 export class TransientEngineState;
 
 // ---------------------------------------------------------------------------
+// The key directory's tree. Both implementations offer the same surface, so
+// the engine names only these aliases. The B+ tree
+// (docs/persistent_btree_design.md) is the default; BYTECASK_KEYDIR=radix
+// builds the engine on the radix tree instead.
+// ---------------------------------------------------------------------------
+#ifdef BYTECASK_USE_BTREE
+export using KeyDirTree = PersistentBTree<KeyDirEntry>;
+export using KeyDirTransient = TransientBTree<KeyDirEntry>;
+export using KeyDirIter = BTreeIterator<KeyDirEntry>;
+export using KeyDirValueIter = BTreeValueIterator<KeyDirEntry>;
+export using KeyDirReverseValueIter = ReverseBTreeValueIterator<KeyDirEntry>;
+// Bulk build of a key directory from ascending keys, and the concatenation
+// of the slices several threads built — what recovery_load_ranged uses.
+export using KeyDirBulkLoader = btree_detail::BulkLoader<KeyDirEntry>;
+export using KeyDirLeafRun = btree_detail::LeafRun<KeyDirEntry>;
+#else
+export using KeyDirTree = PersistentRadixTree<KeyDirEntry>;
+export using KeyDirTransient = TransientRadixTree<KeyDirEntry>;
+export using KeyDirIter = RadixTreeIterator<KeyDirEntry>;
+export using KeyDirValueIter = ValueIterator<KeyDirEntry>;
+export using KeyDirReverseValueIter = ReverseValueIterator<KeyDirEntry>;
+#endif
+
+// ---------------------------------------------------------------------------
 // EngineState — immutable snapshot of all mutable engine state.
 //
 // Each write produces a new EngineState via a pure transition method.
 // The old state stays alive as long as any reader holds a shared_ptr.
 // ---------------------------------------------------------------------------
 export struct EngineState {
-  PersistentRadixTree<KeyDirEntry> key_dir;
+  KeyDirTree key_dir;
   PersistentU32Map<std::shared_ptr<DataFile>> files;
   PersistentU32Map<FileStats> file_stats;
   std::uint32_t active_file_id{};
@@ -291,7 +316,7 @@ export struct RangeTombstone {
 };
 
 export struct RecoveryResult {
-  PersistentRadixTree<KeyDirEntry> key_dir;
+  KeyDirTree key_dir;
   std::map<Key, std::uint64_t> tombstones;
   std::vector<RangeTombstone> range_tombstones;
   std::uint64_t max_seq{0};

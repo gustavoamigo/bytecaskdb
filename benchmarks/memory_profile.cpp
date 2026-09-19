@@ -7,6 +7,11 @@
 //   BC_DATASET_SIZE=1000000 ./memory_profile
 //   BC_KEY_FORMAT=sha256_hex BC_DATASET_SIZE=10000 ./memory_profile
 //   BC_DATASET_SIZE=1000000 node build/memory_profile.js  (WASM)
+//   BC_INDEX_ONLY=btree BC_KEY_FORMAT=uuidv7 ./memory_profile   (tree only)
+//
+// BC_INDEX_ONLY=btree|radix builds only the in-memory key directory from the
+// key shape, without a DB, so the per-key cost of the index itself can be
+// read off directly.
 //
 // Available key formats (BC_KEY_FORMAT):
 //   prefixed (default), uniform, short, incremental, uuidv7, uuidv7_binary,
@@ -20,6 +25,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
+#include <utility>
 #include <span>
 #include <string>
 #include <vector>
@@ -32,6 +39,8 @@
 #endif
 
 import bytecask;
+import bytecask.btree;
+import bytecask.radix_tree;
 
 namespace {
 
@@ -48,6 +57,11 @@ auto dataset_size() -> std::size_t {
 auto key_format() -> std::string {
   const char *env = std::getenv("BC_KEY_FORMAT");
   return (env && *env) ? std::string{env} : "prefixed";
+}
+
+auto index_only() -> std::string {
+  const char *env = std::getenv("BC_INDEX_ONLY");
+  return (env && *env) ? std::string{env} : std::string{};
 }
 
 auto use_unordered_view() -> bool {
@@ -142,6 +156,61 @@ void print_memory(const char *phase) {
 }
 #endif
 
+// Builds only the key directory, one transient per batch the way the engine
+// does, and reports memory. Values are KeyDirEntry, as in the engine.
+template <typename Tree>
+void profile_index_only(const key_generators::KeyShape &shape, std::size_t n) {
+  std::string key_buf;
+  print_memory("before build");
+  {
+    Tree t;
+    for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
+      auto tr = t.transient();
+      auto end = std::min(i + kPopulateBatchSize, n);
+      for (std::size_t j = i; j < end; ++j) {
+        shape.make_key(j, n, key_buf);
+        tr.set(bc_key(key_buf), bytecask::KeyDirEntry::make(j, 0, 0, 0));
+      }
+      t = std::move(tr).persistent();
+    }
+    print_memory("after insert");
+    std::printf("  keys: %zu\n", t.size());
+    if constexpr (requires { t.stats(); }) {
+      const auto st = t.stats();
+      std::printf("  nodes %zu (leaves %zu), height %zu, fill %.2f, "
+                  "dead %.3f, avg leaf prefix %.1f B, avg suffix %.1f B, "
+                  "capacity/key %.1f B\n",
+                  st.nodes, st.leaves, st.height,
+                  static_cast<double>(st.used_bytes) /
+                      static_cast<double>(st.capacity_bytes),
+                  static_cast<double>(st.dead_bytes) /
+                      static_cast<double>(st.capacity_bytes),
+                  static_cast<double>(st.leaf_prefix_bytes) /
+                      static_cast<double>(st.leaves),
+                  static_cast<double>(st.leaf_suffix_bytes) /
+                      static_cast<double>(st.entries),
+                  static_cast<double>(st.capacity_bytes) /
+                      static_cast<double>(st.entries));
+      std::map<std::uint32_t, std::size_t> hist;
+      for (auto c : st.leaf_counts)
+        ++hist[c];
+      std::vector<std::pair<std::size_t, std::uint32_t>> top;
+      for (const auto &[c, n_leaves] : hist)
+        top.emplace_back(n_leaves, c);
+      std::sort(top.rbegin(), top.rend());
+      std::printf("  splits by rule (outlier-last, outlier-first, seq-asc, seq-desc, balanced):");
+      for (auto &c : bytecask::btree_detail::split_rule_counts)
+        std::printf(" %lu", static_cast<unsigned long>(c.load()));
+      std::printf("\n");
+      std::printf("  leaf sizes (keys: leaves):");
+      for (std::size_t i = 0; i < std::min<std::size_t>(6, top.size()); ++i)
+        std::printf(" %u:%zu", top[i].second, top[i].first);
+      std::printf("\n");
+    }
+  }
+  print_memory("after close");
+}
+
 } // namespace
 
 int main() {
@@ -164,6 +233,20 @@ int main() {
 
   auto val = make_value();
   bytecask::BytesView val_view{val.data(), val.size()};
+
+  if (auto index = index_only(); !index.empty()) {
+    std::printf("=== Index-only Memory Profile (%s, %zu keys, %zu-byte %s keys) ===\n",
+                index.c_str(), n, avg_key_size, format.c_str());
+    if (index == "btree") {
+      profile_index_only<bytecask::PersistentBTree<bytecask::KeyDirEntry>>(*shape, n);
+    } else if (index == "radix") {
+      profile_index_only<bytecask::PersistentRadixTree<bytecask::KeyDirEntry>>(*shape, n);
+    } else {
+      std::fprintf(stderr, "Unknown BC_INDEX_ONLY: %s (btree|radix)\n", index.c_str());
+      return 1;
+    }
+    return 0;
+  }
 
   std::printf("=== Memory Profile (%zu keys, %zu-byte %s keys, %zu-byte values%s) ===\n",
               n, avg_key_size, format.c_str(), kValueSize,

@@ -10,7 +10,7 @@ Canonical location: `docs/engine_api_design.md`.
 
 - Provide a clean, minimal API surface for key-value operations.
 - Support atomic multi-operation batches.
-- Support ordered range iteration (enabled by the radix-tree key directory).
+- Support ordered range iteration (enabled by the ordered, in-memory key directory).
 - Be idiomatic C++20: no raw pointers, no stringly-typed errors, move-only ownership.
 
 ## Non-Goals (for now)
@@ -27,7 +27,7 @@ Canonical location: `docs/engine_api_design.md`.
 
 ByteCaskDB uses `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times. The immutable trie structure provides structural sharing so readers take a cheap snapshot of the root without acquiring any lock.
 
-`PersistentRadixTree<V>` is a custom copy-on-write adaptive radix tree (ART-style) implemented in `src/radix_tree.cppm`. It supports O(k) get/set/erase (k = key length), structural sharing between versions, and in-order iteration via `RadixTreeIterator<V>`.
+`PersistentBTree<V>` is a custom copy-on-write B+ tree implemented in `bytecaskdb/btree.cppm`. It supports get/set/erase, structural sharing between versions, and in-order iteration via `BTreeIterator<V>`. `PersistentRadixTree<V>` (`bytecaskdb/radix_tree.cppm`) offers the same surface and is selected by `BYTECASK_KEYDIR=radix`; the engine names both only through the aliases in `bytecaskdb/internals.cppm`.
 
 ### Concurrency Model
 
@@ -237,7 +237,7 @@ private:
 Both iterators satisfy `std::input_iterator`. They are forward-only and yield entries in ascending key order.
 
 ```cpp
-// Yields keys only (no data file I/O). Walks the in-memory radix tree.
+// Yields keys only (no data file I/O). Walks the in-memory key directory.
 class KeyIterator {
 public:
     using value_type      = Bytes;
@@ -271,7 +271,7 @@ for (auto& key : db.keys_from(opts, prefix))              { ... }
 
 **Decisions:**
 - **Lazy**: `operator*` reads one value from disk on demand via a single `pread`. Early-termination scans pay no I/O cost for unvisited entries.
-- **`KeyIterator` is in-memory only**: walks the radix-tree key directory without touching any data file.
+- **`KeyIterator` is in-memory only**: walks the in-memory key directory without touching any data file.
 - **Error handling**: throws `std::system_error` on I/O failure (consistent with all other operations).
 
 ---
@@ -336,7 +336,7 @@ public:
                                  BytesView from = {}) const
         -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
 
-    // Returns an input range of keys >= from. Walks the in-memory radix tree
+    // Returns an input range of keys >= from. Walks the in-memory key directory
     // only; no disk I/O.
     [[nodiscard]] auto keys_from(const ReadOptions& opts,
                                  BytesView from = {}) const
@@ -389,7 +389,7 @@ for (auto& [key, value] : db.iter_from(kRead, as_bytes("user:"))) {
     // Iterates all keys >= "user:" in ascending order.
 }
 
-// Keys-only scan (no disk I/O — radix tree walk only).
+// Keys-only scan (no disk I/O — key directory walk only).
 for (auto& key : db.keys_from(kRead, as_bytes("user:"))) { ... }
 
 // Background vacuum loop (run in a dedicated thread).
@@ -414,7 +414,7 @@ while (!stop_requested) {
 | D3 | **WritePlan ownership**: `WritePlan` is move-only (copy constructor and copy assignment deleted). Single-use by design; `apply_batch` consumes it. |
 | D4 | **WritePlan size limit**: None — the caller is responsible. |
 | D5 | **Iterator strategy**: Lazy — `operator*` reads one value from disk on demand via a single `pread`. Early-termination scans pay no I/O cost for unvisited entries. |
-| D6 | **`KeyIterator` source**: In-memory only — walks the radix-tree key directory without opening any data file. |
+| D6 | **`KeyIterator` source**: In-memory only — walks the in-memory key directory without opening any data file. |
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
 | D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1). |
 | D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. Concurrent sync writers are batched via group commit. `ReadOptions::staleness_tolerance` enables bounded-staleness reads. |

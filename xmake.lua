@@ -125,6 +125,14 @@ end
 -- LTO and target CPU applied per-target to avoid polluting dependency package builds.
 -- Set BYTECASK_MARCH to override (e.g. "x86-64-v3" for portable wheels).
 -- Defaults to "native" for local development.
+-- Key directory tree selection: the engine is built on the persistent B+ tree
+-- (docs/persistent_btree_design.md). BYTECASK_KEYDIR=radix builds it on the
+-- radix tree instead, which both trees' test suites still exercise. Applies to
+-- every target so tests and benchmarks agree.
+if os.getenv("BYTECASK_KEYDIR") ~= "radix" then
+    add_defines("BYTECASK_USE_BTREE")
+end
+
 local march = os.getenv("BYTECASK_MARCH") or "native"
 local function add_release_opts(t)
     if is_mode("release") then
@@ -167,6 +175,20 @@ target("bytecask_tests")
         add_packages("catch2")
     end
     add_defines("BYTECASK_TESTING", "BYTECASK_RADIX_ACCOUNTING")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        apply_coverage(t)
+        add_release_opts(t)
+    end)
+
+target("btree_tests")
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/btree_test.cpp", "bytecaskdb/*.cppm")
+    add_includedirs("bytecaskdb", "tests")
+    add_packages("catch2", "crc32c")
+    add_defines("BYTECASK_TESTING")
     on_config(function(t)
         add_native_syslinks(t)
         apply_sanitizer(t)
@@ -221,8 +243,15 @@ target("engine_bench")
     set_default(false)
     add_files("benchmarks/engine_bench.cpp", "bytecaskdb/*.cppm")
     add_cxflags("-Wno-global-constructors")
-    add_packages("benchmark", "crc32c", "rocksdb")
     add_defines("BENCH_NO_LEVELDB")
+    -- BYTECASK_NO_ROCKSDB=1 drops the RocksDB comparison rows, for hosts
+    -- without the library (the ByteCaskDB rows are unaffected).
+    if os.getenv("BYTECASK_NO_ROCKSDB") then
+        add_packages("benchmark", "crc32c")
+        add_defines("BENCH_NO_ROCKSDB")
+    else
+        add_packages("benchmark", "crc32c", "rocksdb")
+    end
     on_config(function(t)
         add_native_syslinks(t)
         apply_sanitizer(t)
@@ -248,6 +277,7 @@ target("memory_profile")
     set_default(false)
     add_files("benchmarks/memory_profile.cpp", "bytecaskdb/*.cppm")
     add_packages("crc32c", "jemalloc")
+    add_defines("BYTECASK_TESTING")
     on_config(function(t)
         add_native_syslinks(t)
         apply_sanitizer(t)

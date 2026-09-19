@@ -53,6 +53,7 @@ jobs:
       - name: Build all test targets
         run: |
           xmake build bytecask_tests
+          xmake build btree_tests
           xmake build radix_tree_memory_tests
           xmake build unordered_view_tests
 
@@ -61,6 +62,7 @@ jobs:
           mkdir -p test-results
           status=0
           build/linux/x86_64/release/bytecask_tests --reporter junit --out test-results/bytecask_tests.xml || status=1
+          build/linux/x86_64/release/btree_tests --reporter junit --out test-results/btree_tests.xml || status=1
           build/linux/x86_64/release/radix_tree_memory_tests --reporter junit --out test-results/radix_tree_memory_tests.xml || status=1
           build/linux/x86_64/release/unordered_view_tests --reporter junit --out test-results/unordered_view_tests.xml || status=1
           exit "$status"
@@ -75,6 +77,7 @@ jobs:
         run: |
           /usr/bin/python scripts/enrich_junit_sources.py \
             --pair build/linux/x86_64/release/bytecask_tests:test-results/bytecask_tests.xml \
+            --pair build/linux/x86_64/release/btree_tests:test-results/btree_tests.xml \
             --pair build/linux/x86_64/release/radix_tree_memory_tests:test-results/radix_tree_memory_tests.xml \
             --pair build/linux/x86_64/release/unordered_view_tests:test-results/unordered_view_tests.xml
 
@@ -99,6 +102,7 @@ jobs:
         with:
           files: |
             ./test-results/bytecask_tests.xml
+            ./test-results/btree_tests.xml
             ./test-results/radix_tree_memory_tests.xml
             ./test-results/unordered_view_tests.xml
           report_type: test_results
@@ -108,6 +112,47 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
           use_oidc: true
+
+  # ---------------------------------------------------------------------------
+  # The radix tree is no longer the key directory the engine builds on, so
+  # nothing else here would compile it. This job keeps BYTECASK_KEYDIR=radix
+  # from rotting: same engine suite, other tree.
+  # ---------------------------------------------------------------------------
+  radix-keydir:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+      BYTECASK_KEYDIR: radix
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel \
+            xmake \
+            python3-pip python3-devel \
+            git ninja-build
+          # bytecaskdb_python's on_load() asks nanobind for its include dir, and
+          # xmake f loads every target — so this job needs it even though it
+          # only builds bytecask_tests.
+          pip3 install nanobind
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            -y
+
+      - name: Build and run the engine suite on the radix key directory
+        run: |
+          xmake build bytecask_tests
+          build/linux/x86_64/release/bytecask_tests
 
   # ---------------------------------------------------------------------------
   # MariaDB storage engine plugin: unit + proof tests (Catch2/ctest) and the
