@@ -948,6 +948,17 @@ private:
       -> std::optional<Offset>;
   // Writes hint files for all sealed files in s.
   void flush_hints(const EngineState &s);
+  // Both HintFile openers verify the file-level CRC before any parsing, so
+  // either one is the point a damaged hint is detected.
+  using HintOpener = auto (*)(std::filesystem::path) -> HintFile;
+  // Opens a hint file, rebuilding it from its data file if it will not open.
+  // A hint is a derived index, not the records it points at: a CRC failure in
+  // one says the index is damaged, not that the data file behind it is.
+  // Throws when the rebuild cannot produce a readable hint, leaving the
+  // caller to apply fail_recovery_on_crc_errors to a file it cannot index.
+  static auto open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
+                                   const std::filesystem::path &hint_path,
+                                   HintOpener open) -> HintFile;
 
   
 
@@ -2937,6 +2948,29 @@ static auto recovery_key_cmp(std::span<const std::byte> a,
   return a.size() < b.size() ? -1 : 1;
 }
 
+auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
+                              const std::filesystem::path &hint_path,
+                              HintOpener open) -> HintFile {
+  try {
+    return open(hint_path);
+  } catch (const std::exception &e) {
+    // flush_hints_for leaves an existing hint alone, so the damaged one has
+    // to go first. Nothing is lost by removing it: it is unreadable either
+    // way, and a rebuild that does not finish here leaves the file hint-less,
+    // which the next open regenerates through the same scan.
+    std::filesystem::remove(hint_path);
+    (void)flush_hints_for(data_file, hint_path.parent_path());
+    auto hint = open(hint_path);
+    // The tail-drop recovery_prepare_files does for a hint-less file is not
+    // repeated here: a file that had a hint at all was sealed, and sealing
+    // already gave its preallocated tail back.
+    std::fprintf(stderr,
+                 "bytecask: rebuilt hint file '%s' from its data file: %s\n",
+                 hint_path.string().c_str(), e.what());
+    return hint;
+  }
+}
+
 auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
                               const std::filesystem::path &dir)
     -> std::optional<Offset> {
@@ -3363,9 +3397,12 @@ void DB::resume() {
                              narrow<std::uint32_t>(entry.value.size()),
                              entry.key});
       }
+      // Every entry yielded lies below the iterator's committed offset, so
+      // recording it here keeps valid_offset in step with `committed` even
+      // when the next entry is corrupt and ++iter throws.
+      valid_offset = iter.committed_offset();
       ++iter;
     }
-    valid_offset = iter.committed_offset();
   } catch (...) {
     // Stop at first CRC error — valid_offset is the last known-good position.
   }
@@ -3824,7 +3861,8 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
 
   for (auto &[file_id, data_file, hint_path, tb] : files) {
     try {
-      auto hint = HintFile::OpenForRead(hint_path);
+      auto hint =
+          open_hint_or_rebuild(data_file, hint_path, &HintFile::OpenForRead);
       auto scanner = hint.make_scanner();
       while (auto he = scanner.next()) {
         // Track per-file sequence bounds for ALL entries, including those
@@ -3888,7 +3926,8 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
     } catch (const std::exception &e) {
       if (strict) throw;
       std::fprintf(stderr,
-                   "bytecask: skipping hint file '%s' due to CRC error: %s\n",
+                   "bytecask: skipping data file for hint '%s' — could not "
+                   "read it or rebuild it from the data file: %s\n",
                    hint_path.string().c_str(), e.what());
     }
   }
@@ -4176,7 +4215,8 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   // Put is admitted.
   for (auto &[file_id, data_file, hint_path, tb] : files) {
     try {
-      open_hints.push_back(HintFile::OpenForMerge(hint_path));
+      open_hints.push_back(
+          open_hint_or_rebuild(data_file, hint_path, &HintFile::OpenForMerge));
       auto scanner = open_hints.back().make_scanner();
       std::optional<HintEntry> first;
       while (auto he = scanner.next()) {
@@ -4197,7 +4237,8 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
     } catch (const std::exception &e) {
       if (strict) throw;
       std::fprintf(stderr,
-                   "bytecask: skipping hint file '%s' due to CRC error: %s\n",
+                   "bytecask: skipping data file for hint '%s' — could not "
+                   "read it or rebuild it from the data file: %s\n",
                    hint_path.string().c_str(), e.what());
     }
   }

@@ -27,7 +27,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 510 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex for their in-memory phase, with group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost. The commit is pipelined: while one flush is in flight, the next batch is validated, applied and appended, so the disk never waits on in-memory work. On the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
-- **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a degraded state: reads remain available, all writes throw `DbDegraded`, and the service calls `resume()` to recover without a restart.
+- **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. Hint files are an index, not the record: one that fails its CRC is rebuilt from its data file at recovery rather than dropped, so a damaged index costs the time to rebuild it and not the keys behind it. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a degraded state: reads remain available, all writes throw `DbDegraded`, and the service calls `resume()` to recover without a restart.
 - **Bounded value cache** — `IoBackend::BufferPool` serves data files from a frame cache whose size the operator sets, filled with `O_DIRECT`, for deployments where the dataset far exceeds RAM and the footprint has to be a number rather than whatever the kernel's page cache settles on. Reads stay lock-free; the active file is resident from the moment its bytes are written. `capacity_bytes` is the total footprint, and `stats()` reports a hit ratio to size against — something a page cache cannot give. On a resident dataset a hit is within ~80 ns of `mmap`; it is off by default, and worth turning on when there is a memory budget to enforce.
 - **Operational counters** — `stats()` returns a flat `map<string, int64_t>` of monotonic counters (bytes written, fsyncs, group writer batches, vacuum bytes reclaimed, CRC failures, I/O errors, degraded transitions) and gauges (degraded state, open files, live key count, buffer pool hit/miss and residency). Designed for pull-based scraping (Prometheus, logging). Counters only track what the engine can see internally — request counts and latency are the caller's responsibility.
 - **Replication transport in Python** — Python bindings expose a `DataEntry(sequence, entry_type, key, value)` constructor accepting bytes-like payloads, so `changes_since()` output can be serialized over the wire and reconstructed before `ingest()`.
@@ -211,10 +211,12 @@ namespace bytecask {
 struct Options {
     uint64_t max_file_bytes{64 * 1024 * 1024};  // active file rotation threshold (default 64 MiB, hard ceiling: 4 GiB)
     unsigned recovery_threads{4};                // parallelism for hint-file replay at open
-    // When true (default): any CRC error during recovery causes DB::open to throw.
-    // When false: corrupt entries and hint files are skipped; DB opens with the
-    // keys that were successfully recovered. A warning is printed to stderr for
-    // each skipped item.
+    // A hint file is a rebuildable index: one that fails its CRC is
+    // regenerated from its data file in both modes and costs no keys. This
+    // setting governs what is left — a data file that cannot be rescanned.
+    // When true (default): DB::open throws. When false: that file is skipped
+    // and the DB opens with the keys recovered from the rest, with a warning
+    // on stderr for each one.
     bool fail_recovery_on_crc_errors{true};
     Mode initial_mode{Mode::Leader};             // leader allows normal writes; follower allows ingest
     uint32_t max_key_bytes{4096};                // max key size (hard ceiling: 65,535 — u16 wire format)

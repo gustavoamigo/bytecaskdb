@@ -78,6 +78,13 @@ auto get_val(const bytecask::DB &db, bytecask::BytesView key)
   return out;
 }
 
+// get_val as a string, naming the absent case so a failed CHECK says which
+// of the two it was.
+auto get_str(const bytecask::DB &db, bytecask::BytesView key) -> std::string {
+  const auto v = get_val(db, key);
+  return v ? to_string(*v) : std::string{"<missing>"};
+}
+
 // Creates a unique temp directory for each test, cleaned up on scope exit.
 struct TempDir {
   std::filesystem::path path;
@@ -112,6 +119,31 @@ void corrupt_file_middle(const std::filesystem::path &path) {
   f.seekp(static_cast<std::streamoff>(pos));
   c ^= static_cast<char>(0xFF);
   f.put(c);
+}
+
+void flip_byte(const std::filesystem::path &p, std::uint64_t off) {
+  std::fstream f{p, std::ios::in | std::ios::out | std::ios::binary};
+  f.seekg(static_cast<std::streamoff>(off));
+  char c{};
+  f.get(c);
+  f.seekp(static_cast<std::streamoff>(off));
+  f.put(static_cast<char>(c ^ static_cast<char>(0xFF)));
+}
+
+// Corrupts the key of the first entry in a data file. The 15-byte header is
+// left intact so the entry still frames correctly and fails on its CRC —
+// which is what a rescan of the file has to hit for the rescan to fail.
+void corrupt_first_entry_key(const std::filesystem::path &data) {
+  flip_byte(data, 15);
+}
+
+// Damages a hint file AND the data file behind it: the one state in which
+// recovery genuinely cannot index a file, because rebuilding the hint from
+// the data file is not available either.
+void corrupt_hint_beyond_rebuild(const std::filesystem::path &hint) {
+  corrupt_file_middle(hint);
+  corrupt_first_entry_key(hint.parent_path() /
+                          (hint.stem().string() + ".data"));
 }
 
 // Returns .hint files in dir sorted by name (ascending creation-time order).
@@ -1017,10 +1049,11 @@ TEST_CASE("DB parallel recovery: matches serial result",
 // ---------------------------------------------------------------------------
 // BC-157: fail_recovery_on_crc_errors — strict mode (default)
 //
-// Corrupt one hint file; strict recovery (fail_recovery_on_crc_errors=true)
-// must throw std::runtime_error from DB::open.
+// A hint file is a derived index, so a corrupt one alone is repaired rather
+// than fatal. Damage the data file behind it too and there is nothing left to
+// rebuild from: strict recovery must throw std::runtime_error from DB::open.
 // ---------------------------------------------------------------------------
-TEST_CASE("DB recovery: strict mode throws on corrupt hint file",
+TEST_CASE("DB recovery: strict mode throws when a hint cannot be rebuilt",
           "[bytecask][recovery][recovery_strict]") {
   TempDir td;
   const auto db_path = td.path / "db";
@@ -1033,10 +1066,11 @@ TEST_CASE("DB recovery: strict mode throws on corrupt hint file",
     db.put({}, to_bytes("key_third"),  to_bytes("v3"));
   }
 
-  // Corrupt the second hint file (middle of three by timestamp sort).
+  // Corrupt the second hint file (middle of three by timestamp sort) and the
+  // data file it indexes, so the rebuild has no intact source to scan.
   const auto hints = list_hint_files(db_path);
   REQUIRE(hints.size() >= 2);
-  corrupt_file_middle(hints[1]);
+  corrupt_hint_beyond_rebuild(hints[1]);
 
   // Default options → fail_recovery_on_crc_errors=true → must throw.
   REQUIRE_THROWS_AS(bytecask::DB::open(db_path), std::runtime_error);
@@ -1046,9 +1080,10 @@ TEST_CASE("DB recovery: strict mode throws on corrupt hint file",
 // BC-157: fail_recovery_on_crc_errors — lenient mode
 //
 // Same corruption; lenient recovery must open successfully.
-// Keys from the corrupt file are absent; keys from clean files are present.
+// Keys from the unindexable file are absent; keys from clean files present.
 // ---------------------------------------------------------------------------
-TEST_CASE("DB recovery: lenient mode opens with partial recovery on corrupt hint",
+TEST_CASE("DB recovery: lenient mode opens with partial recovery when a hint "
+          "cannot be rebuilt",
           "[bytecask][recovery][recovery_lenient]") {
   TempDir td;
   const auto db_path = td.path / "db";
@@ -1063,8 +1098,8 @@ TEST_CASE("DB recovery: lenient mode opens with partial recovery on corrupt hint
   const auto hints = list_hint_files(db_path);
   REQUIRE(hints.size() >= 2);
   // Filenames contain random salts so name-sort order is non-deterministic.
-  // Corrupt the middle hint file by index — we don't know which key it holds.
-  corrupt_file_middle(hints[1]);
+  // Corrupt the middle pair by index — we don't know which key it holds.
+  corrupt_hint_beyond_rebuild(hints[1]);
 
   // Lenient recovery must succeed even with a corrupt hint file.
   bytecask::DB db =
@@ -1086,7 +1121,8 @@ TEST_CASE("DB recovery: lenient mode opens with partial recovery on corrupt hint
 // This test verifies that a corrupt hint file with recovery_threads>1 and
 // fail_recovery_on_crc_errors=true raises std::runtime_error — not std::terminate.
 // ---------------------------------------------------------------------------
-TEST_CASE("DB parallel recovery: corrupt hint throws instead of terminating",
+TEST_CASE("DB parallel recovery: an unrebuildable hint throws instead of "
+          "terminating",
           "[bytecask][recovery][recovery_parallel_terminate_fix]") {
   TempDir td;
   const auto db_path = td.path / "db";
@@ -1101,7 +1137,7 @@ TEST_CASE("DB parallel recovery: corrupt hint throws instead of terminating",
 
   const auto hints = list_hint_files(db_path);
   REQUIRE(hints.size() >= 2);
-  corrupt_file_middle(hints[1]);
+  corrupt_hint_beyond_rebuild(hints[1]);
 
   // recovery_threads>1 + strict mode → must throw, not terminate.
   REQUIRE_THROWS_AS(
@@ -1110,6 +1146,91 @@ TEST_CASE("DB parallel recovery: corrupt hint throws instead of terminating",
                           .recovery_threads = 4,
                           .fail_recovery_on_crc_errors = true}),
       std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// A hint file is a derived index, not the records it points at. A CRC failure
+// in one says the index is damaged, not the data file behind it, so recovery
+// rebuilds it from that data file — the path a missing hint already takes —
+// and loses nothing. Before this, a corrupt hint was skipped: its keys went
+// missing from an intact file, and the next vacuum, seeing a file with no
+// live bytes, unlinked it and made the loss permanent.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB recovery: a corrupt hint is rebuilt from its data file",
+          "[bytecask][recovery][hint_rebuild]") {
+  const auto strict = GENERATE(true, false);
+  const auto threads = GENERATE(1u, 4u);
+  CAPTURE(strict, threads);
+
+  TempDir td;
+  const auto db_path = td.path / "db";
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+    db.put({}, to_bytes("key_first"), to_bytes("v1"));
+    db.put({}, to_bytes("key_second"), to_bytes("v2"));
+    db.put({}, to_bytes("key_third"), to_bytes("v3"));
+  }
+
+  // Only the index is damaged; every entry in the data file still holds.
+  const auto hints = list_hint_files(db_path);
+  REQUIRE(hints.size() >= 2);
+  corrupt_file_middle(hints[1]);
+
+  {
+    auto db = bytecask::DB::open(db_path,
+                                 {.max_file_bytes = 1,
+                                  .recovery_threads = threads,
+                                  .fail_recovery_on_crc_errors = strict});
+
+    // Nothing is lost, in either recovery mode: a damaged index costs the
+    // time to rebuild it, not keys.
+    CHECK(get_str(db, to_bytes("key_first")) == "v1");
+    CHECK(get_str(db, to_bytes("key_second")) == "v2");
+    CHECK(get_str(db, to_bytes("key_third")) == "v3");
+  }
+
+  // The repair is persisted, not redone per open: the hint is back on disk,
+  // and a second open — strict, so an unreadable hint that could not be
+  // rebuilt would throw — still finds everything.
+  CHECK(std::filesystem::exists(hints[1]));
+  CHECK(std::filesystem::file_size(hints[1]) > 0);
+
+  auto reopened = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+  CHECK(get_str(reopened, to_bytes("key_first")) == "v1");
+  CHECK(get_str(reopened, to_bytes("key_second")) == "v2");
+  CHECK(get_str(reopened, to_bytes("key_third")) == "v3");
+}
+
+// ---------------------------------------------------------------------------
+// The loss in the case above only became permanent at the next vacuum, which
+// saw a file with no live bytes and unlinked it. With the file indexed again
+// its bytes are live, so vacuum has to leave it alone.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB recovery: vacuum keeps a data file whose hint was rebuilt",
+          "[bytecask][recovery][hint_rebuild][vacuum]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+    db.put({}, to_bytes("key_first"), to_bytes("v1"));
+    db.put({}, to_bytes("key_second"), to_bytes("v2"));
+    db.put({}, to_bytes("key_third"), to_bytes("v3"));
+  }
+
+  const auto hints = list_hint_files(db_path);
+  REQUIRE(hints.size() >= 2);
+  const auto victim_data =
+      db_path / (hints[1].stem().string() + ".data");
+  corrupt_file_middle(hints[1]);
+
+  auto db = bytecask::DB::open(db_path, {.fail_recovery_on_crc_errors = false});
+  for (int i = 0; i < 8 && db.vacuum(); ++i) {
+  }
+
+  CHECK(std::filesystem::exists(victim_data));
+  CHECK(get_str(db, to_bytes("key_first")) == "v1");
+  CHECK(get_str(db, to_bytes("key_second")) == "v2");
+  CHECK(get_str(db, to_bytes("key_third")) == "v3");
 }
 
 // ---------------------------------------------------------------------------
@@ -4087,17 +4208,63 @@ TEST_CASE("writes throw DbDegraded on a degraded engine", "[degraded]") {
   CHECK(db.contains_key({}, to_bytes("k5")));
 }
 
-TEST_CASE("resume() discards pending batch on CRC error in active file",
-          "[degraded][resume]") {
-  TempDir td;
-  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1'000'000});
+namespace {
 
-  // Committed entries — baseline.
-  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
-  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+// Walks the raw entry headers of a data file and returns each entry's offset.
+// Mirrors the on-disk format documented in data_entry.cppm: a 15-byte header
+// (u64 sequence, u8 entry_type, u16 key_size, u32 value_size, all little
+// endian) followed by key, value and a 4-byte CRC. Stops at the zero-filled
+// tail, which a zero sequence identifies.
+auto raw_entry_offsets(const std::filesystem::path &data)
+    -> std::vector<std::uint64_t> {
+  std::ifstream f{data, std::ios::binary};
+  const auto size = std::filesystem::file_size(data);
+  std::vector<std::uint64_t> offsets;
+  for (std::uint64_t off = 0; off + 19 <= size;) {
+    std::array<unsigned char, 15> hdr{};
+    f.seekg(static_cast<std::streamoff>(off));
+    f.read(reinterpret_cast<char *>(hdr.data()), std::ssize(hdr));
+    const auto le = [&hdr](std::size_t pos, std::size_t len) -> std::uint64_t {
+      std::uint64_t v = 0;
+      for (std::size_t i = len; i-- > 0;) v = (v << 8) | hdr[pos + i];
+      return v;
+    };
+    if (le(0, 8) == 0) break;  // zero-filled tail
+    offsets.push_back(off);
+    off += 15 + le(9, 2) + le(11, 4) + 4;
+  }
+  return offsets;
+}
 
-  // Write a batch that lands on disk (append succeeds) but sync fails,
-  // degrading the engine. The batch bytes are in the page cache.
+auto active_data_file(const std::filesystem::path &dir) -> std::filesystem::path {
+  std::filesystem::path newest;
+  for (const auto &e : std::filesystem::directory_iterator(dir)) {
+    if (e.path().extension() == ".data" &&
+        (newest.empty() || e.path().filename() > newest.filename())) {
+      newest = e.path();
+    }
+  }
+  return newest;
+}
+
+// Peak resident set size in bytes, as the kernel records it. Monotonic over
+// the process lifetime, so it captures a transient spike that has already
+// been freed by the time the caller looks.
+auto peak_rss_bytes() -> std::uint64_t {
+  std::ifstream f{"/proc/self/status"};
+  for (std::string line; std::getline(f, line);) {
+    if (line.starts_with("VmHWM:")) {
+      return std::stoull(line.substr(6)) * 1024;
+    }
+  }
+  return 0;
+}
+
+// Degrades db by failing the fdatasync of a batch whose bytes reached the
+// file, and returns the offsets of the active file's entries.
+auto degrade_with_unsynced_batch(bytecask::DB &db,
+                                 const std::filesystem::path &dir)
+    -> std::vector<std::uint64_t> {
   {
     bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
     bytecask::WritePlan plan;
@@ -4107,37 +4274,86 @@ TEST_CASE("resume() discards pending batch on CRC error in active file",
                       std::system_error);
   }
   REQUIRE(db.is_degraded());
+  return raw_entry_offsets(active_data_file(dir));
+}
 
-  // Corrupt the active data file — flip a byte in the batch region so
-  // resume's scan hits a CRC error mid-batch.
-  for (auto &e : std::filesystem::directory_iterator(td.path / "db")) {
-    if (e.path().extension() == ".data") {
-      auto sz = std::filesystem::file_size(e.path());
-      if (sz > 10) {
-        std::fstream f{e.path(), std::ios::in | std::ios::out | std::ios::binary};
-        // Corrupt near the end — where the batch entries live.
-        f.seekp(static_cast<std::streamoff>(sz - 5));
-        char c{};
-        f.get(c);
-        f.seekp(static_cast<std::streamoff>(sz - 5));
-        c ^= static_cast<char>(0xFF);
-        f.put(c);
-      }
-    }
-  }
+}  // namespace
 
-  // resume() should recover — the CRC error causes pending.clear() and
-  // the incomplete batch is discarded via truncation.
+TEST_CASE("resume() discards pending batch on CRC error in active file",
+          "[degraded][resume]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+
+  // Committed entries — baseline.
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+
+  const auto offsets = degrade_with_unsynced_batch(db, dir);
+  REQUIRE(offsets.size() == 6);  // k1, k2, BulkBegin, b1, b2, BulkEnd
+
+  // Corrupt an entry inside the unsynced batch, so resume()'s scan throws
+  // part-way through the file. The flip has to land on an entry: an active
+  // file is zero-filled ahead of the write cursor, so its last bytes are
+  // tail, which the scan stops before and never reads.
+  flip_byte(active_data_file(dir), offsets[3] + 15);
+
+  // resume() truncates the batch away and recovers.
   REQUIRE_NOTHROW(db.resume());
   CHECK_FALSE(db.is_degraded());
 
-  // Committed entries before the batch must survive.
-  CHECK(db.contains_key({}, to_bytes("k1")));
-  CHECK(db.contains_key({}, to_bytes("k2")));
+  // The entries committed before the corruption must still be readable.
+  // Present in the key directory is not enough — truncating to the wrong
+  // offset leaves them there while their bytes are gone.
+  bytecask::Bytes out;
+  CHECK(db.get({}, to_bytes("k1"), out));
+  CHECK(to_string(out) == "v1");
+  CHECK(db.get({}, to_bytes("k2"), out));
+  CHECK(to_string(out) == "v2");
 
   // Writes succeed after resume.
   REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
   CHECK(db.contains_key({}, to_bytes("k3")));
+}
+
+TEST_CASE("resume() does not trust an entry size that runs past the file",
+          "[degraded][resume]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+
+  const auto offsets = degrade_with_unsynced_batch(db, dir);
+  REQUIRE(offsets.size() == 6);
+
+  // Corrupt the value_size field (header offset 11, u32 LE) of the first
+  // entry in the unsynced batch so it claims a ~4 GiB value. The CRC that
+  // would reject the entry covers the value, so it cannot be checked until
+  // that many bytes have been read.
+  {
+    std::fstream f{active_data_file(dir),
+                   std::ios::in | std::ios::out | std::ios::binary};
+    f.seekp(static_cast<std::streamoff>(offsets[3] + 11));
+    const std::array<char, 4> huge{'\x00', '\x00', '\x00', '\x7F'};
+    f.write(huge.data(), std::ssize(huge));
+  }
+
+  const auto peak_before = peak_rss_bytes();
+  REQUIRE_NOTHROW(db.resume());
+  const auto peak_after = peak_rss_bytes();
+
+  CHECK_FALSE(db.is_degraded());
+  // A declared size is not a reason to allocate: the entry ends past
+  // everything ever written to the file, so it is corrupt by inspection.
+  CHECK(peak_after - peak_before < 256uz * 1024 * 1024);
+
+  bytecask::Bytes out;
+  CHECK(db.get({}, to_bytes("k1"), out));
+  CHECK(to_string(out) == "v1");
+  CHECK(db.get({}, to_bytes("k2"), out));
+  CHECK(to_string(out) == "v2");
 }
 
 TEST_CASE("resume() with live snapshot on degraded DB",

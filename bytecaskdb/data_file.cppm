@@ -383,15 +383,21 @@ struct WritableFileOps {
 
   [[nodiscard]] auto scan(Offset offset) const
       -> std::optional<std::pair<DataEntry, Offset>> {
-    if (offset >= offset_) {
+    if (offset + kHeaderSize > offset_) {
       return std::nullopt;
     }
     auto header = scan_read_header(offset);
     if (header.sequence == 0) return std::nullopt;
-    std::vector<std::byte> buf;
-    auto view = scan_read_entry(offset, header.key_size, header.value_size, buf);
     const auto next =
         offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
+    // The entry CRC covers the key and value, so the sizes cannot be
+    // verified before those bytes are read. An entry ending past everything
+    // ever written to this file is corrupt by inspection: reject it rather
+    // than size a read buffer from it. The sealed files bound scan() against
+    // their size the same way.
+    if (next > offset_) return std::nullopt;
+    std::vector<std::byte> buf;
+    auto view = scan_read_entry(offset, header.key_size, header.value_size, buf);
     return std::make_pair(
         DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
                   .key = {view.key.begin(), view.key.end()},
