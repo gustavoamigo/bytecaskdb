@@ -29,6 +29,7 @@ class VacuumCompactFailureClass(Enum):
     VC2 = "append_fails"      # io_data_file_append during scan/copy to tmp
     VC3 = "sync_fails"        # io_data_file_sync on tmp file
     VC4 = "rename_fails"      # io_vacuum_compact_rename (synced tmp on disk)
+    VC5 = "unlink_fails"      # io_vacuum_compact_unlink (committed; source left on disk)
 
 
 # Compact path is now always used for files with live_bytes > 0.

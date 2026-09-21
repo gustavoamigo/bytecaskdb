@@ -3232,6 +3232,11 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
 // continue via their open fds (POSIX: pread succeeds on unlinked files).
 void DB::vacuum_unlink_old_file(
     const std::shared_ptr<const EngineState> &snap, std::uint32_t file_id) {
+#ifdef BYTECASK_TESTING
+  // The state is committed and the replacement is on disk; failing here is
+  // the kill inside vacuum's publish window, with the source left behind.
+  FAULT_INJECTION(io_vacuum_compact_unlink);
+#endif
   auto old_data_file = *snap->files.get(file_id);
   auto old_hint_path =
       dir_ / (old_data_file->path().stem().string() + ".hint");
@@ -4523,6 +4528,11 @@ auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
   if (W == 0) W = 1;
 #endif
 
+  // Runs body(0..n) on n threads. A body that throws would take the process
+  // down — an exception leaving a std::thread is std::terminate — so each
+  // is caught and the first rethrown here, on the caller's thread, once
+  // every thread is joined. That turns a failure in any phase into an
+  // exception from DB::open rather than an abort.
   auto parallel_for = [](unsigned n, auto &&body) {
 #ifdef BYTECASK_SINGLE_THREADED
     for (unsigned i = 0; i < n; ++i) body(i);
@@ -4531,10 +4541,23 @@ auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
       if (n == 1) body(0);
       return;
     }
-    std::vector<std::jthread> threads;
-    threads.reserve(n);
-    for (unsigned i = 0; i < n; ++i)
-      threads.emplace_back([&body, i] { body(i); });
+    std::vector<std::exception_ptr> errors(n);
+    {
+      std::vector<std::jthread> threads;
+      threads.reserve(n);
+      for (unsigned i = 0; i < n; ++i) {
+        threads.emplace_back([&body, &errors, i] {
+          try {
+            body(i);
+          } catch (...) {
+            errors[i] = std::current_exception();
+          }
+        });
+      }
+    }
+    for (const auto &err : errors) {
+      if (err) std::rethrow_exception(err);
+    }
 #endif
   };
 

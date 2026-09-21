@@ -147,10 +147,21 @@ static_assert(sizeof(KeyDirEntry) == 16);
 // right. The higher file id wins because recovery numbers files in name
 // order and the compacted file's stem is the later one, so the source — the
 // larger file — is the one left holding nothing live, and the next vacuum
-// unlinks it without a rewrite. This used to throw, which turned a kill
-// inside vacuum's publish window into a database that would not open.
+// unlinks it without a rewrite. This used to throw on any such pair, which
+// turned a kill inside vacuum's publish window into a database that would
+// not open.
+//
+// What is still corruption: the same key under the same sequence with a
+// different value size. A copy is byte for byte its source, so two sizes
+// are two different writes that were given one sequence, which no engine
+// path produces. That case throws, as the old check did for every pair.
 export inline auto kde_newer(const KeyDirEntry &a, const KeyDirEntry &b) -> bool {
   if (a.sequence() != b.sequence()) return a.sequence() > b.sequence();
+  if (a.value_size() != b.value_size()) {
+    throw std::runtime_error(
+        "bytecask: corrupt database — two entries share a sequence number "
+        "but are different writes (value sizes differ)");
+  }
   if (a.file_id() != b.file_id()) return a.file_id() > b.file_id();
   return a.file_offset() > b.file_offset();
 }

@@ -81,6 +81,12 @@ def gen_vacuum_call(
         "    // vacuum_commit never ran. Old file remains in state.\n"
         "    // assert_vacuum_recoverable confirms .data.tmp is not replayed."
         if failure == VacuumCompactFailureClass.VC4
+        else "\n    // VC5: committed, source not unlinked — the kill inside vacuum's\n"
+        "    // publish window. In-memory outcome is success; on disk the source\n"
+        "    // and its compacted copy both exist with the same entries under\n"
+        "    // the same sequences. assert_vacuum_recoverable proves recovery\n"
+        "    // opens that directory."
+        if failure == VacuumCompactFailureClass.VC5
         else ""
     )
 
@@ -156,6 +162,8 @@ FILE_HEADER = """\
 // DB with a sealed file, optionally injects a fault, calls vacuum(), and
 // verifies the file was correctly compacted or that the DB is clean on failure.
 // VC4 additionally verifies that an orphaned .data.tmp is not replayed on recovery.
+// VC5 verifies that a directory holding a compacted file and its source — a kill
+// after the commit, before the unlink — recovers.
 
 #include <system_error>
 
