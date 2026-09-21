@@ -136,18 +136,23 @@ export struct KeyDirEntry {
 static_assert(sizeof(KeyDirEntry) == 16);
 
 // Canonical key-ownership comparator. Returns true if `a` is strictly newer
-// than `b`. Sequence numbers are unique per logical write, so equal sequences
-// must point to the same physical record. If they don't, the database is
-// corrupt and recovery is aborted.
+// than `b`: a total order on (sequence, file_id, file_offset), so every
+// recovery path — one worker, the pairwise merge, the ranged merge — picks
+// the same record for a key whichever order it meets them in.
+//
+// Equal sequences are not corruption. A sequence names one logical write,
+// but vacuum copies a file's live entries into a compacted file under their
+// original sequences and only then unlinks the source; a kill in between
+// leaves both on disk, byte for byte the same entry twice. Either copy is
+// right. The higher file id wins because recovery numbers files in name
+// order and the compacted file's stem is the later one, so the source — the
+// larger file — is the one left holding nothing live, and the next vacuum
+// unlinks it without a rewrite. This used to throw, which turned a kill
+// inside vacuum's publish window into a database that would not open.
 export inline auto kde_newer(const KeyDirEntry &a, const KeyDirEntry &b) -> bool {
   if (a.sequence() != b.sequence()) return a.sequence() > b.sequence();
-  // Same sequence — must be the same physical record.
-  if (a.file_id() != b.file_id() || a.file_offset() != b.file_offset()) {
-    throw std::runtime_error(
-        "bytecask: corrupt database — two entries share the same sequence "
-        "number but differ in physical location");
-  }
-  return false; // identical record
+  if (a.file_id() != b.file_id()) return a.file_id() > b.file_id();
+  return a.file_offset() > b.file_offset();
 }
 
 // Returns the on-disk size of a data file entry given key and value sizes.

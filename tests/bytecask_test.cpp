@@ -2760,6 +2760,100 @@ TEST_CASE("vacuum compact removes dead entries", "[vacuum]") {
 }
 
 // ---------------------------------------------------------------------------
+// A kill inside vacuum's publish window — after the compacted file is renamed
+// into place and before the source is unlinked — leaves two files holding the
+// same entries under the same sequence numbers. Recovery must open that
+// directory, serve every key once, agree with itself across worker counts,
+// and leave the losing copy as garbage for the next vacuum, not refuse it.
+// ---------------------------------------------------------------------------
+TEST_CASE("recovery tolerates a compacted file whose source outlived a kill",
+          "[vacuum][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  std::map<std::string, std::string> oracle;
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 4096});
+    for (int i = 0; i < 200; ++i) {
+      auto k = std::format("k{:04d}", i);
+      auto v = std::format("v{:04d}", i) + std::string(40, 'x');
+      db.put({.sync = false}, to_bytes(k), to_bytes(v));
+      oracle[k] = v;
+    }
+    (void)db.del({.sync = false}, to_bytes("k0007"));
+    oracle.erase("k0007");
+  }
+
+  // The window's on-disk state: a sealed file and a byte-identical copy of
+  // it under a later stem, with the copy's hint present as vacuum leaves it
+  // just before the unlink. Deleting k0007 rotated files, so at least one
+  // sealed file holds live keys.
+  std::vector<std::filesystem::path> sealed;
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".data" &&
+        std::filesystem::exists(db_path / (e.path().stem().string() + ".hint")) &&
+        std::filesystem::file_size(e.path()) > 0) {
+      sealed.push_back(e.path());
+    }
+  }
+  REQUIRE(!sealed.empty());
+  std::ranges::sort(sealed);
+  const auto source = sealed.front();
+  const auto copy_stem = "data_29991231235959_ffffffffffffffff_V01";
+  std::filesystem::copy_file(source, db_path / (copy_stem + std::string{".data"}));
+  std::filesystem::copy_file(db_path / (source.stem().string() + ".hint"),
+                             db_path / (copy_stem + std::string{".hint"}));
+
+  auto collect = [](bytecask::DB &db) {
+    std::map<std::string, std::string> out;
+    for (auto &[key, value] : db.iter_from({})) {
+      out[to_string(key)] = to_string(value);
+    }
+    return out;
+  };
+  auto collect_stats = [](bytecask::DB &db) {
+    std::vector<std::tuple<std::uint64_t, std::uint64_t>> vals;
+    for (const auto &[fid, fs] : db.file_stats()) {
+      vals.emplace_back(fs.live_bytes, fs.total_bytes);
+    }
+    std::ranges::sort(vals);
+    return vals;
+  };
+
+  std::vector<std::tuple<std::uint64_t, std::uint64_t>> serial_stats;
+  {
+    const auto p = td.path / "serial";
+    std::filesystem::copy(db_path, p, std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 4096, .recovery_threads = 1});
+    CHECK(collect(db) == oracle);
+    serial_stats = collect_stats(db);
+    // Exactly one of the two copies carries the live bytes; the other is
+    // all garbage, and vacuum reclaims it without rewriting anything.
+    std::uint64_t live_total = 0;
+    for (const auto &[live, total] : serial_stats) live_total += live;
+    std::uint64_t oracle_bytes = 0;
+    for (const auto &[k, v] : oracle) oracle_bytes += esize(k, v);
+    CHECK(live_total == oracle_bytes);
+    const auto files_before = db.file_stats().size();
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.99}));
+    CHECK(db.file_stats().size() == files_before - 1);
+    CHECK(collect(db) == oracle);
+  }
+  // Files go to workers round-robin, so which worker counts vary in whether
+  // the two copies meet inside one worker's build or in the merge across
+  // workers; every count from 2 to the file count covers both.
+  const auto n_files = static_cast<unsigned>(sealed.size()) + 2;
+  for (unsigned w = 2; w <= n_files; ++w) {
+    DYNAMIC_SECTION("parallel recovery agrees with serial, " << w << " workers") {
+      const auto p = td.path / std::format("parallel{}", w);
+      std::filesystem::copy(db_path, p, std::filesystem::copy_options::recursive);
+      auto db = bytecask::DB::open(p, {.max_file_bytes = 4096, .recovery_threads = w});
+      CHECK(collect(db) == oracle);
+      CHECK(collect_stats(db) == serial_stats);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // vacuum_compact_file: tombstones are preserved
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum compact preserves tombstones", "[vacuum]") {

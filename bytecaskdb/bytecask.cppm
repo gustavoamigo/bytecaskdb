@@ -3850,15 +3850,24 @@ auto DB::recovery_prepare_files(EngineState &s)
     }
   }
 
+  // Data files in name order, which is creation order: the stem carries a
+  // UTC timestamp (see make_data_file_stem). Directory order is whatever the
+  // filesystem returns, and file ids are assigned here in sequence, so
+  // sorting first makes the ids — and with them the tie-break in kde_newer,
+  // which prefers the higher id when two files hold the same entry — a
+  // function of the directory's contents alone.
+  std::vector<std::filesystem::path> data_paths;
+  for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
+    if (dir_entry.path().extension() == ".data") {
+      data_paths.push_back(dir_entry.path());
+    }
+  }
+  std::ranges::sort(data_paths);
+
   std::vector<RecoveredFile> files;
   auto files_t = s.files.transient();
 
-  for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
-    const auto &p = dir_entry.path();
-    if (p.extension() != ".data") {
-      continue;
-    }
-
+  for (const auto &p : data_paths) {
     const auto file_id = s.next_file_id++;
     auto data_file =
         openDataFileForRead(p, io_backend_, pool_.get(), file_id);
@@ -4410,8 +4419,16 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
       const auto i = heap.back();
       heap.pop_back();
       matches.push_back(i);
-      if (cursors[i].cur->sequence > winner.sequence) {
-        winner = *cursors[i].cur;
+      // The same order as kde_newer, so a file holding the same entry as
+      // another — vacuum's source outliving a kill — resolves the same way
+      // here as it does when the two land in different workers.
+      const auto &c = *cursors[i].cur;
+      if (c.sequence > winner.sequence ||
+          (c.sequence == winner.sequence &&
+           (cursors[i].file_id > winner_file ||
+            (cursors[i].file_id == winner_file &&
+             c.file_offset > winner.file_offset)))) {
+        winner = c;
         winner_file = cursors[i].file_id;
       }
     }
