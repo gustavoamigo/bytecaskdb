@@ -229,6 +229,30 @@ public:
     destroy_all(to_free);
   }
 
+  // What an operator can see of reclamation: how many versions are alive —
+  // one is the published state, every further one is a snapshot, an
+  // iterator or a thread's read cache holding an older tree — and how many
+  // retired nodes those older versions are keeping from being freed. Under
+  // random writes a version held long enough ends up holding the whole
+  // tree it was taken from, so parked nodes climbing towards the node count
+  // while versions stay above one names a stale holder, not a leak.
+  struct Gauges {
+    std::size_t versions{0};
+    std::size_t parked_nodes{0};
+  };
+  [[nodiscard]] auto gauges() -> Gauges {
+    std::lock_guard<std::mutex> lk{mu_};
+    Gauges g{records_.size(), 0};
+    for (const auto &rec : records_) {
+      g.parked_nodes += rec.parked.nodes.size();
+      for (const auto &parcel : rec.more)
+        g.parked_nodes += parcel.nodes.size();
+    }
+    for (const auto &parcel : pending_)
+      g.parked_nodes += parcel.nodes.size();
+    return g;
+  }
+
   // Test-only: every retired node still waiting for a live version to
   // release it.
   [[nodiscard]] auto parked_nodes() -> std::vector<const void *> {

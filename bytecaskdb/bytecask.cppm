@@ -322,13 +322,9 @@ public:
     if (!has_cached_) {
       auto &dir_entry = *cur_;
       auto &file = *(*state_->files.get(dir_entry.file_id()));
-      if (verify_checksums_) {
-        raw_cached_ = file.read_entry(dir_entry.file_offset(),
-                                      dir_entry.value_size(), io_buf_);
-      } else {
-        raw_cached_ = file.read_entry_unverified(dir_entry.file_offset(),
-                                                 dir_entry.value_size(), io_buf_);
-      }
+      raw_cached_ = file.lend_entry(dir_entry.file_offset(),
+                                    dir_entry.value_size(), verify_checksums_,
+                                    io_buf_, lease_);
       cached_ = EntryView{.key = raw_cached_.key, .value = raw_cached_.value};
       has_cached_ = true;
     }
@@ -338,6 +334,7 @@ public:
   auto operator++() -> EntryIterator & {
     ++cur_;
     has_cached_ = false;
+    lease_.reset();  // the spans are dead now; let the frame go
     return *this;
   }
 
@@ -354,6 +351,10 @@ private:
   mutable DataEntryView raw_cached_;
   mutable EntryView cached_;
   mutable Bytes io_buf_;
+  // Backs the spans when the file lends them out of a pool frame; empty
+  // when they point into io_buf_. Declared after io_buf_ so it is released
+  // first: nothing may still reference the frame when the pin drops.
+  mutable FrameLease lease_;
   mutable bool has_cached_{false};
 };
 
@@ -439,13 +440,9 @@ public:
     if (!has_cached_) {
       auto &dir_entry = *cur_;
       auto &file = *(*state_->files.get(dir_entry.file_id()));
-      if (verify_checksums_) {
-        raw_cached_ = file.read_entry(dir_entry.file_offset(),
-                                      dir_entry.value_size(), io_buf_);
-      } else {
-        raw_cached_ = file.read_entry_unverified(dir_entry.file_offset(),
-                                                 dir_entry.value_size(), io_buf_);
-      }
+      raw_cached_ = file.lend_entry(dir_entry.file_offset(),
+                                    dir_entry.value_size(), verify_checksums_,
+                                    io_buf_, lease_);
       cached_ = EntryView{.key = raw_cached_.key, .value = raw_cached_.value};
       has_cached_ = true;
     }
@@ -455,6 +452,7 @@ public:
   auto operator++() -> ReverseEntryIterator & {
     ++cur_;
     has_cached_ = false;
+    lease_.reset();  // the spans are dead now; let the frame go
     return *this;
   }
 
@@ -471,6 +469,10 @@ private:
   mutable DataEntryView raw_cached_;
   mutable EntryView cached_;
   mutable Bytes io_buf_;
+  // Backs the spans when the file lends them out of a pool frame; empty
+  // when they point into io_buf_. Declared after io_buf_ so it is released
+  // first: nothing may still reference the frame when the pin drops.
+  mutable FrameLease lease_;
   mutable bool has_cached_{false};
 };
 
@@ -735,6 +737,172 @@ export struct FileInfo;
 export struct FileManifest;
 
 // ---------------------------------------------------------------------------
+// Per-thread read cache.
+//
+// A read caches the engine state it saw in a slot owned by its thread, so a
+// get costs no reference-count traffic on the control block every thread
+// shares. The slot is not private to its thread, though. A thread that reads
+// once and then idles would otherwise keep the key directory version it saw
+// alive for as long as it idles, and under a write load a version held long
+// enough comes to hold a whole retained copy of the tree — measured at
+// ~1.1 GB for 20 M keys on a MariaDB thread parked in the server's thread
+// cache. So every slot is registered, and the writer, on publishing, takes
+// the cached state away from any slot that has not been used for a while.
+//
+// The protocol is a claim on the slot (RocksDB's per-thread SuperVersion
+// cache works the same way). A reader exchanges the slot's pointer for
+// kInUse, uses the entry, and stores the pointer back. The scrape leaves a
+// slot that reads kInUse alone and swaps any other idle one to kObsolete,
+// then frees the entry it took. A reader that finds kObsolete, or an empty
+// slot, acquires the current state afresh. Nothing on the reader's path
+// contends: the exchange is on its own line, and "recently used" is a scrape
+// epoch the reader copies from a counter the scrape bumps ~10 times a
+// second, not a clock.
+// ---------------------------------------------------------------------------
+export class DB;
+
+struct ReadCacheEntry {
+  const DB *owner{nullptr};  // compared, never dereferenced
+  std::shared_ptr<const EngineState> state;
+  std::int64_t last_write_time{0};
+  // The scrape epoch this entry was last used in. Written by its reader,
+  // read by the scrape, hence atomic; nothing else in the entry is touched
+  // by anyone but the holder of the claim.
+  std::atomic<std::uint64_t> used_epoch{0};
+};
+
+class ReadCacheRegistry;
+
+class ReadCacheSlot {
+public:
+  ReadCacheSlot();
+  ~ReadCacheSlot();
+  ReadCacheSlot(const ReadCacheSlot &) = delete;
+  auto operator=(const ReadCacheSlot &) -> ReadCacheSlot & = delete;
+
+  // Sentinels: a slot is either empty, claimed, obsoleted, or holds an entry.
+  [[nodiscard]] static auto in_use() noexcept -> ReadCacheEntry *;
+  [[nodiscard]] static auto obsolete() noexcept -> ReadCacheEntry *;
+  [[nodiscard]] static auto is_entry(const ReadCacheEntry *e) noexcept -> bool {
+    return e != nullptr && e != in_use() && e != obsolete();
+  }
+
+  // Takes the claim. Returns the entry this thread cached, or nullptr when
+  // there is none or the scrape took it; either way the slot reads kInUse
+  // until release().
+  [[nodiscard]] auto claim() noexcept -> ReadCacheEntry * {
+    auto *e = ptr_.exchange(in_use(), std::memory_order_acquire);
+    return is_entry(e) ? e : nullptr;
+  }
+  void release(ReadCacheEntry *e) noexcept {
+    ptr_.store(e, std::memory_order_release);
+  }
+
+private:
+  friend class ReadCacheRegistry;
+  std::atomic<ReadCacheEntry *> ptr_{nullptr};
+};
+
+class ReadCacheRegistry {
+public:
+  static auto instance() -> ReadCacheRegistry & {
+    // Immortal, like VersionChain: a thread can exit after static
+    // destruction and its slot has to find the registry then.
+    alignas(ReadCacheRegistry) static std::byte storage[sizeof(ReadCacheRegistry)];
+    static auto *r = new (storage) ReadCacheRegistry();
+    return *r;
+  }
+
+  void add(ReadCacheSlot *slot) {
+    std::lock_guard<std::mutex> lk{mu_};
+    slots_.push_back(slot);
+  }
+  void remove(ReadCacheSlot *slot) {
+    std::lock_guard<std::mutex> lk{mu_};
+    std::erase(slots_, slot);
+  }
+
+  [[nodiscard]] auto epoch() const noexcept -> std::uint64_t {
+    return epoch_.load(std::memory_order_relaxed);
+  }
+
+  // Advances the epoch and takes the entry from every slot that has not
+  // been used for `idle_epochs` epochs. A slot read as kInUse is skipped —
+  // its reader is in the middle of a read — and a claim that lands between
+  // the load and the swap makes the swap fail, so an entry is only ever
+  // freed once no reader can be holding it.
+  void scrape(std::uint64_t idle_epochs) {
+    std::vector<ReadCacheEntry *> taken;
+    {
+      std::lock_guard<std::mutex> lk{mu_};
+      const auto now = epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
+      for (auto *slot : slots_) {
+        auto *e = slot->ptr_.load(std::memory_order_acquire);
+        if (!ReadCacheSlot::is_entry(e)) continue;
+        if (now - e->used_epoch.load(std::memory_order_relaxed) <= idle_epochs)
+          continue;
+        if (slot->ptr_.compare_exchange_strong(e, ReadCacheSlot::obsolete(),
+                                               std::memory_order_acq_rel)) {
+          taken.push_back(e);
+        }
+      }
+    }
+    for (auto *e : taken) delete e;
+  }
+
+private:
+  ReadCacheRegistry() = default;
+  std::mutex mu_;
+  std::vector<ReadCacheSlot *> slots_;
+  std::atomic<std::uint64_t> epoch_{1};
+};
+
+inline ReadCacheSlot::ReadCacheSlot() { ReadCacheRegistry::instance().add(this); }
+inline ReadCacheSlot::~ReadCacheSlot() {
+  // Claim first, so a scrape in flight leaves the slot alone, then leave the
+  // registry, then free what the thread was holding.
+  auto *e = ptr_.exchange(in_use(), std::memory_order_acq_rel);
+  ReadCacheRegistry::instance().remove(this);
+  if (is_entry(e)) delete e;
+}
+inline auto ReadCacheSlot::in_use() noexcept -> ReadCacheEntry * {
+  alignas(ReadCacheEntry) static std::byte storage[sizeof(ReadCacheEntry)];
+  static auto *e = new (storage) ReadCacheEntry();
+  return e;
+}
+inline auto ReadCacheSlot::obsolete() noexcept -> ReadCacheEntry * {
+  alignas(ReadCacheEntry) static std::byte storage[sizeof(ReadCacheEntry)];
+  static auto *e = new (storage) ReadCacheEntry();
+  return e;
+}
+
+// What load_state_for_read hands out: the claim on this thread's slot for
+// the duration of one read. The state reference it exposes is valid while
+// the guard lives; the destructor gives the slot back.
+class ReadStateGuard {
+public:
+  ReadStateGuard(ReadCacheSlot &slot, ReadCacheEntry *entry) noexcept
+      : slot_{&slot}, entry_{entry} {}
+  ~ReadStateGuard() { slot_->release(entry_); }
+  ReadStateGuard(const ReadStateGuard &) = delete;
+  auto operator=(const ReadStateGuard &) -> ReadStateGuard & = delete;
+  ReadStateGuard(ReadStateGuard &&) = delete;
+  auto operator=(ReadStateGuard &&) -> ReadStateGuard & = delete;
+
+  [[nodiscard]] auto state() const noexcept
+      -> const std::shared_ptr<const EngineState> & {
+    return entry_->state;
+  }
+  [[nodiscard]] auto operator->() const noexcept -> const EngineState * {
+    return entry_->state.get();
+  }
+
+private:
+  ReadCacheSlot *slot_;
+  ReadCacheEntry *entry_;
+};
+
+// ---------------------------------------------------------------------------
 // DB — the public interface to a ByteCaskDB database.
 //
 // Thread safety: write operations (put, del, apply_batch) are serialised by
@@ -937,6 +1105,7 @@ public:
   // EngineState. Designed for pull-based scraping (Prometheus, logging).
   [[nodiscard]] auto stats() const -> std::map<std::string, std::int64_t>;
 
+
     // Drains background hint tasks then writes all sealed hint files.
     // temporary in public for memoery profile - TODO: Move it back to private:
   void flush_hints();
@@ -995,19 +1164,23 @@ private:
   void vacuum_remove_file(std::uint32_t file_id);
 
   // State access helpers — raw state_ / state_time_ access is confined here.
-  // Per-thread read cache behind load_state_for_read. One function-local
-  // thread_local shared by every DB the thread touches, so it records its
-  // owner. commit_wait seeds it with the state that covered the thread's
-  // own write — see there for why the timestamp alone is not enough.
-  struct ReadCache {
-    const DB *owner{nullptr};
-    std::shared_ptr<const EngineState> snapshot;
-    std::int64_t last_write_time{0};
-  };
-  [[nodiscard]] static auto read_cache() -> ReadCache &;
-  // Read path: thread-local cached snapshot, may be slightly stale.
+  // Per-thread read cache behind load_state_for_read (see ReadCacheSlot).
+  // One function-local thread_local slot shared by every DB the thread
+  // touches, so its entry records its owner. commit_wait seeds it with the
+  // state that covered the thread's own write — see there for why the
+  // timestamp alone is not enough.
+  [[nodiscard]] static auto read_cache() -> ReadCacheSlot &;
+  // Claims this thread's slot and returns the guard; the entry behind it
+  // holds this DB's state, refreshed when the staleness rule says so.
   [[nodiscard]] auto load_state_for_read(const ReadOptions &opts) const
-      -> const std::shared_ptr<const EngineState> &;
+      -> ReadStateGuard;
+  // Publishes reclaim: bumps the scrape epoch and frees the entries of
+  // slots idle for kReadCacheIdleEpochs epochs. Rate-limited to one in
+  // kReadCacheScrapePeriod; called from store_state.
+  void scrape_read_caches() const;
+  static constexpr auto kReadCacheScrapePeriod = std::chrono::milliseconds{100};
+  static constexpr std::uint64_t kReadCacheIdleEpochs = 10;  // ~1 s idle
+  mutable std::atomic<std::int64_t> last_scrape_ns_{0};
   // Barrier write path: the published state, which after quiesce() covers
   // the prepared head. Caller must hold write_mu_ and the flush role. Only
   // execute_slots builds on the head itself (load_head).
@@ -1158,7 +1331,9 @@ private:
   IoBackend io_backend_{IoBackend::Pread};
   // Declared before state_ so it outlives every DataFile holding a pointer to
   // it: members are destroyed in reverse declaration order.
-  std::unique_ptr<BufferPool> pool_;
+  // Shared with every pool-backed data file: a file lends spans into the
+  // pool's frames and can outlive the DB in an iterator's hands.
+  std::shared_ptr<BufferPool> pool_;
   SizeLimits size_limits_;
   mutable Counters counters_;
   // All mutable state — SWMR. Writers publish via atomic_store()
@@ -2185,7 +2360,7 @@ DB::DB(std::filesystem::path dir, Options opts)
           "max_file_bytes — the two are coupled.",
           opts.buffer_pool.capacity_bytes, opts.max_file_bytes)};
     }
-    pool_ = std::make_unique<BufferPool>(opts.buffer_pool, counters_);
+    pool_ = std::make_shared<BufferPool>(opts.buffer_pool);
   }
   KeyDirEntry::check_file_offset(opts.max_file_bytes);
   std::filesystem::create_directories(dir_);
@@ -2235,7 +2410,7 @@ DB::DB(std::filesystem::path dir, Options opts)
     s.active_file_id = s.next_file_id++;
     const auto stem = make_data_file_stem();
     auto new_active = createDataFileForWrite(
-        dir_, stem, ".data", rotation_threshold_, io_backend_, pool_.get(),
+        dir_, stem, ".data", rotation_threshold_, io_backend_, pool_,
         s.active_file_id);
     if (pool_) pool_->set_active_file(s.active_file_id);
     // +1 for the new active file.
@@ -2297,7 +2472,10 @@ DB::~DB() {
 // mismatch.
 auto DB::get(const ReadOptions &opts, BytesView key,
                    Bytes &out) const -> bool {
-  auto s = load_state_for_read(opts);
+  // The guard, not a copy of the state: copying it is a read-modify-write
+  // on a control block every reader shares — the line that capped
+  // concurrent gets before the read did.
+  const auto s = load_state_for_read(opts);
   const auto kv = s->key_dir.get(key);
   if (!kv) {
     return false;
@@ -2315,9 +2493,8 @@ auto DB::get(const ReadOptions &opts, BytesView key,
   (*s->files.get(kv->file_id()))
       ->read_value(kv->file_offset(), narrow<std::uint16_t>(key.size()),
                    kv->value_size(), opts.verify_checksums, io_buf, out);
-  counters_.disk_reads.fetch_add(1, std::memory_order_relaxed);
-  counters_.disk_read_bytes.fetch_add(
-      static_cast<std::int64_t>(kv->value_size()), std::memory_order_relaxed);
+  counters_.disk_reads.add(1);
+  counters_.disk_read_bytes.add(static_cast<std::int64_t>(kv->value_size()));
   return true;
 }
 
@@ -2351,7 +2528,7 @@ auto DB::del_range(const WriteOptions &opts, BytesView from,
 }
 
 auto DB::contains_key(const ReadOptions& opts, BytesView key) const -> bool {
-  auto s = load_state_for_read(opts);
+  const auto s = load_state_for_read(opts);
   return s->key_dir.contains(key);
 }
 
@@ -2361,7 +2538,7 @@ auto DB::contains_key(const ReadOptions& opts, BytesView key) const -> bool {
 
 auto DB::snapshot() const -> Snapshot {
   ReadOptions opts{};
-  return Snapshot{load_state_for_read(opts), size_limits_};
+  return Snapshot{load_state_for_read(opts).state(), size_limits_};
 }
 
 // The single write path. Routes to either write_group_ (default) or
@@ -2751,12 +2928,21 @@ void DB::commit_wait(EngineSlot &slot) {
       // nothing new and serve its cached pre-write snapshot. Seed the
       // cache with the covering state instead. last_write_time is left as
       // is: once the timestamp lands the next read refreshes as usual.
-      auto &tl = read_cache();
-      if (tl.owner != this) {
-        tl.owner = this;
-        tl.last_write_time = 0;
+      {
+        auto &slot = read_cache();
+        auto *e = slot.claim();
+        if (e == nullptr) {
+          e = new ReadCacheEntry();
+        }
+        if (e->owner != this) {
+          e->owner = this;
+          e->last_write_time = 0;
+        }
+        e->state = std::move(published);
+        e->used_epoch.store(ReadCacheRegistry::instance().epoch(),
+                            std::memory_order_relaxed);
+        slot.release(e);
       }
-      tl.snapshot = std::move(published);
       return;
     }
     {
@@ -2868,7 +3054,7 @@ auto DB::iter_from(const ReadOptions &opts, BytesView from) const
       ? s->key_dir.value_begin()
       : s->key_dir.value_lower_bound(from);
   return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
-      EntryIterator{s, std::move(it), opts.verify_checksums},
+      EntryIterator{s.state(), std::move(it), opts.verify_checksums},
       std::default_sentinel};
 }
 
@@ -2889,7 +3075,7 @@ auto DB::riter_from(const ReadOptions &opts, BytesView from) const
       ? s->key_dir.value_rbegin()
       : s->key_dir.value_rlower_bound(from);
   return std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>{
-      ReverseEntryIterator{s, std::move(it), opts.verify_checksums},
+      ReverseEntryIterator{s.state(), std::move(it), opts.verify_checksums},
       std::default_sentinel};
 }
 
@@ -2915,6 +3101,11 @@ auto DB::rkeys_from(const ReadOptions &opts, BytesView from) const
 auto DB::vacuum(VacuumOptions opts) -> bool {
   std::lock_guard<std::mutex> vg{*vacuum_mu_};
   if (auto s = load_state(); s->degraded) throw DbDegraded{s->degraded_reason};
+  // Publishes scrape idle read caches; with no writes there are none, and
+  // what the last writes retired stays pinned by whichever thread went idle
+  // last. vacuum and stats are the entry points that keep running without
+  // writes, so they scrape too.
+  scrape_read_caches();
 
   // Drain in-flight background hint writes so that vacuum's
   // flush_hints_for call cannot race on the same .hint.tmp file.
@@ -2968,7 +3159,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 void DB::rotate_active_file(TransientEngineState &t,
                             const std::shared_ptr<const EngineState> &) {
   t.active_file().shrink_to_fit();
-  auto read_only_old = openDataFileForRead(t.active_file().path(), io_backend_, pool_.get(),
+  auto read_only_old = openDataFileForRead(t.active_file().path(), io_backend_, pool_,
                                          t.active_file_id());
   const auto stem = make_data_file_stem();
 #ifdef BYTECASK_TESTING
@@ -2976,7 +3167,7 @@ void DB::rotate_active_file(TransientEngineState &t,
 #endif
   const auto new_file_id = t.reserve_file_id();
   auto new_file = createDataFileForWrite(
-      dir_, stem, ".data", rotation_threshold_, io_backend_, pool_.get(),
+      dir_, stem, ".data", rotation_threshold_, io_backend_, pool_,
       new_file_id);
   t.apply_rotate_file(read_only_old, std::move(new_file), new_file_id);
   // The sealed file's frames become evictable and the new file's pinned.
@@ -3302,7 +3493,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
     store_state(current, std::move(t).persistent());
   }
 
-  auto new_file = openDataFileForRead(final_data_path, io_backend_, pool_.get(),
+  auto new_file = openDataFileForRead(final_data_path, io_backend_, pool_,
                                       dest_file_id);
   flush_hints_for(new_file, dir_);
 
@@ -3353,7 +3544,10 @@ auto DB::degraded_reason() const noexcept -> std::string {
 }
 
 auto DB::stats() const -> std::map<std::string, std::int64_t> {
+  scrape_read_caches();  // see vacuum()
   auto s = load_state();
+  const auto *pool = pool_ ? &pool_->counters() : nullptr;
+  const auto reclaim = KeyDirTree::reclamation_gauges();
   std::int64_t open_files = 0;
   for (auto it = s->files.begin(); it != std::default_sentinel; ++it)
     ++open_files;
@@ -3362,6 +3556,11 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
       // and not a cache. Multiply by the bytes/key your key shape measures
       // (scripts/run_memory_profile.py; about 50 for typical keys).
       {"bytecask.keydir_keys", narrow<std::int64_t>(s->key_dir.size())},
+      // Gauges: versions of the key directory alive right now (1 = only the
+      // published state) and retired nodes those older versions still pin.
+      {"bytecask.keydir_versions_live", narrow<std::int64_t>(reclaim.versions)},
+      {"bytecask.keydir_nodes_parked",
+       narrow<std::int64_t>(reclaim.parked_nodes)},
       {"bytecask.bytes_written",
        counters_.bytes_written.load(std::memory_order_relaxed)},
       {"bytecask.group_writer_batches",
@@ -3375,22 +3574,20 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
       {"bytecask.commit_wait_blocked",
        counters_.commit_wait_blocked.load(std::memory_order_relaxed)},
       {"bytecask.disk_reads",
-       counters_.disk_reads.load(std::memory_order_relaxed)},
+       counters_.disk_reads.load()},
       {"bytecask.disk_read_bytes",
-       counters_.disk_read_bytes.load(std::memory_order_relaxed)},
-      {"bytecask.pool_hits",
-       counters_.pool_hits.load(std::memory_order_relaxed)},
-      {"bytecask.pool_misses",
-       counters_.pool_misses.load(std::memory_order_relaxed)},
+       counters_.disk_read_bytes.load()},
+      {"bytecask.pool_hits", pool ? pool->hits.load() : 0},
+      {"bytecask.pool_misses", pool ? pool->misses.load() : 0},
       {"bytecask.pool_fills",
-       counters_.pool_fills.load(std::memory_order_relaxed)},
+       pool ? pool->fills.load(std::memory_order_relaxed) : 0},
       {"bytecask.pool_evictions",
-       counters_.pool_evictions.load(std::memory_order_relaxed)},
-      {"bytecask.pool_frames_total", counters_.pool_frames_total},
+       pool ? pool->evictions.load(std::memory_order_relaxed) : 0},
+      {"bytecask.pool_frames_total", pool ? pool->frames_total : 0},
       {"bytecask.pool_frames_resident",
-       counters_.pool_frames_resident.load(std::memory_order_relaxed)},
+       pool ? pool->frames_resident.load(std::memory_order_relaxed) : 0},
       {"bytecask.pool_direct_io_fallbacks",
-       counters_.pool_direct_io_fallbacks.load(std::memory_order_relaxed)},
+       pool ? pool->direct_io_fallbacks.load(std::memory_order_relaxed) : 0},
       {"bytecask.vacuum_bytes_reclaimed",
        counters_.vacuum_bytes_reclaimed.load(std::memory_order_relaxed)},
       {"bytecask.vacuum_files_unlinked",
@@ -3488,7 +3685,7 @@ void DB::resume() {
   file.sync();
 
   // Open the old active as read-only for hint generation.
-  auto read_only_old = openDataFileForRead(file.path(), io_backend_, pool_.get(),
+  auto read_only_old = openDataFileForRead(file.path(), io_backend_, pool_,
                                          old_file_id);
 
   // Dispatch hint generation — idempotent (flush_hints_for skips files
@@ -3504,7 +3701,7 @@ void DB::resume() {
 #endif
   const auto new_file_id = t.reserve_file_id();
   auto new_file = createDataFileForWrite(
-      dir_, stem, ".data", rotation_threshold_, io_backend_, pool_.get(),
+      dir_, stem, ".data", rotation_threshold_, io_backend_, pool_,
       new_file_id);
 
   // Build and publish new state. Replay scanned entries into key_dir so that
@@ -3610,39 +3807,56 @@ auto DB::create_manifest() -> FileManifest {
 // reference to the thread-local snapshot. The snapshot stays alive until
 // the same thread calls load_state_for_read again, so callers must not
 // stash the reference across a second load_state_for_read call.
-auto DB::read_cache() -> ReadCache & {
-  // Per-thread state cache — thread-exit destructor is intentional.
+auto DB::read_cache() -> ReadCacheSlot & {
+  // Per-thread slot — thread-exit destructor is intentional: it is what
+  // leaves the registry.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-  thread_local ReadCache tl;
+  thread_local ReadCacheSlot tl;
 #pragma clang diagnostic pop
   return tl;
 }
 
 auto DB::load_state_for_read(const ReadOptions &opts) const
-    -> const std::shared_ptr<const EngineState> & {
-  auto &tl = read_cache();
-  // owner identifies which DB instance snapshot belongs to: without it a
+    -> ReadStateGuard {
+  auto &slot = read_cache();
+  auto *e = slot.claim();
+  // owner identifies which DB instance the entry belongs to: without it a
   // thread that reads from two DBs could see one DB's generation while
-  // querying the other.
-  if (tl.owner != this) {
-    // Cache holds another DB's generation (or is empty): drop it and
-    // force a refresh below. Freed inline — this DB's reclaimer (if any)
-    // must never take ownership of another DB's state.
-    tl.snapshot.reset();
-    tl.owner = this;
-    tl.last_write_time = 0;
+  // querying the other. An entry of another DB is dropped, not reused —
+  // this DB must never take ownership of another DB's state.
+  if (e == nullptr || e->owner != this) {
+    if (e == nullptr) {
+      e = new ReadCacheEntry();
+    } else {
+      e->state.reset();
+    }
+    e->owner = this;
+    e->last_write_time = 0;
   }
   const auto wt = state_time_.load(std::memory_order_relaxed);
   const auto tolerance =
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           opts.staleness_tolerance)
           .count();
-  if (wt - tl.last_write_time > tolerance) {
-    tl.snapshot = load_state();
-    tl.last_write_time = wt;
+  if (wt - e->last_write_time > tolerance) {
+    e->state = load_state();
+    e->last_write_time = wt;
   }
-  return tl.snapshot;
+  e->used_epoch.store(ReadCacheRegistry::instance().epoch(),
+                      std::memory_order_relaxed);
+  return ReadStateGuard{slot, e};
+}
+
+void DB::scrape_read_caches() const {
+  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto period =
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          kReadCacheScrapePeriod)
+          .count();
+  if (now - last_scrape_ns_.load(std::memory_order_relaxed) < period) return;
+  last_scrape_ns_.store(now, std::memory_order_relaxed);
+  ReadCacheRegistry::instance().scrape(kReadCacheIdleEpochs);
 }
 
 auto DB::load_state_for_write() const -> std::shared_ptr<EngineState> {
@@ -3725,6 +3939,10 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
   if (test_between_publish_stores_) test_between_publish_stores_();
 #endif
   state_time_.store(now_ns(), std::memory_order_release);
+
+  // The version this publish superseded is freed once nothing holds it;
+  // an idle thread's read cache is the holder nothing else can reach.
+  scrape_read_caches();
 
   if (became_degraded) {
     counters_.degraded_transitions.fetch_add(1, std::memory_order_relaxed);
@@ -3861,7 +4079,7 @@ auto DB::recovery_prepare_files(EngineState &s)
 
     const auto file_id = s.next_file_id++;
     auto data_file =
-        openDataFileForRead(p, io_backend_, pool_.get(), file_id);
+        openDataFileForRead(p, io_backend_, pool_, file_id);
 
     const auto hint_path = dir_ / (p.stem().string() + ".hint");
     if (!std::filesystem::exists(hint_path)) {
@@ -3879,7 +4097,7 @@ auto DB::recovery_prepare_files(EngineState &s)
         // but resize_file only drops a tail: every byte below *end is
         // unchanged, and no reader addresses anything above it. Frames past
         // the new end are orphans CLOCK reclaims.
-        data_file = openDataFileForRead(p, io_backend_, pool_.get(), file_id);
+        data_file = openDataFileForRead(p, io_backend_, pool_, file_id);
       }
     }
     files_t.set(file_id, data_file);

@@ -804,10 +804,15 @@ not accidents:
   the `pread` fallback and fails as a clean short read rather than
   faulting on a page beyond end of file.
 
-The other two back-ends raise neither case: under `pread`, and under
-the buffer pool — which copies each value out of its frames rather than
-lending one — every span an iterator hands out points into that
-iterator's own `io_buf_`, which no file event can reach.
+Under `pread` neither case arises: every span an iterator hands out
+points into that iterator's own `io_buf_`, which no file event can
+reach. Under the buffer pool an iterator is lent spans straight into a
+pool frame when the entry sits inside one resident frame, and holds a
+`FrameLease` — a pin on that frame — until it advances. A pinned frame
+is immutable and cannot be evicted or refilled, and the pool itself is
+held by the data file, which the iterator holds, so no file event and
+not even `DB` destruction can reach the frame while the span is live.
+Call that **L**.
 
 ### The grid
 
@@ -846,7 +851,7 @@ matters here.
 | — | | |
 | Next `get` into the same `Bytes` | Overwritten | The vector is reused by design; copy it out first if the previous value is still needed |
 
-#### `EntryView` spans, `io_backend` = `pread` or `buffer_pool`
+#### `EntryView` spans, `io_backend` = `pread`
 
 | Event | Verdict | Why |
 |-------|---------|-----|
@@ -863,6 +868,32 @@ matters here.
 | Iterator destroyed | Invalid | The buffer goes with it |
 | Iterator moved | Valid | The buffer moves with the iterator; the span keeps addressing it |
 | Iterator copied | Not possible | The iterators are move-only. A copy would carry spans addressing the source's buffer while deep-copying that buffer, so the copy is deleted rather than documented |
+
+#### `EntryView` spans, `io_backend` = `buffer_pool`
+
+Spans point into a pool frame under lease when the whole entry lies in
+one resident frame, and into the iterator's `io_buf_` otherwise. Both
+are covered below.
+
+| Event | Verdict | Why |
+|-------|---------|-----|
+| `resume()` | Valid | B + L — truncation lowers the active file's size; the lent entry lies below it and its frame is pinned |
+| `vacuum()` | Valid | B + L — the frame outlives the unlink; file ids are never reused, so nothing looks the frame up again |
+| File rotation | Valid | B + L — the frames of the old active file become evictable, but not while pinned |
+| Seal | Valid | B + L |
+| `set_mode()` | Valid | In-memory transition only |
+| Originating `Snapshot` destroyed | Valid | B |
+| Concurrent write | Valid | B + L — an append extends a frame only past the size the reader is bounded by; a fill never touches a pinned frame |
+| Eviction under memory pressure | Valid | L — CLOCK passes over a pinned frame; it never waits for it |
+| `DB` destruction | Valid | B + L — the pool and its counters are held by the data file, which the iterator holds |
+| — | | |
+| Next `operator++()` | Invalid | The lease is released and the buffer reused |
+| Iterator destroyed | Invalid | The lease and the buffer go with it |
+| Iterator moved | Valid | The lease and the buffer move with the iterator |
+| Iterator copied | Not possible | Move-only, same as above |
+
+A lease held across a long loop body keeps one frame out of the pool's
+hands for that long. That is one frame, not a stall: eviction skips it.
 
 #### `EntryView` spans, `io_backend` = `mmap`
 

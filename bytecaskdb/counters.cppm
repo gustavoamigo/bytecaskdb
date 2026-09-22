@@ -8,7 +8,9 @@
 // cross-counter consistency is not required.
 
 module;
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 export module bytecask.counters;
@@ -16,11 +18,58 @@ export module bytecask.counters;
 namespace bytecask {
 
 // ---------------------------------------------------------------------------
+// StripedCounter — a monotonic counter every reader thread bumps.
+//
+// A single atomic bumped on every get is one cache line that every core
+// fights over, and at 32 readers that line, not the read, sets the
+// throughput: the line can absorb roughly 50 M read-modify-writes a second
+// however cheap the reads are. Striping the count across cache lines keyed by
+// thread keeps each increment on a line only a couple of threads touch; the
+// value is the sum of the stripes, read at stats() time.
+// ---------------------------------------------------------------------------
+export class StripedCounter {
+public:
+  void add(std::int64_t n) noexcept {
+    stripes_[stripe_index()].value.fetch_add(n, std::memory_order_relaxed);
+  }
+
+  // A sum of relaxed loads: exact once writers are quiescent, approximate
+  // while they are not, which is what a monotonic metric needs.
+  [[nodiscard]] auto load() const noexcept -> std::int64_t {
+    std::int64_t total = 0;
+    for (const auto &s : stripes_) {
+      total += s.value.load(std::memory_order_relaxed);
+    }
+    return total;
+  }
+
+private:
+  static constexpr std::size_t kStripes = 16;
+  static constexpr std::size_t kCacheLineBytes = 64;
+  static_assert((kStripes & (kStripes - 1)) == 0, "kStripes must be a power of two");
+
+  struct alignas(kCacheLineBytes) Stripe {
+    std::atomic<std::int64_t> value{0};
+  };
+
+  // Threads take stripes round-robin on first use; more than kStripes threads
+  // share stripes, which is contention between a few threads rather than all.
+  static auto stripe_index() noexcept -> std::size_t {
+    static std::atomic<std::size_t> next{0};
+    thread_local const std::size_t id =
+        next.fetch_add(1, std::memory_order_relaxed) & (kStripes - 1);
+    return id;
+  }
+
+  std::array<Stripe, kStripes> stripes_{};
+};
+
+// ---------------------------------------------------------------------------
 // Counters — per-DB-instance operational counters.
 //
 // Write-path counters are incremented under write_mu_ (zero contention).
-// Read-path counters use relaxed atomic fetch_add (~8 ns on x86, negligible
-// next to the pread syscall).
+// Read-path counters are bumped by every reader on every get and are striped
+// (StripedCounter) so that concurrent readers do not serialise on one line.
 // Recovery counters are plain int64_t — set once during construction, then
 // immutable for the lifetime of the DB.
 // ---------------------------------------------------------------------------
@@ -36,25 +85,12 @@ export struct Counters {
   std::atomic<std::int64_t> commit_wait_blocked{0};
 
   // -- Read path --
-  std::atomic<std::int64_t> disk_reads{0};
-  std::atomic<std::int64_t> disk_read_bytes{0};
+  StripedCounter disk_reads;
+  StripedCounter disk_read_bytes;
 
-  // -- Buffer pool (all zero when IoBackend != BufferPool) --
-  // hits/misses are the primary metric: unlike disk_reads, a miss here is
-  // known to have left the pool, which the page cache cannot tell you.
-  std::atomic<std::int64_t> pool_hits{0};
-  std::atomic<std::int64_t> pool_misses{0};
-  // Frames admitted by a read miss. The writer's inserts on append are not
-  // fills: they cost no I/O.
-  std::atomic<std::int64_t> pool_fills{0};
-  std::atomic<std::int64_t> pool_evictions{0};
-  std::int64_t pool_frames_total{0};
-  // Gauge: frames currently holding a file's bytes. Resident / total is the
-  // fill level an operator sizes against.
-  std::atomic<std::int64_t> pool_frames_resident{0};
-  // Files whose filesystem refused O_DIRECT and fill through the page cache
-  // instead. Catches a CI mount that would otherwise measure the wrong thing.
-  std::atomic<std::int64_t> pool_direct_io_fallbacks{0};
+  // -- Buffer pool: see PoolCounters in bytecask.buffer_pool. They live with
+  // the pool because the pool can outlive the DB — an iterator holds the
+  // data file, the file holds the pool — and stats() reads them through it.
 
   // -- Vacuum --
   std::atomic<std::int64_t> vacuum_bytes_reclaimed{0};

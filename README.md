@@ -28,8 +28,8 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex for their in-memory phase, with group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost. The commit is pipelined: while one flush is in flight, the next batch is validated, applied and appended, so the disk never waits on in-memory work. On the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
 - **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. Hint files are an index, not the record: one that fails its CRC is rebuilt from its data file at recovery rather than dropped, so a damaged index costs the time to rebuild it and not the keys behind it. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a degraded state: reads remain available, all writes throw `DbDegraded`, and the service calls `resume()` to recover without a restart.
-- **Bounded value cache** — `IoBackend::BufferPool` serves data files from a frame cache whose size the operator sets, filled with `O_DIRECT`, for deployments where the dataset far exceeds RAM and the footprint has to be a number rather than whatever the kernel's page cache settles on. Reads stay lock-free; the active file is resident from the moment its bytes are written. `capacity_bytes` is the total footprint, and `stats()` reports a hit ratio to size against — something a page cache cannot give. On a resident dataset a hit is within ~80 ns of `mmap`; it is off by default, and worth turning on when there is a memory budget to enforce.
-- **Operational counters** — `stats()` returns a flat `map<string, int64_t>` of monotonic counters (bytes written, fsyncs, group writer batches, vacuum bytes reclaimed, CRC failures, I/O errors, degraded transitions) and gauges (degraded state, open files, live key count, buffer pool hit/miss and residency). Designed for pull-based scraping (Prometheus, logging). Counters only track what the engine can see internally — request counts and latency are the caller's responsibility.
+- **Bounded value cache** — `IoBackend::BufferPool` serves data files from a frame cache whose size the operator sets, filled with `O_DIRECT`, for deployments where the dataset far exceeds RAM and the footprint has to be a number rather than whatever the kernel's page cache settles on. Reads stay lock-free; the active file is resident from the moment its bytes are written. `capacity_bytes` is the total footprint, and `stats()` reports a hit ratio to size against — something a page cache cannot give. On a resident dataset a hit is ~15 ns behind `mmap` and scales with reader threads the same way; it is off by default, and worth turning on when there is a memory budget to enforce.
+- **Operational counters** — `stats()` returns a flat `map<string, int64_t>` of monotonic counters (bytes written, fsyncs, group writer batches, vacuum bytes reclaimed, CRC failures, I/O errors, degraded transitions) and gauges (degraded state, open files, live key count, buffer pool hit/miss and residency, key directory versions alive and retired nodes they pin). Designed for pull-based scraping (Prometheus, logging). Counters only track what the engine can see internally — request counts and latency are the caller's responsibility.
 - **Replication transport in Python** — Python bindings expose a `DataEntry(sequence, entry_type, key, value)` constructor accepting bytes-like payloads, so `changes_since()` output can be serialized over the wire and reconstructed before `ingest()`.
 
 ## Performance
@@ -127,7 +127,7 @@ Recovery runs when ByteCaskDB opens an existing database: it rebuilds the in-mem
 
 _Tested on AMD Ryzen 7 3700X (8C/16T), Samsung SSD 860 EVO SATA (463 MiB/s read), 31 GiB RAM. Each result is the mean of 5 runs. Benchmark source: [`benchmarks/engine_bench.cpp`](benchmarks/engine_bench.cpp)._
 
-_These figures were measured on the radix key directory, before the B+ tree became the default. A head-to-head run of both trees on one engine put the B+ tree ahead on reads and batched writes and behind on unsynced single puts, but that run was on different hardware, so the absolute numbers above have not been re-measured on this machine and are not restated here. Reproduce either tree with [`scripts/compare_engine_bench.py`](scripts/compare_engine_bench.py)._
+_These figures were measured on the radix key directory, before the B+ tree became the default, and on the `mmap` read path, before `engine_bench` switched its default to the buffer pool. A head-to-head run of both trees on one engine put the B+ tree ahead on reads and batched writes and behind on unsynced single puts, but that run was on different hardware, so the absolute numbers above have not been re-measured on this machine and are not restated here. Reproduce either tree with [`scripts/compare_engine_bench.py`](scripts/compare_engine_bench.py)._
 
 ## Quick Start
 
@@ -362,7 +362,8 @@ public:
 
     // Returns all operational counters and gauges as a flat map.
     // Monotonic counters (bytes_written, fsyncs, …) and current-state
-    // gauges (degraded, open_files). Designed for pull-based scraping.
+    // gauges (degraded, open_files, keydir_versions_live,
+    // keydir_nodes_parked). Designed for pull-based scraping.
     [[nodiscard]] auto stats() const -> std::map<std::string, std::int64_t>;
 };
 

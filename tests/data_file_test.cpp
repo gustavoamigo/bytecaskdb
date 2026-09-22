@@ -331,12 +331,11 @@ TEST_CASE("WritableDataFile: fresh file has no unwritten extents",
 
   constexpr std::size_t kCapacity = 8 * 1024 * 1024;
   // Required by the BufferPool back-end, ignored by the other two.
-  bytecask::Counters counters;
-  bytecask::BufferPool pool{
-      bytecask::BufferPoolOptions{.capacity_bytes = 4 * kCapacity}, counters};
+  auto pool = std::make_shared<bytecask::BufferPool>(
+      bytecask::BufferPoolOptions{.capacity_bytes = 4 * kCapacity});
   auto file = bytecask::createDataFileForWrite(
       std::filesystem::temp_directory_path(), "bc_test_zero_fill", ".data",
-      kCapacity, io_backend, &pool, /*file_id=*/1);
+      kCapacity, io_backend, pool, /*file_id=*/1);
   CHECK(file->size() == 0);
   // Zero-filled one chunk ahead, not to capacity.
   CHECK(std::filesystem::file_size(path) == bytecask::kZeroFillChunkBytes);

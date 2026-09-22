@@ -104,6 +104,20 @@ public:
       Offset offset, std::uint32_t value_size,
       std::vector<std::byte> &io_buf) const -> DataEntryView = 0;
 
+  // read_entry / read_entry_unverified for a caller that keeps the spans
+  // across its own work — an iterator — and can therefore hold a lease. A
+  // pool-backed file lends spans straight into the resident frame under
+  // lease, with no copy; every other back-end copies exactly as the two
+  // methods above do and leaves lease empty. Spans are valid until the next
+  // call with the same io_buf and lease, whichever of the two backs them.
+  // Each back-end implements it by name rather than through a base default,
+  // so the copying ones cost one virtual call, not two.
+  [[nodiscard]] virtual auto lend_entry(Offset offset, std::uint32_t value_size,
+                                        bool verify,
+                                        std::vector<std::byte> &io_buf,
+                                        FrameLease &lease) const
+      -> DataEntryView = 0;
+
   [[nodiscard]] auto path() const -> const std::filesystem::path & {
     return path_;
   }
@@ -172,6 +186,67 @@ WritableDataFile::~WritableDataFile() = default;
 // mapping and uses only the append half.
 // ---------------------------------------------------------------------------
 
+// The zero-copy read behind lend_entry for the two pool-backed files: the
+// entry's spans point into the frame the lease pins when the whole entry —
+// header through CRC — lies inside one resident frame below file_size.
+// nullopt otherwise, with nothing pinned; the caller copies instead. That
+// covers a straddling entry, a non-resident frame and a lost race alike.
+auto lend_from_pool(BufferPool &pool, std::uint32_t file_id,
+                    std::size_t file_size, Offset offset,
+                    std::uint32_t value_size, bool verify, FrameLease &lease)
+    -> std::optional<DataEntryView> {
+  const auto bytes = pool.view(file_id, offset, file_size, lease);
+  if (bytes.size() < kHeaderSize) {
+    lease.reset();
+    return std::nullopt;
+  }
+  const auto hdr = bytecask::read_header(bytes);
+  const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
+  if (total > bytes.size()) {
+    lease.reset();
+    return std::nullopt;
+  }
+  const auto entry = bytes.first(total);
+  const auto header = verify ? parse_header_and_verify(entry) : hdr;
+  pool.note_hit();
+  const auto body = entry.subspan(kHeaderSize);
+  return DataEntryView{
+      .sequence = header.sequence,
+      .entry_type = header.entry_type,
+      .key = body.subspan(0, hdr.key_size),
+      .value = body.subspan(hdr.key_size, value_size),
+  };
+}
+
+// The point read behind read_value for the two pool-backed files: assigns
+// the value into out straight from the frame — the same one allocation and
+// copy the mmap path does, with no zero-fill of out and no run bookkeeping —
+// when the bytes it needs lie in one resident frame. With verify, that is
+// the whole entry, checked in place. Returns false, with nothing pinned,
+// when they do not; the caller then reads through the pool the long way.
+auto read_value_from_pool(BufferPool &pool, std::uint32_t file_id,
+                          std::size_t file_size, Offset offset,
+                          std::uint16_t key_size, std::uint32_t value_size,
+                          bool verify, std::vector<std::byte> &out) -> bool {
+  FrameLease lease;
+  if (verify) {
+    const auto total = kHeaderSize + key_size + value_size + kCrcSize;
+    const auto bytes = pool.view(file_id, offset, file_size, lease);
+    if (bytes.size() < total) return false;
+    const auto entry = bytes.first(total);
+    (void)parse_header_and_verify(entry);
+    const auto value = entry.subspan(kHeaderSize + key_size, value_size);
+    out.assign(value.begin(), value.end());
+  } else {
+    const auto val_offset = offset + kHeaderSize + key_size;
+    const auto bytes = pool.view(file_id, val_offset, file_size, lease);
+    if (bytes.size() < value_size) return false;
+    out.assign(bytes.begin(), bytes.begin() + value_size);
+  }
+  pool.note_hit();
+  return true;
+}
+
 // pread(2) back-end. Stateless: every publish() call compiles away.
 export struct PreadIo {
   // Each point read costs a syscall, so read_entry_unverified over-reads
@@ -193,6 +268,19 @@ export struct PreadIo {
       done += static_cast<std::size_t>(n);
     }
   }
+
+  // Nothing resident to lend or assign from: the file's read methods copy.
+  [[nodiscard]] static auto lend(Offset, std::uint32_t, bool, Offset,
+                                 FrameLease &) noexcept
+      -> std::optional<DataEntryView> {
+    return std::nullopt;
+  }
+  [[nodiscard]] static auto read_value(Offset, std::uint16_t, std::uint32_t,
+                                       bool, Offset,
+                                       std::vector<std::byte> &) noexcept
+      -> bool {
+    return false;
+  }
 };
 
 // Buffer pool back-end: appended bytes go into the pool as they are written,
@@ -202,8 +290,8 @@ export struct PreadIo {
 // O_DIRECT.
 export class PoolIo {
 public:
-  PoolIo(BufferPool &pool, std::uint32_t file_id) noexcept
-      : pool_{&pool}, file_id_{file_id} {}
+  PoolIo(std::shared_ptr<BufferPool> pool, std::uint32_t file_id) noexcept
+      : pool_{std::move(pool)}, file_id_{file_id} {}
 
   // The bytes are already in memory, so an over-read saves nothing.
   static constexpr bool kResident = true;
@@ -227,8 +315,29 @@ public:
                    len, static_cast<std::size_t>(logical_end), dst);
   }
 
+  // Zero-copy entry and point read out of the frames the writer filled,
+  // bounded by the active file's logical end. See lend_from_pool and
+  // read_value_from_pool.
+  [[nodiscard]] auto lend(Offset offset, std::uint32_t value_size, bool verify,
+                          Offset logical_end, FrameLease &lease) const
+      -> std::optional<DataEntryView> {
+    return lend_from_pool(*pool_, file_id_,
+                          static_cast<std::size_t>(logical_end), offset,
+                          value_size, verify, lease);
+  }
+  [[nodiscard]] auto read_value(Offset offset, std::uint16_t key_size,
+                                std::uint32_t value_size, bool verify,
+                                Offset logical_end,
+                                std::vector<std::byte> &out) const -> bool {
+    return read_value_from_pool(*pool_, file_id_,
+                                static_cast<std::size_t>(logical_end), offset,
+                                key_size, value_size, verify, out);
+  }
+
 private:
-  BufferPool *pool_;  // never null: bound to a reference at construction
+  // Shared, not borrowed: the file lends spans into the pool's frames and
+  // can outlive the DB in an iterator's hands, so the pool outlives the file.
+  std::shared_ptr<BufferPool> pool_;  // never null
   std::uint32_t file_id_;
 };
 
@@ -603,6 +712,15 @@ public:
     return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf);
   }
 
+  [[nodiscard]] auto lend_entry(Offset offset, std::uint32_t value_size,
+                                bool verify, std::vector<std::byte> &io_buf,
+                                FrameLease &lease) const
+      -> DataEntryView override {
+    lease.reset();
+    return verify ? WritableMmapDataFile::read_entry(offset, value_size, io_buf)
+                  : WritableMmapDataFile::read_entry_unverified(offset, value_size, io_buf);
+  }
+
   [[nodiscard]] auto read_entry_unverified(
       Offset offset, std::uint32_t value_size,
       std::vector<std::byte> &io_buf) const
@@ -821,6 +939,12 @@ public:
                   std::uint32_t value_size, bool verify,
                   std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const override {
+    if constexpr (Io::kResident) {
+      if (ops_.io_.read_value(offset, key_size, value_size, verify,
+                              ops_.offset_, out)) {
+        return;
+      }
+    }
     if (verify) {
       auto view = read_entry_with_key_size(offset, key_size, value_size, io_buf);
       out.assign(view.value.begin(), view.value.end());
@@ -829,6 +953,22 @@ public:
       out.resize(value_size);
       fetch(val_offset, value_size, out.data());
     }
+  }
+
+  [[nodiscard]] auto lend_entry(Offset offset, std::uint32_t value_size,
+                                bool verify, std::vector<std::byte> &io_buf,
+                                FrameLease &lease) const
+      -> DataEntryView override {
+    if constexpr (Io::kResident) {
+      if (auto lent = ops_.io_.lend(offset, value_size, verify, ops_.offset_,
+                                    lease)) {
+        return *lent;
+      }
+    }
+    lease.reset();
+    return verify ? WritablePosixFile::read_entry(offset, value_size, io_buf)
+                  : WritablePosixFile::read_entry_unverified(offset, value_size,
+                                                             io_buf);
   }
 
   [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
@@ -1040,6 +1180,15 @@ public:
     return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf);
   }
 
+  [[nodiscard]] auto lend_entry(Offset offset, std::uint32_t value_size,
+                                bool verify, std::vector<std::byte> &io_buf,
+                                FrameLease &lease) const
+      -> DataEntryView override {
+    lease.reset();
+    return verify ? ReadOnlyPosixDataFile::read_entry(offset, value_size, io_buf)
+                  : ReadOnlyPosixDataFile::read_entry_unverified(offset, value_size, io_buf);
+  }
+
   [[nodiscard]] auto read_entry_unverified(
       Offset offset, std::uint32_t value_size,
       std::vector<std::byte> &io_buf) const -> DataEntryView override {
@@ -1213,6 +1362,15 @@ public:
     return read_entry_with_key_size(offset, hdr.key_size, value_size);
   }
 
+  [[nodiscard]] auto lend_entry(Offset offset, std::uint32_t value_size,
+                                bool verify, std::vector<std::byte> &io_buf,
+                                FrameLease &lease) const
+      -> DataEntryView override {
+    lease.reset();
+    return verify ? ReadOnlyMmapDataFile::read_entry(offset, value_size, io_buf)
+                  : ReadOnlyMmapDataFile::read_entry_unverified(offset, value_size, io_buf);
+  }
+
   [[nodiscard]] auto read_entry_unverified(
       Offset offset, std::uint32_t value_size,
       [[maybe_unused]] std::vector<std::byte> &io_buf) const
@@ -1301,7 +1459,8 @@ inline void drop_page_cache(int fd) noexcept {
 export class ReadOnlyBufferPoolDataFile : public DataFile {
 public:
   [[nodiscard]] static auto openForRead(std::filesystem::path path,
-                                        std::uint32_t file_id, BufferPool &pool)
+                                        std::uint32_t file_id,
+                                        std::shared_ptr<BufferPool> pool)
       -> std::shared_ptr<ReadOnlyBufferPoolDataFile> {
     auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd == -1) {
@@ -1317,10 +1476,10 @@ public:
     }
 
     int direct_fd = -1;
-    if (pool.direct_io()) {
+    if (pool->direct_io()) {
       direct_fd = open_uncached(path, file_size);
       if (direct_fd == -1) {
-        pool.note_direct_io_fallback();
+        pool->note_direct_io_fallback();
       } else {
         // Fills no longer come from the page cache, so the residency this
         // file built up while it was the active file is pure waste from here
@@ -1331,7 +1490,7 @@ public:
     }
     return std::shared_ptr<ReadOnlyBufferPoolDataFile>(
         new ReadOnlyBufferPoolDataFile{std::move(path), fd, direct_fd,
-                                       file_size, file_id, pool});
+                                       file_size, file_id, std::move(pool)});
   }
 
   ~ReadOnlyBufferPoolDataFile() override;
@@ -1363,6 +1522,10 @@ public:
                   std::uint32_t value_size, bool verify,
                   std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const override {
+    if (read_value_from_pool(*pool_, file_id_, file_size_, offset, key_size,
+                             value_size, verify, out)) {
+      return;
+    }
     if (verify) {
       auto view = read_entry_with_key_size(offset, key_size, value_size,
                                            io_buf, Source::Pool);
@@ -1385,6 +1548,21 @@ public:
   // No speculative over-read here, unlike the pread back-end: that exists to
   // save a second syscall, and a pool hit has no syscall to save. Reading the
   // header first is both simpler and usually free — it lands in the same frame.
+  [[nodiscard]] auto lend_entry(Offset offset, std::uint32_t value_size,
+                                bool verify, std::vector<std::byte> &io_buf,
+                                FrameLease &lease) const
+      -> DataEntryView override {
+    if (auto lent = lend_from_pool(*pool_, file_id_, file_size_, offset,
+                                   value_size, verify, lease)) {
+      return *lent;
+    }
+    lease.reset();
+    return verify
+        ? ReadOnlyBufferPoolDataFile::read_entry(offset, value_size, io_buf)
+        : ReadOnlyBufferPoolDataFile::read_entry_unverified(offset, value_size,
+                                                            io_buf);
+  }
+
   [[nodiscard]] auto read_entry_unverified(
       Offset offset, std::uint32_t value_size,
       std::vector<std::byte> &io_buf) const -> DataEntryView override {
@@ -1409,9 +1587,10 @@ public:
 private:
   ReadOnlyBufferPoolDataFile(std::filesystem::path path, int fd,
                              int direct_fd, std::size_t file_size,
-                             std::uint32_t file_id, BufferPool &pool)
+                             std::uint32_t file_id,
+                             std::shared_ptr<BufferPool> pool)
       : DataFile{std::move(path)}, fd_{fd}, direct_fd_{direct_fd},
-        file_size_{file_size}, file_id_{file_id}, pool_{&pool} {}
+        file_size_{file_size}, file_id_{file_id}, pool_{std::move(pool)} {}
 
 
   // A sweep just finished. Under direct I/O the page cache it pulled in serves
@@ -1429,7 +1608,8 @@ private:
   int direct_fd_;  // -1: no uncached reads here; fills go through fd_
   std::size_t file_size_;
   std::uint32_t file_id_;
-  BufferPool *pool_;
+  // Shared so the pool outlives every file that lends spans into it.
+  std::shared_ptr<BufferPool> pool_;
 
   // Point reads go through the pool; scans deliberately do not. scan() sweeps
   // a whole file once — vacuum, hint generation, create_manifest — and
@@ -1494,13 +1674,14 @@ ReadOnlyBufferPoolDataFile::~ReadOnlyBufferPoolDataFile() {
 // Every IoBackend::BufferPool file needs the DB's pool: falling back to pread
 // would make the configured bound quietly meaningless, which is the whole
 // point of the subsystem.
-[[nodiscard]] inline auto require_pool(BufferPool *pool, const char *who)
-    -> BufferPool & {
+[[nodiscard]] inline auto require_pool(std::shared_ptr<BufferPool> pool,
+                                       const char *who)
+    -> std::shared_ptr<BufferPool> {
   if (pool == nullptr) {
     throw std::logic_error{
         std::format("{}: IoBackend::BufferPool requires a pool", who)};
   }
-  return *pool;
+  return pool;
 }
 
 // The back-end for a file that is not an engine file yet — vacuum's staging
@@ -1517,12 +1698,12 @@ export [[nodiscard]] inline auto stagingBackend(IoBackend backend) noexcept
 // there and ignored elsewhere.
 export [[nodiscard]] inline auto openDataFileForRead(
     std::filesystem::path path, IoBackend backend = IoBackend::Pread,
-    BufferPool *pool = nullptr, std::uint32_t file_id = 0)
+    std::shared_ptr<BufferPool> pool = nullptr, std::uint32_t file_id = 0)
     -> std::shared_ptr<DataFile> {
 #ifndef __EMSCRIPTEN__
   if (backend == IoBackend::BufferPool) {
     return ReadOnlyBufferPoolDataFile::openForRead(
-        std::move(path), file_id, require_pool(pool, "openDataFileForRead"));
+        std::move(path), file_id, require_pool(std::move(pool), "openDataFileForRead"));
   }
   if (backend == IoBackend::Mmap) {
     struct stat st {};
@@ -1541,13 +1722,13 @@ export [[nodiscard]] inline auto openDataFileForRead(
 // createDataFileForWrite — but tests and tooling reopen a file they wrote.
 export [[nodiscard]] inline auto openDataFileForWrite(
     std::filesystem::path path, std::size_t capacity, IoBackend backend,
-    BufferPool *pool = nullptr, std::uint32_t file_id = 0)
+    std::shared_ptr<BufferPool> pool = nullptr, std::uint32_t file_id = 0)
     -> std::shared_ptr<WritableDataFile> {
 #ifndef __EMSCRIPTEN__
   if (backend == IoBackend::BufferPool) {
     return WritableBufferPoolDataFile::create(
         std::move(path), capacity, /*exclusive=*/false,
-        PoolIo{require_pool(pool, "openDataFileForWrite"), file_id});
+        PoolIo{require_pool(std::move(pool), "openDataFileForWrite"), file_id});
   }
   if (backend == IoBackend::Mmap && capacity > 0) {
     return WritableMmapDataFile::create(std::move(path), capacity);
@@ -1570,7 +1751,7 @@ export [[nodiscard]] inline auto openDataFileForWrite(
 export [[nodiscard]] inline auto createDataFileForWrite(
     const std::filesystem::path &dir, const std::string &stem,
     std::string_view suffix, std::size_t capacity, IoBackend backend,
-    BufferPool *pool = nullptr, std::uint32_t file_id = 0)
+    std::shared_ptr<BufferPool> pool = nullptr, std::uint32_t file_id = 0)
     -> std::shared_ptr<WritableDataFile> {
   const auto hint_path = dir / (stem + ".hint");
   // error_code overload: the question is "is this stem taken", and a stat
@@ -1588,7 +1769,7 @@ export [[nodiscard]] inline auto createDataFileForWrite(
   if (backend == IoBackend::BufferPool) {
     return WritableBufferPoolDataFile::create(
         std::move(path), capacity, /*exclusive=*/true,
-        PoolIo{require_pool(pool, "createDataFileForWrite"), file_id});
+        PoolIo{require_pool(std::move(pool), "createDataFileForWrite"), file_id});
   }
   if (backend == IoBackend::Mmap && capacity > 0) {
     return WritableMmapDataFile::create(std::move(path), capacity,
