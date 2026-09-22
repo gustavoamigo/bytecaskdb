@@ -2834,6 +2834,222 @@ TEST_CASE("vacuum compact removes dead entries", "[vacuum]") {
 }
 
 // ---------------------------------------------------------------------------
+// A kill inside vacuum's publish window — after the compacted file is renamed
+// into place and before the source is unlinked — leaves two files holding the
+// same entries under the same sequences. Recovery undoes the vacuum: it
+// deletes the compacted copy, keeps the source, and opens with every key.
+// See docs/vacuum_crash_recovery_design.md.
+// ---------------------------------------------------------------------------
+namespace {
+
+auto data_files_in(const std::filesystem::path &dir)
+    -> std::set<std::filesystem::path> {
+  std::set<std::filesystem::path> out;
+  for (const auto &e : std::filesystem::directory_iterator{dir}) {
+    if (e.path().extension() == ".data") out.insert(e.path().filename());
+  }
+  return out;
+}
+
+auto collect_kv(bytecask::DB &db) -> std::map<std::string, std::string> {
+  std::map<std::string, std::string> out;
+  for (auto &[key, value] : db.iter_from({})) {
+    out[to_string(key)] = to_string(value);
+  }
+  return out;
+}
+
+auto sequence_ranges(bytecask::DB &db)
+    -> std::vector<std::pair<std::uint64_t, std::uint64_t>> {
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> out;
+  for (const auto &[fid, fs] : db.file_stats()) {
+    if (fs.min_sequence > 0) out.emplace_back(fs.min_sequence, fs.max_sequence);
+  }
+  std::ranges::sort(out);
+  return out;
+}
+
+auto disjoint(const std::vector<std::pair<std::uint64_t, std::uint64_t>> &r)
+    -> bool {
+  for (std::size_t i = 1; i < r.size(); ++i) {
+    if (r[i - 1].second >= r[i].first) return false;
+  }
+  return true;
+}
+
+} // namespace
+
+TEST_CASE("recovery undoes a vacuum killed before the source was unlinked",
+          "[vacuum][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  std::map<std::string, std::string> oracle;
+  std::set<std::filesystem::path> before_vacuum;
+  std::filesystem::path copy;
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 4096});
+    for (int i = 0; i < 200; ++i) {
+      auto k = std::format("k{:04d}", i);
+      auto v = std::format("v{:04d}", i) + std::string(40, 'x');
+      db.put({.sync = false}, to_bytes(k), to_bytes(v));
+      oracle[k] = v;
+    }
+    // Garbage in the first file, which keeps live keys too: vacuum compacts
+    // it rather than removing it.
+    for (int i = 0; i < 40; i += 2) {
+      auto k = std::format("k{:04d}", i);
+      auto v = std::format("w{:04d}", i) + std::string(40, 'y');
+      db.put({.sync = false}, to_bytes(k), to_bytes(v));
+      oracle[k] = v;
+    }
+    (void)db.del({.sync = false}, to_bytes("k0007"));
+    oracle.erase("k0007");
+
+    before_vacuum = data_files_in(db_path);
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_unlink"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}),
+                        std::system_error);
+    }
+    std::vector<std::filesystem::path> added;
+    std::ranges::set_difference(data_files_in(db_path), before_vacuum,
+                                std::back_inserter(added));
+    REQUIRE(added.size() == 1);
+    copy = added.front();
+  }
+  // The window's on-disk state: the compacted copy and every file that
+  // existed before vacuum, its source among them.
+  const auto on_disk = data_files_in(db_path);
+  REQUIRE(on_disk.contains(copy));
+  REQUIRE(std::ranges::includes(on_disk, before_vacuum));
+
+  auto check_undone = [&](bytecask::DB &db, const std::filesystem::path &p) {
+    CHECK(collect_kv(db) == oracle);
+    const auto after = data_files_in(p);
+    CHECK_FALSE(after.contains(copy));
+    CHECK(std::ranges::includes(after, before_vacuum));
+    CHECK(disjoint(sequence_ranges(db)));
+  };
+
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> serial_ranges;
+  {
+    const auto p = td.path / "serial";
+    std::filesystem::copy(db_path, p, std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 4096, .recovery_threads = 1});
+    check_undone(db, p);
+    serial_ranges = sequence_ranges(db);
+
+    // Each sequence once: the copy's duplicates are gone from changes_since
+    // too (#129).
+    auto snap = db.snapshot();
+    std::vector<std::uint64_t> seqs;
+    for (const auto &entry : db.changes_since(snap, 0)) {
+      seqs.push_back(entry.sequence);
+    }
+    auto sorted = seqs;
+    std::ranges::sort(sorted);
+    CHECK(std::ranges::adjacent_find(sorted) == sorted.end());
+
+    // The vacuum that was undone runs again.
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+    CHECK(collect_kv(db) == oracle);
+  }
+  // Files go to workers round-robin, so worker counts vary in whether the two
+  // files meet inside one worker's build or in the merge across workers.
+  const auto n_files = static_cast<unsigned>(on_disk.size());
+  for (unsigned w = 2; w <= n_files; ++w) {
+    DYNAMIC_SECTION("parallel recovery agrees with serial, " << w << " workers") {
+      const auto p = td.path / std::format("parallel{}", w);
+      std::filesystem::copy(db_path, p, std::filesystem::copy_options::recursive);
+      auto db = bytecask::DB::open(p, {.max_file_bytes = 4096, .recovery_threads = w});
+      check_undone(db, p);
+      CHECK(sequence_ranges(db) == serial_ranges);
+    }
+  }
+}
+
+// Deleting the smaller file is safe on the one thing recovery checks — that
+// its entries are all in the larger one. A copy of a prefix of a file passes
+// that check; deleting the larger file would lose every write after the copy.
+TEST_CASE("recovery keeps the full file over a copy of its prefix",
+          "[vacuum][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  const auto prefix_name =
+      std::filesystem::path{"data_20000101000000_0000000000000000_V01.data"};
+  std::map<std::string, std::string> oracle;
+  {
+    auto db = bytecask::DB::open(db_path);
+    for (int i = 0; i < 20; ++i) {
+      auto k = std::format("k{:02d}", i);
+      auto v = std::format("v{:02d}", i);
+      db.put({}, to_bytes(k), to_bytes(v));
+      oracle[k] = v;
+      if (i == 9) {
+        // Copy the active file's first ten entries: its logical size, not
+        // its preallocated one.
+        const auto s = db.engine_state();
+        const auto &active = **s->files.get(s->active_file_id);
+        const auto len = s->file_stats.get(s->active_file_id)->total_bytes;
+        std::ifstream in{active.path(), std::ios::binary};
+        std::string bytes(len, '\0');
+        in.read(bytes.data(), static_cast<std::streamsize>(len));
+        std::ofstream out{td.path / prefix_name, std::ios::binary};
+        out.write(bytes.data(), static_cast<std::streamsize>(len));
+      }
+    }
+  }
+  std::filesystem::copy_file(td.path / prefix_name, db_path / prefix_name);
+  const auto before = data_files_in(db_path);
+
+  auto db = bytecask::DB::open(db_path);
+  CHECK(collect_kv(db) == oracle);
+  auto kept = before;
+  kept.erase(prefix_name);
+  const auto after = data_files_in(db_path);
+  CHECK_FALSE(after.contains(prefix_name));
+  CHECK(std::ranges::includes(after, kept));
+  CHECK(disjoint(sequence_ranges(db)));
+}
+
+// The same key under the same sequence with a different value of the same
+// size is two writes, not a copy. Recovery refuses it and deletes nothing.
+TEST_CASE("recovery refuses two different writes under one sequence",
+          "[vacuum][recovery]") {
+  TempDir td;
+  const auto a = td.path / "a";
+  const auto b = td.path / "b";
+  {
+    auto db = bytecask::DB::open(a);
+    db.put({}, to_bytes("key"), to_bytes("aaaa"));
+  }
+  {
+    auto db = bytecask::DB::open(b);
+    db.put({}, to_bytes("key"), to_bytes("bbbb"));
+  }
+  for (const auto &e : std::filesystem::directory_iterator{b}) {
+    const auto ext = e.path().extension();
+    if (ext == ".data" || ext == ".hint") {
+      std::filesystem::copy_file(e.path(), a / e.path().filename());
+    }
+  }
+  const auto before = data_files_in(a);
+  REQUIRE(before.size() >= 2);
+
+  for (unsigned w : {1u, 2u}) {
+    INFO("recovery_threads = " << w);
+    try {
+      auto db = bytecask::DB::open(a, {.recovery_threads = w});
+      FAIL("open must refuse the directory");
+    } catch (const std::runtime_error &e) {
+      CHECK(std::string_view{e.what()}.find(
+                "neither is a compacted copy") != std::string_view::npos);
+    }
+    CHECK(data_files_in(a) == before);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // vacuum_compact_file: tombstones are preserved
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum compact preserves tombstones", "[vacuum]") {

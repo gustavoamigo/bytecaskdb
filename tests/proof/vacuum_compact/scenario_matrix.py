@@ -36,13 +36,11 @@ class VacuumCompactFailureClass(Enum):
     VC2 = "append_fails"      # io_data_file_append during scan/copy to tmp
     VC3 = "sync_fails"        # io_data_file_sync on tmp file
     VC4 = "rename_fails"      # io_vacuum_compact_rename (synced tmp on disk)
-    # NOT a class here, deliberately — see "Orphaned .data files" in
-    # docs/correctness_validation.md. The io_vacuum_compact_post_rename fault
-    # point exists and reproduces the state (a rename that completed while its
-    # commit did not), but what the engine then does is a defect, not a
-    # contract worth freezing into cells: DB::open refuses under pread, and
-    # under mmap the process aborts in ~DB. Cells here would assert one of
-    # those as expected.
+    VC5 = "unlink_fails"      # io_vacuum_compact_unlink (committed; source left on disk)
+    # io_vacuum_compact_post_rename is the other end of VC5's window —
+    # renamed, not yet committed — and leaves the same pair on disk, which
+    # recovery undoes (see "Orphaned .data files" in
+    # docs/correctness_validation.md). It has no class here yet.
 
 
 # Compact path is now always used for files with live_bytes > 0.

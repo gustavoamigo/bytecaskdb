@@ -696,10 +696,10 @@ fault points.
 
 This directly proves: *resume always eventually recovers once the underlying fault clears.*
 
-### vacuum_compact — 40 tests
+### vacuum_compact — 48 tests
 
-40 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover eight state
-shapes × five failure classes (SUCCESS, VC1–VC4).
+48 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover eight state
+shapes × six failure classes (SUCCESS, VC1–VC5).
 
 State shapes create a DB with exactly one sealed file having fragmentation > 0:
 
@@ -735,13 +735,26 @@ sealed file.
 
 Failure classes: SUCCESS, VC1 (`io_vacuum_compact_tmp_create`),
 VC2 (`io_data_file_append`), VC3 (`io_data_file_sync`),
-VC4 (`io_vacuum_compact_rename`).
+VC4 (`io_vacuum_compact_rename`), VC5 (`io_vacuum_compact_unlink`).
 
 VC4 is the most critical: the tmp file is fully synced and renamed
 (a new `.data` file exists on disk) but `vacuum_commit` has not run —
 the old file is still in the published state. `assert_vacuum_recoverable`
 confirms that recovery does not replay the orphaned new file as a
 secondary source and sees only the data the old file guaranteed.
+
+VC5 is the other side of the commit: `vacuum_commit` has run, so in memory
+the outcome is success (`assert_vacuum_success`), but the source was never
+unlinked. On disk that is a compacted file and its source holding the same
+entries under the same sequences — what a kill anywhere between the rename
+and the unlink leaves, a window that spans the compacted file's hint scan.
+Recovery undoes the vacuum by deleting the compacted file.
+`assert_vacuum_recoverable` proves the directory opens with every key and,
+for every class, that the recovered files are sequence-disjoint. Before
+recovery handled this pair, every VC5 test failed with "two entries share
+the same sequence number but differ in physical location", which is how a
+cgroup OOM kill under a write-heavy sysbench run left a database that would
+not open.
 
 ### corruption — 16 tests
 
@@ -1473,54 +1486,27 @@ auto atomic_rename(const path& from, const path& to) -> void {
 
 ### Orphaned `.data` files
 
-If `rename()` completes but the process crashes before `vacuum_commit`
-runs, a `.data` file exists on disk unreferenced by the published
-`EngineState`. `io_vacuum_compact_post_rename` reproduces exactly that
-state.
+If `rename()` completes but the process is killed before the source is
+unlinked, the compacted copy and its source are on disk together, holding
+the same entries under the same sequences. `io_vacuum_compact_post_rename`
+reproduces the earliest point of that window — renamed, not yet committed —
+and VC5 (`io_vacuum_compact_unlink`) the latest, committed but with the
+source still on disk.
 
-**What the engine does with it, measured.** Not what an earlier draft of
-this section claimed, and not the benign outcome a first probe suggested
-either — that probe duplicated a sealed file byte for byte, which is not
-the shape vacuum leaves. A compacted copy holds the same sequences at
-*different* offsets, because compaction drops dead entries and the live
-ones move. Recovery detects that and refuses:
+Recovery undoes the vacuum: it deletes the copy once it has checked that
+every entry in it is also in the source, and refuses to open on any other
+pair of files that share sequences (#137, and
+[`vacuum_crash_recovery_design.md`](vacuum_crash_recovery_design.md) for
+why undo and not finish). Before that, a kill anywhere in the window left a
+database that would not open — `DB::open` threw under `Pread`, and under
+`Mmap` the process aborted in `~DB`. Measured after #137 with the
+post-rename point on both backends: `~DB` returns, the next open removes
+the copy, and every key reads back.
 
-```
-bytecask: corrupt database — two entries share the same sequence number
-but differ in physical location
-```
-
-Under `IoBackend::Pread` that surfaces as `DB::open` throwing. Under
-`IoBackend::Mmap` the process **aborts in `~DB`** rather than throwing,
-which is a second defect and not the same one.
-
-No data is lost in either case: the file vacuum was compacting is
-untouched, and removing the orphan by hand recovers everything. But a
-crash in an ordinary vacuum window leaves a database that will not open,
-and nothing clears it.
-
-**Why there are no cells for it.** Refusing to open on a detected
-inconsistency is defensible under principle 1 — the engine cannot tell
-which copy is authoritative, and guessing is how silent corruption starts.
-What is not defensible is that there is no path back. Cells here would
-have to assert one of `DB::open` throwing or the process aborting *as the
-expected contract*, and freezing either into the ratchet is worse than
-leaving the gap visible. The fault point stays; the class does not, until
-the resolution is decided.
-
-Resolving it is a design question, not a test gap:
-
-- The orphan is only distinguishable from the legitimately hint-less
-  active file by its sequences duplicating another file's, and the engine
-  already relies on files being sequence-disjoint.
-- The crash window has two halves. `vacuum_compact_file` writes the new
-  file's hint *before* `vacuum_commit`, so a crash before that leaves an
-  orphan with no hint and a crash after leaves one with a hint.
-- Deleting a data file is irreversible, so a detector that is wrong once
-  costs more than the disk the orphan wastes.
-
-This supersedes #104's class **M3**, which assumed detection and removal
-were already implemented and only needed a fault point and an assertion.
+This is #104's class **M3**. Its reference model assumed detection and
+removal were already implemented; #137 is what implemented them. VC5 holds
+the committed end of the window in cells; the post-rename point has no
+class of its own yet.
 
 ---
 

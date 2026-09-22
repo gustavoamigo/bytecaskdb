@@ -628,7 +628,9 @@ Processing order across files does not matter — the canonical key-ownership co
 
 ##### Canonical key-ownership comparator
 
-Sequence numbers are unique per logical write. When two `KeyDirEntry` values claim the same key, the one with the higher sequence wins. If two entries share the same sequence number, they must point to the same physical record (`file_id`, `file_offset`); if they don't, the database is corrupt and recovery throws `std::runtime_error`. This comparator is commutative, so merge results are independent of worker count, completion order, or file iteration order. Both serial and parallel recovery use this comparator.
+Sequence numbers are unique per logical write. When two `KeyDirEntry` values claim the same key, the one with the higher sequence wins. If two entries share the same sequence number, they must point to the same physical record (`file_id`, `file_offset`). Two offsets in one file are corruption and throw `std::runtime_error`. Two files throw `SequenceOverlap`, which `recovery_open` catches: that is the shape an interrupted vacuum leaves, and it is resolved or rejected as described under *Vacuum → Crash safety*. This comparator is commutative, so merge results are independent of worker count, completion order, or file iteration order. Both serial and parallel recovery use this comparator.
+
+Recovery assigns file ids in name order (`recovery_prepare_files` sorts the `.data` paths), so ids are a function of the directory's contents rather than of the order the filesystem lists it in. A failure in any phase of the ranged merge is an exception from `DB::open`: its `parallel_for` catches on each thread and rethrows on the caller's after joining, where an exception leaving a thread used to be `std::terminate`.
 
 ##### Sequence bounds
 
@@ -690,6 +692,14 @@ This is a pure metadata operation — no scanning, no copying, no syncing. The f
 #### Crash safety
 
 `vacuum_compact_file` writes the new data file to `.data.tmp` and renames it atomically to `.data` after `fdatasync`. If the engine crashes mid-write, recovery ignores `.data.tmp` files (it only processes `.data` extensions) and cleans them up in `open_and_prepare_files`. The hint file uses the same `.hint.tmp` → `.hint` protocol.
+
+After the rename there is a second window. Vacuum scans the compacted file C to write its hint, commits, and only then unlinks the source S. A kill anywhere in there leaves C and S both on disk, holding the same entries under the same sequences — seconds for a 64 MiB file, and a cgroup OOM kill under a write-heavy load found it. Vacuum is committed on disk only once S is unlinked, so recovery undoes it (`DB::recovery_open`, design in [`vacuum_crash_recovery_design.md`](vacuum_crash_recovery_design.md)):
+
+1. Recovery stops at the first sign of two files sharing sequences: `kde_newer` throws `SequenceOverlap` when two files claim one key under one sequence, and `find_sequence_overlap` checks the per-file sequence ranges once recovery is done, for a pair that shares no key. The ranges check is over files, not keys, and is the only cost a healthy open pays.
+2. `recovery_undo_interrupted_vacuum` takes the smaller file as C and reads both data files, checking that every committed entry of C appears in S in order with the same sequence, type, key and value.
+3. If it does, C's hint and then C are deleted, with a line on stderr, and recovery runs again from scratch (with a fresh buffer pool, since ids are reassigned). If it does not, `DB::open` throws: the two files are not a compaction pair, and nothing is deleted.
+
+Deleting C is safe on exactly what step 2 checks: everything in C is also in S. Deleting S instead would also assume that S's other entries are dead, which nothing checks; a copy of a prefix of a file passes step 2, and deleting the larger file there would lose every write after the copy. The cost is that the next vacuum redoes the compaction. After reopening, files are sequence-disjoint again (D18), so `changes_since` yields each entry once.
 
 `vacuum_remove_file` has no crash safety concerns — it performs no I/O, only removes file references from engine state.
 
@@ -1645,7 +1655,7 @@ Counters are per-DB instance (`Counters` struct owned by `DB`). Two open databas
 | D15 | **C ABI / shared-library link constraint**: `libbytecask.a` is compiled with `-fPIC` so it can be linked into a shared object (e.g. `ha_bytecaskdb.so`). Without `-fPIC`, clang emits `R_X86_64_TPOFF32`/`R_X86_64_32S` relocations illegal in a DSO. xmake syntax: `add_cxxflags("-fPIC", {force = true})` on the `bytecask` static target. |
 | D16 | **MariaDB plugin header ordering**: Server-internal headers require `server/my_global.h` before `handler.h`. The client-side stub does not define `MY_GLOBAL_INCLUDED`/`uchar`/`unlikely()`. Fedora layout: base `/usr/include/mysql`, server `/usr/include/mysql/server`, private `/usr/include/mysql/server/private`. CMake include order must be `server/private` → `server` → base. `-DMYSQL_SERVER` is required. `handlerton::state` does not exist in this MariaDB ABI; use `PLUGIN_LICENSE_GPL` (no MIT constant). |
 | D17 | **Directory locking**: One process per directory, enforced by `flock()` on `dir/.lock`. Advisory only — does not protect against uncooperative processes that bypass `DB::open()`. |
-| D18 | **Sequence-disjoint files**: All data files must have non-overlapping sequence ranges — no two files contain entries with the same sequence number. Active file rotation naturally preserves this (sealed files have contiguous sequence ranges). Vacuum compact must ensure compacted files maintain disjoint ranges. This invariant enables efficient replication (linear scan instead of min-heap merge), supports future file merging operations, and allows skipping entire files based on sequence bounds. |
+| D18 | **Sequence-disjoint files**: All data files must have non-overlapping sequence ranges — no two files contain entries with the same sequence number. Active file rotation naturally preserves this (sealed files have contiguous sequence ranges). Vacuum compact must ensure compacted files maintain disjoint ranges; the one exception, a compacted file whose source outlived a kill, is removed at the next open (see *Vacuum → Crash safety*), and recovery refuses any other overlap. This invariant enables efficient replication (linear scan instead of min-heap merge), supports future file merging operations, and allows skipping entire files based on sequence bounds. |
 | D19 | **MariaDB insert hot path**: Handler-open state caches secondary-index metadata and direct catalog counter pointers. Per-row INSERT processing must not take catalog map locks for stable table metadata, row-count increments, or AUTO_INCREMENT reservations once the handler has opened the table. |
 
 ## Replication Primitives
