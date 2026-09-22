@@ -28,6 +28,7 @@ def vacuum_compact_delta(
     VC4 note: after a successful rename the tmp file is valid on disk but
     unreferenced. The .data.tmp extension is not scanned by recovery, so it
     is a harmless disk orphan — assert_vacuum_recoverable confirms this.
+
     """
     if failure == VacuumCompactFailureClass.SUCCESS:
         return VacuumCompactDelta(threw=False, file_removed=True)

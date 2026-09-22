@@ -320,6 +320,12 @@ Three more instrument the hint write, mirroring the data file's:
 12. `io_hint_rename` — before `std::filesystem::rename()` in
     `flush_hints_for()`
 
+And one for the window a completed rename opens:
+
+13. `io_vacuum_compact_post_rename` — after `renameDataFileExclusive()` and
+    before `vacuum_commit()` in `vacuum_compact_file()`. See *Orphaned
+    `.data` files* for what it reproduces and why no cell asserts it yet.
+
 ### Orphaned BulkBegin degrade
 
 If a multi-entry batch fails mid-write after `BulkBegin`, the engine
@@ -456,16 +462,20 @@ Observers that read a key (`held_value`, `held_iter_span`,
 leaves one behind, so they skip `empty_db` and `deleted_key`.
 
 Reverting #90 — restoring the `munmap` / `mmap` in
-`WritableMmapDataFile::truncate` — makes 40 of these cells fail, every
-one of them on the byte comparison rather than only under ASan, and none
-by crashing. The `mincore` probe passes in all 40: `mmap` hands back the
-address `munmap` just released, which is exactly the blind spot that
-motivated comparing bytes. Half are `held_iter_span` and half
-`held_riter_span` — the reverse iterator's span points into the same
-mapping. The
-`rotation_threshold_mmap` cells correctly keep passing: at
-`max_file_bytes = 1` every write rotates, so their span points into a
-sealed `MAP_PRIVATE` file that `truncate()` never touches.
+`WritableMmapDataFile::truncate` — makes these cells fail on the byte
+comparison rather than only under ASan, and none by crashing. The
+`mincore` probe passes in every one of them: `mmap` hands back the address
+`munmap` just released, which is exactly the blind spot that motivated
+comparing bytes. The `rotation_threshold_mmap` cells correctly keep
+passing: at `max_file_bytes = 1` every write rotates, so their span points
+into a sealed `MAP_PRIVATE` file that `truncate()` never touches.
+
+This is also the answer to #104's proposed class **M1**, a `MAP_FIXED`
+hook to force `mmap` to return the address `munmap` just released. Its
+stated goal is to turn "often looks like it works" into a cell that either
+passes or fails, and the byte comparison already does that — it does not
+care what address came back, only what bytes are behind it. A hook would
+add machinery for a property the axis already holds deterministically.
 
 Reverting BC-243 — dropping the owner check from
 `DB::load_state_for_read` — fails 10 `second_instance` cells on
@@ -1422,33 +1432,53 @@ auto atomic_rename(const path& from, const path& to) -> void {
 ### Orphaned `.data` files
 
 If `rename()` completes but the process crashes before `vacuum_commit`
-runs, a `.data` file may exist on disk unreferenced by the published
-`EngineState`. The original file remains in the published state and is
-fully readable. No data is lost.
+runs, a `.data` file exists on disk unreferenced by the published
+`EngineState`. `io_vacuum_compact_post_rename` reproduces exactly that
+state.
 
-What recovery actually does with it — measured, not assumed:
-`recovery_prepare_files` removes stale `.hint.tmp` and `.data.tmp` files
-and then adopts **every** `.data` file in the directory, generating a
-hint for any that lacks one. It does not single out the orphan. Since
-the compacted copy carries the same entries at the same sequences as the
-original, the merge resolves each key to one of the two files and leaves
-the other holding `live_bytes = 0`, which a later `vacuum()` reclaims.
-The DB opens, every key reads back, and the disk cost is temporary — but
-detection and removal at recovery, as an earlier draft of this document
-described, is not implemented.
-
-Closing that gap is what #104's proposed class M3 needs before it can be
-a cell: the reference model below is the behaviour to build, not the
-behaviour to assert.
+**What the engine does with it, measured.** Not what an earlier draft of
+this section claimed, and not the benign outcome a first probe suggested
+either — that probe duplicated a sealed file byte for byte, which is not
+the shape vacuum leaves. A compacted copy holds the same sequences at
+*different* offsets, because compaction drops dead entries and the live
+ones move. Recovery detects that and refuses:
 
 ```
-Class M3 — rename completes but process does not confirm
-           old file remains in published state (correct)
-           new .data file exists as orphan on disk
-           next recovery should detect and remove the orphan  [not implemented]
-           DB remains operational
-           no data is lost
+bytecask: corrupt database — two entries share the same sequence number
+but differ in physical location
 ```
+
+Under `IoBackend::Pread` that surfaces as `DB::open` throwing. Under
+`IoBackend::Mmap` the process **aborts in `~DB`** rather than throwing,
+which is a second defect and not the same one.
+
+No data is lost in either case: the file vacuum was compacting is
+untouched, and removing the orphan by hand recovers everything. But a
+crash in an ordinary vacuum window leaves a database that will not open,
+and nothing clears it.
+
+**Why there are no cells for it.** Refusing to open on a detected
+inconsistency is defensible under principle 1 — the engine cannot tell
+which copy is authoritative, and guessing is how silent corruption starts.
+What is not defensible is that there is no path back. Cells here would
+have to assert one of `DB::open` throwing or the process aborting *as the
+expected contract*, and freezing either into the ratchet is worse than
+leaving the gap visible. The fault point stays; the class does not, until
+the resolution is decided.
+
+Resolving it is a design question, not a test gap:
+
+- The orphan is only distinguishable from the legitimately hint-less
+  active file by its sequences duplicating another file's, and the engine
+  already relies on files being sequence-disjoint.
+- The crash window has two halves. `vacuum_compact_file` writes the new
+  file's hint *before* `vacuum_commit`, so a crash before that leaves an
+  orphan with no hint and a crash after leaves one with a hint.
+- Deleting a data file is irreversible, so a detector that is wrong once
+  costs more than the disk the orphan wastes.
+
+This supersedes #104's class **M3**, which assumed detection and removal
+were already implemented and only needed a fault point and an assertion.
 
 ---
 

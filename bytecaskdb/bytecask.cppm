@@ -3547,6 +3547,12 @@ auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
   // between here and the staging create. renameDataFileExclusive refuses the
   // target instead of replacing it.
   renameDataFileExclusive(tmp_data_path, final_data_path);
+#ifdef BYTECASK_TESTING
+  // Class G in docs/correctness_validation.md: the rename completed and the
+  // process did not get to confirm it. The compacted file is on disk under its
+  // final name while the old one is still the published state's.
+  FAULT_INJECTION(io_vacuum_compact_post_rename);
+#endif
 
   // Reserve the destination id before opening the file, so the file carries
   // its engine file_id from construction — the buffer pool keys frames by it.
