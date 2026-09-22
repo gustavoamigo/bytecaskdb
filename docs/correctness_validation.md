@@ -650,13 +650,14 @@ and in `assert_keys_recoverable`. A truncation that cut too far leaves
 the key directory intact while the bytes behind it are gone, which is
 exactly how the #36 bug stayed invisible to a test named for it.
 
-Every cell also ends with `assert_sequence_bounds_match_recovery`. The
-key assertions ask whether `resume()` produced the *right* state; this one
-asks whether it produced the *same* state a cold open produces from the
-same bytes, which is the property `resume()` exists to preserve and the
-one both bugs in this matrix's history violated. It compares per-file
-`min_sequence`/`max_sequence`, keyed by the data file's stem because
-recovery assigns file ids by directory order.
+Every cell also ends with `assert_matches_recovery`. The key assertions
+ask whether `resume()` produced the *right* state; this one asks whether
+it produced the *same* state a cold open produces from the same bytes,
+which is the property `resume()` exists to preserve and the one both bugs
+in this matrix's history violated. It compares `next_seq`, the full
+key-value map in both directions, and per-file `live_bytes`,
+`total_bytes`, `min_sequence` and `max_sequence` — keyed by the data
+file's stem, because recovery assigns file ids by directory order.
 
 Each R1/R2/R3 test uses a multi-phase pattern:
 1. Establish degraded state
@@ -894,17 +895,23 @@ I/O checkpoints:
   bytes it had. Used by the `held_value` and `held_iter_span` observers.
 - `assert_resumable(db)` — calls `resume()` and verifies the engine clears
   the degraded flag and passes `assert_consistent`. Inserted immediately
-  after `assert_delta` for all degraded failure classes (B1, B2, B3, C, F, G, H).
+  after `assert_delta` for all degraded failure classes (B1, B2, B3, C, F,
+  G, H), which then end with `assert_matches_recovery` below.
 - `assert_recoverable(dir, before, expected)` — opens a fresh DB from
   disk and verifies the recovered state matches the expected state
   (pre-existing keys survive, added keys present, removed keys absent,
   no extra keys, structural consistency).
-- `capture_sequence_bounds(db)` /
-  `assert_sequence_bounds_match_recovery(dir, before)` — per-file
-  `min_sequence`/`max_sequence` keyed by the data file's stem, compared
-  against a fresh recovery's. The other resume assertions ask whether
-  `resume()` produced the right state; this asks whether it produced the
-  same one a cold open produces from the same bytes.
+- `EngineFingerprint` / `fingerprint(db)` /
+  `assert_matches_recovery(dir, before)` — everything a resumed engine and
+  a cold-opened one must agree on: `next_seq`, the key-value map compared
+  in both directions, and per-file `FileStats`, keyed by data file stem
+  because recovery assigns file ids by directory order. The other
+  assertions ask whether the engine produced the right state; this asks
+  whether it produced the same one a cold open produces from the same
+  bytes. It is what every `[prove]` cell that degrades ends with, and the
+  only check the F and G cells get — what `resume()` commits from the page
+  cache cannot be predicted, but the equivalence can be asserted without
+  predicting it.
 - `assert_keys_recoverable(dir, keys_present, keys_absent)` — lighter
   recovery check used by resume proof tests: opens a fresh DB, reads each
   expected key back with `get` and compares its value, checks the absent

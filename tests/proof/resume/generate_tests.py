@@ -306,11 +306,11 @@ def gen_recovery_check(degrade: DegradeShape, delta: ResumeDelta) -> str:
 
 
 def gen_bounds_check(degrade: DegradeShape) -> str:
-    """Compare the resumed file_stats bounds against a fresh recovery's."""
+    """Compare the whole resumed engine against a fresh recovery's."""
     opts = _build_open_opts(degrade)
     if opts:
-        return f"  assert_sequence_bounds_match_recovery(dir, bounds, {{{opts}}});"
-    return "  assert_sequence_bounds_match_recovery(dir, bounds);"
+        return f"  assert_matches_recovery(dir, fp, {{{opts}}});"
+    return "  assert_matches_recovery(dir, fp);"
 
 
 def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
@@ -327,7 +327,7 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     parts.append(f'TEST_CASE("{name}", "[prove_resume]") {{')
     parts.append("  TempDir td;")
     parts.append('  auto dir = td.path / "db";')
-    parts.append("  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;")
+    parts.append("  bytecask::testing::EngineFingerprint fp;")
     parts.append("  {")
     parts.append(gen_degrade_setup(degrade))
     parts.append("")
@@ -347,8 +347,8 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
 
     parts.append("")
     parts.append("    // resume() and a cold open read the same bytes; they must")
-    parts.append("    // describe them the same way.")
-    parts.append("    bounds = capture_sequence_bounds(db);")
+    parts.append("    // reconstruct the same engine.")
+    parts.append("    fp = fingerprint(db);")
     parts.append("  }")
     parts.append(gen_recovery_check(degrade, delta))
     parts.append(gen_bounds_check(degrade))
@@ -386,7 +386,9 @@ import bytecask;
 namespace {
 
 using bytecask::testing::assert_consistent;
-using bytecask::testing::assert_keys_recoverable;\nusing bytecask::testing::assert_sequence_bounds_match_recovery;\nusing bytecask::testing::capture_sequence_bounds;
+using bytecask::testing::assert_keys_recoverable;
+using bytecask::testing::assert_matches_recovery;
+using bytecask::testing::fingerprint;
 using bytecask::testing::to_bytes;
 using bytecask::testing::to_string;
 

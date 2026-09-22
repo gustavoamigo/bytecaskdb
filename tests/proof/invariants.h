@@ -273,42 +273,70 @@ inline void assert_keys_recoverable(
   assert_consistent(recovered);
 }
 
-// Per-file sequence bounds, keyed by the data file's stem. Recovery assigns
-// file ids by directory order, so ids do not survive a reopen and a stem does.
-inline auto capture_sequence_bounds(const DB &db)
-    -> std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> {
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+// A fingerprint of everything a resumed engine and a cold-opened one must
+// agree on. File ids are assigned by directory order at recovery and do not
+// survive a reopen, so per-file stats are keyed by the data file's stem.
+struct EngineFingerprint {
+  std::uint64_t next_seq{0};
+  std::map<std::string, Bytes> key_values;
+  std::map<std::string, FileStats> file_stats;
+};
+
+inline auto fingerprint(const DB &db) -> EngineFingerprint {
+  EngineFingerprint fp;
   auto state = db.engine_state();
+  fp.next_seq = state->next_seq;
+  for (const auto &entry : db.iter_from({})) {
+    fp.key_values[to_string(entry.key)] =
+        Bytes{entry.value.begin(), entry.value.end()};
+  }
   for (const auto [file_id, fs] : state->file_stats) {
     auto file = state->files.get(file_id);
     if (!file) continue;
-    bounds[(*file)->path().stem().string()] = {fs.min_sequence,
-                                               fs.max_sequence};
+    fp.file_stats[(*file)->path().stem().string()] = fs;
   }
-  return bounds;
+  return fp;
 }
 
-// resume() and a cold open read the same bytes, so they must describe them
-// the same way. `min_sequence` above a sequence the file really holds is the
-// specific failure this catches: `ChangeIterator` orders its file queue by
-// `min_sequence`, and `flush_hints_for` refuses to deduplicate for exactly
-// this reason. Files the recovered DB does not have — its own fresh active
-// file has no counterpart in `before` — are skipped.
-inline void assert_sequence_bounds_match_recovery(
-    const std::filesystem::path &dir,
-    const std::map<std::string, std::pair<std::uint64_t, std::uint64_t>>
-        &before,
-    const Options &opts = {}) {
+// resume() and a cold open read the same bytes, so they must reconstruct the
+// same engine. This is the property resume() exists to preserve, and the one
+// every bug this matrix has found so far violated: a range tombstone that was
+// replayed as a no-op left keys behind that recovery removed, and a filtered
+// batch marker left a min_sequence recovery computed differently. Both were
+// invisible to assertions that only asked whether the resumed state was
+// *right*, because it looked right on its own terms.
+//
+// The recovered DB opens its own fresh active file, which has no counterpart
+// in `before`; stems absent from the resumed state are therefore skipped.
+inline void assert_matches_recovery(const std::filesystem::path &dir,
+                                    const EngineFingerprint &before,
+                                    const Options &opts = {}) {
   auto recovered = DB::open(dir, opts);
-  const auto after = capture_sequence_bounds(recovered);
-  for (const auto &[stem, bound] : before) {
-    auto it = after.find(stem);
-    if (it == after.end()) continue;
-    INFO("sequence bounds for " << stem
-                                << " must match after recovery: resume said ["
-                                << bound.first << ", " << bound.second << "]");
-    CHECK(it->second.first == bound.first);
-    CHECK(it->second.second == bound.second);
+  const auto after = fingerprint(recovered);
+
+  INFO("next_seq must survive recovery");
+  CHECK(after.next_seq == before.next_seq);
+
+  for (const auto &[key, value] : before.key_values) {
+    INFO("key present after resume must be present after recovery: " << key);
+    auto it = after.key_values.find(key);
+    REQUIRE(it != after.key_values.end());
+    CHECK(it->second == value);
+  }
+  for (const auto &[key, _] : after.key_values) {
+    INFO("key present after recovery must have been present after resume: "
+         << key);
+    CHECK(before.key_values.contains(key));
+  }
+
+  for (const auto &[stem, fs] : before.file_stats) {
+    auto it = after.file_stats.find(stem);
+    if (it == after.file_stats.end()) continue;
+    INFO("file_stats for " << stem << " must match after recovery");
+    CHECK(it->second.live_bytes == fs.live_bytes);
+    CHECK(it->second.total_bytes == fs.total_bytes);
+    CHECK(it->second.min_sequence == fs.min_sequence);
+    CHECK(it->second.max_sequence == fs.max_sequence);
   }
 }
 
