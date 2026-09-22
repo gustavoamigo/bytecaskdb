@@ -988,3 +988,288 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__rename_fails", "[prove_vacuum
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
+
+TEST_CASE("prove_vacuum_compact__batched_file__success", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("k0"), to_bytes("v_k0"));
+      plan.put(to_bytes("k1"), to_bytes("v_k1"));
+      (void)db.apply_batch({.sync = false}, std::move(plan));
+    }
+    // Delete ['k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+
+    assert_vacuum_success(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
+}
+
+TEST_CASE("prove_vacuum_compact__batched_file__tmp_create_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("k0"), to_bytes("v_k0"));
+      plan.put(to_bytes("k1"), to_bytes("v_k1"));
+      (void)db.apply_batch({.sync = false}, std::move(plan));
+    }
+    // Delete ['k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_tmp_create"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
+}
+
+TEST_CASE("prove_vacuum_compact__batched_file__append_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("k0"), to_bytes("v_k0"));
+      plan.put(to_bytes("k1"), to_bytes("v_k1"));
+      (void)db.apply_batch({.sync = false}, std::move(plan));
+    }
+    // Delete ['k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
+}
+
+TEST_CASE("prove_vacuum_compact__batched_file__sync_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("k0"), to_bytes("v_k0"));
+      plan.put(to_bytes("k1"), to_bytes("v_k1"));
+      (void)db.apply_batch({.sync = false}, std::move(plan));
+    }
+    // Delete ['k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
+}
+
+TEST_CASE("prove_vacuum_compact__batched_file__rename_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("k0"), to_bytes("v_k0"));
+      plan.put(to_bytes("k1"), to_bytes("v_k1"));
+      (void)db.apply_batch({.sync = false}, std::move(plan));
+    }
+    // Delete ['k1'] to create dead entries in file_0.
+    (void)db.del({.sync = false}, to_bytes("k1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+    // VC4: rename succeeded — synced .data.tmp exists on disk but
+    // vacuum_commit never ran. Old file remains in state.
+    // assert_vacuum_recoverable confirms .data.tmp is not replayed.
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
+}
+
+TEST_CASE("prove_vacuum_compact__range_tombstone_file__success", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Range tombstone inside the file being compacted: it deletes ['k1'],
+    // and compaction has to carry it across even though it is not key data.
+    db.del_range({.sync = false}, to_bytes("k1"), to_bytes("k2"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+
+    assert_vacuum_success(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
+}
+
+TEST_CASE("prove_vacuum_compact__range_tombstone_file__tmp_create_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Range tombstone inside the file being compacted: it deletes ['k1'],
+    // and compaction has to carry it across even though it is not key data.
+    db.del_range({.sync = false}, to_bytes("k1"), to_bytes("k2"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_tmp_create"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
+}
+
+TEST_CASE("prove_vacuum_compact__range_tombstone_file__append_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Range tombstone inside the file being compacted: it deletes ['k1'],
+    // and compaction has to carry it across even though it is not key data.
+    db.del_range({.sync = false}, to_bytes("k1"), to_bytes("k2"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
+}
+
+TEST_CASE("prove_vacuum_compact__range_tombstone_file__sync_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Range tombstone inside the file being compacted: it deletes ['k1'],
+    // and compaction has to carry it across even though it is not key data.
+    db.del_range({.sync = false}, to_bytes("k1"), to_bytes("k2"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
+}
+
+TEST_CASE("prove_vacuum_compact__range_tombstone_file__rename_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // Range tombstone inside the file being compacted: it deletes ['k1'],
+    // and compaction has to carry it across even though it is not key data.
+    db.del_range({.sync = false}, to_bytes("k1"), to_bytes("k2"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+    // VC4: rename succeeded — synced .data.tmp exists on disk but
+    // vacuum_commit never ran. Old file remains in state.
+    // assert_vacuum_recoverable confirms .data.tmp is not replayed.
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK_FALSE(db.is_degraded());
+  }
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
+}

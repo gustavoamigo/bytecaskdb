@@ -3743,6 +3743,582 @@ TEST_CASE("prove__empty_db__solo_sequential_overwrite__commit_sync_fails", "[pro
   // the in-process recovery path.
 }
 
+TEST_CASE("prove__empty_db__range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__empty_db__range_del_then_put__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__range_del_then_put__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__range_del_then_put__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__range_del_then_put__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__range_del_then_put__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__range_del_then_put__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__empty_db__put_then_range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__put_then_range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__put_then_range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__put_then_range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__put_then_range_del__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__empty_db__put_then_range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
 TEST_CASE("prove__single_key__single_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -9535,6 +10111,599 @@ TEST_CASE("prove__single_key__solo_sequential_overwrite__commit_sync_fails", "[p
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__single_key__range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__single_key__range_del_then_put__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__range_del_then_put__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__range_del_then_put__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__range_del_then_put__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__range_del_then_put__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__range_del_then_put__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__single_key__put_then_range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__put_then_range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__put_then_range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__put_then_range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__put_then_range_del__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__single_key__put_then_range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
                             std::move(plan)),
           std::system_error);
     }
@@ -16617,6 +17786,752 @@ TEST_CASE("prove__populated_db__solo_sequential_overwrite__commit_sync_fails", "
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__populated_db__range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__populated_db__range_del_then_put__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {"k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__range_del_then_put__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__range_del_then_put__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__range_del_then_put__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__range_del_then_put__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__range_del_then_put__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__populated_db__put_then_range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__put_then_range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__put_then_range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__put_then_range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__put_then_range_del__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__populated_db__put_then_range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
                             std::move(plan)),
           std::system_error);
     }
@@ -24613,6 +26528,813 @@ TEST_CASE("prove__rotation_threshold__solo_sequential_overwrite__rotation_file_c
   assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
 }
 
+TEST_CASE("prove__rotation_threshold__range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__range_del__rotation_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__range_del__rotation_file_creation_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__range_del_then_put__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__range_del_then_put__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__range_del_then_put__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__range_del_then_put__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__range_del_then_put__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__range_del_then_put__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__range_del_then_put__rotation_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__range_del_then_put__rotation_file_creation_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__put_then_range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__put_then_range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__put_then_range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__put_then_range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__put_then_range_del__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__put_then_range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__put_then_range_del__rotation_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__rotation_threshold__put_then_range_del__rotation_file_creation_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+}
+
 TEST_CASE("prove__deleted_key__single_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -28501,6 +31223,616 @@ TEST_CASE("prove__deleted_key__solo_sequential_overwrite__commit_sync_fails", "[
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__deleted_key__range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__deleted_key__range_del_then_put__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__range_del_then_put__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__range_del_then_put__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__range_del_then_put__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__range_del_then_put__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__range_del_then_put__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+
+TEST_CASE("prove__deleted_key__put_then_range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__put_then_range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__put_then_range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__put_then_range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__put_then_range_del__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected);
+}
+
+TEST_CASE("prove__deleted_key__put_then_range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
                             std::move(plan)),
           std::system_error);
     }
@@ -35033,6 +38365,633 @@ TEST_CASE("prove__single_key_mmap__solo_sequential_overwrite__commit_sync_fails"
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__range_del_then_put__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__range_del_then_put__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__range_del_then_put__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__range_del_then_put__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__range_del_then_put__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__range_del_then_put__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__put_then_range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__put_then_range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__put_then_range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__put_then_range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__put_then_range_del__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__put_then_range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
                             std::move(plan)),
           std::system_error);
     }
@@ -42934,6 +46893,786 @@ TEST_CASE("prove__populated_db_mmap__solo_sequential_overwrite__commit_sync_fail
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__range_del_then_put__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {"k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__range_del_then_put__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__range_del_then_put__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__range_del_then_put__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__range_del_then_put__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__range_del_then_put__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__put_then_range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__put_then_range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__put_then_range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__put_then_range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__put_then_range_del__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__put_then_range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
                             std::move(plan)),
           std::system_error);
     }
@@ -51765,6 +56504,859 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_sequential_overwrite__rotation_f
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del__rotation_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del__rotation_file_creation_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del_then_put__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del_then_put__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del_then_put__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del_then_put__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del_then_put__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del_then_put__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del_then_put__rotation_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__range_del_then_put__rotation_file_creation_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__put_then_range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__put_then_range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__put_then_range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__put_then_range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__put_then_range_del__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__put_then_range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__put_then_range_del__rotation_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__put_then_range_del__rotation_file_creation_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_pool__single_put__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -57839,6 +63431,633 @@ TEST_CASE("prove__single_key_pool__solo_sequential_overwrite__commit_sync_fails"
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__range_del_then_put__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__range_del_then_put__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__range_del_then_put__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__range_del_then_put__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__range_del_then_put__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__range_del_then_put__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__put_then_range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__put_then_range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__put_then_range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__put_then_range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__put_then_range_del__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__put_then_range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
                             std::move(plan)),
           std::system_error);
     }
@@ -65205,6 +71424,786 @@ TEST_CASE("prove__populated_db_pool__solo_sequential_overwrite__commit_sync_fail
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__range_del_then_put__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {"k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__range_del_then_put__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__range_del_then_put__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__range_del_then_put__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__range_del_then_put__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__range_del_then_put__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__put_then_range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__put_then_range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__put_then_range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__put_then_range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__put_then_range_del__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__put_then_range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
                             std::move(plan)),
           std::system_error);
     }
@@ -73579,6 +80578,859 @@ TEST_CASE("prove__rotation_threshold_pool__solo_sequential_overwrite__rotation_f
       bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del__rotation_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del__rotation_file_creation_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del_then_put__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del_then_put__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del_then_put__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del_then_put__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del_then_put__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del_then_put__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del_then_put__rotation_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__range_del_then_put__rotation_file_creation_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {"k0"},
+        .keys_removed = {},
+        .expected_values = {{"k0", "new1"}},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+    plan.put(to_bytes("k0"), to_bytes("new1"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__put_then_range_del__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = false,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      REQUIRE(
+          db.apply_batch({.sync = true},
+                            std::move(plan)));
+    }
+
+    assert_delta(before, db, expected);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__put_then_range_del__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__put_then_range_del__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__put_then_range_del__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__put_then_range_del__on_bulk_end_append", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__put_then_range_del__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{6};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__put_then_range_del__rotation_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+  }
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__put_then_range_del__rotation_file_creation_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {"k0"},
+        .expected_values = {},
+        .seq_advance = 4,
+        .degraded = true,
+    };
+  Baseline before;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+    plan.del_range(to_bytes("k"), to_bytes("l"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
                             std::move(plan)),
           std::system_error);
     }

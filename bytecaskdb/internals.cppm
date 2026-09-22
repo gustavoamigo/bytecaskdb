@@ -259,7 +259,10 @@ export struct ResumeEntry {
   EntryType entry_type;
   std::uint64_t file_offset;
   std::uint32_t value_size;
+  // For RangeDel, `key` is the range's inclusive lower bound and `range_end`
+  // its exclusive upper bound. Empty for every other entry type.
   std::vector<std::byte> key;
+  std::vector<std::byte> range_end;
 };
 
 export struct VacuumScanResult {

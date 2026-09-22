@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Generator, List, Tuple
+from typing import Generator, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,13 @@ class CompactStateShape:
     deleted_keys: List[str]
     max_file_bytes: int
     io_backend: str = "pread"  # pread | mmap | buffer_pool
+    # Write sealed_keys as one atomic batch, so the sealed file being
+    # compacted carries a BulkBegin/BulkEnd pair around its live entries.
+    batched: bool = False
+    # A range delete, written into the sealed file after sealed_keys, so the
+    # file being compacted carries a range tombstone. The keys it covers are
+    # named in deleted_keys.
+    range_del: Optional[Tuple[str, str]] = None
 
     @property
     def live_keys(self) -> List[str]:
@@ -75,6 +82,30 @@ COMPACT_STATE_SHAPES = [
         deleted_keys=["k1", "k2", "k3", "k4", "k5"],
         max_file_bytes=150,
         io_backend="buffer_pool",
+    ),
+    # The two structural shapes. Compaction has to preserve the batch markers
+    # and the range tombstone it copies — they are not key data, so nothing in
+    # the key/value assertions notices if a retried compaction drops one, and
+    # recovery would not notice either. assert_vacuum_success compares the
+    # entry stream, which is what makes these cells say something.
+    #
+    # Sizing: an entry is 19 + key + value bytes and a marker is 19. The batch
+    # is 19 + 25 + 25 + 19 = 88, so max_file_bytes=88 seals file_0 with the
+    # whole batch in it and sends the delete to the next file.
+    CompactStateShape(
+        "batched_file",
+        sealed_keys=["k0", "k1"],
+        deleted_keys=["k1"],
+        max_file_bytes=88,
+        batched=True,
+    ),
+    # 25 + 25 for the two puts, plus 19 + 2 + 2 for the range tombstone = 73.
+    CompactStateShape(
+        "range_tombstone_file",
+        sealed_keys=["k0", "k1"],
+        deleted_keys=["k1"],
+        max_file_bytes=73,
+        range_del=("k1", "k2"),
     ),
 ]
 

@@ -6,15 +6,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List
 
 from .scenario_matrix import DegradeShape, DegradeVia, ResumeFailureClass
 
 
 @dataclass(frozen=True)
 class ResumeDelta:
-    # Keys that must be present after all resume() calls complete.
-    keys_present: List[str]
+    # Keys that must be present after all resume() calls complete, mapped to
+    # the value they must read back as. A wrong truncation leaves the key
+    # directory intact while the bytes behind it are gone, so presence alone
+    # is not enough to assert — the cells read the value.
+    keys_present: Dict[str, str]
     # Keys that must be absent after all resume() calls complete.
     keys_absent: List[str]
     # Did the fault-injected resume() throw? (False for SUCCESS.)
@@ -44,18 +47,49 @@ def resume_delta(degrade: DegradeShape, failure: ResumeFailureClass) -> ResumeDe
                on a small max_file_bytes DB. The pre-rotation sync failed.
                Bytes are in the page cache. resume() scans and replays p0.
                Both k0 and p0 survive.
+
+    degrade_B2: k0 was committed; p0's writev returned short, leaving a torn
+               entry whose CRC cannot hold. resume()'s scan stops at it and
+               truncates back to after k0. Only k0 survives — and its value
+               must still read back, which is what distinguishes a correct
+               truncation from one that cut too far.
+
+    degrade_B3: k0 was committed; p0's writev wrote every byte and then
+               returned an error. offset_ never advanced, so the entry lies
+               past the file's committed offset and resume() discards it.
+               Only k0 survives.
+
+    degrade_F_range: k0 and k1 were committed (sync=false); a del_range over
+               [k, l) was appended but its commit sync failed, so the range
+               tombstone reached the page cache and the key directory was
+               never told. resume() replays the entry, and replaying a range
+               tombstone means applying it: both keys go. A resume() that
+               ignored the entry would leave the engine holding keys a fresh
+               open would not.
+
+    degrade_F_batch: a 2-op batch committed (sync=false), so the active file
+               holds BulkBegin, p0, p1, BulkEnd below the failure point; then
+               k0's commit sync fails. All three keys survive. What this shape
+               is really for is the file's sequence bounds: the markers
+               consume sequences 1 and 4, and a resume() that did not collect
+               them reported min_sequence 2 for a file whose first entry is
+               sequence 1 — a bound a cold open, whose hint file does carry
+               markers, computes differently.
     """
-    if degrade.degrade_via == DegradeVia.H:
-        keys_present = ["k0", "p0"]
+    if degrade.degrade_via in (DegradeVia.H, DegradeVia.F, DegradeVia.G):
+        keys_present = {"k0": "v0", "p0": "new0"}
         keys_absent: List[str] = []
     elif degrade.degrade_via == DegradeVia.C:
-        keys_present = ["k0"]
+        keys_present = {"k0": "v0"}
         keys_absent = ["p0", "p1"]
-    elif degrade.degrade_via == DegradeVia.F:
-        keys_present = ["k0", "p0"]
-        keys_absent: List[str] = []
-    else:  # DegradeVia.G
-        keys_present = ["k0", "p0"]
+    elif degrade.degrade_via in (DegradeVia.B2, DegradeVia.B3):
+        keys_present = {"k0": "v0"}
+        keys_absent = ["p0"]
+    elif degrade.degrade_via == DegradeVia.F_RANGE:
+        keys_present = {}
+        keys_absent = ["k0", "k1"]
+    else:  # DegradeVia.F_BATCH
+        keys_present = {"p0": "new0", "p1": "new1", "k0": "v0"}
         keys_absent: List[str] = []
 
     first_threw = failure not in (

@@ -36,6 +36,8 @@ from tests.proof.scenario_matrix import (
 
 def key_labels_for(plan: PlanShape) -> List[str]:
     """Return the key name assigned to each op in the plan."""
+    if plan.op_keys:
+        return list(plan.op_keys)
     if plan.causality_key:
         return [plan.causality_key] * len(plan.ops)
     labels: List[str] = []
@@ -131,6 +133,11 @@ def gen_plan(plan: PlanShape, state: StateShape, labels: List[str]) -> str:
             )
         elif op == OpType.DELETE:
             lines.append(f'    plan.del(to_bytes("{label}"));')
+        elif op == OpType.RANGE_DEL:
+            lines.append(
+                f'    plan.del_range(to_bytes("{plan.range_from}"), '
+                f'to_bytes("{plan.range_to}"));'
+            )
 
     return "\n".join(lines)
 

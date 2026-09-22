@@ -333,12 +333,12 @@ to callers. Degrading forces `resume()` before further writes are accepted;
 
 ## Proof Test Generator
 
-### apply_batch — 1668 tests
+### apply_batch — 1873 tests
 
-1668 generated Catch2 tests (`[prove]` tag) cover every valid
+1873 generated Catch2 tests (`[prove]` tag) cover every valid
 (StateShape, PlanShape, FailureClass, Observer) combination for
-`apply_batch`. The scenario matrix is 11 state shapes × 17 plan shapes ×
-9 failure classes; 4 elimination rules reduce this to 1108 observer-free
+`apply_batch`. The scenario matrix is 11 state shapes × 20 plan shapes ×
+9 failure classes; 4 elimination rules reduce this to 1313 observer-free
 cells, and the observer axis adds 560 more.
 
 #### State shapes
@@ -394,7 +394,7 @@ observer is how a generated cell can act on it.
 
 | Observer | Acquired before the transition | Catches |
 |----------|-------------------------------|---------|
-| `none` | — | (every cell; the 1108 observer-free cells) |
+| `none` | — | (every cell; the 1313 observer-free cells) |
 | `held_value` | `get` into a `Bytes` kept alive | value-path invalidation |
 | `held_iter_span` | a span from `iter_from`, held across the call | #87 |
 | `held_riter_span` | a span from `riter_from`, held across the call | the reverse read path |
@@ -469,8 +469,8 @@ primary's cached generation, in which that key does not exist.
 
 Reverting BC-122 — giving `ReverseRadixTreeIterator::operator*` back the
 `std::reverse_iterator` shape, where it dereferences a temporary copy and
-returns a span into it — leaves **all 1190 cells passing**. Four
-`radix_tree_test.cpp` cases catch it instead.
+returns a span into it — left **every cell in the matrix passing** when it
+was measured. Four `radix_tree_test.cpp` cases catch it instead.
 
 That is structural, not a coverage gap to close by adding cells. The
 reverted class is reached only through `key_dir.rbegin()`, and no public
@@ -504,6 +504,22 @@ for that one, and they hold it.
 | `solo_causality_put_del_put` | 1 put + 1 delete + 1 put (same key), solo | No | No | Same as `causality_put_del_put` via solo writer path |
 | `sequential_overwrite` | 1 put targeting k0 | No | No | Overwrites pre-existing k0 — sequential put-then-put causality across calls |
 | `solo_sequential_overwrite` | 1 put targeting k0, solo | No | No | Same as `sequential_overwrite` via solo writer path |
+| `range_del` | 1 range delete over `["k", "l")` | No | No | A range tombstone as the whole transition — one append, a delta covering every key the range spans |
+| `range_del_then_put` | 1 range delete + 1 put on k0 | No | No | The put lands *inside* the range it follows and wins; k0 survives with the new value, every other k-key goes |
+| `put_then_range_del` | 1 put on k0 + 1 range delete | No | No | The same two operations the other way round; the range tombstone wins and k0 goes with the rest |
+
+The three range-delete shapes are the same question asked of a write
+whose delta is not bounded by its key: `del_range` appends one entry and
+removes however many keys fall inside the bounds. Pairing it with a put
+*inside* the range, in both orders, is what makes the cells about
+sequence resolution rather than key lookup — nothing in the key
+directory distinguishes the two orderings, only the sequences do, and a
+failure class is precisely what perturbs the order the entries reach
+disk in. They also drive the range-tombstone suppression loop in
+`recovery_build_from_hints`, which is O(R) per Put during hint replay and
+was previously exercised on clean paths only. They carry no observers:
+what a range tombstone does is settled in the key directory and at
+recovery, and a lent view can see neither.
 
 The four `causality_*` shapes verify that operation ordering within a
 batch is preserved through all failure classes and recovery. Each shape
@@ -520,9 +536,8 @@ del-then-put, and cross-file causality.
 expected values (the `expected_values` field in `ExpectedDelta`).
 
 Shapes not currently covered: guards-without-writes (pure read-dependency check),
-delete-only multi-entry batches, plans exceeding the `256 KiB` solo-writer
-threshold, and causality shapes with `del_range` (covered by manual tests in
-`bytecask_test.cpp`). These are deferred — the current shapes exercise every
+delete-only multi-entry batches, and plans exceeding the `256 KiB` solo-writer
+threshold. These are deferred — the current shapes exercise every
 code path branch in `apply_batch` (single vs multi entry, with and without
 guards, conflict vs success, same-key causality).
 
@@ -549,12 +564,12 @@ Each test follows the same structure:
 7. `assert_recoverable(dir, before, expected)` — validates persistence
    invariant via fresh recovery (where applicable)
 
-### resume() — 37 tests
+### resume() — 59 tests
 
-37 generated Catch2 tests (`[prove_resume]` tag) cover every valid
+59 generated Catch2 tests (`[prove_resume]` tag) cover every valid
 (DegradeShape, ResumeFailureClass) combination.
 
-Eight degrade shapes establish a degraded DB before resume is called:
+Twelve degrade shapes establish a degraded DB before resume is called:
 
 - **degrade_H** — `io_rotate_file_creation` fires on a put at the
   rotation threshold. The write committed (both keys are in key_dir),
@@ -577,6 +592,33 @@ Eight degrade shapes establish a degraded DB before resume is called:
   in `CONTRACT.md`, and *DataFile mmap* in `bytecask_design.md`).
 - **degrade_H_pool**, **degrade_C_pool** — the same two through the
   buffer pool. All four are compiled out on Emscripten builds.
+- **degrade_B2** — `io_data_file_append_partial` with `short_write`. The
+  `writev` returned short, so the trailing entry is torn and its CRC
+  cannot hold. Every other shape leaves a *well-formed* active file whose
+  orphaned bytes parse; this one is genuinely malformed on disk, and it
+  reaches that state by construction rather than by damaging bytes after
+  the fact. It is the branch both #36 bugs lived on: a scan that does not
+  reach EOF cleanly.
+- **degrade_B3** — the same checkpoint with `throw_after`. Every byte
+  reached the disk and the entry is structurally complete, but `offset_`
+  never advanced, so the entry sits past the file's committed offset and
+  `resume()` discards it. Torn and complete-but-unacknowledged are
+  different bytes on disk arriving at the same expected delta.
+- **degrade_F_range** — a `del_range` whose commit `fdatasync` fails.
+  Structurally this is degrade_F; what it adds is the entry type. A range
+  tombstone reached the page cache and the key directory was never told,
+  so `resume()` has to replay it — and replaying a range tombstone means
+  *applying* it, not stepping over it. Before the `apply_resume` fix that
+  landed with these cells, all five of them failed: the resumed engine
+  held keys a fresh open did not.
+- **degrade_F_batch** — a committed 2-op batch sits below the failure
+  point, so the active file holds `BulkBegin`(1), p0(2), p1(3),
+  `BulkEnd`(4) and then k0(5), whose commit sync fails. The keys are the
+  easy part; the shape exists for the file's *sequence bounds*. Markers
+  consume sequences, and `resume()` used to filter them out of the entries
+  it collected, so it reported `min_sequence = 2` for a file whose first
+  entry is sequence 1 — while a cold open, whose hint file does carry
+  markers, said 1. All five cells failed before that filter was removed.
 
 Six resume failure classes:
 
@@ -589,17 +631,32 @@ Six resume failure classes:
 
 Two elimination rules apply:
 
-1. **R1 requires orphaned bytes.** degrade_H, degrade_F and degrade_G
-   have none in the active file, so `file.size() == valid_offset` and
-   `resume()` skips the truncation branch entirely (`if (file.size() !=
-   valid_offset) { ... truncate ... }`). R1 is valid only for the
-   degrade_C shapes — 5 combinations filtered.
+1. **R1 requires orphaned bytes.** degrade_H, degrade_F, degrade_G,
+   degrade_F_range and degrade_F_batch have none in the active file, so
+   `file.size() == valid_offset` and `resume()` skips the truncation branch entirely
+   (`if (file.size() != valid_offset) { ... truncate ... }`). R1 is valid
+   for the degrade_C shapes (orphaned `BulkBegin`) and for degrade_B2 and
+   degrade_B3, which leave a torn and a complete-but-uncommitted entry
+   respectively — 7 combinations filtered.
 2. **R2 and CASCADE require an unsealed file.** The degrade_H shapes
    seal the active file during rotation before the fault fires, so
    `resume()` never enters the truncate/sync/seal block and the sync
    fault point is unreachable — 6 more combinations filtered.
 
-8 shapes × 6 classes = 48 minus 11 filtered = **37 tests**.
+12 shapes × 6 classes = 72 minus 13 filtered = **59 tests**.
+
+Present keys are asserted with `get`, not `contains_key`, both in-process
+and in `assert_keys_recoverable`. A truncation that cut too far leaves
+the key directory intact while the bytes behind it are gone, which is
+exactly how the #36 bug stayed invisible to a test named for it.
+
+Every cell also ends with `assert_sequence_bounds_match_recovery`. The
+key assertions ask whether `resume()` produced the *right* state; this one
+asks whether it produced the *same* state a cold open produces from the
+same bytes, which is the property `resume()` exists to preserve and the
+one both bugs in this matrix's history violated. It compares per-file
+`min_sequence`/`max_sequence`, keyed by the data file's stem because
+recovery assigns file ids by directory order.
 
 Each R1/R2/R3 test uses a multi-phase pattern:
 1. Establish degraded state
@@ -614,9 +671,9 @@ fault points.
 
 This directly proves: *resume always eventually recovers once the underlying fault clears.*
 
-### vacuum_compact — 30 tests
+### vacuum_compact — 40 tests
 
-30 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover six state
+40 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover eight state
 shapes × five failure classes (SUCCESS, VC1–VC4).
 
 State shapes create a DB with exactly one sealed file having fragmentation > 0:
@@ -630,6 +687,22 @@ State shapes create a DB with exactly one sealed file having fragmentation > 0:
 - **low_fragmentation_pool**, **mostly_dead_pool** — the same two
   through the buffer pool. All four are compiled out on Emscripten
   builds.
+- **batched_file** — the sealed file's live entries sit inside a
+  `BulkBegin`/`BulkEnd` pair. `max_file_bytes = 88` is the batch's exact
+  size (19 per marker, 25 per entry), so file_0 seals with the whole
+  batch and the delete that fragments it lands in the next file.
+- **range_tombstone_file** — the sealed file holds a range tombstone
+  (25 + 25 for the puts, 23 for the `RangeDel`, so `max_file_bytes = 73`).
+
+The last two exist for an invariant no key-and-value assertion can see:
+batch markers and range tombstones are not key data, so a compaction
+that dropped one on its retry path would leave a batch that is no longer
+atomic on disk, and neither the delta checks nor recovery would notice.
+`capture_vacuum_baseline` therefore counts them over `changes_since`, and
+`assert_vacuum_success`, `assert_vacuum_no_change` and
+`assert_vacuum_recoverable` all compare that count — the success path,
+the failure path, and the round trip through disk. The other six shapes
+contain none, so the check is vacuous there and costs nothing.
 
 Files with live entries always use the compact path (sealed→sealed).
 `mostly_dead` uses `max_file_bytes=150` to pack all 6 keys into one
@@ -760,7 +833,7 @@ write on new leader → backward sync → verify convergence).
 
 | File | Role |
 |------|------|
-| `scenario_matrix.py` | DegradeShape (H, C, F, G), ResumeFailureClass (SUCCESS, R1–R3, DOUBLE, CASCADE), validity filter |
+| `scenario_matrix.py` | DegradeShape (H, C, F, G, B2, B3, F_RANGE, F_BATCH), ResumeFailureClass (SUCCESS, R1–R3, DOUBLE, CASCADE), validity filter |
 | `fault_point_resolver.py` | Maps failure class → fault checkpoint name |
 | `expected_delta.py` | Reference model: keys present/absent after all resume calls |
 | `generate_tests.py` | Generates `prove_resume.cpp` |
@@ -769,7 +842,7 @@ write on new leader → backward sync → verify convergence).
 
 | File | Role |
 |------|------|
-| `scenario_matrix.py` | CompactStateShape (low_fragmentation, mostly_dead), VacuumCompactFailureClass |
+| `scenario_matrix.py` | CompactStateShape (low_fragmentation, mostly_dead, batched_file, range_tombstone_file), VacuumCompactFailureClass |
 | `fault_point_resolver.py` | Maps failure class → fault checkpoint name |
 | `expected_delta.py` | Reference model: threw/file_removed outcome |
 | `generate_tests.py` | Generates `prove_vacuum_compact.cpp` |
@@ -787,7 +860,7 @@ write on new leader → backward sync → verify convergence).
 
 | File | Role |
 |------|------|
-| [`invariants.h`](../tests/proof/invariants.h) | `capture_baseline`, `assert_consistent`, `assert_delta`, `assert_recoverable`, `assert_resumable`, `assert_keys_recoverable`, `VacuumBaseline`, `capture_vacuum_baseline`, `find_vacuum_target`, `assert_vacuum_success`, `assert_vacuum_no_change`, `assert_vacuum_recoverable`, `OwnedEntries`, `collect_changes`, `ReplicationBaseline`, `capture_replication_baseline`, `assert_replication_match`, `assert_replication_no_change`, `assert_replication_recovery`, `assert_durable_boundary` |
+| [`invariants.h`](../tests/proof/invariants.h) | `capture_baseline`, `assert_consistent`, `assert_delta`, `assert_recoverable`, `assert_resumable`, `assert_keys_recoverable`, `VacuumBaseline`, `capture_vacuum_baseline`, `find_vacuum_target`, `count_structural_entries`, `assert_structural_entries_preserved`, `assert_vacuum_success`, `assert_vacuum_no_change`, `assert_vacuum_recoverable`, `OwnedEntries`, `collect_changes`, `ReplicationBaseline`, `capture_replication_baseline`, `assert_replication_match`, `assert_replication_no_change`, `assert_replication_recovery`, `assert_durable_boundary` |
 
 ### Fault injection modes
 
@@ -826,11 +899,27 @@ I/O checkpoints:
   disk and verifies the recovered state matches the expected state
   (pre-existing keys survive, added keys present, removed keys absent,
   no extra keys, structural consistency).
+- `capture_sequence_bounds(db)` /
+  `assert_sequence_bounds_match_recovery(dir, before)` — per-file
+  `min_sequence`/`max_sequence` keyed by the data file's stem, compared
+  against a fresh recovery's. The other resume assertions ask whether
+  `resume()` produced the right state; this asks whether it produced the
+  same one a cold open produces from the same bytes.
 - `assert_keys_recoverable(dir, keys_present, keys_absent)` — lighter
-  recovery check used by resume proof tests: opens a fresh DB and
-  checks specific keys present/absent plus `assert_consistent`.
+  recovery check used by resume proof tests: opens a fresh DB, reads each
+  expected key back with `get` and compares its value, checks the absent
+  ones, then `assert_consistent`. `contains_key` is not enough — a
+  truncation that cut too far leaves the key directory intact while the
+  bytes behind it are gone.
 - `VacuumBaseline` / `capture_vacuum_baseline(db)` — snapshots key-values,
-  `next_lsn`, and per-file `FileStats` before a vacuum operation.
+  `next_lsn`, per-file `FileStats`, and the structural entry counts below
+  before a vacuum operation.
+- `count_structural_entries(db)` / `assert_structural_entries_preserved(db,
+  before)` — counts `BulkBegin`, `BulkEnd` and `RangeDel` entries over
+  `changes_since` and asserts none went missing. These carry no key data,
+  so every other vacuum assertion is blind to a compaction that drops
+  one — and a dropped marker leaves a batch that is no longer atomic on
+  disk.
 - `find_vacuum_target(db)` — returns the file_id of the sealed file with
   the highest fragmentation, matching `DB::vacuum()`'s selection logic.
 - `assert_vacuum_success(db, before, vacuumed_file_id)` — verifies the
@@ -865,27 +954,28 @@ smoke-test the helpers themselves.
 ### Test coverage
 
 All nine failure classes for `apply_batch` (SUCCESS, A, B1, B2, B3, C,
-F, G, H) are covered by the 1668 `[prove]` tests. Each class is exercised
+F, G, H) are covered by the 1873 `[prove]` tests. Each class is exercised
 across all valid (StateShape, PlanShape) combinations, with and without
 back-end, and — for every class that can disturb a lent view — against
 each of the five observers.
 
 All three resume failure classes (R1–R3) plus DOUBLE and CASCADE across
-all eight degrade shapes (H, C, F, G, and H and C again through mmap and
-the buffer pool) are covered by the 37 `[prove_resume]` tests. R1 is correctly excluded for
-the degrade_H, degrade_F and degrade_G shapes (no orphaned bytes to
-truncate — fault point unreachable), and R2/CASCADE for degrade_H (file
-already sealed).
+all twelve degrade shapes (H, C, F, G, B2, B3, F_RANGE and F_BATCH, plus
+H and C again through mmap and the buffer pool) are covered by the 59
+`[prove_resume]` tests. R1 is correctly excluded for the degrade_H,
+degrade_F, degrade_G, degrade_F_range and degrade_F_batch shapes (no
+orphaned bytes to truncate — fault point unreachable), and R2/CASCADE for
+degrade_H (file already sealed).
 
-All five vacuum_compact failure classes across all six state shapes are
-covered by the 30 `[prove_vacuum_compact]` tests.
+All five vacuum_compact failure classes across all eight state shapes are
+covered by the 40 `[prove_vacuum_compact]` tests.
 
 All seven ingest failure classes across 11 state shapes and 5 ops shapes
 are covered by the 178 `[prove_repl]` tests. All three manifest failure
 classes across 11 state shapes are covered by the 33 `[prove_manifest]`
 tests. Four elimination rules reduce the full matrix to 211 valid tests.
 
-Total generated proof tests: **1946**.
+Total generated proof tests: **2183**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
@@ -1096,23 +1186,33 @@ auto atomic_rename(const path& from, const path& to) -> void {
 
 ### Orphaned `.data` files
 
-If `rename()` completes but the process crashes before confirming,
-a `.data` file may exist on disk unreferenced by the published
-`EngineState`. The original file remains in the published state and
-is fully readable. No data is lost.
+If `rename()` completes but the process crashes before `vacuum_commit`
+runs, a `.data` file may exist on disk unreferenced by the published
+`EngineState`. The original file remains in the published state and is
+fully readable. No data is lost.
 
-Recovery detects `.data` files not referenced by any hint file and
-not registered in the engine state, and removes them as orphans.
+What recovery actually does with it — measured, not assumed:
+`recovery_prepare_files` removes stale `.hint.tmp` and `.data.tmp` files
+and then adopts **every** `.data` file in the directory, generating a
+hint for any that lacks one. It does not single out the orphan. Since
+the compacted copy carries the same entries at the same sequences as the
+original, the merge resolves each key to one of the two files and leaves
+the other holding `live_bytes = 0`, which a later `vacuum()` reclaims.
+The DB opens, every key reads back, and the disk cost is temporary — but
+detection and removal at recovery, as an earlier draft of this document
+described, is not implemented.
 
-This adds a failure sub-class to the vacuum compact model:
+Closing that gap is what #104's proposed class M3 needs before it can be
+a cell: the reference model below is the behaviour to build, not the
+behaviour to assert.
 
 ```
-Class G — rename completes but process does not confirm
-          old file remains in published state (correct)
-          new .data file exists as orphan on disk
-          next recovery detects and removes orphan
-          DB remains operational
-          no data is lost
+Class M3 — rename completes but process does not confirm
+           old file remains in published state (correct)
+           new .data file exists as orphan on disk
+           next recovery should detect and remove the orphan  [not implemented]
+           DB remains operational
+           no data is lost
 ```
 
 ---
@@ -1158,18 +1258,22 @@ control:
   entry detects this on recovery (the entry fails CRC and is truncated),
   which is the correct behavior — but the fault injector models failures
   at the `writev` boundary, not the sector boundary.
-- **Corrupt bytes in an otherwise healthy file** — every degrade shape in
-  the matrix leaves a *well-formed* active file: the orphaned bytes parse,
-  and their CRCs hold. A read that succeeds and returns wrong bytes is not
-  a failure class the taxonomy has (#104), so no generated case ever drove
-  `resume()`'s scan down its CRC-error branch. Both bugs found on that
-  branch — `valid_offset` left at 0 when the scan throws, and a read buffer
-  sized from an unverified `value_size` — were invisible to all 37 resume
-  proof tests while every one of them passed. The hand-written test that
-  was meant to cover it corrupted the file at `file_size - 5`, which on a
-  zero-filled active file is in the tail past the write cursor and is never
-  scanned. Corruption shapes belong in the matrix as a fault axis over the
-  *bytes*, orthogonal to the syscall-failure axis over the *calls*.
+- **Corrupt bytes in an otherwise healthy file** — the `degrade_B2` shape
+  now reaches `resume()`'s CRC-error branch by construction: a short
+  `writev` leaves a torn trailing entry whose CRC cannot hold. That covers
+  the branch, not the axis. A read that succeeds and returns wrong bytes
+  from an *arbitrary* position — a flipped byte in the first entry, in the
+  middle of a file, or between a `BulkBegin` and its `BulkEnd` — is still
+  not a failure class the taxonomy has (#104), and a torn *tail* is the
+  only position `short_write` can produce. Both bugs found on that branch
+  — `valid_offset` left at 0 when the scan throws, and a read buffer sized
+  from an unverified `value_size` — were invisible to all 37 resume proof
+  tests of the time while every one of them passed. The hand-written test
+  that was meant to cover it corrupted the file at `file_size - 5`, which
+  on a zero-filled active file is in the tail past the write cursor and is
+  never scanned. A full corruption axis is one over the *bytes*,
+  orthogonal to the syscall-failure axis over the *calls*, and needs a
+  helper that can target an entry by position.
 - **Hardware-level fault injection** — kernel block-layer error injection
   (`dm-flakey`, `dm-dust`), power-cut testing rigs, or filesystem-
   specific fault tools. The fault injector operates at the application

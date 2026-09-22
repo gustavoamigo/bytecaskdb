@@ -102,6 +102,96 @@ def gen_degrade_setup(degrade: DegradeShape) -> str:
             "    }\n"
             "    REQUIRE(db.is_degraded());"
         )
+    elif degrade.degrade_via in (DegradeVia.B2, DegradeVia.B3):
+        opts = _build_open_opts(degrade)
+        open_call = (
+            f"bytecask::DB::open(dir, {{{opts}}})" if opts
+            else "bytecask::DB::open(dir)"
+        )
+        if degrade.degrade_via == DegradeVia.B2:
+            what = (
+                "    // Establish degrade_B2: k0 committed; p0's writev returns short,\n"
+                "    // leaving a torn trailing entry whose CRC cannot hold. This is the\n"
+                "    // one on-disk state that is genuinely malformed rather than merely\n"
+                "    // orphaned — resume()'s scan stops on it.\n"
+            )
+            injector = (
+                '      bytecask::testing::ScopedFaultInjector fi_degrade{\n'
+                '          "io_data_file_append_partial", PW::short_write, 5};\n'
+            )
+        else:
+            what = (
+                "    // Establish degrade_B3: k0 committed; p0's writev wrote every byte\n"
+                "    // and then returned an error. The entry is structurally complete on\n"
+                "    // disk, but offset_ never advanced, so it sits past the file's\n"
+                "    // committed offset.\n"
+            )
+            injector = (
+                '      bytecask::testing::ScopedFaultInjector fi_degrade{\n'
+                '          "io_data_file_append_partial", PW::throw_after};\n'
+            )
+        return (
+            what
+            + f"    auto db = {open_call};\n"
+            '    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));\n'
+            "    {\n"
+            "      using PW = bytecask::testing::PostWriteMode;\n"
+            + injector
+            + "      REQUIRE_THROWS_AS(\n"
+            '          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),\n'
+            "          std::system_error);\n"
+            "    }\n"
+            "    REQUIRE(db.is_degraded());"
+        )
+    elif degrade.degrade_via == DegradeVia.F_BATCH:
+        opts = _build_open_opts(degrade)
+        open_call = (
+            f"bytecask::DB::open(dir, {{{opts}}})" if opts
+            else "bytecask::DB::open(dir)"
+        )
+        return (
+            "    // Establish degrade_F_batch: a 2-op batch commits (sync=false), so\n"
+            "    // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the\n"
+            "    // failure point; then k0's commit sync fails at sequence 5. The\n"
+            "    // markers consume sequences the file's bounds have to account for.\n"
+            f"    auto db = {open_call};\n"
+            "    {\n"
+            "      bytecask::WritePlan plan;\n"
+            '      plan.put(to_bytes("p0"), to_bytes("new0"));\n'
+            '      plan.put(to_bytes("p1"), to_bytes("new1"));\n'
+            "      REQUIRE(db.apply_batch({.sync = false}, std::move(plan)));\n"
+            "    }\n"
+            "    {\n"
+            '      bytecask::testing::ScopedFaultInjector fi_degrade{"io_data_file_sync"};\n'
+            "      REQUIRE_THROWS_AS(\n"
+            '          db.put({.sync = true}, to_bytes("k0"), to_bytes("v0")),\n'
+            "          std::system_error);\n"
+            "    }\n"
+            "    REQUIRE(db.is_degraded());"
+        )
+    elif degrade.degrade_via == DegradeVia.F_RANGE:
+        opts = _build_open_opts(degrade)
+        open_call = (
+            f"bytecask::DB::open(dir, {{{opts}}})" if opts
+            else "bytecask::DB::open(dir)"
+        )
+        return (
+            "    // Establish degrade_F_range: k0 and k1 committed (sync=false); a\n"
+            "    // del_range over [k, l) is appended but its commit sync fails. The\n"
+            "    // range tombstone is on disk and the key directory was never told, so\n"
+            "    // resume() has to replay it — and replaying a range tombstone means\n"
+            "    // applying it, not just stepping over it.\n"
+            f"    auto db = {open_call};\n"
+            '    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));\n'
+            '    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));\n'
+            "    {\n"
+            '      bytecask::testing::ScopedFaultInjector fi_degrade{"io_data_file_sync"};\n'
+            "      REQUIRE_THROWS_AS(\n"
+            '          db.del_range({.sync = true}, to_bytes("k"), to_bytes("l")),\n'
+            "          std::system_error);\n"
+            "    }\n"
+            "    REQUIRE(db.is_degraded());"
+        )
     else:  # DegradeVia.G
         opts = _build_open_opts(degrade, max_file_bytes=1)
         return (
@@ -117,6 +207,31 @@ def gen_degrade_setup(degrade: DegradeShape) -> str:
             "    }\n"
             "    REQUIRE(db.is_degraded());"
         )
+
+
+def gen_key_checks(delta: ResumeDelta) -> List[str]:
+    """Key visibility checks after a resume().
+
+    Read the value back with get(), not contains_key(): a truncation that cut
+    too far leaves the key directory intact while the bytes behind it are
+    gone, which is exactly how the BC-036 bug stayed invisible to a test named
+    for it.
+    """
+    lines: List[str] = []
+    for key, value in delta.keys_present.items():
+        lines.append(f'    {{')
+        lines.append(f'      bytecask::Bytes out;')
+        lines.append(
+            f'      INFO("resumed value for key: {key}");'
+        )
+        lines.append(
+            f'      CHECK(db.get({{}}, to_bytes("{key}"), out));'
+        )
+        lines.append(f'      CHECK(to_string(out) == "{value}");')
+        lines.append(f'    }}')
+    for key in delta.keys_absent:
+        lines.append(f'    CHECK_FALSE(db.contains_key({{}}, to_bytes("{key}")));')
+    return lines
 
 
 def gen_fault_phase(fault_name: str) -> str:
@@ -152,19 +267,13 @@ def gen_double_resume(delta: ResumeDelta) -> str:
     lines.append("    // First resume() succeeds.")
     lines.append("    REQUIRE_NOTHROW(db.resume());")
     lines.append("    REQUIRE_FALSE(db.is_degraded());")
-    for key in delta.keys_present:
-        lines.append(f'    CHECK(db.contains_key({{}}, to_bytes("{key}")));')
-    for key in delta.keys_absent:
-        lines.append(f'    CHECK_FALSE(db.contains_key({{}}, to_bytes("{key}")));')
+    lines.extend(gen_key_checks(delta))
     lines.append("    assert_consistent(db);")
     lines.append("")
     lines.append("    // Second resume() is a no-op — engine already healthy.")
     lines.append("    REQUIRE_NOTHROW(db.resume());")
     lines.append("    REQUIRE_FALSE(db.is_degraded());")
-    for key in delta.keys_present:
-        lines.append(f'    CHECK(db.contains_key({{}}, to_bytes("{key}")));')
-    for key in delta.keys_absent:
-        lines.append(f'    CHECK_FALSE(db.contains_key({{}}, to_bytes("{key}")));')
+    lines.extend(gen_key_checks(delta))
     lines.append("    assert_consistent(db);")
     return "\n".join(lines)
 
@@ -179,22 +288,29 @@ def gen_clean_resume_and_checks(delta: ResumeDelta, phase_num: int = 3) -> str:
     )
     lines.append("    REQUIRE_NOTHROW(db.resume());")
     lines.append("    REQUIRE_FALSE(db.is_degraded());")
-    for key in delta.keys_present:
-        lines.append(f'    CHECK(db.contains_key({{}}, to_bytes("{key}")));')
-    for key in delta.keys_absent:
-        lines.append(f'    CHECK_FALSE(db.contains_key({{}}, to_bytes("{key}")));')
+    lines.extend(gen_key_checks(delta))
     lines.append("    assert_consistent(db);")
     return "\n".join(lines)
 
 
 def gen_recovery_check(degrade: DegradeShape, delta: ResumeDelta) -> str:
     """Generate assert_keys_recoverable call after db scope closes."""
-    present = "{" + ", ".join(f'"{k}"' for k in delta.keys_present) + "}"
+    present = (
+        "{" + ", ".join(f'{{"{k}", "{v}"}}' for k, v in delta.keys_present.items()) + "}"
+    )
     absent = "{" + ", ".join(f'"{k}"' for k in delta.keys_absent) + "}"
     opts = _build_open_opts(degrade)
     if opts:
         return f"  assert_keys_recoverable(dir, {present}, {absent}, {{{opts}}});"
     return f"  assert_keys_recoverable(dir, {present}, {absent});"
+
+
+def gen_bounds_check(degrade: DegradeShape) -> str:
+    """Compare the resumed file_stats bounds against a fresh recovery's."""
+    opts = _build_open_opts(degrade)
+    if opts:
+        return f"  assert_sequence_bounds_match_recovery(dir, bounds, {{{opts}}});"
+    return "  assert_sequence_bounds_match_recovery(dir, bounds);"
 
 
 def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
@@ -211,6 +327,7 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     parts.append(f'TEST_CASE("{name}", "[prove_resume]") {{')
     parts.append("  TempDir td;")
     parts.append('  auto dir = td.path / "db";')
+    parts.append("  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;")
     parts.append("  {")
     parts.append(gen_degrade_setup(degrade))
     parts.append("")
@@ -228,8 +345,13 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     else:
         parts.append(gen_clean_resume_and_checks(delta))
 
+    parts.append("")
+    parts.append("    // resume() and a cold open read the same bytes; they must")
+    parts.append("    // describe them the same way.")
+    parts.append("    bounds = capture_sequence_bounds(db);")
     parts.append("  }")
     parts.append(gen_recovery_check(degrade, delta))
+    parts.append(gen_bounds_check(degrade))
     parts.append("}")
     if degrade.io_backend != "pread":
         parts.append("#endif  // __EMSCRIPTEN__")
@@ -250,7 +372,7 @@ FILE_HEADER = """\
 // state, optionally injects a fault inside resume() (verifying it stays
 // degraded), then performs a clean resume() and verifies recovery.
 
-#include <system_error>
+#include <map>\n#include <system_error>\n#include <utility>
 
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
@@ -264,8 +386,9 @@ import bytecask;
 namespace {
 
 using bytecask::testing::assert_consistent;
-using bytecask::testing::assert_keys_recoverable;
+using bytecask::testing::assert_keys_recoverable;\nusing bytecask::testing::assert_sequence_bounds_match_recovery;\nusing bytecask::testing::capture_sequence_bounds;
 using bytecask::testing::to_bytes;
+using bytecask::testing::to_string;
 
 struct TempDir {
   std::filesystem::path path;

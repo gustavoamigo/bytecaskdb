@@ -14,6 +14,7 @@ from typing import Generator, List, Optional, Tuple
 class OpType(Enum):
     PUT = "put"
     DELETE = "delete"
+    RANGE_DEL = "range_del"
 
 
 class FailureClass(Enum):
@@ -49,6 +50,17 @@ class PlanShape:
     is_conflicting: bool = False
     causality_key: Optional[str] = None  # all ops target this key
     use_solo: bool = False  # route through solo writer instead of group commit
+    # Explicit key label per op, when the default assignment (fresh p0/p1 for
+    # puts, k0 for deletes) is not what the shape is asking about.
+    op_keys: Optional[Tuple[str, ...]] = None
+    # Bounds of the RANGE_DEL op, when the shape has one. A state shape's keys
+    # are k0..kN, so ["k", "l") spans every one of them.
+    range_from: Optional[str] = None
+    range_to: Optional[str] = None
+
+    @property
+    def has_range_del(self) -> bool:
+        return OpType.RANGE_DEL in self.ops
 
     @property
     def is_single_entry(self) -> bool:
@@ -131,6 +143,30 @@ PLAN_SHAPES = [
     ),
     PlanShape("sequential_overwrite", (OpType.PUT,), causality_key="k0"),
     PlanShape("solo_sequential_overwrite", (OpType.PUT,), causality_key="k0", use_solo=True),
+    # Range deletes. A range tombstone is resolved by sequence, not by key
+    # lookup, so the two orderings against a put landing inside the range are
+    # distinct questions and both are asked.
+    PlanShape(
+        "range_del",
+        (OpType.RANGE_DEL,),
+        op_keys=("k",),
+        range_from="k",
+        range_to="l",
+    ),
+    PlanShape(
+        "range_del_then_put",
+        (OpType.RANGE_DEL, OpType.PUT),
+        op_keys=("k", "k0"),
+        range_from="k",
+        range_to="l",
+    ),
+    PlanShape(
+        "put_then_range_del",
+        (OpType.PUT, OpType.RANGE_DEL),
+        op_keys=("k0", "k"),
+        range_from="k",
+        range_to="l",
+    ),
 ]
 
 FAILURE_CLASSES = list(FailureClass)
