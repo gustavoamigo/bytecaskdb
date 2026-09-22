@@ -74,7 +74,7 @@ The seqlock writer stores the odd version and then a release fence, so the chang
 
 ## 5. The active file
 
-The active file is always created empty at startup, so every byte in it was written by this process, and the writer already holds those bytes after `pwritev`. `WritableFileOps` hands each iovec it just wrote to `append_resident`, which extends a resident frame in place with relaxed word stores and **no version bump** — an append never modifies existing bytes, a boundary word is observed old-or-new atomically, and a reader only asks for bytes below the published file size — or admits a frame whose written prefix starts at its first byte. The writable file's point reads then go through the pool like a sealed file's, with its logical end as the file size.
+The active file is always created empty at startup, so every byte in it was written by this process, and the writer already holds those bytes after `pwritev`. The active file is its own implementation, `WritableBufferPoolDataFile` — `WritablePosixFile` instantiated on the `PoolIo` policy — so the pool's descriptor and `file_id` are that class's state rather than a nullable member every writable file carries. Its policy hands each iovec the writer just wrote to `append_resident`, which extends a resident frame in place with relaxed word stores and **no version bump** — an append never modifies existing bytes, a boundary word is observed old-or-new atomically, and a reader only asks for bytes below the published file size — or admits a frame whose written prefix starts at its first byte. The writable file's point reads then go through the pool like a sealed file's, with its logical end as the file size.
 
 This gives read-your-own-writes without a disk read or a page-cache read, warms the cache with the hottest data for free, and removes the `O_DIRECT` coherency hazard: the one file being written with buffered `pwritev` is the one file never read from disk. CLOCK skips any slot whose key names the active file; at rotation the engine moves that id (under the write lock) and the previous file's frames become ordinary, no sweep needed.
 
@@ -84,9 +84,9 @@ The new active file's `file_id` is reserved (`TransientEngineState::reserve_file
 
 ## 6. Sealed files — `O_DIRECT`
 
-Each pool-backed sealed file opens a second descriptor with `O_DIRECT` for frame fills and keeps the buffered one for everything else. The direct descriptor is **proved usable with one aligned read at open** — some filesystems accept the flag and fail at read — and a file whose filesystem refuses fills buffered, counted in `pool_direct_io_fallbacks` so a CI mount cannot silently measure the wrong thing. Alignment falls out of the frame size: every fill is a frame-aligned offset, a rounded-up length and a 4 KiB-aligned buffer, and a read past EOF comes back short, which is allowed.
+Each pool-backed sealed file opens a second descriptor for frame fills through `open_uncached` and keeps the buffered one for everything else. That function is the only place in the engine that names a platform mechanism for uncached reads, and the only platform `#if` left in it; the engine and the tests both ask it, so the two cannot disagree about whether a mount serves one. The descriptor is **proved usable with one aligned read at open** — some filesystems accept the flag and fail at read — and a file whose filesystem refuses fills buffered, counted in `pool_direct_io_fallbacks` so a CI mount cannot silently measure the wrong thing. Alignment falls out of the frame size: every fill is a frame-aligned offset, a rounded-up length and a 4 KiB-aligned buffer, and a read past EOF comes back short, which is allowed.
 
-`POSIX_FADV_DONTNEED` runs at open, releasing the residency the file built up while it was the active file (it was `fdatasync`'d before it was sealed, so the pages are clean), and after every scan sweep, since under direct I/O the page cache a sweep pulls in serves nothing afterwards. On macOS there is no `O_DIRECT`; the direct descriptor gets `F_NOCACHE` instead, and there is no `posix_fadvise` to call. Where neither exists, every file takes the buffered fallback.
+`POSIX_FADV_DONTNEED` runs at open, releasing the residency the file built up while it was the active file (it was `fdatasync`'d before it was sealed, so the pages are clean), and after every scan sweep, since under direct I/O the page cache a sweep pulls in serves nothing afterwards. On macOS there is no `O_DIRECT`; `open_uncached` sets `F_NOCACHE` instead, and there is no `posix_fadvise` to call. Where neither exists it returns -1 and every file takes the buffered fallback.
 
 `O_DIRECT` is never applied to the write path: appends gather unaligned caller buffers with `pwritev`, and aligning them would need a bounce buffer.
 
@@ -109,7 +109,7 @@ Each pool-backed sealed file opens a second descriptor with `O_DIRECT` for frame
 **Options and counters.**
 
 ```cpp
-enum class IoBackend { Pread, Mmap, BufferPool };   // BufferPool builds the active file as Pread does
+enum class IoBackend { Pread, Mmap, BufferPool };   // one writable + one read-only implementation each
 struct BufferPoolOptions {
   std::size_t capacity_bytes;   // total footprint; >= 2 x max_file_bytes
   bool direct_io{true};

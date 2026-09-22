@@ -3258,7 +3258,8 @@ auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
     FAULT_INJECTION(io_vacuum_compact_tmp_create);
 #endif
     auto tmp_file = createDataFileForWrite(
-        dir_, stem, ".data.tmp", rotation_threshold_, io_backend_);
+        dir_, stem, ".data.tmp", rotation_threshold_,
+        stagingBackend(io_backend_));
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id);
     tmp_file->sync();
     tmp_file->shrink_to_fit();

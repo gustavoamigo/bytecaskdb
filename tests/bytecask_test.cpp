@@ -38,6 +38,7 @@
 
 import bytecask;
 import bytecask.batch_iterator;
+import bytecask.buffer_pool;
 import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.types;
@@ -7713,25 +7714,20 @@ TEST_CASE("io_backend=BufferPool: verify_checksums=false read paths",
 }
 
 namespace {
-// Whether the test directory's filesystem serves O_DIRECT reads. Where it does
+// Whether the test directory's filesystem serves uncached reads. Where it does
 // not, the pool falls back per file and the direct-path assertions below do
-// not apply — the fallback itself is what is under test there.
+// not apply — the fallback itself is what is under test there. Asks the same
+// function the engine does, so the two can never disagree about a mount.
 auto temp_dir_supports_direct_io() -> bool {
+  static constexpr std::size_t kProbeBytes = 8192;
   const auto path = std::filesystem::temp_directory_path() / "bc_odirect_probe";
   {
     std::ofstream f{path, std::ios::binary};
-    f << std::string(8192, 'p');
+    f << std::string(kProbeBytes, 'p');
   }
-  bool ok = false;
-#ifdef O_DIRECT
-  auto fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
-  if (fd != -1) {
-    void *buf = std::aligned_alloc(4096, 4096);
-    ok = buf != nullptr && ::pread(fd, buf, 4096, 0) == 4096;
-    std::free(buf);
-    ::close(fd);
-  }
-#endif
+  const auto fd = bytecask::open_uncached(path, kProbeBytes);
+  const bool ok = fd != -1;
+  if (ok) ::close(fd);
   std::error_code ec;
   std::filesystem::remove(path, ec);
   return ok;

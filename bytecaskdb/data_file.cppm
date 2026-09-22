@@ -158,29 +158,58 @@ protected:
 WritableDataFile::~WritableDataFile() = default;
 
 // ---------------------------------------------------------------------------
-// WritableFileOps — shared write-path state and logic.
+// Write-path I/O policies.
 //
-// Module-internal composition helper. Both WritableMmapDataFile and
-// WritablePosixDataFile hold a WritableFileOps member and delegate write/scan
-// operations to it. Read methods remain class-specific.
+// One per writable back-end. A policy owns whatever state that back-end needs
+// beyond the file descriptor, answers point reads of the active file, and is
+// told about bytes as they are appended. Back-ends select one at compile time
+// — WritableFileOps and WritablePosixFile are templates on it — so a back-end
+// neither pays for nor can reach another back-end's state.
+//
+// The two roles are used by different holders: WritableFileOps calls publish()
+// from the append path, WritablePosixFile calls fetch() and reads kResident
+// from the read path. WritableMmapDataFile serves its own reads from the
+// mapping and uses only the append half.
 // ---------------------------------------------------------------------------
 
-struct WritableFileOps {
-  int fd_{-1};
-  Offset offset_{0};       // logical end: next append lands here
-  Offset zeroed_end_{0};   // physical end: zeros written through here
-  std::size_t capacity_{0};  // zero-fill never extends past this (0 = off)
-  std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};
-  // Set when the DB runs a buffer pool: appended bytes go into it as they
-  // are written, so the active file stays resident and read-your-own-writes
-  // never touches disk (design §5). Null for every other back-end.
-  BufferPool *pool_{nullptr};
-  std::uint32_t file_id_{0};
+// pread(2) back-end. Stateless: every publish() call compiles away.
+export struct PreadIo {
+  // Each point read costs a syscall, so read_entry_unverified over-reads
+  // speculatively to fuse the header and the body into one of them.
+  static constexpr bool kResident = false;
 
-  // After a successful pwritev of iov at start: hands the pool the bytes it
-  // just wrote, one iovec at a time, so nothing is re-read or gathered.
-  void publish_appended(Offset start, std::span<const ::iovec> iov) const {
-    if (pool_ == nullptr) return;
+  void publish(Offset, std::span<const ::iovec>) const noexcept {}
+
+  void fetch(int fd, Offset offset, std::size_t len, Offset /*logical_end*/,
+             std::byte *dst) const {
+    std::size_t done = 0;
+    while (done < len) {
+      const auto n = ::pread(fd, dst + done, len - done,
+                             narrow<off_t>(offset + done));
+      if (n <= 0) {
+        throw std::system_error{errno, std::generic_category(),
+                                "PreadIo::fetch: pread failed"};
+      }
+      done += static_cast<std::size_t>(n);
+    }
+  }
+};
+
+// Buffer pool back-end: appended bytes go into the pool as they are written,
+// so the active file stays resident and read-your-own-writes never touches
+// disk (design §5). A frame the writer could not claim falls through to pread
+// inside read_at, which is coherent because the active file is never opened
+// O_DIRECT.
+export class PoolIo {
+public:
+  PoolIo(BufferPool &pool, std::uint32_t file_id) noexcept
+      : pool_{&pool}, file_id_{file_id} {}
+
+  // The bytes are already in memory, so an over-read saves nothing.
+  static constexpr bool kResident = true;
+
+  // One append_resident per iovec, so nothing is re-read or re-gathered.
+  void publish(Offset start, std::span<const ::iovec> iov) const {
     auto at = static_cast<std::uint64_t>(start);
     for (const auto &v : iov) {
       pool_->append_resident(
@@ -189,6 +218,39 @@ struct WritableFileOps {
       at += v.iov_len;
     }
   }
+
+  // logical_end is the file size the pool bounds admission by; unlike a sealed
+  // file's, it moves with every append.
+  void fetch(int fd, Offset offset, std::size_t len, Offset logical_end,
+             std::byte *dst) const {
+    pool_->read_at(file_id_, PoolFile{.buffered = fd, .direct = -1}, offset,
+                   len, static_cast<std::size_t>(logical_end), dst);
+  }
+
+private:
+  BufferPool *pool_;  // never null: bound to a reference at construction
+  std::uint32_t file_id_;
+};
+
+// ---------------------------------------------------------------------------
+// WritableFileOps — shared write-path state and logic.
+//
+// Module-internal composition helper. WritableMmapDataFile and every
+// WritablePosixFile instantiation hold one and delegate write/scan operations
+// to it. Read methods remain class-specific.
+// ---------------------------------------------------------------------------
+
+template <typename Io>
+struct WritableFileOps {
+  WritableFileOps() = default;
+  explicit WritableFileOps(Io io) : io_{std::move(io)} {}
+
+  int fd_{-1};
+  Offset offset_{0};       // logical end: next append lands here
+  Offset zeroed_end_{0};   // physical end: zeros written through here
+  std::size_t capacity_{0};  // zero-fill never extends past this (0 = off)
+  std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};
+  Io io_{};
 
   [[nodiscard]] auto append_entry(std::uint64_t sequence, EntryType entry_type,
                                   std::span<const std::byte> key,
@@ -220,7 +282,7 @@ struct WritableFileOps {
                               "WritableFileOps::append_entry: pwritev failed"};
     }
 
-    publish_appended(offset_, iov);
+    io_.publish(offset_, iov);
     offset_ += static_cast<Offset>(total);
     return entry_offset;
   }
@@ -298,7 +360,7 @@ struct WritableFileOps {
                                 "WritableFileOps::append_entries: pwritev failed"};
       }
 
-      publish_appended(offset_, std::span<const ::iovec>{iov});
+      io_.publish(offset_, std::span<const ::iovec>{iov});
       offset_ += static_cast<Offset>(total_bytes);
     }
   }
@@ -631,7 +693,7 @@ private:
     }
   }
 
-  WritableFileOps ops_;
+  WritableFileOps<PreadIo> ops_;
   std::byte *mmap_base_{nullptr};
   std::size_t mmap_len_{0};   // mapped length — fixed after construction
   // Upper bound for mapping-served reads; past it, reads take the pread path.
@@ -708,32 +770,36 @@ WritableMmapDataFile::~WritableMmapDataFile() {
 }
 
 // ---------------------------------------------------------------------------
-// WritablePosixDataFile — pread-based writable data file.
+// WritablePosixFile — pwritev-based writable data file.
 //
-// Used on platforms without mmap (Emscripten) or when mmap is disabled.
-// All reads go through pread syscalls. Writes use pwritev.
+// Writes go through pwritev; point reads go through the Io policy. The two
+// instantiations below are the writable back-ends:
+//
+//   WritablePosixDataFile       PreadIo — one pread per point read. The only
+//                               writable back-end on platforms without mmap
+//                               (Emscripten), and the default elsewhere.
+//   WritableBufferPoolDataFile  PoolIo  — appends land in the buffer pool and
+//                               point reads are served from it.
 //
 // Thread safety: NOT thread-safe for writes (external synchronization required).
 // Concurrent reads are safe: readers only access offsets published in the
 // key directory after pwritev + fdatasync.
-export class WritablePosixDataFile : public WritableDataFile {
+export template <typename Io>
+class WritablePosixFile : public WritableDataFile {
 public:
-  // pool/file_id: the buffer pool this file feeds on append and the engine
-  // id its frames are keyed by. Both null/zero for every other back-end.
   [[nodiscard]] static auto create(std::filesystem::path path,
                                    std::size_t capacity,
-                                   bool exclusive = false,
-                                   BufferPool *pool = nullptr,
-                                   std::uint32_t file_id = 0)
+                                   bool exclusive = false, Io io = Io{})
       -> std::shared_ptr<WritableDataFile> {
-    auto f = std::shared_ptr<WritablePosixDataFile>(
-        new WritablePosixDataFile{std::move(path), capacity, exclusive});
-    f->ops_.pool_ = pool;
-    f->ops_.file_id_ = file_id;
-    return f;
+    return std::shared_ptr<WritablePosixFile>(new WritablePosixFile{
+        std::move(path), capacity, exclusive, std::move(io)});
   }
 
-  ~WritablePosixDataFile() override;
+  ~WritablePosixFile() override {
+    if (ops_.fd_ != -1) {
+      ::close(ops_.fd_);
+    }
+  }
 
   [[nodiscard]] auto append_entry(std::uint64_t sequence, EntryType entry_type,
                             std::span<const std::byte> key,
@@ -776,49 +842,39 @@ public:
       Offset offset, std::uint32_t value_size,
       std::vector<std::byte> &io_buf) const
       -> DataEntryView override {
-    if (ops_.pool_ != nullptr) {
-      // Resident: no syscall to save, so no speculative over-read.
+    if constexpr (Io::kResident) {
+      // Nothing to save by over-reading: read the header, then exactly the
+      // entry it describes.
       const auto hdr = read_header(offset);
       const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
       io_buf.resize(total);
       fetch(offset, total, io_buf.data());
-      auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
-                                             hdr.key_size + value_size};
-      return DataEntryView{
-          .sequence = hdr.sequence,
-          .entry_type = hdr.entry_type,
-          .key = body.subspan(0, hdr.key_size),
-          .value = body.subspan(hdr.key_size, value_size),
-      };
-    }
-    static constexpr std::size_t kKeyBudget = 256;
-    const auto speculative_total = kHeaderSize + kKeyBudget + value_size + kCrcSize;
-    io_buf.resize(speculative_total);
-    auto bytes_read = ::pread(ops_.fd_, io_buf.data(), speculative_total,
-                             narrow<off_t>(offset));
-    if (bytes_read < narrow<ssize_t>(kHeaderSize)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "WritablePosixDataFile::read_entry_unverified: pread failed"};
-    }
-    auto hdr = bytecask::read_header(
-        std::span<const std::byte>{io_buf.data(), kHeaderSize});
-    const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
-    if (total > speculative_total) {
-      io_buf.resize(total);
-      if (::pread(ops_.fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
-          narrow<ssize_t>(total)) {
+      return view_of(hdr, value_size, io_buf);
+    } else {
+      // A syscall per read, so over-read by a key budget and fuse the header
+      // and the body into one pread. Only a longer key pays for a second.
+      static constexpr std::size_t kKeyBudget = 256;
+      const auto speculative_total = kHeaderSize + kKeyBudget + value_size + kCrcSize;
+      io_buf.resize(speculative_total);
+      auto bytes_read = ::pread(ops_.fd_, io_buf.data(), speculative_total,
+                               narrow<off_t>(offset));
+      if (bytes_read < narrow<ssize_t>(kHeaderSize)) {
         throw std::system_error{errno, std::generic_category(),
-                                "WritablePosixDataFile::read_entry_unverified: pread failed"};
+                                "WritablePosixFile::read_entry_unverified: pread failed"};
       }
+      auto hdr = bytecask::read_header(
+          std::span<const std::byte>{io_buf.data(), kHeaderSize});
+      const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
+      if (total > speculative_total) {
+        io_buf.resize(total);
+        if (::pread(ops_.fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
+            narrow<ssize_t>(total)) {
+          throw std::system_error{errno, std::generic_category(),
+                                  "WritablePosixFile::read_entry_unverified: pread failed"};
+        }
+      }
+      return view_of(hdr, value_size, io_buf);
     }
-    auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
-                                           hdr.key_size + value_size};
-    return DataEntryView{
-        .sequence = hdr.sequence,
-        .entry_type = hdr.entry_type,
-        .key = body.subspan(0, hdr.key_size),
-        .value = body.subspan(hdr.key_size, value_size),
-    };
   }
 
   void sync() override { ops_.sync(); }
@@ -830,7 +886,7 @@ public:
   void truncate(Offset new_size) override {
     if (::ftruncate(ops_.fd_, narrow<off_t>(new_size)) != 0) {
       throw std::system_error{errno, std::system_category(),
-                              "WritablePosixDataFile::truncate"};
+                              "WritablePosixFile::truncate"};
     }
     ops_.offset_ = new_size;
     ops_.zeroed_end_ = new_size;
@@ -839,9 +895,9 @@ public:
   void shrink_to_fit() override { ops_.shrink_to_fit(); }
 
 private:
-  WritablePosixDataFile(std::filesystem::path path, std::size_t capacity,
-                        bool exclusive)
-      : WritableDataFile{std::move(path)} {
+  WritablePosixFile(std::filesystem::path path, std::size_t capacity,
+                    bool exclusive, Io io)
+      : WritableDataFile{std::move(path)}, ops_{std::move(io)} {
     ops_.fd_ = ::open(path_.c_str(),
                       O_RDWR | O_CREAT | O_CLOEXEC | (exclusive ? O_EXCL : 0),
                       0644);
@@ -849,7 +905,7 @@ private:
       if (exclusive && errno == EEXIST) panic_on_reused_path(path_);
       throw std::system_error{
           errno, std::generic_category(),
-          std::format("WritablePosixDataFile: cannot open '{}'", path_.string())};
+          std::format("WritablePosixFile: cannot open '{}'", path_.string())};
     }
 #ifndef __APPLE__
     ::posix_fadvise(ops_.fd_, 0, 0, POSIX_FADV_RANDOM);
@@ -857,36 +913,33 @@ private:
     ops_.adopt(std::filesystem::file_size(path_), capacity);
   }
 
-  WritableFileOps ops_;
+  WritableFileOps<Io> ops_;
 
-  // Point reads of the active file. With a pool they are served from the
-  // frames the writer filled on append (design §5); a frame the writer could
-  // not claim falls through to pread inside read_at, which is coherent
-  // because the active file is never opened O_DIRECT. Its logical end is the
-  // file size the pool bounds admission by, and it moves with every append.
+  // Point reads of the active file, answered by the back-end's policy. Its
+  // logical end moves with every append, so it is passed per call.
   void fetch(Offset offset, std::size_t len, std::byte *dst) const {
-    if (ops_.pool_ != nullptr) {
-      ops_.pool_->read_at(ops_.file_id_,
-                          PoolFile{.buffered = ops_.fd_, .direct = -1}, offset,
-                          len, static_cast<std::size_t>(ops_.offset_), dst);
-      return;
-    }
-    std::size_t done = 0;
-    while (done < len) {
-      const auto n = ::pread(ops_.fd_, dst + done, len - done,
-                             narrow<off_t>(offset + done));
-      if (n <= 0) {
-        throw std::system_error{errno, std::generic_category(),
-                                "WritablePosixDataFile: pread failed"};
-      }
-      done += static_cast<std::size_t>(n);
-    }
+    ops_.io_.fetch(ops_.fd_, offset, len, ops_.offset_, dst);
   }
 
   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
     std::array<std::byte, kHeaderSize> hdr{};
     fetch(offset, kHeaderSize, hdr.data());
     return bytecask::read_header(std::span{hdr});
+  }
+
+  // io_buf holds the whole entry starting at its header; the view borrows it.
+  [[nodiscard]] static auto view_of(const EntryHeader &hdr,
+                                    std::uint32_t value_size,
+                                    const std::vector<std::byte> &io_buf)
+      -> DataEntryView {
+    auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
+                                           hdr.key_size + value_size};
+    return DataEntryView{
+        .sequence = hdr.sequence,
+        .entry_type = hdr.entry_type,
+        .key = body.subspan(0, hdr.key_size),
+        .value = body.subspan(hdr.key_size, value_size),
+    };
   }
 
   [[nodiscard]] auto read_entry_with_key_size(Offset offset,
@@ -906,14 +959,12 @@ private:
         .value = body.subspan(key_size, value_size),
     };
   }
-
 };
 
-WritablePosixDataFile::~WritablePosixDataFile() {
-  if (ops_.fd_ != -1) {
-    ::close(ops_.fd_);
-  }
-}
+// The writable back-ends. Each names its I/O policy once; nothing downstream
+// branches on which one it holds.
+export using WritablePosixDataFile = WritablePosixFile<PreadIo>;
+export using WritableBufferPoolDataFile = WritablePosixFile<PoolIo>;
 
 // ---------------------------------------------------------------------------
 // ReadOnlyPosixDataFile — pread-based read-only data file.
@@ -1267,7 +1318,7 @@ public:
 
     int direct_fd = -1;
     if (pool.direct_io()) {
-      direct_fd = open_direct(path, file_size);
+      direct_fd = open_uncached(path, file_size);
       if (direct_fd == -1) {
         pool.note_direct_io_fallback();
       } else {
@@ -1362,45 +1413,6 @@ private:
       : DataFile{std::move(path)}, fd_{fd}, direct_fd_{direct_fd},
         file_size_{file_size}, file_id_{file_id}, pool_{&pool} {}
 
-  // Opens a second descriptor with O_DIRECT for frame fills, and proves it
-  // usable with one aligned read before handing it over — some filesystems
-  // accept the flag at open and fail at read, so the open alone proves
-  // nothing.
-  // Returns -1 when the filesystem refuses; the caller counts the fallback.
-  [[nodiscard]] static auto open_direct(const std::filesystem::path &path,
-                                        std::size_t file_size) -> int {
-#if defined(O_DIRECT)
-    auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-    if (fd == -1) return -1;
-#elif defined(F_NOCACHE)
-    // macOS: no O_DIRECT. F_NOCACHE is the analogue the design names — reads
-    // bypass the buffer cache, with no alignment requirement, so the aligned
-    // fills below are simply valid reads.
-    auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd == -1) return -1;
-    if (::fcntl(fd, F_NOCACHE, 1) == -1) {
-      ::close(fd);
-      return -1;
-    }
-#else
-    (void)path;
-    (void)file_size;
-    return -1;  // no uncached read on this platform: every file falls back
-#endif
-    if (file_size == 0) return fd;  // nothing to probe, nothing to fill
-    void *probe = std::aligned_alloc(kPoolFrameBytes, kPoolFrameBytes);
-    if (probe == nullptr) {
-      ::close(fd);
-      return -1;
-    }
-    const auto n = ::pread(fd, probe, kPoolFrameBytes, 0);
-    std::free(probe);
-    if (n <= 0) {
-      ::close(fd);
-      return -1;
-    }
-    return fd;
-  }
 
   // A sweep just finished. Under direct I/O the page cache it pulled in serves
   // nothing afterwards — point reads come from frames — so give it back. The
@@ -1414,7 +1426,7 @@ private:
   }
 
   int fd_;
-  int direct_fd_;  // -1: filesystem refused O_DIRECT; fills use fd_
+  int direct_fd_;  // -1: no uncached reads here; fills go through fd_
   std::size_t file_size_;
   std::uint32_t file_id_;
   BufferPool *pool_;
@@ -1479,6 +1491,27 @@ ReadOnlyBufferPoolDataFile::~ReadOnlyBufferPoolDataFile() {
   }
 }
 
+// Every IoBackend::BufferPool file needs the DB's pool: falling back to pread
+// would make the configured bound quietly meaningless, which is the whole
+// point of the subsystem.
+[[nodiscard]] inline auto require_pool(BufferPool *pool, const char *who)
+    -> BufferPool & {
+  if (pool == nullptr) {
+    throw std::logic_error{
+        std::format("{}: IoBackend::BufferPool requires a pool", who)};
+  }
+  return *pool;
+}
+
+// The back-end for a file that is not an engine file yet — vacuum's staging
+// copy. It has no file_id to key pool frames by (one is reserved only once the
+// copy is complete), so it is written like a Pread file and enters the pool
+// when it is reopened for read under its final name.
+export [[nodiscard]] inline auto stagingBackend(IoBackend backend) noexcept
+    -> IoBackend {
+  return backend == IoBackend::BufferPool ? IoBackend::Pread : backend;
+}
+
 // Generic factory: returns the read-only DataFile for the selected back-end.
 // BufferPool needs the DB's pool and the file's engine id; both are required
 // there and ignored elsewhere.
@@ -1488,14 +1521,8 @@ export [[nodiscard]] inline auto openDataFileForRead(
     -> std::shared_ptr<DataFile> {
 #ifndef __EMSCRIPTEN__
   if (backend == IoBackend::BufferPool) {
-    if (pool == nullptr) {
-      // Falling back to pread would make the configured bound quietly
-      // meaningless, which is the whole point of the subsystem.
-      throw std::logic_error{
-          "openDataFileForRead: IoBackend::BufferPool requires a pool"};
-    }
-    return ReadOnlyBufferPoolDataFile::openForRead(std::move(path), file_id,
-                                                   *pool);
+    return ReadOnlyBufferPoolDataFile::openForRead(
+        std::move(path), file_id, require_pool(pool, "openDataFileForRead"));
   }
   if (backend == IoBackend::Mmap) {
     struct stat st {};
@@ -1507,7 +1534,8 @@ export [[nodiscard]] inline auto openDataFileForRead(
   return ReadOnlyPosixDataFile::openForRead(std::move(path));
 }
 
-// Factory for writable data files: mmap-backed when requested, pread-based otherwise.
+// Factory for writable data files: returns the WritableDataFile for the
+// selected back-end.
 // Opens path for write, creating it if absent and adopting its current length
 // if present. The engine never uses this to create a new file — see
 // createDataFileForWrite — but tests and tooling reopen a file they wrote.
@@ -1516,12 +1544,17 @@ export [[nodiscard]] inline auto openDataFileForWrite(
     BufferPool *pool = nullptr, std::uint32_t file_id = 0)
     -> std::shared_ptr<WritableDataFile> {
 #ifndef __EMSCRIPTEN__
+  if (backend == IoBackend::BufferPool) {
+    return WritableBufferPoolDataFile::create(
+        std::move(path), capacity, /*exclusive=*/false,
+        PoolIo{require_pool(pool, "openDataFileForWrite"), file_id});
+  }
   if (backend == IoBackend::Mmap && capacity > 0) {
     return WritableMmapDataFile::create(std::move(path), capacity);
   }
 #endif
   return WritablePosixDataFile::create(std::move(path), capacity,
-                                       /*exclusive=*/false, pool, file_id);
+                                       /*exclusive=*/false);
 }
 
 // Creates the one writable data file for stem in dir: "<stem>.data", or
@@ -1552,13 +1585,18 @@ export [[nodiscard]] inline auto createDataFileForWrite(
   }
   auto path = dir / (stem + std::string{suffix});
 #ifndef __EMSCRIPTEN__
+  if (backend == IoBackend::BufferPool) {
+    return WritableBufferPoolDataFile::create(
+        std::move(path), capacity, /*exclusive=*/true,
+        PoolIo{require_pool(pool, "createDataFileForWrite"), file_id});
+  }
   if (backend == IoBackend::Mmap && capacity > 0) {
     return WritableMmapDataFile::create(std::move(path), capacity,
                                         /*exclusive=*/true);
   }
 #endif
   return WritablePosixDataFile::create(std::move(path), capacity,
-                                       /*exclusive=*/true, pool, file_id);
+                                       /*exclusive=*/true);
 }
 
 // Moves a staged data file onto its final name, refusing to replace an
