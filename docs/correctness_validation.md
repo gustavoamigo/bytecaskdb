@@ -726,6 +726,83 @@ the old file is still in the published state. `assert_vacuum_recoverable`
 confirms that recovery does not replay the orphaned new file as a
 secondary source and sees only the data the old file guaranteed.
 
+### corruption — 16 tests
+
+16 generated Catch2 tests (`[prove_corruption]` tag) cover four positions ×
+four damaged fields. Classes A through H all mean the same thing at the
+POSIX level — a syscall returned an error. This axis is over the **bytes**
+rather than the **calls**: a read that succeeds and hands back something
+wrong.
+
+The entry layout makes a position addressable without parsing. A data
+entry is 15 bytes of header — `sequence` u64, `entry_type` u8, `key_size`
+u16, `value_size` u32 — then key, then value, then a 4-byte CRC. With
+2-byte keys and values every entry is 23 bytes, so entry *i* starts at
+`23 * i` and each field sits at a fixed offset inside it.
+
+| Field | Damage |
+|-------|--------|
+| `crc` | flip a key byte, which the entry CRC covers |
+| `value_size` | a size that runs past the end of the file — what #36 sized a read buffer from |
+| `entry_type` | a byte that is not a valid `EntryType` |
+| `sequence` | zeroed, which the scan already treats as end of file |
+
+crossed with position: first entry, mid-file, last entry, and inside a
+batch between `BulkBegin` and `BulkEnd`.
+
+The delta is the same in every cell, which is what makes the axis cheap:
+everything below the first damaged entry survives and stays **readable**,
+everything from it onward is truncated away, and the engine ends
+non-degraded. Presence is not a sufficient check — the bug this axis
+exists to catch leaves the key directory intact while the bytes behind it
+are gone — so each surviving key is read back by value.
+
+What separates these cells from every other shape in the framework: the
+damaged entry was appended, synced **and published**. Every other degrade
+shape truncates only orphaned bytes, which the key directory never
+referenced, so replay was purely additive. Here the scan stops in front of
+keys the published state already points at.
+
+#### Two bugs it found
+
+**A corrupt entry cost the entry in front of it.** `advance()` set
+`committed_offset_` to the end of the entry it had just buffered and then
+called `++cur_` to parse the next one. When that threw, the exception left
+`operator++` and discarded the buffered entry with it, so the caller never
+saw an entry that was perfectly intact and below the truncation point. A
+corruption at entry 2 truncated to 23 instead of 46, taking entry 1 with
+it. `step()` now absorbs the parse failure and stops *after* the buffered
+entry, which is also what keeps the entries `resume()` replays and the
+offset it truncates to describing the same prefix — an earlier fix that
+read the offset out of the iterator in the catch block got the offset
+right and left `committed` a prefix short, which showed up as a
+`max_sequence` below a sequence the file still held.
+
+**`resume()` left the key directory pointing past the end of the file.**
+Nothing pruned published keys whose bytes the truncation removed. In a
+debug build the extent check in `store_state` rejected the resumed state
+and the engine stayed degraded **with no retry that could ever succeed** —
+the committed prefix already truncated away, which is the second #36 bug's
+shape reached through a different door. With `NDEBUG` that check is
+compiled out, so `resume()` reported success and the next read of such a
+key `pread`ed past the end of the file. `apply_resume` now drops them,
+which is all it can do — the bytes are gone either way, and what `resume()`
+owes the caller is a consistent engine for everything the damage did not
+reach.
+
+Reverting the pruning fails all 16 cells; reverting the iterator fix fails
+4 — the ones with an intact entry sitting immediately before the damage.
+
+#### One thing the cells deliberately do not require
+
+A cold open may report a lower `next_seq` than the resumed engine. The
+damage erased the entries that carried those sequences, and with them the
+only evidence they were consumed; recovery cannot know what it cannot
+read. `assert_matches_recovery` takes `NextSeq::RecoveryMayLag` for these
+cells and asserts the direction instead — recovery may know fewer consumed
+sequences, never more. Reuse is safe here precisely because the entries
+that held them are gone.
+
 ### recovery — 40 tests
 
 40 generated Catch2 tests (`[prove_recovery]` tag) cover five state shapes
@@ -961,6 +1038,14 @@ write on new leader → backward sync → verify convergence).
 | `expected_delta.py` | Reference model: keys present/absent after all resume calls |
 | `generate_tests.py` | Generates `prove_resume.cpp` |
 
+**corruption module** (`tests/proof/corruption/`):
+
+| File | Role |
+|------|------|
+| `scenario_matrix.py` | CorruptionShape (position), CorruptField (crc, value_size, entry_type, sequence), computed byte offsets |
+| `expected_delta.py` | Reference model: which keys survive by value, which are gone, what the file truncates to |
+| `generate_tests.py` | Generates `prove_corruption.cpp` |
+
 **recovery module** (`tests/proof/recovery/`):
 
 | File | Role |
@@ -1122,7 +1207,7 @@ are covered by the 178 `[prove_repl]` tests. All three manifest failure
 classes across 11 state shapes are covered by the 33 `[prove_manifest]`
 tests. Four elimination rules reduce the full matrix to 211 valid tests.
 
-Total generated proof tests: **2245**.
+Total generated proof tests: **2261**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
@@ -1281,6 +1366,7 @@ tests/
       prove_vacuum_compact.cpp     ← generated, never hand-edited
       prove_group_commit.cpp       ← generated, never hand-edited
       prove_recovery.cpp           ← generated, never hand-edited
+      prove_corruption.cpp         ← generated, never hand-edited
       prove_replication.cpp        ← generated, never hand-edited
 ```
 
@@ -1407,22 +1493,6 @@ control:
   entry detects this on recovery (the entry fails CRC and is truncated),
   which is the correct behavior — but the fault injector models failures
   at the `writev` boundary, not the sector boundary.
-- **Corrupt bytes in an otherwise healthy file** — the `degrade_B2` shape
-  now reaches `resume()`'s CRC-error branch by construction: a short
-  `writev` leaves a torn trailing entry whose CRC cannot hold. That covers
-  the branch, not the axis. A read that succeeds and returns wrong bytes
-  from an *arbitrary* position — a flipped byte in the first entry, in the
-  middle of a file, or between a `BulkBegin` and its `BulkEnd` — is still
-  not a failure class the taxonomy has (#104), and a torn *tail* is the
-  only position `short_write` can produce. Both bugs found on that branch
-  — `valid_offset` left at 0 when the scan throws, and a read buffer sized
-  from an unverified `value_size` — were invisible to all 37 resume proof
-  tests of the time while every one of them passed. The hand-written test
-  that was meant to cover it corrupted the file at `file_size - 5`, which
-  on a zero-filled active file is in the tail past the write cursor and is
-  never scanned. A full corruption axis is one over the *bytes*,
-  orthogonal to the syscall-failure axis over the *calls*, and needs a
-  helper that can target an entry by position.
 - **Hardware-level fault injection** — kernel block-layer error injection
   (`dm-flakey`, `dm-dust`), power-cut testing rigs, or filesystem-
   specific fault tools. The fault injector operates at the application

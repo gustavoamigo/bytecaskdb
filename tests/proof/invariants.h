@@ -309,14 +309,30 @@ inline auto fingerprint(const DB &db) -> EngineFingerprint {
 //
 // The recovered DB opens its own fresh active file, which has no counterpart
 // in `before`; stems absent from the resumed state are therefore skipped.
+// What a cold open may know about consumed sequences.
+enum class NextSeq {
+  Exact,  // the usual case: the file still carries every sequence it used
+  // The damage erased entries, and with them the only evidence that their
+  // sequences were ever consumed. A cold open cannot know what it cannot
+  // read, so it may report less — never more. Reuse is safe here precisely
+  // because the entries that held those sequences are gone.
+  RecoveryMayLag,
+};
+
 inline void assert_matches_recovery(const std::filesystem::path &dir,
                                     const EngineFingerprint &before,
-                                    const Options &opts = {}) {
+                                    const Options &opts = {},
+                                    NextSeq next_seq = NextSeq::Exact) {
   auto recovered = DB::open(dir, opts);
   const auto after = fingerprint(recovered);
 
-  INFO("next_seq must survive recovery");
-  CHECK(after.next_seq == before.next_seq);
+  if (next_seq == NextSeq::Exact) {
+    INFO("next_seq must survive recovery");
+    CHECK(after.next_seq == before.next_seq);
+  } else {
+    INFO("a cold open may know fewer consumed sequences, never more");
+    CHECK(after.next_seq <= before.next_seq);
+  }
 
   for (const auto &[key, value] : before.key_values) {
     INFO("key present after resume must be present after recovery: " << key);
@@ -399,6 +415,68 @@ inline auto corrupt_newest_hint(const std::filesystem::path &dir) -> bool {
   f.seekp(0);
   f.write(&b, 1);
   return static_cast<bool>(f);
+}
+
+// ---- Byte-level corruption ------------------------------------------------
+//
+// The fault injector models calls that fail. These model a read that succeeds
+// and returns something wrong: the damage is already in the file. Offsets are
+// computable rather than parsed — a data entry is 15 bytes of header
+// (sequence u64, entry_type u8, key_size u16, value_size u32), then key, then
+// value, then a 4-byte CRC.
+
+// Writes `bytes` at `off` in the newest data file.
+inline void poke_active_file(const std::filesystem::path &dir,
+                             std::uint64_t off,
+                             std::span<const unsigned char> bytes) {
+  const auto data = sorted_paths(dir, ".data");
+  REQUIRE_FALSE(data.empty());
+  std::fstream f{data.back(), std::ios::binary | std::ios::in | std::ios::out};
+  REQUIRE(f);
+  f.seekp(static_cast<std::streamoff>(off));
+  f.write(reinterpret_cast<const char *>(bytes.data()),
+          static_cast<std::streamsize>(bytes.size()));
+  f.flush();
+  REQUIRE(f);
+}
+
+// Flips every bit of one byte, so the value is guaranteed to change whatever
+// it was.
+inline void flip_byte_at(const std::filesystem::path &dir, std::uint64_t off) {
+  const auto data = sorted_paths(dir, ".data");
+  REQUIRE_FALSE(data.empty());
+  std::fstream f{data.back(), std::ios::binary | std::ios::in | std::ios::out};
+  REQUIRE(f);
+  f.seekg(static_cast<std::streamoff>(off));
+  char b = 0;
+  f.read(&b, 1);
+  b = static_cast<char>(~static_cast<unsigned char>(b));
+  f.seekp(static_cast<std::streamoff>(off));
+  f.write(&b, 1);
+  f.flush();
+  REQUIRE(f);
+}
+
+// A little-endian u32 large enough that the entry it describes ends past any
+// file this suite writes — what #36 sized a read buffer from.
+inline void poke_huge_value_size(const std::filesystem::path &dir,
+                                 std::uint64_t off) {
+  const std::array<unsigned char, 4> huge{0xF0, 0xFF, 0xFF, 0xFF};
+  poke_active_file(dir, off, huge);
+}
+
+// A byte that is not a valid EntryType (valid are 0x01..0x05).
+inline void poke_invalid_entry_type(const std::filesystem::path &dir,
+                                    std::uint64_t off) {
+  const std::array<unsigned char, 1> bad{0x7F};
+  poke_active_file(dir, off, bad);
+}
+
+// Zero the 8-byte sequence, which the scan already treats as end of file.
+inline void poke_zero_sequence(const std::filesystem::path &dir,
+                               std::uint64_t off) {
+  const std::array<unsigned char, 8> zero{};
+  poke_active_file(dir, off, zero);
 }
 
 // ---- Vacuum baseline and helpers -----------------------------------------

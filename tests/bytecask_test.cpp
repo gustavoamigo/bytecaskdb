@@ -4871,7 +4871,11 @@ TEST_CASE("apply_resume: empty entries is a no-op",
   auto t = state->transient();
 
   std::vector<bytecask::ResumeEntry> entries;
-  t.apply_resume(1, entries, 0);
+  // valid_offset is what the file is about to be truncated to, so it has to
+  // cover k1's entry for this to be a no-op — the file's own total_bytes.
+  // Passing 0 here would say "truncate this file to nothing", and dropping
+  // the key that lives in it is then the correct outcome, not a no-op.
+  t.apply_resume(1, entries, 100);
 
   auto s = std::move(t).persistent();
   CHECK(s->key_dir.get(to_bytes("k1")).has_value());

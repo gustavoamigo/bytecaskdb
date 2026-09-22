@@ -71,6 +71,7 @@ private:
   void advance() {
     pending_.clear();
     emit_idx_ = 0;
+    if (stop_) return;
 
     while (!(cur_ == std::default_sentinel)) {
       const auto& [entry, entry_off] = *cur_;
@@ -78,17 +79,23 @@ private:
       if (entry.entry_type == EntryType::BulkBegin) {
         // Buffer entries until matching BulkEnd or EOF.
         pending_.emplace_back(entry, entry_off);
-        ++cur_;
+        if (!step()) {
+          pending_.clear();  // damaged inside the batch — discard it whole
+          return;
+        }
 
         while (!(cur_ == std::default_sentinel)) {
           const auto& [inner, inner_off] = *cur_;
           pending_.emplace_back(inner, inner_off);
           if (inner.entry_type == EntryType::BulkEnd) {
             committed_offset_ = cur_.next_offset();
-            ++cur_;
+            (void)step();
             return;
           }
-          ++cur_;
+          if (!step()) {
+            pending_.clear();
+            return;
+          }
         }
         // EOF before BulkEnd — discard incomplete batch.
         pending_.clear();
@@ -98,8 +105,27 @@ private:
       // Standalone entry (Put, Delete, RangeDel).
       committed_offset_ = cur_.next_offset();
       pending_.emplace_back(entry, entry_off);
-      ++cur_;
+      (void)step();
       return;
+    }
+  }
+
+  // Advances the underlying scan, reporting whether it survived.
+  //
+  // A parse failure here says the NEXT entry is damaged. The one already
+  // buffered is intact, lies below committed_offset_, and must still be
+  // yielded — letting the throw out of operator++ would discard it, and the
+  // caller would truncate to a point that excludes an entry it never saw.
+  // resume() needs the entries it replays and the offset it truncates to to
+  // describe the same prefix; a corrupt entry costs itself and what follows
+  // it, never the entry in front of it.
+  auto step() -> bool {
+    try {
+      ++cur_;
+      return true;
+    } catch (...) {
+      stop_ = true;
+      return false;
     }
   }
 
@@ -107,6 +133,7 @@ private:
   std::vector<value_type> pending_;
   std::size_t emit_idx_{0};
   Offset committed_offset_{};
+  bool stop_{false};  // a damaged entry was found past the buffered one
 };
 
 export inline auto scan_committed(const DataFile& file, Offset start = 0)
