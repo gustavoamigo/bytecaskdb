@@ -142,6 +142,19 @@ If any precondition guard, range guard, or implicit W-W check fails,
 writes, perform I/O, or change state. The caller's snapshot must not
 be invalidated.
 
+A conflict is reported no earlier than the moment a retry could see
+what the plan lost to. Plans are validated against writes that are
+applied but not yet published (the commit pipeline's head); a snapshot
+never contains those, so a plan that lost to one is held until that
+write is published — at most one flush — and then reported. A plan whose
+snapshot is already behind the published state is reported at once. This
+is the engine's guarantee against retries that cannot succeed; it is
+*not* a guarantee that a fresh snapshot after a conflict holds the value
+that won, which a later write may already have superseded. Under genuine
+contention — several writers on one key — a retry can still lose; backing
+off between retries is the caller's responsibility, and a tight retry
+loop is not a supported client pattern.
+
 A `WritePlan` with guards but no write operations (no `put` or `del`)
 is not empty — guards are evaluated. If all guards pass, the plan
 returns `true` with no I/O and no state change. If any guard fails,

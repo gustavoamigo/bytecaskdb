@@ -548,6 +548,15 @@ public:
   // don't need one (MustExist, MustBeAbsent).
   // Returns true if all guards pass.
   [[nodiscard]] auto validate_preconditions(const WritePlan &plan) const
+      -> bool {
+    std::uint64_t ignored = 0;
+    return validate_preconditions(plan, ignored);
+  }
+  // On failure, lost_to is the highest sequence among the entries the plan
+  // lost to — what a retry has to be able to see — or, for a key the plan
+  // found deleted or absent, the head's latest sequence.
+  [[nodiscard]] auto validate_preconditions(const WritePlan &plan,
+                                            std::uint64_t &lost_to) const
       -> bool;
 
   // Prepare IO plan — pure read, no mutations.
@@ -893,6 +902,11 @@ public:
   // sequence at return. min_sequence = 0, an already-reached target, or a
   // nonpositive timeout returns immediately. Identical semantics in Leader
   // and Follower mode (on a follower it reflects the last synced ingest).
+  // Blocks until the published state covers sequence — a fresh snapshot
+  // can see the write a plan lost to — or the engine degrades. See
+  // apply_batch.
+  void wait_published(std::uint64_t sequence) const;
+
   [[nodiscard]] auto durable_sequence(
       std::uint64_t min_sequence = 0,
       std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
@@ -1491,6 +1505,12 @@ export struct EngineSlot : Slot {
   WritePlan plan;
   WriteOptions opts;
   std::optional<CommitResult> result;
+  // On a conflict: the sequence of the entry the plan lost to, and the
+  // plan's snapshot's next_seq. A snapshot that already covers every
+  // published write lost to something still in flight — see apply_batch,
+  // which then reports the conflict only once that write is published.
+  std::uint64_t conflict_lost_to{0};
+  std::uint64_t conflict_snap_next{0};
 };
 
 
@@ -1570,10 +1590,17 @@ auto EngineState::transient() const -> TransientEngineState {
       sync_requested_seq, mode, degraded, degraded_reason};
 }
 
-auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
-    -> bool {
+auto TransientEngineState::validate_preconditions(
+    const WritePlan &plan, std::uint64_t &lost_to) const -> bool {
   const auto *snap_state =
       plan.snap_ ? plan.snap_->state_.get() : nullptr;
+  // The head's latest sequence: what a retry must see when the entry the
+  // plan lost to has no sequence of its own (deleted, or absent).
+  const auto head_latest = next_seq_ - 1;
+  const auto lost = [&](const std::optional<KeyDirEntry> &cur) {
+    lost_to = cur ? cur->sequence() : head_latest;
+    return false;
+  };
 
   // 1. Point guards.
   for (const auto &[key, guard] : plan.guards_) {
@@ -1582,17 +1609,17 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
 
     switch (guard.precondition) {
     case WritePlan::Precondition::MustExist:
-      if (!cur_entry) return false;
+      if (!cur_entry) return lost(std::nullopt);
       break;
     case WritePlan::Precondition::MustBeAbsent:
-      if (cur_entry) return false;
+      if (cur_entry) return lost(cur_entry);
       break;
     case WritePlan::Precondition::MustBeUnchanged: {
       // ensure_unchanged already enforced snap_ is present at build time.
       const auto snap_entry = snap_state->key_dir.get(key_span);
       const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
       const std::uint64_t cur_seq = cur_entry ? cur_entry->sequence() : 0;
-      if (cur_seq != snap_seq) return false;
+      if (cur_seq != snap_seq) return lost(cur_entry);
       break;
     }
     case WritePlan::Precondition::None:
@@ -1612,7 +1639,7 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
       if (Key{key_span} >= Key{to_span}) break;
       const auto snap_entry = snap_state->key_dir.get(key_span);
       const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
-      if (entry.sequence() != snap_seq) return false;
+      if (entry.sequence() != snap_seq) return lost(entry);
     }
 
     // Check snapshot for keys deleted since snapshot.
@@ -1620,7 +1647,7 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
          it != std::default_sentinel; ++it) {
       auto [key_span, entry] = *it;
       if (Key{key_span} >= Key{to_span}) break;
-      if (!key_dir_.get(key_span)) return false;
+      if (!key_dir_.get(key_span)) return lost(std::nullopt);
     }
   }
 
@@ -1640,7 +1667,10 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
               const bool modified =
                   snap_entry && cur_entry &&
                   cur_entry->sequence() != snap_entry->sequence();
-              if (appeared || deleted || modified) has_conflict = true;
+              if (appeared || deleted || modified) {
+                has_conflict = true;
+                lost_to = cur_entry ? cur_entry->sequence() : head_latest;
+              }
             } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
               const std::span<const std::byte> key_span{op.key};
               const auto snap_entry = snap_state->key_dir.get(key_span);
@@ -1650,7 +1680,10 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
               const bool modified =
                   snap_entry && cur_entry &&
                   cur_entry->sequence() != snap_entry->sequence();
-              if (appeared || deleted || modified) has_conflict = true;
+              if (appeared || deleted || modified) {
+                has_conflict = true;
+                lost_to = cur_entry ? cur_entry->sequence() : head_latest;
+              }
             } else if constexpr (std::is_same_v<T, WritePlan::RangeDel>) {
               // Range conflict check: verify no keys in [from, to) changed since snapshot
               const std::span<const std::byte> from_span{op.from};
@@ -1663,7 +1696,10 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
                 if (Key{key_span} >= Key{to_span}) break;
                 const auto snap_entry = snap_state->key_dir.get(key_span);
                 const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
-                if (entry.sequence() != snap_seq) has_conflict = true;
+                if (entry.sequence() != snap_seq) {
+                  has_conflict = true;
+                  lost_to = entry.sequence();
+                }
               }
 
               // Check snapshot for keys deleted since snapshot.
@@ -1671,7 +1707,10 @@ auto TransientEngineState::validate_preconditions(const WritePlan &plan) const
                    it != std::default_sentinel && !has_conflict; ++it) {
                 auto [key_span, entry] = *it;
                 if (Key{key_span} >= Key{to_span}) break;
-                if (!key_dir_.get(key_span)) has_conflict = true;
+                if (!key_dir_.get(key_span)) {
+                  has_conflict = true;
+                  lost_to = head_latest;
+                }
               }
             }
           },
@@ -2358,6 +2397,26 @@ auto DB::apply_batch(WriteOptions opts,
 #endif
   if (slot.result && slot.result->sequence != 0) commit_wait(slot);
 
+  // A conflict against a write the head holds but no snapshot can see yet.
+  // Plans are validated against the head, which is right — two in-flight
+  // writes to one key must not both pass — but a snapshot sees only the
+  // published state, so until that write is published every retry from a
+  // fresh snapshot finds the same state and loses again: a caller's retry
+  // loop spun through the whole fdatasync of a competing write, 50 to 300
+  // attempts per collision, and the CAS benchmark's average attempts went
+  // from 1.0 to 7-350 when the commit was pipelined. So a conflict is
+  // reported once the head it lost to is published — the moment a retry
+  // can make progress — which is when it was reported before the pipeline.
+  // A plan whose snapshot is already behind the published state returns at
+  // once: its retry has something new to see. The wait is for the write the
+  // plan lost to, not for the whole head: under many writers the head
+  // always holds entries appended after the flush in progress began, and
+  // waiting for those would cost a second flush for nothing.
+  if (!slot.result && slot.conflict_snap_next != 0 &&
+      slot.conflict_snap_next >= load_state()->next_seq) {
+    wait_published(slot.conflict_lost_to);
+  }
+
   return slot.result;
 }
 
@@ -2378,8 +2437,10 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
     return true;
   }
 
-  if (!t.validate_preconditions(slot.plan)) {
+  if (!t.validate_preconditions(slot.plan, slot.conflict_lost_to)) {
     slot.result = std::nullopt;
+    slot.conflict_snap_next =
+        slot.plan.snap_ ? slot.plan.snap_->state_->next_seq : 0;
     return false;
   }
 
@@ -3360,6 +3421,10 @@ void DB::set_mode(Mode mode) {
 
 void DB::deem_as_degraded(std::string reason) {
   store_state(load_state()->degraded_copy(std::move(reason)));
+  // A waiter on a publication that will now never come re-checks and sees
+  // the degrade. Not under durable_mu_ here — no caller holds it.
+  { std::lock_guard<std::mutex> lk{durable_mu_}; }
+  durable_cv_.notify_all();
 }
 
 void DB::resume() {
@@ -3457,6 +3522,14 @@ void DB::resume() {
   // start clean.
   std::lock_guard<std::mutex> lk{durable_mu_};
   flush_error_ = nullptr;
+}
+
+void DB::wait_published(std::uint64_t sequence) const {
+  std::unique_lock<std::mutex> lk{durable_mu_};
+  durable_cv_.wait(lk, [&] {
+    const auto s = load_state();
+    return s->next_seq > sequence || s->degraded;
+  });
 }
 
 auto DB::durable_sequence(std::uint64_t min_sequence,
@@ -3614,6 +3687,8 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
 
   const auto durable_advanced =
       new_state->durable_seq > old_state->durable_seq;
+  const auto published_advanced =
+      new_state->next_seq > old_state->next_seq;
   const auto became_degraded =
       new_state->degraded && !old_state->degraded;
 
@@ -3653,7 +3728,12 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
   if (became_degraded) {
     counters_.degraded_transitions.fetch_add(1, std::memory_order_relaxed);
   }
-  if (durable_advanced) {
+  // Wakes the sequence waiters: durable_sequence on a durable advance, and
+  // wait_published on any publication, which is why a nosync publish that
+  // advances no durable sequence notifies too. (A failed flush publishes
+  // through the raw store under durable_mu_ and finish_flush notifies for
+  // it; deem_as_degraded notifies for itself.)
+  if (durable_advanced || published_advanced || became_degraded) {
     { std::lock_guard<std::mutex> lk{durable_mu_}; }
     durable_cv_.notify_all();
   }

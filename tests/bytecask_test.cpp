@@ -8245,16 +8245,30 @@ TEST_CASE("pipeline: snapshot conflict is detected against a write that is "
   auto v = get_val(db, to_bytes("a"));
   REQUIRE(v.has_value());
   CHECK(to_string(*v) == "v0");
-  // ... but a plan from the older snapshot conflicts with the pending
-  // write and is rejected without waiting for the flush.
-  bytecask::WritePlan plan{std::move(snap)};
-  plan.put(to_bytes("a"), to_bytes("fromB"));
-  CHECK_FALSE(db.apply_batch({.sync = true}, std::move(plan)).has_value());
+  // ... and a plan from the older snapshot conflicts with the pending
+  // write. The conflict is validated against the head at once — the plan
+  // is never appended — but it is reported only once A's write is
+  // published: until then no snapshot can see what the plan lost to, and a
+  // retry would lose the same way for the length of the flush.
+  std::atomic<bool> b_returned{false};
+  std::optional<bytecask::CommitResult> rb;
+  std::thread tb([&] {
+    bytecask::WritePlan plan{std::move(snap)};
+    plan.put(to_bytes("a"), to_bytes("fromB"));
+    rb = db.apply_batch({.sync = true}, std::move(plan));
+    b_returned.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  CHECK_FALSE(b_returned.load());
+  v = get_val(db, to_bytes("a"));
+  CHECK(to_string(*v) == "v0");  // B's wait published nothing
 
   gate.open();
   ta.join();
+  tb.join();
   db.test_before_flush_sync_ = nullptr;
   REQUIRE(ra.has_value());
+  CHECK_FALSE(rb.has_value());
   v = get_val(db, to_bytes("a"));
   REQUIRE(v.has_value());
   CHECK(to_string(*v) == "fromA");
@@ -8435,6 +8449,77 @@ TEST_CASE("pipeline: a writer whose write another thread published sees it "
   CHECK(rf->sequence > rt->sequence);
   CHECK(t_saw_own_write);
   CHECK(db.contains_key({}, to_bytes("t")));
+}
+
+TEST_CASE("pipeline: a plan that loses to a write not yet published reports "
+          "the conflict once a retry can see that write",
+          "[pipeline][concurrency]") {
+  // Plans are validated against the head, which holds writes still in
+  // their fdatasync; a snapshot sees only the published state. A plan that
+  // collides with such a write cannot succeed on any retry until the write
+  // is published, so the conflict must not come back before then — a
+  // retry loop otherwise spins for the length of the flush (the CAS
+  // benchmark's average attempts went from 1 to 7-350 with the pipeline).
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("k"), to_bytes("0"));
+
+  // A: stage 1 done, entry for k in the head, parked before its flush.
+  FlushGate before_wait;
+  db.test_before_commit_wait_ = before_wait.hook();
+  std::thread ta([&] { db.put({.sync = true}, to_bytes("k"), to_bytes("1")); });
+  before_wait.wait_in_flush();
+
+  // B: snapshot (sees "0"), guarded write on k — loses to A's in-flight
+  // write, and must block until A publishes.
+  std::atomic<bool> b_returned{false};
+  std::optional<bytecask::CommitResult> rb;
+  std::thread tb([&] {
+    auto snap = db.snapshot();
+    bytecask::Bytes out;
+    REQUIRE(snap.get({}, to_bytes("k"), out));
+    REQUIRE(to_string(out) == "0");
+    bytecask::WritePlan plan{std::move(snap)};
+    plan.ensure_unchanged(to_bytes("k"));
+    plan.put(to_bytes("k"), to_bytes("b"));
+    rb = db.apply_batch({.sync = true}, std::move(plan));
+    b_returned.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  CHECK_FALSE(b_returned.load());
+
+  before_wait.open();
+  ta.join();
+  tb.join();
+  db.test_before_commit_wait_ = nullptr;
+  CHECK_FALSE(rb.has_value());
+
+  // The retry sees A's write and succeeds first time.
+  auto snap = db.snapshot();
+  bytecask::Bytes out;
+  REQUIRE(snap.get({}, to_bytes("k"), out));
+  CHECK(to_string(out) == "1");
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("2"));
+  CHECK(db.apply_batch({.sync = true}, std::move(plan)).has_value());
+  CHECK(to_string(*get_val(db, to_bytes("k"))) == "2");
+}
+
+TEST_CASE("pipeline: a plan whose snapshot is already behind the published "
+          "state reports its conflict at once",
+          "[pipeline][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("k"), to_bytes("0"));
+  auto snap = db.snapshot();
+  db.put({.sync = true}, to_bytes("k"), to_bytes("1"));  // published
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("b"));
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK_FALSE(db.apply_batch({.sync = true}, std::move(plan)).has_value());
+  CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds{100});
 }
 
 TEST_CASE("pipeline: a batch admitted before a flush failure is rejected as "
