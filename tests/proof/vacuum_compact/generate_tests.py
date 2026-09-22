@@ -109,6 +109,10 @@ def gen_vacuum_call(
         "    // the same sequences. Recovery deletes the copy, undoing the\n"
         "    // vacuum; assert_vacuum_recoverable proves the directory opens."
         if failure == VacuumCompactFailureClass.VC5
+        else "\n    // VC6: renamed, not committed (#104 M3) — the compacted copy is on\n"
+        "    // disk under its final name and the published state does not\n"
+        "    // reference it. The next open must detect it and delete it."
+        if failure == VacuumCompactFailureClass.VC6
         else ""
     )
 
@@ -152,6 +156,9 @@ def gen_test(
     parts.append("  TempDir td;")
     parts.append('  auto dir = td.path / "db";')
     parts.append("  bytecask::testing::VacuumBaseline before;")
+    orphan_check = failure == VacuumCompactFailureClass.VC6
+    if orphan_check:
+        parts.append("  std::vector<std::filesystem::path> orphans;")
     parts.append("  {")
     parts.append(gen_setup(state))
     parts.append("")
@@ -161,9 +168,14 @@ def gen_test(
     parts.append(gen_vacuum_call(fault_name, failure))
     parts.append("")
     parts.append(gen_assertions(delta))
+    if orphan_check:
+        parts.append("    orphans = unreferenced_data_files(db, dir);")
+        parts.append("    REQUIRE(orphans.size() == 1);  // the uncommitted copy")
     parts.append("  }")
     opts = _build_open_opts(state)
     parts.append(f"  assert_vacuum_recoverable(dir, before, {{{opts}}});")
+    if orphan_check:
+        parts.append("  CHECK_FALSE(std::filesystem::exists(orphans.front()));")
     parts.append("}")
     if state.io_backend != "pread":
         parts.append("#endif  // __EMSCRIPTEN__")
@@ -186,6 +198,8 @@ FILE_HEADER = """\
 // VC4 additionally verifies that an orphaned .data.tmp is not replayed on recovery.
 // VC5 verifies that a directory holding a compacted file and its source — a kill
 // after the commit, before the unlink — recovers, with the vacuum undone.
+// VC6 (#104 M3) verifies that a copy renamed but never committed is an orphan
+// the next open detects and deletes.
 
 #include <system_error>
 
@@ -203,6 +217,7 @@ namespace {
 using bytecask::testing::assert_consistent;
 using bytecask::testing::assert_vacuum_no_change;
 using bytecask::testing::assert_vacuum_recoverable;
+using bytecask::testing::unreferenced_data_files;
 using bytecask::testing::assert_vacuum_success;
 using bytecask::testing::capture_vacuum_baseline;
 using bytecask::testing::find_vacuum_target;

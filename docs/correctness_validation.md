@@ -227,6 +227,16 @@ healthy but fails on the next append. Degrading is the correct response;
 | G | No — page cache only | No | Yes | Yes | Yes |
 | H | Yes — fully | Yes — full delta | Yes | Yes | Yes |
 
+Classes A through H are syscalls that return an error. #104 added the
+region they leave out, syscalls that **succeed with the wrong result**:
+
+| Class | What succeeds wrongly | Engine behaviour | Proven by |
+|-------|----------------------|------------------|-----------|
+| M1 | `mmap` returns the address `munmap` just released | a span handed out before `truncate()` still reads the same bytes | observer axis, `assert_view_stable` (byte comparison, not address) |
+| M2 | `open(O_CREAT)` on a stem already on disk or already hinted | aborts rather than adopting the sealed file | `createDataFileForWrite panics when the data file already exists` / `… when the stem was already hinted` in `data_file_test.cpp` |
+| M3 | `rename` completes, the process does not confirm it | the next open detects the uncommitted copy and deletes it | VC6 in `[prove_vacuum_compact]` |
+| M4 | `pread` returns damaged bytes of published data | fail-stop: `resume()` refuses and truncates nothing; `open` refuses where the format can see it | `[prove_corruption]`, `[corruption]` |
+
 Note on classes B1/B2/B3 — LSN advanced, engine degraded: Any `writev`
 failure leaves the file in an indeterminate state — POSIX does not guarantee
 `writev = -1` means no bytes were written. `next_lsn` is advanced past all
@@ -696,10 +706,10 @@ fault points.
 
 This directly proves: *resume always eventually recovers once the underlying fault clears.*
 
-### vacuum_compact — 48 tests
+### vacuum_compact — 56 tests
 
-48 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover eight state
-shapes × six failure classes (SUCCESS, VC1–VC5).
+56 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover eight state
+shapes × seven failure classes (SUCCESS, VC1–VC6).
 
 State shapes create a DB with exactly one sealed file having fragmentation > 0:
 
@@ -735,7 +745,8 @@ sealed file.
 
 Failure classes: SUCCESS, VC1 (`io_vacuum_compact_tmp_create`),
 VC2 (`io_data_file_append`), VC3 (`io_data_file_sync`),
-VC4 (`io_vacuum_compact_rename`), VC5 (`io_vacuum_compact_unlink`).
+VC4 (`io_vacuum_compact_rename`), VC5 (`io_vacuum_compact_unlink`),
+VC6 (`io_vacuum_compact_post_rename`).
 
 VC4 is the most critical: the tmp file is fully synced and renamed
 (a new `.data` file exists on disk) but `vacuum_commit` has not run —
@@ -755,6 +766,15 @@ recovery handled this pair, every VC5 test failed with "two entries share
 the same sequence number but differ in physical location", which is how a
 cgroup OOM kill under a write-heavy sysbench run left a database that would
 not open.
+
+VC6 is the other end of that window, and #104's class M3: the rename
+completed and the process did not get to confirm it. Nothing is committed,
+so in memory the outcome is a failed vacuum (`assert_vacuum_no_change`), and
+on disk the compacted copy sits under its final name, referenced by nothing
+in the published state. The cell records that orphan's path before closing
+and checks the next open deleted it, on top of what
+`assert_vacuum_recoverable` proves for every class. Making recovery's undo
+throw instead fails all eight VC6 cells, and all eight VC5 cells with them.
 
 ### corruption — 16 tests
 
@@ -1229,6 +1249,9 @@ I/O checkpoints:
   matches its actual on-disk size, `assert_consistent`.
 - `assert_vacuum_recoverable(dir, before)` — opens a fresh DB and verifies
   all pre-vacuum keys survive recovery with correct values.
+- `unreferenced_data_files(db, dir)` — the `.data` files on disk that the
+  published state does not reference; VC6 uses it to name the orphan a
+  post-rename kill leaves, and to check the next open deleted it.
 - `OwnedEntries` / `collect_changes(range)` — collects transient
   `ChangeIterator` entries into owned storage. The views returned by the
   iterator are invalidated on advance; `OwnedEntries` preserves them.
@@ -1264,15 +1287,15 @@ degrade_F, degrade_G, degrade_F_range and degrade_F_batch shapes (no
 orphaned bytes to truncate — fault point unreachable), and R2/CASCADE for
 degrade_H (file already sealed).
 
-All five vacuum_compact failure classes across all eight state shapes are
-covered by the 40 `[prove_vacuum_compact]` tests.
+All seven vacuum_compact classes (SUCCESS, VC1–VC6) across all eight state
+shapes are covered by the 56 `[prove_vacuum_compact]` tests.
 
 All seven ingest failure classes across 11 state shapes and 5 ops shapes
 are covered by the 178 `[prove_repl]` tests. All three manifest failure
 classes across 11 state shapes are covered by the 33 `[prove_manifest]`
 tests. Four elimination rules reduce the full matrix to 211 valid tests.
 
-Total generated proof tests: **2261**.
+Total generated proof tests: **2277**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
@@ -1504,9 +1527,10 @@ post-rename point on both backends: `~DB` returns, the next open removes
 the copy, and every key reads back.
 
 This is #104's class **M3**. Its reference model assumed detection and
-removal were already implemented; #137 is what implemented them. VC5 holds
-the committed end of the window in cells; the post-rename point has no
-class of its own yet.
+removal were already implemented; #137 is what implemented them. The two
+ends of the window are cells now — VC6 for the post-rename point and VC5
+for the unlink (see *vacuum_compact* above) — and they are the reference
+model this section used to spell out in prose.
 
 ---
 

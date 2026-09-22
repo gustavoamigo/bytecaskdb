@@ -31,6 +31,12 @@ def vacuum_compact_delta(
     the vacuum by deleting the compacted file, and assert_vacuum_recoverable
     proves the directory opens with every key and sequence-disjoint files.
 
+    VC6: vacuum throws after the rename and before the commit — #104's M3.
+    In memory nothing changed, as for VC1–VC4. On disk the compacted copy
+    sits under its final name, unreferenced, beside the source it copies.
+    Recovery must detect it and delete it: the cell records the orphan's
+    path before closing and checks it is gone after the next open.
+
     VC4 note: after a successful rename the tmp file is valid on disk but
     unreferenced. The .data.tmp extension is not scanned by recovery, so it
     is a harmless disk orphan — assert_vacuum_recoverable confirms this.

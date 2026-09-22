@@ -37,10 +37,10 @@ class VacuumCompactFailureClass(Enum):
     VC3 = "sync_fails"        # io_data_file_sync on tmp file
     VC4 = "rename_fails"      # io_vacuum_compact_rename (synced tmp on disk)
     VC5 = "unlink_fails"      # io_vacuum_compact_unlink (committed; source left on disk)
-    # io_vacuum_compact_post_rename is the other end of VC5's window —
-    # renamed, not yet committed — and leaves the same pair on disk, which
-    # recovery undoes (see "Orphaned .data files" in
-    # docs/correctness_validation.md). It has no class here yet.
+    # The other end of VC5's window (#104 M3): the rename completed and the
+    # process did not get to confirm it. Nothing is committed, so the copy on
+    # disk is an orphan the published state does not reference.
+    VC6 = "post_rename"       # io_vacuum_compact_post_rename (renamed; not committed)
 
 
 # Compact path is now always used for files with live_bytes > 0.

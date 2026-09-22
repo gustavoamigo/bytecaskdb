@@ -15,6 +15,7 @@ _COMPACT_FAULT_NAMES = {
     VacuumCompactFailureClass.VC3: "io_data_file_sync",
     VacuumCompactFailureClass.VC4: "io_vacuum_compact_rename",
     VacuumCompactFailureClass.VC5: "io_vacuum_compact_unlink",
+    VacuumCompactFailureClass.VC6: "io_vacuum_compact_post_rename",
 }
 
 

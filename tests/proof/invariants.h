@@ -638,6 +638,23 @@ inline void assert_vacuum_no_change(const DB &db, const VacuumBaseline &before,
 }
 
 // Opens a fresh DB and verifies all pre-vacuum keys survive.
+// `.data` files in dir that the engine's published state does not reference —
+// what a vacuum killed after its rename and before its commit leaves behind.
+inline auto unreferenced_data_files(const DB &db,
+                                    const std::filesystem::path &dir)
+    -> std::vector<std::filesystem::path> {
+  auto state = db.engine_state();
+  std::vector<std::string> referenced;
+  for (const auto [file_id, file] : state->files)
+    referenced.push_back(file->path().filename().string());
+  std::vector<std::filesystem::path> out;
+  for (const auto &p : sorted_paths(dir, ".data"))
+    if (std::ranges::find(referenced, p.filename().string()) ==
+        referenced.end())
+      out.push_back(p);
+  return out;
+}
+
 inline void assert_vacuum_recoverable(const std::filesystem::path &dir,
                                       const VacuumBaseline &before,
                                       const Options &opts = {}) {
