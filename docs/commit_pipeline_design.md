@@ -189,6 +189,24 @@ If those earlier writes later fail their flush, the dependent plan fails
 too — see below. Snapshots handed to clients come from `state_` and never
 contain non-durable sync entries.
 
+**When a conflict is reported.** A plan that loses to a write `head_` holds
+but `state_` does not is rejected — correctly — but no snapshot can show a
+retry what it lost to until that write is published, so every retry until
+then is rejected the same way. Before the pipeline this could not happen:
+the fdatasync ran under `write_mu_`, so a competing plan was validated only
+after the earlier write was published. With immediate rejection, a caller's
+retry loop spun through the whole flush of the write it lost to — the CAS
+benchmark's average attempts went from 1.0 to 7–350 with the pipeline, at
+a 1 % true collision rate. So `apply_batch` reports such a conflict once the
+head it lost to is published (`wait_published`): the first moment a retry
+can make progress, and the moment the conflict was reported before the
+pipeline. It is detectable at validation — the plan's snapshot already
+covers everything in `state_` (`conflict_snap_next >= state_->next_seq`) —
+and a plan whose snapshot is behind `state_` returns at once, since its
+retry has something new to see. Nothing is written either way, and a
+non-conflicting plan keeps the full pipelining. Backoff under genuine
+contention remains the caller's job (`CONTRACT.md`, *Conflict Safety*).
+
 ### Failure: the fdatasync returns an error
 
 Today (classes F/G): the batch's slots get the `system_error`, `next_seq` is
@@ -379,7 +397,8 @@ Cheap pre-check before writing any of it:
   green under serial and parallel recovery, since on-disk shape is unchanged.
 - **Snapshot conflict against a pending write**: plan A puts k; before A's
   flush lands, plan B with `ensure_unchanged(k)` from an older snapshot must
-  be rejected.
+  be rejected — and the rejection reported only once A's write is
+  published, never before (see *When a conflict is reported*).
 - **Lone writer never waits on a condvar**: assert via the existing
   `WriteGroup` test hooks or a counter that a single-threaded `Put/Sync` runs
   `flush_once` on the calling thread.

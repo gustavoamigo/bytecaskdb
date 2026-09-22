@@ -220,7 +220,7 @@ The hot leader wins one regime: many closed-loop writers with no think time on a
 
 ##### Commit pipeline: stage 1 under `write_mu_`, stage 2 under the flush role
 
-Design: `docs/commit_pipeline_design.md`. The executor (stage 1) runs under `write_mu_` and stops after the append; the fdatasync and the publication (stage 2) run under a separate *flush role*, outside `write_mu_`, so stage 1 of the next batch overlaps the fdatasync of the previous one. On a flush-bound disk this took ~280 µs of serial in-memory work per commit cycle off the disk's critical path.
+Design: `docs/commit_pipeline_design.md`. The executor (stage 1) runs under `write_mu_` and stops after the append; the fdatasync and the publication (stage 2) run under a separate *flush role*, outside `write_mu_`, so stage 1 of the next batch overlaps the fdatasync of the previous one. Plans are validated against the head, so a plan can lose to a write that is applied but not yet published; such a conflict is reported once that write is published (`wait_published`), since no retry can succeed before — see *When a conflict is reported* in the pipeline design. On a flush-bound disk this took ~280 µs of serial in-memory work per commit cycle off the disk's critical path.
 
 Two state pointers over the same persistent chain:
 

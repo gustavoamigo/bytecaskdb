@@ -286,6 +286,21 @@ struct TmpDir {
 // Engine adapters — normalize each engine's API for generic benchmarks.
 // ===========================================================================
 
+// What a real optimistic client does after losing a commit: sleep a little
+// before trying again, doubling with jitter, so contending writers spread
+// out instead of re-colliding in lockstep. A tight retry loop measures the
+// engine's conflict detection, not a workload. The first retry is immediate
+// — one lost race is not contention — and the delay is capped well below a
+// commit's own latency. Applied to every engine's CAS adapter alike.
+inline void cas_backoff(std::uint64_t failed_attempts) {
+  if (failed_attempts < 2) return;
+  thread_local std::mt19937 rng{std::random_device{}()};
+  const auto exponent = std::min<std::uint64_t>(failed_attempts - 2, 5);
+  const auto max_us = std::uint64_t{50} << exponent;  // 50 µs .. 1.6 ms
+  std::uniform_int_distribution<std::uint64_t> dist{0, max_us};
+  std::this_thread::sleep_for(std::chrono::microseconds{dist(rng)});
+}
+
 template <bool UseMmap = false>
 struct BcAdapterBase {
   static auto generate_keys(std::size_t n) { return generate_prefixed_keys(n); }
@@ -503,6 +518,7 @@ struct BcCasAdapter {
 
       if (db.engine.apply_batch(wo, std::move(plan)))
         return attempts;
+      cas_backoff(attempts);
     }
   }
 };
@@ -801,8 +817,10 @@ struct RdbCasAdapter {
       delete txn;
       if (s.ok())
         return attempts;
-      if (s.IsTryAgain() || s.IsBusy())
+      if (s.IsTryAgain() || s.IsBusy()) {
+        cas_backoff(attempts);
         continue;
+      }
       throw std::runtime_error{"CAS commit failed: " + s.ToString()};
     }
   }
