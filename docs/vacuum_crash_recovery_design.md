@@ -31,11 +31,14 @@ do?
 - **Accept any duplicate sequence.** This is PR #131. `kde_newer` stops
   throwing on equal sequences and picks one entry by file id and offset. It
   still throws if the two value sizes differ.
-- **Finish the vacuum that was cut off.** Recovery proves that C is a
-  compaction of S, deletes S, then opens as usual. Every other duplicate
-  still refuses to open.
+- **Finish the vacuum.** Recovery deletes S, completing step 4.
+- **Undo the vacuum.** Recovery deletes C, returning to the state before
+  vacuum started.
 
-We choose the third option.
+We choose to undo. Vacuum is committed on disk when S is unlinked. Before
+that, C is unfinished work and recovery discards it, the same way it already
+discards a leftover `.data.tmp`. Any duplicate that is not a C and S pair
+still refuses to open.
 
 ## Why not accept any duplicate
 
@@ -54,23 +57,38 @@ A stronger per-entry check is not cheap. Hint files carry no per-entry CRC,
 so the comparator cannot tell two same-size values apart without reading
 data files for every key.
 
-There are two smaller costs:
+It also leaves S on disk until the next vacuum, and until then
+`changes_since` returns S's entries twice (#129).
 
-- Until the next vacuum removes S, `changes_since` returns S's entries
-  twice (#129).
-- The tie-break assumes C sorts after S by name. Names sort by creation
-  time only to the second. Within a second the random salt decides, so
-  about half the time S would keep the live bytes and the next vacuum would
-  rewrite it instead of deleting it.
+## Why undo rather than finish
 
-## Why finishing the vacuum is safe
+Recovery can prove one thing about the pair: every entry of C is also in S,
+with the same sequence, key and CRC.
 
-Vacuum only renames C into place after C is fsynced. So if C exists as
-`.data`, it is complete, and step 4 (unlinking S) is the only step left.
-Recovery completing it produces the same directory a vacuum that was not
-interrupted would have left.
+- **Deleting C** is safe on that proof alone. Everything in C is still in
+  S, so nothing is lost, and the result is a directory recovery already
+  opened before vacuum ran.
+- **Deleting S** also assumes that the entries in S but not in C are dead.
+  That is true only if C really came from vacuum and vacuum had no bugs.
+  The check does not prove it.
 
-## How recovery proves C is a compaction of S
+When the assumption fails, finishing loses data. Suppose a data file is
+copied while it is still being written, and the copy is later restored
+into the directory under another name. The copy is a prefix of the real
+file, so it passes the check. Undoing deletes the stale copy and loses
+nothing. Finishing deletes the real file and every write after the copy
+was taken.
+
+The cost of undoing is that the next vacuum redoes the compaction: one
+rewrite of one file, on a background path, after a crash.
+
+The process that was killed had already committed C in memory (step 3), so
+after reopening the database is back on S. The data is the same; only the
+file set differs. That matters only to something that recorded C's name in
+between, such as a `create_manifest` taken in that window, and callers of
+`create_manifest` must already keep vacuum from running during a transfer.
+
+## How recovery finds the pair
 
 This runs at open, before the key directory is built.
 
@@ -81,7 +99,7 @@ This runs at open, before the key directory is built.
    both data files in order and check that every entry of C, including
    tombstones and batch markers, appears in S with the same sequence, key
    and CRC.
-4. If the check passes, delete S and its hint file, then continue recovery.
+4. If the check passes, delete C and its hint file, then continue recovery.
 5. If the check fails, or files overlap in any other way, refuse to open.
 
 The check reads two data files, and only when files overlap, which should
@@ -93,7 +111,7 @@ kill.
 
 ## What still refuses to open
 
-- Two files with overlapping sequences that are not a compaction pair.
+- Two files with overlapping sequences that are not a C and S pair.
 - An entry in C that is missing from S or differs from it.
 - Any duplicate sequence the step above did not remove. `kde_newer` keeps
   its current strict check.
@@ -112,19 +130,22 @@ We drop the relaxed `kde_newer` and the matching tie-break in
 
 ## Tests
 
-- VC5 (existing, from PR #131): after the fault, reopen and also check that
-  S is gone from disk and every file's sequence range is disjoint.
+- VC5 (existing, from PR #131): after the fault, reopen and check that C
+  is gone from disk, S is still there, and every file's sequence range is
+  disjoint. The next vacuum compacts S again.
 - Recovery opens a directory holding S and a real compacted C (from vacuum,
   not a byte copy), with serial and parallel recovery agreeing.
-- Recovery refuses a pair that overlaps but is not a compaction: an entry
+- Recovery opens a directory holding a file and a copy of a prefix of it,
+  and keeps the full file.
+- Recovery refuses a pair that overlaps but is not a C and S pair: an entry
   in C missing from S, or the same sequence with a different value of the
   same size.
 - `changes_since` after reopening returns each sequence once (#129).
 
 ## Possible later change
 
-If the check at open ever proves too slow or too loose, vacuum can write a
-small intent file naming S before the rename in step 1. Recovery would then
-know the pair directly instead of deriving it. We are not doing this now
+If the check at open ever proves too slow, vacuum can write a small intent
+file naming S and C before the rename in step 1, and delete it after step 4.
+Recovery would then know the pair directly. We are not doing this now
 because the check above also covers directories written before such a file
 existed.
