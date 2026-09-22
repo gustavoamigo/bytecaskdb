@@ -7,11 +7,14 @@
 // through H model syscalls that fail; these model a read that succeeds and
 // returns something wrong, so the axis is over the bytes rather than the
 // calls. Each test publishes a known set of entries, damages one field of one
-// entry at a computed offset, and verifies that resume() keeps everything
-// below the damage readable, drops everything from it onward, and ends
-// non-degraded and in agreement with a cold open.
+// entry at a computed offset, and verifies the engine fails stop: resume()
+// refuses and stays degraded, a cold open refuses wherever the format can see
+// the damage, and neither truncates a byte. There is no recovery contract for
+// damaged published data — only a promise not to make it worse.
 
+#include <string_view>
 #include <system_error>
+#include <vector>
 
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
@@ -24,15 +27,26 @@ import bytecask;
 
 namespace {
 
-using bytecask::testing::assert_consistent;
-using bytecask::testing::assert_matches_recovery;
-using bytecask::testing::fingerprint;
+using bytecask::testing::data_file_prefix;
 using bytecask::testing::flip_byte_at;
 using bytecask::testing::poke_huge_value_size;
 using bytecask::testing::poke_invalid_entry_type;
 using bytecask::testing::poke_zero_sequence;
 using bytecask::testing::to_bytes;
-using bytecask::testing::to_string;
+
+// resume() must refuse with the corruption it found — not an I/O error, which
+// it rethrows as-is, and not by succeeding.
+auto resume_refuses_over_damage(bytecask::DB& db) -> bool {
+  try {
+    db.resume();
+  } catch (const std::system_error&) {
+    return false;
+  } catch (const std::runtime_error& e) {
+    return std::string_view{e.what()}.find("refusing to truncate") !=
+           std::string_view::npos;
+  }
+  return false;
+}
 
 struct TempDir {
   std::filesystem::path path;
@@ -57,7 +71,7 @@ struct TempDir {
 TEST_CASE("prove_corruption__first_entry__crc", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // Six 23-byte entries: entry i begins at 23*i.
@@ -70,8 +84,8 @@ TEST_CASE("prove_corruption__first_entry__crc", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -82,33 +96,29 @@ TEST_CASE("prove_corruption__first_entry__crc", "[prove_corruption]") {
 
     // Damage the crc field of the entry at byte 0.
     flip_byte_at(dir, 15);
+    damaged = data_file_prefix(dir, 161);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("k0")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k3")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k4")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k5")));
-    assert_consistent(db);
-    fp = fingerprint(db);
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 161) == damaged);
+    }
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // A cold open reads the same damage and refuses the same way,
+  // under the default fail_recovery_on_crc_errors, without
+  // trimming the file to the point it could parse.
+  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
+  CHECK(data_file_prefix(dir, 161) == damaged);
 }
 
 TEST_CASE("prove_corruption__first_entry__value_size", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // Six 23-byte entries: entry i begins at 23*i.
@@ -121,8 +131,8 @@ TEST_CASE("prove_corruption__first_entry__value_size", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -133,33 +143,30 @@ TEST_CASE("prove_corruption__first_entry__value_size", "[prove_corruption]") {
 
     // Damage the value_size field of the entry at byte 0.
     poke_huge_value_size(dir, 11);
+    damaged = data_file_prefix(dir, 161);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("k0")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k3")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k4")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k5")));
-    assert_consistent(db);
-    fp = fingerprint(db);
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 161) == damaged);
+    }
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // No cold-open assertion: a value_size damaged this way
+  // reads as the end of written data, which is also what the
+  // unwritten tail of a crashed active file looks like, and a
+  // hint-less file records no committed length to tell the two
+  // apart. resume() can only because the published state knows
+  // the extent. See docs/correctness_validation.md, class M4.
 }
 
 TEST_CASE("prove_corruption__first_entry__entry_type", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // Six 23-byte entries: entry i begins at 23*i.
@@ -172,8 +179,8 @@ TEST_CASE("prove_corruption__first_entry__entry_type", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -184,33 +191,29 @@ TEST_CASE("prove_corruption__first_entry__entry_type", "[prove_corruption]") {
 
     // Damage the entry_type field of the entry at byte 0.
     poke_invalid_entry_type(dir, 8);
+    damaged = data_file_prefix(dir, 161);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("k0")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k3")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k4")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k5")));
-    assert_consistent(db);
-    fp = fingerprint(db);
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 161) == damaged);
+    }
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // A cold open reads the same damage and refuses the same way,
+  // under the default fail_recovery_on_crc_errors, without
+  // trimming the file to the point it could parse.
+  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
+  CHECK(data_file_prefix(dir, 161) == damaged);
 }
 
 TEST_CASE("prove_corruption__first_entry__sequence", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // Six 23-byte entries: entry i begins at 23*i.
@@ -223,8 +226,8 @@ TEST_CASE("prove_corruption__first_entry__sequence", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -235,33 +238,30 @@ TEST_CASE("prove_corruption__first_entry__sequence", "[prove_corruption]") {
 
     // Damage the sequence field of the entry at byte 0.
     poke_zero_sequence(dir, 0);
+    damaged = data_file_prefix(dir, 161);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("k0")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k3")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k4")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k5")));
-    assert_consistent(db);
-    fp = fingerprint(db);
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 161) == damaged);
+    }
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // No cold-open assertion: a sequence damaged this way
+  // reads as the end of written data, which is also what the
+  // unwritten tail of a crashed active file looks like, and a
+  // hint-less file records no committed length to tell the two
+  // apart. resume() can only because the published state knows
+  // the extent. See docs/correctness_validation.md, class M4.
 }
 
 TEST_CASE("prove_corruption__mid_file__crc", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // Six 23-byte entries: entry i begins at 23*i.
@@ -274,8 +274,8 @@ TEST_CASE("prove_corruption__mid_file__crc", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -286,43 +286,29 @@ TEST_CASE("prove_corruption__mid_file__crc", "[prove_corruption]") {
 
     // Damage the crc field of the entry at byte 46.
     flip_byte_at(dir, 61);
+    damaged = data_file_prefix(dir, 161);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    {
-      bytecask::Bytes out;
-      INFO("k0 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k0"), out));
-      CHECK(to_string(out) == "v0");
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 161) == damaged);
     }
-    {
-      bytecask::Bytes out;
-      INFO("k1 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k1"), out));
-      CHECK(to_string(out) == "v1");
-    }
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k3")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k4")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k5")));
-    assert_consistent(db);
-    fp = fingerprint(db);
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // A cold open reads the same damage and refuses the same way,
+  // under the default fail_recovery_on_crc_errors, without
+  // trimming the file to the point it could parse.
+  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
+  CHECK(data_file_prefix(dir, 161) == damaged);
 }
 
 TEST_CASE("prove_corruption__mid_file__value_size", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // Six 23-byte entries: entry i begins at 23*i.
@@ -335,8 +321,8 @@ TEST_CASE("prove_corruption__mid_file__value_size", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -347,43 +333,30 @@ TEST_CASE("prove_corruption__mid_file__value_size", "[prove_corruption]") {
 
     // Damage the value_size field of the entry at byte 46.
     poke_huge_value_size(dir, 57);
+    damaged = data_file_prefix(dir, 161);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    {
-      bytecask::Bytes out;
-      INFO("k0 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k0"), out));
-      CHECK(to_string(out) == "v0");
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 161) == damaged);
     }
-    {
-      bytecask::Bytes out;
-      INFO("k1 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k1"), out));
-      CHECK(to_string(out) == "v1");
-    }
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k3")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k4")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k5")));
-    assert_consistent(db);
-    fp = fingerprint(db);
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // No cold-open assertion: a value_size damaged this way
+  // reads as the end of written data, which is also what the
+  // unwritten tail of a crashed active file looks like, and a
+  // hint-less file records no committed length to tell the two
+  // apart. resume() can only because the published state knows
+  // the extent. See docs/correctness_validation.md, class M4.
 }
 
 TEST_CASE("prove_corruption__mid_file__entry_type", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // Six 23-byte entries: entry i begins at 23*i.
@@ -396,8 +369,8 @@ TEST_CASE("prove_corruption__mid_file__entry_type", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -408,43 +381,29 @@ TEST_CASE("prove_corruption__mid_file__entry_type", "[prove_corruption]") {
 
     // Damage the entry_type field of the entry at byte 46.
     poke_invalid_entry_type(dir, 54);
+    damaged = data_file_prefix(dir, 161);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    {
-      bytecask::Bytes out;
-      INFO("k0 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k0"), out));
-      CHECK(to_string(out) == "v0");
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 161) == damaged);
     }
-    {
-      bytecask::Bytes out;
-      INFO("k1 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k1"), out));
-      CHECK(to_string(out) == "v1");
-    }
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k3")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k4")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k5")));
-    assert_consistent(db);
-    fp = fingerprint(db);
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // A cold open reads the same damage and refuses the same way,
+  // under the default fail_recovery_on_crc_errors, without
+  // trimming the file to the point it could parse.
+  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
+  CHECK(data_file_prefix(dir, 161) == damaged);
 }
 
 TEST_CASE("prove_corruption__mid_file__sequence", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // Six 23-byte entries: entry i begins at 23*i.
@@ -457,8 +416,8 @@ TEST_CASE("prove_corruption__mid_file__sequence", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -469,43 +428,30 @@ TEST_CASE("prove_corruption__mid_file__sequence", "[prove_corruption]") {
 
     // Damage the sequence field of the entry at byte 46.
     poke_zero_sequence(dir, 46);
+    damaged = data_file_prefix(dir, 161);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    {
-      bytecask::Bytes out;
-      INFO("k0 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k0"), out));
-      CHECK(to_string(out) == "v0");
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 161) == damaged);
     }
-    {
-      bytecask::Bytes out;
-      INFO("k1 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k1"), out));
-      CHECK(to_string(out) == "v1");
-    }
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k3")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k4")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("k5")));
-    assert_consistent(db);
-    fp = fingerprint(db);
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // No cold-open assertion: a sequence damaged this way
+  // reads as the end of written data, which is also what the
+  // unwritten tail of a crashed active file looks like, and a
+  // hint-less file records no committed length to tell the two
+  // apart. resume() can only because the published state knows
+  // the extent. See docs/correctness_validation.md, class M4.
 }
 
 TEST_CASE("prove_corruption__last_entry__crc", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // Six 23-byte entries: entry i begins at 23*i.
@@ -518,8 +464,8 @@ TEST_CASE("prove_corruption__last_entry__crc", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -530,58 +476,29 @@ TEST_CASE("prove_corruption__last_entry__crc", "[prove_corruption]") {
 
     // Damage the crc field of the entry at byte 115.
     flip_byte_at(dir, 130);
+    damaged = data_file_prefix(dir, 161);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    {
-      bytecask::Bytes out;
-      INFO("k0 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k0"), out));
-      CHECK(to_string(out) == "v0");
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 161) == damaged);
     }
-    {
-      bytecask::Bytes out;
-      INFO("k1 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k1"), out));
-      CHECK(to_string(out) == "v1");
-    }
-    {
-      bytecask::Bytes out;
-      INFO("k2 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k2"), out));
-      CHECK(to_string(out) == "v2");
-    }
-    {
-      bytecask::Bytes out;
-      INFO("k3 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k3"), out));
-      CHECK(to_string(out) == "v3");
-    }
-    {
-      bytecask::Bytes out;
-      INFO("k4 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k4"), out));
-      CHECK(to_string(out) == "v4");
-    }
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("k5")));
-    assert_consistent(db);
-    fp = fingerprint(db);
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // A cold open reads the same damage and refuses the same way,
+  // under the default fail_recovery_on_crc_errors, without
+  // trimming the file to the point it could parse.
+  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
+  CHECK(data_file_prefix(dir, 161) == damaged);
 }
 
 TEST_CASE("prove_corruption__last_entry__value_size", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // Six 23-byte entries: entry i begins at 23*i.
@@ -594,8 +511,8 @@ TEST_CASE("prove_corruption__last_entry__value_size", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -606,58 +523,30 @@ TEST_CASE("prove_corruption__last_entry__value_size", "[prove_corruption]") {
 
     // Damage the value_size field of the entry at byte 115.
     poke_huge_value_size(dir, 126);
+    damaged = data_file_prefix(dir, 161);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    {
-      bytecask::Bytes out;
-      INFO("k0 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k0"), out));
-      CHECK(to_string(out) == "v0");
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 161) == damaged);
     }
-    {
-      bytecask::Bytes out;
-      INFO("k1 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k1"), out));
-      CHECK(to_string(out) == "v1");
-    }
-    {
-      bytecask::Bytes out;
-      INFO("k2 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k2"), out));
-      CHECK(to_string(out) == "v2");
-    }
-    {
-      bytecask::Bytes out;
-      INFO("k3 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k3"), out));
-      CHECK(to_string(out) == "v3");
-    }
-    {
-      bytecask::Bytes out;
-      INFO("k4 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k4"), out));
-      CHECK(to_string(out) == "v4");
-    }
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("k5")));
-    assert_consistent(db);
-    fp = fingerprint(db);
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // No cold-open assertion: a value_size damaged this way
+  // reads as the end of written data, which is also what the
+  // unwritten tail of a crashed active file looks like, and a
+  // hint-less file records no committed length to tell the two
+  // apart. resume() can only because the published state knows
+  // the extent. See docs/correctness_validation.md, class M4.
 }
 
 TEST_CASE("prove_corruption__last_entry__entry_type", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // Six 23-byte entries: entry i begins at 23*i.
@@ -670,8 +559,8 @@ TEST_CASE("prove_corruption__last_entry__entry_type", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -682,58 +571,29 @@ TEST_CASE("prove_corruption__last_entry__entry_type", "[prove_corruption]") {
 
     // Damage the entry_type field of the entry at byte 115.
     poke_invalid_entry_type(dir, 123);
+    damaged = data_file_prefix(dir, 161);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    {
-      bytecask::Bytes out;
-      INFO("k0 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k0"), out));
-      CHECK(to_string(out) == "v0");
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 161) == damaged);
     }
-    {
-      bytecask::Bytes out;
-      INFO("k1 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k1"), out));
-      CHECK(to_string(out) == "v1");
-    }
-    {
-      bytecask::Bytes out;
-      INFO("k2 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k2"), out));
-      CHECK(to_string(out) == "v2");
-    }
-    {
-      bytecask::Bytes out;
-      INFO("k3 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k3"), out));
-      CHECK(to_string(out) == "v3");
-    }
-    {
-      bytecask::Bytes out;
-      INFO("k4 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k4"), out));
-      CHECK(to_string(out) == "v4");
-    }
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("k5")));
-    assert_consistent(db);
-    fp = fingerprint(db);
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // A cold open reads the same damage and refuses the same way,
+  // under the default fail_recovery_on_crc_errors, without
+  // trimming the file to the point it could parse.
+  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
+  CHECK(data_file_prefix(dir, 161) == damaged);
 }
 
 TEST_CASE("prove_corruption__last_entry__sequence", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // Six 23-byte entries: entry i begins at 23*i.
@@ -746,8 +606,8 @@ TEST_CASE("prove_corruption__last_entry__sequence", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -758,58 +618,30 @@ TEST_CASE("prove_corruption__last_entry__sequence", "[prove_corruption]") {
 
     // Damage the sequence field of the entry at byte 115.
     poke_zero_sequence(dir, 115);
+    damaged = data_file_prefix(dir, 161);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    {
-      bytecask::Bytes out;
-      INFO("k0 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k0"), out));
-      CHECK(to_string(out) == "v0");
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 161) == damaged);
     }
-    {
-      bytecask::Bytes out;
-      INFO("k1 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k1"), out));
-      CHECK(to_string(out) == "v1");
-    }
-    {
-      bytecask::Bytes out;
-      INFO("k2 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k2"), out));
-      CHECK(to_string(out) == "v2");
-    }
-    {
-      bytecask::Bytes out;
-      INFO("k3 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k3"), out));
-      CHECK(to_string(out) == "v3");
-    }
-    {
-      bytecask::Bytes out;
-      INFO("k4 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k4"), out));
-      CHECK(to_string(out) == "v4");
-    }
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("k5")));
-    assert_consistent(db);
-    fp = fingerprint(db);
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // No cold-open assertion: a sequence damaged this way
+  // reads as the end of written data, which is also what the
+  // unwritten tail of a crashed active file looks like, and a
+  // hint-less file records no committed length to tell the two
+  // apart. resume() can only because the published state knows
+  // the extent. See docs/correctness_validation.md, class M4.
 }
 
 TEST_CASE("prove_corruption__inside_batch__crc", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // k0, k1 standalone, then a batch — the corruption lands
@@ -825,8 +657,8 @@ TEST_CASE("prove_corruption__inside_batch__crc", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -837,41 +669,29 @@ TEST_CASE("prove_corruption__inside_batch__crc", "[prove_corruption]") {
 
     // Damage the crc field of the entry at byte 65.
     flip_byte_at(dir, 80);
+    damaged = data_file_prefix(dir, 153);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    {
-      bytecask::Bytes out;
-      INFO("k0 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k0"), out));
-      CHECK(to_string(out) == "v0");
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 153) == damaged);
     }
-    {
-      bytecask::Bytes out;
-      INFO("k1 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k1"), out));
-      CHECK(to_string(out) == "v1");
-    }
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("b0")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("b1")));
-    assert_consistent(db);
-    fp = fingerprint(db);
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // A cold open reads the same damage and refuses the same way,
+  // under the default fail_recovery_on_crc_errors, without
+  // trimming the file to the point it could parse.
+  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
+  CHECK(data_file_prefix(dir, 153) == damaged);
 }
 
 TEST_CASE("prove_corruption__inside_batch__value_size", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // k0, k1 standalone, then a batch — the corruption lands
@@ -887,8 +707,8 @@ TEST_CASE("prove_corruption__inside_batch__value_size", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -899,41 +719,30 @@ TEST_CASE("prove_corruption__inside_batch__value_size", "[prove_corruption]") {
 
     // Damage the value_size field of the entry at byte 65.
     poke_huge_value_size(dir, 76);
+    damaged = data_file_prefix(dir, 153);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    {
-      bytecask::Bytes out;
-      INFO("k0 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k0"), out));
-      CHECK(to_string(out) == "v0");
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 153) == damaged);
     }
-    {
-      bytecask::Bytes out;
-      INFO("k1 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k1"), out));
-      CHECK(to_string(out) == "v1");
-    }
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("b0")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("b1")));
-    assert_consistent(db);
-    fp = fingerprint(db);
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // No cold-open assertion: a value_size damaged this way
+  // reads as the end of written data, which is also what the
+  // unwritten tail of a crashed active file looks like, and a
+  // hint-less file records no committed length to tell the two
+  // apart. resume() can only because the published state knows
+  // the extent. See docs/correctness_validation.md, class M4.
 }
 
 TEST_CASE("prove_corruption__inside_batch__entry_type", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // k0, k1 standalone, then a batch — the corruption lands
@@ -949,8 +758,8 @@ TEST_CASE("prove_corruption__inside_batch__entry_type", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -961,41 +770,29 @@ TEST_CASE("prove_corruption__inside_batch__entry_type", "[prove_corruption]") {
 
     // Damage the entry_type field of the entry at byte 65.
     poke_invalid_entry_type(dir, 73);
+    damaged = data_file_prefix(dir, 153);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    {
-      bytecask::Bytes out;
-      INFO("k0 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k0"), out));
-      CHECK(to_string(out) == "v0");
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 153) == damaged);
     }
-    {
-      bytecask::Bytes out;
-      INFO("k1 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k1"), out));
-      CHECK(to_string(out) == "v1");
-    }
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("b0")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("b1")));
-    assert_consistent(db);
-    fp = fingerprint(db);
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // A cold open reads the same damage and refuses the same way,
+  // under the default fail_recovery_on_crc_errors, without
+  // trimming the file to the point it could parse.
+  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
+  CHECK(data_file_prefix(dir, 153) == damaged);
 }
 
 TEST_CASE("prove_corruption__inside_batch__sequence", "[prove_corruption]") {
   TempDir td;
   auto dir = td.path / "db";
-  bytecask::testing::EngineFingerprint fp;
+  std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
     // k0, k1 standalone, then a batch — the corruption lands
@@ -1011,8 +808,8 @@ TEST_CASE("prove_corruption__inside_batch__sequence", "[prove_corruption]") {
 
     // Every key above was appended, synced and published. The
     // damage lands afterwards, which is what separates this axis
-    // from the syscall-failure ones: the key directory already
-    // points at bytes that are about to stop being readable.
+    // from the syscall-failure ones: it sits inside bytes readers
+    // have already been served, not in a tail nobody saw.
     {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
       REQUIRE_THROWS_AS(
@@ -1023,33 +820,22 @@ TEST_CASE("prove_corruption__inside_batch__sequence", "[prove_corruption]") {
 
     // Damage the sequence field of the entry at byte 65.
     poke_zero_sequence(dir, 65);
+    damaged = data_file_prefix(dir, 153);
 
-    REQUIRE_NOTHROW(db.resume());
-    CHECK_FALSE(db.is_degraded());
-
-    // Below the damage: still there, and still readable. Presence
-    // alone would not discriminate — the key directory survives a
-    // truncation that takes the bytes behind it.
-    {
-      bytecask::Bytes out;
-      INFO("k0 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k0"), out));
-      CHECK(to_string(out) == "v0");
+    // No consistent state to resume into: refuse, twice, and leave
+    // every byte where it was — the published extent and the
+    // unpublished entry after it alike.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      INFO("resume attempt " << attempt);
+      CHECK(resume_refuses_over_damage(db));
+      CHECK(db.is_degraded());
+      CHECK(data_file_prefix(dir, 153) == damaged);
     }
-    {
-      bytecask::Bytes out;
-      INFO("k1 is below the damage and must still read");
-      CHECK(db.get({}, to_bytes("k1"), out));
-      CHECK(to_string(out) == "v1");
-    }
-    // From the damage onward: gone, not dangling.
-    CHECK_FALSE(db.contains_key({}, to_bytes("b0")));
-    CHECK_FALSE(db.contains_key({}, to_bytes("b1")));
-    assert_consistent(db);
-    fp = fingerprint(db);
   }
-  // And a cold open of the damaged file agrees with the resume,
-  // save for how many consumed sequences it can still see: the
-  // damage erased the entries that carried them.
-  assert_matches_recovery(dir, fp, {}, bytecask::testing::NextSeq::RecoveryMayLag);
+  // No cold-open assertion: a sequence damaged this way
+  // reads as the end of written data, which is also what the
+  // unwritten tail of a crashed active file looks like, and a
+  // hint-less file records no committed length to tell the two
+  // apart. resume() can only because the published state knows
+  // the extent. See docs/correctness_validation.md, class M4.
 }

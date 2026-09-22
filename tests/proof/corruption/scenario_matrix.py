@@ -10,6 +10,12 @@
 # whose CRCs hold; degrade_B2 reaches the scan's error branch by construction,
 # but a torn tail is the only position a short write can produce.
 #
+# The contract under test is fail-stop, not recovery. Damage inside bytes that
+# were already published leaves no consistent state to resume into, so the
+# engine promises only to detect it and refuse: resume() throws, stays
+# degraded and truncates nothing. It promises nothing about what the damaged
+# file still holds.
+#
 # The entry layout makes a position addressable without parsing: a data entry
 # is 15 bytes of header, then key, then value, then a 4-byte CRC, and the
 # header is sequence(u64) entry_type(u8) key_size(u16) value_size(u32). With
@@ -39,9 +45,22 @@ class CorruptField(Enum):
     # A zeroed sequence, which the scan already treats as end of file.
     SEQUENCE = "sequence"
 
+    @property
+    def detected_at_open(self) -> bool:
+        """Whether a cold open can tell this damage from the end of the file.
+
+        A CRC mismatch and an invalid entry type fail to parse, and the open
+        refuses. A zeroed sequence and an entry running past the file's end
+        both read as the end of written data — the same thing the unwritten,
+        zero-filled tail of a crashed active file looks like — and a hint-less
+        file records no committed length to tell them apart. resume() can,
+        because the published state knows how far the file was published.
+        """
+        return self in (CorruptField.CRC, CorruptField.ENTRY_TYPE)
+
 
 class Position(Enum):
-    FIRST = "first"      # entry 0 — valid_offset stays 0, everything goes
+    FIRST = "first"      # entry 0 — the scan parses nothing at all
     MIDDLE = "middle"    # entry 2
     LAST = "last"        # entry 5, the final entry
     IN_BATCH = "in_batch"  # an entry between BulkBegin and BulkEnd
@@ -80,25 +99,12 @@ class CorruptionShape:
         return self.corrupt_entry_index * ENTRY_BYTES
 
     @property
-    def surviving_keys(self) -> list:
-        """Keys whose bytes lie entirely below the corruption."""
+    def published_extent(self) -> int:
+        """Bytes published before the damage — what resume() must not cut."""
         if self.position == Position.IN_BATCH:
-            # An incomplete batch is discarded whole, so the scan stops at the
-            # BulkBegin — everything before it survives.
-            return ["k0", "k1"]
-        return [f"k{i}" for i in range(self.corrupt_entry_index)]
-
-    @property
-    def lost_keys(self) -> list:
-        if self.position == Position.IN_BATCH:
-            return ["b0", "b1"]
-        return [f"k{i}" for i in range(self.corrupt_entry_index, 6)]
-
-    @property
-    def valid_offset(self) -> int:
-        if self.position == Position.IN_BATCH:
-            return 2 * ENTRY_BYTES
-        return self.corrupt_entry_index * ENTRY_BYTES
+            # k0, k1, then BulkBegin, b0, b1, BulkEnd.
+            return 4 * ENTRY_BYTES + 2 * MARKER_BYTES
+        return 6 * ENTRY_BYTES
 
 
 CORRUPTION_SHAPES = [

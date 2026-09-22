@@ -2223,36 +2223,6 @@ void TransientEngineState::apply_resume(
     fs.max_sequence = 0;
   });
 
-  // Keys the published state holds in this file whose bytes the truncation is
-  // about to remove. Every other degrade shape truncates only orphaned bytes —
-  // written but never published — so the key directory never referenced them
-  // and replaying was purely additive. Corruption is not like that: an entry
-  // that was appended, synced and published can still fail its CRC later, and
-  // the scan then stops in front of keys the key directory already points at.
-  // Leaving them is not an option in either build: the debug extent check
-  // rejects the resumed state and the engine stays degraded with no retry that
-  // can ever succeed, and without it the next read of such a key preads past
-  // the end of the file. The bytes are gone either way; what resume() owes the
-  // caller is a consistent engine for everything the damage did not reach.
-  std::vector<Key> orphaned;
-  for (auto it = key_dir_.lower_bound(std::span<const std::byte>{});
-       it != std::default_sentinel; ++it) {
-    auto [key_span, entry] = *it;
-    if (entry.file_id() != file_id) continue;
-    const auto end =
-        entry.file_offset() + entry_size(key_span.size(), entry.value_size());
-    if (end > valid_offset) orphaned.emplace_back(key_span);
-  }
-  for (const auto &k : orphaned) {
-    const std::span<const std::byte> key_span{k};
-    if (const auto existing = key_dir_.get(key_span)) {
-      const auto dec = entry_size(key_span.size(), existing->value_size());
-      const auto ef = existing->file_id();
-      file_stats_.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
-    }
-    key_dir_.erase(key_span);
-  }
-
   std::uint64_t max_seq = 0;
   std::uint64_t seq_min = 0;
   std::uint64_t seq_max = 0;
@@ -3751,11 +3721,32 @@ void DB::resume() {
       valid_offset = iter.committed_offset();
       ++iter;
     }
-  } catch (...) {
-    // Only reachable when the very first entry is damaged: past that, the
-    // iterator absorbs the parse failure itself and stops after the last
-    // intact entry, so the loop body above has already recorded the offset.
-    // valid_offset stays 0 here, which is correct — nothing parsed.
+  } catch (const std::system_error &) {
+    // An I/O error says nothing about the bytes — the next attempt may read
+    // them fine. Truncating on it would destroy data over a transient fault.
+    throw;  // stays degraded
+  } catch (const std::runtime_error &) {
+    // The scan stopped at an entry that does not parse. valid_offset is the
+    // end of the last committed entry or batch before it; whether that is
+    // a torn tail to trim or damage to refuse is decided below.
+  }
+
+  // resume() trims what a failed write left behind: bytes appended but never
+  // published. Everything below the published extent was acknowledged, and a
+  // scan that stops short of it has found damage in data readers have
+  // already been served, not a torn tail. There is no consistent state to
+  // resume into from there, so resume() refuses — before truncating, so the
+  // file is left exactly as it was found and the engine stays degraded.
+  // This is detection, not repair: resume() makes no promise about what a
+  // damaged file still holds, only that it will not truncate acknowledged
+  // bytes or report success over them.
+  const auto active_stats = current->file_stats.get(old_file_id);
+  const auto published_extent = active_stats ? active_stats->total_bytes : 0;
+  if (valid_offset < published_extent) {
+    throw std::runtime_error{std::format(
+        "resume: active file '{}' is damaged at offset {}, inside data "
+        "already published (up to {}); refusing to truncate it",
+        file.path().string(), valid_offset, published_extent)};
   }
 
   // Remove garbage bytes / orphaned batch markers via truncation.

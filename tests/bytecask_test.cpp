@@ -1235,6 +1235,80 @@ TEST_CASE("DB recovery: vacuum keeps a data file whose hint was rebuilt",
 }
 
 // ---------------------------------------------------------------------------
+// Damage in a data file is detected and refused, never trimmed around. The
+// scan that indexes a hint-less file at open and the one vacuum copies a
+// sealed file with both stop by throwing: the first entry that fails to parse
+// must not read as the end of the file. If it did, open would truncate the
+// data file to that point and vacuum would publish a copy without the entries
+// after it and unlink the original — each turning one bad entry into the
+// permanent loss of every entry behind it.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB recovery: a damaged hint-less data file refuses to open and is "
+          "not truncated",
+          "[bytecask][recovery][corruption]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  {
+    auto db = bytecask::DB::open(db_path);
+    for (int i = 0; i < 6; ++i)
+      db.put({.sync = true}, to_bytes(std::format("k{}", i)),
+             to_bytes(std::format("v{}", i)));
+  }
+  // A clean close leaves the file that was active at shutdown without a
+  // hint, so the next open has to scan it.
+  REQUIRE(list_hint_files(db_path).empty());
+  std::filesystem::path data;
+  for (const auto &e : std::filesystem::directory_iterator{db_path})
+    if (e.path().extension() == ".data") data = e.path();
+  const auto size_before = std::filesystem::file_size(data);
+
+  // k2's key: 2-byte keys and values make every entry 23 bytes, and the
+  // key starts after the 15-byte header.
+  flip_byte(data, 2 * 23 + 15);
+
+  REQUIRE_THROWS_AS(bytecask::DB::open(db_path), std::runtime_error);
+  CHECK(std::filesystem::file_size(data) == size_before);
+  CHECK(list_hint_files(db_path).empty());
+}
+
+TEST_CASE("DB vacuum: a damaged sealed file is not compacted away",
+          "[bytecask][vacuum][corruption]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  const bytecask::Options opts{.max_file_bytes = 190};
+  std::filesystem::path victim;
+  {
+    auto db = bytecask::DB::open(db_path, opts);
+    for (int i = 0; i < 8; ++i) {
+      db.put({.sync = true}, to_bytes(std::format("a{}", i)),
+             to_bytes(std::format("v{}", i)));
+      // Only one data file exists until the first rotation.
+      if (i == 0)
+        for (const auto &e : std::filesystem::directory_iterator{db_path})
+          if (e.path().extension() == ".data") victim = e.path();
+    }
+    // Overwrite half of them so the first file qualifies for compaction.
+    for (int i = 0; i < 4; ++i)
+      db.put({.sync = true}, to_bytes(std::format("a{}", i)), to_bytes("xx"));
+    REQUIRE(list_hint_files(db_path).size() >= 1);
+
+    const auto size_before = std::filesystem::file_size(victim);
+    flip_byte(victim, 5 * 23 + 15);  // a5's key, a live entry
+
+    CHECK_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.1}),
+                    std::runtime_error);
+    CHECK(std::filesystem::exists(victim));
+    CHECK(std::filesystem::file_size(victim) == size_before);
+  }
+
+  // The entries behind the damaged one are still indexed and still read.
+  auto db = bytecask::DB::open(db_path, opts);
+  CHECK(get_str(db, to_bytes("a4")) == "v4");
+  CHECK(get_str(db, to_bytes("a6")) == "v6");
+  CHECK(get_str(db, to_bytes("a7")) == "v7");
+}
+
+// ---------------------------------------------------------------------------
 // Model-based recovery: random workload with oracle comparison.
 //
 // A random sequence of puts, deletes, overwrites, and batches is applied to
@@ -4871,11 +4945,7 @@ TEST_CASE("apply_resume: empty entries is a no-op",
   auto t = state->transient();
 
   std::vector<bytecask::ResumeEntry> entries;
-  // valid_offset is what the file is about to be truncated to, so it has to
-  // cover k1's entry for this to be a no-op — the file's own total_bytes.
-  // Passing 0 here would say "truncate this file to nothing", and dropping
-  // the key that lives in it is then the correct outcome, not a no-op.
-  t.apply_resume(1, entries, 100);
+  t.apply_resume(1, entries, 0);
 
   auto s = std::move(t).persistent();
   CHECK(s->key_dir.get(to_bytes("k1")).has_value());

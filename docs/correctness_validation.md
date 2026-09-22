@@ -760,58 +760,93 @@ u16, `value_size` u32 — then key, then value, then a 4-byte CRC. With
 crossed with position: first entry, mid-file, last entry, and inside a
 batch between `BulkBegin` and `BulkEnd`.
 
-The delta is the same in every cell, which is what makes the axis cheap:
-everything below the first damaged entry survives and stays **readable**,
-everything from it onward is truncated away, and the engine ends
-non-degraded. Presence is not a sufficient check — the bug this axis
-exists to catch leaves the key directory intact while the bytes behind it
-are gone — so each surviving key is read back by value.
+#### The contract is fail-stop, not recovery
 
 What separates these cells from every other shape in the framework: the
 damaged entry was appended, synced **and published**. Every other degrade
-shape truncates only orphaned bytes, which the key directory never
-referenced, so replay was purely additive. Here the scan stops in front of
-keys the published state already points at.
+shape leaves damage only in bytes a failed write appended and never
+published — a torn tail nobody was served. Here readers were already served
+the bytes that are now wrong, and the engine cannot know what state that
+leaves it in. So it makes no promise about what a damaged file still holds.
+It promises only to stop rather than make the damage worse:
 
-#### Two bugs it found
+- `resume()` throws `std::runtime_error`, stays degraded, and truncates
+  nothing — and does the same on every retry;
+- the data file is byte-for-byte what it was after the damage, including
+  the unpublished entry the failed write appended after it;
+- a cold open under the default `fail_recovery_on_crc_errors` refuses as
+  well, wherever the format lets it see the damage (below), and leaves the
+  file untouched.
 
-**A corrupt entry cost the entry in front of it.** `advance()` set
+The line `resume()` draws is the **published extent** — the active file's
+`total_bytes` in the last published state. `resume()` exists to trim what
+a failed write left behind, which is by construction above that extent. A
+scan that stops below it has found damage in acknowledged data, not a torn
+tail, and truncating there would destroy acknowledged entries and every
+entry behind them. The check runs before the truncation, so a refusal
+leaves the file as it was found. An I/O error during the scan is rethrown
+as-is for the same reason: it says nothing about the bytes, and trimming
+on a transient `EIO` would destroy data over a fault the next attempt may
+not see.
+
+The delta is the same shape in every cell: refuse, stay degraded, touch no
+byte.
+
+#### What a cold open can and cannot see
+
+| Field | `resume()` | Cold open |
+|-------|-----------|-----------|
+| `crc` | refuses | refuses — the entry fails verification |
+| `entry_type` | refuses | refuses — the entry does not parse |
+| `value_size` | refuses | cannot tell it from the end of the file |
+| `sequence` | refuses | cannot tell it from the end of the file |
+
+An entry that claims to run past the end of the file and a zeroed sequence
+both read as the end of written data, which is also what the zero-filled,
+unwritten tail of a crashed active file looks like. A hint-less file
+records no committed length, so a cold open has nothing to tell the two
+apart with and trims the file to the last entry it could parse. `resume()`
+can tell because the published state knows the extent. The `value_size`
+and `sequence` cells therefore assert the `resume()` refusal only; closing
+the gap at open needs the committed length on disk, which is a format
+change.
+
+#### What the axis found
+
+**The scan was one step ahead of what it had yielded.** `advance()` set
 `committed_offset_` to the end of the entry it had just buffered and then
-called `++cur_` to parse the next one. When that threw, the exception left
-`operator++` and discarded the buffered entry with it, so the caller never
-saw an entry that was perfectly intact and below the truncation point. A
-corruption at entry 2 truncated to 23 instead of 46, taking entry 1 with
-it. `step()` now absorbs the parse failure and stops *after* the buffered
-entry, which is also what keeps the entries `resume()` replays and the
-offset it truncates to describing the same prefix — an earlier fix that
-read the offset out of the iterator in the catch block got the offset
-right and left `committed` a prefix short, which showed up as a
-`max_sequence` below a sequence the file still held.
+called `++cur_` to parse the next one before returning. When that threw,
+the exception left the `operator++` that was about to yield the buffered
+entry, so the caller never saw an intact entry below the damage and
+`resume()` placed the damage one entry too early. `CommittedEntryIterator`
+now defers that step to the next advance: the entry after a committed one
+is parsed only when the caller moves past it, so the throw comes out of
+the `operator++` that steps past an entry the caller has already counted.
+Every parse and I/O error still propagates to every caller. An earlier fix
+caught the error inside the iterator and ended the scan there instead.
+That iterator is shared with the scan that indexes a hint-less file at
+open and the one vacuum compacts a sealed file with, and both rely on the
+throw: open truncated the data file to the damage, and vacuum published a
+copy without the entries behind it and unlinked the original. Two cells in
+`bytecask_test.cpp` (`[corruption]`) pin both down.
 
-**`resume()` left the key directory pointing past the end of the file.**
-Nothing pruned published keys whose bytes the truncation removed. In a
-debug build the extent check in `store_state` rejected the resumed state
-and the engine stayed degraded **with no retry that could ever succeed** —
-the committed prefix already truncated away, which is the second #36 bug's
-shape reached through a different door. With `NDEBUG` that check is
-compiled out, so `resume()` reported success and the next read of such a
-key `pread`ed past the end of the file. `apply_resume` now drops them,
-which is all it can do — the bytes are gone either way, and what `resume()`
-owes the caller is a consistent engine for everything the damage did not
-reach.
+**`resume()` could report success over data it had cut.** With the damage
+below the published extent, the old `resume()` truncated to the damage
+while the key directory still pointed at the bytes it removed. A debug
+build's extent check in `store_state` rejected the resumed state and left
+the engine degraded; with `NDEBUG` that check is compiled out, so `resume()`
+reported success and the next read of such a key `pread` past the end of
+the file. Refusing before the truncation closes both: nothing is cut, so
+nothing dangles. Pruning the dangling keys instead was considered and
+rejected — it presents a damaged file as a consistent engine, and a key
+with an older version in a sealed file would then read as absent after
+`resume()` and as the old value after a cold open.
 
-Reverting the pruning fails all 16 cells; reverting the iterator fix fails
-4 — the ones with an intact entry sitting immediately before the damage.
-
-#### One thing the cells deliberately do not require
-
-A cold open may report a lower `next_seq` than the resumed engine. The
-damage erased the entries that carried those sequences, and with them the
-only evidence they were consumed; recovery cannot know what it cannot
-read. `assert_matches_recovery` takes `NextSeq::RecoveryMayLag` for these
-cells and asserts the direction instead — recovery may know fewer consumed
-sequences, never more. Reuse is safe here precisely because the entries
-that held them are gone.
+Reverting the extent check fails all 16 cells. Restoring the catching
+iterator fails the two `[corruption]` cells and the cold-open half of six
+more — `crc` and `entry_type` at every position but the first, where the
+scan throws opening the file, before the iterator takes a step it could
+catch.
 
 ### recovery — 40 tests
 

@@ -309,29 +309,15 @@ inline auto fingerprint(const DB &db) -> EngineFingerprint {
 //
 // The recovered DB opens its own fresh active file, which has no counterpart
 // in `before`; stems absent from the resumed state are therefore skipped.
-// What a cold open may know about consumed sequences.
-enum class NextSeq {
-  Exact,  // the usual case: the file still carries every sequence it used
-  // The damage erased entries, and with them the only evidence that their
-  // sequences were ever consumed. A cold open cannot know what it cannot
-  // read, so it may report less — never more. Reuse is safe here precisely
-  // because the entries that held those sequences are gone.
-  RecoveryMayLag,
-};
-
 inline void assert_matches_recovery(const std::filesystem::path &dir,
                                     const EngineFingerprint &before,
-                                    const Options &opts = {},
-                                    NextSeq next_seq = NextSeq::Exact) {
+                                    const Options &opts = {}) {
   auto recovered = DB::open(dir, opts);
   const auto after = fingerprint(recovered);
 
-  if (next_seq == NextSeq::Exact) {
+  {
     INFO("next_seq must survive recovery");
     CHECK(after.next_seq == before.next_seq);
-  } else {
-    INFO("a cold open may know fewer consumed sequences, never more");
-    CHECK(after.next_seq <= before.next_seq);
   }
 
   for (const auto &[key, value] : before.key_values) {
@@ -425,13 +411,34 @@ inline auto corrupt_newest_hint(const std::filesystem::path &dir) -> bool {
 // (sequence u64, entry_type u8, key_size u16, value_size u32), then key, then
 // value, then a 4-byte CRC.
 
-// Writes `bytes` at `off` in the newest data file.
+// The corruption cells write one data file and damage it. A directory with
+// more than one is refused rather than guessed at: data file names end in a
+// random suffix, so sorting them does not recover creation order.
+inline auto only_data_file(const std::filesystem::path &dir)
+    -> std::filesystem::path {
+  const auto data = sorted_paths(dir, ".data");
+  REQUIRE(data.size() == 1);
+  return data.front();
+}
+
+// The first `n` bytes of the only data file, to prove a refused resume or
+// open left the bytes it refused over exactly as they were.
+inline auto data_file_prefix(const std::filesystem::path &dir, std::size_t n)
+    -> std::vector<char> {
+  std::ifstream f{only_data_file(dir), std::ios::binary};
+  REQUIRE(f);
+  std::vector<char> out(n);
+  f.read(out.data(), static_cast<std::streamsize>(n));
+  REQUIRE(f.gcount() == static_cast<std::streamsize>(n));
+  return out;
+}
+
+// Writes `bytes` at `off` in the only data file.
 inline void poke_active_file(const std::filesystem::path &dir,
                              std::uint64_t off,
                              std::span<const unsigned char> bytes) {
-  const auto data = sorted_paths(dir, ".data");
-  REQUIRE_FALSE(data.empty());
-  std::fstream f{data.back(), std::ios::binary | std::ios::in | std::ios::out};
+  std::fstream f{only_data_file(dir),
+                 std::ios::binary | std::ios::in | std::ios::out};
   REQUIRE(f);
   f.seekp(static_cast<std::streamoff>(off));
   f.write(reinterpret_cast<const char *>(bytes.data()),
@@ -443,18 +450,16 @@ inline void poke_active_file(const std::filesystem::path &dir,
 // Flips every bit of one byte, so the value is guaranteed to change whatever
 // it was.
 inline void flip_byte_at(const std::filesystem::path &dir, std::uint64_t off) {
-  const auto data = sorted_paths(dir, ".data");
-  REQUIRE_FALSE(data.empty());
-  std::fstream f{data.back(), std::ios::binary | std::ios::in | std::ios::out};
-  REQUIRE(f);
-  f.seekg(static_cast<std::streamoff>(off));
-  char b = 0;
-  f.read(&b, 1);
-  b = static_cast<char>(~static_cast<unsigned char>(b));
-  f.seekp(static_cast<std::streamoff>(off));
-  f.write(&b, 1);
-  f.flush();
-  REQUIRE(f);
+  std::array<unsigned char, 1> b{};
+  {
+    std::ifstream f{only_data_file(dir), std::ios::binary};
+    REQUIRE(f);
+    f.seekg(static_cast<std::streamoff>(off));
+    f.read(reinterpret_cast<char *>(b.data()), 1);
+    REQUIRE(f);
+  }
+  b[0] = static_cast<unsigned char>(~b[0]);
+  poke_active_file(dir, off, b);
 }
 
 // A little-endian u32 large enough that the entry it describes ends past any

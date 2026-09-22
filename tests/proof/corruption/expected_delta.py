@@ -3,35 +3,33 @@
 #
 # Reference model for the corruption axis.
 #
-# The delta is the same in every cell, which is what makes the axis cheap to
-# assert: everything below the first damaged entry survives and stays
-# READABLE, everything from it onward is truncated away, and the engine ends
-# non-degraded. Presence is not a sufficient check — the bug this axis exists
-# to catch leaves the key directory intact while the bytes behind it are gone,
-# so each surviving key is read back by value.
+# Damage inside published bytes has no recovery contract: the engine cannot
+# know what state the damage left it in, so it makes no promise about what the
+# file still holds. What it does promise is to stop rather than make the
+# damage worse — resume() refuses, stays degraded and truncates nothing, and a
+# cold open refuses too wherever the format lets it see the damage. The delta
+# is therefore the same shape in every cell.
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
 
-from .scenario_matrix import CorruptField, CorruptionShape
+from .scenario_matrix import ENTRY_BYTES, CorruptField, CorruptionShape
 
 
 @dataclass(frozen=True)
 class CorruptionDelta:
-    keys_present: dict      # key -> value it must still read back as
-    keys_absent: List[str]
-    valid_offset: int       # what the file must be truncated to
-    degraded_after_resume: bool = False
+    # Bytes that must survive every refusal untouched: the published extent,
+    # plus the unpublished entry the failed write appended after it.
+    guarded_bytes: int
+    # Whether the cold open that follows must refuse as well.
+    open_refuses: bool
 
 
 def corruption_delta(
     shape: CorruptionShape, field: CorruptField
 ) -> CorruptionDelta:
-    present = {k: f"v{k[1:]}" for k in shape.surviving_keys}
     return CorruptionDelta(
-        keys_present=present,
-        keys_absent=shape.lost_keys,
-        valid_offset=shape.valid_offset,
+        guarded_bytes=shape.published_extent + ENTRY_BYTES,
+        open_refuses=field.detected_at_open,
     )

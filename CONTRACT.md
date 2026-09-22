@@ -179,6 +179,13 @@ If any I/O operation (append, sync) throws during execution:
   key directory does not reflect those bytes. `resume()` scans the active
   file, truncates garbage, replays valid committed entries, and creates a
   fresh active file, restoring normal operation.
+- Garbage is only ever above the **published extent** — the active file's
+  `total_bytes` in the last published state. Damage below it is not a
+  failed write's leftovers but corruption of acknowledged data, and has no
+  recovery contract: `resume()` throws `std::runtime_error` before
+  truncating anything, the file is left exactly as found, and the engine
+  stays degraded on every retry. An I/O error during the scan is rethrown
+  unchanged rather than read as the end of the file.
 - The DB must remain operational for subsequent calls.
 
 ### Rotation Safety
@@ -627,7 +634,10 @@ two cold paths.
 P is the invariant the mmap read path depends on — see *Offset
 containment* under **View and span lifetimes**. It is checked after
 `resume()` specifically because `resume()` is the operation that
-shortens a file that published offsets point into.
+shortens a file that published offsets point into. It holds in release
+builds too, where this check does not run: `resume()` refuses before
+truncating below the published extent, so it can only ever cut bytes no
+published offset addresses.
 
 On violation: throws `std::runtime_error`. The DB does not open or
 `resume()` fails. This is intentional — if recovery produces
