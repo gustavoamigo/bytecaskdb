@@ -355,7 +355,21 @@ struct WritableFileOps {
   explicit WritableFileOps(Io io) : io_{std::move(io)} {}
 
   int fd_{-1};
-  Offset offset_{0};       // logical end: next append lands here
+  // Logical end: the next append lands here. Written only under write_mu_,
+  // but every point read of the active file loads it (the pool bounds
+  // admission by it, and fetch passes it to every back-end alike), so it is
+  // atomic: relaxed on both sides, since a reader only ever asks for offsets
+  // a published state names and needs an untorn value, not an ordering.
+  std::atomic<Offset> offset_{0};
+  [[nodiscard]] auto logical_end() const noexcept -> Offset {
+    return offset_.load(std::memory_order_relaxed);
+  }
+  void advance(Offset bytes) noexcept {
+    offset_.store(logical_end() + bytes, std::memory_order_relaxed);
+  }
+  void set_logical_end(Offset end) noexcept {
+    offset_.store(end, std::memory_order_relaxed);
+  }
   Offset zeroed_end_{0};   // physical end: zeros written through here
   std::size_t capacity_{0};  // zero-fill never extends past this (0 = off)
   std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc_buf_{};
@@ -367,7 +381,7 @@ struct WritableFileOps {
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_data_file_append);
 #endif
-    const auto entry_offset = offset_;
+    const auto entry_offset = logical_end();
 
     write_header_and_crc(hdr_crc_buf_, sequence, entry_type, key, value);
 
@@ -378,10 +392,10 @@ struct WritableFileOps {
         {hdr_crc_buf_.data() + kHeaderSize, kCrcSize},
     }};
     const auto total = kHeaderSize + key.size() + value.size() + kCrcSize;
-    ensure_zeroed(offset_ + static_cast<Offset>(total));
+    ensure_zeroed(entry_offset + static_cast<Offset>(total));
 
     const auto written = ::pwritev(fd_, iov.data(), std::ssize(iov),
-                                   narrow<off_t>(offset_));
+                                   narrow<off_t>(entry_offset));
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION_POST_WRITE(io_data_file_append_partial,
                                fd_, entry_offset, total);
@@ -391,8 +405,8 @@ struct WritableFileOps {
                               "WritableFileOps::append_entry: pwritev failed"};
     }
 
-    io_.publish(offset_, iov);
-    offset_ += static_cast<Offset>(total);
+    io_.publish(entry_offset, iov);
+    advance(static_cast<Offset>(total));
     return entry_offset;
   }
 
@@ -436,7 +450,7 @@ struct WritableFileOps {
         testing_fault_injection_append(iov, serialized, total_bytes);
 #endif
 
-        offsets_out[base + i] = offset_ + static_cast<Offset>(total_bytes);
+        offsets_out[base + i] = logical_end() + static_cast<Offset>(total_bytes);
 
         write_header_and_crc(hdr_crcs[i], e.sequence, e.entry_type,
                              e.key, e.value);
@@ -455,22 +469,23 @@ struct WritableFileOps {
 #endif
       }
 
-      ensure_zeroed(offset_ + static_cast<Offset>(total_bytes));
+      const auto start = logical_end();
+      ensure_zeroed(start + static_cast<Offset>(total_bytes));
       const auto written =
           ::pwritev(fd_, iov.data(), narrow<int>(chunk_size * kIovecsPerEntry),
-                    narrow<off_t>(offset_));
+                    narrow<off_t>(start));
 
 #ifdef BYTECASK_TESTING
       FAULT_INJECTION_POST_WRITE(io_data_file_append_partial,
-                                 fd_, offset_, total_bytes);
+                                 fd_, start, total_bytes);
 #endif
       if (written != narrow<ssize_t>(total_bytes)) {
         throw std::system_error{errno, std::generic_category(),
                                 "WritableFileOps::append_entries: pwritev failed"};
       }
 
-      io_.publish(offset_, std::span<const ::iovec>{iov});
-      offset_ += static_cast<Offset>(total_bytes);
+      io_.publish(start, std::span<const ::iovec>{iov});
+      advance(static_cast<Offset>(total_bytes));
     }
   }
 
@@ -484,7 +499,7 @@ struct WritableFileOps {
     }
   }
 
-  [[nodiscard]] auto size() const noexcept -> Offset { return offset_; }
+  [[nodiscard]] auto size() const noexcept -> Offset { return logical_end(); }
 
   // Keeps the file zero-filled ahead of the write cursor: before an append
   // ends at write_end, zeros are written from zeroed_end_ up to the next
@@ -532,7 +547,7 @@ struct WritableFileOps {
   // See WritableDataFile::shrink_to_fit. ftruncate + fdatasync: the size
   // change is metadata fdatasync is required to persist.
   void shrink_to_fit() {
-    if (::ftruncate(fd_, narrow<off_t>(offset_)) != 0) {
+    if (::ftruncate(fd_, narrow<off_t>(logical_end())) != 0) {
       throw std::system_error{errno, std::generic_category(),
                               "WritableFileOps::shrink_to_fit: ftruncate failed"};
     }
@@ -540,13 +555,13 @@ struct WritableFileOps {
       throw std::system_error{errno, std::generic_category(),
                               "WritableFileOps::shrink_to_fit: fdatasync failed"};
     }
-    zeroed_end_ = offset_;
+    zeroed_end_ = logical_end();
   }
 
   // Adopts the file's current length as both logical and physical end, and
   // fills the first chunk of a fresh file so its first commits are cheap.
   void adopt(Offset file_size, std::size_t capacity) {
-    offset_ = file_size;
+    set_logical_end(file_size);
     zeroed_end_ = file_size;
     capacity_ = capacity;
     if (file_size == 0 && capacity > 0) ensure_zeroed(1);
@@ -554,7 +569,7 @@ struct WritableFileOps {
 
   [[nodiscard]] auto scan(Offset offset) const
       -> std::optional<std::pair<DataEntry, Offset>> {
-    if (offset + kHeaderSize > offset_) {
+    if (offset + kHeaderSize > logical_end()) {
       return std::nullopt;
     }
     auto header = scan_read_header(offset);
@@ -566,7 +581,7 @@ struct WritableFileOps {
     // ever written to this file is corrupt by inspection: reject it rather
     // than size a read buffer from it. The sealed files bound scan() against
     // their size the same way.
-    if (next > offset_) return std::nullopt;
+    if (next > logical_end()) return std::nullopt;
     std::vector<std::byte> buf;
     auto view = scan_read_entry(offset, header.key_size, header.value_size, buf);
     return std::make_pair(
@@ -621,9 +636,9 @@ private:
         const auto written =
             ::pwritev(fd_, iov_buf.data(),
                       narrow<int>(serialized * kIovecsPerEntry),
-                      narrow<off_t>(offset_));
+                      narrow<off_t>(logical_end()));
         if (written == narrow<ssize_t>(byte_count)) {
-          offset_ += static_cast<Offset>(byte_count);
+          advance(static_cast<Offset>(byte_count));
         }
       }
       throw;
@@ -769,7 +784,7 @@ public:
       throw std::system_error{errno, std::system_category(),
                               "WritableMmapDataFile::truncate"};
     }
-    ops_.offset_ = new_size;
+    ops_.set_logical_end(new_size);
     ops_.zeroed_end_ = new_size;
     set_mmap_end(new_size);
   }
@@ -941,7 +956,7 @@ public:
                   std::vector<std::byte> &out) const override {
     if constexpr (Io::kResident) {
       if (ops_.io_.read_value(offset, key_size, value_size, verify,
-                              ops_.offset_, out)) {
+                              ops_.logical_end(), out)) {
         return;
       }
     }
@@ -960,7 +975,7 @@ public:
                                 FrameLease &lease) const
       -> DataEntryView override {
     if constexpr (Io::kResident) {
-      if (auto lent = ops_.io_.lend(offset, value_size, verify, ops_.offset_,
+      if (auto lent = ops_.io_.lend(offset, value_size, verify, ops_.logical_end(),
                                     lease)) {
         return *lent;
       }
@@ -1028,7 +1043,7 @@ public:
       throw std::system_error{errno, std::system_category(),
                               "WritablePosixFile::truncate"};
     }
-    ops_.offset_ = new_size;
+    ops_.set_logical_end(new_size);
     ops_.zeroed_end_ = new_size;
   }
 
@@ -1058,7 +1073,7 @@ private:
   // Point reads of the active file, answered by the back-end's policy. Its
   // logical end moves with every append, so it is passed per call.
   void fetch(Offset offset, std::size_t len, std::byte *dst) const {
-    ops_.io_.fetch(ops_.fd_, offset, len, ops_.offset_, dst);
+    ops_.io_.fetch(ops_.fd_, offset, len, ops_.logical_end(), dst);
   }
 
   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
