@@ -15,6 +15,15 @@
 # column) as it happens, so a plot can overlay both series, and Ctrl-C at any
 # point still leaves whatever samples were already collected.
 #
+# Each sample also records write_mib (block-layer bytes written during that
+# interval, from the instance's cgroup io.stat) and eng_write_mib (what the
+# engine itself reports writing). Plotted against elapsed_s these show write
+# amplification developing: as updates spread over more pages than the buffer
+# pool can keep coalescing, an in-place engine's bytes per transaction climb
+# while an append-only one's stay flat. A single end-of-run total hides that.
+# eng_write_mib is partial on both sides — see the note on engine_counters in
+# lib_common.sh — so compare write_mib across engines, not the ratio.
+#
 # Prerequisites: same as run-sysbench.sh (plugin buildable, mariadbd +
 # mariadb-install-db + sysbench on PATH).
 #
@@ -148,9 +157,12 @@ cleanup() {
   # actually stop a running sysbench (a very likely scenario for a
   # multi-hour run started under nohup/tmux). Kill it directly first.
   [[ -n "$SYSBENCH_PID" ]] && kill "$SYSBENCH_PID" 2>/dev/null
-  stop_mariadbd "$BYTECASKDB_DIR/mariadbd.pid" "$BYTECASKDB_DIR"
-  stop_mariadbd "$INNODB_DIR/mariadbd.pid" "$INNODB_DIR"
-  stop_mariadbd "$ROCKSDB_DIR/mariadbd.pid" "$ROCKSDB_DIR"
+  stop_mariadbd "${BYTECASKDB_DIR}/mariadbd.pid"
+  remove_instance "${BYTECASKDB_DIR}"
+  stop_mariadbd "${INNODB_DIR}/mariadbd.pid"
+  remove_instance "${INNODB_DIR}"
+  stop_mariadbd "${ROCKSDB_DIR}/mariadbd.pid"
+  remove_instance "${ROCKSDB_DIR}"
 }
 # A plain `trap cleanup INT TERM` would run cleanup() then bash resumes the
 # script right after the interrupted command (e.g. moving on to the next
@@ -176,6 +188,9 @@ parse_report_line() {
 # ---------------------------------------------------------------------------
 run_longbench() {
   local engine="$1" port="$2" socket="$3" storage_engine="$4"
+  local dir pid_file
+  dir="$(dirname "$socket")"
+  pid_file="$dir/mariadbd.pid"
 
   echo "--- Preparing $TABLE_SIZE rows on $engine (this can take a while for large tables) ---"
   local conn_args
@@ -197,15 +212,29 @@ run_longbench() {
   stdbuf -oL sysbench "$WORKLOAD" $conn_args \
     --time="$DURATION" --report-interval="$REPORT_INTERVAL" \
     --mysql-ignore-errors=1180,1213 run > >(
+    # Bytes are sampled per report interval, not once at the end: the point of
+    # a long run is watching write amplification build as updates spread over
+    # more pages than the buffer pool can keep coalescing. A single total
+    # flattens exactly that.
+    local io_prev eng_prev
+    io_prev="$(io_sample "$pid_file")"
+    eng_prev="$(engine_counters "$engine" "$socket")"
     while IFS= read -r line; do
       local row
       row="$(echo "$line" | parse_report_line)"
       if [[ -n "$row" ]]; then
         local ts; ts="$(date -u +%FT%TZ)"
-        echo "$ts,$engine,$WORKLOAD,$THREADS,$row" >> "$RESULTS_CSV"
+        local io_now eng_now w_mib e_mib
+        io_now="$(io_sample "$pid_file")"
+        eng_now="$(engine_counters "$engine" "$socket")"
+        w_mib="$(io_delta "$io_prev" "$io_now" | cut -d, -f2)"
+        e_mib="$(eng_delta "$eng_prev" "$eng_now" | cut -d, -f1)"
+        io_prev="$io_now"
+        eng_prev="$eng_now"
+        echo "$ts,$engine,$WORKLOAD,$THREADS,$row,$w_mib,$e_mib" >> "$RESULTS_CSV"
         # elapsed_s is the row's first field — echo a compact live progress line.
         local elapsed="${row%%,*}"
-        echo "  [$engine] ${elapsed}s / ${DURATION}s : $line"
+        echo "  [$engine] ${elapsed}s / ${DURATION}s : $line | wrote ${w_mib} MiB"
       else
         echo "  [$engine] $line"
       fi
@@ -229,44 +258,52 @@ echo "    Data root: $DATA_ROOT"
 echo ""
 
 # Append across runs so a long-run history accumulates; the timestamp column
-# separates runs. The header is written only when the file is new.
+# separates runs. The header is written only when the file is new — a CSV from
+# before write_mib/eng_write_mib existed keeps its old header, so start a new
+# file (or --out) rather than mixing column counts.
 if [[ ! -s "$RESULTS_CSV" ]]; then
-  echo "timestamp,engine,workload,threads,elapsed_s,report_threads,tps,qps,lat95_ms,err_per_s" > "$RESULTS_CSV"
+  echo "timestamp,engine,workload,threads,elapsed_s,report_threads,tps,qps,lat95_ms,err_per_s,write_mib,eng_write_mib" > "$RESULTS_CSV"
 fi
 
 if engine_enabled bytecaskdb; then
   echo "=== Starting ByteCaskDB MariaDB instance (port $BYTECASKDB_PORT) ==="
   symlink_providers "$PLUGIN_DIR"
+  init_datadir "${BYTECASKDB_DIR}/data"
   start_mariadbd \
-    "$BYTECASKDB_DIR/data" "$BYTECASKDB_DIR/mysql.sock" "$BYTECASKDB_PORT" \
+    "${BYTECASKDB_DIR}/data" "$BYTECASKDB_DIR/mysql.sock" "$BYTECASKDB_PORT" \
     "$BYTECASKDB_DIR/mariadbd.pid" "$BYTECASKDB_DIR/error.log" \
     "$SCRIPT_DIR/bytecaskdb.cnf" \
     --plugin-dir="$PLUGIN_DIR" --plugin-load-add=bytecaskdb=ha_bytecaskdb.so
   run_longbench bytecaskdb "$BYTECASKDB_PORT" "$BYTECASKDB_DIR/mysql.sock" bytecaskdb
-  stop_mariadbd "$BYTECASKDB_DIR/mariadbd.pid" "$BYTECASKDB_DIR"
+  stop_mariadbd "${BYTECASKDB_DIR}/mariadbd.pid"
+  remove_instance "${BYTECASKDB_DIR}"
   echo ""
 fi
 
 if engine_enabled innodb; then
   echo "=== Starting InnoDB MariaDB instance (port $INNODB_PORT) ==="
+  init_datadir "${INNODB_DIR}/data"
   start_mariadbd \
-    "$INNODB_DIR/data" "$INNODB_DIR/mysql.sock" "$INNODB_PORT" \
+    "${INNODB_DIR}/data" "$INNODB_DIR/mysql.sock" "$INNODB_PORT" \
     "$INNODB_DIR/mariadbd.pid" "$INNODB_DIR/error.log" \
     "$SCRIPT_DIR/innodb.cnf"
   run_longbench innodb "$INNODB_PORT" "$INNODB_DIR/mysql.sock" innodb
-  stop_mariadbd "$INNODB_DIR/mariadbd.pid" "$INNODB_DIR"
+  stop_mariadbd "${INNODB_DIR}/mariadbd.pid"
+  remove_instance "${INNODB_DIR}"
   echo ""
 fi
 
 if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
   echo "=== Starting RocksDB MariaDB instance (port $ROCKSDB_PORT) ==="
+  init_datadir "${ROCKSDB_DIR}/data"
   start_mariadbd \
-    "$ROCKSDB_DIR/data" "$ROCKSDB_DIR/mysql.sock" "$ROCKSDB_PORT" \
+    "${ROCKSDB_DIR}/data" "$ROCKSDB_DIR/mysql.sock" "$ROCKSDB_PORT" \
     "$ROCKSDB_DIR/mariadbd.pid" "$ROCKSDB_DIR/error.log" \
     "$SCRIPT_DIR/rocksdb.cnf" \
     --plugin-load-add=rocksdb=ha_rocksdb.so --plugin-dir="$ROCKSDB_PLUGIN_DIR"
   run_longbench rocksdb "$ROCKSDB_PORT" "$ROCKSDB_DIR/mysql.sock" rocksdb
-  stop_mariadbd "$ROCKSDB_DIR/mariadbd.pid" "$ROCKSDB_DIR"
+  stop_mariadbd "${ROCKSDB_DIR}/mariadbd.pid"
+  remove_instance "${ROCKSDB_DIR}"
   echo ""
 fi
 
