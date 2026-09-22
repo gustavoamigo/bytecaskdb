@@ -23,6 +23,7 @@ namespace {
 using bytecask::testing::assert_consistent;
 using bytecask::testing::assert_keys_recoverable;
 using bytecask::testing::to_bytes;
+using bytecask::testing::to_string;
 
 struct TempDir {
   std::filesystem::path path;
@@ -62,11 +63,21 @@ TEST_CASE("prove_resume__degrade_H__success", "[prove_resume]") {
     // resume() succeeds on first attempt.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 TEST_CASE("prove_resume__degrade_H__file_creation_fails", "[prove_resume]") {
@@ -94,11 +105,21 @@ TEST_CASE("prove_resume__degrade_H__file_creation_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 TEST_CASE("prove_resume__degrade_H__double_resume", "[prove_resume]") {
@@ -119,18 +140,38 @@ TEST_CASE("prove_resume__degrade_H__double_resume", "[prove_resume]") {
     // First resume() succeeds.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
 
     // Second resume() is a no-op — engine already healthy.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 TEST_CASE("prove_resume__degrade_C__success", "[prove_resume]") {
@@ -156,12 +197,17 @@ TEST_CASE("prove_resume__degrade_C__success", "[prove_resume]") {
     // resume() succeeds on first attempt.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
 }
 
 TEST_CASE("prove_resume__degrade_C__truncate_fails", "[prove_resume]") {
@@ -194,12 +240,17 @@ TEST_CASE("prove_resume__degrade_C__truncate_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
 }
 
 TEST_CASE("prove_resume__degrade_C__sync_fails", "[prove_resume]") {
@@ -232,12 +283,17 @@ TEST_CASE("prove_resume__degrade_C__sync_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
 }
 
 TEST_CASE("prove_resume__degrade_C__file_creation_fails", "[prove_resume]") {
@@ -270,12 +326,17 @@ TEST_CASE("prove_resume__degrade_C__file_creation_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
 }
 
 TEST_CASE("prove_resume__degrade_C__double_resume", "[prove_resume]") {
@@ -301,7 +362,12 @@ TEST_CASE("prove_resume__degrade_C__double_resume", "[prove_resume]") {
     // First resume() succeeds.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
@@ -309,12 +375,17 @@ TEST_CASE("prove_resume__degrade_C__double_resume", "[prove_resume]") {
     // Second resume() is a no-op — engine already healthy.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
 }
 
 TEST_CASE("prove_resume__degrade_C__cascade_r2_r3", "[prove_resume]") {
@@ -354,12 +425,17 @@ TEST_CASE("prove_resume__degrade_C__cascade_r2_r3", "[prove_resume]") {
     // Phase 4: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
 }
 
 TEST_CASE("prove_resume__degrade_F__success", "[prove_resume]") {
@@ -381,11 +457,21 @@ TEST_CASE("prove_resume__degrade_F__success", "[prove_resume]") {
     // resume() succeeds on first attempt.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 TEST_CASE("prove_resume__degrade_F__sync_fails", "[prove_resume]") {
@@ -414,11 +500,21 @@ TEST_CASE("prove_resume__degrade_F__sync_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 TEST_CASE("prove_resume__degrade_F__file_creation_fails", "[prove_resume]") {
@@ -447,11 +543,21 @@ TEST_CASE("prove_resume__degrade_F__file_creation_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 TEST_CASE("prove_resume__degrade_F__double_resume", "[prove_resume]") {
@@ -473,18 +579,38 @@ TEST_CASE("prove_resume__degrade_F__double_resume", "[prove_resume]") {
     // First resume() succeeds.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
 
     // Second resume() is a no-op — engine already healthy.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 TEST_CASE("prove_resume__degrade_F__cascade_r2_r3", "[prove_resume]") {
@@ -520,11 +646,21 @@ TEST_CASE("prove_resume__degrade_F__cascade_r2_r3", "[prove_resume]") {
     // Phase 4: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 TEST_CASE("prove_resume__degrade_G__success", "[prove_resume]") {
@@ -546,11 +682,21 @@ TEST_CASE("prove_resume__degrade_G__success", "[prove_resume]") {
     // resume() succeeds on first attempt.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 TEST_CASE("prove_resume__degrade_G__sync_fails", "[prove_resume]") {
@@ -579,11 +725,21 @@ TEST_CASE("prove_resume__degrade_G__sync_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 TEST_CASE("prove_resume__degrade_G__file_creation_fails", "[prove_resume]") {
@@ -612,11 +768,21 @@ TEST_CASE("prove_resume__degrade_G__file_creation_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 TEST_CASE("prove_resume__degrade_G__double_resume", "[prove_resume]") {
@@ -638,18 +804,38 @@ TEST_CASE("prove_resume__degrade_G__double_resume", "[prove_resume]") {
     // First resume() succeeds.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
 
     // Second resume() is a no-op — engine already healthy.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 TEST_CASE("prove_resume__degrade_G__cascade_r2_r3", "[prove_resume]") {
@@ -685,11 +871,21 @@ TEST_CASE("prove_resume__degrade_G__cascade_r2_r3", "[prove_resume]") {
     // Phase 4: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
 }
 
 #ifndef __EMSCRIPTEN__
@@ -711,11 +907,21 @@ TEST_CASE("prove_resume__degrade_H_mmap__success", "[prove_resume]") {
     // resume() succeeds on first attempt.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -745,11 +951,21 @@ TEST_CASE("prove_resume__degrade_H_mmap__file_creation_fails", "[prove_resume]")
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -772,18 +988,38 @@ TEST_CASE("prove_resume__degrade_H_mmap__double_resume", "[prove_resume]") {
     // First resume() succeeds.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
 
     // Second resume() is a no-op — engine already healthy.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -811,12 +1047,17 @@ TEST_CASE("prove_resume__degrade_C_mmap__success", "[prove_resume]") {
     // resume() succeeds on first attempt.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -851,12 +1092,17 @@ TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -891,12 +1137,17 @@ TEST_CASE("prove_resume__degrade_C_mmap__sync_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -931,12 +1182,17 @@ TEST_CASE("prove_resume__degrade_C_mmap__file_creation_fails", "[prove_resume]")
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -964,7 +1220,12 @@ TEST_CASE("prove_resume__degrade_C_mmap__double_resume", "[prove_resume]") {
     // First resume() succeeds.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
@@ -972,12 +1233,17 @@ TEST_CASE("prove_resume__degrade_C_mmap__double_resume", "[prove_resume]") {
     // Second resume() is a no-op — engine already healthy.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1019,12 +1285,17 @@ TEST_CASE("prove_resume__degrade_C_mmap__cascade_r2_r3", "[prove_resume]") {
     // Phase 4: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1047,11 +1318,21 @@ TEST_CASE("prove_resume__degrade_H_pool__success", "[prove_resume]") {
     // resume() succeeds on first attempt.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1081,11 +1362,21 @@ TEST_CASE("prove_resume__degrade_H_pool__file_creation_fails", "[prove_resume]")
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1108,18 +1399,38 @@ TEST_CASE("prove_resume__degrade_H_pool__double_resume", "[prove_resume]") {
     // First resume() succeeds.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
 
     // Second resume() is a no-op — engine already healthy.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
-    CHECK(db.contains_key({}, to_bytes("p0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: p0");
+      CHECK(db.get({}, to_bytes("p0"), out));
+      CHECK(to_string(out) == "new0");
+    }
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0", "p0"}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1147,12 +1458,17 @@ TEST_CASE("prove_resume__degrade_C_pool__success", "[prove_resume]") {
     // resume() succeeds on first attempt.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1187,12 +1503,17 @@ TEST_CASE("prove_resume__degrade_C_pool__truncate_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1227,12 +1548,17 @@ TEST_CASE("prove_resume__degrade_C_pool__sync_fails", "[prove_resume]") {
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1267,12 +1593,17 @@ TEST_CASE("prove_resume__degrade_C_pool__file_creation_fails", "[prove_resume]")
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1300,7 +1631,12 @@ TEST_CASE("prove_resume__degrade_C_pool__double_resume", "[prove_resume]") {
     // First resume() succeeds.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
@@ -1308,12 +1644,17 @@ TEST_CASE("prove_resume__degrade_C_pool__double_resume", "[prove_resume]") {
     // Second resume() is a no-op — engine already healthy.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1355,11 +1696,715 @@ TEST_CASE("prove_resume__degrade_C_pool__cascade_r2_r3", "[prove_resume]") {
     // Phase 4: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());
     REQUIRE_FALSE(db.is_degraded());
-    CHECK(db.contains_key({}, to_bytes("k0")));
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
     CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
     CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
     assert_consistent(db);
   }
-  assert_keys_recoverable(dir, {"k0"}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
+
+TEST_CASE("prove_resume__degrade_B2__success", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_B2: k0 committed; p0's writev returns short,
+    // leaving a torn trailing entry whose CRC cannot hold. This is the
+    // one on-disk state that is genuinely malformed rather than merely
+    // orphaned — resume()'s scan stops on it.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // resume() succeeds on first attempt.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+}
+
+TEST_CASE("prove_resume__degrade_B2__truncate_fails", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_B2: k0 committed; p0's writev returns short,
+    // leaving a torn trailing entry whose CRC cannot hold. This is the
+    // one on-disk state that is genuinely malformed rather than merely
+    // orphaned — resume()'s scan stops on it.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject resume fault → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_truncate"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+}
+
+TEST_CASE("prove_resume__degrade_B2__sync_fails", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_B2: k0 committed; p0's writev returns short,
+    // leaving a torn trailing entry whose CRC cannot hold. This is the
+    // one on-disk state that is genuinely malformed rather than merely
+    // orphaned — resume()'s scan stops on it.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject resume fault → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_sync"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+}
+
+TEST_CASE("prove_resume__degrade_B2__file_creation_fails", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_B2: k0 committed; p0's writev returns short,
+    // leaving a torn trailing entry whose CRC cannot hold. This is the
+    // one on-disk state that is genuinely malformed rather than merely
+    // orphaned — resume()'s scan stops on it.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject resume fault → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_file_creation"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+}
+
+TEST_CASE("prove_resume__degrade_B2__double_resume", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_B2: k0 committed; p0's writev returns short,
+    // leaving a torn trailing entry whose CRC cannot hold. This is the
+    // one on-disk state that is genuinely malformed rather than merely
+    // orphaned — resume()'s scan stops on it.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // First resume() succeeds.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+
+    // Second resume() is a no-op — engine already healthy.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+}
+
+TEST_CASE("prove_resume__degrade_B2__cascade_r2_r3", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_B2: k0 committed; p0's writev returns short,
+    // leaving a torn trailing entry whose CRC cannot hold. This is the
+    // one on-disk state that is genuinely malformed rather than merely
+    // orphaned — resume()'s scan stops on it.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject io_resume_sync → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_sync"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: inject io_resume_file_creation → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_file_creation"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 4: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+}
+
+TEST_CASE("prove_resume__degrade_B3__success", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_B3: k0 committed; p0's writev wrote every byte
+    // and then returned an error. The entry is structurally complete on
+    // disk, but offset_ never advanced, so it sits past the file's
+    // committed offset.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // resume() succeeds on first attempt.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+}
+
+TEST_CASE("prove_resume__degrade_B3__truncate_fails", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_B3: k0 committed; p0's writev wrote every byte
+    // and then returned an error. The entry is structurally complete on
+    // disk, but offset_ never advanced, so it sits past the file's
+    // committed offset.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject resume fault → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_truncate"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+}
+
+TEST_CASE("prove_resume__degrade_B3__sync_fails", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_B3: k0 committed; p0's writev wrote every byte
+    // and then returned an error. The entry is structurally complete on
+    // disk, but offset_ never advanced, so it sits past the file's
+    // committed offset.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject resume fault → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_sync"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+}
+
+TEST_CASE("prove_resume__degrade_B3__file_creation_fails", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_B3: k0 committed; p0's writev wrote every byte
+    // and then returned an error. The entry is structurally complete on
+    // disk, but offset_ never advanced, so it sits past the file's
+    // committed offset.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject resume fault → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_file_creation"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+}
+
+TEST_CASE("prove_resume__degrade_B3__double_resume", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_B3: k0 committed; p0's writev wrote every byte
+    // and then returned an error. The entry is structurally complete on
+    // disk, but offset_ never advanced, so it sits past the file's
+    // committed offset.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // First resume() succeeds.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+
+    // Second resume() is a no-op — engine already healthy.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+}
+
+TEST_CASE("prove_resume__degrade_B3__cascade_r2_r3", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_B3: k0 committed; p0's writev wrote every byte
+    // and then returned an error. The entry is structurally complete on
+    // disk, but offset_ never advanced, so it sits past the file's
+    // committed offset.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject io_resume_sync → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_sync"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: inject io_resume_file_creation → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_file_creation"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 4: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+}
+
+TEST_CASE("prove_resume__degrade_F_range__success", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_F_range: k0 and k1 committed (sync=false); a
+    // del_range over [k, l) is appended but its commit sync fails. The
+    // range tombstone is on disk and the key directory was never told, so
+    // resume() has to replay it — and replaying a range tombstone means
+    // applying it, not just stepping over it.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    {
+      bytecask::testing::ScopedFaultInjector fi_degrade{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.del_range({.sync = true}, to_bytes("k"), to_bytes("l")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // resume() succeeds on first attempt.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK_FALSE(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {}, {"k0", "k1"});
+}
+
+TEST_CASE("prove_resume__degrade_F_range__sync_fails", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_F_range: k0 and k1 committed (sync=false); a
+    // del_range over [k, l) is appended but its commit sync fails. The
+    // range tombstone is on disk and the key directory was never told, so
+    // resume() has to replay it — and replaying a range tombstone means
+    // applying it, not just stepping over it.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    {
+      bytecask::testing::ScopedFaultInjector fi_degrade{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.del_range({.sync = true}, to_bytes("k"), to_bytes("l")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject resume fault → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_sync"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK_FALSE(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {}, {"k0", "k1"});
+}
+
+TEST_CASE("prove_resume__degrade_F_range__file_creation_fails", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_F_range: k0 and k1 committed (sync=false); a
+    // del_range over [k, l) is appended but its commit sync fails. The
+    // range tombstone is on disk and the key directory was never told, so
+    // resume() has to replay it — and replaying a range tombstone means
+    // applying it, not just stepping over it.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    {
+      bytecask::testing::ScopedFaultInjector fi_degrade{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.del_range({.sync = true}, to_bytes("k"), to_bytes("l")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject resume fault → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_file_creation"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK_FALSE(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {}, {"k0", "k1"});
+}
+
+TEST_CASE("prove_resume__degrade_F_range__double_resume", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_F_range: k0 and k1 committed (sync=false); a
+    // del_range over [k, l) is appended but its commit sync fails. The
+    // range tombstone is on disk and the key directory was never told, so
+    // resume() has to replay it — and replaying a range tombstone means
+    // applying it, not just stepping over it.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    {
+      bytecask::testing::ScopedFaultInjector fi_degrade{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.del_range({.sync = true}, to_bytes("k"), to_bytes("l")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // First resume() succeeds.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK_FALSE(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+    assert_consistent(db);
+
+    // Second resume() is a no-op — engine already healthy.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK_FALSE(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {}, {"k0", "k1"});
+}
+
+TEST_CASE("prove_resume__degrade_F_range__cascade_r2_r3", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    // Establish degrade_F_range: k0 and k1 committed (sync=false); a
+    // del_range over [k, l) is appended but its commit sync fails. The
+    // range tombstone is on disk and the key directory was never told, so
+    // resume() has to replay it — and replaying a range tombstone means
+    // applying it, not just stepping over it.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    {
+      bytecask::testing::ScopedFaultInjector fi_degrade{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.del_range({.sync = true}, to_bytes("k"), to_bytes("l")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: inject io_resume_sync → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_sync"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 3: inject io_resume_file_creation → resume() throws, stays degraded.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{"io_resume_file_creation"};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 4: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    CHECK_FALSE(db.contains_key({}, to_bytes("k0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+    assert_consistent(db);
+  }
+  assert_keys_recoverable(dir, {}, {"k0", "k1"});
+}

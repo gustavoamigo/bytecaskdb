@@ -2232,7 +2232,8 @@ void TransientEngineState::apply_resume(
     if (seq_min == 0 || e.sequence < seq_min) seq_min = e.sequence;
     if (e.sequence > seq_max) seq_max = e.sequence;
 
-    if (e.entry_type == EntryType::Put) {
+    switch (e.entry_type) {
+    case EntryType::Put: {
       const auto existing = key_dir_.get(key_span);
       if (!existing || existing->sequence() < e.sequence) {
         if (existing) {
@@ -2248,7 +2249,9 @@ void TransientEngineState::apply_resume(
                      KeyDirEntry::make(e.sequence, e.file_offset, file_id,
                                        e.value_size));
       }
-    } else if (e.entry_type == EntryType::Delete) {
+      break;
+    }
+    case EntryType::Delete: {
       const auto existing = key_dir_.get(key_span);
       if (existing && existing->sequence() < e.sequence) {
         const auto dec = entry_size(key_span.size(), existing->value_size());
@@ -2256,6 +2259,35 @@ void TransientEngineState::apply_resume(
         file_stats_.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
         key_dir_.erase(key_span);
       }
+      break;
+    }
+    case EntryType::RangeDel: {
+      // Same suppression rule recovery applies when it replays a range
+      // tombstone from a hint file: erase every key in [from, to) carrying a
+      // lower sequence. Skipping it here would leave the resumed key
+      // directory holding keys a fresh open would not — the one divergence
+      // resume() exists to prevent.
+      const Key end{std::span<const std::byte>{e.range_end}};
+      std::vector<Key> to_erase;
+      for (auto it = key_dir_.lower_bound(key_span);
+           it != std::default_sentinel; ++it) {
+        auto [k, entry] = *it;
+        if (Key{k} >= end) break;
+        if (entry.sequence() >= e.sequence) continue;
+        const auto dec = entry_size(k.size(), entry.value_size());
+        const auto ef = entry.file_id();
+        file_stats_.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+        to_erase.emplace_back(k);
+      }
+      for (const auto &k : to_erase)
+        key_dir_.erase(std::span<const std::byte>{k});
+      break;
+    }
+    case EntryType::BulkBegin:
+    case EntryType::BulkEnd:
+      // resume()'s scan never collects markers — they carry no key directory
+      // effect, and an orphaned pair is truncated rather than replayed.
+      break;
     }
   }
 
@@ -3656,9 +3688,16 @@ void DB::resume() {
       const auto &[entry, entry_off] = *iter;
       if (entry.entry_type != EntryType::BulkBegin &&
           entry.entry_type != EntryType::BulkEnd) {
+        // A range tombstone carries its exclusive upper bound in the value,
+        // and apply_resume needs both bounds to suppress the range.
+        auto range_end = entry.entry_type == EntryType::RangeDel
+                             ? std::vector<std::byte>{entry.value.begin(),
+                                                      entry.value.end()}
+                             : std::vector<std::byte>{};
         committed.push_back({entry.sequence, entry.entry_type, entry_off,
                              narrow<std::uint32_t>(entry.value.size()),
-                             entry.key});
+                             {entry.key.begin(), entry.key.end()},
+                             std::move(range_end)});
       }
       // Every entry yielded lies below the iterator's committed offset, so
       // recording it here keeps valid_offset in step with `committed` even

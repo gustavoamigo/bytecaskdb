@@ -247,17 +247,24 @@ inline void assert_recoverable(const std::filesystem::path &dir,
   assert_consistent(recovered);
 }
 
-// Opens a fresh DB and verifies that specific keys are present/absent.
-// Used by resume and vacuum proof tests for recovery validation.
+// Opens a fresh DB and verifies that specific keys recover with the values
+// they are owed, and that specific others are absent. Used by the resume
+// proof tests.
+//
+// Present keys are read with get(), not contains_key(): a truncation that cut
+// too far leaves the key directory intact while the bytes behind it are gone,
+// which is how the BC-036 bug stayed invisible to a test named for it.
 inline void assert_keys_recoverable(
     const std::filesystem::path &dir,
-    const std::vector<std::string> &keys_present,
+    const std::map<std::string, std::string> &keys_present,
     const std::vector<std::string> &keys_absent = {},
     const Options &opts = {}) {
   auto recovered = DB::open(dir, opts);
-  for (const auto &key : keys_present) {
-    INFO("key must be present after recovery: " << key);
-    CHECK(recovered.contains_key({}, to_bytes(key)));
+  for (const auto &[key, value] : keys_present) {
+    INFO("key must recover with its value: " << key);
+    Bytes out;
+    CHECK(recovered.get({}, to_bytes(key), out));
+    CHECK(to_string(out) == value);
   }
   for (const auto &key : keys_absent) {
     INFO("key must be absent after recovery: " << key);
@@ -272,9 +279,26 @@ inline void assert_keys_recoverable(
 struct VacuumBaseline {
   Baseline keys;
   std::map<std::uint32_t, FileStats> file_stats;  // pre-vacuum per-file stats
+  std::map<EntryType, int> structural;            // marker / tombstone counts
 };
 
-// Captures key-values, next_seq, and per-file stats for vacuum tests.
+// Counts the entries that carry no key data of their own: the BulkBegin and
+// BulkEnd markers that make a batch atomic on disk, and range tombstones.
+// Compaction must preserve all three, and no key-and-value assertion can see
+// it when a retried compaction drops one.
+inline auto count_structural_entries(const DB &db) -> std::map<EntryType, int> {
+  std::map<EntryType, int> counts{{EntryType::BulkBegin, 0},
+                                  {EntryType::BulkEnd, 0},
+                                  {EntryType::RangeDel, 0}};
+  auto snap = db.snapshot();
+  for (const auto &e : db.changes_since(snap, 0)) {
+    auto it = counts.find(e.entry_type);
+    if (it != counts.end()) ++it->second;
+  }
+  return counts;
+}
+
+// Captures key-values, next_seq, per-file stats and structural entry counts.
 inline auto capture_vacuum_baseline(const DB &db) -> VacuumBaseline {
   VacuumBaseline bl;
   bl.keys = capture_baseline(db);
@@ -282,7 +306,21 @@ inline auto capture_vacuum_baseline(const DB &db) -> VacuumBaseline {
   for (const auto [file_id, fs] : state->file_stats) {
     bl.file_stats.emplace(file_id, fs);
   }
+  bl.structural = count_structural_entries(db);
   return bl;
+}
+
+// Every batch marker and range tombstone the DB held before the vacuum is
+// still there afterwards. Holds on both outcomes: a successful compaction
+// copies them into the new file, and a failed one leaves the old file alone.
+inline void assert_structural_entries_preserved(const DB &db,
+                                                const VacuumBaseline &before) {
+  const auto now = count_structural_entries(db);
+  for (const auto &[type, count] : before.structural) {
+    INFO("structural entry type " << static_cast<int>(type)
+                                  << " must survive vacuum");
+    CHECK(now.at(type) == count);
+  }
 }
 
 // Returns the file_id of the sealed file vacuum() would select — the one with
@@ -337,6 +375,7 @@ inline void assert_vacuum_success(const DB &db, const VacuumBaseline &before,
   INFO("active file total_bytes staleness check");
   CHECK(state->file_stats.get(active_id)->total_bytes == actual_size);
 
+  assert_structural_entries_preserved(db, before);
   assert_consistent(db);
 }
 
@@ -382,6 +421,7 @@ inline void assert_vacuum_no_change(const DB &db, const VacuumBaseline &before,
   INFO("active file total_bytes staleness check after failed vacuum");
   CHECK(state->file_stats.get(active_id)->total_bytes == actual_size);
 
+  assert_structural_entries_preserved(db, before);
   assert_consistent(db);
 }
 
@@ -398,6 +438,10 @@ inline void assert_vacuum_recoverable(const std::filesystem::path &dir,
       CHECK(out == value);
     }
   }
+  // Markers and range tombstones must survive the round trip through disk as
+  // well as the vacuum itself: hint generation deliberately drops markers,
+  // but the data file recovery reads them back from must still carry them.
+  assert_structural_entries_preserved(recovered, before);
   assert_consistent(recovered);
 }
 

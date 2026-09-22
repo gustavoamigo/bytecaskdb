@@ -44,6 +44,18 @@ def _full_delta(
             final_state[label] = ("put", i)
         elif op == OpType.DELETE:
             final_state[label] = "deleted"
+        elif op == OpType.RANGE_DEL:
+            # One append, but the delta covers every key the range spans:
+            # the pre-transition keys inside it, plus anything an earlier op
+            # in this same plan put there. A later op can put a key back —
+            # the loop order is what decides, which is the point of the
+            # shape.
+            for key in existing_keys:
+                if plan.range_from <= key < plan.range_to:
+                    final_state[key] = "deleted"
+            for key in list(final_state):
+                if plan.range_from <= key < plan.range_to:
+                    final_state[key] = "deleted"
 
     keys_added = [k for k, s in final_state.items() if s != "deleted"]
     keys_removed = [k for k, s in final_state.items() if s == "deleted"]

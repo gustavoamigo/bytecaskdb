@@ -15,6 +15,9 @@ class DegradeVia(Enum):
     C = "bulk_end_append"         # fail_at=3 on 2-op batch: BulkEnd+isolation all fail
     F = "commit_sync"             # io_data_file_sync on sync=true: bytes in page cache
     G = "rotation_sync"           # io_data_file_sync on sync=false + small max_file_bytes
+    B2 = "append_partial_write"   # short_write: a torn trailing entry on disk
+    B3 = "append_throw_after"     # throw_after: a complete entry the caller was never told about
+    F_RANGE = "commit_sync_range" # commit_sync, but the unpublished entry is a range tombstone
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,9 @@ DEGRADE_SHAPES = [
     DegradeShape("degrade_C_mmap", DegradeVia.C, io_backend="mmap"),
     DegradeShape("degrade_H_pool", DegradeVia.H, io_backend="buffer_pool"),
     DegradeShape("degrade_C_pool", DegradeVia.C, io_backend="buffer_pool"),
+    DegradeShape("degrade_B2", DegradeVia.B2),
+    DegradeShape("degrade_B3", DegradeVia.B3),
+    DegradeShape("degrade_F_range", DegradeVia.F_RANGE),
 ]
 
 RESUME_FAILURE_CLASSES = list(ResumeFailureClass)
@@ -56,8 +62,14 @@ def is_valid_combination(
     # are valid entries in the page cache — valid_offset == file.size())
     # so the guard `if (file.size() != valid_offset)` skips truncate
     # entirely — the fault point is unreachable and the test would pass
-    # vacuously. Only degrade_C (orphaned BulkBegin) triggers truncation.
-    if failure == ResumeFailureClass.R1 and degrade.degrade_via != DegradeVia.C:
+    # vacuously. degrade_C leaves an orphaned BulkBegin; degrade_B2 leaves a
+    # torn entry and degrade_B3 a complete one the caller was never told
+    # about. All three reach truncate.
+    if failure == ResumeFailureClass.R1 and degrade.degrade_via not in (
+        DegradeVia.C,
+        DegradeVia.B2,
+        DegradeVia.B3,
+    ):
         return False
     # R2 (sync) and CASCADE (R2→R3) require the file to NOT be sealed so
     # that resume() enters the truncate/sync/seal block. degrade_H seals

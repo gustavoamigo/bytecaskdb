@@ -54,11 +54,33 @@ def gen_setup(state: CompactStateShape) -> str:
     lines.append(
         f"    auto db = bytecask::DB::open(dir, {{{opts}}});"
     )
-    for key in state.sealed_keys:
+    if state.batched:
+        lines.append("    {")
+        lines.append("      bytecask::WritePlan plan;")
+        for key in state.sealed_keys:
+            lines.append(
+                f'      plan.put(to_bytes("{key}"), to_bytes("v_{key}"));'
+            )
+        lines.append("      (void)db.apply_batch({.sync = false}, std::move(plan));")
+        lines.append("    }")
+    else:
+        for key in state.sealed_keys:
+            lines.append(
+                f'    db.put({{.sync = false}}, to_bytes("{key}"), to_bytes("v_{key}"));'
+            )
+    if state.range_del:
+        lo, hi = state.range_del
         lines.append(
-            f'    db.put({{.sync = false}}, to_bytes("{key}"), to_bytes("v_{key}"));'
+            f"    // Range tombstone inside the file being compacted: it deletes"
+            f' {state.deleted_keys},'
         )
-    if state.deleted_keys:
+        lines.append(
+            "    // and compaction has to carry it across even though it is not key data."
+        )
+        lines.append(
+            f'    db.del_range({{.sync = false}}, to_bytes("{lo}"), to_bytes("{hi}"));'
+        )
+    elif state.deleted_keys:
         lines.append(
             f"    // Delete {state.deleted_keys} to create dead entries in file_0."
         )
