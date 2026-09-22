@@ -198,6 +198,18 @@ Sysbench: 1 table, `--report-interval=0`, `--time=10`.
 
 ### Running
 
+`run-sysbench.sh` loads each engine's table once up front, then runs every
+workload/thread cell against a freshly started server, stopping it again
+afterwards — so only the engine under test is running and no other engine's
+background flushing or compaction competes for the disk. Each cell records the
+block-layer bytes it read and wrote, taken from the instance's cgroup
+`io.stat`, alongside tps and latency in `sysbench_results.csv`.
+
+Because the table is loaded once per engine rather than once per cell,
+workloads that mutate it (`oltp_insert`, `oltp_write_only`, `oltp_read_write`)
+leave it changed for whatever runs next: results depend on the order workloads
+are listed in.
+
 ```bash
 # All engines (default)
 ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh

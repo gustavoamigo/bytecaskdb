@@ -30,6 +30,26 @@
 #                data/tmp/socket files (default: repository root). Point it at a
 #                filesystem that supports native fdatasync/O_DIRECT when the repo
 #                lives on a bind mount or overlay that doesn't, e.g. --data-root=/mnt/nvme
+#
+# Run structure:
+#   1. Prepare  — per engine: initialise the data directory, start the server,
+#                 load the sysbench table once, stop the server cleanly.
+#   2. Measure  — per workload x thread count x engine: start the server, run
+#                 an unmeasured warm-up, sample /proc/<pid>/io, run the
+#                 measured workload, sample again, stop the server. Only the
+#                 engine under test is running, so no other engine's background
+#                 flushing or compaction competes for the disk.
+#   3. Teardown — remove every instance directory.
+#
+# The table is loaded ONCE per engine, not once per cell. Workloads that mutate
+# it (oltp_insert, oltp_write_only, oltp_read_write) leave it changed for
+# whatever runs next, so results depend on the order workloads are listed in.
+#
+# The CSV gains read_mib/write_mib — block-layer bytes over the measured run,
+# taken from the instance's cgroup io.stat — plus syscr/syscw, which count
+# read()/write() on every descriptor, client sockets included, and so describe
+# workload shape rather than disk traffic. I/O columns are empty when
+# systemd-run --user --scope is unavailable.
 
 set -euo pipefail
 
@@ -123,120 +143,185 @@ if engine_enabled rocksdb; then
 fi
 
 # ---------------------------------------------------------------------------
+# Engine metadata — one place that knows a name, so the phases below stay
+# engine-agnostic instead of repeating a block per engine.
+# ---------------------------------------------------------------------------
+engine_dir() {
+  case "$1" in
+    bytecaskdb) echo "$BYTECASKDB_DIR" ;;
+    innodb)     echo "$INNODB_DIR" ;;
+    rocksdb)    echo "$ROCKSDB_DIR" ;;
+  esac
+}
+
+engine_port() {
+  case "$1" in
+    bytecaskdb) echo "$BYTECASKDB_PORT" ;;
+    innodb)     echo "$INNODB_PORT" ;;
+    rocksdb)    echo "$ROCKSDB_PORT" ;;
+  esac
+}
+
+engine_short() {
+  case "$1" in
+    bytecaskdb) echo "BC" ;;
+    innodb)     echo "InnoDB" ;;
+    rocksdb)    echo "RocksDB" ;;
+  esac
+}
+
+engine_label() {
+  case "$1" in
+    bytecaskdb) echo "ByteCaskDB" ;;
+    innodb)     echo "InnoDB" ;;
+    rocksdb)    echo "RocksDB" ;;
+  esac
+}
+
+# Enabled on the command line, and for RocksDB only when its plugin was found.
+engine_active() {
+  engine_enabled "$1" || return 1
+  if [[ "$1" == rocksdb && -z "$ROCKSDB_PLUGIN_DIR" ]]; then return 1; fi
+  return 0
+}
+
+ACTIVE_ENGINES=()
+for e in bytecaskdb innodb rocksdb; do
+  if engine_active "$e"; then ACTIVE_ENGINES+=("$e"); fi
+done
+if [[ ${#ACTIVE_ENGINES[@]} -eq 0 ]]; then
+  echo "ERROR: no engines to benchmark"; exit 1
+fi
+
+start_engine() {
+  local engine="$1"
+  local dir; dir="$(engine_dir "$engine")"
+  local extra=()
+  case "$engine" in
+    bytecaskdb)
+      symlink_providers "$PLUGIN_DIR"
+      extra=(--plugin-dir="$PLUGIN_DIR" --plugin-load-add=bytecaskdb=ha_bytecaskdb.so) ;;
+    rocksdb)
+      extra=(--plugin-load-add=rocksdb=ha_rocksdb.so --plugin-dir="$ROCKSDB_PLUGIN_DIR") ;;
+    innodb) ;;
+  esac
+  start_mariadbd \
+    "$dir/data" "$dir/mysql.sock" "$(engine_port "$engine")" \
+    "$dir/mariadbd.pid" "$dir/error.log" "$SCRIPT_DIR/$engine.cnf" \
+    "${extra[@]}"
+}
+
+stop_engine() {
+  local dir; dir="$(engine_dir "$1")"
+  stop_mariadbd "$dir/mariadbd.pid"
+}
+
+# ---------------------------------------------------------------------------
 # Cleanup trap
 # ---------------------------------------------------------------------------
 cleanup() {
   echo ""
   echo "=== Cleaning up ==="
-  stop_mariadbd "$BYTECASKDB_DIR/mariadbd.pid" "$BYTECASKDB_DIR"
-  stop_mariadbd "$INNODB_DIR/mariadbd.pid" "$INNODB_DIR"
-  stop_mariadbd "$ROCKSDB_DIR/mariadbd.pid" "$ROCKSDB_DIR"
+  local engine dir
+  for engine in bytecaskdb innodb rocksdb; do
+    dir="$(engine_dir "$engine")"
+    stop_mariadbd "$dir/mariadbd.pid"
+    remove_instance "$dir"
+  done
 }
 trap cleanup INT TERM
-
-# ---------------------------------------------------------------------------
-# Start instances
-# ---------------------------------------------------------------------------
-if engine_enabled bytecaskdb; then
-  echo "=== Starting ByteCaskDB MariaDB instance (port $BYTECASKDB_PORT) ==="
-  symlink_providers "$PLUGIN_DIR"
-  start_mariadbd \
-    "$BYTECASKDB_DIR/data" \
-    "$BYTECASKDB_DIR/mysql.sock" \
-    "$BYTECASKDB_PORT" \
-    "$BYTECASKDB_DIR/mariadbd.pid" \
-    "$BYTECASKDB_DIR/error.log" \
-    "$SCRIPT_DIR/bytecaskdb.cnf" \
-    --plugin-dir="$PLUGIN_DIR" \
-    --plugin-load-add=bytecaskdb=ha_bytecaskdb.so
-fi
-
-if engine_enabled innodb; then
-  echo "=== Starting InnoDB MariaDB instance (port $INNODB_PORT) ==="
-  start_mariadbd \
-    "$INNODB_DIR/data" \
-    "$INNODB_DIR/mysql.sock" \
-    "$INNODB_PORT" \
-    "$INNODB_DIR/mariadbd.pid" \
-    "$INNODB_DIR/error.log" \
-    "$SCRIPT_DIR/innodb.cnf"
-fi
-
-if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
-  echo "=== Starting RocksDB MariaDB instance (port $ROCKSDB_PORT) ==="
-  start_mariadbd \
-    "$ROCKSDB_DIR/data" \
-    "$ROCKSDB_DIR/mysql.sock" \
-    "$ROCKSDB_PORT" \
-    "$ROCKSDB_DIR/mariadbd.pid" \
-    "$ROCKSDB_DIR/error.log" \
-    "$SCRIPT_DIR/rocksdb.cnf" \
-    --plugin-load-add=rocksdb=ha_rocksdb.so \
-    --plugin-dir="$ROCKSDB_PLUGIN_DIR"
-fi
 
 # ---------------------------------------------------------------------------
 # Common sysbench args
 # ---------------------------------------------------------------------------
 common_args() {
-  local port="$1"
-  local socket="$2"
-  local threads="$3"
+  local port="$1" socket="$2" threads="$3"
   echo "$(sysbench_conn_args "$port" "$socket" "$threads" "$TABLE_SIZE") --report-interval=0"
 }
 
+# Splits "oltp_read_only:points_only" into a base workload and variant flags.
+variant_flags() {
+  case "${1##*:}" in
+    points_only)    echo "--range-selects=off" ;;
+    ranges_only)    echo "--point-selects=0" ;;
+    simple_range)   echo "--point-selects=0 --sum-ranges=0 --order-ranges=0 --distinct-ranges=0" ;;
+    sum_range)      echo "--point-selects=0 --simple-ranges=0 --order-ranges=0 --distinct-ranges=0" ;;
+    order_range)    echo "--point-selects=0 --simple-ranges=0 --sum-ranges=0 --distinct-ranges=0" ;;
+    distinct_range) echo "--point-selects=0 --simple-ranges=0 --sum-ranges=0 --order-ranges=0" ;;
+    *)              echo "" ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
-# Run one benchmark and extract results
+# Phase 1 — load the table once per engine, then stop the server.
+# ---------------------------------------------------------------------------
+PREPARE_WORKLOAD="${WORKLOADS%% *}"
+PREPARE_WORKLOAD="${PREPARE_WORKLOAD%%:*}"
+
+prepare_engine() {
+  local engine="$1"
+  local dir; dir="$(engine_dir "$engine")"
+  echo "--- $(engine_label "$engine"): loading $TABLE_SIZE rows ---"
+  init_datadir "$dir/data"
+  start_engine "$engine"
+  local args
+  args="$(sysbench_conn_args "$(engine_port "$engine")" "$dir/mysql.sock" \
+          "${THREAD_LIST[0]}" "$TABLE_SIZE")"
+  # shellcheck disable=SC2086
+  if ! sysbench "$PREPARE_WORKLOAD" $args --mysql_storage_engine="$engine" \
+        --create_secondary="$CREATE_SECONDARY" prepare >/dev/null 2>&1; then
+    echo "  [FAILED] sysbench prepare for $engine" >&2
+  fi
+  stop_engine "$engine"
+}
+
+# ---------------------------------------------------------------------------
+# Phase 2 — one measured cell: start, warm up, measure, stop.
 # ---------------------------------------------------------------------------
 run_bench() {
-  local engine="$1"
-  local workload="$2"
-  local port="$3"
-  local socket="$4"
-  local threads="$5"
-  local storage_engine="$6"
-  shift 6
-  local extra_args="$*"
+  local engine="$1" workload="$2" threads="$3"
+  local dir; dir="$(engine_dir "$engine")"
 
-  # Parse workload variant: "oltp_read_only:points_only" → base + extra flags
-  local base_workload="$workload"
-  local variant_args=""
+  local base_workload="$workload" variant_args=""
   if [[ "$workload" == *:* ]]; then
     base_workload="${workload%%:*}"
-    local variant="${workload##*:}"
-    case "$variant" in
-      points_only)    variant_args="--range-selects=off" ;;
-      ranges_only)    variant_args="--point-selects=0" ;;
-      simple_range)   variant_args="--point-selects=0 --sum-ranges=0 --order-ranges=0 --distinct-ranges=0" ;;
-      sum_range)      variant_args="--point-selects=0 --simple-ranges=0 --order-ranges=0 --distinct-ranges=0" ;;
-      order_range)    variant_args="--point-selects=0 --simple-ranges=0 --sum-ranges=0 --distinct-ranges=0" ;;
-      distinct_range) variant_args="--point-selects=0 --simple-ranges=0 --sum-ranges=0 --order-ranges=0" ;;
-    esac
+    variant_args="$(variant_flags "$workload")"
   fi
 
   local args
-  args="$(common_args "$port" "$socket" "$threads")"
+  args="$(common_args "$(engine_port "$engine")" "$dir/mysql.sock" "$threads")"
 
-  # Fresh table per cell. sysbench's prepare is a bare CREATE TABLE and fails
-  # on an existing one, so without the cleanup every cell after the first
-  # would silently reuse whatever the previous workloads left behind.
-  sysbench "$base_workload" $args cleanup >/dev/null 2>&1 || true
-  if ! sysbench "$base_workload" $args --mysql_storage_engine="$storage_engine" \
-      --create_secondary="$CREATE_SECONDARY" prepare >/dev/null 2>&1; then
-    echo "  [FAILED] sysbench prepare for $engine/$workload" >&2
-  fi
+  start_engine "$engine"
 
-  # Unmeasured warm-up, then the measured run.
+  # Unmeasured warm-up. The server was just started, so this also refills
+  # whatever cache the engine keeps — InnoDB's buffer pool is cold otherwise.
   if (( WARMUP > 0 )); then
+    # shellcheck disable=SC2086
     sysbench "$base_workload" $args $variant_args --time="$WARMUP" \
       --mysql-ignore-errors=1180,1213 run >/dev/null 2>&1 || true
   fi
-  local output
-  output="$(sysbench "$base_workload" $args $variant_args --time="$DURATION" \
-    --mysql-ignore-errors=1180,1213 run 2>&1)"
 
-  # Cleanup (skip — keep data for EXPLAIN)
-  # sysbench "$base_workload" $args cleanup >/dev/null 2>&1
+  # Sample either side of the measured run only, so prepare and warm-up I/O
+  # stay out of the numbers.
+  local io_before io_after io_cols output eng_before eng_after eng_cols
+  io_before="$(io_sample "$dir/mariadbd.pid")"
+  eng_before="$(engine_counters "$engine" "$dir/mysql.sock")"
+  # shellcheck disable=SC2086
+  output="$(sysbench "$base_workload" $args $variant_args --time="$DURATION" \
+    --mysql-ignore-errors=1180,1213 run 2>&1)" || true
+  # Engine counters must be read while the server is still up.
+  eng_after="$(engine_counters "$engine" "$dir/mysql.sock")"
+  io_after="$(io_sample "$dir/mariadbd.pid")"
+  io_cols="$(io_delta "$io_before" "$io_after")"
+  eng_cols="$(eng_delta "$eng_before" "$eng_after")"
+
+  # Shutdown flush: InnoDB writes dirty pages here, caused by the run above.
+  local dev_before dev_after flush_mib
+  dev_before="$(dev_written_bytes)"
+  stop_engine "$engine"
+  dev_after="$(dev_written_bytes)"
+  flush_mib="$(awk -v b=$((dev_after - dev_before)) \
+    'BEGIN { printf "%.1f", (b > 0 ? b : 0) / 1048576 }')"
 
   # Extract metrics (sysbench 1.0 outputs only one percentile: 95th by default).
   # The "transactions:" / "queries:" / "ignored errors:" lines are all
@@ -255,15 +340,29 @@ run_bench() {
     echo "$output" | tail -20 >&2
   fi
 
-  echo "$engine,$workload,$threads,$tps,$qps,$avg_lat,$p95,$err"
+  echo "$engine,$workload,$threads,$tps,$qps,$avg_lat,$p95,$err,$io_cols,$eng_cols,$flush_mib"
+}
+
+# Echoes the collected CSV row for a cell, or nothing.
+find_result() {
+  local r
+  for r in "${ALL_RESULTS[@]}"; do
+    if [[ "$(cut -d, -f1 <<< "$r")" == "$1" &&
+          "$(cut -d, -f2 <<< "$r")" == "$2" &&
+          "$(cut -d, -f3 <<< "$r")" == "$3" ]]; then
+      echo "$r"
+      return 0
+    fi
+  done
+  echo ""
 }
 
 # ---------------------------------------------------------------------------
-# Run all benchmarks
+# Run
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== Sysbench OLTP Benchmark ==="
-echo "    Engines: ${ENGINES}"
+echo "    Engines: ${ACTIVE_ENGINES[*]}"
 echo "    Table size: $TABLE_SIZE rows | Warm-up: ${WARMUP}s | Duration: ${DURATION}s per run"
 echo "    Threads: ${THREADS}"
 echo "    Workloads: $WORKLOADS"
@@ -273,98 +372,103 @@ if engine_enabled rocksdb && [[ -z "$ROCKSDB_PLUGIN_DIR" ]]; then
 fi
 echo ""
 
-# CSV header
-echo "engine,workload,threads,tps,qps,avg_lat_ms,p95_ms,err_per_s" > "$RESULTS_CSV"
+echo "=== Phase 1: preparing data ==="
+for engine in "${ACTIVE_ENGINES[@]}"; do
+  prepare_engine "$engine"
+done
+echo ""
 
-# Collect all results
+echo "=== Phase 2: running workloads ==="
+echo "engine,workload,threads,tps,qps,avg_lat_ms,p95_ms,err_per_s,read_mib,write_mib,syscr,syscw,eng_write_mib,eng_fsyncs,flush_mib" > "$RESULTS_CSV"
 declare -a ALL_RESULTS=()
 
 for workload in $WORKLOADS; do
   for t in "${THREAD_LIST[@]}"; do
     echo "--- $workload | threads=$t ---"
-
-    if engine_enabled bytecaskdb; then
-      echo -n "  ByteCaskDB: "
-      result_bc="$(run_bench bytecaskdb "$workload" "$BYTECASKDB_PORT" "$BYTECASKDB_DIR/mysql.sock" "$t" bytecaskdb)"
-      echo "$result_bc" >> "$RESULTS_CSV"
-      ALL_RESULTS+=("$result_bc")
-      tps_bc="$(echo "$result_bc" | cut -d, -f4)"
-      echo "${tps_bc} tps"
-    fi
-
-    if engine_enabled innodb; then
-      echo -n "  InnoDB:     "
-      result_in="$(run_bench innodb "$workload" "$INNODB_PORT" "$INNODB_DIR/mysql.sock" "$t" innodb)"
-      echo "$result_in" >> "$RESULTS_CSV"
-      ALL_RESULTS+=("$result_in")
-      tps_in="$(echo "$result_in" | cut -d, -f4)"
-      echo "${tps_in} tps"
-    fi
-
-    if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
-      echo -n "  RocksDB:    "
-      result_rk="$(run_bench rocksdb "$workload" "$ROCKSDB_PORT" "$ROCKSDB_DIR/mysql.sock" "$t" rocksdb)"
-      echo "$result_rk" >> "$RESULTS_CSV"
-      ALL_RESULTS+=("$result_rk")
-      tps_rk="$(echo "$result_rk" | cut -d, -f4)"
-      echo "${tps_rk} tps"
-    fi
-
+    for engine in "${ACTIVE_ENGINES[@]}"; do
+      printf '  %-12s' "$(engine_label "$engine"):"
+      result="$(run_bench "$engine" "$workload" "$t")"
+      echo "$result" >> "$RESULTS_CSV"
+      ALL_RESULTS+=("$result")
+      printf '%8s tps | read %8s MiB | write %8s MiB\n' \
+        "$(cut -d, -f4 <<< "$result")" \
+        "$(cut -d, -f9 <<< "$result")" \
+        "$(cut -d, -f10 <<< "$result")"
+    done
     echo ""
   done
 done
 
 # ---------------------------------------------------------------------------
-# Print comparison table
+# Throughput / latency table
 # ---------------------------------------------------------------------------
 echo ""
-
-# Build header dynamically based on enabled engines
 header_fmt="%-22s %4s"
 header_args=("Workload" "Thr")
-if engine_enabled bytecaskdb; then
+for engine in "${ACTIVE_ENGINES[@]}"; do
   header_fmt+=" | %10s %10s %8s %8s"
-  header_args+=("BC tps" "qps" "avg" "p95")
-fi
-if engine_enabled innodb; then
-  header_fmt+=" | %10s %10s %8s %8s"
-  header_args+=("InnoDB tps" "qps" "avg" "p95")
-fi
-if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
-  header_fmt+=" | %10s %10s %8s %8s"
-  header_args+=("RocksDB tps" "qps" "avg" "p95")
-fi
-
+  header_args+=("$(engine_short "$engine") tps" "qps" "avg" "p95")
+done
+# shellcheck disable=SC2059
 printf "$header_fmt\n" "${header_args[@]}"
 
 for workload in $WORKLOADS; do
   for t in "${THREAD_LIST[@]}"; do
-    bc_line="" in_line="" rk_line=""
-    for r in "${ALL_RESULTS[@]}"; do
-      eng="$(echo "$r" | cut -d, -f1)"
-      wl="$(echo "$r" | cut -d, -f2)"
-      thr="$(echo "$r" | cut -d, -f3)"
-      if [[ "$wl" == "$workload" && "$thr" == "$t" ]]; then
-        if [[ "$eng" == "bytecaskdb" ]]; then bc_line="$r"; fi
-        if [[ "$eng" == "innodb" ]]; then in_line="$r"; fi
-        if [[ "$eng" == "rocksdb" ]]; then rk_line="$r"; fi
-      fi
-    done
-
     row_fmt="%-22s %4s"
     row_args=("$workload" "$t")
-    if engine_enabled bytecaskdb; then
+    for engine in "${ACTIVE_ENGINES[@]}"; do
+      line="$(find_result "$engine" "$workload" "$t")"
       row_fmt+=" | %10s %10s %8s %8s"
-      row_args+=("$(echo "$bc_line" | cut -d, -f4)" "$(echo "$bc_line" | cut -d, -f5)" "$(echo "$bc_line" | cut -d, -f6)" "$(echo "$bc_line" | cut -d, -f7)")
-    fi
-    if engine_enabled innodb; then
-      row_fmt+=" | %10s %10s %8s %8s"
-      row_args+=("$(echo "$in_line" | cut -d, -f4)" "$(echo "$in_line" | cut -d, -f5)" "$(echo "$in_line" | cut -d, -f6)" "$(echo "$in_line" | cut -d, -f7)")
-    fi
-    if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
-      row_fmt+=" | %10s %10s %8s %8s"
-      row_args+=("$(echo "$rk_line" | cut -d, -f4)" "$(echo "$rk_line" | cut -d, -f5)" "$(echo "$rk_line" | cut -d, -f6)" "$(echo "$rk_line" | cut -d, -f7)")
-    fi
+      row_args+=("$(cut -d, -f4 <<< "$line")" "$(cut -d, -f5 <<< "$line")" \
+                 "$(cut -d, -f6 <<< "$line")" "$(cut -d, -f7 <<< "$line")")
+    done
+    # shellcheck disable=SC2059
+    printf "$row_fmt\n" "${row_args[@]}"
+  done
+done
+
+# ---------------------------------------------------------------------------
+# Write accounting.
+#   wMiB   — block layer, during the measured run (cgroup io.stat, Linux only).
+#   flMiB  — block layer, during server shutdown. InnoDB defers dirty-page
+#            flushing, so a short run against a dataset that fits its buffer
+#            pool writes redo only and settles the B-tree here. Ignoring this
+#            column makes InnoDB look like it writes far less than it does.
+#   engMiB — engine-reported, and what each engine counts differs enough that
+#            it is a per-engine diagnostic, never a cross-engine ratio:
+#              ByteCaskDB  committed appends only — not vacuum, hint files or
+#                          zero-fill-ahead (~6x below the device figure).
+#              RocksDB     the WAL/memtable path only — compaction is excluded
+#                          (~70-100x below the device figure).
+#              InnoDB      blank. MariaDB 10.11 leaves Innodb_data_written,
+#                          Innodb_pages_written and
+#                          Innodb_buffer_pool_pages_flushed all at zero, so only
+#                          redo is visible; a figure there would understate it
+#                          by ~99% (6 MiB against 518 MiB at the device).
+#            Compare wMiB across engines. Use engMiB only to see how much of an
+#            engine's own accounting reaches the disk.
+# ---------------------------------------------------------------------------
+echo ""
+io_fmt="%-22s %4s"
+io_args=("Workload" "Thr")
+for engine in "${ACTIVE_ENGINES[@]}"; do
+  io_fmt+=" | %8s %8s %8s %8s"
+  io_args+=("$(engine_short "$engine") rMiB" "wMiB" "flMiB" "engMiB")
+done
+# shellcheck disable=SC2059
+printf "$io_fmt\n" "${io_args[@]}"
+
+for workload in $WORKLOADS; do
+  for t in "${THREAD_LIST[@]}"; do
+    row_fmt="%-22s %4s"
+    row_args=("$workload" "$t")
+    for engine in "${ACTIVE_ENGINES[@]}"; do
+      line="$(find_result "$engine" "$workload" "$t")"
+      row_fmt+=" | %8s %8s %8s %8s"
+      row_args+=("$(cut -d, -f9 <<< "$line")" "$(cut -d, -f10 <<< "$line")" \
+                 "$(cut -d, -f15 <<< "$line")" "$(cut -d, -f13 <<< "$line")")
+    done
+    # shellcheck disable=SC2059
     printf "$row_fmt\n" "${row_args[@]}"
   done
 done
