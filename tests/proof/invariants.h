@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <span>
 #include <string>
@@ -338,6 +339,66 @@ inline void assert_matches_recovery(const std::filesystem::path &dir,
     CHECK(it->second.min_sequence == fs.min_sequence);
     CHECK(it->second.max_sequence == fs.max_sequence);
   }
+}
+
+// ---- Recovery state shaping -----------------------------------------------
+//
+// A hint file is a rebuildable index, not the record. These helpers put a
+// directory into the states recovery has to cope with: the hint-less data file
+// a crash leaves behind, and a hint whose CRC no longer holds.
+
+inline auto sorted_paths(const std::filesystem::path &dir,
+                         std::string_view ext) -> std::vector<std::filesystem::path> {
+  std::vector<std::filesystem::path> out;
+  for (const auto &e : std::filesystem::directory_iterator{dir}) {
+    if (e.path().extension() == ext) out.push_back(e.path());
+  }
+  std::ranges::sort(out);  // stems lead with a timestamp
+  return out;
+}
+
+// True when the newest data file has no hint beside it. A clean close leaves
+// exactly this: flush_hints skips the active file, so the file that was active
+// at shutdown is hint-less whether the process stopped cleanly or crashed.
+// recovery_prepare_files regenerates it at the next open.
+inline auto newest_data_is_hintless(const std::filesystem::path &dir) -> bool {
+  const auto data = sorted_paths(dir, ".data");
+  if (data.empty()) return false;
+  auto hint = data.back();
+  hint.replace_extension(".hint");
+  return !std::filesystem::exists(hint);
+}
+
+// Removes every hint file that exists, so recovery regenerates all of them.
+inline auto drop_all_hints(const std::filesystem::path &dir) -> int {
+  int dropped = 0;
+  for (const auto &h : sorted_paths(dir, ".hint")) {
+    std::error_code ec;
+    if (std::filesystem::remove(h, ec)) ++dropped;
+  }
+  return dropped;
+}
+
+// Flips a byte inside the newest hint file so its CRC-32C trailer no longer
+// matches. open_hint_or_rebuild must notice, discard it, and rebuild from the
+// data file rather than dropping the keys behind it.
+inline auto corrupt_newest_hint(const std::filesystem::path &dir) -> bool {
+  const auto hints = sorted_paths(dir, ".hint");
+  if (hints.empty()) return false;
+  const auto &path = hints.back();
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(path, ec);
+  if (ec || size == 0) return false;
+  std::fstream f{path, std::ios::binary | std::ios::in | std::ios::out};
+  if (!f) return false;
+  // Byte 0 is inside the first entry, which the trailer CRC covers.
+  f.seekg(0);
+  char b = 0;
+  f.read(&b, 1);
+  b = static_cast<char>(b ^ 0xFF);
+  f.seekp(0);
+  f.write(&b, 1);
+  return static_cast<bool>(f);
 }
 
 // ---- Vacuum baseline and helpers -----------------------------------------

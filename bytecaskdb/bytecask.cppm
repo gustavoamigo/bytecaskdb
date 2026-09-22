@@ -3341,6 +3341,9 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
     hint.append(e.seq, e.type, e.file_off, key_of(e), e.val_size);
 
   hint.close();
+#ifdef BYTECASK_TESTING
+  FAULT_INJECTION(io_hint_rename);
+#endif
   std::filesystem::rename(tmp_path, hint_path);
   return it.committed_offset();
 }

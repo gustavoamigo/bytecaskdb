@@ -313,6 +313,13 @@ Six additional checkpoints exist in `bytecask.cpp` (compiled under `BYTECASK_TES
 9. `io_vacuum_compact_rename` — before `std::filesystem::rename()` in
     `vacuum_compact_file()`
 
+Three more instrument the hint write, mirroring the data file's:
+
+10. `io_hint_write` — before the CRC trailer `write()` in `HintFile::close()`
+11. `io_hint_sync` — before the `fdatasync()` in `HintFile::close()`
+12. `io_hint_rename` — before `std::filesystem::rename()` in
+    `flush_hints_for()`
+
 ### Orphaned BulkBegin degrade
 
 If a multi-entry batch fails mid-write after `BulkBegin`, the engine
@@ -719,6 +726,51 @@ the old file is still in the published state. `assert_vacuum_recoverable`
 confirms that recovery does not replay the orphaned new file as a
 secondary source and sees only the data the old file guaranteed.
 
+### recovery — 40 tests
+
+40 generated Catch2 tests (`[prove_recovery]` tag) cover five state shapes
+× four failure classes × `recovery_threads ∈ {1, 4}`.
+
+`hint_file.cppm` had 19 syscall sites and no fault points, and `DB::open`
+had no matrix at all — recovery was proven by the `[model]` tests, every
+one of which runs the clean path. The README sells the hint write as a
+crash-safety mechanism (`write → fdatasync → rename`) and nothing injected
+a failure into any of the three steps. Three checkpoints now mirror what
+the data file already has: `io_hint_write`, `io_hint_sync`,
+`io_hint_rename`.
+
+What makes the matrix cheap to assert is that the expected delta is the
+same in every cell: **a hint file is a rebuildable index, not the record**,
+so a failure generating one may cost recovery time and must not cost keys.
+`recovery_prepare_files` calls `flush_hints_for` without a catch, so the
+failure propagates out of `DB::open`; each cell then reopens with the
+fault cleared and checks every key back, by value.
+
+#### State shapes
+
+| Shape | Damage | What it tests |
+|-------|--------|---------------|
+| `crash_hintless` | none needed | The file that was active at shutdown. A clean close already leaves it hint-less — `flush_hints` skips `active_file_id` — so this *is* the shape a crash produces, and the one `recovery_prepare_files` regenerates from |
+| `multi_file_hintless` | every hint removed | Several sealed files, none with a hint; all must be rebuilt |
+| `damaged_hint` | newest hint's CRC broken | `open_hint_or_rebuild` must discard it and rebuild from the data file rather than drop the keys behind it |
+| `hintless_batched` | none needed | `BulkBegin`/`BulkEnd` have to survive regeneration — a hint carries them so recovery can compute `durable_seq` across a batch |
+| `hintless_range_del` | none needed | A range tombstone has to survive it too; recovery reads it back out of the regenerated hint to suppress the range |
+
+Serial and parallel recovery diverging is the specific risk the `[model]`
+tests were built around, so every shape is recovered both ways.
+
+#### What is out of reach, and why it is not worked around
+
+Six call sites reach `flush_hints_for`. Four are synchronous —
+`recovery_prepare_files`, `open_hint_or_rebuild`, `flush_hints` at close,
+and `vacuum_compact_file` — and a fault armed on the thread calling
+`DB::open` reaches them. The two post-rotation `worker_.dispatch` sites do
+not: `active_injector` is thread-local and the background worker has its
+own. Propagating one into the worker would need it to outlive the stack
+frame that set it, and the failure it models — a missing hint — is already
+the state `crash_hintless` starts from and every cell here recovers from.
+So it is recorded rather than engineered around.
+
 ### group_commit — 22 tests
 
 22 generated Catch2 tests (`[prove_group]` + `[concurrency]` tags) cover
@@ -909,6 +961,15 @@ write on new leader → backward sync → verify convergence).
 | `expected_delta.py` | Reference model: keys present/absent after all resume calls |
 | `generate_tests.py` | Generates `prove_resume.cpp` |
 
+**recovery module** (`tests/proof/recovery/`):
+
+| File | Role |
+|------|------|
+| `scenario_matrix.py` | RecoveryStateShape (damage kind, batches, range deletes), RecoveryFailureClass (SUCCESS, RC1–RC3), `recovery_threads` axis |
+| `fault_point_resolver.py` | Maps failure class → `io_hint_write` / `io_hint_sync` / `io_hint_rename` |
+| `expected_delta.py` | Reference model: does `DB::open` throw, and (always) do all keys come back |
+| `generate_tests.py` | Generates `prove_recovery.cpp` |
+
 **group_commit module** (`tests/proof/group_commit/`):
 
 | File | Role |
@@ -1061,7 +1122,7 @@ are covered by the 178 `[prove_repl]` tests. All three manifest failure
 classes across 11 state shapes are covered by the 33 `[prove_manifest]`
 tests. Four elimination rules reduce the full matrix to 211 valid tests.
 
-Total generated proof tests: **2205**.
+Total generated proof tests: **2245**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
@@ -1219,6 +1280,7 @@ tests/
       prove_resume.cpp             ← generated, never hand-edited
       prove_vacuum_compact.cpp     ← generated, never hand-edited
       prove_group_commit.cpp       ← generated, never hand-edited
+      prove_recovery.cpp           ← generated, never hand-edited
       prove_replication.cpp        ← generated, never hand-edited
 ```
 
