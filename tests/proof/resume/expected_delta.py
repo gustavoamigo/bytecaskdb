@@ -66,6 +66,15 @@ def resume_delta(degrade: DegradeShape, failure: ResumeFailureClass) -> ResumeDe
                tombstone means applying it: both keys go. A resume() that
                ignored the entry would leave the engine holding keys a fresh
                open would not.
+
+    degrade_F_batch: a 2-op batch committed (sync=false), so the active file
+               holds BulkBegin, p0, p1, BulkEnd below the failure point; then
+               k0's commit sync fails. All three keys survive. What this shape
+               is really for is the file's sequence bounds: the markers
+               consume sequences 1 and 4, and a resume() that did not collect
+               them reported min_sequence 2 for a file whose first entry is
+               sequence 1 — a bound a cold open, whose hint file does carry
+               markers, computes differently.
     """
     if degrade.degrade_via in (DegradeVia.H, DegradeVia.F, DegradeVia.G):
         keys_present = {"k0": "v0", "p0": "new0"}
@@ -76,9 +85,12 @@ def resume_delta(degrade: DegradeShape, failure: ResumeFailureClass) -> ResumeDe
     elif degrade.degrade_via in (DegradeVia.B2, DegradeVia.B3):
         keys_present = {"k0": "v0"}
         keys_absent = ["p0"]
-    else:  # DegradeVia.F_RANGE
+    elif degrade.degrade_via == DegradeVia.F_RANGE:
         keys_present = {}
         keys_absent = ["k0", "k1"]
+    else:  # DegradeVia.F_BATCH
+        keys_present = {"p0": "new0", "p1": "new1", "k0": "v0"}
+        keys_absent: List[str] = []
 
     first_threw = failure not in (
         ResumeFailureClass.SUCCESS,

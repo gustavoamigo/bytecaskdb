@@ -18,6 +18,7 @@ class DegradeVia(Enum):
     B2 = "append_partial_write"   # short_write: a torn trailing entry on disk
     B3 = "append_throw_after"     # throw_after: a complete entry the caller was never told about
     F_RANGE = "commit_sync_range" # commit_sync, but the unpublished entry is a range tombstone
+    F_BATCH = "commit_sync_batch" # commit_sync, with a committed batch below the failure
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ DEGRADE_SHAPES = [
     DegradeShape("degrade_B2", DegradeVia.B2),
     DegradeShape("degrade_B3", DegradeVia.B3),
     DegradeShape("degrade_F_range", DegradeVia.F_RANGE),
+    DegradeShape("degrade_F_batch", DegradeVia.F_BATCH),
 ]
 
 RESUME_FAILURE_CLASSES = list(ResumeFailureClass)

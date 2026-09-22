@@ -143,6 +143,32 @@ def gen_degrade_setup(degrade: DegradeShape) -> str:
             "    }\n"
             "    REQUIRE(db.is_degraded());"
         )
+    elif degrade.degrade_via == DegradeVia.F_BATCH:
+        opts = _build_open_opts(degrade)
+        open_call = (
+            f"bytecask::DB::open(dir, {{{opts}}})" if opts
+            else "bytecask::DB::open(dir)"
+        )
+        return (
+            "    // Establish degrade_F_batch: a 2-op batch commits (sync=false), so\n"
+            "    // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the\n"
+            "    // failure point; then k0's commit sync fails at sequence 5. The\n"
+            "    // markers consume sequences the file's bounds have to account for.\n"
+            f"    auto db = {open_call};\n"
+            "    {\n"
+            "      bytecask::WritePlan plan;\n"
+            '      plan.put(to_bytes("p0"), to_bytes("new0"));\n'
+            '      plan.put(to_bytes("p1"), to_bytes("new1"));\n'
+            "      REQUIRE(db.apply_batch({.sync = false}, std::move(plan)));\n"
+            "    }\n"
+            "    {\n"
+            '      bytecask::testing::ScopedFaultInjector fi_degrade{"io_data_file_sync"};\n'
+            "      REQUIRE_THROWS_AS(\n"
+            '          db.put({.sync = true}, to_bytes("k0"), to_bytes("v0")),\n'
+            "          std::system_error);\n"
+            "    }\n"
+            "    REQUIRE(db.is_degraded());"
+        )
     elif degrade.degrade_via == DegradeVia.F_RANGE:
         opts = _build_open_opts(degrade)
         open_call = (
@@ -279,6 +305,14 @@ def gen_recovery_check(degrade: DegradeShape, delta: ResumeDelta) -> str:
     return f"  assert_keys_recoverable(dir, {present}, {absent});"
 
 
+def gen_bounds_check(degrade: DegradeShape) -> str:
+    """Compare the resumed file_stats bounds against a fresh recovery's."""
+    opts = _build_open_opts(degrade)
+    if opts:
+        return f"  assert_sequence_bounds_match_recovery(dir, bounds, {{{opts}}});"
+    return "  assert_sequence_bounds_match_recovery(dir, bounds);"
+
+
 def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     """Generate one complete TEST_CASE."""
     delta = resume_delta(degrade, failure)
@@ -293,6 +327,7 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     parts.append(f'TEST_CASE("{name}", "[prove_resume]") {{')
     parts.append("  TempDir td;")
     parts.append('  auto dir = td.path / "db";')
+    parts.append("  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;")
     parts.append("  {")
     parts.append(gen_degrade_setup(degrade))
     parts.append("")
@@ -310,8 +345,13 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     else:
         parts.append(gen_clean_resume_and_checks(delta))
 
+    parts.append("")
+    parts.append("    // resume() and a cold open read the same bytes; they must")
+    parts.append("    // describe them the same way.")
+    parts.append("    bounds = capture_sequence_bounds(db);")
     parts.append("  }")
     parts.append(gen_recovery_check(degrade, delta))
+    parts.append(gen_bounds_check(degrade))
     parts.append("}")
     if degrade.io_backend != "pread":
         parts.append("#endif  // __EMSCRIPTEN__")
@@ -332,7 +372,7 @@ FILE_HEADER = """\
 // state, optionally injects a fault inside resume() (verifying it stays
 // degraded), then performs a clean resume() and verifies recovery.
 
-#include <system_error>
+#include <map>\n#include <system_error>\n#include <utility>
 
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
@@ -346,7 +386,7 @@ import bytecask;
 namespace {
 
 using bytecask::testing::assert_consistent;
-using bytecask::testing::assert_keys_recoverable;
+using bytecask::testing::assert_keys_recoverable;\nusing bytecask::testing::assert_sequence_bounds_match_recovery;\nusing bytecask::testing::capture_sequence_bounds;
 using bytecask::testing::to_bytes;
 using bytecask::testing::to_string;
 

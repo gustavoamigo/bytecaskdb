@@ -2285,8 +2285,12 @@ void TransientEngineState::apply_resume(
     }
     case EntryType::BulkBegin:
     case EntryType::BulkEnd:
-      // resume()'s scan never collects markers — they carry no key directory
-      // effect, and an orphaned pair is truncated rather than replayed.
+      // A marker carries no key and no value, so it moves no key directory
+      // entry and no live byte. Its sequence is counted above with every
+      // other entry's, which is the whole reason the scan collects it: the
+      // file's bounds must describe the sequences the file actually holds.
+      // An orphaned pair never reaches here — it lies above valid_offset and
+      // is truncated rather than replayed.
       break;
     }
   }
@@ -3686,19 +3690,22 @@ void DB::resume() {
     auto iter = CommittedEntryIterator{DataFileIterator{file}};
     while (!(iter == std::default_sentinel)) {
       const auto &[entry, entry_off] = *iter;
-      if (entry.entry_type != EntryType::BulkBegin &&
-          entry.entry_type != EntryType::BulkEnd) {
-        // A range tombstone carries its exclusive upper bound in the value,
-        // and apply_resume needs both bounds to suppress the range.
-        auto range_end = entry.entry_type == EntryType::RangeDel
-                             ? std::vector<std::byte>{entry.value.begin(),
-                                                      entry.value.end()}
-                             : std::vector<std::byte>{};
-        committed.push_back({entry.sequence, entry.entry_type, entry_off,
-                             narrow<std::uint32_t>(entry.value.size()),
-                             {entry.key.begin(), entry.key.end()},
-                             std::move(range_end)});
-      }
+      // Batch markers are collected like everything else. They have no key
+      // directory effect — apply_resume says so once, in its switch — but
+      // they do consume sequences, and the file's min/max bounds have to
+      // count them or resume reports a min_sequence above a sequence the
+      // file really contains. Hint files carry markers for the same reason,
+      // so dropping them here made resume and a cold open disagree.
+      // A range tombstone carries its exclusive upper bound in the value,
+      // and apply_resume needs both bounds to suppress the range.
+      auto range_end = entry.entry_type == EntryType::RangeDel
+                           ? std::vector<std::byte>{entry.value.begin(),
+                                                    entry.value.end()}
+                           : std::vector<std::byte>{};
+      committed.push_back({entry.sequence, entry.entry_type, entry_off,
+                           narrow<std::uint32_t>(entry.value.size()),
+                           {entry.key.begin(), entry.key.end()},
+                           std::move(range_end)});
       // Every entry yielded lies below the iterator's committed offset, so
       // recording it here keeps valid_offset in step with `committed` even
       // when the next entry is corrupt and ++iter throws.

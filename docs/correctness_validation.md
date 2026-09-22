@@ -564,12 +564,12 @@ Each test follows the same structure:
 7. `assert_recoverable(dir, before, expected)` — validates persistence
    invariant via fresh recovery (where applicable)
 
-### resume() — 54 tests
+### resume() — 59 tests
 
-54 generated Catch2 tests (`[prove_resume]` tag) cover every valid
+59 generated Catch2 tests (`[prove_resume]` tag) cover every valid
 (DegradeShape, ResumeFailureClass) combination.
 
-Eleven degrade shapes establish a degraded DB before resume is called:
+Twelve degrade shapes establish a degraded DB before resume is called:
 
 - **degrade_H** — `io_rotate_file_creation` fires on a put at the
   rotation threshold. The write committed (both keys are in key_dir),
@@ -611,6 +611,14 @@ Eleven degrade shapes establish a degraded DB before resume is called:
   *applying* it, not stepping over it. Before the `apply_resume` fix that
   landed with these cells, all five of them failed: the resumed engine
   held keys a fresh open did not.
+- **degrade_F_batch** — a committed 2-op batch sits below the failure
+  point, so the active file holds `BulkBegin`(1), p0(2), p1(3),
+  `BulkEnd`(4) and then k0(5), whose commit sync fails. The keys are the
+  easy part; the shape exists for the file's *sequence bounds*. Markers
+  consume sequences, and `resume()` used to filter them out of the entries
+  it collected, so it reported `min_sequence = 2` for a file whose first
+  entry is sequence 1 — while a cold open, whose hint file does carry
+  markers, said 1. All five cells failed before that filter was removed.
 
 Six resume failure classes:
 
@@ -623,24 +631,32 @@ Six resume failure classes:
 
 Two elimination rules apply:
 
-1. **R1 requires orphaned bytes.** degrade_H, degrade_F, degrade_G and
-   degrade_F_range have none in the active file, so `file.size() ==
-   valid_offset` and `resume()` skips the truncation branch entirely
+1. **R1 requires orphaned bytes.** degrade_H, degrade_F, degrade_G,
+   degrade_F_range and degrade_F_batch have none in the active file, so
+   `file.size() == valid_offset` and `resume()` skips the truncation branch entirely
    (`if (file.size() != valid_offset) { ... truncate ... }`). R1 is valid
    for the degrade_C shapes (orphaned `BulkBegin`) and for degrade_B2 and
    degrade_B3, which leave a torn and a complete-but-uncommitted entry
-   respectively — 6 combinations filtered.
+   respectively — 7 combinations filtered.
 2. **R2 and CASCADE require an unsealed file.** The degrade_H shapes
    seal the active file during rotation before the fault fires, so
    `resume()` never enters the truncate/sync/seal block and the sync
    fault point is unreachable — 6 more combinations filtered.
 
-11 shapes × 6 classes = 66 minus 12 filtered = **54 tests**.
+12 shapes × 6 classes = 72 minus 13 filtered = **59 tests**.
 
 Present keys are asserted with `get`, not `contains_key`, both in-process
 and in `assert_keys_recoverable`. A truncation that cut too far leaves
 the key directory intact while the bytes behind it are gone, which is
 exactly how the #36 bug stayed invisible to a test named for it.
+
+Every cell also ends with `assert_sequence_bounds_match_recovery`. The
+key assertions ask whether `resume()` produced the *right* state; this one
+asks whether it produced the *same* state a cold open produces from the
+same bytes, which is the property `resume()` exists to preserve and the
+one both bugs in this matrix's history violated. It compares per-file
+`min_sequence`/`max_sequence`, keyed by the data file's stem because
+recovery assigns file ids by directory order.
 
 Each R1/R2/R3 test uses a multi-phase pattern:
 1. Establish degraded state
@@ -817,7 +833,7 @@ write on new leader → backward sync → verify convergence).
 
 | File | Role |
 |------|------|
-| `scenario_matrix.py` | DegradeShape (H, C, F, G, B2, B3, F_RANGE), ResumeFailureClass (SUCCESS, R1–R3, DOUBLE, CASCADE), validity filter |
+| `scenario_matrix.py` | DegradeShape (H, C, F, G, B2, B3, F_RANGE, F_BATCH), ResumeFailureClass (SUCCESS, R1–R3, DOUBLE, CASCADE), validity filter |
 | `fault_point_resolver.py` | Maps failure class → fault checkpoint name |
 | `expected_delta.py` | Reference model: keys present/absent after all resume calls |
 | `generate_tests.py` | Generates `prove_resume.cpp` |
@@ -883,6 +899,12 @@ I/O checkpoints:
   disk and verifies the recovered state matches the expected state
   (pre-existing keys survive, added keys present, removed keys absent,
   no extra keys, structural consistency).
+- `capture_sequence_bounds(db)` /
+  `assert_sequence_bounds_match_recovery(dir, before)` — per-file
+  `min_sequence`/`max_sequence` keyed by the data file's stem, compared
+  against a fresh recovery's. The other resume assertions ask whether
+  `resume()` produced the right state; this asks whether it produced the
+  same one a cold open produces from the same bytes.
 - `assert_keys_recoverable(dir, keys_present, keys_absent)` — lighter
   recovery check used by resume proof tests: opens a fresh DB, reads each
   expected key back with `get` and compares its value, checks the absent
@@ -938,12 +960,12 @@ back-end, and — for every class that can disturb a lent view — against
 each of the five observers.
 
 All three resume failure classes (R1–R3) plus DOUBLE and CASCADE across
-all eleven degrade shapes (H, C, F, G, B2, B3 and F_RANGE, plus H and C
-again through mmap and the buffer pool) are covered by the 54
+all twelve degrade shapes (H, C, F, G, B2, B3, F_RANGE and F_BATCH, plus
+H and C again through mmap and the buffer pool) are covered by the 59
 `[prove_resume]` tests. R1 is correctly excluded for the degrade_H,
-degrade_F, degrade_G and degrade_F_range shapes (no orphaned bytes to
-truncate — fault point unreachable), and R2/CASCADE for degrade_H (file
-already sealed).
+degrade_F, degrade_G, degrade_F_range and degrade_F_batch shapes (no
+orphaned bytes to truncate — fault point unreachable), and R2/CASCADE for
+degrade_H (file already sealed).
 
 All five vacuum_compact failure classes across all eight state shapes are
 covered by the 40 `[prove_vacuum_compact]` tests.
@@ -953,7 +975,7 @@ are covered by the 178 `[prove_repl]` tests. All three manifest failure
 classes across 11 state shapes are covered by the 33 `[prove_manifest]`
 tests. Four elimination rules reduce the full matrix to 211 valid tests.
 
-Total generated proof tests: **2178**.
+Total generated proof tests: **2183**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:

@@ -273,6 +273,45 @@ inline void assert_keys_recoverable(
   assert_consistent(recovered);
 }
 
+// Per-file sequence bounds, keyed by the data file's stem. Recovery assigns
+// file ids by directory order, so ids do not survive a reopen and a stem does.
+inline auto capture_sequence_bounds(const DB &db)
+    -> std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> {
+  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  auto state = db.engine_state();
+  for (const auto [file_id, fs] : state->file_stats) {
+    auto file = state->files.get(file_id);
+    if (!file) continue;
+    bounds[(*file)->path().stem().string()] = {fs.min_sequence,
+                                               fs.max_sequence};
+  }
+  return bounds;
+}
+
+// resume() and a cold open read the same bytes, so they must describe them
+// the same way. `min_sequence` above a sequence the file really holds is the
+// specific failure this catches: `ChangeIterator` orders its file queue by
+// `min_sequence`, and `flush_hints_for` refuses to deduplicate for exactly
+// this reason. Files the recovered DB does not have — its own fresh active
+// file has no counterpart in `before` — are skipped.
+inline void assert_sequence_bounds_match_recovery(
+    const std::filesystem::path &dir,
+    const std::map<std::string, std::pair<std::uint64_t, std::uint64_t>>
+        &before,
+    const Options &opts = {}) {
+  auto recovered = DB::open(dir, opts);
+  const auto after = capture_sequence_bounds(recovered);
+  for (const auto &[stem, bound] : before) {
+    auto it = after.find(stem);
+    if (it == after.end()) continue;
+    INFO("sequence bounds for " << stem
+                                << " must match after recovery: resume said ["
+                                << bound.first << ", " << bound.second << "]");
+    CHECK(it->second.first == bound.first);
+    CHECK(it->second.second == bound.second);
+  }
+}
+
 // ---- Vacuum baseline and helpers -----------------------------------------
 
 // Owned snapshot of DB state before a vacuum operation.
