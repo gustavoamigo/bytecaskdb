@@ -1,6 +1,7 @@
 # Recovering from a kill inside vacuum
 
-Status: proposed. Replaces the approach in PR #131. Fixes #130 and #129.
+Status: implemented. Replaces the approach in PR #131 (closed). Fixes #130
+and #129.
 
 ## Problem
 
@@ -63,7 +64,7 @@ It also leaves S on disk until the next vacuum, and until then
 ## Why undo rather than finish
 
 Recovery can prove one thing about the pair: every entry of C is also in S,
-with the same sequence, key and CRC.
+with the same sequence, type, key and value.
 
 - **Deleting C** is safe on that proof alone. Everything in C is still in
   S, so nothing is lost, and the result is a directory recovery already
@@ -90,20 +91,27 @@ between, such as a `create_manifest` taken in that window, and callers of
 
 ## How recovery finds the pair
 
-This runs at open, before the key directory is built.
+Recovery runs as usual. Two things stop it:
 
-1. Compute each file's sequence range from its hint file.
-2. Find any two files whose ranges overlap. Normally there are none, and
-   nothing below runs.
-3. For an overlapping pair, call the smaller file C and the larger S. Read
-   both data files in order and check that every entry of C, including
-   tombstones and batch markers, appears in S with the same sequence, key
-   and CRC.
-4. If the check passes, delete C and its hint file, then continue recovery.
-5. If the check fails, or files overlap in any other way, refuse to open.
+- two files claim one key under one sequence (`kde_newer` throws
+  `SequenceOverlap`), or
+- once it is done, two files' sequence ranges overlap. This catches a pair
+  that shares no key, such as a C holding only tombstones.
 
-The check reads two data files, and only when files overlap, which should
-not happen outside this crash. Normal opens pay nothing.
+Either way, `DB::recovery_open` then:
+
+1. Takes the smaller of the two files as C and the larger as S.
+2. Reads both data files in order and checks that every committed entry of
+   C, including tombstones and batch markers, appears in S with the same
+   sequence, type, key and value.
+3. If the check passes, deletes C's hint file, then C, logs a line to
+   stderr, and runs recovery again from scratch.
+4. If the check fails, refuses to open. Nothing is deleted.
+
+Each pass removes one file or throws, so this ends. A healthy open runs one
+pass, and the only added cost is the ranges check, which is over files, not
+keys. The data files are read only when files overlap, which should not
+happen outside this crash.
 
 This needs no change to the on-disk format and no new file type. It also
 opens directories already in this state, including the one from the OOM
@@ -130,17 +138,18 @@ We drop the relaxed `kde_newer` and the matching tie-break in
 
 ## Tests
 
-- VC5 (existing, from PR #131): after the fault, reopen and check that C
-  is gone from disk, S is still there, and every file's sequence range is
-  disjoint. The next vacuum compacts S again.
-- Recovery opens a directory holding S and a real compacted C (from vacuum,
-  not a byte copy), with serial and parallel recovery agreeing.
-- Recovery opens a directory holding a file and a copy of a prefix of it,
-  and keeps the full file.
-- Recovery refuses a pair that overlaps but is not a C and S pair: an entry
-  in C missing from S, or the same sequence with a different value of the
-  same size.
-- `changes_since` after reopening returns each sequence once (#129).
+- VC5, in all eight proof shapes: vacuum fails after the commit, before the
+  unlink. The reopened database holds every key, and its files are
+  sequence-disjoint (checked for every failure class).
+- A real vacuum killed at the same point, reopened with every worker count
+  from one to the number of files: every key is served, C is gone, every
+  file that existed before the vacuum is still there, serial and parallel
+  recovery agree, `changes_since` returns each sequence once (#129), and
+  the next vacuum compacts S again.
+- A file and a copy of a prefix of it: recovery keeps the full file.
+- Two files with the same key under the same sequence and different values
+  of the same size: `DB::open` throws and nothing is deleted, at one worker
+  and at two.
 
 ## Possible later change
 
