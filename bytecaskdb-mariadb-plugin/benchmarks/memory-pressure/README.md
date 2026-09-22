@@ -12,12 +12,26 @@ results and what they mean.
 
 - `mariadbd`, `mariadb` and `sysbench` on the `PATH`; the plugin is built by
   the script (`cmake`, Release).
-- cgroup v2 with the memory controller enabled at the root:
-  `grep memory /sys/fs/cgroup/cgroup.subtree_control`.
-- Passwordless `sudo`, for creating the cgroup and dropping the page cache
-  between runs. Everything else runs as you.
+- `systemd-run`, and cgroup v2 with the memory controller delegated to your
+  systemd user session (the default): `grep memory
+  /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.subtree_control`.
+  Each server runs in a transient scope with `MemoryMax=` set, and the page
+  cache is dropped per data file with `posix_fadvise(DONTNEED)`, so nothing
+  needs root. Everything runs as you.
+- `libjemalloc.so.2`: every server runs under jemalloc so its RSS is the
+  engine's, not memory glibc's arenas keep after a free. `MARIADB_MALLOC=none`
+  opts out.
 - A swap device, only if you pass `--swap-limit`. The host needs one for the
   limit to mean anything; the script refuses otherwise.
+
+Sizing the limit: the steady state is the key directory (~50 B per key,
+two keys per row with the secondary index) plus the pool plus ~300 MB of
+server, but two transients sit on top. Recovery builds per-worker trees and
+merges them, so its peak is above the steady state (watch `memory.peak`).
+Under a write load vacuum's compaction snapshot pins the key directory nodes
+retired while it runs — up to a few hundred MB at 10 M rows; `SHOW ENGINE
+BYTECASKDB STATUS` reports `keydir_versions_live` and `keydir_nodes_parked`
+for exactly that.
 
 ## Running
 
@@ -41,9 +55,12 @@ results and what they mean.
 ```
 
 Put `--data-root` on the disk you want the data files on; the default is
-`results/` under this directory, which is git-ignored. Prepared data is reused
-across runs and across the three ByteCaskDB back-ends (InnoDB has its own);
-`--fresh` wipes it. Don't put a swapfile inside the data root.
+`results/` under this directory, which is git-ignored. Every run wipes the
+engine directories under it and prepares from scratch — nothing from an
+earlier run is reused, so a directory an earlier run's OOM kill left behind
+cannot be handed to the next one. Within a run the three ByteCaskDB back-ends
+share one prepare (InnoDB has its own), as long as the previous cell's server
+shut down cleanly. Don't put a swapfile inside the data root.
 
 | option | default | meaning |
 |---|---|---|

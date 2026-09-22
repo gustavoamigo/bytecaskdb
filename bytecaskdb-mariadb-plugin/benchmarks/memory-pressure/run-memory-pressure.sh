@@ -4,15 +4,23 @@
 # memory.swap.max) set, so the page cache, the key directory and the buffer
 # pool all have to fit the same limit.
 #
-# Requirements: mariadbd, mariadb and sysbench on the PATH; the plugin built
-# (this script builds it); passwordless sudo, for the cgroup and for dropping
-# the page cache between runs. cgroup v2 with the memory controller enabled
-# at the root (`cat /sys/fs/cgroup/cgroup.subtree_control` lists `memory`).
+# Requirements: mariadbd, mariadb, sysbench and systemd-run on the PATH; the
+# plugin built (this script builds it). No root: each server runs in a
+# transient scope under your systemd user session (`systemd-run --user
+# --scope -p MemoryMax=`), which needs cgroup v2 with the memory controller
+# delegated to that session — the default on a systemd host, checked at
+# start — and the page cache is dropped per file with posix_fadvise
+# (DONTNEED) rather than /proc/sys/vm/drop_caches, which reaches exactly
+# the files the run is about and nothing another engine's run has warmed.
+# jemalloc (libjemalloc.so.2): every mariadbd runs under it, because memory
+# glibc's arenas keep after a free counts against memory.max exactly like
+# live data and would be reported as the engine's; MARIADB_MALLOC=none runs
+# on the system allocator instead (see lib_common.sh).
 #
 # Usage:
 #   ./run-memory-pressure.sh [--rows=N] [--mem-limit=BYTES] [--swap-limit=BYTES|max]
 #       [--pool-bytes=BYTES] [--engines=LIST] [--workloads=LIST] [--threads=LIST]
-#       [--warmup=S] [--time=S] [--start-timeout=S] [--data-root=DIR] [--fresh] [--out=FILE]
+#       [--warmup=S] [--time=S] [--start-timeout=S] [--data-root=DIR] [--out=FILE]
 #
 #   --engines    default bytecaskdb-pool,bytecaskdb-mmap,bytecaskdb-pread,innodb
 #   --rows       default 10 M: ~3.2 GB of ByteCaskDB data files plus ~1.1 GB of
@@ -33,8 +41,12 @@
 #                with memory to spare and minutes once it is being swapped;
 #                the time it took is recorded per run as startup_s.
 #   --data-root  where the data directories live (default: this directory's
-#                results/). Prepared data is reused across runs and across the
-#                three ByteCaskDB back-ends; --fresh wipes it first.
+#                results/). The engine directories under it are wiped at the
+#                start of every run: nothing from an earlier run is reused,
+#                so a server an earlier run's OOM killer ended cannot hand
+#                the next run its directory. Within a run the three
+#                ByteCaskDB back-ends share one prepare, and only while the
+#                previous cell's server shut down cleanly.
 #
 # Output: one CSV row per engine × workload × thread count with sysbench's
 # transactions per second, average and p95 latency, the pool's hit ratio,
@@ -52,13 +64,13 @@ THREADS="1,8,16"
 WARMUP=30
 DURATION=60
 START_TIMEOUT=900
-FRESH=0
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATA_ROOT="$SCRIPT_DIR/results"
 OUT=""
 PORT=3322
 SOCKET=/tmp/bytecaskdb-mempressure.sock   # short: mariadbd rejects paths over 107 bytes
-CG=/sys/fs/cgroup/bytecaskdb-mempressure
+CG=""   # the running server's cgroup path, set by start_db; empty with no limit
+USER_SLICE="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service"
 
 for arg in "$@"; do
   case "$arg" in
@@ -74,7 +86,6 @@ for arg in "$@"; do
     --start-timeout=*) START_TIMEOUT="${arg#*=}" ;;
     --data-root=*)  DATA_ROOT="${arg#*=}" ;;
     --out=*)        OUT="${arg#*=}" ;;
-    --fresh)        FRESH=1 ;;
     --help|-h)      sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
   esac
@@ -82,17 +93,25 @@ done
 mkdir -p "$DATA_ROOT"
 DATA_ROOT="$(cd "$DATA_ROOT" && pwd)"
 OUT="${OUT:-$DATA_ROOT/memory_pressure_$(date +%Y%m%dT%H%M%S).csv}"
+# Every run starts from nothing: only the engine directories, so earlier
+# runs' CSVs beside them stay.
+rm -rf "$DATA_ROOT/bytecaskdb" "$DATA_ROOT/innodb"
 
 BYTECASK_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 PLUGIN_DIR="$BYTECASK_ROOT/bytecaskdb-mariadb-plugin/build"
 # shellcheck source=../lib_common.sh
 source "$SCRIPT_DIR/../lib_common.sh"
 
-for tool in mariadbd mariadb sysbench sudo; do
+for tool in mariadbd mariadb sysbench systemd-run; do
   command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: $tool not found"; exit 1; }
 done
-sudo -n true 2>/dev/null || { echo "ERROR: passwordless sudo is required (cgroup, drop_caches)"; exit 1; }
-grep -qw memory /sys/fs/cgroup/cgroup.subtree_control || { echo "ERROR: cgroup v2 memory controller not enabled at the root"; exit 1; }
+if (( MEM_LIMIT > 0 )) && ! grep -qw memory "$USER_SLICE/cgroup.subtree_control" 2>/dev/null; then
+  echo "ERROR: the memory controller is not delegated to your systemd user session"
+  echo "       ($USER_SLICE/cgroup.subtree_control does not list memory), so a"
+  echo "       memory.max cannot be set without root. Check cgroup v2 is in use and"
+  echo "       user@.service has Delegate= including memory (the systemd default)."
+  exit 1
+fi
 if [[ $SWAP_LIMIT != 0 ]] && [[ -z "$(swapon --show --noheadings 2>/dev/null)" ]]; then
   echo "ERROR: --swap-limit=$SWAP_LIMIT but the host has no active swap device; the limit would do nothing"
   echo "       and anything over memory.max is an OOM kill. Enable swap (e.g. a swapfile) or use --swap-limit=0."
@@ -102,10 +121,17 @@ fi
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 DB_PID=""
+DB_ENGINE=""  # storage engine of the running server
+# Engines prepared in this run whose last server shut down cleanly. A cell
+# whose server was killed leaves the engine off this list, and the next
+# cell re-prepares rather than open the directory the kill left.
+PREPARED_CLEAN=""
 start_db() {  # <storage engine: bytecaskdb|innodb> <backend> <pool bytes> <limit or 0> <base dir>
   local engine="$1" backend="$2" pool="$3" limit="$4" base="$5"
   local data="$base/data" cnf="$base/bench.cnf"
   mkdir -p "$data" "$base/tmp"
+  DB_ENGINE="$engine"
+  PREPARED_CLEAN="${PREPARED_CLEAN// $engine / }"
   if [[ ! -d $data/mysql ]]; then
     mariadb-install-db --datadir="$data" --auth-root-authentication-method=normal >/dev/null 2>&1
   fi
@@ -146,18 +172,46 @@ CNF
   fi
   # Every run starts with the same cold page cache: an earlier back-end must
   # not hand the next one a warm one.
-  sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+  evict_page_cache "$data"
+  # The limit is a transient scope under the user session; systemd creates
+  # the cgroup, moves the server into it and removes it when the server
+  # exits, so nothing here needs root and nothing is left behind.
+  local scope=()
   if (( limit > 0 )); then
-    sudo mkdir -p "$CG"
-    echo "$limit" | sudo tee "$CG/memory.max" >/dev/null
-    echo "$SWAP_LIMIT" | sudo tee "$CG/memory.swap.max" >/dev/null
+    local swap_max=$SWAP_LIMIT
+    [[ $swap_max == max ]] && swap_max=infinity
+    scope=(systemd-run --user --scope --quiet -p "MemoryMax=$limit" -p "MemorySwapMax=$swap_max" --)
   fi
-  mariadbd --defaults-extra-file="$cnf" --datadir="$data" --socket="$SOCKET" --port=$PORT \
+  local preload=()
+  local malloc_lib
+  malloc_lib="$(jemalloc_library)"
+  if [[ "$malloc_lib" == "none" ]]; then
+    :
+  elif [[ -n "$malloc_lib" ]]; then
+    preload=(env "LD_PRELOAD=$malloc_lib${LD_PRELOAD:+:$LD_PRELOAD}")
+  else
+    echo "WARNING: libjemalloc.so.2 not found; mariadbd ($engine/$backend) runs on the" \
+         "system allocator and its RSS will include memory glibc has not returned" >&2
+  fi
+  "${scope[@]}" "${preload[@]}" mariadbd --defaults-extra-file="$cnf" --datadir="$data" --socket="$SOCKET" --port=$PORT \
     --pid-file="$base/mariadbd.pid" --skip-grant-tables --tmpdir="$base/tmp" \
     --log-error="$base/error.log" "${extra[@]}" &
   DB_PID=$!
+  CG=""
   if (( limit > 0 )); then
-    echo $DB_PID | sudo tee "$CG/cgroup.procs" >/dev/null
+    # systemd-run --scope execs the server, so $! is mariadbd and its cgroup
+    # is the scope's. memory.current, memory.stat and memory.events are read
+    # from there for the CSV. A server already dead here is left to the
+    # readiness loop below, which says why.
+    sleep 1
+    if kill -0 "$DB_PID" 2>/dev/null; then
+      CG="/sys/fs/cgroup$(cut -d: -f3 "/proc/$DB_PID/cgroup" 2>/dev/null)"
+      if [[ ! -f $CG/memory.max ]] || (( $(cat "$CG/memory.max" 2>/dev/null || echo 0) != limit )); then
+        echo "ERROR: mariadbd ($engine/$backend) is not under a memory.max=$limit scope (cgroup: ${CG#/sys/fs/cgroup})"
+        kill "$DB_PID" 2>/dev/null
+        exit 1
+      fi
+    fi
   fi
   local tries=0
   STARTUP_S=0
@@ -165,7 +219,7 @@ CNF
     sleep 1; tries=$((tries + 1)); STARTUP_S=$tries
     if (( tries > START_TIMEOUT )) || ! kill -0 "$DB_PID" 2>/dev/null; then
       echo "ERROR: mariadbd ($engine/$backend) did not start; see $base/error.log"
-      if [[ -f $CG/memory.events ]] && (( $(awk '/^oom_kill /{print $2}' "$CG/memory.events") > 0 )); then
+      if (( $(oom_kills) > 0 )); then
         echo "       The cgroup OOM killer ended it: memory.max=$limit is below what recovery of the"
         echo "       key directory needs (anonymous memory; ~50 bytes per key, and 2 keys per row here)."
       fi
@@ -177,14 +231,44 @@ CNF
 }
 
 stop_db() {
-  mariadb --socket="$SOCKET" -u root -e "SHUTDOWN" >/dev/null 2>&1 || kill "$DB_PID" 2>/dev/null
-  wait "$DB_PID" 2>/dev/null
+  if mariadb --socket="$SOCKET" -u root -e "SHUTDOWN" >/dev/null 2>&1 && wait "$DB_PID" 2>/dev/null; then
+    PREPARED_CLEAN="$PREPARED_CLEAN $DB_ENGINE "
+  else
+    kill "$DB_PID" 2>/dev/null
+    wait "$DB_PID" 2>/dev/null
+    log "$DB_ENGINE: server did not shut down cleanly; the next cell re-prepares its data"
+  fi
   DB_PID=""
-  [[ -d $CG ]] && sudo rmdir "$CG" 2>/dev/null
+  DB_ENGINE=""
+  CG=""
   rm -f "$SOCKET"
 }
 cleanup() { [[ -n $DB_PID ]] && stop_db; }
 trap cleanup EXIT INT TERM
+
+# OOM kills of the running server. From the scope's memory.events while the
+# scope exists; once the server is dead the scope is gone with it, and the
+# kill is in the user journal instead, logged by systemd against the scope,
+# whose name carries the server's pid.
+oom_kills() {
+  local n=""
+  [[ -n $CG ]] && n="$(awk '/^oom_kill /{print $2}' "$CG/memory.events" 2>/dev/null)"
+  if [[ -z $n ]] && [[ -n $DB_PID ]]; then
+    n="$(journalctl --user --since=-1h -o cat 2>/dev/null \
+         | grep -c "run-p${DB_PID}-.*killed by the OOM killer")"
+  fi
+  echo "${n:-0}"
+}
+
+# Drops every file under dir from the page cache with posix_fadvise(DONTNEED),
+# which needs no privilege for clean pages — and the data files are all
+# fdatasync'd and closed by the time this runs. sync first so nothing is
+# dirty, then dd's iflag=nocache with count=0 issues the advice and reads
+# nothing.
+evict_page_cache() {  # <dir>
+  sync
+  find "$1" -type f -exec dd if={} iflag=nocache count=0 status=none \; 2>/dev/null
+}
 
 sysbench_args() {  # <threads>
   echo "--db-driver=mysql --mysql-host=127.0.0.1 --mysql-port=$PORT --mysql-socket=$SOCKET --mysql-user=root --mysql-db=sbtest --tables=1 --table_size=$ROWS --threads=$1 --report-interval=0 --mysql-ignore-errors=1180,1213"
@@ -201,8 +285,8 @@ engine_stat() {  # <counter name without the bytecask. prefix>
 
 prepare() {  # <storage engine> <base dir>
   local engine="$1" base="$2"
-  if [[ -f $base/prepared && -d $base/data/sbtest && $FRESH == 0 ]] && (( $(cat "$base/prepared") == ROWS )); then
-    log "$engine: reusing prepared data in $base ($ROWS rows)"
+  if [[ $PREPARED_CLEAN == *" $engine "* ]]; then
+    log "$engine: reusing this run's prepared data in $base ($ROWS rows)"
     return
   fi
   rm -rf "$base"
@@ -233,7 +317,6 @@ prepare() {  # <storage engine> <base dir>
     sysbench oltp_read_write $(sysbench_args 4) --mysql_storage_engine=innodb prepare >/dev/null
   fi
   stop_db
-  echo "$ROWS" > "$base/prepared"
   log "$engine: data size $(du -sh "$base/data" | cut -f1)"
 }
 
@@ -274,7 +357,7 @@ run_engine() {  # <engine label>
       rss="$(awk '/VmRSS/{print $2 * 1024}' "/proc/$DB_PID/status" 2>/dev/null)"
       cur="$(cat "$CG/memory.current" 2>/dev/null)"
       swp="$(cat "$CG/memory.swap.current" 2>/dev/null)"
-      oom="$(awk '/^oom_kill /{print $2}' "$CG/memory.events" 2>/dev/null)"
+      oom="$(oom_kills)"
       if [[ -z $tps ]]; then
         log "  [FAILED] $label $wl threads=$t"; echo "$out" | tail -5
         tps=0; avg=0; p95=0

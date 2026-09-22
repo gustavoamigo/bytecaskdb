@@ -49,7 +49,32 @@ symlink_providers() {
   done
 }
 
+# Echoes the jemalloc shared library to preload into mariadbd, or nothing.
+# glibc's per-thread arenas keep a freed 10 M-key tree resident after every
+# drop/re-prepare cycle — measured at ~2 GiB of RSS that malloc_trim gave
+# straight back — so without jemalloc the memory column reports the
+# allocator, not the engine. Every engine gets the same allocator.
+jemalloc_library() {
+  if [[ -n "${MARIADB_MALLOC:-}" ]]; then
+    echo "$MARIADB_MALLOC"
+    return 0
+  fi
+  local lib
+  lib="$(ldconfig -p 2>/dev/null | awk '/libjemalloc\.so\.2 /{print $NF; exit}')"
+  if [[ -z "$lib" ]]; then
+    for lib in /usr/lib64/libjemalloc.so.2 /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
+               /usr/lib/aarch64-linux-gnu/libjemalloc.so.2 /usr/lib/libjemalloc.so.2; do
+      [[ -f "$lib" ]] && break
+      lib=""
+    done
+  fi
+  echo "$lib"
+}
+
 # Starts an ephemeral mariadbd instance and waits for it to accept connections.
+# Runs it under jemalloc when the library is found (see jemalloc_library);
+# set MARIADB_MALLOC=/path/to/lib.so to pick another, or MARIADB_MALLOC=none
+# for the system allocator.
 start_mariadbd() {
   local data_dir="$1"
   local socket="$2"
@@ -74,7 +99,19 @@ start_mariadbd() {
     defaults_arg=("--defaults-extra-file=$defaults_copy")
   fi
 
-  mariadbd \
+  local preload=()
+  local malloc_lib
+  malloc_lib="$(jemalloc_library)"
+  if [[ "$malloc_lib" == "none" ]]; then
+    :
+  elif [[ -n "$malloc_lib" ]]; then
+    preload=(env "LD_PRELOAD=$malloc_lib${LD_PRELOAD:+:$LD_PRELOAD}")
+  else
+    echo "WARNING: libjemalloc.so.2 not found; mariadbd on port $port runs on the" \
+         "system allocator and its RSS will include memory glibc has not returned" >&2
+  fi
+
+  "${preload[@]}" mariadbd \
     "${defaults_arg[@]}" \
     --datadir="$data_dir" \
     --socket="$socket" \
