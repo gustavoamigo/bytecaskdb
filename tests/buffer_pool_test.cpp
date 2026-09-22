@@ -440,3 +440,64 @@ TEST_CASE("BufferPool: concurrent readers never observe a torn frame",
   CHECK(mismatches.load() == 0);
   CHECK(pool.counters().evictions.load() > 0);
 }
+
+TEST_CASE("BufferPool: every frame is claimable and pinnable again once "
+          "readers stop",
+          "[buffer_pool]") {
+  // A reader that loaded a slot just before eviction claimed its frame pins
+  // a dead frame: the pin fails and is dropped again. If the refill cleared
+  // the dead bit with a store of zero in between, that drop would wrap the
+  // pin word below zero — the frame could never be pinned or claimed again,
+  // its key would miss forever, and the dead bit would flicker off under
+  // later failed pins, letting a reader into a frame being written. The
+  // post-condition below catches the first symptom: with the churn over,
+  // reading any frame twice in a row must hit the second time.
+  ScratchFile file{1024 * 1024};
+  const std::size_t capacity = 24 * (bytecask::kPoolFrameBytes + 64);
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
+
+  constexpr int kThreads = 8;
+  constexpr int kIters = 20000;
+  std::atomic<int> mismatches{0};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      std::mt19937_64 rng{static_cast<unsigned long long>(t) + 11};
+      std::vector<std::byte> got(64);
+      bytecask::FrameLease lease;
+      for (int i = 0; i < kIters; ++i) {
+        // Forty frames contend for twenty-four: every read is close to
+        // an eviction of a frame some other thread is about to pin.
+        const auto offset = static_cast<std::size_t>(
+            (rng() % 40) * bytecask::kPoolFrameBytes + 8);
+        if ((i & 1) == 0) {
+          pool.read_at(1, file.fd(), offset, got.size(), file.size(),
+                       got.data());
+        } else if (const auto span = pool.view(1, offset, file.size(), lease);
+                   !span.empty()) {
+          got.assign(span.begin(), span.begin() + 64);
+          lease.reset();
+        } else {
+          pool.read_at(1, file.fd(), offset, got.size(), file.size(),
+                       got.data());
+        }
+        if (got != file.expected(offset, 64)) mismatches.fetch_add(1);
+      }
+    });
+  }
+  for (auto &th : threads) th.join();
+  CHECK(mismatches.load() == 0);
+  REQUIRE(pool.counters().evictions.load() > 0);
+
+  std::vector<std::byte> got(64);
+  for (std::size_t f = 0; f < 40; ++f) {
+    const auto offset = f * bytecask::kPoolFrameBytes;
+    pool.read_at(1, file.fd(), offset, got.size(), file.size(), got.data());
+    const auto hits_before = pool.counters().hits.load();
+    pool.read_at(1, file.fd(), offset, got.size(), file.size(), got.data());
+    INFO("frame " << f);
+    CHECK(pool.counters().hits.load() == hits_before + 1);
+  }
+}

@@ -478,6 +478,10 @@ private:
         const auto tagged = s.frame.load(std::memory_order_relaxed);
         const auto f = tagged & ~kRefBit;
         if (!pin(f)) break;
+        // The seqlock reader's fence: the key and frame loads above may not
+        // sink below the version re-read, and neither an acquire load nor
+        // the acquiring pin RMW orders the loads before them.
+        std::atomic_thread_fence(std::memory_order_acquire);
         if (s.version.load(std::memory_order_acquire) != v1) {
           unpin(f);
           break;
@@ -516,8 +520,13 @@ private:
 
   // Places key -> frame, writing len bytes of src into the frame first. The
   // frame is dead on entry — claimed by eviction, or fresh and named by no
-  // slot — so no reader is in it; the pin word is released last, after the
+  // slot — so no reader is in it; the dead bit is cleared last, after the
   // slot is even, so a reader that pins it then finds the slot as it is.
+  // Cleared with an RMW, not a store of zero: a reader that loaded the
+  // victim's old slot can still be between the fetch_add of a pin that will
+  // fail and the fetch_sub that drops it, and a store would wipe that +1 so
+  // the fetch_sub wraps the word below zero — a frame no one could pin or
+  // claim again, and whose pin word's dead bit later flickers off.
   void insert(std::uint64_t key, std::uint32_t frame, const std::byte *src,
               std::size_t len) noexcept {
     auto h = home(key);
@@ -530,7 +539,7 @@ private:
     s.key.store(key, std::memory_order_relaxed);
     std::memcpy(frame_bytes(frame), src, len);
     end_change(s);
-    pins_[frame].store(0, std::memory_order_release);
+    pins_[frame].fetch_and(~kDead, std::memory_order_release);
   }
 
   // Removes the entry at slot i by backward shift: every later entry in the
