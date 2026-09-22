@@ -111,25 +111,92 @@ export [[nodiscard]] inline auto open_uncached(
   return fd;
 }
 
+// The pool's own counters, owned by the pool rather than by the DB's
+// Counters: a pool-backed data file holds the pool, an iterator holds the
+// file, and either can outlive the DB. All zero when there is no pool.
+// hits/misses are the primary metric: unlike disk_reads, a miss here is
+// known to have left the pool, which the page cache cannot tell you.
+export struct PoolCounters {
+  StripedCounter hits;
+  StripedCounter misses;
+  // Frames admitted by a read miss. The writer's inserts on append are not
+  // fills: they cost no I/O.
+  std::atomic<std::int64_t> fills{0};
+  std::atomic<std::int64_t> evictions{0};
+  std::int64_t frames_total{0};
+  // Gauge: frames currently holding a file's bytes. Resident / total is the
+  // fill level an operator sizes against.
+  std::atomic<std::int64_t> frames_resident{0};
+  // Files whose filesystem refused O_DIRECT and fill through the page cache
+  // instead. Catches a CI mount that would otherwise measure the wrong thing.
+  std::atomic<std::int64_t> direct_io_fallbacks{0};
+};
+
+export class BufferPool;
+
+// A pin on one frame, held by a reader that was lent a span into it rather
+// than a copy. The span stays valid until the lease is reset or destroyed;
+// the frame cannot be evicted or refilled while it is held. Move-only, and
+// meant to live in the object that holds the span — an iterator — so the two
+// lifetimes cannot come apart.
+export class FrameLease {
+public:
+  FrameLease() = default;
+  ~FrameLease() { reset(); }
+  FrameLease(const FrameLease &) = delete;
+  auto operator=(const FrameLease &) -> FrameLease & = delete;
+  FrameLease(FrameLease &&o) noexcept : pool_{o.pool_}, frame_{o.frame_} {
+    o.pool_ = nullptr;
+  }
+  auto operator=(FrameLease &&o) noexcept -> FrameLease & {
+    if (this != &o) {
+      reset();
+      pool_ = o.pool_;
+      frame_ = o.frame_;
+      o.pool_ = nullptr;
+    }
+    return *this;
+  }
+
+  // Releases the pin. Any span lent under this lease is dangling afterwards.
+  void reset() noexcept;
+
+  [[nodiscard]] explicit operator bool() const noexcept {
+    return pool_ != nullptr;
+  }
+
+private:
+  friend class BufferPool;
+  FrameLease(BufferPool *pool, std::uint32_t frame) noexcept
+      : pool_{pool}, frame_{frame} {}
+
+  BufferPool *pool_{nullptr};
+  std::uint32_t frame_{0};
+};
+
 // ---------------------------------------------------------------------------
 // BufferPool — fixed-size frame cache keyed by (file_id, frame_index).
 //
-// Two arrays: an arena of 4 KiB frames and an open-addressed index of 16-byte
-// slots. A slot is the cache's only metadata — key, frame number, CLOCK
-// reference bit and a seqlock version — so a hit touches one index line and
-// then the frame.
+// Three arrays: an arena of 4 KiB frames, an open-addressed index of 16-byte
+// slots — key, frame number, CLOCK reference bit and a seqlock version — and
+// a pin count per frame.
 //
-// Reads are lock-free: probe the index with acquire loads, copy out of the
-// frame under the slot's seqlock, and retry if the version moved. Nothing on
-// the hit path writes except a test-then-set of the reference bit, so a hot
-// frame writes nothing after its first touch.
+// A frame's bytes are immutable while any reader holds a pin on it. A reader
+// probes the index with acquire loads, pins the frame the slot names, checks
+// the slot did not change under it, and then reads the frame with a plain
+// memcpy: nothing can write those bytes until it unpins. Eviction claims a
+// frame by moving its pin word from zero to kDead, which fails while a pin is
+// held and makes any later pin attempt back off, so a frame is filled only
+// when no reader can be in it and no reader can enter it. The only concurrent
+// write a pinned frame ever sees is the active file's append extending it
+// past the size every reader is bounded by — disjoint bytes, no race.
 //
 // Every change to the index or to a frame's contents happens under one mutex,
-// and each change is bracketed by the slot's version going odd and then even
-// again. That is the whole invariant: a reader that copied a frame while its
-// slot's version stayed even and unchanged copied exactly the bytes that slot
-// mapped to. The mutex is not held across device reads — a miss reads the
-// frame into a thread-local buffer first and admits it afterwards.
+// and each change to a slot is bracketed by its version going odd and then
+// even again, so a reader that pinned a frame and then saw the slot's version
+// unchanged knows the slot still maps its key to that frame. The mutex is not
+// held across device reads — a miss reads the frame into a thread-local
+// buffer first and admits it afterwards.
 //
 // Deletion is by backward shift, not tombstones: a tombstoned linear-probing
 // table gets slower with every eviction and never recovers.
@@ -140,18 +207,20 @@ export [[nodiscard]] inline auto open_uncached(
 // ---------------------------------------------------------------------------
 export class BufferPool {
 public:
-  BufferPool(const BufferPoolOptions &opts, Counters &counters)
-      : counters_{counters}, direct_io_{opts.direct_io},
+  explicit BufferPool(const BufferPoolOptions &opts)
+      : direct_io_{opts.direct_io},
         oversize_limit_{opts.capacity_bytes / kOversizeDivisor} {
-    // The table is a power of two at most 70 % full; the arena takes what is
-    // left of the budget. Frame count is derived from the budget, never the
-    // budget from the frame count — the bound is the contract.
-    const auto wanted = opts.capacity_bytes / (kPoolFrameBytes + sizeof(Slot));
+    // The table is a power of two at most 70 % full; the arena and the pin
+    // words take what is left of the budget. Frame count is derived from the
+    // budget, never the budget from the frame count — the bound is the
+    // contract.
+    constexpr auto kPerFrame = kPoolFrameBytes + sizeof(std::atomic<std::uint32_t>);
+    const auto wanted = opts.capacity_bytes / (kPerFrame + sizeof(Slot));
     const auto table = std::bit_ceil(std::max<std::size_t>(wanted * 10 / 7, 2));
     const auto table_bytes = table * sizeof(Slot);
     const auto frames = std::min(
         opts.capacity_bytes > table_bytes
-            ? (opts.capacity_bytes - table_bytes) / kPoolFrameBytes
+            ? (opts.capacity_bytes - table_bytes) / kPerFrame
             : 0,
         table * 7 / 10);
     if (frames == 0) {
@@ -166,10 +235,10 @@ public:
     // Value-initialising the arena touches every page now, so the operator's
     // memory is taken at open rather than faulted in one page at a time on
     // the read path, where it showed up as a p99 that grew with pool size.
-    arena_ = std::vector<std::atomic<std::uint64_t>>(frame_count_ *
-                                                     kWordsPerFrame);
+    arena_ = std::vector<std::byte>(frame_count_ * kPoolFrameBytes);
+    pins_ = std::vector<std::atomic<std::uint32_t>>(frame_count_);
     table_ = std::vector<Slot>(table);
-    counters_.pool_frames_total = narrow<std::int64_t>(frame_count_);
+    counters_.frames_total = narrow<std::int64_t>(frame_count_);
   }
 
   BufferPool(const BufferPool &) = delete;
@@ -177,6 +246,9 @@ public:
 
   [[nodiscard]] auto frame_count() const noexcept -> std::size_t {
     return frame_count_;
+  }
+  [[nodiscard]] auto counters() const noexcept -> const PoolCounters & {
+    return counters_;
   }
 
   // Reads exactly len bytes at offset of file_id's file into dst, serving what
@@ -187,6 +259,18 @@ public:
   // Throws std::system_error if the underlying read fails or comes up short.
   void read_at(std::uint32_t file_id, PoolFile file, std::uint64_t offset,
                std::size_t len, std::size_t file_size, std::byte *dst);
+
+  // Lends the resident bytes from offset to the end of its frame, or to
+  // file_size if that comes first, without copying: the returned span points
+  // into the frame and lease holds the pin that keeps it valid. Empty if the
+  // frame is not resident, in which case nothing is pinned and the caller
+  // reads through read_at. Counts nothing: the caller records a hit with
+  // note_hit() once it has used the span, since a span too short for its
+  // entry sends it to read_at, which counts that read itself.
+  [[nodiscard]] auto view(std::uint32_t file_id, std::uint64_t offset,
+                          std::size_t file_size, FrameLease &lease)
+      -> std::span<const std::byte>;
+  void note_hit() noexcept { counters_.hits.add(1); }
 
   // The active file's frames are never evicted: CLOCK skips them, and the
   // engine moves this at rotation (under the write lock), at which point the
@@ -201,8 +285,8 @@ public:
   // active file. Puts them in the pool so the active file stays resident and
   // read-your-own-writes never touches disk. A frame already resident is
   // extended in place with no version bump: an append never modifies existing
-  // bytes, a boundary word is observed old-or-new atomically, and a reader
-  // only asks for bytes below the published file size. A frame not yet
+  // bytes, and a reader only asks for bytes below the published file size.
+  // A frame not yet
   // resident is admitted with its written prefix. Best effort: if no frame can
   // be claimed the bytes stay on disk and reads take the buffered fallback.
   void append_resident(std::uint32_t file_id, std::uint64_t offset,
@@ -214,10 +298,12 @@ public:
   // will fill through the page cache. Surfaced so a CI run on such a mount
   // cannot silently measure the wrong thing.
   void note_direct_io_fallback() noexcept {
-    counters_.pool_direct_io_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    counters_.direct_io_fallbacks.fetch_add(1, std::memory_order_relaxed);
   }
 
 private:
+  friend class FrameLease;
+
   struct alignas(16) Slot {
     std::atomic<std::uint64_t> key{kEmptyKey};
     // Frame index, with the CLOCK reference bit in the top bit.
@@ -229,6 +315,10 @@ private:
 
   static constexpr std::uint64_t kEmptyKey = ~std::uint64_t{0};
   static constexpr std::uint32_t kRefBit = std::uint32_t{1} << 31;
+  // Set in a frame's pin word from the moment eviction claims it until its
+  // new contents are in place. A reader whose pin lands on a dead frame
+  // backs off; eviction's claim fails while any pin is held.
+  static constexpr std::uint32_t kDead = std::uint32_t{1} << 31;
   static constexpr std::size_t kNoSlot = ~std::size_t{0};
   // An entry larger than capacity / this is read straight to the caller and
   // never admitted: admitting it would evict the working set for one value.
@@ -236,8 +326,6 @@ private:
   // Beyond this a racing eviction is likely pathological, and a direct read
   // is always correct — so the reader stops retrying and pays the syscall.
   static constexpr int kMaxRetries = 8;
-  static constexpr std::size_t kWordBytes = sizeof(std::uint64_t);
-  static constexpr std::size_t kWordsPerFrame = kPoolFrameBytes / kWordBytes;
 
   [[nodiscard]] static auto make_key(std::uint32_t file_id,
                                      std::uint64_t frame_index) noexcept
@@ -261,67 +349,22 @@ private:
     return hash_key(key) & table_mask_;
   }
 
-  [[nodiscard]] auto words(std::uint32_t frame) noexcept
-      -> std::atomic<std::uint64_t> * {
-    return arena_.data() + static_cast<std::size_t>(frame) * kWordsPerFrame;
+  [[nodiscard]] auto frame_bytes(std::uint32_t frame) noexcept -> std::byte * {
+    return arena_.data() + static_cast<std::size_t>(frame) * kPoolFrameBytes;
   }
 
-  // Frames hold atomic words, not plain bytes: a reader copying out of a
-  // frame runs concurrently with a fill writing into it. The seqlock decides
-  // whether the bytes are usable, but two plain memcpys racing is a data race
-  // and therefore UB whatever the version check proves. Relaxed atomic word
-  // accesses make it well-defined; on x86 they are plain movs.
-  //
-  // Head, body, tail: only a boundary word is sliced; every whole word is one
-  // load and one 8-byte memcpy, which the compiler turns into a mov pair.
-  static void read_words(const std::atomic<std::uint64_t> *w,
-                         std::size_t byte_off, std::size_t len,
-                         std::byte *dst) noexcept {
-    w += byte_off / kWordBytes;
-    std::size_t done = 0;
-    if (const auto head = byte_off % kWordBytes; head != 0) {
-      const auto chunk = std::min(kWordBytes - head, len);
-      const auto value = w++->load(std::memory_order_relaxed);
-      std::byte buf[kWordBytes];
-      std::memcpy(buf, &value, kWordBytes);
-      std::memcpy(dst, buf + head, chunk);
-      done = chunk;
+  // Takes a pin on frame. Returns false, with the pin already dropped, if
+  // the frame is dead: eviction has claimed it and its bytes are or will be
+  // some other key's.
+  [[nodiscard]] auto pin(std::uint32_t frame) noexcept -> bool {
+    if ((pins_[frame].fetch_add(1, std::memory_order_acquire) & kDead) == 0) {
+      return true;
     }
-    for (; done + kWordBytes <= len; done += kWordBytes) {
-      const auto value = w++->load(std::memory_order_relaxed);
-      std::memcpy(dst + done, &value, kWordBytes);
-    }
-    if (done < len) {
-      const auto value = w->load(std::memory_order_relaxed);
-      std::memcpy(dst + done, &value, len - done);
-    }
+    unpin(frame);
+    return false;
   }
-
-  // Writes len bytes at byte_off of a frame. A boundary word is
-  // load-patch-store: the bytes it already held are unchanged, so a reader
-  // sees an old-or-new word whose old part is identical either way.
-  static void write_words(std::atomic<std::uint64_t> *w, std::size_t byte_off,
-                          const std::byte *src, std::size_t len) noexcept {
-    w += byte_off / kWordBytes;
-    std::size_t done = 0;
-    const auto patch = [&](std::size_t in_word, std::size_t chunk) {
-      auto value = w->load(std::memory_order_relaxed);
-      std::byte buf[kWordBytes];
-      std::memcpy(buf, &value, kWordBytes);
-      std::memcpy(buf + in_word, src + done, chunk);
-      std::memcpy(&value, buf, kWordBytes);
-      w++->store(value, std::memory_order_relaxed);
-      done += chunk;
-    };
-    if (const auto head = byte_off % kWordBytes; head != 0) {
-      patch(head, std::min(kWordBytes - head, len));
-    }
-    for (; done + kWordBytes <= len; done += kWordBytes) {
-      std::uint64_t value = 0;
-      std::memcpy(&value, src + done, kWordBytes);
-      w++->store(value, std::memory_order_relaxed);
-    }
-    if (done < len) patch(0, len - done);
+  void unpin(std::uint32_t frame) noexcept {
+    pins_[frame].fetch_sub(1, std::memory_order_release);
   }
 
   // O_DIRECT needs the offset, the length and the buffer aligned to the
@@ -395,36 +438,62 @@ private:
     std::size_t cap_{0};
   };
 
-  // Copies this frame's overlap with [offset, offset+len) into dst under the
-  // slot's seqlock. Returns false on a miss or after losing a race to an
-  // eviction; callers then refill the whole read, so a partial write to dst
-  // is fine.
+  // Copies this frame's overlap with [offset, offset+len) into dst. Returns
+  // false on a miss or after losing a race to an eviction; callers then
+  // refill the whole read, so a partial write to dst is fine.
+  //
+  // Pin first, validate second: the slot named frame f for this key when we
+  // read it, but f could have been claimed and refilled between that load
+  // and the pin. Its slot would have been erased to do that, and a slot's
+  // version only ever moves, so the version being what it was proves the
+  // slot still maps key to f — and the pin now held proves f stays put.
   [[nodiscard]] auto copy_out(std::uint64_t key, std::uint64_t frame_index,
                               std::uint64_t offset, std::size_t len,
                               std::byte *dst) noexcept -> bool {
+    const auto f = find_pinned(key);
+    if (f == kNoFrame) return false;
     const auto frame_start = frame_index * kPoolFrameBytes;
     const auto from = std::max(offset, frame_start);
     const auto to = std::min(offset + len, frame_start + kPoolFrameBytes);
+    std::memcpy(dst + (from - offset), frame_bytes(f) + (from - frame_start),
+                static_cast<std::size_t>(to - from));
+    unpin(f);
+    return true;
+  }
 
+  static constexpr std::uint32_t kNoFrame = ~std::uint32_t{0};
+
+  // Probes for key and returns its frame with a pin held, or kNoFrame with
+  // nothing held: a miss, or a race with eviction lost kMaxRetries times, and
+  // the caller then reads the device, which is always correct.
+  [[nodiscard]] auto find_pinned(std::uint64_t key) noexcept -> std::uint32_t {
     for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
       for (auto h = home(key);; h = (h + 1) & table_mask_) {
         auto &s = table_[h];
         const auto v1 = s.version.load(std::memory_order_acquire);
         const auto k = s.key.load(std::memory_order_relaxed);
-        if (k == kEmptyKey) return false;
+        if (k == kEmptyKey) return kNoFrame;
         if (k != key) continue;
         if ((v1 & 1U) != 0U) break;  // being changed: retry from the top
-        const auto f = s.frame.load(std::memory_order_relaxed);
-        read_words(words(f & ~kRefBit), from - frame_start, to - from,
-                   dst + (from - offset));
+        const auto tagged = s.frame.load(std::memory_order_relaxed);
+        const auto f = tagged & ~kRefBit;
+        if (!pin(f)) break;
+        // The seqlock reader's fence: the key and frame loads above may not
+        // sink below the version re-read, and neither an acquire load nor
+        // the acquiring pin RMW orders the loads before them.
         std::atomic_thread_fence(std::memory_order_acquire);
-        if (s.version.load(std::memory_order_relaxed) != v1) break;
+        if (s.version.load(std::memory_order_acquire) != v1) {
+          unpin(f);
+          break;
+        }
         // Test-then-set: a hot frame writes nothing after the first touch.
-        if ((f & kRefBit) == 0) s.frame.fetch_or(kRefBit, std::memory_order_relaxed);
-        return true;
+        if ((tagged & kRefBit) == 0) {
+          s.frame.fetch_or(kRefBit, std::memory_order_relaxed);
+        }
+        return f;
       }
     }
-    return false;  // caller falls back to a direct read, always correct
+    return kNoFrame;
   }
 
   // ----- everything below runs under mu_ -----
@@ -449,9 +518,15 @@ private:
                     std::memory_order_release);
   }
 
-  // Places key -> frame, writing len bytes of src into the frame first.
-  // The slot stays odd for the whole frame write, so a reader probing for
-  // this key waits rather than copying a half-written frame.
+  // Places key -> frame, writing len bytes of src into the frame first. The
+  // frame is dead on entry — claimed by eviction, or fresh and named by no
+  // slot — so no reader is in it; the dead bit is cleared last, after the
+  // slot is even, so a reader that pins it then finds the slot as it is.
+  // Cleared with an RMW, not a store of zero: a reader that loaded the
+  // victim's old slot can still be between the fetch_add of a pin that will
+  // fail and the fetch_sub that drops it, and a store would wipe that +1 so
+  // the fetch_sub wraps the word below zero — a frame no one could pin or
+  // claim again, and whose pin word's dead bit later flickers off.
   void insert(std::uint64_t key, std::uint32_t frame, const std::byte *src,
               std::size_t len) noexcept {
     auto h = home(key);
@@ -462,8 +537,9 @@ private:
     begin_change(s);
     s.frame.store(frame | kRefBit, std::memory_order_relaxed);
     s.key.store(key, std::memory_order_relaxed);
-    write_words(words(frame), 0, src, len);
+    std::memcpy(frame_bytes(frame), src, len);
     end_change(s);
+    pins_[frame].fetch_and(~kDead, std::memory_order_release);
   }
 
   // Removes the entry at slot i by backward shift: every later entry in the
@@ -493,8 +569,10 @@ private:
   }
 
   // CLOCK over the index: advance the hand, clearing reference bits, until an
-  // unreferenced, unpinned entry turns up. Returns kNoSlot if every entry is
-  // pinned.
+  // unreferenced entry of a sealed file turns up whose frame no reader holds.
+  // That frame is claimed (dead) on return. A frame a reader is in is passed
+  // over, never waited for: a pin can be held across a caller's loop body.
+  // Returns kNoSlot if nothing could be claimed.
   [[nodiscard]] auto clock_victim() noexcept -> std::size_t {
     const auto active = active_file_id_.load(std::memory_order_relaxed);
     for (std::size_t steps = 0; steps <= 2 * table_mask_ + 2; ++steps) {
@@ -507,7 +585,12 @@ private:
         s.frame.fetch_and(~kRefBit, std::memory_order_relaxed);
         continue;
       }
-      return i;
+      const auto f = s.frame.load(std::memory_order_relaxed) & ~kRefBit;
+      std::uint32_t unpinned = 0;
+      if (pins_[f].compare_exchange_strong(unpinned, kDead,
+                                           std::memory_order_acq_rel)) {
+        return i;
+      }
     }
     return kNoSlot;
   }
@@ -521,25 +604,30 @@ private:
     std::uint32_t frame = 0;
     if (used_frames_ < frame_count_) {
       frame = narrow<std::uint32_t>(used_frames_++);
-      counters_.pool_frames_resident.store(narrow<std::int64_t>(used_frames_),
+      // Named by no slot yet, so nothing can pin it; dead keeps the
+      // invariant that a frame is written only while dead.
+      pins_[frame].store(kDead, std::memory_order_relaxed);
+      counters_.frames_resident.store(narrow<std::int64_t>(used_frames_),
                                            std::memory_order_relaxed);
     } else {
       const auto victim = clock_victim();
       if (victim == kNoSlot) return false;
       frame = table_[victim].frame.load(std::memory_order_relaxed) & ~kRefBit;
       erase(victim);
-      counters_.pool_evictions.fetch_add(1, std::memory_order_relaxed);
+      counters_.evictions.fetch_add(1, std::memory_order_relaxed);
     }
     insert(key, frame, src, len);
     return true;
   }
 
-  Counters &counters_;
+  PoolCounters counters_;
   bool direct_io_;
   std::size_t oversize_limit_;
   std::size_t frame_count_{0};
   std::size_t table_mask_{0};
-  std::vector<std::atomic<std::uint64_t>> arena_;
+  std::vector<std::byte> arena_;
+  // Per frame: the number of readers in it, kDead while eviction owns it.
+  std::vector<std::atomic<std::uint32_t>> pins_;
   std::vector<Slot> table_;
   std::mutex mu_;
   std::size_t hand_{0};         // guarded by mu_
@@ -562,12 +650,6 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
   const auto first = offset / kPoolFrameBytes;
   const auto last = (offset + len - 1) / kPoolFrameBytes;
 
-  // Thread-exit destructor is intentional; suppress the Clang diagnostic.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wexit-time-destructors"
-  thread_local AlignedScratch scratch;
-#pragma clang diagnostic pop
-
   // Reads frames [a, b] in one I/O, copies their overlap with the request
   // into dst, and admits each whole frame. The caller's bytes come from the
   // read buffer, not from the frames: a frame admitted here can be evicted
@@ -583,6 +665,12 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
                   static_cast<std::size_t>(to - from), from);
       return;
     }
+    // Declared on the miss path so a hit never touches thread-local storage.
+    // Thread-exit destructor is intentional; suppress the Clang diagnostic.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+    thread_local AlignedScratch scratch;
+#pragma clang diagnostic pop
     const auto run_len = static_cast<std::size_t>(run_end - run_start);
     auto *buf = scratch.ensure(align_up(run_len, kPoolFrameBytes));
     if (file.direct < 0 || !pread_direct(file.direct, buf, run_len, run_start)) {
@@ -605,7 +693,7 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
       if (frame_start + kPoolFrameBytes > file_size) break;
       if (admit(make_key(file_id, f), buf + (frame_start - run_start),
                 kPoolFrameBytes)) {
-        counters_.pool_fills.fetch_add(1, std::memory_order_relaxed);
+        counters_.fills.fetch_add(1, std::memory_order_relaxed);
       }
     }
   };
@@ -630,8 +718,29 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
     }
   }
   if (in_run) fill_run(run_start, last);
-  (any_miss ? counters_.pool_misses : counters_.pool_hits)
-      .fetch_add(1, std::memory_order_relaxed);
+  (any_miss ? counters_.misses : counters_.hits).add(1);
+}
+
+auto BufferPool::view(std::uint32_t file_id, std::uint64_t offset,
+                      std::size_t file_size, FrameLease &lease)
+    -> std::span<const std::byte> {
+  lease.reset();
+  if (offset >= file_size) return {};
+  const auto frame_index = offset / kPoolFrameBytes;
+  const auto f = find_pinned(make_key(file_id, frame_index));
+  if (f == kNoFrame) return {};
+  lease = FrameLease{this, f};
+  const auto frame_start = frame_index * kPoolFrameBytes;
+  const auto end = std::min<std::uint64_t>(frame_start + kPoolFrameBytes, file_size);
+  return {frame_bytes(f) + (offset - frame_start),
+          static_cast<std::size_t>(end - offset)};
+}
+
+void FrameLease::reset() noexcept {
+  if (pool_ != nullptr) {
+    pool_->unpin(frame_);
+    pool_ = nullptr;
+  }
 }
 
 void BufferPool::append_resident(std::uint32_t file_id, std::uint64_t offset,
@@ -649,8 +758,10 @@ void BufferPool::append_resident(std::uint32_t file_id, std::uint64_t offset,
     const auto key = make_key(file_id, f);
 
     if (const auto s = find(key); s != kNoSlot) {
+      // Extends the frame past the size every reader is bounded by: the
+      // bytes written are ones no reader can be reading, pinned or not.
       const auto frame = table_[s].frame.load(std::memory_order_relaxed);
-      write_words(words(frame & ~kRefBit), in_frame, src, seg_len);
+      std::memcpy(frame_bytes(frame & ~kRefBit) + in_frame, src, seg_len);
       continue;
     }
     // Only a frame whose written prefix starts here can be admitted from

@@ -159,7 +159,7 @@ def run_regular(dataset_size: int) -> dict:
     # them here only adds wall-clock time to every showcase run.
     filt = _exclude_filter([
         "Recovery", "CasMT", "BoundedStaleness", "UUIDv4", "UnorderedView",
-        "PeriodicSync", "_Pread",
+        "PeriodicSync", "_Pread", "_Mmap",
     ])
     if filt is None:
         raise RuntimeError("All benchmarks were excluded — nothing to run.")

@@ -7414,6 +7414,8 @@ TEST_CASE("stats: all expected keys are present in dump",
   auto s = db.stats();
   std::vector<std::string> expected = {
       "bytecask.keydir_keys",
+      "bytecask.keydir_versions_live",
+      "bytecask.keydir_nodes_parked",
       "bytecask.bytes_written",
       "bytecask.group_writer_batches",
       "bytecask.group_writer_coalesced",
@@ -7911,6 +7913,162 @@ TEST_CASE("io_backend=BufferPool: iteration and vacuum agree with pread",
   CHECK(run(bytecask::IoBackend::BufferPool) ==
         run(bytecask::IoBackend::Pread));
 #endif
+}
+
+TEST_CASE("io_backend=BufferPool: lent entry spans hold while readers evict",
+          "[bytecask][buffer_pool]") {
+#ifndef __EMSCRIPTEN__
+  // An iterator over the pool is handed spans into frames, not copies. The
+  // frame under a span must stay put for as long as the iterator is on that
+  // entry, while other readers miss and evict around it: the iterator is
+  // deliberately slow — it re-reads its spans after other readers have
+  // churned the pool — and every byte it sees must still be the entry's.
+  constexpr int kCount = 2000;
+  TempDir td;
+  bytecask::Options opts{.max_file_bytes = 32 * 1024,
+                         .io_backend = bytecask::IoBackend::BufferPool};
+  opts.buffer_pool.capacity_bytes = 128 * 1024;  // a few frames: evicts hard
+  auto db = bytecask::DB::open(td.path, opts);
+  for (int i = 0; i < kCount; ++i) {
+    db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+           to_bytes(std::format("v{:05d}", i) + std::string(300, 'x')));
+  }
+
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> churn;
+  for (int t = 0; t < 4; ++t) {
+    churn.emplace_back([&db, &stop, t] {
+      std::mt19937 rng{static_cast<unsigned>(1000 + t)};
+      bytecask::Bytes out;
+      while (!stop.load(std::memory_order_relaxed)) {
+        const auto i = static_cast<int>(rng() % kCount);
+        REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
+      }
+    });
+  }
+
+  const auto stats_before = db.stats();
+  int seen = 0;
+  for (auto &[key, value] : db.iter_from({.verify_checksums = false})) {
+    const auto first = to_string(key) + "=" + to_string(value);
+    // Give the churn time to evict everything it can around this frame.
+    bytecask::Bytes out;
+    for (int j = 0; j < 20; ++j) {
+      (void)db.get({}, to_bytes(std::format("k{:05d}", (seen * 7 + j) % kCount)), out);
+    }
+    const auto again = to_string(key) + "=" + to_string(value);
+    REQUIRE(again == first);
+    REQUIRE(first == std::format("k{:05d}=v{:05d}", seen, seen) + std::string(300, 'x'));
+    ++seen;
+  }
+  stop.store(true);
+  for (auto &th : churn) th.join();
+  CHECK(seen == kCount);
+  // The point of the sizing: eviction really ran underneath the iterator.
+  CHECK(db.stats().at("bytecask.pool_evictions") >
+        stats_before.at("bytecask.pool_evictions"));
+#endif
+}
+
+TEST_CASE("io_backend=BufferPool: an iterator outlives the DB with its spans",
+          "[bytecask][buffer_pool]") {
+#ifndef __EMSCRIPTEN__
+  // CONTRACT.md: views already taken stay valid and readable after ~DB. For
+  // the pool that means the frames a lent span points into, the pool that
+  // owns them and the counters a hit bumps must all outlive the DB, held
+  // through the iterator's data file. Both a span taken before destruction
+  // and entries read after it have to be right.
+  TempDir td;
+  bytecask::Options opts{.max_file_bytes = 32 * 1024,
+                         .io_backend = bytecask::IoBackend::BufferPool};
+  opts.buffer_pool.capacity_bytes = 256 * 1024;
+  bytecask::EntryIterator it;
+  bytecask::BytesView first_value;
+  {
+    auto db = bytecask::DB::open(td.path, opts);
+    for (int i = 0; i < 300; ++i) {
+      db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+             to_bytes(std::format("v{:05d}", i) + std::string(200, 'x')));
+    }
+    auto range = db.iter_from({.verify_checksums = false});
+    it = range.begin();
+    first_value = (*it).value;  // a span into a frame, lease held
+    REQUIRE(to_string(first_value) == "v00000" + std::string(200, 'x'));
+  }  // ~DB
+
+  CHECK(to_string(first_value) == "v00000" + std::string(200, 'x'));
+  int seen = 1;
+  for (++it; it != std::default_sentinel; ++it, ++seen) {
+    REQUIRE(to_string((*it).key) == std::format("k{:05d}", seen));
+    REQUIRE(to_string((*it).value) ==
+            std::format("v{:05d}", seen) + std::string(200, 'x'));
+  }
+  CHECK(seen == 300);
+#endif
+}
+
+// A thread's cached read snapshot pins the key directory version it last
+// saw. Under writes that version comes to hold a whole retained copy of the
+// tree — a MariaDB thread parked in the server's thread cache did exactly
+// that, at ~1.1 GB — so the engine takes the cache away from a thread that
+// has gone idle, without that thread's help: the scrape that runs on
+// publish obsoletes any slot unused for ~1 s. The idle thread here does
+// nothing after its one read; the two stats gauges show its version go.
+TEST_CASE("an idle thread's cached version is reclaimed without its help",
+          "[bytecask][reclamation]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  for (int i = 0; i < 2000; ++i) {
+    db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+           to_bytes(std::format("v{:05d}", i)));
+  }
+
+  // A second thread reads once, then idles with its snapshot cached.
+  std::mutex mu;
+  std::condition_variable cv;
+  int step = 0;
+  std::thread idle{[&] {
+    bytecask::Bytes out;
+    REQUIRE(db.get({}, to_bytes("k00001"), out));
+    { std::lock_guard<std::mutex> lk{mu}; step = 1; }
+    cv.notify_all();
+    { std::unique_lock<std::mutex> lk{mu}; cv.wait(lk, [&] { return step == 2; }); }
+  }};
+  { std::unique_lock<std::mutex> lk{mu}; cv.wait(lk, [&] { return step == 1; }); }
+
+  // Overwrite every key: each write retires nodes the idle thread's
+  // version still reaches, and nothing can free them while it is held.
+  for (int i = 0; i < 2000; ++i) {
+    db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+           to_bytes(std::format("w{:05d}", i)));
+  }
+  // Whether the idle thread's version is still held here depends on how
+  // long the overwrites took against the idle grace (under a sanitizer they
+  // take longer than it), so it is reported, not asserted.
+  auto st = db.stats();
+  INFO("after overwrite: versions_live="
+       << st.at("bytecask.keydir_versions_live")
+       << " nodes_parked=" << st.at("bytecask.keydir_nodes_parked"));
+
+  // Keep publishing past the idle grace. The idle thread is not involved;
+  // the writer's scrapes take its cache and the version it pinned goes.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  bool reclaimed = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    db.put({.sync = false}, to_bytes("tick"), to_bytes("t"));
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    st = db.stats();
+    if (st.at("bytecask.keydir_versions_live") == 1 &&
+        st.at("bytecask.keydir_nodes_parked") == 0) {
+      reclaimed = true;
+      break;
+    }
+  }
+  CHECK(reclaimed);
+
+  { std::lock_guard<std::mutex> lk{mu}; step = 2; }
+  cv.notify_all();
+  idle.join();
 }
 
 TEST_CASE("io_backend=Pread: full pread mode",

@@ -1713,6 +1713,10 @@ public:
   [[nodiscard]] static auto parked_nodes() -> std::vector<const void *> {
     return chain().parked_nodes();
   }
+  // Live versions and parked retired nodes, for stats().
+  [[nodiscard]] static auto reclamation_gauges() {
+    return chain().gauges();
+  }
   // Calls f(const void*) for every node reachable from this version.
   template <typename F> void visit_nodes(F &&f) const {
     std::vector<const N *> stack;

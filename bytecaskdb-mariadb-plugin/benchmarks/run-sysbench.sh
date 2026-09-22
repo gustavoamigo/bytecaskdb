@@ -9,6 +9,9 @@
 #   - Plugin .so built (run-unit-tests.sh or cmake)
 #   - mariadbd + mariadb-install-db on PATH
 #   - sysbench installed
+#   - jemalloc (libjemalloc.so.2) — preloaded into every mariadbd so RSS reports
+#     the engine, not memory glibc's arenas keep after a drop/re-prepare;
+#     MARIADB_MALLOC=none runs on the system allocator instead
 #
 # Usage:
 #   ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh [--table-size=N] [--threads=LIST] [--time=S] [--warmup=S] [--engines=LIST] [--workloads=LIST] [--data-root=PATH]

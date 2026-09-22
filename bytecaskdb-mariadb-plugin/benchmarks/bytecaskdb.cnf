@@ -1,5 +1,6 @@
 [mariadbd]
-bytecaskdb_io_backend = mmap
+bytecaskdb_io_backend = buffer_pool
+bytecaskdb_buffer_pool_size = 1075840000
 bytecaskdb_max_file_bytes = 67108864
 bytecaskdb_verify_checksums = OFF
 bytecaskdb_vacuum_fragmentation_threshold = 0.9

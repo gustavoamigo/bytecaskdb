@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -87,57 +88,78 @@ constexpr std::size_t kRoomyCapacity = 4 * 1024 * 1024;
 
 } // namespace
 
+// The read-path counters are striped across threads so that concurrent
+// readers do not serialise on one cache line. What makes that a counter
+// rather than an estimate: every increment lands, whichever stripe a thread
+// draws, and more threads than stripes share them without losing any.
+TEST_CASE("StripedCounter: concurrent adds sum exactly", "[buffer_pool]") {
+  bytecask::StripedCounter counter;
+  constexpr int kThreads = 40;  // more than the stripe count
+  constexpr int kAddsPerThread = 10'000;
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&counter, t] {
+      for (int i = 0; i < kAddsPerThread; ++i) {
+        counter.add(1 + (t % 3));
+      }
+    });
+  }
+  for (auto &th : threads) th.join();
+
+  std::int64_t expected = 0;
+  for (int t = 0; t < kThreads; ++t) {
+    expected += static_cast<std::int64_t>(kAddsPerThread) * (1 + (t % 3));
+  }
+  CHECK(counter.load() == expected);
+}
+
 TEST_CASE("BufferPool: capacity below one frame is rejected",
           "[buffer_pool]") {
-  bytecask::Counters counters;
   // Silently producing a zero-frame pool would be a cache that does nothing.
   CHECK_THROWS_AS(
-      bytecask::BufferPool(bytecask::BufferPoolOptions{.capacity_bytes = 128},
-                           counters),
+      bytecask::BufferPool(bytecask::BufferPoolOptions{.capacity_bytes = 128}),
       std::invalid_argument);
 }
 
 TEST_CASE("BufferPool: frame count is derived from the budget",
           "[buffer_pool]") {
-  bytecask::Counters counters;
   bytecask::BufferPool pool{
-      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}, counters};
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
 
   // The bound is the contract: everything the pool owns — frames, per-frame
   // metadata, table share — comes out of capacity_bytes, so the frames alone
   // must be strictly under it rather than equal to it.
   CHECK(pool.frame_count() * bytecask::kPoolFrameBytes < kRoomyCapacity);
   CHECK(pool.frame_count() > 0);
-  CHECK(counters.pool_frames_total ==
+  CHECK(pool.counters().frames_total ==
         static_cast<std::int64_t>(pool.frame_count()));
 }
 
 TEST_CASE("BufferPool: a repeated read is served from cache", "[buffer_pool]") {
   ScratchFile file{64 * 1024};
-  bytecask::Counters counters;
   bytecask::BufferPool pool{
-      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}, counters};
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
 
   std::vector<std::byte> got(100);
   pool.read_at(1, file.fd(), 512, got.size(), file.size(), got.data());
   CHECK(got == file.expected(512, got.size()));
-  CHECK(counters.pool_misses.load() == 1);
-  CHECK(counters.pool_hits.load() == 0);
+  CHECK(pool.counters().misses.load() == 1);
+  CHECK(pool.counters().hits.load() == 0);
 
   // Same range again — must not reach the device.
   std::fill(got.begin(), got.end(), std::byte{0});
   pool.read_at(1, file.fd(), 512, got.size(), file.size(), got.data());
   CHECK(got == file.expected(512, got.size()));
-  CHECK(counters.pool_hits.load() == 1);
-  CHECK(counters.pool_misses.load() == 1);
+  CHECK(pool.counters().hits.load() == 1);
+  CHECK(pool.counters().misses.load() == 1);
 }
 
 TEST_CASE("BufferPool: file_id is part of the key", "[buffer_pool]") {
   ScratchFile a{16 * 1024};
   ScratchFile b{16 * 1024};
-  bytecask::Counters counters;
   bytecask::BufferPool pool{
-      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}, counters};
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
 
   std::vector<std::byte> from_a(64);
   std::vector<std::byte> from_b(64);
@@ -147,15 +169,14 @@ TEST_CASE("BufferPool: file_id is part of the key", "[buffer_pool]") {
 
   CHECK(from_a == a.expected(0, from_a.size()));
   CHECK(from_b == b.expected(0, from_b.size()));
-  CHECK(counters.pool_misses.load() == 2);
+  CHECK(pool.counters().misses.load() == 2);
 }
 
 TEST_CASE("BufferPool: reads spanning frames are served whole",
           "[buffer_pool]") {
   ScratchFile file{64 * 1024};
-  bytecask::Counters counters;
   bytecask::BufferPool pool{
-      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}, counters};
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
 
   // Straddles three frames: starts mid-frame 0, ends mid-frame 2.
   const std::size_t offset = bytecask::kPoolFrameBytes - 10;
@@ -163,21 +184,20 @@ TEST_CASE("BufferPool: reads spanning frames are served whole",
   std::vector<std::byte> got(len);
   pool.read_at(1, file.fd(), offset, len, file.size(), got.data());
   CHECK(got == file.expected(offset, len));
-  CHECK(counters.pool_misses.load() == 1);  // one coalesced fill, not three
+  CHECK(pool.counters().misses.load() == 1);  // one coalesced fill, not three
 
   std::fill(got.begin(), got.end(), std::byte{0});
   pool.read_at(1, file.fd(), offset, len, file.size(), got.data());
   CHECK(got == file.expected(offset, len));
-  CHECK(counters.pool_hits.load() == 1);  // every covered frame was resident
+  CHECK(pool.counters().hits.load() == 1);  // every covered frame was resident
 }
 
 TEST_CASE("BufferPool: a short tail frame is correct but never admitted",
           "[buffer_pool]") {
   // Final frame is partial, so it must be served without being cached.
   ScratchFile file{bytecask::kPoolFrameBytes + 100};
-  bytecask::Counters counters;
   bytecask::BufferPool pool{
-      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}, counters};
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
 
   const std::size_t offset = bytecask::kPoolFrameBytes + 10;
   std::vector<std::byte> got(50);
@@ -187,17 +207,16 @@ TEST_CASE("BufferPool: a short tail frame is correct but never admitted",
     CHECK(got == file.expected(offset, got.size()));
   }
   // Never cached, so every read is a miss — correctness over hit ratio.
-  CHECK(counters.pool_hits.load() == 0);
-  CHECK(counters.pool_misses.load() == 3);
+  CHECK(pool.counters().hits.load() == 0);
+  CHECK(pool.counters().misses.load() == 3);
 }
 
 TEST_CASE("BufferPool: an oversize read bypasses admission", "[buffer_pool]") {
   ScratchFile file{1024 * 1024};
-  bytecask::Counters counters;
   // 64 frames; the guard rejects anything over an eighth of capacity.
   const std::size_t capacity = 64 * (bytecask::kPoolFrameBytes + 64);
   bytecask::BufferPool pool{
-      bytecask::BufferPoolOptions{.capacity_bytes = capacity}, counters};
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
 
   const std::size_t len = capacity / 4;  // comfortably over capacity/8
   std::vector<std::byte> got(len);
@@ -207,9 +226,9 @@ TEST_CASE("BufferPool: an oversize read bypasses admission", "[buffer_pool]") {
   // Admitting it would have evicted the working set to hold one value, so
   // it is neither a hit nor a miss: it never touched the pool.
   pool.read_at(1, file.fd(), 0, len, file.size(), got.data());
-  CHECK(counters.pool_hits.load() == 0);
-  CHECK(counters.pool_misses.load() == 0);
-  CHECK(counters.pool_fills.load() == 0);
+  CHECK(pool.counters().hits.load() == 0);
+  CHECK(pool.counters().misses.load() == 0);
+  CHECK(pool.counters().fills.load() == 0);
 }
 
 TEST_CASE("BufferPool: differential against pread under constant eviction",
@@ -218,10 +237,9 @@ TEST_CASE("BufferPool: differential against pread under constant eviction",
   // the file's true contents, at a pool far too small to hold the working set
   // so that eviction runs continuously.
   ScratchFile file{2 * 1024 * 1024};
-  bytecask::Counters counters;
   const std::size_t capacity = 16 * (bytecask::kPoolFrameBytes + 64);
   bytecask::BufferPool pool{
-      bytecask::BufferPoolOptions{.capacity_bytes = capacity}, counters};
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
 
   std::mt19937_64 rng{12345};
   std::vector<std::byte> got;
@@ -236,7 +254,94 @@ TEST_CASE("BufferPool: differential against pread under constant eviction",
     }
   }
   // The point of the sizing: eviction must actually have run.
-  CHECK(counters.pool_evictions.load() > 0);
+  CHECK(pool.counters().evictions.load() > 0);
+}
+
+TEST_CASE("BufferPool: a leased frame survives eviction pressure",
+          "[buffer_pool]") {
+  // What makes a span into a frame safe to hand out: while the lease is
+  // held the frame is neither reclaimed nor refilled, however hard the rest
+  // of the pool churns. Same sizing as the differential test, so eviction
+  // runs continuously around the one frame that must not move.
+  ScratchFile file{2 * 1024 * 1024};
+  const std::size_t capacity = 16 * (bytecask::kPoolFrameBytes + 64);
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
+
+  // Make the frame resident, then lend it.
+  const std::size_t leased_offset = 7 * bytecask::kPoolFrameBytes + 100;
+  std::vector<std::byte> scratch(64);
+  pool.read_at(1, file.fd(), leased_offset, scratch.size(), file.size(),
+               scratch.data());
+  bytecask::FrameLease lease;
+  const auto span = pool.view(1, leased_offset, file.size(), lease);
+  REQUIRE(static_cast<bool>(lease));
+  REQUIRE(span.size() == bytecask::kPoolFrameBytes - 100);
+  const std::vector<std::byte> lent_before(span.begin(), span.end());
+  CHECK(lent_before == file.expected(leased_offset, span.size()));
+
+  // Churn every other frame many times over.
+  std::mt19937_64 rng{777};
+  std::vector<std::byte> got;
+  for (int i = 0; i < 4000; ++i) {
+    const auto len = static_cast<std::size_t>(1 + rng() % 3000);
+    const auto offset =
+        static_cast<std::size_t>(rng() % (file.size() - len));
+    got.assign(len, std::byte{0});
+    pool.read_at(1, file.fd(), offset, len, file.size(), got.data());
+    REQUIRE(got == file.expected(offset, len));
+  }
+  CHECK(pool.counters().evictions.load() > 100);
+
+  // The lent bytes are exactly what they were, read through the same span.
+  CHECK(std::vector<std::byte>(span.begin(), span.end()) == lent_before);
+
+  // Released, the frame is ordinary again: the next churn may reuse it, and
+  // a fresh view of the same offset must still read the file's bytes —
+  // either from a surviving frame or after a refill — never stale ones.
+  lease.reset();
+  CHECK_FALSE(static_cast<bool>(lease));
+  for (int i = 0; i < 2000; ++i) {
+    const auto len = static_cast<std::size_t>(1 + rng() % 3000);
+    const auto offset =
+        static_cast<std::size_t>(rng() % (file.size() - len));
+    got.assign(len, std::byte{0});
+    pool.read_at(1, file.fd(), offset, len, file.size(), got.data());
+  }
+  got.assign(scratch.size(), std::byte{0});
+  pool.read_at(1, file.fd(), leased_offset, got.size(), file.size(),
+               got.data());
+  CHECK(got == file.expected(leased_offset, got.size()));
+}
+
+TEST_CASE("BufferPool: a view of a straddling or absent range is empty",
+          "[buffer_pool]") {
+  ScratchFile file{64 * 1024};
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
+  bytecask::FrameLease lease;
+
+  // Not resident: nothing lent, nothing pinned, no hit counted.
+  CHECK(pool.view(1, 4096, file.size(), lease).empty());
+  CHECK_FALSE(static_cast<bool>(lease));
+  CHECK(pool.counters().hits.load() == 0);
+
+  // Resident: lent up to the end of its frame. The hit is the caller's to
+  // record once the span proves long enough for what it wanted.
+  std::vector<std::byte> got(16);
+  pool.read_at(1, file.fd(), 4096, got.size(), file.size(), got.data());
+  const auto span = pool.view(1, 4096 + 4000, file.size(), lease);
+  CHECK(static_cast<bool>(lease));
+  CHECK(span.size() == 96);
+  CHECK(std::vector<std::byte>(span.begin(), span.end()) ==
+        file.expected(4096 + 4000, 96));
+  CHECK(pool.counters().hits.load() == 0);
+  pool.note_hit();
+  CHECK(pool.counters().hits.load() == 1);
+
+  // At or past the size the caller is bounded by: nothing.
+  CHECK(pool.view(1, file.size(), file.size(), lease).empty());
+  CHECK_FALSE(static_cast<bool>(lease));
 }
 
 // Bytes this process has passed through read(2)-family syscalls, cached or
@@ -259,11 +364,10 @@ TEST_CASE("BufferPool: a partial miss reads only the missing frames",
   // value, which at 2 MiB a value was the difference between a 4 KiB read
   // and a 2 MiB one on every partial miss.
   ScratchFile file{1024 * 1024};
-  bytecask::Counters counters;
   // ~64 frames; the oversize guard admits a value up to an eighth of that.
   const std::size_t capacity = 64 * (bytecask::kPoolFrameBytes + 64);
   bytecask::BufferPool pool{
-      bytecask::BufferPoolOptions{.capacity_bytes = capacity}, counters};
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
   const auto frames = pool.frame_count();
   REQUIRE(frames >= 32);
 
@@ -272,7 +376,7 @@ TEST_CASE("BufferPool: a partial miss reads only the missing frames",
   const std::size_t v_len = kVFrames * bytecask::kPoolFrameBytes;
   std::vector<std::byte> v(v_len);
   pool.read_at(1, file.fd(), 0, v_len, file.size(), v.data());
-  REQUIRE(counters.pool_fills.load() == kVFrames);
+  REQUIRE(pool.counters().fills.load() == kVFrames);
 
   // Fill the rest of the pool with one frame each, then keep going so
   // CLOCK evicts a good fraction of everything — including some of V.
@@ -282,13 +386,13 @@ TEST_CASE("BufferPool: a partial miss reads only the missing frames",
     const auto off = (kVFrames + 1 + i) * bytecask::kPoolFrameBytes;
     pool.read_at(1, file.fd(), off, one.size(), file.size(), one.data());
   }
-  REQUIRE(counters.pool_evictions.load() > 0);
+  REQUIRE(pool.counters().evictions.load() > 0);
 
-  const auto fills_before = counters.pool_fills.load();
+  const auto fills_before = pool.counters().fills.load();
   const auto bytes_before = rchar();
   std::fill(v.begin(), v.end(), std::byte{0});
   pool.read_at(1, file.fd(), 0, v_len, file.size(), v.data());
-  const auto refilled = counters.pool_fills.load() - fills_before;
+  const auto refilled = pool.counters().fills.load() - fills_before;
   const auto bytes_read = rchar() - bytes_before;
 
   CHECK(v == file.expected(0, v_len));
@@ -307,10 +411,9 @@ TEST_CASE("BufferPool: concurrent readers never observe a torn frame",
   // Frames are reused memory, so a reader racing evict-then-refill would get
   // bytes that are part old and part new. This is what the seqlock is for.
   ScratchFile file{1024 * 1024};
-  bytecask::Counters counters;
   const std::size_t capacity = 24 * (bytecask::kPoolFrameBytes + 64);
   bytecask::BufferPool pool{
-      bytecask::BufferPoolOptions{.capacity_bytes = capacity}, counters};
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
 
   constexpr int kThreads = 8;
   constexpr int kIters = 3000;
@@ -335,5 +438,66 @@ TEST_CASE("BufferPool: concurrent readers never observe a torn frame",
   }
   for (auto &th : threads) th.join();
   CHECK(mismatches.load() == 0);
-  CHECK(counters.pool_evictions.load() > 0);
+  CHECK(pool.counters().evictions.load() > 0);
+}
+
+TEST_CASE("BufferPool: every frame is claimable and pinnable again once "
+          "readers stop",
+          "[buffer_pool]") {
+  // A reader that loaded a slot just before eviction claimed its frame pins
+  // a dead frame: the pin fails and is dropped again. If the refill cleared
+  // the dead bit with a store of zero in between, that drop would wrap the
+  // pin word below zero — the frame could never be pinned or claimed again,
+  // its key would miss forever, and the dead bit would flicker off under
+  // later failed pins, letting a reader into a frame being written. The
+  // post-condition below catches the first symptom: with the churn over,
+  // reading any frame twice in a row must hit the second time.
+  ScratchFile file{1024 * 1024};
+  const std::size_t capacity = 24 * (bytecask::kPoolFrameBytes + 64);
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
+
+  constexpr int kThreads = 8;
+  constexpr int kIters = 20000;
+  std::atomic<int> mismatches{0};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      std::mt19937_64 rng{static_cast<unsigned long long>(t) + 11};
+      std::vector<std::byte> got(64);
+      bytecask::FrameLease lease;
+      for (int i = 0; i < kIters; ++i) {
+        // Forty frames contend for twenty-four: every read is close to
+        // an eviction of a frame some other thread is about to pin.
+        const auto offset = static_cast<std::size_t>(
+            (rng() % 40) * bytecask::kPoolFrameBytes + 8);
+        if ((i & 1) == 0) {
+          pool.read_at(1, file.fd(), offset, got.size(), file.size(),
+                       got.data());
+        } else if (const auto span = pool.view(1, offset, file.size(), lease);
+                   !span.empty()) {
+          got.assign(span.begin(), span.begin() + 64);
+          lease.reset();
+        } else {
+          pool.read_at(1, file.fd(), offset, got.size(), file.size(),
+                       got.data());
+        }
+        if (got != file.expected(offset, 64)) mismatches.fetch_add(1);
+      }
+    });
+  }
+  for (auto &th : threads) th.join();
+  CHECK(mismatches.load() == 0);
+  REQUIRE(pool.counters().evictions.load() > 0);
+
+  std::vector<std::byte> got(64);
+  for (std::size_t f = 0; f < 40; ++f) {
+    const auto offset = f * bytecask::kPoolFrameBytes;
+    pool.read_at(1, file.fd(), offset, got.size(), file.size(), got.data());
+    const auto hits_before = pool.counters().hits.load();
+    pool.read_at(1, file.fd(), offset, got.size(), file.size(), got.data());
+    INFO("frame " << f);
+    CHECK(pool.counters().hits.load() == hits_before + 1);
+  }
 }

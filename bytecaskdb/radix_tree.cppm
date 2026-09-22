@@ -1832,6 +1832,10 @@ public:
   [[nodiscard]] static auto parked_nodes() -> std::vector<const void *> {
     return chain().parked_nodes();
   }
+  // Live versions and parked retired nodes, for stats().
+  [[nodiscard]] static auto reclamation_gauges() {
+    return chain().gauges();
+  }
 
   // Test-only: visits every node reachable from this version once. Used
   // with detail::radix_accounting() to check the node accounting

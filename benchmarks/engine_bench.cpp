@@ -45,6 +45,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -301,9 +302,29 @@ inline void cas_backoff(std::uint64_t failed_attempts) {
   std::this_thread::sleep_for(std::chrono::microseconds{dist(rng)});
 }
 
-template <bool UseMmap = false>
+
+// Total buffer pool footprint for the BufferPool adapter — the default, so
+// every fixture allocates one and it is sized to the dataset rather than
+// fixed: ~512 B per key against ~300 B per entry on disk keeps the whole
+// dataset resident once warmed, so the rows measure the hit path (the
+// pool_hit_ratio counter on the read rows confirms it), and the 256 MiB
+// floor clears DB::open's 2 x max_file_bytes minimum with room to spare.
+static const std::size_t kPoolCapacityBytes =
+    std::max(std::size_t{256} << 20, kDatasetSize * 512);
+
+template <bytecask::IoBackend Backend>
 struct BcAdapterBase {
   static auto generate_keys(std::size_t n) { return generate_prefixed_keys(n); }
+
+  static auto open_options() -> bytecask::Options {
+    bytecask::Options opts;
+    opts.io_backend = Backend;
+    if constexpr (Backend == bytecask::IoBackend::BufferPool) {
+      opts.buffer_pool = {.capacity_bytes = kPoolCapacityBytes,
+                          .direct_io = true};
+    }
+    return opts;
+  }
 
   struct Db {
     TmpDir dir;
@@ -311,7 +332,7 @@ struct BcAdapterBase {
 
     Db(std::string_view tag, const std::vector<std::string> *populate_keys,
        const std::vector<std::byte> *populate_val)
-        : dir{tag}, engine{bytecask::DB::open(dir.path, {.io_backend = UseMmap ? bytecask::IoBackend::Mmap : bytecask::IoBackend::Pread})} {
+        : dir{tag}, engine{bytecask::DB::open(dir.path, open_options())} {
       if (populate_keys) {
         static constexpr std::size_t kPopulateBatchSize = 100;
         bytecask::WriteOptions wo;
@@ -326,9 +347,26 @@ struct BcAdapterBase {
           wo.sync = (end == n);
           (void)engine.apply_batch(wo, std::move(plan));
         }
+        // One read of every key so the sealed files are resident before the
+        // timed loop: the page cache already holds them after populate, but a
+        // pool fills only on a read miss, and a cold pool would spend the
+        // first pass on O_DIRECT fills rather than hits.
+        bytecask::ReadOptions ro;
+        ro.verify_checksums = false;
+        bytecask::Bytes value;
+        for (const auto &k : *populate_keys) {
+          (void)engine.get(ro, bc_key(k), value);
+        }
       }
     }
   };
+
+  // Pool hits and misses so far, for a delta across the timed loop.
+  static auto pool_counts(Db &db) -> std::pair<double, double> {
+    const auto stats = db.engine.stats();
+    return {static_cast<double>(stats.at("bytecask.pool_hits")),
+            static_cast<double>(stats.at("bytecask.pool_misses"))};
+  }
 
   static auto open_empty(std::string_view tag) -> Db {
     return Db{tag, nullptr, nullptr};
@@ -395,13 +433,44 @@ struct BcAdapterBase {
 };
 
 // BcAdapter: default ByteCaskDB adapter behind the unlabeled "ByteCaskDB/..."
-// benchmarks. Uses mmap reads. BcPreadAdapter below is the pread counterpart,
-// benchmarked separately as "ByteCaskDB_Pread/...".
-using BcAdapter = BcAdapterBase<true>;
+// benchmarks. Sealed files are served from the buffer pool, warmed to a
+// ~100 % hit ratio. BcMmapAdapter and BcPreadAdapter are the mmap and pread
+// counterparts, benchmarked separately as "ByteCaskDB_Mmap/..." and
+// "ByteCaskDB_Pread/...".
+using BcAdapter = BcAdapterBase<bytecask::IoBackend::BufferPool>;
 
-// BcPreadAdapter: pread-based read path, for direct comparison against the
-// mmap default.
-using BcPreadAdapter = BcAdapterBase<false>;
+// BcMmapAdapter: zero-copy mmap reads, the bar the pool's hit path is
+// measured against.
+using BcMmapAdapter = BcAdapterBase<bytecask::IoBackend::Mmap>;
+
+// BcPreadAdapter: pread-based read path.
+using BcPreadAdapter = BcAdapterBase<bytecask::IoBackend::Pread>;
+
+// Attaches the pool hit ratio over the timed loop to rows of adapters that
+// expose it, so a pool-backed row states whether it measured hits or fills.
+template <typename A, typename Db>
+struct PoolHitRatio {
+  Db &db;
+  double hits0{0};
+  double misses0{0};
+
+  explicit PoolHitRatio(Db &d) : db{d} {
+    if constexpr (requires { A::pool_counts(db); }) {
+      std::tie(hits0, misses0) = A::pool_counts(db);
+    }
+  }
+
+  void attach(benchmark::State &state) const {
+    if constexpr (requires { A::pool_counts(db); }) {
+      const auto [hits, misses] = A::pool_counts(db);
+      const auto total = (hits - hits0) + (misses - misses0);
+      if (total > 0) {
+        state.counters["pool_hit_ratio"] = benchmark::Counter(
+            (hits - hits0) / total, benchmark::Counter::kAvgThreads);
+      }
+    }
+  }
+};
 
 // BcAdapterStale: identical to BcAdapter but get() uses bounded staleness
 // (thread-local snapshot refreshed every staleness_tolerance). Lets BM_GetMT
@@ -869,6 +938,7 @@ template <typename A> void BM_Get(benchmark::State &state) {
   static auto keys = A::generate_keys(kDatasetSize);
   static auto val = make_value();
   static auto db = A::open_populated("get", keys, val);
+  const PoolHitRatio<A, typename A::Db> pool_ratio{db};
 
   std::size_t idx = 0;
   std::vector<double> samples;
@@ -890,6 +960,7 @@ template <typename A> void BM_Get(benchmark::State &state) {
   state.counters["ops_per_us"] = benchmark::Counter(
       static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
   attach_jitter(state, samples);
+  pool_ratio.attach(state);
 }
 
 // ──────────────────────────── Del ────────────────────────────────────────────
@@ -948,6 +1019,7 @@ template <typename A, int RangeLen> void BM_Range(benchmark::State &state) {
   static auto keys = A::generate_keys(kDatasetSize);
   static auto val = make_value();
   static auto db = A::open_populated("range", keys, val);
+  const PoolHitRatio<A, typename A::Db> pool_ratio{db};
 
   std::size_t idx = 0;
   std::vector<double> samples;
@@ -969,6 +1041,7 @@ template <typename A, int RangeLen> void BM_Range(benchmark::State &state) {
   state.counters["scans_per_us"] = benchmark::Counter(
       static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
   attach_jitter(state, samples);
+  pool_ratio.attach(state);
 }
 
 
@@ -1099,6 +1172,7 @@ template <typename A> void BM_GetMT(benchmark::State &state) {
   static std::vector<std::byte> shared_val = make_value();
   static auto shared_db =
       std::make_unique<typename A::Db>("get_mt", &shared_keys, &shared_val);
+  const PoolHitRatio<A, typename A::Db> pool_ratio{*shared_db};
 
   const auto thread_offset =
       static_cast<std::size_t>(state.thread_index()) * (kDatasetSize / 8);
@@ -1122,6 +1196,7 @@ template <typename A> void BM_GetMT(benchmark::State &state) {
   state.counters["ops_per_us"] = benchmark::Counter(
       static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
   attach_jitter(state, samples);
+  pool_ratio.attach(state);
 }
 
 // ────────────────────────── Put (multithreaded) ───────────────────────────
@@ -1407,7 +1482,8 @@ void BM_RecoveryParallel(benchmark::State &state) {
 // reflected in throughput counters instead of being hidden by CPU-time.
 #define BENCH(...) BENCHMARK(__VA_ARGS__)->UseRealTime()
 
-using Bc  = BcAdapter;        // mmap (default read path)
+using Bc  = BcAdapter;        // buffer pool, warmed (default read path)
+using BcMmap = BcMmapAdapter;    // mmap (explicit comparison)
 using BcPread = BcPreadAdapter;  // pread (explicit comparison)
 using BcUV = BcUnorderedViewAdapter;
 
@@ -1439,6 +1515,10 @@ BENCH(BM_Del<Bc, true>)           ->Name("ByteCaskDB/Del/Sync");
 BENCH(BM_Get<Bc>)                 ->Name("ByteCaskDB/Get");
 BENCH(BM_Range<Bc, kRangeLen>)    ->Name("ByteCaskDB/Range50");
 BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCaskDB/MixedBatch/Sync");
+
+// --- mmap read path, the bar for the pool's hit path ---
+BENCH(BM_Get<BcMmap>)             ->Name("ByteCaskDB_Mmap/Get");
+BENCH(BM_Range<BcMmap, kRangeLen>)->Name("ByteCaskDB_Mmap/Range50");
 
 // --- UnorderedView ---
 BENCH(BM_Put<BcUV, false>)          ->Name("ByteCaskDB_UnorderedView/Put/NoSync")->Iterations(kDatasetSize);
@@ -1500,6 +1580,12 @@ BENCH(BM_GetMT<BcPread>)           ->Name("ByteCaskDB_Pread/GetMT")     ->Thread
 BENCH(BM_GetMT<BcPread>)           ->Name("ByteCaskDB_Pread/GetMT")     ->Threads(8);
 BENCH(BM_GetMT<BcPread>)           ->Name("ByteCaskDB_Pread/GetMT")     ->Threads(16);
 BENCH(BM_GetMT<BcPread>)           ->Name("ByteCaskDB_Pread/GetMT")     ->Threads(32);
+// --- mmap GetMT ---
+BENCH(BM_GetMT<BcMmap>)            ->Name("ByteCaskDB_Mmap/GetMT")       ->Threads(2);
+BENCH(BM_GetMT<BcMmap>)            ->Name("ByteCaskDB_Mmap/GetMT")       ->Threads(4);
+BENCH(BM_GetMT<BcMmap>)            ->Name("ByteCaskDB_Mmap/GetMT")       ->Threads(8);
+BENCH(BM_GetMT<BcMmap>)            ->Name("ByteCaskDB_Mmap/GetMT")       ->Threads(16);
+BENCH(BM_GetMT<BcMmap>)            ->Name("ByteCaskDB_Mmap/GetMT")       ->Threads(32);
 #ifndef BENCH_NO_ROCKSDB
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(2);
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(4);
