@@ -1278,6 +1278,12 @@ private:
   void execute_slots(std::vector<Slot *> &batch);
 
   // Recovery
+  // Runs recovery, undoing an interrupted vacuum it finds on the way.
+  auto recovery_open(const Options &opts) -> EngineState;
+  // Deletes the compacted file of an interrupted vacuum, or throws if the two
+  // files are not a compacted file and its source.
+  static void recovery_undo_interrupted_vacuum(const std::filesystem::path &a,
+                                               const std::filesystem::path &b);
   // Phase 1: opens all data files, seals them, generates missing hint files.
   auto recovery_prepare_files(EngineState &s)
       -> std::vector<RecoveredFile>;
@@ -1289,15 +1295,17 @@ private:
       -> RecoveryResult;
   // Reconstructs key_dir from hint files. Uses file-level fan-in parallelism
   // when recovery_threads > 1; single-threaded otherwise.
-  auto recovery_load_parallel(EngineState s, unsigned recovery_threads,
-                               bool strict) -> EngineState;
+  auto recovery_load_parallel(EngineState s, std::vector<RecoveredFile> files,
+                              unsigned recovery_threads, bool strict)
+      -> EngineState;
 #ifdef BYTECASK_USE_BTREE
   // Reconstructs key_dir from hint files by range merge. Coupled to the B+
   // tree: it needs the tree to sample its own separators and to bulk-build
   // and concatenate range-disjoint slices. See the definition for why the
   // radix tree wants a different strategy.
-  auto recovery_load_ranged(EngineState s, unsigned recovery_threads,
-                            bool strict) -> EngineState;
+  auto recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
+                            unsigned recovery_threads, bool strict)
+      -> EngineState;
   // Builds a RecoveryResult by merging sorted hint runs into a bulk loader.
   // Requires the sorted hint files flush_hints_for writes.
   static auto recovery_build_sorted(std::span<RecoveredFile> files,
@@ -2420,15 +2428,8 @@ DB::DB(std::filesystem::path dir, Options opts)
   }
 
   try {
-    EngineState s;
     const auto recovery_start = std::chrono::steady_clock::now();
-#ifdef BYTECASK_USE_BTREE
-    s = recovery_load_ranged(std::move(s), opts.recovery_threads,
-                             opts.fail_recovery_on_crc_errors);
-#else
-    s = recovery_load_parallel(std::move(s), opts.recovery_threads,
-                               opts.fail_recovery_on_crc_errors);
-#endif
+    auto s = recovery_open(opts);
     const auto recovery_end = std::chrono::steady_clock::now();
     counters_.recovery_duration_us =
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3459,6 +3460,11 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
 // continue via their open fds (POSIX: pread succeeds on unlinked files).
 void DB::vacuum_unlink_old_file(
     const std::shared_ptr<const EngineState> &snap, std::uint32_t file_id) {
+#ifdef BYTECASK_TESTING
+  // The state is committed and the compacted file is on disk; failing here
+  // is the kill inside vacuum's publish window, with the source left behind.
+  FAULT_INJECTION(io_vacuum_compact_unlink);
+#endif
   auto old_data_file = *snap->files.get(file_id);
   auto old_hint_path =
       dir_ / (old_data_file->path().stem().string() + ".hint");
@@ -4101,6 +4107,143 @@ void DB::validate_state_consistency(const EngineState &s) const {
 
 #pragma region Recovery
 
+namespace {
+
+// True if every committed entry of `copy` appears in `source`, in order, with
+// the same sequence, type, key and value. Reads both files end to end; only
+// called for two files whose sequences overlap, which a healthy directory
+// never has.
+auto is_compaction_of(const std::filesystem::path &copy,
+                      const std::filesystem::path &source) -> bool {
+  const auto copy_file = openDataFileForRead(copy);
+  const auto source_file = openDataFileForRead(source);
+  auto src = scan_committed(*source_file);
+  auto it = src.begin();
+  for (const auto &[entry, entry_off] : scan_committed(*copy_file)) {
+    for (;; ++it) {
+      if (it == std::default_sentinel) return false;
+      const auto &cand = (*it).first;
+      if (cand.sequence > entry.sequence) return false;
+      if (cand.sequence == entry.sequence &&
+          cand.entry_type == entry.entry_type && cand.key == entry.key &&
+          cand.value == entry.value) {
+        ++it;
+        break;
+      }
+    }
+  }
+  return true;
+}
+
+// The first two files whose sequence ranges overlap, by id. Every file is
+// sequence-disjoint from every other (D18) except for what an interrupted
+// vacuum leaves, so this is nullopt on every healthy open.
+auto find_sequence_overlap(const EngineState &s)
+    -> std::optional<std::pair<std::uint32_t, std::uint32_t>> {
+  struct Range {
+    std::uint64_t min, max;
+    std::uint32_t file_id;
+  };
+  std::vector<Range> ranges;
+  for (const auto [fid, fs] : s.file_stats) {
+    if (fs.min_sequence > 0) {
+      ranges.push_back({fs.min_sequence, fs.max_sequence, fid});
+    }
+  }
+  std::ranges::sort(ranges, {}, &Range::min);
+  const Range *widest = nullptr;
+  for (const auto &r : ranges) {
+    if (widest != nullptr && r.min <= widest->max) {
+      return std::pair{widest->file_id, r.file_id};
+    }
+    if (widest == nullptr || r.max > widest->max) widest = &r;
+  }
+  return std::nullopt;
+}
+
+} // namespace
+
+// Recovery, with one repair: the compacted file of an interrupted vacuum is
+// deleted and recovery runs again. Vacuum renames its compacted file into
+// place, commits, and only then unlinks the source, so a kill in between
+// leaves both on disk under the same sequences. Recovery stops on that — by
+// SequenceOverlap as soon as two files claim one key under one sequence, or
+// by the file ranges check once it is done, for a pair that shares no key —
+// and recovery_undo_interrupted_vacuum decides what the pair is. Each pass
+// removes one file or throws, so this ends. A healthy open runs one pass and
+// pays only for the ranges check, which is over files, not keys. See
+// docs/vacuum_crash_recovery_design.md.
+auto DB::recovery_open(const Options &opts) -> EngineState {
+  for (;;) {
+    std::filesystem::path a;
+    std::filesystem::path b;
+    {
+      EngineState s;
+      auto files = recovery_prepare_files(s);
+      // Maps the file ids in a SequenceOverlap back to paths once s is gone.
+      const auto registered = s.files;
+      const auto path_of = [&](std::uint32_t id) {
+        return (*registered.get(id))->path();
+      };
+      try {
+#ifdef BYTECASK_USE_BTREE
+        s = recovery_load_ranged(std::move(s), std::move(files),
+                                 opts.recovery_threads,
+                                 opts.fail_recovery_on_crc_errors);
+#else
+        s = recovery_load_parallel(std::move(s), std::move(files),
+                                   opts.recovery_threads,
+                                   opts.fail_recovery_on_crc_errors);
+#endif
+        const auto overlap = find_sequence_overlap(s);
+        if (!overlap) return s;
+        a = path_of(overlap->first);
+        b = path_of(overlap->second);
+      } catch (const SequenceOverlap &e) {
+        a = path_of(e.file_a);
+        b = path_of(e.file_b);
+      }
+    }
+    recovery_undo_interrupted_vacuum(a, b);
+    // The next pass numbers files afresh, so an id can now name a different
+    // file. The pool keys frames by id; a fresh one holds none of the old.
+    if (pool_) pool_ = std::make_shared<BufferPool>(opts.buffer_pool);
+  }
+}
+
+// Two files hold entries under the same sequences. The one shape the engine
+// produces is vacuum's: a compacted file C and its source S, both on disk
+// because the kill came between the rename and the unlink. Vacuum is
+// committed on disk only once S is gone, so C is unfinished work and is
+// deleted — as recovery already deletes a leftover .data.tmp. That is safe on
+// exactly what is checked here, that every entry of C is also in S: nothing
+// is lost. Deleting S instead would also assume S's other entries are dead,
+// which nothing here proves. Anything that is not such a pair is corruption.
+void DB::recovery_undo_interrupted_vacuum(const std::filesystem::path &a,
+                                          const std::filesystem::path &b) {
+  // C holds a subset of S, so it is never the larger file. Two files of one
+  // size that pass are identical, and either may go.
+  const auto a_smaller =
+      std::filesystem::file_size(a) <= std::filesystem::file_size(b);
+  const auto &copy = a_smaller ? a : b;
+  const auto &source = a_smaller ? b : a;
+  if (!is_compaction_of(copy, source)) {
+    throw std::runtime_error{std::format(
+        "bytecask: corrupt database — data files '{}' and '{}' hold entries "
+        "under the same sequence numbers, and neither is a compacted copy of "
+        "the other",
+        a.string(), b.string())};
+  }
+  std::fprintf(stderr,
+               "bytecask: removing '%s', the compacted copy of '%s' left by "
+               "an interrupted vacuum\n",
+               copy.string().c_str(), source.string().c_str());
+  auto hint = copy;
+  hint.replace_extension(".hint");
+  std::filesystem::remove(hint);
+  std::filesystem::remove(copy);
+}
+
 // Phase 1 shared by serial and parallel recovery: remove stale .hint.tmp
 // files, open all data files, seal them, register in s.files, and
 // generate missing hint files. Returns the RecoveredFile list.
@@ -4114,15 +4257,20 @@ auto DB::recovery_prepare_files(EngineState &s)
     }
   }
 
+  // Name order, so file ids are a function of the directory's contents and
+  // not of the order the filesystem lists it in.
+  std::vector<std::filesystem::path> data_paths;
+  for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
+    if (dir_entry.path().extension() == ".data") {
+      data_paths.push_back(dir_entry.path());
+    }
+  }
+  std::ranges::sort(data_paths);
+
   std::vector<RecoveredFile> files;
   auto files_t = s.files.transient();
 
-  for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
-    const auto &p = dir_entry.path();
-    if (p.extension() != ".data") {
-      continue;
-    }
-
+  for (const auto &p : data_paths) {
     const auto file_id = s.next_file_id++;
     auto data_file =
         openDataFileForRead(p, io_backend_, pool_, file_id);
@@ -4268,6 +4416,9 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
           }
         }
       }
+    } catch (const SequenceOverlap &) {
+      // Not a damaged file to skip: recovery_open resolves or rejects it.
+      throw;
     } catch (const std::exception &e) {
       if (strict) throw;
       std::fprintf(stderr,
@@ -4365,11 +4516,11 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 // Parallel recovery: file-level partitioning with sequential accumulator merge.
 // Round-robin assigns files to W workers, each builds a RecoveryResult,
 // then results are merged one-at-a-time into an accumulator as workers finish.
-auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
-                                bool strict) -> EngineState {
+auto DB::recovery_load_parallel(EngineState s,
+                                std::vector<RecoveredFile> files,
+                                unsigned recovery_threads, bool strict)
+    -> EngineState {
   RecoveryPhaseLog plog;
-  auto files = recovery_prepare_files(s);
-  plog.mark("prepare_files");
 
   if (files.empty()) {
     return s;
@@ -4466,10 +4617,16 @@ auto DB::recovery_load_parallel(EngineState s, unsigned recovery_threads,
     queue.push_back(std::move(acc));
   }
 
-  // Threads are joined. Propagate any worker exceptions now.
+  // Threads are joined. Propagate any worker exceptions now. A
+  // SequenceOverlap propagates in both modes: it is not a file to skip.
   for (const auto &err : worker_errors) {
-    if (err) {
-      if (strict) std::rethrow_exception(err);
+    if (!err) continue;
+    try {
+      std::rethrow_exception(err);
+    } catch (const SequenceOverlap &) {
+      throw;
+    } catch (...) {
+      if (strict) throw;
       // lenient: warning already emitted inside recovery_build_from_hints
     }
   }
@@ -4753,11 +4910,10 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
 // to the overlap rather than to N. Rebuilding the key set into range slices
 // would throw that away, which is why the radix path keeps the pairwise fold.
 // ---------------------------------------------------------------------------
-auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
-                              bool strict) -> EngineState {
+auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
+                              unsigned recovery_threads, bool strict)
+    -> EngineState {
   RecoveryPhaseLog plog;
-  auto files = recovery_prepare_files(s);
-  plog.mark("prepare_files");
   if (files.empty()) {
     return s;
   }
@@ -4770,6 +4926,10 @@ auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
   if (W == 0) W = 1;
 #endif
 
+  // Runs body(0..n) on n threads. An exception leaving a std::thread is
+  // std::terminate, so each thread catches its own and the first is rethrown
+  // here once every thread is joined: a failure in any phase — the range
+  // merge's SequenceOverlap among them — is an exception from DB::open.
   auto parallel_for = [](unsigned n, auto &&body) {
 #ifdef BYTECASK_SINGLE_THREADED
     for (unsigned i = 0; i < n; ++i) body(i);
@@ -4778,10 +4938,23 @@ auto DB::recovery_load_ranged(EngineState s, unsigned recovery_threads,
       if (n == 1) body(0);
       return;
     }
-    std::vector<std::jthread> threads;
-    threads.reserve(n);
-    for (unsigned i = 0; i < n; ++i)
-      threads.emplace_back([&body, i] { body(i); });
+    std::vector<std::exception_ptr> errors(n);
+    {
+      std::vector<std::jthread> threads;
+      threads.reserve(n);
+      for (unsigned i = 0; i < n; ++i) {
+        threads.emplace_back([&body, &errors, i] {
+          try {
+            body(i);
+          } catch (...) {
+            errors[i] = std::current_exception();
+          }
+        });
+      }
+    }
+    for (const auto &err : errors) {
+      if (err) std::rethrow_exception(err);
+    }
 #endif
   };
 

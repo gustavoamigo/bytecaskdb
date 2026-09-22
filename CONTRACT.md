@@ -408,6 +408,17 @@ written and renamed:
 - The new file exists on disk but is unreferenced by `key_dir`.
 - Recovery or next vacuum must handle it.
 
+If the process is killed anywhere between the rename and the unlink of the
+old file — before or after the commit:
+
+- Both files are on disk with the same entries under the same sequences.
+- The next open must succeed with every key the old file held, and must
+  leave sequence-disjoint files: recovery deletes the new file, undoing the
+  vacuum, once it has checked that every entry of the new file is in the
+  old one.
+- Two files that share sequences and fail that check must make `DB::open`
+  throw, with nothing deleted.
+
 ### Stale File Safety
 
 The old data file must remain readable through any in-flight reader

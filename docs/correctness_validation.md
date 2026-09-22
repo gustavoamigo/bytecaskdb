@@ -671,10 +671,10 @@ fault points.
 
 This directly proves: *resume always eventually recovers once the underlying fault clears.*
 
-### vacuum_compact — 40 tests
+### vacuum_compact — 48 tests
 
-40 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover eight state
-shapes × five failure classes (SUCCESS, VC1–VC4).
+48 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover eight state
+shapes × six failure classes (SUCCESS, VC1–VC5).
 
 State shapes create a DB with exactly one sealed file having fragmentation > 0:
 
@@ -710,13 +710,26 @@ sealed file.
 
 Failure classes: SUCCESS, VC1 (`io_vacuum_compact_tmp_create`),
 VC2 (`io_data_file_append`), VC3 (`io_data_file_sync`),
-VC4 (`io_vacuum_compact_rename`).
+VC4 (`io_vacuum_compact_rename`), VC5 (`io_vacuum_compact_unlink`).
 
 VC4 is the most critical: the tmp file is fully synced and renamed
 (a new `.data` file exists on disk) but `vacuum_commit` has not run —
 the old file is still in the published state. `assert_vacuum_recoverable`
 confirms that recovery does not replay the orphaned new file as a
 secondary source and sees only the data the old file guaranteed.
+
+VC5 is the other side of the commit: `vacuum_commit` has run, so in memory
+the outcome is success (`assert_vacuum_success`), but the source was never
+unlinked. On disk that is a compacted file and its source holding the same
+entries under the same sequences — what a kill anywhere between the rename
+and the unlink leaves, a window that spans the compacted file's hint scan.
+Recovery undoes the vacuum by deleting the compacted file.
+`assert_vacuum_recoverable` proves the directory opens with every key and,
+for every class, that the recovered files are sequence-disjoint. Before
+recovery handled this pair, every VC5 test failed with "two entries share
+the same sequence number but differ in physical location", which is how a
+cgroup OOM kill under a write-heavy sysbench run left a database that would
+not open.
 
 ### prove_replication — 211 tests
 

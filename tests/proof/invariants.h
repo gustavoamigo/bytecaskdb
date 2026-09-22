@@ -17,6 +17,7 @@
 #include <map>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bytecask::testing {
@@ -482,6 +483,18 @@ inline void assert_vacuum_recoverable(const std::filesystem::path &dir,
   // but the data file recovery reads them back from must still carry them.
   assert_structural_entries_preserved(recovered, before);
   assert_consistent(recovered);
+  // D18: whatever vacuum left on disk, recovery hands back sequence-disjoint
+  // files. VC5 leaves a compacted file and its source overlapping; recovery
+  // must have deleted one of them.
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+  for (const auto &[fid, fs] : recovered.file_stats()) {
+    if (fs.min_sequence > 0) ranges.emplace_back(fs.min_sequence, fs.max_sequence);
+  }
+  std::ranges::sort(ranges);
+  for (std::size_t i = 1; i < ranges.size(); ++i) {
+    INFO("file sequence ranges must be disjoint after recovery");
+    CHECK(ranges[i - 1].second < ranges[i].first);
+  }
 }
 
 // ---- Replication helpers ----------------------------------------------------

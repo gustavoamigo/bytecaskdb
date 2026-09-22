@@ -135,14 +135,35 @@ export struct KeyDirEntry {
 };
 static_assert(sizeof(KeyDirEntry) == 16);
 
+// Two data files hold entries under the same sequence number. Recovery throws
+// this to stop at the first sign of it; DB::recovery_open catches it and
+// decides whether the pair is what an interrupted vacuum leaves.
+export class SequenceOverlap : public std::runtime_error {
+public:
+  SequenceOverlap(std::uint32_t a, std::uint32_t b)
+      : std::runtime_error{"bytecask: corrupt database — two data files hold "
+                           "entries under the same sequence number"},
+        file_a{a}, file_b{b} {}
+  SequenceOverlap(const SequenceOverlap &) = default;
+  auto operator=(const SequenceOverlap &) -> SequenceOverlap & = default;
+  ~SequenceOverlap() override;
+
+  std::uint32_t file_a;
+  std::uint32_t file_b;
+};
+
+SequenceOverlap::~SequenceOverlap() = default;
+
 // Canonical key-ownership comparator. Returns true if `a` is strictly newer
 // than `b`. Sequence numbers are unique per logical write, so equal sequences
-// must point to the same physical record. If they don't, the database is
-// corrupt and recovery is aborted.
+// must point to the same physical record. Two files under one sequence throw
+// SequenceOverlap; two offsets in one file are corruption outright.
 export inline auto kde_newer(const KeyDirEntry &a, const KeyDirEntry &b) -> bool {
   if (a.sequence() != b.sequence()) return a.sequence() > b.sequence();
-  // Same sequence — must be the same physical record.
-  if (a.file_id() != b.file_id() || a.file_offset() != b.file_offset()) {
+  if (a.file_id() != b.file_id()) {
+    throw SequenceOverlap{a.file_id(), b.file_id()};
+  }
+  if (a.file_offset() != b.file_offset()) {
     throw std::runtime_error(
         "bytecask: corrupt database — two entries share the same sequence "
         "number but differ in physical location");
