@@ -1290,8 +1290,15 @@ TEST_CASE("DB vacuum: a damaged sealed file is not compacted away",
     // Overwrite half of them so the first file qualifies for compaction.
     for (int i = 0; i < 4; ++i)
       db.put({.sync = true}, to_bytes(std::format("a{}", i)), to_bytes("xx"));
-    REQUIRE(list_hint_files(db_path).size() >= 1);
-
+  }
+  // The sealed file's hint is written by a background worker after rotation,
+  // which would otherwise race the damage below: it scans the same file and
+  // could meet the flipped byte first. A close writes it synchronously, so
+  // from here on the file is indexed and nothing else reads it.
+  REQUIRE(std::filesystem::exists(
+      db_path / (victim.stem().string() + ".hint")));
+  {
+    auto db = bytecask::DB::open(db_path, opts);
     const auto size_before = std::filesystem::file_size(victim);
     flip_byte(victim, 5 * 23 + 15);  // a5's key, a live entry
 
