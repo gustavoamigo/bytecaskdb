@@ -326,6 +326,13 @@ And one for the window a completed rename opens:
     before `vacuum_commit()` in `vacuum_compact_file()`. See *Orphaned
     `.data` files* for what it reproduces and why no cell asserts it yet.
 
+And one on the read side, for the scan `resume()` runs:
+
+14. `io_data_file_scan` — before the header `pread()` in the active file's
+    `scan()`. An I/O error there says nothing about the bytes, so
+    `resume()` must rethrow it rather than read it as the end of the file
+    and truncate; `[degraded][resume]` holds it to that.
+
 ### Orphaned BulkBegin degrade
 
 If a multi-entry batch fails mid-write after `BulkBegin`, the engine

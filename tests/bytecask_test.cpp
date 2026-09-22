@@ -4391,6 +4391,37 @@ TEST_CASE("resume() discards pending batch on CRC error in active file",
   CHECK(db.contains_key({}, to_bytes("k3")));
 }
 
+// An I/O error while resume() scans the active file says nothing about the
+// bytes, so it must not be read as the end of the file: truncating there
+// would cut acknowledged data over a fault the next attempt may not see.
+// resume() rethrows it unchanged, truncates nothing, and a retry once the
+// fault clears trims only the failed write's tail.
+TEST_CASE("resume() rethrows an I/O error from its scan and truncates nothing",
+          "[degraded][resume]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+
+  const auto offsets = degrade_with_unsynced_batch(db, dir);
+  REQUIRE(offsets.size() == 6);  // k1, k2, BulkBegin, b1, b2, BulkEnd
+  const auto size_before = std::filesystem::file_size(active_data_file(dir));
+
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_scan"};
+    REQUIRE_THROWS_AS(db.resume(), std::system_error);
+  }
+  CHECK(db.is_degraded());
+  CHECK(std::filesystem::file_size(active_data_file(dir)) == size_before);
+
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  CHECK(get_str(db, to_bytes("k1")) == "v1");
+  CHECK(get_str(db, to_bytes("k2")) == "v2");
+}
+
 TEST_CASE("resume() does not trust an entry size that runs past the file",
           "[degraded][resume]") {
   TempDir td;

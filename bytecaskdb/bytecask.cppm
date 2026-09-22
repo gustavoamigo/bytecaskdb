@@ -3730,7 +3730,8 @@ void DB::resume() {
     // end of the last committed entry or batch before it; whether that is
     // a torn tail to trim or damage to refuse is decided below.
   }
-
+  const auto active_stats = current->file_stats.get(old_file_id);
+  const auto published_extent = active_stats ? active_stats->total_bytes : 0;
   // resume() trims what a failed write left behind: bytes appended but never
   // published. Everything below the published extent was acknowledged, and a
   // scan that stops short of it has found damage in data readers have
@@ -3740,8 +3741,6 @@ void DB::resume() {
   // This is detection, not repair: resume() makes no promise about what a
   // damaged file still holds, only that it will not truncate acknowledged
   // bytes or report success over them.
-  const auto active_stats = current->file_stats.get(old_file_id);
-  const auto published_extent = active_stats ? active_stats->total_bytes : 0;
   if (valid_offset < published_extent) {
     throw std::runtime_error{std::format(
         "resume: active file '{}' is damaged at offset {}, inside data "
