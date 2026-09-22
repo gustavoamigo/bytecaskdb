@@ -12,6 +12,7 @@ Usage:
                        regular: 10k, 50k  |  recovery: 50k, 1M
     --skip-build       Skip the xmake release build step.
     --tmpdir DIR       Override TMPDIR for benchmark data (default: ./.tmp).
+                       Hardware info is reported for this path's disk.
     --from-json <dir>  Regenerate the report from previously saved JSON files
                        (skips build and benchmark execution entirely).
 
@@ -86,10 +87,15 @@ def build(skip: bool) -> None:
 # Hardware info
 # ---------------------------------------------------------------------------
 
-def gather_hw_info() -> str:
+def gather_hw_info(target: Path) -> str:
+    """Describe the disk backing *target*, where the benchmarks actually write.
+
+    Passing the path matters: with --tmpdir pointing at another drive, probing
+    the repo's own disk instead would report hardware the run never touched.
+    """
     script = REPO_ROOT / "scripts" / "sys-info.sh"
     result = subprocess.run(
-        ["bash", str(script)],
+        ["bash", str(script), str(target)],
         capture_output=True,
         text=True,
         cwd=REPO_ROOT,
@@ -850,14 +856,14 @@ def main() -> None:
     mode = "Quick" if quick else "Full"
 
     print(f"\n=== ByteCaskDB Benchmark Showcase [{mode}] ===\n")
-    TMPDIR.mkdir(exist_ok=True)
+    TMPDIR.mkdir(parents=True, exist_ok=True)
 
     try:
         build(skip_bld)
         commit = git_commit()
 
         print("=== Gathering hardware information ===")
-        hw = gather_hw_info()
+        hw = gather_hw_info(TMPDIR)
         print(hw)
         print()
 
