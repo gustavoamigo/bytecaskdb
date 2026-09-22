@@ -434,13 +434,19 @@ done
 #            flushing, so a short run against a dataset that fits its buffer
 #            pool writes redo only and settles the B-tree here. Ignoring this
 #            column makes InnoDB look like it writes far less than it does.
-#   engMiB — engine-reported. Blank when the engine's build does not maintain
-#            its data-file counters: MariaDB 10.11 leaves Innodb_data_written,
-#            Innodb_pages_written and Innodb_buffer_pool_pages_flushed all at
-#            zero, so only redo is visible and a figure there would understate
-#            InnoDB by ~99%. ByteCaskDB's bytes_written is real but counts
-#            committed appends only — not vacuum, hint files or zero-fill-ahead.
-#            A diagnostic per engine, never a cross-engine ratio.
+#   engMiB — engine-reported, and what each engine counts differs enough that
+#            it is a per-engine diagnostic, never a cross-engine ratio:
+#              ByteCaskDB  committed appends only — not vacuum, hint files or
+#                          zero-fill-ahead (~6x below the device figure).
+#              RocksDB     the WAL/memtable path only — compaction is excluded
+#                          (~70-100x below the device figure).
+#              InnoDB      blank. MariaDB 10.11 leaves Innodb_data_written,
+#                          Innodb_pages_written and
+#                          Innodb_buffer_pool_pages_flushed all at zero, so only
+#                          redo is visible; a figure there would understate it
+#                          by ~99% (6 MiB against 518 MiB at the device).
+#            Compare wMiB across engines. Use engMiB only to see how much of an
+#            engine's own accounting reaches the disk.
 # ---------------------------------------------------------------------------
 echo ""
 io_fmt="%-22s %4s"

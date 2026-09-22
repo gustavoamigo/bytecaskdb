@@ -258,11 +258,23 @@ echo "    Data root: $DATA_ROOT"
 echo ""
 
 # Append across runs so a long-run history accumulates; the timestamp column
-# separates runs. The header is written only when the file is new — a CSV from
-# before write_mib/eng_write_mib existed keeps its old header, so start a new
-# file (or --out) rather than mixing column counts.
+# separates runs. An existing file must already have this exact layout —
+# appending rows with a different column count under someone else's header
+# silently misaligns every field, and the file looks fine until something
+# tries to read it.
+CSV_HEADER="timestamp,engine,workload,threads,elapsed_s,report_threads,tps,qps,lat95_ms,err_per_s,write_mib,eng_write_mib"
 if [[ ! -s "$RESULTS_CSV" ]]; then
-  echo "timestamp,engine,workload,threads,elapsed_s,report_threads,tps,qps,lat95_ms,err_per_s,write_mib,eng_write_mib" > "$RESULTS_CSV"
+  echo "$CSV_HEADER" > "$RESULTS_CSV"
+else
+  existing_header="$(head -1 "$RESULTS_CSV")"
+  if [[ "$existing_header" != "$CSV_HEADER" ]]; then
+    echo "ERROR: $RESULTS_CSV already exists with a different column layout." >&2
+    echo "  expected: $CSV_HEADER" >&2
+    echo "  found:    $existing_header" >&2
+    echo "  Appending would misalign every row against that header. Move the file" >&2
+    echo "  aside, or pass --out=PATH to write somewhere new." >&2
+    exit 1
+  fi
 fi
 
 if engine_enabled bytecaskdb; then
