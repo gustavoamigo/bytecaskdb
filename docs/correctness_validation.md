@@ -719,6 +719,76 @@ the old file is still in the published state. `assert_vacuum_recoverable`
 confirms that recovery does not replay the orphaned new file as a
 secondary source and sees only the data the old file guaranteed.
 
+### group_commit — 22 tests
+
+22 generated Catch2 tests (`[prove_group]` + `[concurrency]` tags) cover
+six group shapes × the failure classes valid for each. Every other matrix
+in this framework drives one thread; these are the cells where group
+commit — a writer that finds no leader becomes one and executes every
+pending write under a single lock hold — is faulted with more than one
+writer in play.
+
+#### What turned out not to need building
+
+#118 proposed tagging each slot with its own fault, on the premise that a
+follower's I/O could be failed while the leader's succeeded. The write
+path does not work that way. `execute_slot` is pure in-memory — it
+contains no append or sync call at all — and `execute_slots` issues **one**
+`append_entries` for every slot's entries combined and **one** `fdatasync`.
+There is no per-slot I/O boundary to fail, so "fail writer B's slot while
+A leads" is not a state the engine can be in, and the cells that issue
+proposed for it are struck rather than deferred.
+
+What is left is group-wide, and the thread-local injector reaches it as it
+stands. `WriteGroup` already carries `on_leader_start_` and
+`wait_for_queue_size`, so a cell forces a batch of exactly N deterministically
+rather than racing for it.
+
+#### Where a fault has to be armed
+
+Not one answer, and the difference is what made the first draft of these
+cells flaky:
+
+| Call | Thread that makes it |
+|------|---------------------|
+| the group's combined `append_entries` (B1, B2) | the leader, under `write_mu_` |
+| rotation `fdatasync` and file creation (G, H) | the leader, inline — the rotation branch takes the flush role itself |
+| the commit `fdatasync` (F) | **not the leader** |
+
+On the non-rotation path `execute_slots` ends at `store_head()` and
+returns; the flush is left to `flush_pending()`, run by whichever writer
+holds the `FlushRole`. Arming only the leader made the F cells pass or
+fail by race. They arm every writer thread instead, which is also the
+truer question: when the group's `fdatasync` fails, every writer in it
+must learn, whoever ran it.
+
+#### Group shapes
+
+| Shape | Writers | Plans | What it tests |
+|-------|--------:|-------|---------------|
+| `group_of_2`, `group_of_4` | 2, 4 | 1 put each | The combined append and flush for a small and a larger group |
+| `group_of_2_batched`, `group_of_4_batched` | 2, 4 | 2 puts each | The same with a `BulkBegin`/`BulkEnd` pair per writer, so all-or-nothing is asked of batches rather than single entries |
+| `group_of_2_rotation`, `group_of_4_rotation` | 2, 4 | 1 put each, `max_file_bytes = 1` | The rotation barrier with a group behind it — G and H |
+
+Two elimination rules: G and H need the rotation shapes, and the rotation
+shapes are not crossed with B1/B2/F — those would re-ask what the
+non-rotation shapes ask against a fault point that fires at a different
+call in the sequence, which says nothing new about grouping.
+
+#### What every cell asserts
+
+The group shares one append and one `fdatasync`, so the engine has no way
+to tell one writer its write landed and another that it did not. Each cell
+checks that every writer saw the same outcome, that the group's keys are
+all visible or none are, and — since `store_state(published, …)` runs
+before the errors are set in the H path but not in the others — which side
+of that line the class falls on. Degraded cells then resume and end in
+`assert_matches_recovery` like the rest of the framework.
+
+All 22 pass, and passed 8 consecutive runs before being committed. They
+found no engine bug; what they add is that the mechanism is now covered
+at all, and the record of who performs which call.
+
 ### prove_replication — 211 tests
 
 211 generated Catch2 tests (`[prove_repl]` + `[prove_manifest]` tags) cover
@@ -838,6 +908,15 @@ write on new leader → backward sync → verify convergence).
 | `fault_point_resolver.py` | Maps failure class → fault checkpoint name |
 | `expected_delta.py` | Reference model: keys present/absent after all resume calls |
 | `generate_tests.py` | Generates `prove_resume.cpp` |
+
+**group_commit module** (`tests/proof/group_commit/`):
+
+| File | Role |
+|------|------|
+| `scenario_matrix.py` | GroupShape (size, multi-op, rotation), GroupFailureClass (SUCCESS, B1, B2, F, G, H), validity filter |
+| `fault_point_resolver.py` | Maps failure class → fault checkpoint, and to which threads it is armed |
+| `expected_delta.py` | Reference model: did every writer throw, are the group's keys visible, is the engine degraded |
+| `generate_tests.py` | Generates `prove_group_commit.cpp` |
 
 **vacuum_compact module** (`tests/proof/vacuum_compact/`):
 
@@ -982,7 +1061,7 @@ are covered by the 178 `[prove_repl]` tests. All three manifest failure
 classes across 11 state shapes are covered by the 33 `[prove_manifest]`
 tests. Four elimination rules reduce the full matrix to 211 valid tests.
 
-Total generated proof tests: **2183**.
+Total generated proof tests: **2205**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
@@ -1139,6 +1218,7 @@ tests/
       prove_apply_batch.cpp     ← generated, never hand-edited
       prove_resume.cpp             ← generated, never hand-edited
       prove_vacuum_compact.cpp     ← generated, never hand-edited
+      prove_group_commit.cpp       ← generated, never hand-edited
       prove_replication.cpp        ← generated, never hand-edited
 ```
 
