@@ -295,8 +295,14 @@ prepare() {  # <storage engine> <base dir>
   # does, so their tables are identical: ids 1..ROWS with no gaps, which is
   # what sysbench's id draws assume. ByteCaskDB loads unpooled and unlimited;
   # the back-end and the limit only matter for the measured runs.
+  local vacuum_fast_since=0
   if [[ $engine == bytecaskdb ]]; then
     start_db bytecaskdb pread 0 0 "$base"
+    # Shortened before the load, not after it: the vacuum thread applies a
+    # new interval only when its current sleep ends, and the sleep after its
+    # first pass (nothing to do yet) is the configured 30 s.
+    mariadb --socket="$SOCKET" -u root -e "SET GLOBAL bytecaskdb_vacuum_idle_interval_ms = 200"
+    vacuum_fast_since=$SECONDS
   else
     start_db innodb innodb $((4 * 1024 * 1024 * 1024)) 0 "$base"
   fi
@@ -310,12 +316,11 @@ prepare() {  # <storage engine> <base dir>
     # so ByteCaskDB's files end the prepare holding the pre-copy table as dead
     # data (~2.4 GB at 10 M rows). Reclaim it now, or the background vacuum
     # does it during the first measured cell. Vacuum reclaims one file per
-    # pass and sleeps its idle interval after a pass with nothing to do; that
-    # interval is shortened for this server only, so "reclaimed has not moved
-    # for five seconds" means there is nothing left.
-    mariadb --socket="$SOCKET" -u root -e "SET GLOBAL bytecaskdb_vacuum_idle_interval_ms = 200"
+    # pass and, with the idle interval shortened above, retries every 200 ms
+    # once there is nothing to do — so "reclaimed has not moved for five
+    # seconds", once the old 30 s sleep is certainly over, means nothing is left.
     local prev=-1 cur still=0
-    while (( still < 5 )); do
+    while (( still < 5 || SECONDS - vacuum_fast_since < 35 )); do
       sleep 1
       cur=$(engine_stat vacuum_bytes_reclaimed)
       if [[ $cur == "$prev" ]]; then still=$((still + 1)); else still=0; fi
