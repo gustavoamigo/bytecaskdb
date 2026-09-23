@@ -37,10 +37,18 @@ import bytecask.util;
 
 namespace bytecask {
 
-// The O_DIRECT alignment unit and the device transfer minimum, so read
-// amplification over a bare pread is approximately zero — the kernel already
-// reads a page minimum today.
+// The O_DIRECT alignment unit and the device transfer minimum: the pool
+// caches, evicts and serves hits in frames of this size.
 export inline constexpr std::size_t kPoolFrameBytes = 4096;
+
+// While the pool has free frames, a miss is filled a block at a time: the
+// file-aligned block around it is read in one O_DIRECT read and every whole
+// frame in it admitted. Frame-sized fills leave a cold pool warming one 4 KiB
+// read per miss — sysbench on a 2.8 GB dataset spent whole minutes cold, and
+// on SATA each of those reads queued behind the commit's cache flush. 128 KiB
+// is the kernel's default readahead, the rate the page-cache backends warm at.
+export inline constexpr std::size_t kPoolFillBlockBytes = 128 * 1024;
+static_assert(kPoolFillBlockBytes % kPoolFrameBytes == 0);
 
 export struct BufferPoolOptions {
   // TOTAL footprint — frames and the index table both come out of it, so
@@ -698,6 +706,27 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
     }
   };
 
+  // Widens a run of missing frames to the fill blocks it touches, while the
+  // pool has free frames. Blocks are how a cold pool warms; in a full one
+  // each block's neighbours would evict frames that earned their place — at
+  // a pool a tenth of a Zipf dataset, block fills cut throughput 5x. The
+  // resident count is read without the lock: it only grows until the pool is
+  // full, and a stale value picks a fill size, never a correctness outcome.
+  // A pool too small for a block to pass the oversize guard fills frames
+  // only, or one miss would evict the frames it had just admitted. Frames of
+  // the block already resident are read again and not re-admitted; fill_run
+  // clips the block to the file.
+  const auto fill_missing = [&](std::uint64_t a, std::uint64_t b) {
+    if (kPoolFillBlockBytes <= oversize_limit_ &&
+        counters_.frames_resident.load(std::memory_order_relaxed) <
+            counters_.frames_total) {
+      constexpr auto kBlockFrames = kPoolFillBlockBytes / kPoolFrameBytes;
+      a = a / kBlockFrames * kBlockFrames;
+      b = (b / kBlockFrames + 1) * kBlockFrames - 1;
+    }
+    fill_run(a, b);
+  };
+
   // Serve every resident frame from the pool and read only the runs of
   // frames that are not. A value of many frames with one evicted costs one
   // small read, not the whole value again — which matters exactly when
@@ -708,7 +737,7 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
   for (auto f = first; f <= last; ++f) {
     if (copy_out(make_key(file_id, f), f, offset, len, dst)) {
       if (in_run) {
-        fill_run(run_start, f - 1);
+        fill_missing(run_start, f - 1);
         in_run = false;
       }
     } else if (!in_run) {
@@ -717,7 +746,7 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
       any_miss = true;
     }
   }
-  if (in_run) fill_run(run_start, last);
+  if (in_run) fill_missing(run_start, last);
   (any_miss ? counters_.misses : counters_.hits).add(1);
 }
 

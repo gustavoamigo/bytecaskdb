@@ -27,12 +27,13 @@ Eviction     CLOCK over the index, test-then-set reference bit, skips pinned fra
 Writers      one mutex for every change to the index or a frame's bytes
 Active file  fully resident, inserted by the writer on append, never evicted
 Sealed files O_DIRECT fills through a second descriptor
+Fills        while frames are free, a miss reads the file-aligned 128 KiB block around it; once full, only the frames it needs
 CRC          unchanged — verified per entry, per read
 Scans        bypass the pool
 Oversize     an entry over capacity/8 is read straight to the caller, never admitted
 ```
 
-4 KiB frames because that is the `O_DIRECT` alignment unit and the device transfer minimum, so read amplification over a bare `pread` is approximately zero. An entry spanning several frames is resolved as several independent lookups; misses coalesce into one read of the frame-aligned extent.
+4 KiB frames because that is the `O_DIRECT` alignment unit and the device transfer minimum: the pool caches, evicts and serves hits a frame at a time. It does not *fill* a frame at a time while it is warming: until every frame is in use, a miss reads the 128 KiB block of the file around it — the kernel's default readahead, the rate the page-cache back-ends warm at — because frame-sized fills leave a cold pool warming one 4 KiB read per miss (§8). Once the pool is full, a miss reads only the frames it needs, as before. An entry spanning several frames is resolved as several independent lookups; each run of missing frames is one read, widened to the blocks it touches.
 
 **The slot is the only metadata.** Key, frame number, reference bit and version sit in one 16-byte slot, so a hit touches one index cache line and then the frame. An earlier version kept a separate per-frame metadata array with the version and reference bit; that was a second dependent cache miss on every hit for nothing the slot could not hold.
 
@@ -59,7 +60,7 @@ For the MariaDB plugin this is `bytecaskdb_buffer_pool_size`, the knob operators
 
 **A hit** takes no lock. Probe the index from `hash(key)` with linear probing: load the slot's version (acquire), then its key; an empty key ends the probe as a miss. On a match with an even version, load the frame number and **pin the frame** (`fetch_add` on its pin word); a dead marker in the old value means eviction owns it, so unpin and retry. Then reload the slot's version: the slot named this frame for this key when we read it, but the frame could have been claimed and refilled between that load and the pin — doing so would have erased the slot, a slot's version only ever moves, so the version being what it was proves the slot still maps the key to the frame, and the pin now held proves the frame stays put. Copy with `memcpy` (or lend the span) and unpin. After eight lost races fall back to a device read, which is always correct. Besides the pins, the only write on a hit is a test-then-set of the reference bit.
 
-**A miss** reads the frame-aligned extent into a thread-local, page-aligned buffer — `O_DIRECT` where the file has a direct descriptor, buffered otherwise — copies the caller's bytes out of that buffer, then takes the mutex and admits each whole frame the extent covered. The device read happens outside the lock. A short tail frame (one that would extend past EOF) is served but never admitted, which is what lets frames be fixed-length with no per-frame valid-length field. A read larger than `capacity / 8` bypasses the pool entirely: admitting it would evict the working set to hold one value.
+**A miss** in a pool with free frames reads the file-aligned `kPoolFillBlockBytes` (128 KiB) blocks covering the run of missing frames into a thread-local, page-aligned buffer — `O_DIRECT` where the file has a direct descriptor, buffered otherwise — copies the caller's bytes out of that buffer, then takes the mutex and admits each whole frame the read covered. Frames of the block that were already resident are read again and not re-admitted; blocks are clipped to the file. The device read happens outside the lock. A short tail frame (one that would extend past EOF) is served but never admitted, which is what lets frames be fixed-length with no per-frame valid-length field. A read larger than `capacity / 8` bypasses the pool entirely: admitting it would evict the working set to hold one value. A full pool reads just the missing run, frame-aligned: there every neighbour a block admitted would evict a frame that earned its place, and on a Zipf read mix with the pool a tenth of the dataset that cost 5× in throughput (§8). The resident-frame count that decides is read without the lock — it only grows until the pool is full, and a stale value picks a fill size, not an outcome. The oversize bound also applies: a pool so small that a block is over `capacity / 8` fills frames only, or one miss would evict the frames it had just admitted; `DB::open` requires `capacity ≥ 2 × max_file_bytes`, so at any real file size that never binds.
 
 ## 4. Changes under one mutex
 
@@ -182,7 +183,28 @@ What is left of the pool's hit, from `perf annotate` on the pinned copy path: ~8
 
 **Read-your-own-writes** (`--ryow 20000`: put a fresh 512 B value, read it back, gets timed): the pool serves the read from the frame the writer filled at **752 ns p50 / 922 ns p99**, against `pread`'s page-cache read of the bytes it just wrote at 1.31 µs / 2.15 µs, and 151 K pairs/s against 136 K — the insert on append costs less than the page-cache read it saves.
 
-**Cold start and page-cache residency** (`--cold`: every data file fsync'd and `FADV_DONTNEED`'d before each run; each run on its own thread so the engine's thread-local snapshot cannot carry an `mmap` mapping across runs). After a `pread`, `mmap` or buffered-pool run the whole dataset is in the page cache; after a direct-I/O run it holds the active file and nothing else. That column is the deliverable. The cost is readahead: `pread` pulls a cold dataset in 128 KiB reads, a direct miss is one 4 KiB frame, so at a low ratio the pool takes ~40× more device reads to warm and its throughput is a fraction of `pread`'s until the working set is resident. Batched or prefetching fills (§9) are the answer if that transient matters.
+**Cold start and page-cache residency** (`--cold`: every data file fsync'd and `FADV_DONTNEED`'d before each run; each run on its own thread so the engine's thread-local snapshot cannot carry an `mmap` mapping across runs). After a `pread`, `mmap` or buffered-pool run the whole dataset is in the page cache; after a direct-I/O run it holds the active file and nothing else. That column is the deliverable. The cost was readahead: `pread` pulls a cold dataset in 128 KiB reads, and a direct miss was one 4 KiB frame, so the pool took ~40× more device reads to warm. Block fills (below) close that.
+
+**Block fills** (`kPoolFillBlockBytes`, §3). `pool_bench --cold`, `O_DIRECT` rows, Zipf(0.99), 60 k × 512 B, on a SATA SSD (Samsung 860 EVO); ops/s, with p99:
+
+| pool / dataset | frame fills | block fills always | block fills while frames are free |
+|---|---:|---:|---:|
+| 0.10 | 32.6 K (113 µs) | 6.5 K (409 µs) | 34.4 K (111 µs) |
+| 0.25 | 48.5 K (113 µs) | 10.3 K (409 µs) | 53.5 K (112 µs) |
+| 0.50 | 75.8 K (103 µs) | 18.1 K (401 µs) | 100.7 K (98 µs) |
+| 1.00 | 134 K (97 µs) | 847 K (0.7 µs) | 1.57 M (0.7 µs) |
+| 2.00 | 132 K (99 µs) | 1.82 M (0.6 µs) | 1.83 M (0.6 µs) |
+
+Where the pool can hold the working set, frame fills never finish warming it inside the run and block fills do: hit ratio 0.93 → 1.00. Where it cannot, filling blocks unconditionally admits 31 cold neighbours per miss and evicts the hot set (evictions 20 K → 579 K at 0.10); stopping at the first full pool leaves that regime where it was.
+
+MariaDB sysbench `oltp_read_write`, 5 M rows (2.8 GB of data files), 1 GiB pool, 60 s warm-up then 60 s measured, same SATA disk, where `fdatasync` costs ~6.5 ms. With frame fills the pool was still ~85 % empty at the end of every run: 24–28 K misses per run, each queued behind a commit's cache flush (1.9 ms per read against 0.19 ms with no flush in flight), inflating every transaction and stretching the flushes themselves (6.6 → 8.7 ms). With block fills misses fall to hundreds:
+
+| threads | frame fills | block fills |
+|---:|---:|---:|
+| 1 | 118–134 tps | 135 tps |
+| 4 | 211 tps | 313 tps |
+| 8 | 377–451 tps (p95 34–45 ms) | 578–654 tps (p95 14–15 ms) |
+| 16 | 881 tps (p95 36 ms) | 1144–1596 tps (p95 14–16 ms) |
 
 **RocksDB as a reference.** RocksDB 11.11 built from source, `HyperClockCache` (LRU is the same), 1 GiB cache, bloom filters, no compression, fully warmed, identical keys, values and Zipf stream: 503 K gets/s at 1 thread, p50 1.44 µs, p99 2.93 µs; 1.26 M/s at 4 threads. A `Get` there walks memtable, index and filter blocks before the data block, which is where the difference lives; the block cache itself is fine.
 
@@ -225,7 +247,8 @@ At equal memory the pool now leads `pread` by 5 % on throughput — within this 
 
 Each of these is a real option; they are listed so the choice is recorded, not rediscovered.
 
-- **Batched fills / `io_uring` / prefetch on miss.** `iter_from` knows its next N keys with no I/O and could issue N fills at once, and a cold direct-I/O start would warm ~40× faster with readahead-sized fills. Worth doing when a workload shows the transient.
+- **Batched fills / `io_uring` / prefetch on miss.** `iter_from` knows its next N keys with no I/O and could issue N fills at once. (Readahead-sized fills, the other half of this item, are built: §3.)
+- **Prewarming at open**, newest files first. Measured on sysbench (§8) and not taken: it fills a 1 GiB pool in 4.4 s when idle, but under load it competes with the reads it is meant to spare, and in that workload hotness follows the key, not the file's age — the pool held the newest 1 GiB and still missed 15× more than block fills alone.
 - **Entry cache instead of a block cache.** Caches `(file_id, offset) → entry`, holds no headers or superseded entries. Per-object allocator overhead makes it *denser* only when frames are poorly used; measured on the Zipf workload, an evicted frame had served about 20 % of its bytes, which reopens the question without deciding it. Slab calcification has no number attached and is the reason the block cache won.
 - **CRC verified on fill** instead of per read. Worth ~25–40 % of hit latency, but entries straddle frames and it changes what `verify_checksums` means.
 - **Other eviction policies** (S3-FIFO, W-TinyLFU) and **liveness-biased eviction** using `file_stats`.
