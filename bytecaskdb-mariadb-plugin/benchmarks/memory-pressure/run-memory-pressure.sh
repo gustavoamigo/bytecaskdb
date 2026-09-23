@@ -291,30 +291,37 @@ prepare() {  # <storage engine> <base dir>
   fi
   rm -rf "$base"
   log "$engine: preparing $ROWS rows in $base"
+  # Both engines load through sysbench's own prepare, as run-sysbench.sh
+  # does, so their tables are identical: ids 1..ROWS with no gaps, which is
+  # what sysbench's id draws assume. ByteCaskDB loads unpooled and unlimited;
+  # the back-end and the limit only matter for the measured runs.
   if [[ $engine == bytecaskdb ]]; then
     start_db bytecaskdb pread 0 0 "$base"
-    # Table with the secondary index up front and batched inserts. sysbench's
-    # own prepare adds the index afterwards with a copy-ALTER in one giant
-    # transaction, which is not what a memory-pressure run should be measuring.
-    mariadb --socket="$SOCKET" -u root sbtest -e "
-      CREATE TABLE sbtest1 (
-        id INT NOT NULL AUTO_INCREMENT, k INT NOT NULL DEFAULT 0,
-        c CHAR(120) NOT NULL DEFAULT '', pad CHAR(60) NOT NULL DEFAULT '',
-        PRIMARY KEY (id), KEY k_1 (k)) ENGINE=bytecaskdb;"
-    local done_rows=0 batch=50000 n
-    while (( done_rows < ROWS )); do
-      n=$(( ROWS - done_rows < batch ? ROWS - done_rows : batch ))
-      mariadb --socket="$SOCKET" -u root sbtest -e "
-        INSERT INTO sbtest1 (k, c, pad)
-        SELECT FLOOR(RAND() * $ROWS), LPAD(FLOOR(RAND() * 1e18), 120, '0'),
-               LPAD(FLOOR(RAND() * 1e18), 60, '0')
-        FROM seq_$((done_rows + 1))_to_$((done_rows + n));"
-      done_rows=$((done_rows + n))
-      (( done_rows % 1000000 == 0 )) && log "  $done_rows / $ROWS rows"
-    done
   else
     start_db innodb innodb $((4 * 1024 * 1024 * 1024)) 0 "$base"
-    sysbench oltp_read_write $(sysbench_args 4) --mysql_storage_engine=innodb prepare >/dev/null
+  fi
+  sysbench oltp_read_write $(sysbench_args 4) --mysql_storage_engine="$engine" prepare >/dev/null || {
+    echo "ERROR: sysbench prepare failed for $engine; see $base/error.log"
+    stop_db
+    exit 1
+  }
+  if [[ $engine == bytecaskdb ]]; then
+    # sysbench adds the secondary index after the load, with a copying ALTER,
+    # so ByteCaskDB's files end the prepare holding the pre-copy table as dead
+    # data (~2.4 GB at 10 M rows). Reclaim it now, or the background vacuum
+    # does it during the first measured cell. Vacuum reclaims one file per
+    # pass and sleeps its idle interval after a pass with nothing to do; that
+    # interval is shortened for this server only, so "reclaimed has not moved
+    # for five seconds" means there is nothing left.
+    mariadb --socket="$SOCKET" -u root -e "SET GLOBAL bytecaskdb_vacuum_idle_interval_ms = 200"
+    local prev=-1 cur still=0
+    while (( still < 5 )); do
+      sleep 1
+      cur=$(engine_stat vacuum_bytes_reclaimed)
+      if [[ $cur == "$prev" ]]; then still=$((still + 1)); else still=0; fi
+      prev=$cur
+    done
+    log "$engine: vacuum reclaimed $(( ${cur:-0} / 1048576 )) MiB after the load"
   fi
   stop_db
   log "$engine: data size $(du -sh "$base/data" | cut -f1)"
