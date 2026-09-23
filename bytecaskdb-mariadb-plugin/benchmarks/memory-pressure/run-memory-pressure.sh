@@ -40,6 +40,12 @@
 #                (default 900 s). Recovery of the key directory takes seconds
 #                with memory to spare and minutes once it is being swapped;
 #                the time it took is recorded per run as startup_s.
+#   --sysbench-extra extra sysbench arguments for every run, e.g.
+#                "--rand-type=zipfian" (default: sysbench's own, `special`).
+#   BYTECASK_POOL_TRACE=FILE in the environment records the buffer pool's
+#                demand accesses (issue #148 branch) and writes each cell's
+#                warm-up, measure and end times (CLOCK_MONOTONIC) to
+#                FILE.markers.csv, for scripts/pool_trace_split.py.
 #   --data-root  where the data directories live (default: this directory's
 #                results/). The engine directories under it are wiped at the
 #                start of every run: nothing from an earlier run is reused,
@@ -67,6 +73,7 @@ START_TIMEOUT=900
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATA_ROOT="$SCRIPT_DIR/results"
 OUT=""
+SYSBENCH_EXTRA=""
 PORT=3322
 SOCKET=/tmp/bytecaskdb-mempressure.sock   # short: mariadbd rejects paths over 107 bytes
 CG=""   # the running server's cgroup path, set by start_db; empty with no limit
@@ -86,6 +93,7 @@ for arg in "$@"; do
     --start-timeout=*) START_TIMEOUT="${arg#*=}" ;;
     --data-root=*)  DATA_ROOT="${arg#*=}" ;;
     --out=*)        OUT="${arg#*=}" ;;
+    --sysbench-extra=*) SYSBENCH_EXTRA="${arg#*=}" ;;
     --help|-h)      sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
   esac
@@ -271,7 +279,15 @@ evict_page_cache() {  # <dir>
 }
 
 sysbench_args() {  # <threads>
-  echo "--db-driver=mysql --mysql-host=127.0.0.1 --mysql-port=$PORT --mysql-socket=$SOCKET --mysql-user=root --mysql-db=sbtest --tables=1 --table_size=$ROWS --threads=$1 --report-interval=0 --mysql-ignore-errors=1180,1213"
+  echo "--db-driver=mysql --mysql-host=127.0.0.1 --mysql-port=$PORT --mysql-socket=$SOCKET --mysql-user=root --mysql-db=sbtest --tables=1 --table_size=$ROWS --threads=$1 --report-interval=0 --mysql-ignore-errors=1180,1213 $SYSBENCH_EXTRA"
+}
+
+# Cell boundaries for a pool trace, on the clock its records carry.
+trace_mark() {  # <label> <workload> <threads> <phase>
+  [[ -n ${BYTECASK_POOL_TRACE:-} ]] || return 0
+  local now
+  now="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  echo "$1,$2,$3,$4,$now" >> "$BYTECASK_POOL_TRACE.markers.csv"
 }
 
 cg_stat() {  # <field in memory.stat>
@@ -338,13 +354,16 @@ run_engine() {  # <engine label>
   for wl in ${WORKLOADS//,/ }; do
     for t in ${THREADS//,/ }; do
       log "  $label $wl threads=$t (warm-up ${WARMUP}s, measure ${DURATION}s)"
+      trace_mark "$label" "$wl" "$t" warmup
       sysbench "$wl" $(sysbench_args "$t") --time="$WARMUP" run >/dev/null 2>&1
       h0=$(engine_stat pool_hits); m0=$(engine_stat pool_misses)
       # Major faults are what swap actually costs: each one is a page read
       # back from disk in the middle of a query. Sampled around the measured
       # run only, so the warm-up's faults are not counted.
       f0=$(cg_stat pgmajfault)
+      trace_mark "$label" "$wl" "$t" measure
       out="$(sysbench "$wl" $(sysbench_args "$t") --time="$DURATION" run 2>&1)"
+      trace_mark "$label" "$wl" "$t" end
       tps="$(echo "$out" | grep "transactions:" | awk -F'[( ]+' '{print $4}')"
       avg="$(echo "$out" | grep "avg:" | tail -1 | awk '{print $2}')"
       p95="$(echo "$out" | grep "95th percentile:" | awk '{print $NF}')"
@@ -369,6 +388,7 @@ run_engine() {  # <engine label>
 }
 
 build_bytecaskdb_plugin >/dev/null
+[[ -n ${BYTECASK_POOL_TRACE:-} ]] && rm -f "$BYTECASK_POOL_TRACE.markers.csv"
 symlink_providers "$PLUGIN_DIR"
 
 echo "engine,workload,threads,rows,mem_limit_bytes,swap_limit,pool_bytes,tps,avg_ms,p95_ms,pool_hit_ratio,rss_bytes,cgroup_memory_bytes,cgroup_swap_bytes,major_faults,oom_kills,startup_s" > "$OUT"

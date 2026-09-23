@@ -186,6 +186,21 @@ WritableDataFile::~WritableDataFile() = default;
 // mapping and uses only the append half.
 // ---------------------------------------------------------------------------
 
+// Issue #148 trace hook: the frames one logical read needs, recorded whether
+// the pool holds them or not. A no-op unless BYTECASK_POOL_TRACE is set.
+inline void trace_pool_read(std::uint32_t file_id, Offset offset,
+                            std::size_t len, std::uint8_t kind) noexcept {
+  if (auto *t = PoolTrace::get()) t->record(file_id, offset, len, kind);
+}
+
+// The bytes read_value reads: the whole entry when verifying, else the value.
+[[nodiscard]] inline auto read_value_span(Offset offset, std::uint16_t key_size,
+                                          std::uint32_t value_size, bool verify)
+    -> std::pair<Offset, std::size_t> {
+  if (verify) return {offset, kHeaderSize + key_size + value_size + kCrcSize};
+  return {offset + kHeaderSize + key_size, value_size};
+}
+
 // The zero-copy read behind lend_entry for the two pool-backed files: the
 // entry's spans point into the frame the lease pins when the whole entry —
 // header through CRC — lies inside one resident frame below file_size.
@@ -298,6 +313,11 @@ public:
 
   // One append_resident per iovec, so nothing is re-read or re-gathered.
   void publish(Offset start, std::span<const ::iovec> iov) const {
+    if (auto *t = PoolTrace::get()) {
+      std::size_t total = 0;
+      for (const auto &v : iov) total += v.iov_len;
+      t->record(file_id_, start, total, PoolTrace::kActive | PoolTrace::kAppend);
+    }
     auto at = static_cast<std::uint64_t>(start);
     for (const auto &v : iov) {
       pool_->append_resident(
@@ -305,6 +325,10 @@ public:
           std::span{static_cast<const std::byte *>(v.iov_base), v.iov_len});
       at += v.iov_len;
     }
+  }
+
+  void trace_read(Offset offset, std::size_t len, std::uint8_t kind) const noexcept {
+    trace_pool_read(file_id_, offset, len, kind | PoolTrace::kActive);
   }
 
   // logical_end is the file size the pool bounds admission by; unlike a sealed
@@ -960,6 +984,8 @@ public:
                   std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const override {
     if constexpr (Io::kResident) {
+      const auto [at, len] = read_value_span(offset, key_size, value_size, verify);
+      ops_.io_.trace_read(at, len, 0);
       if (ops_.io_.read_value(offset, key_size, value_size, verify,
                               ops_.logical_end(), out)) {
         return;
@@ -980,10 +1006,20 @@ public:
                                 FrameLease &lease) const
       -> DataEntryView override {
     if constexpr (Io::kResident) {
-      if (auto lent = ops_.io_.lend(offset, value_size, verify, ops_.logical_end(),
-                                    lease)) {
-        return *lent;
-      }
+      const auto v = [&] {
+        if (auto lent = ops_.io_.lend(offset, value_size, verify,
+                                      ops_.logical_end(), lease)) {
+          return *lent;
+        }
+        lease.reset();
+        return verify ? WritablePosixFile::read_entry(offset, value_size, io_buf)
+                      : WritablePosixFile::read_entry_unverified(
+                            offset, value_size, io_buf);
+      }();
+      ops_.io_.trace_read(offset,
+                          kHeaderSize + v.key.size() + value_size + kCrcSize,
+                          PoolTrace::kLend);
+      return v;
     }
     lease.reset();
     return verify ? WritablePosixFile::read_entry(offset, value_size, io_buf)
@@ -1542,6 +1578,8 @@ public:
                   std::uint32_t value_size, bool verify,
                   std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const override {
+    const auto [at, len] = read_value_span(offset, key_size, value_size, verify);
+    trace_pool_read(file_id_, at, len, 0);
     if (read_value_from_pool(*pool_, file_id_, file_size_, offset, key_size,
                              value_size, verify, out)) {
       return;
@@ -1572,15 +1610,21 @@ public:
                                 bool verify, std::vector<std::byte> &io_buf,
                                 FrameLease &lease) const
       -> DataEntryView override {
-    if (auto lent = lend_from_pool(*pool_, file_id_, file_size_, offset,
-                                   value_size, verify, lease)) {
-      return *lent;
-    }
-    lease.reset();
-    return verify
-        ? ReadOnlyBufferPoolDataFile::read_entry(offset, value_size, io_buf)
-        : ReadOnlyBufferPoolDataFile::read_entry_unverified(offset, value_size,
-                                                            io_buf);
+    const auto v = [&] {
+      if (auto lent = lend_from_pool(*pool_, file_id_, file_size_, offset,
+                                     value_size, verify, lease)) {
+        return *lent;
+      }
+      lease.reset();
+      return verify
+          ? ReadOnlyBufferPoolDataFile::read_entry(offset, value_size, io_buf)
+          : ReadOnlyBufferPoolDataFile::read_entry_unverified(offset, value_size,
+                                                              io_buf);
+    }();
+    trace_pool_read(file_id_, offset,
+                    kHeaderSize + v.key.size() + value_size + kCrcSize,
+                    PoolTrace::kLend);
+    return v;
   }
 
   [[nodiscard]] auto read_entry_unverified(

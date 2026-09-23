@@ -272,6 +272,16 @@ target("pool_bench")
         add_release_opts(t)
     end)
 
+-- Offline replay of a BYTECASK_POOL_TRACE file through CLOCK and fill
+-- variants (issue #148). Standalone: reads the trace, links nothing of ours.
+target("pool_trace_sim")
+    set_kind("binary")
+    set_default(false)
+    add_files("benchmarks/pool_trace_sim.cpp")
+    on_config(function(t)
+        add_release_opts(t)
+    end)
+
 target("memory_profile")
     set_kind("binary")
     set_default(false)

@@ -25,6 +25,7 @@ module;
 #include <vector>
 
 #include <cerrno>
+#include <ctime>
 #include <fcntl.h>
 #include <filesystem>
 #include <sys/types.h>
@@ -61,6 +62,117 @@ export struct BufferPoolOptions {
   // that refuses O_DIRECT falls back to buffered fills per file, counted in
   // pool_direct_io_fallbacks.
   bool direct_io{true};
+};
+
+// ---------------------------------------------------------------------------
+// PoolTrace — demand-access trace for offline cache simulation (issue #148).
+//
+// Measurement tool, not a feature: on only when BYTECASK_POOL_TRACE names a
+// file at the first pool read. One record per logical read — the frames a
+// read_value or lend_entry needs, whether the pool held them or not — and one
+// per append to the active file. The stream is what the engine asked for, not
+// what the pool did, so one trace replays through any policy at any size
+// (scripts/pool_trace_sim.py, benchmarks/pool_trace_sim.cpp).
+//
+// Records go to a per-thread buffer written out in chunks with O_APPEND, so
+// threads interleave by chunk; the timestamp restores the global order.
+// A buffer is written when it fills, when it is a second old — a server
+// that parks idle connection threads could otherwise hold them to exit —
+// and when its thread exits.
+// ---------------------------------------------------------------------------
+export struct PoolTraceRecord {
+  std::uint64_t ts_ns;        // CLOCK_MONOTONIC
+  std::uint32_t file_id;
+  std::uint32_t first_frame;  // offset / kPoolFrameBytes
+  std::uint32_t n_frames;
+  std::uint16_t first_offset; // offset % kPoolFrameBytes
+  std::uint8_t kind;          // PoolTrace::kActive | kAppend | kLend
+  std::uint8_t pad;
+};
+static_assert(sizeof(PoolTraceRecord) == 24);
+
+export class PoolTrace {
+public:
+  static constexpr std::uint8_t kActive = 1;  // the active file
+  static constexpr std::uint8_t kAppend = 2;  // written, not read
+  static constexpr std::uint8_t kLend = 4;    // iterator read (lend_entry)
+
+  // nullptr unless tracing is on. Leaked on purpose: thread-exit flushes can
+  // run after static destruction has started.
+  [[nodiscard]] static auto get() noexcept -> PoolTrace * {
+    static PoolTrace *const trace = open_from_env();
+    return trace;
+  }
+
+  void record(std::uint32_t file_id, std::uint64_t offset, std::uint64_t len,
+              std::uint8_t kind) noexcept {
+    if (len == 0) return;
+    timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    const auto first = offset / kPoolFrameBytes;
+    const auto last = (offset + len - 1) / kPoolFrameBytes;
+    // Thread-exit destructor is the flush; suppress the Clang diagnostic.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+    thread_local Buffer buf{this};
+#pragma clang diagnostic pop
+    const auto now = static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ULL +
+                     static_cast<std::uint64_t>(ts.tv_nsec);
+    if (buf.recs.empty()) buf.first_ts = now;
+    buf.recs.push_back(PoolTraceRecord{
+        .ts_ns = now,
+        .file_id = file_id,
+        .first_frame = static_cast<std::uint32_t>(first),
+        .n_frames = static_cast<std::uint32_t>(last - first + 1),
+        .first_offset = static_cast<std::uint16_t>(offset % kPoolFrameBytes),
+        .kind = kind,
+        .pad = 0});
+    if (buf.recs.size() >= kChunkRecords || now - buf.first_ts > kMaxAgeNs) {
+      buf.flush();
+    }
+  }
+
+private:
+  static constexpr std::size_t kChunkRecords = 16 * 1024;
+  static constexpr std::uint64_t kMaxAgeNs = 1'000'000'000;
+
+  struct Buffer {
+    explicit Buffer(PoolTrace *t) : trace{t} { recs.reserve(kChunkRecords); }
+    Buffer(const Buffer &) = delete;
+    auto operator=(const Buffer &) -> Buffer & = delete;
+    ~Buffer() { flush(); }
+    void flush() noexcept {
+      if (recs.empty()) return;
+      trace->write_chunk(std::as_bytes(std::span{recs}));
+      recs.clear();
+    }
+    PoolTrace *trace;
+    std::vector<PoolTraceRecord> recs;
+    std::uint64_t first_ts{0};
+  };
+
+  explicit PoolTrace(int fd) noexcept : fd_{fd} {}
+
+  static auto open_from_env() noexcept -> PoolTrace * {
+    const char *path = std::getenv("BYTECASK_POOL_TRACE");
+    if (path == nullptr || *path == '\0') return nullptr;
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC,
+                          0644);
+    if (fd == -1) return nullptr;
+    return new PoolTrace{fd};
+  }
+
+  void write_chunk(std::span<const std::byte> bytes) noexcept {
+    std::lock_guard<std::mutex> lk{mu_};
+    while (!bytes.empty()) {
+      const auto n = ::write(fd_, bytes.data(), bytes.size());
+      if (n <= 0) return;  // a lost chunk shortens the trace; nothing else
+      bytes = bytes.subspan(static_cast<std::size_t>(n));
+    }
+  }
+
+  int fd_;
+  std::mutex mu_;
 };
 
 // The descriptors a pool-backed file hands to the pool. `direct` is opened
