@@ -362,7 +362,9 @@ TEST_CASE("BufferPool: a partial miss reads only the missing frames",
   // one frame while the rest stay resident. Re-reading it must fetch the
   // frames that are gone and no others; the first version re-read the whole
   // value, which at 2 MiB a value was the difference between a 4 KiB read
-  // and a 2 MiB one on every partial miss.
+  // and a 2 MiB one on every partial miss. The pool is too small for a fill
+  // block to pass the oversize guard, so fills here are frame-sized; the
+  // block-sized bound is "a partial miss reads only the blocks it touches".
   ScratchFile file{1024 * 1024};
   // ~64 frames; the oversize guard admits a value up to an eighth of that.
   const std::size_t capacity = 64 * (bytecask::kPoolFrameBytes + 64);
@@ -500,4 +502,204 @@ TEST_CASE("BufferPool: every frame is claimable and pinnable again once "
     INFO("frame " << f);
     CHECK(pool.counters().hits.load() == hits_before + 1);
   }
+}
+
+// Block fills. kRoomyCapacity puts the oversize guard (capacity / 8) above
+// kPoolFillBlockBytes, so every pool below fills a block per miss.
+namespace {
+constexpr std::size_t kBlockFrames =
+    bytecask::kPoolFillBlockBytes / bytecask::kPoolFrameBytes;
+static_assert(kRoomyCapacity / 8 >= bytecask::kPoolFillBlockBytes);
+} // namespace
+
+TEST_CASE("BufferPool: a miss fills the file-aligned block around it",
+          "[buffer_pool]") {
+  ScratchFile file{1024 * 1024};
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
+
+  std::vector<std::byte> got(100);
+  const std::size_t offset = 5 * bytecask::kPoolFrameBytes + 7;
+  pool.read_at(1, file.fd(), offset, got.size(), file.size(), got.data());
+  CHECK(got == file.expected(offset, got.size()));
+  CHECK(pool.counters().misses.load() == 1);
+  CHECK(pool.counters().fills.load() ==
+        static_cast<std::int64_t>(kBlockFrames));
+
+  // The block's last frame came in with it; the next block's first did not.
+  const std::size_t last_in_block = (kBlockFrames - 1) * bytecask::kPoolFrameBytes;
+  pool.read_at(1, file.fd(), last_in_block, got.size(), file.size(), got.data());
+  CHECK(got == file.expected(last_in_block, got.size()));
+  CHECK(pool.counters().hits.load() == 1);
+
+  const std::size_t next_block = bytecask::kPoolFillBlockBytes;
+  pool.read_at(1, file.fd(), next_block, got.size(), file.size(), got.data());
+  CHECK(got == file.expected(next_block, got.size()));
+  CHECK(pool.counters().misses.load() == 2);
+  CHECK(pool.counters().fills.load() ==
+        static_cast<std::int64_t>(2 * kBlockFrames));
+}
+
+TEST_CASE("BufferPool: a read straddling a block boundary fills both blocks",
+          "[buffer_pool]") {
+  ScratchFile file{1024 * 1024};
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
+
+  const std::size_t offset = bytecask::kPoolFillBlockBytes - 10;
+  std::vector<std::byte> got(20);
+  const auto bytes_before = rchar();
+  pool.read_at(1, file.fd(), offset, got.size(), file.size(), got.data());
+  const auto bytes_read = rchar() - bytes_before;
+  CHECK(got == file.expected(offset, got.size()));
+  CHECK(pool.counters().misses.load() == 1);
+  CHECK(pool.counters().fills.load() ==
+        static_cast<std::int64_t>(2 * kBlockFrames));
+  // Two blocks, read once (+ the /proc read that measured it).
+  CHECK(bytes_read <=
+        2 * static_cast<long long>(bytecask::kPoolFillBlockBytes) + 4096);
+}
+
+TEST_CASE("BufferPool: a block is clipped to the file and its short tail",
+          "[buffer_pool]") {
+  // Block 1 holds three whole frames and a partial one before EOF.
+  constexpr std::size_t kTailFrames = 3;
+  ScratchFile file{bytecask::kPoolFillBlockBytes +
+                   kTailFrames * bytecask::kPoolFrameBytes + 100};
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
+
+  std::vector<std::byte> got(50);
+  const std::size_t offset = bytecask::kPoolFillBlockBytes + 10;
+  pool.read_at(1, file.fd(), offset, got.size(), file.size(), got.data());
+  CHECK(got == file.expected(offset, got.size()));
+  CHECK(pool.counters().fills.load() == static_cast<std::int64_t>(kTailFrames));
+
+  // The partial frame is served every time and never admitted.
+  const std::size_t tail =
+      bytecask::kPoolFillBlockBytes + kTailFrames * bytecask::kPoolFrameBytes + 20;
+  for (int i = 0; i < 2; ++i) {
+    std::fill(got.begin(), got.end(), std::byte{0});
+    pool.read_at(1, file.fd(), tail, got.size(), file.size(), got.data());
+    CHECK(got == file.expected(tail, got.size()));
+  }
+  CHECK(pool.counters().fills.load() == static_cast<std::int64_t>(kTailFrames));
+  CHECK(pool.counters().misses.load() == 3);
+}
+
+TEST_CASE("BufferPool: a partial miss reads only the blocks it touches",
+          "[buffer_pool]") {
+  // A value over three blocks with the outer two resident: re-reading it
+  // fetches the middle block and nothing else.
+  ScratchFile file{1024 * 1024};
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
+
+  std::vector<std::byte> one(16);
+  pool.read_at(1, file.fd(), 0, one.size(), file.size(), one.data());
+  pool.read_at(1, file.fd(), 2 * bytecask::kPoolFillBlockBytes, one.size(),
+               file.size(), one.data());
+  REQUIRE(pool.counters().fills.load() ==
+          static_cast<std::int64_t>(2 * kBlockFrames));
+
+  const std::size_t v_len = 3 * bytecask::kPoolFillBlockBytes;
+  std::vector<std::byte> v(v_len);
+  const auto bytes_before = rchar();
+  pool.read_at(1, file.fd(), 0, v_len, file.size(), v.data());
+  const auto bytes_read = rchar() - bytes_before;
+
+  CHECK(v == file.expected(0, v_len));
+  CHECK(pool.counters().fills.load() ==
+        static_cast<std::int64_t>(3 * kBlockFrames));
+  CHECK(bytes_read <=
+        static_cast<long long>(bytecask::kPoolFillBlockBytes) + 4096);
+}
+
+TEST_CASE("BufferPool: block fills against pread under constant eviction",
+          "[buffer_pool]") {
+  // The differential test again, with a pool large enough to fill blocks and
+  // far too small for the file, so admitting a block always evicts.
+  ScratchFile file{8 * 1024 * 1024};
+  const std::size_t capacity = 12 * bytecask::kPoolFillBlockBytes;
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
+
+  std::mt19937_64 rng{4242};
+  std::vector<std::byte> got;
+  for (int i = 0; i < 4000; ++i) {
+    const auto len = static_cast<std::size_t>(1 + rng() % 3000);
+    const auto offset =
+        static_cast<std::size_t>(rng() % (file.size() - len));
+    got.assign(len, std::byte{0});
+    pool.read_at(1, file.fd(), offset, len, file.size(), got.data());
+    if (got != file.expected(offset, len)) {
+      FAIL("mismatch at offset " << offset << " len " << len);
+    }
+  }
+  CHECK(pool.counters().evictions.load() > 0);
+  CHECK(pool.counters().fills.load() > pool.counters().misses.load());
+}
+
+TEST_CASE("BufferPool: concurrent block fills never tear a frame",
+          "[buffer_pool]") {
+  ScratchFile file{8 * 1024 * 1024};
+  const std::size_t capacity = 12 * bytecask::kPoolFillBlockBytes;
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
+
+  constexpr int kThreads = 8;
+  constexpr int kIters = 3000;
+  std::atomic<int> mismatches{0};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      std::mt19937_64 rng{static_cast<unsigned long long>(t) + 101};
+      std::vector<std::byte> got;
+      for (int i = 0; i < kIters; ++i) {
+        const auto len = static_cast<std::size_t>(1 + rng() % 2000);
+        const auto offset =
+            static_cast<std::size_t>(rng() % (file.size() - len));
+        got.assign(len, std::byte{0});
+        pool.read_at(1, file.fd(), offset, len, file.size(), got.data());
+        if (got != file.expected(offset, len)) mismatches.fetch_add(1);
+      }
+    });
+  }
+  for (auto &th : threads) th.join();
+  CHECK(mismatches.load() == 0);
+  CHECK(pool.counters().evictions.load() > 0);
+}
+
+TEST_CASE("BufferPool: a full pool fills only the frames a miss needs",
+          "[buffer_pool]") {
+  // Blocks warm a cold pool; once it is full, a block's neighbours would
+  // evict frames that earned their place, so fills shrink back to frames.
+  ScratchFile file{8 * 1024 * 1024};
+  const std::size_t capacity = 12 * bytecask::kPoolFillBlockBytes;
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
+  const auto total = pool.counters().frames_total;
+
+  std::vector<std::byte> one(16);
+  std::size_t block = 0;
+  while (pool.counters().frames_resident.load() < total) {
+    const auto before = pool.counters().fills.load();
+    pool.read_at(1, file.fd(), block * bytecask::kPoolFillBlockBytes,
+                 one.size(), file.size(), one.data());
+    // Filling a cold pool admits a whole block per miss.
+    CHECK(pool.counters().fills.load() - before ==
+          static_cast<std::int64_t>(kBlockFrames));
+    ++block;
+    REQUIRE(block * bytecask::kPoolFillBlockBytes < file.size());
+  }
+
+  const auto fills_before = pool.counters().fills.load();
+  const std::size_t offset = block * bytecask::kPoolFillBlockBytes + 5000;
+  const auto bytes_before = rchar();
+  pool.read_at(1, file.fd(), offset, one.size(), file.size(), one.data());
+  const auto bytes_read = rchar() - bytes_before;
+  CHECK(one == file.expected(offset, one.size()));
+  CHECK(pool.counters().fills.load() - fills_before == 1);
+  CHECK(bytes_read <= 2 * static_cast<long long>(bytecask::kPoolFrameBytes));
 }
