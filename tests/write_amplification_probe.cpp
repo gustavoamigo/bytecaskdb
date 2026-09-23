@@ -26,7 +26,10 @@
 #include <string>
 #include <vector>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
+#include <sys/types.h>
+#if __has_include(<sys/sysmacros.h>)
+#include <sys/sysmacros.h>  // major()/minor() on glibc; <sys/types.h> on macOS
+#endif
 
 import bytecask.data_file;
 import bytecask.types;
