@@ -1235,6 +1235,87 @@ TEST_CASE("DB recovery: vacuum keeps a data file whose hint was rebuilt",
 }
 
 // ---------------------------------------------------------------------------
+// Damage in a data file is detected and refused, never trimmed around. The
+// scan that indexes a hint-less file at open and the one vacuum copies a
+// sealed file with both stop by throwing: the first entry that fails to parse
+// must not read as the end of the file. If it did, open would truncate the
+// data file to that point and vacuum would publish a copy without the entries
+// after it and unlink the original — each turning one bad entry into the
+// permanent loss of every entry behind it.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB recovery: a damaged hint-less data file refuses to open and is "
+          "not truncated",
+          "[bytecask][recovery][corruption]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  {
+    auto db = bytecask::DB::open(db_path);
+    for (int i = 0; i < 6; ++i)
+      db.put({.sync = true}, to_bytes(std::format("k{}", i)),
+             to_bytes(std::format("v{}", i)));
+  }
+  // A clean close leaves the file that was active at shutdown without a
+  // hint, so the next open has to scan it.
+  REQUIRE(list_hint_files(db_path).empty());
+  std::filesystem::path data;
+  for (const auto &e : std::filesystem::directory_iterator{db_path})
+    if (e.path().extension() == ".data") data = e.path();
+  const auto size_before = std::filesystem::file_size(data);
+
+  // k2's key: 2-byte keys and values make every entry 23 bytes, and the
+  // key starts after the 15-byte header.
+  flip_byte(data, 2 * 23 + 15);
+
+  REQUIRE_THROWS_AS(bytecask::DB::open(db_path), std::runtime_error);
+  CHECK(std::filesystem::file_size(data) == size_before);
+  CHECK(list_hint_files(db_path).empty());
+}
+
+TEST_CASE("DB vacuum: a damaged sealed file is not compacted away",
+          "[bytecask][vacuum][corruption]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  const bytecask::Options opts{.max_file_bytes = 190};
+  std::filesystem::path victim;
+  {
+    auto db = bytecask::DB::open(db_path, opts);
+    for (int i = 0; i < 8; ++i) {
+      db.put({.sync = true}, to_bytes(std::format("a{}", i)),
+             to_bytes(std::format("v{}", i)));
+      // Only one data file exists until the first rotation.
+      if (i == 0)
+        for (const auto &e : std::filesystem::directory_iterator{db_path})
+          if (e.path().extension() == ".data") victim = e.path();
+    }
+    // Overwrite half of them so the first file qualifies for compaction.
+    for (int i = 0; i < 4; ++i)
+      db.put({.sync = true}, to_bytes(std::format("a{}", i)), to_bytes("xx"));
+  }
+  // The sealed file's hint is written by a background worker after rotation,
+  // which would otherwise race the damage below: it scans the same file and
+  // could meet the flipped byte first. A close writes it synchronously, so
+  // from here on the file is indexed and nothing else reads it.
+  REQUIRE(std::filesystem::exists(
+      db_path / (victim.stem().string() + ".hint")));
+  {
+    auto db = bytecask::DB::open(db_path, opts);
+    const auto size_before = std::filesystem::file_size(victim);
+    flip_byte(victim, 5 * 23 + 15);  // a5's key, a live entry
+
+    CHECK_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.1}),
+                    std::runtime_error);
+    CHECK(std::filesystem::exists(victim));
+    CHECK(std::filesystem::file_size(victim) == size_before);
+  }
+
+  // The entries behind the damaged one are still indexed and still read.
+  auto db = bytecask::DB::open(db_path, opts);
+  CHECK(get_str(db, to_bytes("a4")) == "v4");
+  CHECK(get_str(db, to_bytes("a6")) == "v6");
+  CHECK(get_str(db, to_bytes("a7")) == "v7");
+}
+
+// ---------------------------------------------------------------------------
 // Model-based recovery: random workload with oracle comparison.
 //
 // A random sequence of puts, deletes, overwrites, and batches is applied to
@@ -4531,6 +4612,37 @@ TEST_CASE("resume() discards pending batch on CRC error in active file",
   // Writes succeed after resume.
   REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
   CHECK(db.contains_key({}, to_bytes("k3")));
+}
+
+// An I/O error while resume() scans the active file says nothing about the
+// bytes, so it must not be read as the end of the file: truncating there
+// would cut acknowledged data over a fault the next attempt may not see.
+// resume() rethrows it unchanged, truncates nothing, and a retry once the
+// fault clears trims only the failed write's tail.
+TEST_CASE("resume() rethrows an I/O error from its scan and truncates nothing",
+          "[degraded][resume]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+
+  const auto offsets = degrade_with_unsynced_batch(db, dir);
+  REQUIRE(offsets.size() == 6);  // k1, k2, BulkBegin, b1, b2, BulkEnd
+  const auto size_before = std::filesystem::file_size(active_data_file(dir));
+
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_scan"};
+    REQUIRE_THROWS_AS(db.resume(), std::system_error);
+  }
+  CHECK(db.is_degraded());
+  CHECK(std::filesystem::file_size(active_data_file(dir)) == size_before);
+
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  CHECK(get_str(db, to_bytes("k1")) == "v1");
+  CHECK(get_str(db, to_bytes("k2")) == "v2");
 }
 
 TEST_CASE("resume() does not trust an entry size that runs past the file",

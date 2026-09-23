@@ -349,6 +349,8 @@ def gen_test(
     parts.append('  auto dir = td.path / "db";')
     parts.append(f"  auto expected = {gen_delta_literal(delta)};")
     parts.append("  Baseline before;")
+    if delta.degraded:
+        parts.append("  bytecask::testing::EngineFingerprint fp;")
     parts.append("  {")
 
     # Setup
@@ -396,6 +398,10 @@ def gen_test(
         parts.append(verify)
     if delta.degraded:
         parts.append("    assert_resumable(db);")
+        # Whatever resume() committed from the page cache, a cold open of the
+        # same bytes has to agree. This is the only check F/G cells get: what
+        # the delta is cannot be predicted, but the equivalence can.
+        parts.append("    fp = fingerprint(db);")
         # resume() truncates the active file while readers are not quiesced,
         # so the view is checked across it as well as across the failure.
         verify_after_resume = gen_observer_verify(observer, "after resume()")
@@ -425,6 +431,16 @@ def gen_test(
             parts.append(
                 "  // Recovery skipped: degraded state with unpersisted transition."
             )
+    if delta.degraded:
+        opts = _build_open_opts(state)
+        parts.append(
+            "  // resume() and a cold open read the same bytes and must"
+        )
+        parts.append("  // reconstruct the same engine.")
+        if opts:
+            parts.append(f"  assert_matches_recovery(dir, fp, {{{opts}}});")
+        else:
+            parts.append("  assert_matches_recovery(dir, fp);")
 
     parts.append("}")
     if state.io_backend != "pread":
@@ -463,7 +479,9 @@ namespace {
 using bytecask::testing::assert_consistent;
 using bytecask::testing::assert_delta;
 using bytecask::testing::assert_recoverable;
+using bytecask::testing::assert_matches_recovery;
 using bytecask::testing::assert_resumable;
+using bytecask::testing::fingerprint;
 using bytecask::testing::assert_view_stable;
 using bytecask::testing::Baseline;
 using bytecask::testing::capture_baseline;

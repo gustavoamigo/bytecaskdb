@@ -20,6 +20,9 @@ module;
 #include <system_error>
 #include <unistd.h>
 #include <vector>
+#ifdef BYTECASK_TESTING
+#include "fault_injector.h"
+#endif
 
 #ifdef __APPLE__
 static inline int portable_fdatasync(int fd) { return fcntl(fd, F_FULLFSYNC); }
@@ -283,6 +286,9 @@ public:
     std::array<std::byte, kFileCrcSize> trailer{};
     ByteWriter w{trailer};
     w.put(crc_.finalize());
+#ifdef BYTECASK_TESTING
+    FAULT_INJECTION(io_hint_write);
+#endif
     if (::write(write_fd_, trailer.data(), trailer.size()) !=
         std::ssize(trailer)) {
       const auto err = errno;
@@ -291,6 +297,9 @@ public:
       throw std::system_error{err, std::generic_category(),
                               "HintFile::close: write CRC trailer failed"};
     }
+#ifdef BYTECASK_TESTING
+    FAULT_INJECTION(io_hint_sync);
+#endif
     if (portable_fdatasync(write_fd_) != 0) {
       const auto err = errno;
       ::close(write_fd_);

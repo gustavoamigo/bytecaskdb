@@ -594,6 +594,11 @@ struct WritableFileOps {
 private:
   [[nodiscard]] auto scan_read_header(Offset offset) const -> EntryHeader {
     std::array<std::byte, kHeaderSize> hdr{};
+#ifdef BYTECASK_TESTING
+    // A read of the active file that fails — what resume() must rethrow
+    // rather than mistake for the end of the file.
+    FAULT_INJECTION(io_data_file_scan);
+#endif
     if (::pread(fd_, hdr.data(), kHeaderSize, narrow<off_t>(offset)) !=
         std::ssize(hdr)) {
       throw std::system_error{errno, std::generic_category(),

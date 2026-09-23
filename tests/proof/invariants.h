@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <span>
 #include <string>
@@ -274,43 +275,214 @@ inline void assert_keys_recoverable(
   assert_consistent(recovered);
 }
 
-// Per-file sequence bounds, keyed by the data file's stem. Recovery assigns
-// file ids by directory order, so ids do not survive a reopen and a stem does.
-inline auto capture_sequence_bounds(const DB &db)
-    -> std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> {
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+// A fingerprint of everything a resumed engine and a cold-opened one must
+// agree on. File ids are assigned by directory order at recovery and do not
+// survive a reopen, so per-file stats are keyed by the data file's stem.
+struct EngineFingerprint {
+  std::uint64_t next_seq{0};
+  std::map<std::string, Bytes> key_values;
+  std::map<std::string, FileStats> file_stats;
+};
+
+inline auto fingerprint(const DB &db) -> EngineFingerprint {
+  EngineFingerprint fp;
   auto state = db.engine_state();
+  fp.next_seq = state->next_seq;
+  for (const auto &entry : db.iter_from({})) {
+    fp.key_values[to_string(entry.key)] =
+        Bytes{entry.value.begin(), entry.value.end()};
+  }
   for (const auto [file_id, fs] : state->file_stats) {
     auto file = state->files.get(file_id);
     if (!file) continue;
-    bounds[(*file)->path().stem().string()] = {fs.min_sequence,
-                                               fs.max_sequence};
+    fp.file_stats[(*file)->path().stem().string()] = fs;
   }
-  return bounds;
+  return fp;
 }
 
-// resume() and a cold open read the same bytes, so they must describe them
-// the same way. `min_sequence` above a sequence the file really holds is the
-// specific failure this catches: `ChangeIterator` orders its file queue by
-// `min_sequence`, and `flush_hints_for` refuses to deduplicate for exactly
-// this reason. Files the recovered DB does not have — its own fresh active
-// file has no counterpart in `before` — are skipped.
-inline void assert_sequence_bounds_match_recovery(
-    const std::filesystem::path &dir,
-    const std::map<std::string, std::pair<std::uint64_t, std::uint64_t>>
-        &before,
-    const Options &opts = {}) {
+// resume() and a cold open read the same bytes, so they must reconstruct the
+// same engine. This is the property resume() exists to preserve, and the one
+// every bug this matrix has found so far violated: a range tombstone that was
+// replayed as a no-op left keys behind that recovery removed, and a filtered
+// batch marker left a min_sequence recovery computed differently. Both were
+// invisible to assertions that only asked whether the resumed state was
+// *right*, because it looked right on its own terms.
+//
+// The recovered DB opens its own fresh active file, which has no counterpart
+// in `before`; stems absent from the resumed state are therefore skipped.
+inline void assert_matches_recovery(const std::filesystem::path &dir,
+                                    const EngineFingerprint &before,
+                                    const Options &opts = {}) {
   auto recovered = DB::open(dir, opts);
-  const auto after = capture_sequence_bounds(recovered);
-  for (const auto &[stem, bound] : before) {
-    auto it = after.find(stem);
-    if (it == after.end()) continue;
-    INFO("sequence bounds for " << stem
-                                << " must match after recovery: resume said ["
-                                << bound.first << ", " << bound.second << "]");
-    CHECK(it->second.first == bound.first);
-    CHECK(it->second.second == bound.second);
+  const auto after = fingerprint(recovered);
+
+  {
+    INFO("next_seq must survive recovery");
+    CHECK(after.next_seq == before.next_seq);
   }
+
+  for (const auto &[key, value] : before.key_values) {
+    INFO("key present after resume must be present after recovery: " << key);
+    auto it = after.key_values.find(key);
+    REQUIRE(it != after.key_values.end());
+    CHECK(it->second == value);
+  }
+  for (const auto &[key, _] : after.key_values) {
+    INFO("key present after recovery must have been present after resume: "
+         << key);
+    CHECK(before.key_values.contains(key));
+  }
+
+  for (const auto &[stem, fs] : before.file_stats) {
+    auto it = after.file_stats.find(stem);
+    if (it == after.file_stats.end()) continue;
+    INFO("file_stats for " << stem << " must match after recovery");
+    CHECK(it->second.live_bytes == fs.live_bytes);
+    CHECK(it->second.total_bytes == fs.total_bytes);
+    CHECK(it->second.min_sequence == fs.min_sequence);
+    CHECK(it->second.max_sequence == fs.max_sequence);
+  }
+}
+
+// ---- Recovery state shaping -----------------------------------------------
+//
+// A hint file is a rebuildable index, not the record. These helpers put a
+// directory into the states recovery has to cope with: the hint-less data file
+// a crash leaves behind, and a hint whose CRC no longer holds.
+
+inline auto sorted_paths(const std::filesystem::path &dir,
+                         std::string_view ext) -> std::vector<std::filesystem::path> {
+  std::vector<std::filesystem::path> out;
+  for (const auto &e : std::filesystem::directory_iterator{dir}) {
+    if (e.path().extension() == ext) out.push_back(e.path());
+  }
+  std::ranges::sort(out);  // stems lead with a timestamp
+  return out;
+}
+
+// True when the newest data file has no hint beside it. A clean close leaves
+// exactly this: flush_hints skips the active file, so the file that was active
+// at shutdown is hint-less whether the process stopped cleanly or crashed.
+// recovery_prepare_files regenerates it at the next open.
+inline auto newest_data_is_hintless(const std::filesystem::path &dir) -> bool {
+  const auto data = sorted_paths(dir, ".data");
+  if (data.empty()) return false;
+  auto hint = data.back();
+  hint.replace_extension(".hint");
+  return !std::filesystem::exists(hint);
+}
+
+// Removes every hint file that exists, so recovery regenerates all of them.
+inline auto drop_all_hints(const std::filesystem::path &dir) -> int {
+  int dropped = 0;
+  for (const auto &h : sorted_paths(dir, ".hint")) {
+    std::error_code ec;
+    if (std::filesystem::remove(h, ec)) ++dropped;
+  }
+  return dropped;
+}
+
+// Flips a byte inside the newest hint file so its CRC-32C trailer no longer
+// matches. open_hint_or_rebuild must notice, discard it, and rebuild from the
+// data file rather than dropping the keys behind it.
+inline auto corrupt_newest_hint(const std::filesystem::path &dir) -> bool {
+  const auto hints = sorted_paths(dir, ".hint");
+  if (hints.empty()) return false;
+  const auto &path = hints.back();
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(path, ec);
+  if (ec || size == 0) return false;
+  std::fstream f{path, std::ios::binary | std::ios::in | std::ios::out};
+  if (!f) return false;
+  // Byte 0 is inside the first entry, which the trailer CRC covers.
+  f.seekg(0);
+  char b = 0;
+  f.read(&b, 1);
+  b = static_cast<char>(b ^ 0xFF);
+  f.seekp(0);
+  f.write(&b, 1);
+  return static_cast<bool>(f);
+}
+
+// ---- Byte-level corruption ------------------------------------------------
+//
+// The fault injector models calls that fail. These model a read that succeeds
+// and returns something wrong: the damage is already in the file. Offsets are
+// computable rather than parsed — a data entry is 15 bytes of header
+// (sequence u64, entry_type u8, key_size u16, value_size u32), then key, then
+// value, then a 4-byte CRC.
+
+// The corruption cells write one data file and damage it. A directory with
+// more than one is refused rather than guessed at: data file names end in a
+// random suffix, so sorting them does not recover creation order.
+inline auto only_data_file(const std::filesystem::path &dir)
+    -> std::filesystem::path {
+  const auto data = sorted_paths(dir, ".data");
+  REQUIRE(data.size() == 1);
+  return data.front();
+}
+
+// The first `n` bytes of the only data file, to prove a refused resume or
+// open left the bytes it refused over exactly as they were.
+inline auto data_file_prefix(const std::filesystem::path &dir, std::size_t n)
+    -> std::vector<char> {
+  std::ifstream f{only_data_file(dir), std::ios::binary};
+  REQUIRE(f);
+  std::vector<char> out(n);
+  f.read(out.data(), static_cast<std::streamsize>(n));
+  REQUIRE(f.gcount() == static_cast<std::streamsize>(n));
+  return out;
+}
+
+// Writes `bytes` at `off` in the only data file.
+inline void poke_active_file(const std::filesystem::path &dir,
+                             std::uint64_t off,
+                             std::span<const unsigned char> bytes) {
+  std::fstream f{only_data_file(dir),
+                 std::ios::binary | std::ios::in | std::ios::out};
+  REQUIRE(f);
+  f.seekp(static_cast<std::streamoff>(off));
+  f.write(reinterpret_cast<const char *>(bytes.data()),
+          static_cast<std::streamsize>(bytes.size()));
+  f.flush();
+  REQUIRE(f);
+}
+
+// Flips every bit of one byte, so the value is guaranteed to change whatever
+// it was.
+inline void flip_byte_at(const std::filesystem::path &dir, std::uint64_t off) {
+  std::array<unsigned char, 1> b{};
+  {
+    std::ifstream f{only_data_file(dir), std::ios::binary};
+    REQUIRE(f);
+    f.seekg(static_cast<std::streamoff>(off));
+    f.read(reinterpret_cast<char *>(b.data()), 1);
+    REQUIRE(f);
+  }
+  b[0] = static_cast<unsigned char>(~b[0]);
+  poke_active_file(dir, off, b);
+}
+
+// A little-endian u32 large enough that the entry it describes ends past any
+// file this suite writes — what #36 sized a read buffer from.
+inline void poke_huge_value_size(const std::filesystem::path &dir,
+                                 std::uint64_t off) {
+  const std::array<unsigned char, 4> huge{0xF0, 0xFF, 0xFF, 0xFF};
+  poke_active_file(dir, off, huge);
+}
+
+// A byte that is not a valid EntryType (valid are 0x01..0x05).
+inline void poke_invalid_entry_type(const std::filesystem::path &dir,
+                                    std::uint64_t off) {
+  const std::array<unsigned char, 1> bad{0x7F};
+  poke_active_file(dir, off, bad);
+}
+
+// Zero the 8-byte sequence, which the scan already treats as end of file.
+inline void poke_zero_sequence(const std::filesystem::path &dir,
+                               std::uint64_t off) {
+  const std::array<unsigned char, 8> zero{};
+  poke_active_file(dir, off, zero);
 }
 
 // ---- Vacuum baseline and helpers -----------------------------------------
@@ -466,6 +638,23 @@ inline void assert_vacuum_no_change(const DB &db, const VacuumBaseline &before,
 }
 
 // Opens a fresh DB and verifies all pre-vacuum keys survive.
+// `.data` files in dir that the engine's published state does not reference —
+// what a vacuum killed after its rename and before its commit leaves behind.
+inline auto unreferenced_data_files(const DB &db,
+                                    const std::filesystem::path &dir)
+    -> std::vector<std::filesystem::path> {
+  auto state = db.engine_state();
+  std::vector<std::string> referenced;
+  for (const auto [file_id, file] : state->files)
+    referenced.push_back(file->path().filename().string());
+  std::vector<std::filesystem::path> out;
+  for (const auto &p : sorted_paths(dir, ".data"))
+    if (std::ranges::find(referenced, p.filename().string()) ==
+        referenced.end())
+      out.push_back(p);
+  return out;
+}
+
 inline void assert_vacuum_recoverable(const std::filesystem::path &dir,
                                       const VacuumBaseline &before,
                                       const Options &opts = {}) {

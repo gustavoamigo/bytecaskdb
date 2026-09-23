@@ -3342,6 +3342,9 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
     hint.append(e.seq, e.type, e.file_off, key_of(e), e.val_size);
 
   hint.close();
+#ifdef BYTECASK_TESTING
+  FAULT_INJECTION(io_hint_rename);
+#endif
   std::filesystem::rename(tmp_path, hint_path);
   return it.committed_offset();
 }
@@ -3520,6 +3523,12 @@ auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
   // between here and the staging create. renameDataFileExclusive refuses the
   // target instead of replacing it.
   renameDataFileExclusive(tmp_data_path, final_data_path);
+#ifdef BYTECASK_TESTING
+  // Class G in docs/correctness_validation.md: the rename completed and the
+  // process did not get to confirm it. The compacted file is on disk under its
+  // final name while the old one is still the published state's.
+  FAULT_INJECTION(io_vacuum_compact_post_rename);
+#endif
 
   // Reserve the destination id before opening the file, so the file carries
   // its engine file_id from construction — the buffer pool keys frames by it.
@@ -3718,8 +3727,31 @@ void DB::resume() {
       valid_offset = iter.committed_offset();
       ++iter;
     }
-  } catch (...) {
-    // Stop at first CRC error — valid_offset is the last known-good position.
+  } catch (const std::system_error &) {
+    // An I/O error says nothing about the bytes — the next attempt may read
+    // them fine. Truncating on it would destroy data over a transient fault.
+    throw;  // stays degraded
+  } catch (const std::runtime_error &) {
+    // The scan stopped at an entry that does not parse. valid_offset is the
+    // end of the last committed entry or batch before it; whether that is
+    // a torn tail to trim or damage to refuse is decided below.
+  }
+  const auto active_stats = current->file_stats.get(old_file_id);
+  const auto published_extent = active_stats ? active_stats->total_bytes : 0;
+  // resume() trims what a failed write left behind: bytes appended but never
+  // published. Everything below the published extent was acknowledged, and a
+  // scan that stops short of it has found damage in data readers have
+  // already been served, not a torn tail. There is no consistent state to
+  // resume into from there, so resume() refuses — before truncating, so the
+  // file is left exactly as it was found and the engine stays degraded.
+  // This is detection, not repair: resume() makes no promise about what a
+  // damaged file still holds, only that it will not truncate acknowledged
+  // bytes or report success over them.
+  if (valid_offset < published_extent) {
+    throw std::runtime_error{std::format(
+        "resume: active file '{}' is damaged at offset {}, inside data "
+        "already published (up to {}); refusing to truncate it",
+        file.path().string(), valid_offset, published_extent)};
   }
 
   // Remove garbage bytes / orphaned batch markers via truncation.

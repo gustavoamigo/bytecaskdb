@@ -71,6 +71,10 @@ private:
   void advance() {
     pending_.clear();
     emit_idx_ = 0;
+    if (step_pending_) {
+      step_pending_ = false;
+      ++cur_;
+    }
 
     while (!(cur_ == std::default_sentinel)) {
       const auto& [entry, entry_off] = *cur_;
@@ -85,7 +89,7 @@ private:
           pending_.emplace_back(inner, inner_off);
           if (inner.entry_type == EntryType::BulkEnd) {
             committed_offset_ = cur_.next_offset();
-            ++cur_;
+            step_pending_ = true;
             return;
           }
           ++cur_;
@@ -98,7 +102,7 @@ private:
       // Standalone entry (Put, Delete, RangeDel).
       committed_offset_ = cur_.next_offset();
       pending_.emplace_back(entry, entry_off);
-      ++cur_;
+      step_pending_ = true;
       return;
     }
   }
@@ -107,6 +111,14 @@ private:
   std::vector<value_type> pending_;
   std::size_t emit_idx_{0};
   Offset committed_offset_{};
+  // The scan past the last committed entry or batch is deferred to the next
+  // advance(), so the entry after it is parsed only once the caller moves on.
+  // A damaged entry then throws out of the operator++ that steps past an
+  // intact one the caller has already seen and counted in committed_offset(),
+  // not out of the one that was about to yield it. Parse and I/O errors still
+  // propagate to every caller: this iterator never decides that damage is
+  // the end of the file.
+  bool step_pending_{false};
 };
 
 export inline auto scan_committed(const DataFile& file, Offset start = 0)

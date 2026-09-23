@@ -24,8 +24,8 @@ namespace {
 
 using bytecask::testing::assert_consistent;
 using bytecask::testing::assert_keys_recoverable;
-using bytecask::testing::assert_sequence_bounds_match_recovery;
-using bytecask::testing::capture_sequence_bounds;
+using bytecask::testing::assert_matches_recovery;
+using bytecask::testing::fingerprint;
 using bytecask::testing::to_bytes;
 using bytecask::testing::to_string;
 
@@ -52,7 +52,7 @@ struct TempDir {
 TEST_CASE("prove_resume__degrade_H__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 30});
@@ -83,17 +83,17 @@ TEST_CASE("prove_resume__degrade_H__success", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_H__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 30});
@@ -131,17 +131,17 @@ TEST_CASE("prove_resume__degrade_H__file_creation_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_H__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 30});
@@ -189,17 +189,17 @@ TEST_CASE("prove_resume__degrade_H__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -231,17 +231,17 @@ TEST_CASE("prove_resume__degrade_C__success", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__truncate_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -280,17 +280,17 @@ TEST_CASE("prove_resume__degrade_C__truncate_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -329,17 +329,17 @@ TEST_CASE("prove_resume__degrade_C__sync_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -378,17 +378,17 @@ TEST_CASE("prove_resume__degrade_C__file_creation_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -433,17 +433,17 @@ TEST_CASE("prove_resume__degrade_C__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -489,17 +489,17 @@ TEST_CASE("prove_resume__degrade_C__cascade_r2_r3", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F: k0 committed (sync=false); p0 appended but
     // commit sync (fdatasync) fails. Bytes in page cache, key_dir not published.
@@ -531,17 +531,17 @@ TEST_CASE("prove_resume__degrade_F__success", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F: k0 committed (sync=false); p0 appended but
     // commit sync (fdatasync) fails. Bytes in page cache, key_dir not published.
@@ -580,17 +580,17 @@ TEST_CASE("prove_resume__degrade_F__sync_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F: k0 committed (sync=false); p0 appended but
     // commit sync (fdatasync) fails. Bytes in page cache, key_dir not published.
@@ -629,17 +629,17 @@ TEST_CASE("prove_resume__degrade_F__file_creation_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F: k0 committed (sync=false); p0 appended but
     // commit sync (fdatasync) fails. Bytes in page cache, key_dir not published.
@@ -688,17 +688,17 @@ TEST_CASE("prove_resume__degrade_F__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F: k0 committed (sync=false); p0 appended but
     // commit sync (fdatasync) fails. Bytes in page cache, key_dir not published.
@@ -744,17 +744,17 @@ TEST_CASE("prove_resume__degrade_F__cascade_r2_r3", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_G__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_G: k0 committed (sync=false); p0 appended with
     // sync=false on small max_file_bytes. Pre-rotation sync fails.
@@ -786,17 +786,17 @@ TEST_CASE("prove_resume__degrade_G__success", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_G__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_G: k0 committed (sync=false); p0 appended with
     // sync=false on small max_file_bytes. Pre-rotation sync fails.
@@ -835,17 +835,17 @@ TEST_CASE("prove_resume__degrade_G__sync_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_G__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_G: k0 committed (sync=false); p0 appended with
     // sync=false on small max_file_bytes. Pre-rotation sync fails.
@@ -884,17 +884,17 @@ TEST_CASE("prove_resume__degrade_G__file_creation_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_G__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_G: k0 committed (sync=false); p0 appended with
     // sync=false on small max_file_bytes. Pre-rotation sync fails.
@@ -943,17 +943,17 @@ TEST_CASE("prove_resume__degrade_G__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_G__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_G: k0 committed (sync=false); p0 appended with
     // sync=false on small max_file_bytes. Pre-rotation sync fails.
@@ -999,18 +999,18 @@ TEST_CASE("prove_resume__degrade_G__cascade_r2_r3", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 #ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_H_mmap__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::Mmap});
@@ -1041,11 +1041,11 @@ TEST_CASE("prove_resume__degrade_H_mmap__success", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::Mmap});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1053,7 +1053,7 @@ TEST_CASE("prove_resume__degrade_H_mmap__success", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_H_mmap__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::Mmap});
@@ -1091,11 +1091,11 @@ TEST_CASE("prove_resume__degrade_H_mmap__file_creation_fails", "[prove_resume]")
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::Mmap});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1103,7 +1103,7 @@ TEST_CASE("prove_resume__degrade_H_mmap__file_creation_fails", "[prove_resume]")
 TEST_CASE("prove_resume__degrade_H_mmap__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::Mmap});
@@ -1151,11 +1151,11 @@ TEST_CASE("prove_resume__degrade_H_mmap__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::Mmap});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1163,7 +1163,7 @@ TEST_CASE("prove_resume__degrade_H_mmap__double_resume", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_mmap__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -1195,11 +1195,11 @@ TEST_CASE("prove_resume__degrade_C_mmap__success", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1207,7 +1207,7 @@ TEST_CASE("prove_resume__degrade_C_mmap__success", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -1246,11 +1246,11 @@ TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1258,7 +1258,7 @@ TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_mmap__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -1297,11 +1297,11 @@ TEST_CASE("prove_resume__degrade_C_mmap__sync_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1309,7 +1309,7 @@ TEST_CASE("prove_resume__degrade_C_mmap__sync_fails", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_mmap__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -1348,11 +1348,11 @@ TEST_CASE("prove_resume__degrade_C_mmap__file_creation_fails", "[prove_resume]")
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1360,7 +1360,7 @@ TEST_CASE("prove_resume__degrade_C_mmap__file_creation_fails", "[prove_resume]")
 TEST_CASE("prove_resume__degrade_C_mmap__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -1405,11 +1405,11 @@ TEST_CASE("prove_resume__degrade_C_mmap__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1417,7 +1417,7 @@ TEST_CASE("prove_resume__degrade_C_mmap__double_resume", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_mmap__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -1463,11 +1463,11 @@ TEST_CASE("prove_resume__degrade_C_mmap__cascade_r2_r3", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1475,7 +1475,7 @@ TEST_CASE("prove_resume__degrade_C_mmap__cascade_r2_r3", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_H_pool__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -1506,11 +1506,11 @@ TEST_CASE("prove_resume__degrade_H_pool__success", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1518,7 +1518,7 @@ TEST_CASE("prove_resume__degrade_H_pool__success", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_H_pool__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -1556,11 +1556,11 @@ TEST_CASE("prove_resume__degrade_H_pool__file_creation_fails", "[prove_resume]")
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1568,7 +1568,7 @@ TEST_CASE("prove_resume__degrade_H_pool__file_creation_fails", "[prove_resume]")
 TEST_CASE("prove_resume__degrade_H_pool__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -1616,11 +1616,11 @@ TEST_CASE("prove_resume__degrade_H_pool__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1628,7 +1628,7 @@ TEST_CASE("prove_resume__degrade_H_pool__double_resume", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_pool__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -1660,11 +1660,11 @@ TEST_CASE("prove_resume__degrade_C_pool__success", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1672,7 +1672,7 @@ TEST_CASE("prove_resume__degrade_C_pool__success", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_pool__truncate_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -1711,11 +1711,11 @@ TEST_CASE("prove_resume__degrade_C_pool__truncate_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1723,7 +1723,7 @@ TEST_CASE("prove_resume__degrade_C_pool__truncate_fails", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_pool__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -1762,11 +1762,11 @@ TEST_CASE("prove_resume__degrade_C_pool__sync_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1774,7 +1774,7 @@ TEST_CASE("prove_resume__degrade_C_pool__sync_fails", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_pool__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -1813,11 +1813,11 @@ TEST_CASE("prove_resume__degrade_C_pool__file_creation_fails", "[prove_resume]")
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1825,7 +1825,7 @@ TEST_CASE("prove_resume__degrade_C_pool__file_creation_fails", "[prove_resume]")
 TEST_CASE("prove_resume__degrade_C_pool__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -1870,11 +1870,11 @@ TEST_CASE("prove_resume__degrade_C_pool__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1882,7 +1882,7 @@ TEST_CASE("prove_resume__degrade_C_pool__double_resume", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_pool__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
     // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
@@ -1928,18 +1928,18 @@ TEST_CASE("prove_resume__degrade_C_pool__cascade_r2_r3", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
-  assert_sequence_bounds_match_recovery(dir, bounds, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
 TEST_CASE("prove_resume__degrade_B2__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
     // leaving a torn trailing entry whose CRC cannot hold. This is the
@@ -1970,17 +1970,17 @@ TEST_CASE("prove_resume__degrade_B2__success", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B2__truncate_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
     // leaving a torn trailing entry whose CRC cannot hold. This is the
@@ -2018,17 +2018,17 @@ TEST_CASE("prove_resume__degrade_B2__truncate_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B2__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
     // leaving a torn trailing entry whose CRC cannot hold. This is the
@@ -2066,17 +2066,17 @@ TEST_CASE("prove_resume__degrade_B2__sync_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B2__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
     // leaving a torn trailing entry whose CRC cannot hold. This is the
@@ -2114,17 +2114,17 @@ TEST_CASE("prove_resume__degrade_B2__file_creation_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B2__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
     // leaving a torn trailing entry whose CRC cannot hold. This is the
@@ -2167,17 +2167,17 @@ TEST_CASE("prove_resume__degrade_B2__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B2__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
     // leaving a torn trailing entry whose CRC cannot hold. This is the
@@ -2222,17 +2222,17 @@ TEST_CASE("prove_resume__degrade_B2__cascade_r2_r3", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
     // and then returned an error. The entry is structurally complete on
@@ -2263,17 +2263,17 @@ TEST_CASE("prove_resume__degrade_B3__success", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__truncate_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
     // and then returned an error. The entry is structurally complete on
@@ -2311,17 +2311,17 @@ TEST_CASE("prove_resume__degrade_B3__truncate_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
     // and then returned an error. The entry is structurally complete on
@@ -2359,17 +2359,17 @@ TEST_CASE("prove_resume__degrade_B3__sync_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
     // and then returned an error. The entry is structurally complete on
@@ -2407,17 +2407,17 @@ TEST_CASE("prove_resume__degrade_B3__file_creation_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
     // and then returned an error. The entry is structurally complete on
@@ -2460,17 +2460,17 @@ TEST_CASE("prove_resume__degrade_B3__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
     // and then returned an error. The entry is structurally complete on
@@ -2515,17 +2515,17 @@ TEST_CASE("prove_resume__degrade_B3__cascade_r2_r3", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_range__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_range: k0 and k1 committed (sync=false); a
     // del_range over [k, l) is appended but its commit sync fails. The
@@ -2551,17 +2551,17 @@ TEST_CASE("prove_resume__degrade_F_range__success", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {}, {"k0", "k1"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_range__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_range: k0 and k1 committed (sync=false); a
     // del_range over [k, l) is appended but its commit sync fails. The
@@ -2594,17 +2594,17 @@ TEST_CASE("prove_resume__degrade_F_range__sync_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {}, {"k0", "k1"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_range__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_range: k0 and k1 committed (sync=false); a
     // del_range over [k, l) is appended but its commit sync fails. The
@@ -2637,17 +2637,17 @@ TEST_CASE("prove_resume__degrade_F_range__file_creation_fails", "[prove_resume]"
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {}, {"k0", "k1"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_range__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_range: k0 and k1 committed (sync=false); a
     // del_range over [k, l) is appended but its commit sync fails. The
@@ -2680,17 +2680,17 @@ TEST_CASE("prove_resume__degrade_F_range__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {}, {"k0", "k1"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_range__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_range: k0 and k1 committed (sync=false); a
     // del_range over [k, l) is appended but its commit sync fails. The
@@ -2730,17 +2730,17 @@ TEST_CASE("prove_resume__degrade_F_range__cascade_r2_r3", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {}, {"k0", "k1"});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_batch__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
     // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the
@@ -2785,17 +2785,17 @@ TEST_CASE("prove_resume__degrade_F_batch__success", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"p0", "new0"}, {"p1", "new1"}, {"k0", "v0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_batch__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
     // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the
@@ -2847,17 +2847,17 @@ TEST_CASE("prove_resume__degrade_F_batch__sync_fails", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"p0", "new0"}, {"p1", "new1"}, {"k0", "v0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_batch__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
     // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the
@@ -2909,17 +2909,17 @@ TEST_CASE("prove_resume__degrade_F_batch__file_creation_fails", "[prove_resume]"
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"p0", "new0"}, {"p1", "new1"}, {"k0", "v0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_batch__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
     // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the
@@ -2987,17 +2987,17 @@ TEST_CASE("prove_resume__degrade_F_batch__double_resume", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"p0", "new0"}, {"p1", "new1"}, {"k0", "v0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_batch__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
-  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> bounds;
+  bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
     // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the
@@ -3056,9 +3056,9 @@ TEST_CASE("prove_resume__degrade_F_batch__cascade_r2_r3", "[prove_resume]") {
     assert_consistent(db);
 
     // resume() and a cold open read the same bytes; they must
-    // describe them the same way.
-    bounds = capture_sequence_bounds(db);
+    // reconstruct the same engine.
+    fp = fingerprint(db);
   }
   assert_keys_recoverable(dir, {{"p0", "new0"}, {"p1", "new1"}, {"k0", "v0"}}, {});
-  assert_sequence_bounds_match_recovery(dir, bounds);
+  assert_matches_recovery(dir, fp);
 }

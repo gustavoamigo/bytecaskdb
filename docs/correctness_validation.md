@@ -227,6 +227,16 @@ healthy but fails on the next append. Degrading is the correct response;
 | G | No — page cache only | No | Yes | Yes | Yes |
 | H | Yes — fully | Yes — full delta | Yes | Yes | Yes |
 
+Classes A through H are syscalls that return an error. #104 added the
+region they leave out, syscalls that **succeed with the wrong result**:
+
+| Class | What succeeds wrongly | Engine behaviour | Proven by |
+|-------|----------------------|------------------|-----------|
+| M1 | `mmap` returns the address `munmap` just released | a span handed out before `truncate()` still reads the same bytes | observer axis, `assert_view_stable` (byte comparison, not address) |
+| M2 | `open(O_CREAT)` on a stem already on disk or already hinted | aborts rather than adopting the sealed file | `createDataFileForWrite panics when the data file already exists` / `… when the stem was already hinted` in `data_file_test.cpp` |
+| M3 | `rename` completes, the process does not confirm it | the next open detects the uncommitted copy and deletes it | VC6 in `[prove_vacuum_compact]` |
+| M4 | `pread` returns damaged bytes of published data | fail-stop: `resume()` refuses and truncates nothing; `open` refuses where the format can see it | `[prove_corruption]`, `[corruption]` |
+
 Note on classes B1/B2/B3 — LSN advanced, engine degraded: Any `writev`
 failure leaves the file in an indeterminate state — POSIX does not guarantee
 `writev = -1` means no bytes were written. `next_lsn` is advanced past all
@@ -312,6 +322,26 @@ Six additional checkpoints exist in `bytecask.cpp` (compiled under `BYTECASK_TES
    `DataFile` in `vacuum_compact_file()`
 9. `io_vacuum_compact_rename` — before `std::filesystem::rename()` in
     `vacuum_compact_file()`
+
+Three more instrument the hint write, mirroring the data file's:
+
+10. `io_hint_write` — before the CRC trailer `write()` in `HintFile::close()`
+11. `io_hint_sync` — before the `fdatasync()` in `HintFile::close()`
+12. `io_hint_rename` — before `std::filesystem::rename()` in
+    `flush_hints_for()`
+
+And one for the window a completed rename opens:
+
+13. `io_vacuum_compact_post_rename` — after `renameDataFileExclusive()` and
+    before `vacuum_commit()` in `vacuum_compact_file()`. See *Orphaned
+    `.data` files* for what it reproduces and why no cell asserts it yet.
+
+And one on the read side, for the scan `resume()` runs:
+
+14. `io_data_file_scan` — before the header `pread()` in the active file's
+    `scan()`. An I/O error there says nothing about the bytes, so
+    `resume()` must rethrow it rather than read it as the end of the file
+    and truncate; `[degraded][resume]` holds it to that.
 
 ### Orphaned BulkBegin degrade
 
@@ -449,16 +479,20 @@ Observers that read a key (`held_value`, `held_iter_span`,
 leaves one behind, so they skip `empty_db` and `deleted_key`.
 
 Reverting #90 — restoring the `munmap` / `mmap` in
-`WritableMmapDataFile::truncate` — makes 40 of these cells fail, every
-one of them on the byte comparison rather than only under ASan, and none
-by crashing. The `mincore` probe passes in all 40: `mmap` hands back the
-address `munmap` just released, which is exactly the blind spot that
-motivated comparing bytes. Half are `held_iter_span` and half
-`held_riter_span` — the reverse iterator's span points into the same
-mapping. The
-`rotation_threshold_mmap` cells correctly keep passing: at
-`max_file_bytes = 1` every write rotates, so their span points into a
-sealed `MAP_PRIVATE` file that `truncate()` never touches.
+`WritableMmapDataFile::truncate` — makes these cells fail on the byte
+comparison rather than only under ASan, and none by crashing. The
+`mincore` probe passes in every one of them: `mmap` hands back the address
+`munmap` just released, which is exactly the blind spot that motivated
+comparing bytes. The `rotation_threshold_mmap` cells correctly keep
+passing: at `max_file_bytes = 1` every write rotates, so their span points
+into a sealed `MAP_PRIVATE` file that `truncate()` never touches.
+
+This is also the answer to #104's proposed class **M1**, a `MAP_FIXED`
+hook to force `mmap` to return the address `munmap` just released. Its
+stated goal is to turn "often looks like it works" into a cell that either
+passes or fails, and the byte comparison already does that — it does not
+care what address came back, only what bytes are behind it. A hook would
+add machinery for a property the axis already holds deterministically.
 
 Reverting BC-243 — dropping the owner check from
 `DB::load_state_for_read` — fails 10 `second_instance` cells on
@@ -650,13 +684,14 @@ and in `assert_keys_recoverable`. A truncation that cut too far leaves
 the key directory intact while the bytes behind it are gone, which is
 exactly how the #36 bug stayed invisible to a test named for it.
 
-Every cell also ends with `assert_sequence_bounds_match_recovery`. The
-key assertions ask whether `resume()` produced the *right* state; this one
-asks whether it produced the *same* state a cold open produces from the
-same bytes, which is the property `resume()` exists to preserve and the
-one both bugs in this matrix's history violated. It compares per-file
-`min_sequence`/`max_sequence`, keyed by the data file's stem because
-recovery assigns file ids by directory order.
+Every cell also ends with `assert_matches_recovery`. The key assertions
+ask whether `resume()` produced the *right* state; this one asks whether
+it produced the *same* state a cold open produces from the same bytes,
+which is the property `resume()` exists to preserve and the one both bugs
+in this matrix's history violated. It compares `next_seq`, the full
+key-value map in both directions, and per-file `live_bytes`,
+`total_bytes`, `min_sequence` and `max_sequence` — keyed by the data
+file's stem, because recovery assigns file ids by directory order.
 
 Each R1/R2/R3 test uses a multi-phase pattern:
 1. Establish degraded state
@@ -671,10 +706,10 @@ fault points.
 
 This directly proves: *resume always eventually recovers once the underlying fault clears.*
 
-### vacuum_compact — 48 tests
+### vacuum_compact — 56 tests
 
-48 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover eight state
-shapes × six failure classes (SUCCESS, VC1–VC5).
+56 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover eight state
+shapes × seven failure classes (SUCCESS, VC1–VC6).
 
 State shapes create a DB with exactly one sealed file having fragmentation > 0:
 
@@ -710,7 +745,8 @@ sealed file.
 
 Failure classes: SUCCESS, VC1 (`io_vacuum_compact_tmp_create`),
 VC2 (`io_data_file_append`), VC3 (`io_data_file_sync`),
-VC4 (`io_vacuum_compact_rename`), VC5 (`io_vacuum_compact_unlink`).
+VC4 (`io_vacuum_compact_rename`), VC5 (`io_vacuum_compact_unlink`),
+VC6 (`io_vacuum_compact_post_rename`).
 
 VC4 is the most critical: the tmp file is fully synced and renamed
 (a new `.data` file exists on disk) but `vacuum_commit` has not run —
@@ -730,6 +766,242 @@ recovery handled this pair, every VC5 test failed with "two entries share
 the same sequence number but differ in physical location", which is how a
 cgroup OOM kill under a write-heavy sysbench run left a database that would
 not open.
+
+VC6 is the other end of that window, and #104's class M3: the rename
+completed and the process did not get to confirm it. Nothing is committed,
+so in memory the outcome is a failed vacuum (`assert_vacuum_no_change`), and
+on disk the compacted copy sits under its final name, referenced by nothing
+in the published state. The cell records that orphan's path before closing
+and checks the next open deleted it, on top of what
+`assert_vacuum_recoverable` proves for every class. Making recovery's undo
+throw instead fails all eight VC6 cells, and all eight VC5 cells with them.
+
+### corruption — 16 tests
+
+16 generated Catch2 tests (`[prove_corruption]` tag) cover four positions ×
+four damaged fields. Classes A through H all mean the same thing at the
+POSIX level — a syscall returned an error. This axis is over the **bytes**
+rather than the **calls**: a read that succeeds and hands back something
+wrong.
+
+The entry layout makes a position addressable without parsing. A data
+entry is 15 bytes of header — `sequence` u64, `entry_type` u8, `key_size`
+u16, `value_size` u32 — then key, then value, then a 4-byte CRC. With
+2-byte keys and values every entry is 23 bytes, so entry *i* starts at
+`23 * i` and each field sits at a fixed offset inside it.
+
+| Field | Damage |
+|-------|--------|
+| `crc` | flip a key byte, which the entry CRC covers |
+| `value_size` | a size that runs past the end of the file — what #36 sized a read buffer from |
+| `entry_type` | a byte that is not a valid `EntryType` |
+| `sequence` | zeroed, which the scan already treats as end of file |
+
+crossed with position: first entry, mid-file, last entry, and inside a
+batch between `BulkBegin` and `BulkEnd`.
+
+#### The contract is fail-stop, not recovery
+
+What separates these cells from every other shape in the framework: the
+damaged entry was appended, synced **and published**. Every other degrade
+shape leaves damage only in bytes a failed write appended and never
+published — a torn tail nobody was served. Here readers were already served
+the bytes that are now wrong, and the engine cannot know what state that
+leaves it in. So it makes no promise about what a damaged file still holds.
+It promises only to stop rather than make the damage worse:
+
+- `resume()` throws `std::runtime_error`, stays degraded, and truncates
+  nothing — and does the same on every retry;
+- the data file is byte-for-byte what it was after the damage, including
+  the unpublished entry the failed write appended after it;
+- a cold open under the default `fail_recovery_on_crc_errors` refuses as
+  well, wherever the format lets it see the damage (below), and leaves the
+  file untouched.
+
+The line `resume()` draws is the **published extent** — the active file's
+`total_bytes` in the last published state. `resume()` exists to trim what
+a failed write left behind, which is by construction above that extent. A
+scan that stops below it has found damage in acknowledged data, not a torn
+tail, and truncating there would destroy acknowledged entries and every
+entry behind them. The check runs before the truncation, so a refusal
+leaves the file as it was found. An I/O error during the scan is rethrown
+as-is for the same reason: it says nothing about the bytes, and trimming
+on a transient `EIO` would destroy data over a fault the next attempt may
+not see.
+
+The delta is the same shape in every cell: refuse, stay degraded, touch no
+byte.
+
+#### What a cold open can and cannot see
+
+| Field | `resume()` | Cold open |
+|-------|-----------|-----------|
+| `crc` | refuses | refuses — the entry fails verification |
+| `entry_type` | refuses | refuses — the entry does not parse |
+| `value_size` | refuses | cannot tell it from the end of the file |
+| `sequence` | refuses | cannot tell it from the end of the file |
+
+An entry that claims to run past the end of the file and a zeroed sequence
+both read as the end of written data, which is also what the zero-filled,
+unwritten tail of a crashed active file looks like. A hint-less file
+records no committed length, so a cold open has nothing to tell the two
+apart with and trims the file to the last entry it could parse. `resume()`
+can tell because the published state knows the extent. The `value_size`
+and `sequence` cells therefore assert the `resume()` refusal only; closing
+the gap at open needs the committed length on disk, which is a format
+change.
+
+#### What the axis found
+
+**The scan was one step ahead of what it had yielded.** `advance()` set
+`committed_offset_` to the end of the entry it had just buffered and then
+called `++cur_` to parse the next one before returning. When that threw,
+the exception left the `operator++` that was about to yield the buffered
+entry, so the caller never saw an intact entry below the damage and
+`resume()` placed the damage one entry too early. `CommittedEntryIterator`
+now defers that step to the next advance: the entry after a committed one
+is parsed only when the caller moves past it, so the throw comes out of
+the `operator++` that steps past an entry the caller has already counted.
+Every parse and I/O error still propagates to every caller. An earlier fix
+caught the error inside the iterator and ended the scan there instead.
+That iterator is shared with the scan that indexes a hint-less file at
+open and the one vacuum compacts a sealed file with, and both rely on the
+throw: open truncated the data file to the damage, and vacuum published a
+copy without the entries behind it and unlinked the original. Two cells in
+`bytecask_test.cpp` (`[corruption]`) pin both down.
+
+**`resume()` could report success over data it had cut.** With the damage
+below the published extent, the old `resume()` truncated to the damage
+while the key directory still pointed at the bytes it removed. A debug
+build's extent check in `store_state` rejected the resumed state and left
+the engine degraded; with `NDEBUG` that check is compiled out, so `resume()`
+reported success and the next read of such a key `pread` past the end of
+the file. Refusing before the truncation closes both: nothing is cut, so
+nothing dangles. Pruning the dangling keys instead was considered and
+rejected — it presents a damaged file as a consistent engine, and a key
+with an older version in a sealed file would then read as absent after
+`resume()` and as the old value after a cold open.
+
+Reverting the extent check fails all 16 cells. Restoring the catching
+iterator fails the two `[corruption]` cells and the cold-open half of six
+more — `crc` and `entry_type` at every position but the first, where the
+scan throws opening the file, before the iterator takes a step it could
+catch.
+
+### recovery — 40 tests
+
+40 generated Catch2 tests (`[prove_recovery]` tag) cover five state shapes
+× four failure classes × `recovery_threads ∈ {1, 4}`.
+
+`hint_file.cppm` had 19 syscall sites and no fault points, and `DB::open`
+had no matrix at all — recovery was proven by the `[model]` tests, every
+one of which runs the clean path. The README sells the hint write as a
+crash-safety mechanism (`write → fdatasync → rename`) and nothing injected
+a failure into any of the three steps. Three checkpoints now mirror what
+the data file already has: `io_hint_write`, `io_hint_sync`,
+`io_hint_rename`.
+
+What makes the matrix cheap to assert is that the expected delta is the
+same in every cell: **a hint file is a rebuildable index, not the record**,
+so a failure generating one may cost recovery time and must not cost keys.
+`recovery_prepare_files` calls `flush_hints_for` without a catch, so the
+failure propagates out of `DB::open`; each cell then reopens with the
+fault cleared and checks every key back, by value.
+
+#### State shapes
+
+| Shape | Damage | What it tests |
+|-------|--------|---------------|
+| `crash_hintless` | none needed | The file that was active at shutdown. A clean close already leaves it hint-less — `flush_hints` skips `active_file_id` — so this *is* the shape a crash produces, and the one `recovery_prepare_files` regenerates from |
+| `multi_file_hintless` | every hint removed | Several sealed files, none with a hint; all must be rebuilt |
+| `damaged_hint` | newest hint's CRC broken | `open_hint_or_rebuild` must discard it and rebuild from the data file rather than drop the keys behind it |
+| `hintless_batched` | none needed | `BulkBegin`/`BulkEnd` have to survive regeneration — a hint carries them so recovery can compute `durable_seq` across a batch |
+| `hintless_range_del` | none needed | A range tombstone has to survive it too; recovery reads it back out of the regenerated hint to suppress the range |
+
+Serial and parallel recovery diverging is the specific risk the `[model]`
+tests were built around, so every shape is recovered both ways.
+
+#### What is out of reach, and why it is not worked around
+
+Six call sites reach `flush_hints_for`. Four are synchronous —
+`recovery_prepare_files`, `open_hint_or_rebuild`, `flush_hints` at close,
+and `vacuum_compact_file` — and a fault armed on the thread calling
+`DB::open` reaches them. The two post-rotation `worker_.dispatch` sites do
+not: `active_injector` is thread-local and the background worker has its
+own. Propagating one into the worker would need it to outlive the stack
+frame that set it, and the failure it models — a missing hint — is already
+the state `crash_hintless` starts from and every cell here recovers from.
+So it is recorded rather than engineered around.
+
+### group_commit — 22 tests
+
+22 generated Catch2 tests (`[prove_group]` + `[concurrency]` tags) cover
+six group shapes × the failure classes valid for each. Every other matrix
+in this framework drives one thread; these are the cells where group
+commit — a writer that finds no leader becomes one and executes every
+pending write under a single lock hold — is faulted with more than one
+writer in play.
+
+#### What turned out not to need building
+
+#118 proposed tagging each slot with its own fault, on the premise that a
+follower's I/O could be failed while the leader's succeeded. The write
+path does not work that way. `execute_slot` is pure in-memory — it
+contains no append or sync call at all — and `execute_slots` issues **one**
+`append_entries` for every slot's entries combined and **one** `fdatasync`.
+There is no per-slot I/O boundary to fail, so "fail writer B's slot while
+A leads" is not a state the engine can be in, and the cells that issue
+proposed for it are struck rather than deferred.
+
+What is left is group-wide, and the thread-local injector reaches it as it
+stands. `WriteGroup` already carries `on_leader_start_` and
+`wait_for_queue_size`, so a cell forces a batch of exactly N deterministically
+rather than racing for it.
+
+#### Where a fault has to be armed
+
+Not one answer, and the difference is what made the first draft of these
+cells flaky:
+
+| Call | Thread that makes it |
+|------|---------------------|
+| the group's combined `append_entries` (B1, B2) | the leader, under `write_mu_` |
+| rotation `fdatasync` and file creation (G, H) | the leader, inline — the rotation branch takes the flush role itself |
+| the commit `fdatasync` (F) | **not the leader** |
+
+On the non-rotation path `execute_slots` ends at `store_head()` and
+returns; the flush is left to `flush_pending()`, run by whichever writer
+holds the `FlushRole`. Arming only the leader made the F cells pass or
+fail by race. They arm every writer thread instead, which is also the
+truer question: when the group's `fdatasync` fails, every writer in it
+must learn, whoever ran it.
+
+#### Group shapes
+
+| Shape | Writers | Plans | What it tests |
+|-------|--------:|-------|---------------|
+| `group_of_2`, `group_of_4` | 2, 4 | 1 put each | The combined append and flush for a small and a larger group |
+| `group_of_2_batched`, `group_of_4_batched` | 2, 4 | 2 puts each | The same with a `BulkBegin`/`BulkEnd` pair per writer, so all-or-nothing is asked of batches rather than single entries |
+| `group_of_2_rotation`, `group_of_4_rotation` | 2, 4 | 1 put each, `max_file_bytes = 1` | The rotation barrier with a group behind it — G and H |
+
+Two elimination rules: G and H need the rotation shapes, and the rotation
+shapes are not crossed with B1/B2/F — those would re-ask what the
+non-rotation shapes ask against a fault point that fires at a different
+call in the sequence, which says nothing new about grouping.
+
+#### What every cell asserts
+
+The group shares one append and one `fdatasync`, so the engine has no way
+to tell one writer its write landed and another that it did not. Each cell
+checks that every writer saw the same outcome, that the group's keys are
+all visible or none are, and — since `store_state(published, …)` runs
+before the errors are set in the H path but not in the others — which side
+of that line the class falls on. Degraded cells then resume and end in
+`assert_matches_recovery` like the rest of the framework.
+
+All 22 pass, and passed 8 consecutive runs before being committed. They
+found no engine bug; what they add is that the mechanism is now covered
+at all, and the record of who performs which call.
 
 ### prove_replication — 211 tests
 
@@ -851,6 +1123,32 @@ write on new leader → backward sync → verify convergence).
 | `expected_delta.py` | Reference model: keys present/absent after all resume calls |
 | `generate_tests.py` | Generates `prove_resume.cpp` |
 
+**corruption module** (`tests/proof/corruption/`):
+
+| File | Role |
+|------|------|
+| `scenario_matrix.py` | CorruptionShape (position), CorruptField (crc, value_size, entry_type, sequence), computed byte offsets |
+| `expected_delta.py` | Reference model: which keys survive by value, which are gone, what the file truncates to |
+| `generate_tests.py` | Generates `prove_corruption.cpp` |
+
+**recovery module** (`tests/proof/recovery/`):
+
+| File | Role |
+|------|------|
+| `scenario_matrix.py` | RecoveryStateShape (damage kind, batches, range deletes), RecoveryFailureClass (SUCCESS, RC1–RC3), `recovery_threads` axis |
+| `fault_point_resolver.py` | Maps failure class → `io_hint_write` / `io_hint_sync` / `io_hint_rename` |
+| `expected_delta.py` | Reference model: does `DB::open` throw, and (always) do all keys come back |
+| `generate_tests.py` | Generates `prove_recovery.cpp` |
+
+**group_commit module** (`tests/proof/group_commit/`):
+
+| File | Role |
+|------|------|
+| `scenario_matrix.py` | GroupShape (size, multi-op, rotation), GroupFailureClass (SUCCESS, B1, B2, F, G, H), validity filter |
+| `fault_point_resolver.py` | Maps failure class → fault checkpoint, and to which threads it is armed |
+| `expected_delta.py` | Reference model: did every writer throw, are the group's keys visible, is the engine degraded |
+| `generate_tests.py` | Generates `prove_group_commit.cpp` |
+
 **vacuum_compact module** (`tests/proof/vacuum_compact/`):
 
 | File | Role |
@@ -907,17 +1205,23 @@ I/O checkpoints:
   bytes it had. Used by the `held_value` and `held_iter_span` observers.
 - `assert_resumable(db)` — calls `resume()` and verifies the engine clears
   the degraded flag and passes `assert_consistent`. Inserted immediately
-  after `assert_delta` for all degraded failure classes (B1, B2, B3, C, F, G, H).
+  after `assert_delta` for all degraded failure classes (B1, B2, B3, C, F,
+  G, H), which then end with `assert_matches_recovery` below.
 - `assert_recoverable(dir, before, expected)` — opens a fresh DB from
   disk and verifies the recovered state matches the expected state
   (pre-existing keys survive, added keys present, removed keys absent,
   no extra keys, structural consistency).
-- `capture_sequence_bounds(db)` /
-  `assert_sequence_bounds_match_recovery(dir, before)` — per-file
-  `min_sequence`/`max_sequence` keyed by the data file's stem, compared
-  against a fresh recovery's. The other resume assertions ask whether
-  `resume()` produced the right state; this asks whether it produced the
-  same one a cold open produces from the same bytes.
+- `EngineFingerprint` / `fingerprint(db)` /
+  `assert_matches_recovery(dir, before)` — everything a resumed engine and
+  a cold-opened one must agree on: `next_seq`, the key-value map compared
+  in both directions, and per-file `FileStats`, keyed by data file stem
+  because recovery assigns file ids by directory order. The other
+  assertions ask whether the engine produced the right state; this asks
+  whether it produced the same one a cold open produces from the same
+  bytes. It is what every `[prove]` cell that degrades ends with, and the
+  only check the F and G cells get — what `resume()` commits from the page
+  cache cannot be predicted, but the equivalence can be asserted without
+  predicting it.
 - `assert_keys_recoverable(dir, keys_present, keys_absent)` — lighter
   recovery check used by resume proof tests: opens a fresh DB, reads each
   expected key back with `get` and compares its value, checks the absent
@@ -945,6 +1249,9 @@ I/O checkpoints:
   matches its actual on-disk size, `assert_consistent`.
 - `assert_vacuum_recoverable(dir, before)` — opens a fresh DB and verifies
   all pre-vacuum keys survive recovery with correct values.
+- `unreferenced_data_files(db, dir)` — the `.data` files on disk that the
+  published state does not reference; VC6 uses it to name the orphan a
+  post-rename kill leaves, and to check the next open deleted it.
 - `OwnedEntries` / `collect_changes(range)` — collects transient
   `ChangeIterator` entries into owned storage. The views returned by the
   iterator are invalidated on advance; `OwnedEntries` preserves them.
@@ -980,15 +1287,15 @@ degrade_F, degrade_G, degrade_F_range and degrade_F_batch shapes (no
 orphaned bytes to truncate — fault point unreachable), and R2/CASCADE for
 degrade_H (file already sealed).
 
-All five vacuum_compact failure classes across all eight state shapes are
-covered by the 40 `[prove_vacuum_compact]` tests.
+All seven vacuum_compact classes (SUCCESS, VC1–VC6) across all eight state
+shapes are covered by the 56 `[prove_vacuum_compact]` tests.
 
 All seven ingest failure classes across 11 state shapes and 5 ops shapes
 are covered by the 178 `[prove_repl]` tests. All three manifest failure
 classes across 11 state shapes are covered by the 33 `[prove_manifest]`
 tests. Four elimination rules reduce the full matrix to 211 valid tests.
 
-Total generated proof tests: **2183**.
+Total generated proof tests: **2277**.
 
 Two hand-written tests remain in `bytecask_test.cpp` for mechanism
 smoke testing not covered by the proof matrix:
@@ -1145,6 +1452,9 @@ tests/
       prove_apply_batch.cpp     ← generated, never hand-edited
       prove_resume.cpp             ← generated, never hand-edited
       prove_vacuum_compact.cpp     ← generated, never hand-edited
+      prove_group_commit.cpp       ← generated, never hand-edited
+      prove_recovery.cpp           ← generated, never hand-edited
+      prove_corruption.cpp         ← generated, never hand-edited
       prove_replication.cpp        ← generated, never hand-edited
 ```
 
@@ -1199,34 +1509,28 @@ auto atomic_rename(const path& from, const path& to) -> void {
 
 ### Orphaned `.data` files
 
-If `rename()` completes but the process crashes before `vacuum_commit`
-runs, a `.data` file may exist on disk unreferenced by the published
-`EngineState`. The original file remains in the published state and is
-fully readable. No data is lost.
+If `rename()` completes but the process is killed before the source is
+unlinked, the compacted copy and its source are on disk together, holding
+the same entries under the same sequences. `io_vacuum_compact_post_rename`
+reproduces the earliest point of that window — renamed, not yet committed —
+and VC5 (`io_vacuum_compact_unlink`) the latest, committed but with the
+source still on disk.
 
-What recovery actually does with it — measured, not assumed:
-`recovery_prepare_files` removes stale `.hint.tmp` and `.data.tmp` files
-and then adopts **every** `.data` file in the directory, generating a
-hint for any that lacks one. It does not single out the orphan. Since
-the compacted copy carries the same entries at the same sequences as the
-original, the merge resolves each key to one of the two files and leaves
-the other holding `live_bytes = 0`, which a later `vacuum()` reclaims.
-The DB opens, every key reads back, and the disk cost is temporary — but
-detection and removal at recovery, as an earlier draft of this document
-described, is not implemented.
+Recovery undoes the vacuum: it deletes the copy once it has checked that
+every entry in it is also in the source, and refuses to open on any other
+pair of files that share sequences (#137, and
+[`vacuum_crash_recovery_design.md`](vacuum_crash_recovery_design.md) for
+why undo and not finish). Before that, a kill anywhere in the window left a
+database that would not open — `DB::open` threw under `Pread`, and under
+`Mmap` the process aborted in `~DB`. Measured after #137 with the
+post-rename point on both backends: `~DB` returns, the next open removes
+the copy, and every key reads back.
 
-Closing that gap is what #104's proposed class M3 needs before it can be
-a cell: the reference model below is the behaviour to build, not the
-behaviour to assert.
-
-```
-Class M3 — rename completes but process does not confirm
-           old file remains in published state (correct)
-           new .data file exists as orphan on disk
-           next recovery should detect and remove the orphan  [not implemented]
-           DB remains operational
-           no data is lost
-```
+This is #104's class **M3**. Its reference model assumed detection and
+removal were already implemented; #137 is what implemented them. The two
+ends of the window are cells now — VC6 for the post-rename point and VC5
+for the unlink (see *vacuum_compact* above) — and they are the reference
+model this section used to spell out in prose.
 
 ---
 
@@ -1271,22 +1575,6 @@ control:
   entry detects this on recovery (the entry fails CRC and is truncated),
   which is the correct behavior — but the fault injector models failures
   at the `writev` boundary, not the sector boundary.
-- **Corrupt bytes in an otherwise healthy file** — the `degrade_B2` shape
-  now reaches `resume()`'s CRC-error branch by construction: a short
-  `writev` leaves a torn trailing entry whose CRC cannot hold. That covers
-  the branch, not the axis. A read that succeeds and returns wrong bytes
-  from an *arbitrary* position — a flipped byte in the first entry, in the
-  middle of a file, or between a `BulkBegin` and its `BulkEnd` — is still
-  not a failure class the taxonomy has (#104), and a torn *tail* is the
-  only position `short_write` can produce. Both bugs found on that branch
-  — `valid_offset` left at 0 when the scan throws, and a read buffer sized
-  from an unverified `value_size` — were invisible to all 37 resume proof
-  tests of the time while every one of them passed. The hand-written test
-  that was meant to cover it corrupted the file at `file_size - 5`, which
-  on a zero-filled active file is in the tail past the write cursor and is
-  never scanned. A full corruption axis is one over the *bytes*,
-  orthogonal to the syscall-failure axis over the *calls*, and needs a
-  helper that can target an entry by position.
 - **Hardware-level fault injection** — kernel block-layer error injection
   (`dm-flakey`, `dm-dust`), power-cut testing rigs, or filesystem-
   specific fault tools. The fault injector operates at the application
