@@ -185,9 +185,9 @@ private:
 // ---------------------------------------------------------------------------
 // BufferPool — fixed-size frame cache keyed by (file_id, frame_index).
 //
-// Three arrays: an arena of 4 KiB frames, an open-addressed index of 16-byte
-// slots — key, frame number, CLOCK reference bit and a seqlock version — and
-// a pin count per frame.
+// An arena of 4 KiB frames, an open-addressed index of 16-byte slots — key,
+// frame number, visited bit and a seqlock version — a pin count per frame, and
+// the SIEVE list: every resident frame in admission order, with its key.
 //
 // A frame's bytes are immutable while any reader holds a pin on it. A reader
 // probes the index with acquire loads, pins the frame the slot names, checks
@@ -209,6 +209,15 @@ private:
 // Deletion is by backward shift, not tombstones: a tombstoned linear-probing
 // table gets slower with every eviction and never recovers.
 //
+// Eviction is SIEVE (Zhang et al., NSDI '24): a hand walks the list from the
+// oldest frame toward the newest, clearing visited bits and evicting the
+// first frame not read since it was admitted or last passed. A hit only sets
+// the bit — nothing moves — so the hit path is CLOCK's. What differs is the
+// order: survivors keep their place and new frames go in at the newest end,
+// so a frame read once meets the hand after a fraction of a sweep instead of
+// a whole one. Most frames are read once; offline replay of recorded traces
+// (issue #148) put it at 10-20 % fewer misses than CLOCK over the index.
+//
 // Values are copied into the caller's buffer, never returned as a span into
 // a frame: frames are reused memory, and a span into one would dangle the
 // moment it was evicted.
@@ -222,7 +231,8 @@ public:
     // words take what is left of the budget. Frame count is derived from the
     // budget, never the budget from the frame count — the bound is the
     // contract.
-    constexpr auto kPerFrame = kPoolFrameBytes + sizeof(std::atomic<std::uint32_t>);
+    constexpr auto kPerFrame = kPoolFrameBytes + sizeof(std::atomic<std::uint32_t>) +
+                               sizeof(std::uint64_t) + 2 * sizeof(std::uint32_t);
     const auto wanted = opts.capacity_bytes / (kPerFrame + sizeof(Slot));
     const auto table = std::bit_ceil(std::max<std::size_t>(wanted * 10 / 7, 2));
     const auto table_bytes = table * sizeof(Slot);
@@ -245,6 +255,9 @@ public:
     // the read path, where it showed up as a p99 that grew with pool size.
     arena_ = std::vector<std::byte>(frame_count_ * kPoolFrameBytes);
     pins_ = std::vector<std::atomic<std::uint32_t>>(frame_count_);
+    frame_keys_ = std::vector<std::uint64_t>(frame_count_, kEmptyKey);
+    newer_ = std::vector<std::uint32_t>(frame_count_, kNoFrame);
+    older_ = std::vector<std::uint32_t>(frame_count_, kNoFrame);
     table_ = std::vector<Slot>(table);
     counters_.frames_total = narrow<std::int64_t>(frame_count_);
   }
@@ -280,7 +293,7 @@ public:
       -> std::span<const std::byte>;
   void note_hit() noexcept { counters_.hits.add(1); }
 
-  // The active file's frames are never evicted: CLOCK skips them, and the
+  // The active file's frames are never evicted: the hand skips them, and the
   // engine moves this at rotation (under the write lock), at which point the
   // previous active file's frames become ordinary — no sweep, one comparison
   // in the victim check. kNoActiveFile pins nothing.
@@ -314,7 +327,7 @@ private:
 
   struct alignas(16) Slot {
     std::atomic<std::uint64_t> key{kEmptyKey};
-    // Frame index, with the CLOCK reference bit in the top bit.
+    // Frame index, with the SIEVE visited bit in the top bit.
     std::atomic<std::uint32_t> frame{0};
     // Odd while the slot or the frame it maps is being changed.
     std::atomic<std::uint32_t> version{0};
@@ -536,17 +549,19 @@ private:
   // the fetch_sub wraps the word below zero — a frame no one could pin or
   // claim again, and whose pin word's dead bit later flickers off.
   void insert(std::uint64_t key, std::uint32_t frame, const std::byte *src,
-              std::size_t len) noexcept {
+              std::size_t len, bool visited) noexcept {
     auto h = home(key);
     while (table_[h].key.load(std::memory_order_relaxed) != kEmptyKey) {
       h = (h + 1) & table_mask_;
     }
     auto &s = table_[h];
     begin_change(s);
-    s.frame.store(frame | kRefBit, std::memory_order_relaxed);
+    s.frame.store(frame | (visited ? kRefBit : 0), std::memory_order_relaxed);
     s.key.store(key, std::memory_order_relaxed);
     std::memcpy(frame_bytes(frame), src, len);
     end_change(s);
+    frame_keys_[frame] = key;
+    link_newest(frame);
     pins_[frame].fetch_and(~kDead, std::memory_order_release);
   }
 
@@ -576,38 +591,57 @@ private:
     end_change(s);
   }
 
-  // CLOCK over the index: advance the hand, clearing reference bits, until an
-  // unreferenced entry of a sealed file turns up whose frame no reader holds.
-  // That frame is claimed (dead) on return. A frame a reader is in is passed
-  // over, never waited for: a pin can be held across a caller's loop body.
-  // Returns kNoSlot if nothing could be claimed.
-  [[nodiscard]] auto clock_victim() noexcept -> std::size_t {
+  void link_newest(std::uint32_t f) noexcept {
+    older_[f] = newest_;
+    newer_[f] = kNoFrame;
+    if (newest_ != kNoFrame) newer_[newest_] = f;
+    newest_ = f;
+    if (oldest_ == kNoFrame) oldest_ = f;
+  }
+  void unlink(std::uint32_t f) noexcept {
+    if (newer_[f] != kNoFrame) older_[newer_[f]] = older_[f]; else newest_ = older_[f];
+    if (older_[f] != kNoFrame) newer_[older_[f]] = newer_[f]; else oldest_ = newer_[f];
+  }
+
+  // SIEVE: walk the hand from where it stopped toward the newest frame,
+  // wrapping to the oldest, clearing visited bits, until an unvisited frame of
+  // a sealed file turns up that no reader holds. That frame is claimed (dead)
+  // and unlinked on return, and the hand rests on the frame after it. A frame
+  // a reader is in is passed over, never waited for: a pin can be held across
+  // a caller's loop body. Returns the victim's slot, or kNoSlot if nothing
+  // could be claimed.
+  [[nodiscard]] auto sieve_victim() noexcept -> std::size_t {
     const auto active = active_file_id_.load(std::memory_order_relaxed);
-    for (std::size_t steps = 0; steps <= 2 * table_mask_ + 2; ++steps) {
-      const auto i = hand_;
-      hand_ = (hand_ + 1) & table_mask_;
-      auto &s = table_[i];
-      const auto k = s.key.load(std::memory_order_relaxed);
-      if (k == kEmptyKey || (k >> 32) == active) continue;
-      if ((s.frame.load(std::memory_order_relaxed) & kRefBit) != 0) {
-        s.frame.fetch_and(~kRefBit, std::memory_order_relaxed);
-        continue;
+    auto f = hand_ != kNoFrame ? hand_ : oldest_;
+    for (std::size_t steps = 0; steps <= 2 * used_frames_ + 2; ++steps) {
+      const auto next = newer_[f] != kNoFrame ? newer_[f] : oldest_;
+      const auto k = frame_keys_[f];
+      if ((k >> 32) != active) {
+        const auto i = find(k);  // every listed frame is indexed
+        auto &s = table_[i];
+        if ((s.frame.load(std::memory_order_relaxed) & kRefBit) != 0) {
+          s.frame.fetch_and(~kRefBit, std::memory_order_relaxed);
+        } else {
+          std::uint32_t unpinned = 0;
+          if (pins_[f].compare_exchange_strong(unpinned, kDead,
+                                               std::memory_order_acq_rel)) {
+            hand_ = newer_[f];
+            unlink(f);
+            return i;
+          }
+        }
       }
-      const auto f = s.frame.load(std::memory_order_relaxed) & ~kRefBit;
-      std::uint32_t unpinned = 0;
-      if (pins_[f].compare_exchange_strong(unpinned, kDead,
-                                           std::memory_order_acq_rel)) {
-        return i;
-      }
+      f = next;
     }
+    hand_ = f;
     return kNoSlot;
   }
 
   // Caches len bytes of src as the frame for key. Returns false if the key
   // is already resident or no frame could be claimed; either way the caller
   // already holds the bytes.
-  auto admit(std::uint64_t key, const std::byte *src, std::size_t len)
-      -> bool {
+  auto admit(std::uint64_t key, const std::byte *src, std::size_t len,
+             bool visited) -> bool {
     if (find(key) != kNoSlot) return false;
     std::uint32_t frame = 0;
     if (used_frames_ < frame_count_) {
@@ -618,13 +652,13 @@ private:
       counters_.frames_resident.store(narrow<std::int64_t>(used_frames_),
                                            std::memory_order_relaxed);
     } else {
-      const auto victim = clock_victim();
+      const auto victim = sieve_victim();
       if (victim == kNoSlot) return false;
       frame = table_[victim].frame.load(std::memory_order_relaxed) & ~kRefBit;
       erase(victim);
       counters_.evictions.fetch_add(1, std::memory_order_relaxed);
     }
-    insert(key, frame, src, len);
+    insert(key, frame, src, len, visited);
     return true;
   }
 
@@ -638,7 +672,14 @@ private:
   std::vector<std::atomic<std::uint32_t>> pins_;
   std::vector<Slot> table_;
   std::mutex mu_;
-  std::size_t hand_{0};         // guarded by mu_
+  // The SIEVE list, per frame, guarded by mu_: the key the frame holds and
+  // its neighbours in admission order. kNoFrame ends the list.
+  std::vector<std::uint64_t> frame_keys_;
+  std::vector<std::uint32_t> newer_;
+  std::vector<std::uint32_t> older_;
+  std::uint32_t newest_{kNoFrame};  // guarded by mu_
+  std::uint32_t oldest_{kNoFrame};  // guarded by mu_
+  std::uint32_t hand_{kNoFrame};    // guarded by mu_; kNoFrame: start at oldest_
   std::size_t used_frames_{0};  // guarded by mu_; every used frame is indexed
   std::atomic<std::uint32_t> active_file_id_{kNoActiveFile};
 };
@@ -699,8 +740,11 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
       const auto frame_start = f * kPoolFrameBytes;
       // Only whole frames are admitted; a short tail frame stays uncached.
       if (frame_start + kPoolFrameBytes > file_size) break;
+      // Unvisited: the miss that brought it in is its first read, and what
+      // earns it a place is a second one. Admitted visited, a frame read once
+      // would survive a whole pass of the hand and SIEVE would be CLOCK.
       if (admit(make_key(file_id, f), buf + (frame_start - run_start),
-                kPoolFrameBytes)) {
+                kPoolFrameBytes, false)) {
         counters_.fills.fetch_add(1, std::memory_order_relaxed);
       }
     }
@@ -730,7 +774,7 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
   // Serve every resident frame from the pool and read only the runs of
   // frames that are not. A value of many frames with one evicted costs one
   // small read, not the whole value again — which matters exactly when
-  // values are large, since CLOCK evicts frames, not values.
+  // values are large, since eviction takes frames, not values.
   bool any_miss = false;
   bool in_run = false;
   std::uint64_t run_start = 0;
@@ -796,7 +840,9 @@ void BufferPool::append_resident(std::uint32_t file_id, std::uint64_t offset,
     // Only a frame whose written prefix starts here can be admitted from
     // these bytes alone; anything earlier in the frame is on disk, and a
     // read miss will admit the whole frame later.
-    if (in_frame == 0) (void)admit(key, src, seg_len);
+    // Visited: bytes just written are the likeliest to be read next, and the
+    // hand skips the active file anyway until it rotates.
+    if (in_frame == 0) (void)admit(key, src, seg_len, true);
   }
 }
 
