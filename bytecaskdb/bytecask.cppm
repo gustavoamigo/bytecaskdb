@@ -2206,6 +2206,13 @@ void TransientEngineState::apply_vacuum(
   const auto dest_file_id =
       new_sealed_file ? reserved_file_id : active_file_id_;
 
+  // The destination is registered before the remap: a key directory that
+  // reads keys back may resolve an already remapped record while placing the
+  // next one.
+  if (new_sealed_file) {
+    files_.set(dest_file_id, std::move(new_sealed_file));
+  }
+
   auto actual_live_bytes = scan.live_bytes;
   for (const auto &m : scan.mappings) {
     const std::span<const std::byte> key_span{m.key};
@@ -2221,9 +2228,6 @@ void TransientEngineState::apply_vacuum(
   }
 
   files_.erase(old_file_id);
-  if (new_sealed_file) {
-    files_.set(dest_file_id, std::move(new_sealed_file));
-  }
 
   file_stats_.erase(old_file_id);
   if (dest_file_id != active_file_id_) {

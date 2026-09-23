@@ -1,11 +1,12 @@
 # Blind-leaf B+ tree key directory — design
 
-> **Status: step 1 built and measured.** It describes a third key directory
-> beside the B+ tree and the radix tree, for deployments where the number of
-> keys, not the value data, is what runs out of RAM. The tree itself
-> (`bytecaskdb/blind_btree.cppm`) exists and is tested; the engine does not
-> use it yet. §Step 1 results has the G1 and G2 measurements; the numbers
-> elsewhere in this document are the estimates the proposal started from.
+> **Status: steps 1–3 built and measured; experimental.** It describes a
+> third key directory beside the B+ tree and the radix tree, for deployments
+> where the number of keys, not the value data, is what runs out of RAM. The
+> tree (`bytecaskdb/blind_btree.cppm`) is tested, and `BYTECASK_KEYDIR=blind`
+> builds the engine on it with recovery going through a B+ tree (§Steps 2–3
+> results). §Step 1 results has G1 and G2; the numbers elsewhere in this
+> document are the estimates the proposal started from.
 
 Baseline for code references: `main` at the time of writing
 (`bytecaskdb/btree.cppm`, `bytecaskdb/bytecask.cppm`,
@@ -631,6 +632,68 @@ one read per key.
 1,280 bytes (73 entries) is the middle ground: 640 is up to 30% faster to
 search and 3–4 B/key larger; 2,560 is 1.5 B/key smaller and 1.5–3× slower.
 With a leaner leaf header, 1,280 would also pass G1.
+
+## Steps 2–3 results
+
+Built as the easiest version that runs the whole engine, not the one the
+sections above describe in full:
+
+- **The facade** is a set of `kd_*` functions in `bytecaskdb/internals.cppm`
+  that take a `KeyDirCtx` (the version's file registry, and the writer's
+  records not yet written) and forward to the B+ or radix tree unchanged.
+  `bytecaskdb/bytecask.cppm` calls nothing else. A put is now one `upsert`
+  on every tree, where it was a `get` and a `set`.
+- **Sequences are read, not compared by location.** The read that confirms a
+  key returns the whole entry, header included, so `kd_get` returns a full
+  `KeyDirEntry` and every guard, vacuum's remap and `resume()` run unchanged.
+  §Sequence without a sequence field is not implemented: a guard on an
+  unchanged key costs a read.
+- **The leaf's size field holds the value size**, not `entry_bytes`: the
+  data file API reads an entry given its value size, and every live-bytes
+  update already has the key length.
+- **Records not yet written** are resolved from `TransientEngineState`'s
+  `pending_` map, filled as each put or ingested put is applied.
+- **Recovery builds the B+ tree and converts it** (`key_dir_from_recovered`).
+- `DB::get` takes the value from the read that confirmed the key.
+
+Tests: the engine suite passes on all three trees (2,784 cases on the B+ and
+radix trees, 2,750 on the blind tree). The 34 it does not run are the
+`validate_preconditions` and `apply_resume` unit tests, which build an
+`EngineState` by hand with entries that point at no data file; the paths
+they cover run through the DB-level tests.
+
+`engine_bench`, 1M keys, the default buffer-pool back end, CRC off on reads,
+medians of three interleaved runs of each binary on the VM above. "Base" is
+the engine before step 2; "B+" is the B+ tree behind the facade.
+
+| Benchmark | Base | B+ | Blind | B+ / base | Blind / B+ |
+|---|---:|---:|---:|---:|---:|
+| Get | 279 ns | 249 ns | 402 ns | 0.89 | **1.62** |
+| GetMT, 2 threads | 258 ns | 276 ns | 409 ns | 1.07 | **1.48** |
+| GetMT, 4 threads | 270 ns | 273 ns | 404 ns | 1.01 | **1.48** |
+| GetMT, 4 threads, pread | 655 ns | 743 ns | 794 ns | 1.13 | 1.07 |
+| Range50 | 2.86 µs | 2.53 µs | 2.92 µs | 0.88 | 1.16 |
+| Put, NoSync | 5.20 µs | 4.77 µs | 5.30 µs | 0.92 | 1.11 |
+| Put, Sync | 202 µs | 248 µs | 179 µs | 1.23 | 0.72 |
+| Del, Sync | 208 µs | 188 µs | 193 µs | 0.91 | 1.03 |
+| MixedBatch, Sync | 415 µs | 545 µs | 608 µs | 1.31 | 1.12 |
+| Recovery, 4 threads | 60 ms | 57 ms | 100 ms | 0.94 | 1.75 |
+
+- **The facade costs the B+ tree nothing.** Every CPU-bound row is equal or
+  faster. The Sync rows swing ±25% between runs of the same binary; five
+  more interleaved MixedBatch runs put the B+ build at 328–455 µs against
+  405–517 µs for the base, faster in all five.
+- **G3 (point reads within 10%) fails.** A warm `Get` costs 150 ns more.
+  The in-leaf scan accounts for about 80 ns of it (§G2). The rest is
+  probably the read, not measured apart: it looks the header up in the pool
+  and then the entry, two lookups where the B+ tree's `read_value` does
+  one. Where the read itself is expensive the gap shrinks:
+  1.07× through `pread`. Nothing here is a disk read; on a cold cache both
+  trees pay the same one.
+- **G4 (writes): NoSync +11%, Sync within noise.** A put reads one record,
+  from the page cache or the pool, under the write mutex.
+- **Recovery is 1.75×**, the cost of building a B+ tree and converting it;
+  peak memory at open is the B+ tree's. Step 4 replaces this.
 
 ## Plan
 
