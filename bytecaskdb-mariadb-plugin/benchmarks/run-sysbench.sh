@@ -48,8 +48,12 @@
 # The CSV gains read_mib/write_mib — block-layer bytes over the measured run,
 # taken from the instance's cgroup io.stat — plus syscr/syscw, which count
 # read()/write() on every descriptor, client sockets included, and so describe
-# workload shape rather than disk traffic. I/O columns are empty when
-# systemd-run --user --scope is unavailable.
+# workload shape rather than disk traffic. Getting per-instance cgroup
+# accounting needs mariadbd launched into its own systemd scope: either
+# `systemd-run --user --scope` (a logind user session) or, on headless hosts
+# without one, `sudo systemd-run --scope` (passwordless sudo required — see
+# scope_available() in lib_common.sh). I/O columns are empty when neither is
+# available.
 
 set -euo pipefail
 
