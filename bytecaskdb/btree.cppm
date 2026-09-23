@@ -106,7 +106,7 @@ template <typename T> auto as_ptr(const std::byte *p) noexcept -> const T * {
   return static_cast<const T *>(static_cast<const void *>(p));
 }
 
-inline auto compare_bytes(Bytes a, Bytes b) noexcept -> int {
+export inline auto compare_bytes(Bytes a, Bytes b) noexcept -> int {
   const auto n = std::min(a.size(), b.size());
   const int c = n == 0 ? 0 : std::memcmp(a.data(), b.data(), n);
   if (c != 0)
@@ -116,7 +116,8 @@ inline auto compare_bytes(Bytes a, Bytes b) noexcept -> int {
   return a.size() < b.size() ? -1 : 1;
 }
 
-inline auto common_prefix_length(Bytes a, Bytes b) noexcept -> std::size_t {
+export inline auto common_prefix_length(Bytes a, Bytes b) noexcept
+    -> std::size_t {
   const auto n = std::min(a.size(), b.size());
   std::size_t i = 0;
   // Eight bytes at a time: the first differing byte is the lowest set bit
@@ -205,7 +206,7 @@ inline auto common_prefix_length(const KeyParts &x,
 // Nodes are immutable once their version is published; only the session
 // whose tag they carry writes to them.
 // ---------------------------------------------------------------------------
-template <typename V> struct Node {
+export template <typename V> struct Node {
   std::uint64_t tag{0};        // creating session: ownership and reclamation
   Node *first_child{nullptr};  // inner only: child left of every separator
   std::uint32_t capacity{0};   // bytes allocated
@@ -466,7 +467,7 @@ template <typename V> struct Node {
 export template <typename V> class BulkLoader;
 export template <typename V> class LeafRun;
 
-template <typename V> struct ChainTraits {
+export template <typename V> struct ChainTraits {
   using Node = btree_detail::Node<V>;
   static auto tag(const Node *n) noexcept -> std::uint64_t { return n->tag; }
   template <typename F> static void for_each_child(Node *n, F &&f) {
@@ -502,7 +503,7 @@ auto find_ptr(const Node<V> *cur, Bytes key) noexcept -> const V * {
 // replaced by a rebuild or split, or never published — all go through
 // discard(). Used by one thread at a time.
 // ---------------------------------------------------------------------------
-template <typename V> class BuildSession {
+export template <typename V> class BuildSession {
 public:
   using N = Node<V>;
   friend class BulkLoader<V>;
@@ -592,13 +593,17 @@ public:
           0);
       return {leaf, nullptr, true, true};
     }
-    return upsert_rec(root, key, val, should_replace);
+    auto leaf_step = [&](N *leaf) {
+      return upsert_leaf(leaf, key, val, should_replace);
+    };
+    return descend_upsert(root, key, leaf_step);
   }
 
   auto erase(N *root, Bytes key) -> Result {
     if (!root)
       return {nullptr, nullptr, false, false};
-    return erase_rec(root, key);
+    auto leaf_step = [&](N *leaf) { return erase_leaf(leaf, key); };
+    return descend_erase(root, key, leaf_step);
   }
 
   // A fresh root over two halves of a split root.
@@ -613,7 +618,10 @@ public:
     return root;
   }
 
-private:
+  // Everything below is shared with trees whose leaves have another layout
+  // (blind_btree.cppm): they route through the same inner nodes and supply
+  // their own leaf step to the descent.
+protected:
   std::uint64_t tag_;
   std::vector<N *> retired_;
   std::vector<std::byte> sep_; // separator handed up by the last split
@@ -892,27 +900,16 @@ private:
     return {left, right, true, true};
   }
 
-  template <typename Pred>
-  auto upsert_rec(N *node, Bytes key, const V &val, Pred &should_replace)
-      -> Result {
-    if (node->is_leaf) {
-      const auto p = node->search(key);
-      if (p.exact) {
-        auto *existing = node->template payload<V>(p.idx);
-        if (!should_replace(*existing, val))
-          return {node, nullptr, false, false};
-        auto *n = own(node);
-        auto *slot = n->template payload<V>(p.idx);
-        displaced_ = std::move(*slot);
-        std::destroy_at(slot);
-        std::construct_at(slot, val);
-        return {n, nullptr, true, false};
-      }
-      return place(node, p.idx, key, val);
-    }
+  // Path copy from `node` down to the leaf that holds `key`, where
+  // `leaf_step(leaf)` makes the change. A leaf that split hands its right
+  // half and its separator (in sep_) up; this places them in the parent.
+  template <typename LeafStep>
+  auto descend_upsert(N *node, Bytes key, LeafStep &leaf_step) -> Result {
+    if (node->is_leaf)
+      return leaf_step(node);
     const auto idx = node->child_index(key);
     auto *child = node->child(idx);
-    const auto r = upsert_rec(child, key, val, should_replace);
+    const auto r = descend_upsert(child, key, leaf_step);
     if (!r.changed)
       return {node, nullptr, false, false};
     auto *n = own(node);
@@ -926,21 +923,14 @@ private:
     return placed;
   }
 
-  auto erase_rec(N *node, Bytes key) -> Result {
-    if (node->is_leaf) {
-      const auto p = node->search(key);
-      if (!p.exact)
-        return {node, nullptr, false, false};
-      auto *n = own(node);
-      n->remove_entry(p.idx);
-      if (n->count == 0) {
-        discard(n);
-        return {nullptr, nullptr, true, false};
-      }
-      return {n, nullptr, true, false};
-    }
+  // As descend_upsert, for a removal: a leaf step that empties its leaf
+  // discards it and returns a null node, and the parent drops the child.
+  template <typename LeafStep>
+  auto descend_erase(N *node, Bytes key, LeafStep &leaf_step) -> Result {
+    if (node->is_leaf)
+      return leaf_step(node);
     const auto idx = node->child_index(key);
-    const auto r = erase_rec(node->child(idx), key);
+    const auto r = descend_erase(node->child(idx), key, leaf_step);
     if (!r.changed)
       return {node, nullptr, false, false};
     auto *n = own(node);
@@ -958,6 +948,38 @@ private:
       n->remove_entry(0);
     } else {
       n->remove_entry(idx - 1);
+    }
+    return {n, nullptr, true, false};
+  }
+
+private:
+  template <typename Pred>
+  auto upsert_leaf(N *node, Bytes key, const V &val, Pred &should_replace)
+      -> Result {
+    const auto p = node->search(key);
+    if (p.exact) {
+      auto *existing = node->template payload<V>(p.idx);
+      if (!should_replace(*existing, val))
+        return {node, nullptr, false, false};
+      auto *n = own(node);
+      auto *slot = n->template payload<V>(p.idx);
+      displaced_ = std::move(*slot);
+      std::destroy_at(slot);
+      std::construct_at(slot, val);
+      return {n, nullptr, true, false};
+    }
+    return place(node, p.idx, key, val);
+  }
+
+  auto erase_leaf(N *node, Bytes key) -> Result {
+    const auto p = node->search(key);
+    if (!p.exact)
+      return {node, nullptr, false, false};
+    auto *n = own(node);
+    n->remove_entry(p.idx);
+    if (n->count == 0) {
+      discard(n);
+      return {nullptr, nullptr, true, false};
     }
     return {n, nullptr, true, false};
   }
@@ -1110,7 +1132,9 @@ public:
     return std::move(out).assemble(publish_tag);
   }
 
-private:
+  // The level-building and publishing half below is shared with loaders
+  // whose leaves have another layout (blind_btree.cppm).
+protected:
   // One built level: the children produced for it, and the separator that
   // sits between each child and the one before it (so seps[i] separates
   // children[i] from children[i + 1], and there are children.size() - 1).
@@ -1147,18 +1171,27 @@ private:
   // chain frees a dead version by tag interval, and a node tagged above the
   // published version would be taken for a later version's garbage.
   [[nodiscard]] auto assemble(std::uint64_t publish_tag) && -> PersistentBTree<V> {
-    if (first_leaf())
+    auto *root = std::move(*this).assemble_root(publish_tag);
+    if (!root)
       return {};
+    return PersistentBTree<V>{root, size_, publish_tag};
+  }
+
+  // The root of the published version, or null for an empty loader.
+  [[nodiscard]] auto assemble_root(std::uint64_t publish_tag) && -> N * {
+    if (first_leaf())
+      return nullptr;
     std::size_t lvl = 0;
     while (levels_[lvl].children.size() > 1) {
       build_parent(lvl);
       ++lvl;
     }
     auto *root = levels_[lvl].children.front();
-    PersistentBTree<V>::chain().publish(publish_tag, 0, session_.retired_list());
+    VersionChain<ChainTraits<V>>::instance().publish(publish_tag, 0,
+                                                     session_.retired_list());
     session_.finish();
     levels_.clear();
-    return PersistentBTree<V>{root, size_, publish_tag};
+    return root;
   }
 
   // Would `key` still fit in the leaf being filled? A shorter shared prefix
