@@ -4729,6 +4729,12 @@ TEST_CASE("resume() with live snapshot on degraded DB",
   CHECK(db.contains_key({}, to_bytes("k2")));
 }
 
+// The validate_preconditions and apply_resume unit tests build an
+// EngineState by hand, with key directory entries that point at no data file.
+// A blind key directory keeps no keys: it reads them back from the data
+// files, so these states cannot be built for it. Both code paths run in the
+// blind build through the DB-level conflict and resume tests.
+#ifndef BYTECASK_KEYDIR_BLIND
 // ---------------------------------------------------------------------------
 // validate_preconditions unit tests
 // ---------------------------------------------------------------------------
@@ -5227,6 +5233,7 @@ TEST_CASE("apply_resume: multiple entries replayed in order",
   CHECK(s->next_seq == 13);
 }
 
+#endif // !BYTECASK_KEYDIR_BLIND
 #endif
 
 // ---------------------------------------------------------------------------
@@ -8161,7 +8168,13 @@ TEST_CASE("io_backend=BufferPool: the active file is resident on write",
   }
   st = db.stats();
   CHECK(st.at("bytecask.pool_misses") == 0);
-  CHECK(st.at("bytecask.pool_hits") == kCount);
+  // One hit per get. A key directory that reads keys back also reads through
+  // the pool on every put (the candidate's key) and reads a record's header
+  // before the rest, so it counts more; it must still never miss.
+  if constexpr (bytecask::kKeyDirReadsKeys)
+    CHECK(st.at("bytecask.pool_hits") >= kCount);
+  else
+    CHECK(st.at("bytecask.pool_hits") == kCount);
   // Nothing was ever filled by a read: the writer put it all there.
   CHECK(st.at("bytecask.pool_fills") == 0);
   // Batches take the other append path; same guarantee.

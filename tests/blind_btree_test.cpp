@@ -102,14 +102,25 @@ auto bit_key(std::mt19937_64 &rng) -> std::string {
   return k;
 }
 
-void check_accounting(std::initializer_list<const SmallTree *> trees) {
+// Blind-tree nodes alive outside the test when it starts — an engine built on
+// the blind tree keeps them, e.g. the state a thread's read cache still holds
+// after its DB closed — so the counts below are relative to them.
+auto foreign_nodes() -> std::int64_t {
+  auto &acc = bytecask::btree_detail::btree_accounting<BlindRef>();
+  return acc.allocated.load() - acc.freed.load() -
+         static_cast<std::int64_t>(SmallTree::parked_nodes().size());
+}
+
+// Every node this test allocated is reachable from one of `trees` or parked.
+void check_accounting(std::int64_t foreign,
+                      std::initializer_list<const SmallTree *> trees) {
   std::set<const void *> seen;
   for (const auto *t : trees)
     t->visit_nodes([&](const void *n) { seen.insert(n); });
   for (const auto *n : SmallTree::parked_nodes())
     seen.insert(n);
   auto &acc = bytecask::btree_detail::btree_accounting<BlindRef>();
-  CHECK(acc.allocated.load() - acc.freed.load() ==
+  CHECK(acc.allocated.load() - acc.freed.load() - foreign ==
         static_cast<std::int64_t>(seen.size()));
 }
 
@@ -182,6 +193,7 @@ TEST_CASE("blind leaf: search finds every key and every insertion point",
 
 TEST_CASE("blind tree: random operations match std::map", "[blind]") {
   std::mt19937_64 rng{3};
+  const auto foreign = foreign_nodes();
   for (int round = 0; round < 40; ++round) {
     MemResolver res;
     std::map<std::string, BlindRef> model;
@@ -197,7 +209,7 @@ TEST_CASE("blind tree: random operations match std::map", "[blind]") {
           // Insert or overwrite; an overwrite moves the key to a new record.
           auto ref = res.ref(k);
           if (model.contains(k))
-            ref.entry_bytes += 1 + static_cast<std::uint32_t>(rng() % 7);
+            ref.size += 1 + static_cast<std::uint32_t>(rng() % 7);
           const auto displaced = tr.upsert(
               to_bytes(k), ref, res,
               [](const BlindRef &, const BlindRef &) { return true; });
@@ -236,9 +248,9 @@ TEST_CASE("blind tree: random operations match std::map", "[blind]") {
       for (const auto &[k, v] : m)
         REQUIRE(snap.get(to_bytes(k), res) == v);
     }
-    check_accounting({&t});
+    check_accounting(foreign, {&t});
     for (const auto &[snap, m] : snaps)
-      check_accounting({&t, &snap});
+      check_accounting(foreign, {&t, &snap});
   }
 }
 

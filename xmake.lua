@@ -132,6 +132,12 @@ end
 if os.getenv("BYTECASK_KEYDIR") ~= "radix" then
     add_defines("BYTECASK_USE_BTREE")
 end
+-- BYTECASK_KEYDIR=blind builds the engine on the blind-leaf B+ tree
+-- (docs/blind_leaf_btree_design.md). Recovery still builds a B+ tree and
+-- converts it, so the B+ tree stays compiled in.
+if os.getenv("BYTECASK_KEYDIR") == "blind" then
+    add_defines("BYTECASK_KEYDIR_BLIND")
+end
 
 local march = os.getenv("BYTECASK_MARCH") or "native"
 local function add_release_opts(t)

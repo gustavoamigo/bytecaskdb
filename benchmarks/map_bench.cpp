@@ -309,7 +309,7 @@ template <std::size_t LeafBytes> struct BlindAdapter {
     auto tr = base.transient();
     for (const auto &k : keys) {
       auto ref = k.ref;
-      ++ref.entry_bytes;
+      ++ref.size;
       tr.set(to_bytes(k.s), ref, bench_resolver());
     }
     return std::move(tr).persistent();

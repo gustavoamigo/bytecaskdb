@@ -33,18 +33,20 @@ import bytecask.version_chain;
 
 namespace bytecask {
 
-// Where the record holding a key lives, and its on-disk size (header, key,
-// value and CRC). Within one process a (file_id, offset) pair names at most
-// one record, so equal locations mean the same record.
+// Where the record holding a key lives, and a size the owner defines (the
+// engine keeps the value size: with the key length the caller has, it gives
+// both the read to issue and the live bytes to account). Within one process a
+// (file_id, offset) pair names at most one record, so equal locations mean
+// the same record.
 export struct BlindRef {
   std::uint32_t file_id{0};
   std::uint32_t offset{0};
-  std::uint32_t entry_bytes{0};
+  std::uint32_t size{0};
   friend auto operator==(const BlindRef &, const BlindRef &) -> bool = default;
 };
 
 export inline constexpr std::uint32_t kBlindMaxFileId = (1u << 20) - 1;
-export inline constexpr std::uint32_t kBlindMaxEntryBytes = (1u << 29) - 1;
+export inline constexpr std::uint32_t kBlindMaxSize = (1u << 29) - 1;
 
 // Reads the key of the record at a location. The returned span is valid until
 // the next call on the same resolver; the tree never holds two at once.
@@ -131,7 +133,7 @@ export inline auto fingerprint(Bytes k) noexcept -> std::uint32_t {
 //   meta[cap]  u32  crit:20 | fp_lo:12    crit against the previous entry;
 //                                        unused at index 0
 //   loc[cap]   u64  file_id:20 | offset:32 | fp_hi:12
-//   size[cap]  u32  entry_bytes
+//   size[cap]  u32  BlindRef::size
 //
 // The search reads only meta. Capacity follows from the allocation size, so
 // LeafBytes should be a malloc size class.
@@ -193,14 +195,14 @@ export template <std::size_t LeafBytes> struct Leaf {
     a.meta[i] = (crit_bit << 12) | (fp & 0xFFFu);
     a.loc[i] = (std::uint64_t{ref.file_id} << 44) |
                (std::uint64_t{ref.offset} << 12) | (fp >> 12);
-    a.size[i] = ref.entry_bytes;
+    a.size[i] = ref.size;
   }
   // Replaces the record, keeping the crit bit and the fingerprint.
   static void set_ref(N *n, std::uint32_t i, BlindRef ref) noexcept {
     auto a = arrays(n);
     a.loc[i] = (std::uint64_t{ref.file_id} << 44) |
                (std::uint64_t{ref.offset} << 12) | (a.loc[i] & 0xFFFu);
-    a.size[i] = ref.entry_bytes;
+    a.size[i] = ref.size;
   }
   static void set_crit(Arrays a, std::uint32_t i, std::uint32_t crit_bit) noexcept {
     a.meta[i] = (crit_bit << 12) | (a.meta[i] & 0xFFFu);
@@ -335,8 +337,8 @@ inline void check_ref(Bytes key, BlindRef ref) {
     throw std::length_error{"BlindBTree: key exceeds 65535 bytes"};
   if (ref.file_id > kBlindMaxFileId)
     throw std::out_of_range{"BlindBTree: file_id exceeds 20 bits"};
-  if (ref.entry_bytes > kBlindMaxEntryBytes)
-    throw std::out_of_range{"BlindBTree: entry_bytes exceeds 29 bits"};
+  if (ref.size > kBlindMaxSize)
+    throw std::out_of_range{"BlindBTree: size exceeds 29 bits"};
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +546,14 @@ public:
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
     return stack_.empty();
   }
+  // Same position; iterators over different versions never compare equal
+  // unless both are at the end.
+  auto operator==(const BlindBTreeIterator &o) const noexcept -> bool {
+    if (stack_.empty() || o.stack_.empty())
+      return stack_.empty() && o.stack_.empty();
+    return stack_.back().node == o.stack_.back().node &&
+           stack_.back().idx == o.stack_.back().idx;
+  }
 
 private:
   struct Frame {
@@ -727,6 +737,10 @@ public:
   [[nodiscard]] auto last() const -> BlindBTreeIterator<LeafBytes> {
     return {*this, root_, BlindBTreeIterator<LeafBytes>::Seek::Last};
   }
+  // Past the last entry; -- from here is the last entry.
+  [[nodiscard]] auto end_iter() const -> BlindBTreeIterator<LeafBytes> {
+    return {*this, root_, BlindBTreeIterator<LeafBytes>::Seek::End};
+  }
   template <BlindKeyResolver R>
   [[nodiscard]] auto lower_bound(Bytes key, R &res) const
       -> BlindBTreeIterator<LeafBytes> {
@@ -738,6 +752,8 @@ public:
   [[nodiscard]] static auto parked_nodes() -> std::vector<const void *> {
     return chain().parked_nodes();
   }
+  // Live versions and parked retired nodes, for stats().
+  [[nodiscard]] static auto reclamation_gauges() { return chain().gauges(); }
   // Calls f(const void*) for every node reachable from this version.
   template <typename F> void visit_nodes(F &&f) const {
     std::vector<const N *> stack;
@@ -931,8 +947,7 @@ public:
     return session_.take_displaced();
   }
 
-  // Returns the erased reference, whose entry_bytes is what live-bytes
-  // accounting needs.
+  // Returns the erased reference.
   template <BlindKeyResolver R>
   auto erase(Bytes key, R &res) -> std::optional<BlindRef> {
     ensure_active();

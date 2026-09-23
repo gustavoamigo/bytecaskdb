@@ -89,7 +89,8 @@ inline void assert_consistent(const DB &db) {
   // 1. live_bytes matches key_dir.
   std::map<std::uint32_t, std::uint64_t> computed_live;
   std::uint64_t max_seq = 0;
-  for (auto it = state->key_dir.begin(); it != std::default_sentinel; ++it) {
+  for (auto it = kd_begin(state->key_dir, state->kd_ctx());
+       it != std::default_sentinel; ++it) {
     auto [key_span, entry] = *it;
     computed_live[entry.file_id()] +=
         entry_size(key_span.size(), entry.value_size());
