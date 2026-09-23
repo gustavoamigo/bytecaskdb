@@ -9,9 +9,10 @@
 //   BC_DATASET_SIZE=1000000 node build/memory_profile.js  (WASM)
 //   BC_INDEX_ONLY=btree BC_KEY_FORMAT=uuidv7 ./memory_profile   (tree only)
 //
-// BC_INDEX_ONLY=btree|radix builds only the in-memory key directory from the
-// key shape, without a DB, so the per-key cost of the index itself can be
-// read off directly.
+// BC_INDEX_ONLY=btree|radix|blind builds only the in-memory key directory
+// from the key shape, without a DB, so the per-key cost of the index itself
+// can be read off directly. blind is the blind-leaf tree with 1280-byte
+// leaves; blind640 and blind2560 pick the other leaf sizes.
 //
 // Available key formats (BC_KEY_FORMAT):
 //   prefixed (default), uniform, short, incremental, uuidv7, uuidv7_binary,
@@ -40,6 +41,7 @@
 
 import bytecask;
 import bytecask.btree;
+import bytecask.blind_btree;
 import bytecask.radix_tree;
 
 namespace {
@@ -211,6 +213,69 @@ void profile_index_only(const key_generators::KeyShape &shape, std::size_t n) {
   print_memory("after close");
 }
 
+// Resolves a blind tree's record to its key by regenerating it from the key
+// shape: record i holds key i. No key is stored, so the heap measured after
+// the build is the tree's alone.
+struct ShapeResolver {
+  const key_generators::KeyShape *shape;
+  std::size_t n;
+  std::string buf;
+  auto key_at(bytecask::BlindRef r) -> std::span<const std::byte> {
+    shape->make_key(r.offset, n, buf);
+    return std::as_bytes(std::span{buf.data(), buf.size()});
+  }
+};
+
+template <std::size_t LeafBytes>
+void profile_blind(const key_generators::KeyShape &shape, std::size_t n) {
+  using Tree = bytecask::PersistentBlindBTree<LeafBytes>;
+  ShapeResolver res{&shape, n, {}};
+  std::string key_buf;
+  const auto before = measure_heap_allocated();
+  print_memory("before build");
+  {
+    Tree t;
+    for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
+      auto tr = t.transient();
+      auto end = std::min(i + kPopulateBatchSize, n);
+      for (std::size_t j = i; j < end; ++j) {
+        shape.make_key(j, n, key_buf);
+        const bytecask::BlindRef ref{
+            0, static_cast<std::uint32_t>(j),
+            static_cast<std::uint32_t>(key_buf.size() + kValueSize + 20)};
+        tr.set(bc_key(key_buf), ref, res);
+      }
+      t = std::move(tr).persistent();
+    }
+    const auto after = measure_heap_allocated();
+    print_memory("after insert");
+    const auto st = t.stats();
+    std::printf("  keys: %zu, %zu entries per leaf\n", t.size(),
+                Tree::kLeafEntries);
+    std::printf("  nodes %zu (leaves %zu), height %zu, leaf fill %.2f, "
+                "capacity/key %.1f B, heap/key %.1f B\n",
+                st.nodes, st.leaves, st.height,
+                static_cast<double>(st.entries) /
+                    static_cast<double>(st.leaves * Tree::kLeafEntries),
+                static_cast<double>(st.capacity_bytes) /
+                    static_cast<double>(st.entries),
+                static_cast<double>(after - before) /
+                    static_cast<double>(t.size()));
+    std::map<std::uint32_t, std::size_t> hist;
+    for (auto c : st.leaf_counts)
+      ++hist[c];
+    std::vector<std::pair<std::size_t, std::uint32_t>> top;
+    for (const auto &[c, n_leaves] : hist)
+      top.emplace_back(n_leaves, c);
+    std::sort(top.rbegin(), top.rend());
+    std::printf("  leaf sizes (keys: leaves):");
+    for (std::size_t i = 0; i < std::min<std::size_t>(6, top.size()); ++i)
+      std::printf(" %u:%zu", top[i].second, top[i].first);
+    std::printf("\n");
+  }
+  print_memory("after close");
+}
+
 } // namespace
 
 int main() {
@@ -241,8 +306,14 @@ int main() {
       profile_index_only<bytecask::PersistentBTree<bytecask::KeyDirEntry>>(*shape, n);
     } else if (index == "radix") {
       profile_index_only<bytecask::PersistentRadixTree<bytecask::KeyDirEntry>>(*shape, n);
+    } else if (index == "blind") {
+      profile_blind<1280>(*shape, n);
+    } else if (index == "blind640") {
+      profile_blind<640>(*shape, n);
+    } else if (index == "blind2560") {
+      profile_blind<2560>(*shape, n);
     } else {
-      std::fprintf(stderr, "Unknown BC_INDEX_ONLY: %s (btree|radix)\n", index.c_str());
+      std::fprintf(stderr, "Unknown BC_INDEX_ONLY: %s (btree|radix|blind|blind640|blind2560)\n", index.c_str());
       return 1;
     }
     return 0;

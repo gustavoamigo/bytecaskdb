@@ -99,10 +99,10 @@ constexpr auto align_up(std::size_t n, std::size_t a) noexcept -> std::size_t {
   return (n + a - 1) / a * a;
 }
 
-template <typename T> auto as_ptr(std::byte *p) noexcept -> T * {
+export template <typename T> auto as_ptr(std::byte *p) noexcept -> T * {
   return static_cast<T *>(static_cast<void *>(p));
 }
-template <typename T> auto as_ptr(const std::byte *p) noexcept -> const T * {
+export template <typename T> auto as_ptr(const std::byte *p) noexcept -> const T * {
   return static_cast<const T *>(static_cast<const void *>(p));
 }
 
@@ -230,7 +230,7 @@ export template <typename V> struct Node {
   static constexpr std::size_t kLenBytes = 2;
   static constexpr std::size_t kSlotBytes = 8;
 
-  [[nodiscard]] static auto header_bytes() noexcept -> std::size_t {
+  [[nodiscard]] static constexpr auto header_bytes() noexcept -> std::size_t {
     return align_up(sizeof(Node), 8);
   }
   [[nodiscard]] static auto slots_offset_for(std::size_t prefix) noexcept

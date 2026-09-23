@@ -1,10 +1,11 @@
 # Blind-leaf B+ tree key directory — design
 
-> **Status: proposal.** Not a committed plan. It describes a third key
-> directory beside the B+ tree and the radix tree, for deployments where the
-> number of keys, not the value data, is what runs out of RAM. Nothing here
-> has been measured; every number is an estimate that §Gates turns into a
-> measurement before the engine depends on it.
+> **Status: step 1 built and measured.** It describes a third key directory
+> beside the B+ tree and the radix tree, for deployments where the number of
+> keys, not the value data, is what runs out of RAM. The tree itself
+> (`bytecaskdb/blind_btree.cppm`) exists and is tested; the engine does not
+> use it yet. §Step 1 results has the G1 and G2 measurements; the numbers
+> elsewhere in this document are the estimates the proposal started from.
 
 Baseline for code references: `main` at the time of writing
 (`bytecaskdb/btree.cppm`, `bytecaskdb/bytecask.cppm`,
@@ -86,31 +87,34 @@ each key byte b  →  1 b7 b6 b5 b4 b3 b2 b1 b0      (9 bits: continuation, then
 end of key       →  0                              (then 0 forever)
 ```
 
-Bit `p` of key `k` is:
+A bit position is written `byte << 4 | r`: `r = 0` is the byte's
+continuation bit, `r = 1..8` its bits from the most significant. Positions
+written this way compare in bit order, and splitting one is a shift and a
+mask rather than a division by 9. Bit `p` of key `k` is:
 
 ```cpp
-// 9 bits per byte; p / 9 is the byte, p % 9 == 0 is its continuation bit.
-auto bit(std::span<const std::byte> k, std::uint32_t p) -> bool {
-  const auto i = p / 9;
-  const auto r = p % 9;
-  if (i >= k.size()) return false;                  // past the end: 0
-  if (r == 0) return true;                          // a byte is present
-  return (std::to_integer<unsigned>(k[i]) >> (8 - r)) & 1u;
+auto bit(std::span<const std::byte> k, std::uint32_t p) -> std::uint32_t {
+  const std::size_t i = p >> 4;
+  const auto r = p & 15u;
+  if (i >= k.size()) return 0;                      // past the end: 0
+  if (r == 0) return 1;                             // a byte is present
+  return (std::to_integer<std::uint32_t>(k[i]) >> (8 - r)) & 1u;
 }
 ```
 
 A shorter key has `0` where a longer key with the same prefix has its
 continuation `1`, so it sorts first, which is what `std::ranges::lexicographical_compare`
 does on bytes. `crit(a, b)` is the first `p` where `bit(a, p) != bit(b, p)`.
-The largest crit bit for a 65,535-byte key is 589,815, so 20 bits hold it.
+Two distinct keys first differ at byte 65,534 at the latest, so the largest
+crit bit is `65,534 << 4 | 8`, and 20 bits hold it.
 
-The byte-level common prefix used for separators is `crit(a, b) / 9`.
+The byte-level common prefix used for separators is `crit(a, b) >> 4`.
 
 ## Leaf layout
 
 ```
   ┌──────────────┬────────────────────────────┬──────────────────────────────────┐
-  │ header 32 B  │ meta: u32 × capacity       │ entry: u64 loc, u32 size × cap   │
+  │ header 104 B │ meta: u32 × capacity       │ entry: u64 loc, u32 size × cap   │
   └──────────────┴────────────────────────────┴──────────────────────────────────┘
 
   meta  = crit:20 | fp_lo:12        crit of this key against the previous key in the leaf;
@@ -119,13 +123,20 @@ The byte-level common prefix used for separators is `crit(a, b) / 9`.
   size  = entry_bytes:29 | 0:3      header + key + value + CRC of the data entry
 ```
 
-The header is the same 32-byte `NodeHeader` inner nodes use (tag, capacity,
-count, `is_leaf`); `prefix_len`, `heap_floor` and `dead_bytes` are zero in a
-blind leaf. The arrays are structure-of-arrays so the search reads only
-`meta`: 4 bytes per key, 256 bytes for a 64-entry leaf.
+The header is the B+ tree's `Node` header (tag, capacity, count,
+`last_pos`, `is_leaf`), so a blind leaf is a `Node` whose bytes after the
+header are these arrays instead of slots and a heap. That is what lets the
+version chain, `BuildSession` and the inner nodes handle it unchanged:
+children stay `Node *`, `is_leaf` tells a leaf apart, and reclamation never
+looks inside a leaf. `prefix_len`, `heap_floor`, `dead_bytes` and the 64-byte
+search hints are unused in a blind leaf. The header is 104 bytes rather than
+the 32 the proposal assumed, which costs about 1.5 B/key at 0.7 fill with
+73-entry leaves (§Step 1 results). The arrays are structure-of-arrays so the
+search reads only `meta`.
 
 The 24-bit fingerprint (`fp_lo`, `fp_hi`) is a hash of the full key, taken
-when the key is inserted and never recomputed. It is not used for ordering.
+when the key is inserted and never recomputed: a multiply-xor over 8-byte
+little-endian words, inlined, since every lookup and write computes one. It is not used for ordering.
 It lets a lookup reject a candidate that is not the key without reading
 anything, with a false-match rate of 1 in 16.7 million.
 
@@ -137,9 +148,11 @@ without knowing the key length. The largest entry, a 256 MiB value and a
 What leaves the key directory: the 48-bit `sequence` and the key bytes.
 §Sequence without a sequence field shows where each use of `sequence()` goes.
 
-Capacity is a compile-time constant, `kBlindLeafEntries = 64`: 32 + 64 × 16
-= 1,056 bytes. Blind search is linear in the leaf (§Search), so the leaf is
-smaller than the 4 KiB B+ tree leaf. §Gates benchmarks 32, 64 and 128.
+The leaf size is a template parameter, in bytes, and the capacity follows
+from it: `(bytes − 104 − 4) / 16` entries. Sizes are jemalloc size classes so
+no allocation is rounded up: 640 bytes hold 33 entries, 1,280 hold 73 and
+2,560 hold 153. Blind search is linear in the leaf (§Search), so the leaf is
+smaller than the 4 KiB B+ tree leaf.
 
 ### Invariants
 
@@ -280,13 +293,32 @@ read.
 
 ### Split
 
-Split at the middle, or at the append point for the rightmost leaf as the
-B+ tree does. The crit bit at the split, `crit(left.last, right.first)`, is
-already in the leaf, and it gives the separator's length: `cpl =
-crit / 9`, separator `= right.first[0 .. cpl + 1)`. Building it needs the
-bytes of `right.first`, **one read per split**. When the key being inserted
-is `right.first`, its bytes are in hand and the read is skipped. With
-64-entry leaves a split happens about once every 32 inserts in random order.
+The crit bit at the split, `crit(left.last, right.first)`, is already in the
+leaf, and it gives the separator's length: `cpl = crit >> 4`, separator
+`= right.first[0 .. cpl + 1)`. Building it needs the bytes of
+`right.first`, **one read per split**. When the key being inserted is
+`right.first`, its bytes are in hand and the read is skipped. With 73-entry
+leaves a split happens about once every 25 inserts in random order.
+
+Where to split. An insert is *ascending* when it lands one or two positions
+after the leaf's previous insert (`last_pos`, as in the B+ tree). Two
+positions count because a stream of new keys often runs past one existing key
+per step: `key_123459` then `key_123460` skip over `key_12346`. In order of
+preference:
+
+1. Ascending, appending at the end of the leaf: the new key starts the right
+   leaf, so the left one stays full.
+2. Ascending, and the next key shares at least 8 bytes fewer with the new
+   key than the previous key does (another key family, read off the two crit
+   bits): the new key ends the left leaf. The stream goes on to fill leaves
+   of its own instead of dragging the other family along.
+3. Ascending, otherwise: at the insert point, but never left of the middle.
+   A blind leaf's capacity is a count, not bytes, so splitting a full leaf
+   near its start leaves the right half full again, and every following
+   insert split off a one- or two-key leaf (`uniform` keys filled leaves to
+   0.54 that way).
+4. Descending (`pos == 0` after an insert at 0): after the first entry.
+5. Otherwise the middle.
 
 ### Range erase (`del_range`)
 
@@ -490,6 +522,115 @@ In order; the design is abandoned or revised at the first gate that fails.
 | G5 | Recovery | 10M keys, 16 threads: within 1.5× of the B+ tree |
 
 G1 is the reason to build this; if it fails, nothing else matters.
+
+## Step 1 results
+
+Built: `bytecaskdb/blind_btree.cppm`, tested by `tests/blind_btree_test.cpp`
+(a brute-force check of the search over 23,000 single-leaf key sets with
+prefix keys, `\0` bytes and single-bit differences; a model test against
+`std::map` with snapshots; read counts per operation; 65,535-byte keys).
+Undoing the right-turn reset in the search fails five of the seven test
+cases.
+
+What the tree shares with `btree.cppm`: the node header and inner nodes,
+`BuildSession` (ownership, discard, path copying, inner-node splits and
+`make_root`, through a descent that takes the leaf step as a callback), the
+level building and publishing of `BulkLoader`, `ChainTraits` and the
+`VersionChain`. What it adds: the leaf layout, the search, the leaf steps of
+insert, overwrite, erase and split, its iterator, its handle types and a
+loader that fills blind leaves. `map_bench` shows the B+ tree unchanged by
+the refactor that exposes those pieces.
+
+Measured on a 4-vCPU cloud VM (Intel Xeon @ 2.10 GHz), where repeated runs
+vary by up to 30%; `map_bench` figures are medians of three.
+
+### G1 memory
+
+`BC_INDEX_ONLY=… memory_profile`, 1M keys inserted in batches of 100 as the
+engine does, jemalloc heap per key. Leaf fill in parentheses.
+
+| Key shape | B+ tree | Blind 640 (33) | Blind 1280 (73) | Blind 2560 (153) |
+|---|---:|---:|---:|---:|
+| prefixed | 33.9 | 21.4 (1.00) | 18.4 (1.00) | 17.2 (1.00) |
+| hash_prefixed | 33.5 | 20.9 (1.00) | 18.2 (1.00) | 17.0 (1.00) |
+| clustered | 33.3 | 20.6 (1.00) | 18.1 (1.00) | 17.0 (1.00) |
+| zipfian | 35.0 | 21.4 (0.98) | 18.6 (0.98) | 17.4 (0.98) |
+| uuidv7 | 58.5 | 21.1 (1.00) | 18.3 (1.00) | 17.1 (1.00) |
+| uuidv7_binary | 41.8 | 20.6 (1.00) | 18.1 (1.00) | 17.0 (1.00) |
+| binary | 47.3 | 27.5 (0.74) | 24.5 (0.73) | 22.8 (0.74) |
+| uniform | 56.5 | 28.8 (0.72) | 24.8 (0.73) | 23.3 (0.73) |
+| incremental | 56.3 | 28.8 (0.72) | 24.8 (0.73) | 23.3 (0.73) |
+| many_partitions | 62.6 | 30.7 (0.67) | 27.0 (0.67) | 25.4 (0.67) |
+| mixed | 75.9 | 26.5 (0.78) | 23.5 (0.77) | 22.1 (0.77) |
+| uuidv4_binary | 71.5 | 29.6 (0.69) | 26.0 (0.69) | 24.3 (0.70) |
+| sha256_bin | 96.1 | 29.6 (0.70) | 25.9 (0.69) | 24.0 (0.71) |
+| uuidv4_text | 96.1 | 29.8 (0.69) | 25.9 (0.69) | 24.8 (0.68) |
+| uuidv4_prefixed | 96.2 | 29.6 (0.69) | 26.1 (0.69) | 24.5 (0.69) |
+| sha256_hex | 132.8 | 29.6 (0.69) | 25.9 (0.69) | 24.3 (0.70) |
+
+- Below the B+ tree on every shape at every leaf size: 1.8–2.0× smaller on
+  structured keys, 2.8–5.1× on random ones at 1,280 bytes.
+- "At or below 25 B/key on every random shape" holds at 2,560 bytes
+  (24.0–24.8), misses by about 1 B/key at 1,280 (25.9–26.1) and by 4.6 at
+  640. At 1,280 the 104-byte shared header costs 2.1 B/key at 0.69 fill;
+  the proposal's 32-byte header would cost 0.6, which puts the random shapes
+  at about 24.5. The miss is the price of sharing the B+ tree's header, not
+  of the design.
+- `many_partitions` is the worst structured shape: its second pass adds one
+  key after every existing key, so every full leaf must end up holding twice
+  its capacity, three leaves at two thirds each. A leaf with a byte budget
+  has the same problem in a milder form.
+
+### G2 in-memory search
+
+`map_bench`, `generate_uniform_keys`, with a resolver that returns a span
+into an in-memory vector (so a key read costs one cache miss, not I/O).
+
+| Benchmark | B+ tree | Blind 640 | Blind 1280 | Blind 2560 |
+|---|---:|---:|---:|---:|
+| Get/1000 | 67 ns | 127 (1.9×) | 129 (1.9×) | 229 (3.4×) |
+| Get/10000 | 42 ns | 82 (1.9×) | 113 (2.7×) | 359 (8.5×) |
+| Get/100000 | 76 ns | 159 (2.1×) | 147 (1.9×) | 214 (2.8×) |
+| GetAbsent/100000 | 71 ns | 153 (2.2×) | 159 (2.2×) | 229 (3.2×) |
+| LowerBound/1000 | 134 ns | 149 (1.1×) | 189 (1.4×) | 242 (1.8×) |
+| LowerBound/10000 | 101 ns | 109 (1.1×) | 156 (1.5×) | 361 (3.6×) |
+| LowerBound/100000 | 126 ns | 182 (1.4×) | 212 (1.7×) | 275 (2.2×) |
+
+- `LowerBound` passes (within 2×) at 640 and 1,280 bytes. `Get` is at the
+  line at 640 and 1,280 (1.9–2.7×), and fails at 2,560.
+- In absolute terms a blind `Get` costs 40–90 ns more than a B+ tree `Get`.
+  The README's engine `Get` is 728 ns at p50, so if nothing else changed the
+  difference would be about 10% of it, which is G3's whole budget.
+- `GetAbsent`, which never reads a key, costs the same as `Get`: the time is
+  the in-leaf scan, not the key read. It grows by about 2 ns per entry
+  (33 → 73 → 153), so the loop is bound by its instruction count (about 20
+  µops per boundary), not by the dependency on `s`. Three attempts did not
+  move it: shift-and-mask positions instead of division by 9, an inlined
+  fingerprint instead of a CRC-32C library call (both kept, as simpler), and
+  arithmetic masks instead of conditional moves (slower, dropped). Making it
+  faster takes a different in-leaf search, such as HOT's partial keys
+  compared with SIMD.
+
+### Writes and iteration (context, no gate)
+
+| Benchmark | B+ tree | Blind 640 | Blind 1280 |
+|---|---:|---:|---:|
+| TransientInsertBatch/100000 (100 new keys) | 20.9 µs | 35.2 (1.7×) | 38.4 (1.8×) |
+| TransientSet/100000 | 12.9 ms | 20.8 (1.6×) | 19.9 (1.5×) |
+| TransientUpdate/100000 (overwrite all) | 6.3 ms | 13.7 (2.2×) | 20.2 (3.2×) |
+| Iterate/10000 (with keys) | 76.5 µs | 42.2 (0.6×) | 35.3 (0.5×) |
+
+An overwrite reads the key it replaces, which the B+ tree never does; that
+is the 2–3× on `TransientUpdate`. Iteration looks faster only because the
+benchmark's resolver hands out a span into memory while the B+ tree copies
+each key into the iterator's buffer; in the engine a blind `keys_from` does
+one read per key.
+
+### Leaf size
+
+1,280 bytes (73 entries) is the middle ground: 640 is up to 30% faster to
+search and 3–4 B/key larger; 2,560 is 1.5 B/key smaller and 1.5–3× slower.
+With a leaner leaf header, 1,280 would also pass G1.
 
 ## Plan
 
