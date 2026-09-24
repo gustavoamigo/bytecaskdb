@@ -1117,6 +1117,17 @@ class BlindBulkLoader : private btree_detail::BulkLoader<BlindRef> {
 
 public:
   BlindBulkLoader() = default;
+  // Fills each leaf to `fill` of its capacity rather than to the brim. A full
+  // leaf splits into two halves on the first insert after the load, so a
+  // tree loaded full and then written at random spends a stretch near half
+  // full; slack lets each leaf take a few inserts first.
+  explicit BlindBulkLoader(double fill) : BlindBulkLoader{fill, fill} {}
+  // Spreads the fill of successive leaves evenly over [fill_min, fill_max],
+  // so they do not all reach capacity, and split, at the same time.
+  BlindBulkLoader(double fill_min, double fill_max)
+      : fill_min_{fill_min}, fill_max_{fill_max} {
+    next_target();
+  }
   BlindBulkLoader(const BlindBulkLoader &) = delete;
   auto operator=(const BlindBulkLoader &) -> BlindBulkLoader & = delete;
   ~BlindBulkLoader() {
@@ -1134,8 +1145,10 @@ public:
         throw std::invalid_argument{"BlindBulkLoader: keys not ascending"};
       crit_bit = c;
     }
-    if (leaf_ && leaf_->count == L::kCap)
+    if (leaf_ && leaf_->count >= leaf_target_) {
       seal_leaf();
+      next_target();
+    }
     if (!leaf_) {
       leaf_ = L::allocate(this->session_.tag());
       if (this->size_ > 0)
@@ -1187,6 +1200,19 @@ public:
   }
 
 private:
+  double fill_min_{1.0};
+  double fill_max_{1.0};
+  double spread_{0.0}; // position in [0, 1), advanced by the golden ratio
+  std::size_t leaf_target_{L::kCap};
+
+  void next_target() {
+    const auto fill = fill_min_ + (fill_max_ - fill_min_) * spread_;
+    spread_ += 0.6180339887498949;
+    spread_ -= static_cast<double>(static_cast<std::size_t>(spread_));
+    leaf_target_ = std::clamp<std::size_t>(
+        static_cast<std::size_t>(static_cast<double>(L::kCap) * fill), 1,
+        L::kCap);
+  }
   N *leaf_{nullptr};
   std::vector<std::byte> first_; // the first key appended
   std::vector<std::byte> prev_;  // the last key appended

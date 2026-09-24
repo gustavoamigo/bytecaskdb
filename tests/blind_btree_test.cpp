@@ -412,3 +412,30 @@ TEST_CASE("blind tree: sealed slices concatenate into one tree", "[blind]") {
   for (const auto &k : keys)
     REQUIRE(t.get(to_bytes(k), res).has_value());
 }
+
+TEST_CASE("blind tree: bulk load spreads leaf fill over a range", "[blind]") {
+  MemResolver res;
+  std::set<std::string> key_set;
+  std::mt19937_64 rng{6};
+  while (key_set.size() < 4'000)
+    key_set.insert(nasty_key(rng, 9));
+  bytecask::BlindBulkLoader<640> loader{0.5, 1.0};
+  for (const auto &k : key_set)
+    loader.append(to_bytes(k), res.ref(k));
+  const auto t = std::move(loader).finish();
+  t.validate(res);
+  const auto cap = SmallTree::kLeafEntries;
+  const auto st = t.stats();
+  // Every leaf but the last one loaded (wherever stats() lists it) is
+  // between half full and full.
+  std::set<std::uint32_t> sizes;
+  std::size_t short_leaves = 0;
+  for (const auto c : st.leaf_counts) {
+    CHECK(c <= cap);
+    if (c < cap / 2)
+      ++short_leaves;
+    sizes.insert(c);
+  }
+  CHECK(short_leaves <= 1);
+  CHECK(sizes.size() > 5); // spread, not one size
+}

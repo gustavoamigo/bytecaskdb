@@ -274,6 +274,65 @@ void profile_blind(const key_generators::KeyShape &shape, std::size_t n) {
   print_memory("after close");
 }
 
+// Recovery bulk-loads the key directory; this measures what random writes do
+// to it afterwards. Loads n keys of the shape in key order at the given leaf
+// fill, then inserts n / 2 more at random, reporting bytes per key as it goes.
+void profile_blind_growth(const key_generators::KeyShape &shape, std::size_t n,
+                          double fill_min, double fill_max) {
+  using Tree = bytecask::PersistentBlindBTree<1280>;
+  const auto total = n + n / 2;
+  ShapeResolver res{&shape, total, {}};
+  Tree t;
+  {
+    std::vector<std::pair<std::string, std::uint32_t>> keys;
+    keys.reserve(n);
+    std::string buf;
+    for (std::size_t j = 0; j < n; ++j) {
+      shape.make_key(j, total, buf);
+      keys.emplace_back(buf, static_cast<std::uint32_t>(j));
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end(),
+                           [](const auto &a, const auto &b) {
+                             return a.first == b.first;
+                           }),
+               keys.end());
+    bytecask::BlindBulkLoader<1280> loader{fill_min, fill_max};
+    for (const auto &[k, j] : keys)
+      loader.append(bc_key(k), bytecask::BlindRef{0, j});
+    t = std::move(loader).finish();
+  }
+  // Node capacity per key: the tree's own footprint, inner nodes included.
+  auto report = [&](const char *when) {
+    const auto st = t.stats();
+    std::printf("  %-18s keys %9zu  leaf fill %.2f  B/key %.1f\n", when,
+                t.size(),
+                static_cast<double>(st.entries) /
+                    static_cast<double>(st.leaves * Tree::kLeafEntries),
+                static_cast<double>(st.capacity_bytes) /
+                    static_cast<double>(t.size()));
+  };
+  report("after load");
+  std::string key_buf;
+  std::size_t next = n;
+  for (const double grow : {0.01, 0.05, 0.10, 0.25, 0.50}) {
+    const auto until = n + static_cast<std::size_t>(static_cast<double>(n) * grow);
+    while (next < until) {
+      auto tr = t.transient();
+      const auto end = std::min(next + kPopulateBatchSize, until);
+      for (; next < end; ++next) {
+        shape.make_key(next, total, key_buf);
+        tr.set(bc_key(key_buf),
+               bytecask::BlindRef{0, static_cast<std::uint32_t>(next)}, res);
+      }
+      t = std::move(tr).persistent();
+    }
+    char label[32];
+    std::snprintf(label, sizeof label, "+%.0f%% random", grow * 100);
+    report(label);
+  }
+}
+
 } // namespace
 
 int main() {
@@ -306,6 +365,14 @@ int main() {
       profile_index_only<bytecask::PersistentRadixTree<bytecask::KeyDirEntry>>(*shape, n);
     } else if (index == "blind") {
       profile_blind<1280>(*shape, n);
+    } else if (index == "blind_growth") {
+      // BC_BULK_FILL=0.8, or a range 0.5:1.0 spread over the leaves.
+      const char *f = std::getenv("BC_BULK_FILL");
+      const std::string spec = f && *f ? f : "1.0";
+      const auto colon = spec.find(':');
+      const auto lo = std::stod(spec.substr(0, colon));
+      const auto hi = colon == std::string::npos ? lo : std::stod(spec.substr(colon + 1));
+      profile_blind_growth(*shape, n, lo, hi);
     } else if (index == "blind640") {
       profile_blind<640>(*shape, n);
     } else if (index == "blind2560") {
