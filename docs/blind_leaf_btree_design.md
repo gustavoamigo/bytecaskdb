@@ -979,9 +979,31 @@ ranges) and the fingerprint. Two changes aim at it:
   eight bytes, overlapping the previous word) when the key has at least eight
   bytes, instead of a byte loop (~−50).
 
-Together about 40% of the gap. The rest is the inner nodes (374 against 324
-instructions each; the same code on different separators) and the resolver's
-bookkeeping.
+Together about 40% of the gap in instructions. The rest is the inner nodes
+(374 against 324 instructions each; the same code on different separators)
+and the resolver's bookkeeping.
+
+**Tried, and neither helps; both reverted.** `engine_bench` `Get`, 1M keys,
+buffer pool, ops/sec as a fraction of the B+ tree's, medians of 5–6
+interleaved runs:
+
+| Variant | `Get` |
+|---|---:|
+| As before (four levels, branching walk) | 0.86–0.88 |
+| Fingerprint tail as one load | 0.85 |
+| Five levels, branching walk (+ fingerprint) | 0.82 |
+| Four levels, branch-free walk | 0.82 |
+| Five levels, branch-free walk (+ fingerprint) | 0.79 |
+
+The fingerprint change is within noise. The other two lose despite fewer
+instructions, because the leaf search is bound by its chain of dependent
+loads (index slot, its crit bit, the query byte, the next slot), not by
+instruction count. A fifth level lengthens that chain by one step, which
+costs more than the ~5 scan steps it saves. The branching walk lets the core
+speculate past a turn and start the next level's loads; right half the time,
+that beats a branch-free walk that must wait for every load. Callgrind counts
+instructions, so it pointed at the wrong lever. What is left of G3 lives in
+that chain and in the inner nodes; there is no further small change in view.
 
 ### Revised targets
 
