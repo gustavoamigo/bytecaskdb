@@ -37,6 +37,11 @@ search**: it tests only the crit bits of the search key and arrives at one
 is not, the candidate is some neighbour, and one read of the candidate's key
 from its data entry says so and gives the exact position.
 
+That is how a key is *placed*. A point lookup needs less: it only has to
+find the entry that is the key, if there is one, and the leaf's fingerprints
+answer that with a vector compare over the whole leaf, no crit bits
+involved (§Search).
+
 This is the Patricia trie's search, done over a sorted array instead of a
 tree of nodes. The String B-tree (Ferragina and Grossi, 1999) puts a blind
 trie in every node; HOT (Binna et al., SIGMOD 2018) is a height-balanced tree
@@ -141,8 +146,10 @@ words, inlined, since every lookup and write computes one. Words are loaded
 in native byte order, since fingerprints live only in memory and are rebuilt
 with the tree at recovery; a key of eight bytes or more hashes its tail as its
 last eight bytes, overlapping the word before. It is not used for ordering.
-It lets a lookup reject a candidate that is not the key without reading
-anything, with a false-match rate of 1 in 16.7 million.
+A point lookup finds the key by it: the low twelve bits sit in `meta`, one
+contiguous array the lookup compares in vector registers (§Search), and the
+high twelve in `loc` confirm a match before its key is read. The
+false-match rate is 1 in 16.7 million per entry.
 
 `entry_bytes` replaces `value_size`. `get` reads exactly that many bytes, and
 live-bytes accounting needs exactly that number (`entry_size(key, value)`)
@@ -204,7 +211,45 @@ published after `fdatasync`.
 
 ## Search
 
-### Blind search in a leaf
+A leaf answers two questions. A point lookup (`get`, `contains`, `erase`)
+asks whether `q` is in the leaf and at which index; it scans the
+fingerprints (§Point lookups: the fingerprint scan). An insert or
+`lower_bound` asks where `q` belongs among keys it cannot see; it walks the
+crit bits to a candidate and reads that key (§Placing a key: the blind
+walk).
+
+### Point lookups: the fingerprint scan
+
+`meta` holds the low twelve fingerprint bits of every entry in one
+contiguous array. A lookup compares all `kCap` of them with the query's in
+vector registers — ten AVX2 compares for an 80-entry leaf, a fixed count
+with no loop or branch on data — and masks the result to `count`. Each
+match is then checked against the twelve bits in `loc` and, if those agree
+too, its key is read through the resolver; the first key equal to `q` is
+the answer, in index order.
+
+```cpp
+auto find(const Leaf &l, std::span<const std::byte> q, std::uint32_t fpq, R &res)
+    -> std::optional<std::uint32_t> {
+  auto hits = fp_lo_matches(l, fpq & 0xFFF);           // bitmask over entries
+  for (auto i : hits)                                   // ascending
+    if (fp_hi(l, i) == fpq >> 12 && res.key_at(ref(l, i)) == q)
+      return i;
+  return std::nullopt;
+}
+```
+
+A present key costs one read (its own record), plus one per earlier entry
+in the leaf with the same 24-bit fingerprint. An absent key costs none,
+bar a collision. Nothing here depends on the crit bits, so the scan is
+correct for any leaf the inner nodes route to; the unit tests cover leaves
+holding keys whose fingerprints collide.
+
+This replaced the walk below for lookups (§Point lookups by fingerprint
+scan, under results): the walk cost about 295 instructions per lookup and
+carried the data-dependent branches, the scan about 60 and none.
+
+### Placing a key: the blind walk
 
 A left-to-right pass finds the candidate. `c` is the candidate. `s` is the
 crit bit of the last left turn still in force: the boundaries after it with
@@ -248,29 +293,26 @@ tests (§Tests).
 
 ### Resolving the candidate
 
-`find(q, resolver)` returns the entry for `q` or its insertion position:
+`position(q, resolver)` returns the entry for `q` or its insertion position:
 
 1. Route to the leaf through the inner nodes, as today.
 2. `c = blind_candidate(leaf, q)`. If the leaf is empty, the position is 0.
-3. If `fp(q) != fp(c)`: `q` is not in the leaf. For a lookup that is the
-   answer, with no I/O. An insert or `lower_bound` goes on to step 4, because
-   it needs the position.
-4. Read `key[c]` through the resolver. If it equals `q`, found at `c`.
-5. Otherwise let `j = crit(q, key[c])`. The keys that share bits `[0, j)`
+3. Read `key[c]` through the resolver. If it equals `q`, found at `c`.
+4. Otherwise let `j = crit(q, key[c])`. The keys that share bits `[0, j)`
    with `c` are a contiguous run `[a, b)` around `c`: extend left and right
    while `crit > j`. Every key in the run has the same bit `j` as `c`, so if
    `bit(q, j)` is 1, `q` sorts after the run and its position is `b`;
    otherwise it is `a`.
 
-Step 5 is the Patricia argument: `j` cannot be a crit bit on `c`'s path,
+Step 4 is the Patricia argument: `j` cannot be a crit bit on `c`'s path,
 because the search would have tested it and followed `q`'s bit, not `c`'s.
 So no boundary inside the run has crit `j`, and the boundaries at `a` and `b`
 have crit bits below `j` (a boundary with crit `j` next to the run would be
 on `c`'s path too).
 
-A lookup costs one read when `q` is present or its fingerprint collides, and
-none when it is absent. An insert or `lower_bound` costs one read unless the
-leaf is empty.
+An insert or `lower_bound` costs one read unless the leaf is empty. (Until
+the fingerprint scan, lookups took this path too, skipping the read when
+the candidate's fingerprint differed from the query's.)
 
 ## Algorithms
 
@@ -508,6 +550,10 @@ belongs to the pluggable-interface work, not to this tree.
   trailing `\0`, long shared prefixes, 65,535-byte keys, single-bit
   differences at every bit of a byte. A resolver that counts calls asserts
   the I/O table above.
+- **Fingerprint collisions**: a leaf built from pairs of distinct keys with
+  the same 24-bit fingerprint (found by brute force). Every key resolves to
+  its own record, an absent key that shares a pair's fingerprint reads both
+  and finds neither, and erasing one of a pair leaves the other findable.
 - **Crit-bit invariant**: debug `validate()` checks `crit(key[i-1], key[i])`
   against the stored value on every leaf of every test.
 - **Persistence**: the B+ tree's snapshot, transient and `[accounting]`
@@ -1159,13 +1205,74 @@ the B+ tree, and that is the ceiling. It cannot search an 80-entry leaf in
 one step: every boundary adds a discriminating bit, and HOT caps nodes at 32
 entries for that reason. It would mean a leaf of small HOT nodes, with 1–4
 bytes of partial key per entry, +8% to +35% on G1, and gather-free extraction
-on this machine. Not pursued.
+on this machine. Not pursued; the fingerprint scan below gets past its
+ceiling without changing the leaf.
 
 **Reads across two buffer-pool frames, tried and dropped** (#158). Serving a
 record or value that straddles 4 KiB frames from the frames' views, without
 the copying fallback, gains the B+ tree 0.4% (within noise) and costs the
 blind tree 1.4%: a straddling read's cost is the per-frame lookups, pins and
 copies, which any correct path keeps (`docs/buffer_pool_design.md`, §9).
+
+### Point lookups by fingerprint scan
+
+Everything above kept the leaf search as designed: walk the crit bits to
+the one candidate, then check its fingerprint. The walk is what a lookup
+was paying for, ~118 cycles with its dependent loads and its data-dependent
+branches, and a lookup does not need a candidate. It needs the entry that
+*is* the key, and the leaf already holds a 24-bit fingerprint per entry,
+twelve bits of it in `meta`, one contiguous array. So `find` now compares
+every `meta` word with the query's fingerprint in vector registers (ten
+AVX2 compares for 80 entries, masked to `count`) and reads the key behind
+each match, in index order, until one equals the query (§Point lookups: the
+fingerprint scan). The count is fixed per leaf, there is no branch on data,
+and the crit bits are not read at all. Placing a key for an insert still
+walks, and the `top` index stays for that.
+
+`engine_bench`, 1M keys, buffer pool, release build, not pinned, medians of
+five interleaved runs, all three binaries built the same way on the same
+day:
+
+| | `Get` | `UUIDv4/Get` | `GetMT`, 16 threads | Cycles/`Get` | Instructions/`Get` | Branch misses/`Get` |
+|---|---:|---:|---:|---:|---:|---:|
+| B+ tree | 1.00 (4.18 M/s) | 1.00 (2.83 M/s) | 1.00 (37.5 M/s) | 1,019 | 2,252 | 1.29 |
+| Blind, crit-bit walk (1,024-byte leaves) | 0.907 | 1.10 | 0.92 | 1,115 | 2,482 | 2.38 |
+| Blind, fingerprint scan | **1.01** | **1.28** | **0.99** | 1,011 | 2,261 | 1.06 |
+
+`Get` is at parity, `GetMT` within noise of it, and on random keys the blind
+tree leads by 28%. Per call the scan removed ~220 instructions and 1.3
+branch misses; the blind tree now mispredicts less per lookup than the B+
+tree, whose leaf search compares suffixes. What the profile above attributed
+to `Leaf::find` and `find_ref` (~163 cycles) is now ~60, so the blind path's
+remaining costs are outside the tree: the record read through
+`lend_record` and the key confirmation `memcmp`, which the B+ tree does not
+do, against the B+ tree's fourth node search, which the blind tree does not
+do. They cancel.
+
+Across dataset sizes (same setup; medians of three, of two at 10M), as a
+fraction of the B+ tree's ops/sec:
+
+| Keys | `Get` | `UUIDv4/Get` |
+|---:|---:|---:|
+| 500K | 0.96 | 1.31 |
+| 1M | 1.01 | 1.28 |
+| 2M | 1.05 | 1.25 |
+| 10M | 1.00 | 1.29 |
+
+In memory (`map_bench`, default shape, medians of three, B+ tree in
+parentheses): `Get` 72 / 46 / 86 ns at 1k / 10k / 100k keys (84 / 54 / 87),
+was 94 / 72 / 117; `GetAbsent` 65 / 40 / 77 (75 / 45 / 82), was 101 / 73 /
+117. G2 is met at 1.0× on this shape.
+
+The scan reads all 320 bytes of `meta` (five cache lines) where the walk
+touched two or three: at 1M keys the directory fits in L3 and this shows up
+nowhere. A twelve-bit match that the other twelve bits reject costs one
+`loc` load and no read, about once in 70 lookups at 56 entries per leaf; a
+full 24-bit collision costs one extra read, about three per million
+lookups. A unit test builds leaves from colliding keys and checks that
+every key still resolves to its own record. On targets without AVX2 the
+same scan runs on SSE2, NEON, or a scalar loop; the algorithm does not
+change.
 
 ### How these were measured
 
@@ -1196,8 +1303,8 @@ change lands:
 | Gate | Target | Today |
 |---|---|---|
 | G1 | ≤ 18 B/key random, ≤ 14 structured (`memory_profile`, 1M keys) | 19.0 random (`uuidv4_binary`), 13.7 structured (`prefixed`), 1,024-byte leaves |
-| G2 | `map_bench` `Get` within 2× of the B+ tree | 1.9–2.7× |
-| G3 | `engine_bench` `Get`, `GetMT` within 10% (buffer pool) | `Get` 0.90, `GetMT` 0.92 of the B+ tree's ops/sec at 1M keys (at the line); `Get` 0.87–0.96 over 0.5M–10M keys |
+| G2 | `map_bench` `Get` within 2× of the B+ tree | Met: 0.85–1.0× on the default shape at 1k–100k keys (§Point lookups by fingerprint scan) |
+| G3 | `engine_bench` `Get`, `GetMT` within 10% (buffer pool) | Met: `Get` 1.01, `GetMT` 0.99 of the B+ tree's ops/sec at 1M keys, `Get` 0.96–1.05 over 0.5M–10M keys; `UUIDv4/Get` 1.25–1.31 (§Point lookups by fingerprint scan) |
 | G4 | `Put` NoSync within 10%, Sync within noise | +11% / noise |
 | G5 | Recovery within 1.5× | 1.75× (through the B+ tree) |
 
@@ -1225,7 +1332,8 @@ all three trees, and before-and-after numbers on the buffer-pool rows:
 7. **R4** — the 40-byte common node header. B+ tree unchanged in
    `map_bench` and `memory_profile`; G1 on the blind tree.
 8. **R6** — the in-leaf search (#156). G2, G3; then pick the leaf size again:
-   1,024 bytes (§Leaf size, revisited).
+   1,024 bytes (§Leaf size, revisited). Then point lookups by fingerprint
+   scan, which met G3 (§Point lookups by fingerprint scan).
 9. **R5** — bulk-load slack; redistribution only if the random shapes still
    miss G1.
 10. **R7** — recovery from sorted hint streams. `[model]` tests. G5.

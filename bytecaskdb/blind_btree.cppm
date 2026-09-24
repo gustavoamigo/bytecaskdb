@@ -7,9 +7,11 @@
 // tree's (btree.cppm). A leaf stores no key bytes: each entry is a crit bit
 // (the first bit where the key differs from the previous key in the leaf), a
 // 24-bit fingerprint and the location of the record that holds the key: 12
-// bytes. A search in a leaf tests crit bits only and reaches one candidate,
-// whose key a caller-supplied resolver reads to confirm the match or to find
-// the exact position. See docs/blind_leaf_btree_design.md.
+// bytes. A point lookup scans the leaf's fingerprints and reads the key of
+// each match through a caller-supplied resolver until one is the query. An
+// insert or lower_bound needs a position, so it walks the crit bits to one
+// candidate and reads that key to place the query exactly. See
+// docs/blind_leaf_btree_design.md.
 
 module;
 #include <algorithm>
@@ -26,6 +28,11 @@ module;
 #include <string>
 #include <utility>
 #include <vector>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 export module bytecask.blind_btree;
 import bytecask.btree;
@@ -147,15 +154,18 @@ export inline auto fingerprint(Bytes k) noexcept -> std::uint32_t {
 //                                        unused at index 0
 //   loc[cap]   u64  file_id:20 | offset:32 | fp_hi:12
 //
-// The search reads only top and meta. Capacity follows from the allocation
-// size, so LeafBytes should be a malloc size class.
+// Capacity follows from the allocation size, so LeafBytes should be a malloc
+// size class.
 //
-// The sorted keys and their crit bits imply a Patricia trie whose root is the
+// A point lookup (find) compares every meta word's fp_lo with the query's,
+// a fixed number of vector compares, and reads the key behind each match:
+// no walk, no branch on data. Placing a key (position) needs the trie. The
+// sorted keys and their crit bits imply a Patricia trie whose root is the
 // boundary with the smallest crit bit, and every subtree of which is a
 // contiguous range of entries. top holds that trie's first four levels in
 // heap order (the children of slot k are 2k+1 and 2k+2): the index of the
 // boundary at the root of each range, 0 for a range of fewer than two
-// entries. A search walks them with four bit tests and scans only the range
+// entries. The walk takes four bit tests down it and scans only the range
 // it lands in — about a sixteenth of a leaf of random keys — instead of the
 // whole leaf.
 // ---------------------------------------------------------------------------
@@ -314,20 +324,93 @@ export template <std::size_t LeafBytes> struct Leaf {
     return c;
   }
 
-  // Index of `q` in the leaf, if present. Reads the candidate's key only when
-  // its fingerprint matches.
+  // Entries whose low twelve fingerprint bits are a given value, as a
+  // bitmask in index order. All kCap meta words are compared, a fixed
+  // number of vector compares with no loop or branch on data, and the mask
+  // is then cut at count: the words past count are stale or garbage. The
+  // reads stay inside the leaf (static_assert below).
+  static constexpr std::size_t kMaskWords = (kCap + 63) / 64;
+  struct Matches {
+    std::uint64_t w[kMaskWords]{};
+  };
+  static constexpr std::size_t kMetaWordsRead = (kCap + 7) / 8 * 8;
+  static_assert(kMetaOff + 4 * kMetaWordsRead <= LeafBytes,
+                "the fingerprint scan reads whole vectors of meta");
+
+  [[nodiscard]] static auto fp_lo_matches(const N *n,
+                                          std::uint32_t fp_lo) noexcept
+      -> Matches {
+    const auto *m = meta(n);
+    Matches out;
+    // fp_lo occupies the low twelve bits of a meta word; shifting the crit
+    // bits out lets one compare test the whole word.
+    const auto want = fp_lo << 20;
+#if defined(__AVX2__)
+    const auto w = _mm256_set1_epi32(static_cast<int>(want));
+    for (std::size_t v = 0; v < kMetaWordsRead / 8; ++v) {
+      __m256i x;
+      std::memcpy(&x, m + 8 * v, sizeof x);
+      const auto eq = _mm256_cmpeq_epi32(_mm256_slli_epi32(x, 20), w);
+      const auto bits = static_cast<std::uint64_t>(
+          _mm256_movemask_ps(_mm256_castsi256_ps(eq)));
+      out.w[8 * v / 64] |= bits << (8 * v % 64);
+    }
+#elif defined(__SSE2__)
+    const auto w = _mm_set1_epi32(static_cast<int>(want));
+    for (std::size_t v = 0; v < kMetaWordsRead / 4; ++v) {
+      __m128i x;
+      std::memcpy(&x, m + 4 * v, sizeof x);
+      const auto eq = _mm_cmpeq_epi32(_mm_slli_epi32(x, 20), w);
+      const auto bits =
+          static_cast<std::uint64_t>(_mm_movemask_ps(_mm_castsi128_ps(eq)));
+      out.w[4 * v / 64] |= bits << (4 * v % 64);
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    const auto w = vdupq_n_u32(want);
+    const uint32x4_t lane_bit = {1u, 2u, 4u, 8u};
+    for (std::size_t v = 0; v < kMetaWordsRead / 4; ++v) {
+      uint32x4_t x;
+      std::memcpy(&x, m + 4 * v, sizeof x);
+      const auto eq = vceqq_u32(vshlq_n_u32(x, 20), w);
+      const auto bits = std::uint64_t{vaddvq_u32(vandq_u32(eq, lane_bit))};
+      out.w[4 * v / 64] |= bits << (4 * v % 64);
+    }
+#else
+    for (std::size_t i = 0; i < kCap; ++i)
+      out.w[i / 64] |= std::uint64_t{(m[i] << 20) == want} << (i % 64);
+#endif
+    // Cut at count, without a branch on it.
+    for (std::size_t k = 0; k < kMaskWords; ++k) {
+      const auto n_bits = std::min<std::size_t>(
+          n->count > 64 * k ? n->count - 64 * k : 0, 64);
+      out.w[k] &= n_bits == 64 ? ~std::uint64_t{0}
+                               : (std::uint64_t{1} << n_bits) - 1;
+    }
+    return out;
+  }
+
+  // Index of `q` in the leaf, if present. A point lookup does not walk the
+  // trie: it scans the fingerprints, whose cost is fixed per leaf, and
+  // reads the key of each entry with the query's full fingerprint, in
+  // index order, until one is the query. That is one read when `q` is
+  // present and none when it is absent, unless fingerprints collide.
   template <BlindKeyResolver R>
   [[nodiscard]] static auto find(const N *n, Bytes q, std::uint32_t fpq, R &res)
       -> std::optional<std::uint32_t> {
-    if (n->count == 0)
-      return std::nullopt;
-    const auto c = candidate(n, q);
-    if (fp_at(n, c) != fpq)
-      return std::nullopt;
-    const Bytes kc = res.key_at(ref_at(n, c));
-    if (btree_detail::compare_bytes(kc, q) != 0)
-      return std::nullopt;
-    return c;
+    const auto hits = fp_lo_matches(n, fpq & 0xFFFu);
+    const auto fp_hi = fpq >> 12;
+    for (std::size_t k = 0; k < kMaskWords; ++k) {
+      for (auto bits = hits.w[k]; bits != 0; bits &= bits - 1) {
+        const auto i = static_cast<std::uint32_t>(
+            64 * k + static_cast<std::size_t>(std::countr_zero(bits)));
+        if ((loc(n)[i] & 0xFFFu) != fp_hi)
+          continue;
+        const Bytes kc = res.key_at(ref_at(n, i));
+        if (btree_detail::compare_bytes(kc, q) == 0)
+          return i;
+      }
+    }
+    return std::nullopt;
   }
 
   // Where `q` is or belongs. For an absent key, `j` is its crit bit against

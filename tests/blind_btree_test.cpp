@@ -197,6 +197,80 @@ TEST_CASE("blind leaf: search finds every key and every insertion point",
   }
 }
 
+// Distinct keys with the same 24-bit fingerprint, found by brute force. A
+// lookup scans fingerprints, so these are the keys it must tell apart by
+// reading.
+auto colliding_keys(std::mt19937_64 &rng, std::size_t pairs)
+    -> std::vector<std::pair<std::string, std::string>> {
+  std::map<std::uint32_t, std::string> seen;
+  std::vector<std::pair<std::string, std::string>> out;
+  std::uniform_int_distribution<int> byte{'a', 'z'};
+  while (out.size() < pairs) {
+    std::string k(12, '\0');
+    for (auto &c : k)
+      c = static_cast<char>(byte(rng));
+    const auto fp = bd::fingerprint(to_bytes(k));
+    auto [it, inserted] = seen.try_emplace(fp, k);
+    if (!inserted && it->second != k)
+      out.emplace_back(it->second, k);
+  }
+  return out;
+}
+
+TEST_CASE("blind leaf: lookups tell colliding fingerprints apart",
+          "[blind]") {
+  std::mt19937_64 rng{7};
+  const auto pairs = colliding_keys(rng, 3);
+  for (const auto &[a, b] : pairs) {
+    REQUIRE(a != b);
+    REQUIRE(bd::fingerprint(to_bytes(a)) == bd::fingerprint(to_bytes(b)));
+  }
+  MemResolver res;
+  std::set<std::string> keys;
+  for (const auto &[a, b] : pairs) {
+    keys.insert(a);
+    keys.insert(b);
+  }
+  for (int i = 0; i < 20; ++i)
+    keys.insert("filler" + std::to_string(i));
+  bytecask::BlindBulkLoader<640> loader;
+  for (const auto &k : keys)
+    loader.append(to_bytes(k), res.ref(k));
+  const auto t = std::move(loader).finish();
+  REQUIRE(t.stats().leaves == 1);
+
+  // Every key resolves to its own record: the entries with the query's
+  // fingerprint are read in index order until one is the query.
+  for (const auto &k : keys) {
+    res.reads = 0;
+    const auto got = t.get(to_bytes(k), res);
+    REQUIRE(got.has_value());
+    REQUIRE(res.store.at(got->offset) == k);
+    REQUIRE(res.reads <= 2);
+  }
+  // An absent key whose fingerprint two entries share reads both and finds
+  // neither.
+  std::string absent;
+  const auto want = bd::fingerprint(to_bytes(pairs[0].first));
+  std::uniform_int_distribution<int> byte{'a', 'z'};
+  do {
+    absent.assign(12, '\0');
+    for (auto &c : absent)
+      c = static_cast<char>(byte(rng));
+  } while (bd::fingerprint(to_bytes(absent)) != want || keys.contains(absent));
+  res.reads = 0;
+  REQUIRE_FALSE(t.get(to_bytes(absent), res).has_value());
+  REQUIRE(res.reads == 2);
+
+  // Erasing one of a pair leaves the other findable, and the erased one not.
+  auto tr = t.transient();
+  REQUIRE(tr.erase(to_bytes(pairs[0].first), res).has_value());
+  REQUIRE_FALSE(tr.get(to_bytes(pairs[0].first), res).has_value());
+  const auto other = tr.get(to_bytes(pairs[0].second), res);
+  REQUIRE(other.has_value());
+  REQUIRE(res.store.at(other->offset) == pairs[0].second);
+}
+
 TEST_CASE("blind tree: random operations match std::map", "[blind]") {
   std::mt19937_64 rng{3};
   const auto foreign = foreign_nodes();

@@ -130,7 +130,7 @@ The radix tree replaced that map (BC-030) and was in turn replaced as the defaul
 
 #### The blind-leaf key directory (`BYTECASK_KEYDIR=blind`, experimental)
 
-A B+ tree whose leaves store no key bytes: each entry is a crit bit, a 24-bit fingerprint, the record's location and its value size, 16 bytes in all. A lookup scans a leaf's crit bits to one candidate and reads that candidate's record to confirm it, so the key directory's size no longer depends on key length (17–26 B/key at 1M keys, against 33–133 for the B+ tree). Inner nodes, path copying and reclamation are the B+ tree's. Implemented in `bytecask.blind_btree` (`bytecaskdb/blind_btree.cppm`); `docs/blind_leaf_btree_design.md` is the design and has the measurements.
+A B+ tree whose leaves store no key bytes: each entry is a crit bit, a 24-bit fingerprint and the record's location, 12 bytes in all. A point lookup compares the leaf's fingerprints with the query's in vector registers and reads the record behind each match to confirm the key; an insert walks the leaf's crit bits to one candidate and reads that record to place the key. The key directory's size no longer depends on key length (13.7–19 B/key at 1M keys, against 33–133 for the B+ tree). Inner nodes, path copying and reclamation are the B+ tree's. Implemented in `bytecask.blind_btree` (`bytecaskdb/blind_btree.cppm`); `docs/blind_leaf_btree_design.md` is the design and has the measurements.
 
 In the engine it changes what reads the data files:
 
