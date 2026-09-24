@@ -333,7 +333,8 @@ export template <std::size_t LeafBytes> struct Leaf {
   struct Matches {
     std::uint64_t w[kMaskWords]{};
   };
-  static constexpr std::size_t kMetaWordsRead = (kCap + 7) / 8 * 8;
+  // Rounded up to 16 words: the widest group any kernel below takes at once.
+  static constexpr std::size_t kMetaWordsRead = (kCap + 15) / 16 * 16;
   static_assert(kMetaOff + 4 * kMetaWordsRead <= LeafBytes,
                 "the fingerprint scan reads whole vectors of meta");
 
@@ -366,14 +367,25 @@ export template <std::size_t LeafBytes> struct Leaf {
       out.w[4 * v / 64] |= bits << (4 * v % 64);
     }
 #elif defined(__ARM_NEON) && defined(__aarch64__)
+    // NEON has no movemask. Four compares are masked to disjoint bit
+    // positions, OR-ed, and reduced with one horizontal add per sixteen
+    // entries: the vector-to-scalar move is the expensive step here, so it
+    // happens five times for an 80-entry leaf rather than twenty.
     const auto w = vdupq_n_u32(want);
-    const uint32x4_t lane_bit = {1u, 2u, 4u, 8u};
-    for (std::size_t v = 0; v < kMetaWordsRead / 4; ++v) {
-      uint32x4_t x;
-      std::memcpy(&x, m + 4 * v, sizeof x);
-      const auto eq = vceqq_u32(vshlq_n_u32(x, 20), w);
-      const auto bits = std::uint64_t{vaddvq_u32(vandq_u32(eq, lane_bit))};
-      out.w[4 * v / 64] |= bits << (4 * v % 64);
+    const uint32x4_t lane_bits[4] = {{1u << 0, 1u << 1, 1u << 2, 1u << 3},
+                                     {1u << 4, 1u << 5, 1u << 6, 1u << 7},
+                                     {1u << 8, 1u << 9, 1u << 10, 1u << 11},
+                                     {1u << 12, 1u << 13, 1u << 14, 1u << 15}};
+    for (std::size_t g = 0; g < kMetaWordsRead / 16; ++g) {
+      auto acc = vdupq_n_u32(0);
+      for (std::size_t j = 0; j < 4; ++j) {
+        uint32x4_t x;
+        std::memcpy(&x, m + 16 * g + 4 * j, sizeof x);
+        const auto eq = vceqq_u32(vshlq_n_u32(x, 20), w);
+        acc = vorrq_u32(acc, vandq_u32(eq, lane_bits[j]));
+      }
+      const auto bits = std::uint64_t{vaddvq_u32(acc)};
+      out.w[16 * g / 64] |= bits << (16 * g % 64);
     }
 #else
     for (std::size_t i = 0; i < kCap; ++i)

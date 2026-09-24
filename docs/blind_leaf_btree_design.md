@@ -1272,7 +1272,13 @@ full 24-bit collision costs one extra read, about three per million
 lookups. A unit test builds leaves from colliding keys and checks that
 every key still resolves to its own record. On targets without AVX2 the
 same scan runs on SSE2, NEON, or a scalar loop; the algorithm does not
-change.
+change. The SSE2 kernel was built with `BYTECASK_MARCH=x86-64-v2` and passes
+the tree tests. The NEON kernel (aarch64) masks four compares to disjoint
+bit positions and reduces them with one `addv` per sixteen entries, since
+NEON has no movemask and the vector-to-scalar move is the costly step;
+cross-compiled it is 128 instructions for an 80-entry leaf. It has not run
+on hardware: the arm64 pass is `btree_tests '[blind]'` on the blind build,
+then `engine_bench` `Get` against the B+ tree on that host.
 
 ### How these were measured
 
