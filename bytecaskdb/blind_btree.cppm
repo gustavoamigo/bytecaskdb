@@ -153,8 +153,9 @@ export inline auto fingerprint(Bytes k) noexcept -> std::uint32_t {
 // ---------------------------------------------------------------------------
 export template <std::size_t LeafBytes> struct Leaf {
   static constexpr std::size_t kHeader = N::header_bytes();
-  static constexpr std::size_t kIndexSlots = 31;
-  static constexpr std::size_t kIndexBytes = 32;
+  static constexpr std::size_t kIndexLevels = 5;
+  static constexpr std::size_t kIndexSlots = (1u << kIndexLevels) - 1;
+  static constexpr std::size_t kIndexBytes = kIndexSlots + 1;
   static constexpr std::size_t kIndexOff = kHeader;
   static constexpr std::size_t kMetaOff = kHeader + kIndexBytes;
   static constexpr std::size_t kCap =
@@ -270,31 +271,37 @@ export template <std::size_t LeafBytes> struct Leaf {
       -> std::uint32_t {
     const auto *m = meta(n);
     const auto *t = top(n);
-    std::uint32_t lo = 0;
-    std::uint32_t hi = n->count;
-    for (std::size_t k = 0; k < kIndexSlots && t[k] != 0;) {
-      const std::uint32_t r = t[k];
-      if (bit(q, m[r] >> 12) != 0) {
-        lo = r;
-        k = 2 * k + 2;
-      } else {
-        hi = r;
-        k = 2 * k + 1;
-      }
-    }
     const std::size_t len = q.size();
     const std::byte zero{};
     const std::byte *d = len > 0 ? q.data() : &zero;
     const std::size_t last = len > 0 ? len - 1 : 0;
+    // q's bit at crit bit p, without a branch.
+    const auto bit_at = [&](std::uint32_t p) {
+      const std::size_t bi = p >> kPosShift;
+      const auto byte = std::to_integer<std::uint32_t>(d[std::min(bi, last)]);
+      const auto enc = bi < len ? (0x100u | byte) : 0u;
+      return (enc >> (8 - (p & 15u))) & 1u;
+    };
+    // A fixed number of steps, without a branch: which way the search turns
+    // is a coin flip on random keys, and a mispredicted branch per level
+    // costs more than the level saves. An empty slot (a range of fewer than
+    // two entries) has empty children, so the walk runs on without moving.
+    std::uint32_t lo = 0;
+    std::uint32_t hi = n->count;
+    std::size_t k = 0;
+    for (std::size_t level = 0; level < kIndexLevels; ++level) {
+      const std::uint32_t r = t[k];
+      const auto right = bit_at(m[r] >> 12);
+      const bool live = r != 0;
+      lo = (live && right != 0) ? r : lo;
+      hi = (live && right == 0) ? r : hi;
+      k = 2 * k + 1 + (live ? right : 0u);
+    }
     std::uint32_t c = lo;
     std::uint32_t s = kNoCrit;
     for (std::uint32_t i = lo + 1; i < hi; ++i) {
       const auto p = m[i] >> 12;
-      const std::size_t bi = p >> kPosShift;
-      const auto r = p & 15u;
-      const auto byte = std::to_integer<std::uint32_t>(d[std::min(bi, last)]);
-      const auto enc = bi < len ? (0x100u | byte) : 0u;
-      const auto right = (enc >> (8 - r)) & 1u;
+      const auto right = bit_at(p);
       const bool on_path = p < s;
       c = (on_path && right != 0) ? i : c;
       s = on_path ? (right != 0 ? kNoCrit : p) : s;
