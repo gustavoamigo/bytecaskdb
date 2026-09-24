@@ -1032,41 +1032,42 @@ hitting L1. What callgrind missed is three extra branch misses per call.
 Most of them came from one branch clang put in the scan, on the `right` bit
 (§Blind search in a leaf). Writing that update as a mask fixes it.
 
-`engine_bench`, 1M keys, buffer pool, pinned to one core, performance
-governor. Ops/sec as a fraction of the B+ tree's, medians of five
-interleaved runs. The ranges span separate sessions, one of them a rebuild
-with a different function layout.
+`engine_bench`, 1M keys, buffer pool, release build, performance governor,
+not pinned. Ops/sec as a fraction of the B+ tree's, medians of five
+interleaved runs (spread under 1% on `Get`), and cycles per call:
 
-| | `Get` | `UUIDv4/Get` | `GetMT`, 16 threads | Branch misses/call |
-|---|---:|---:|---:|---:|
-| Before | 0.870–0.873 | 1.14 | 0.80 | 4.32 |
-| Scan `s` update as a select | 0.908–0.913 | 1.19 | 0.85–0.87 | 2.03 |
-| + fingerprint words as single loads | 0.916–0.918 | 1.19 | 0.87 | 2.03 |
+| | `Get` | `UUIDv4/Get` | `GetMT`, 16 threads | Cycles/call | Branch misses/call |
+|---|---:|---:|---:|---:|---:|
+| B+ tree | 1.00 (4.24 M/s) | 1.00 | 1.00 | 1,000 | 1.29 |
+| Before | 0.800 | 1.04 | 0.81 | 1,249 | 4.08 |
+| Scan `s` update as a select, fingerprint words as single loads | 0.856 | 1.10 | 0.85 | 1,167 | 2.04 |
 
-The select leaves the instruction count unchanged. It removes 2.3
-mispredicts per call, about 28 cycles each, and `Put` NoSync is unchanged.
-The fingerprint change is the one found within noise above: it takes 40
-instructions off a lookup, and its gain is small but was positive in every
-run. On random 16-byte keys (`UUIDv4/Get`) the blind tree was already ahead
-of the B+ tree, and the select widens that lead.
+That is +7% on `Get`, +6% on random keys and +5% on `GetMT`, with
+`Put` NoSync unchanged. The select alone removes 2.3 mispredicts per call,
+about 30 cycles each, at the same instruction count. The fingerprint
+change is the one found within noise above: it takes 40 instructions off a
+lookup, and its gain is small but was positive in every run. On random
+16-byte keys (`UUIDv4/Get`) the blind tree was already ahead of the B+ tree,
+and this widens the lead.
 
-Tried again on this machine, on top of the select, and dropped:
+Pin the benchmark to one core and the ratios come out higher: 0.87 before
+and 0.92 after. Both trees then lose time to another task on that core,
+and B+ loses more of it per call (~48 ns against ~34 ns), so pinning flatters
+the blind tree. Unpinned, the ops ratio equals the cycle ratio, on `Get` and
+`GetMT` alike. The numbers above are unpinned, and so is
+`scripts/run_engine_bench.py`.
 
-| Variant | `Get` | `UUIDv4/Get` | `GetMT` 16 | Outcome |
-|---|---:|---:|---:|---|
-| Branch-free index walk | 0.886 | 1.16 | 0.83 | Misses fall to the B+ tree's (1.30/call), cycles rise 43: the walk's dependent loads, as argued above |
-| Fifth index level | 0.900 | 1.24 | 0.86 | Helps random keys, costs structured ones; saves no instructions on structured keys; +0.2 B/key |
-| `key_at` and `read_header` inlined | 0.898–0.909 | — | — | Instructions unchanged; within layout noise |
+Tried again on this machine, on top of the select, and dropped. Cycles per
+`Get` against the select alone, which pinning does not bias:
 
-The benchmark's wall-clock ratio (0.87 before) is above its cycle ratio
-(0.80). Both trees ran at the same clock, and CPU time per call tracks
-cycles exactly, but each B+ `Get` also spends ~48 ns off the CPU, against
-~34 ns for blind. The cause is not identified. G3 is judged on ops/sec.
+| Variant | Cycles/call | Outcome |
+|---|---:|---|
+| Branch-free index walk | +43 | Misses fall to the B+ tree's (1.30/call), but the walk's dependent loads can no longer overlap, as argued above |
+| Fifth index level | +35 | Faster on random keys (+4.5% ops), slower on structured ones; +0.2 B/key |
+| `key_at` and `read_header` inlined | +6 to +21 | Instructions unchanged |
 
-`GetMT` stays short of the gate. With two threads per core, issue slots are
-shared and instruction count matters more; the ratio sits near the
-instruction ratio (2,292 / 2,720 = 0.84). What remains is instructions in the
-leaf scan: about 20 for each of ~10 entries.
+What remains of G3 is per-call CPU cost: 1,167 cycles against 1,000. The
+gate needs about 1,110.
 
 ### Revised targets
 
@@ -1082,7 +1083,7 @@ change lands:
 |---|---|---|
 | G1 | ≤ 18 B/key random, ≤ 14 structured (`memory_profile`, 1M keys) | 25.9 / 17–18 |
 | G2 | `map_bench` `Get` within 2× of the B+ tree | 1.9–2.7× |
-| G3 | `engine_bench` `Get`, `GetMT` within 10% (buffer pool) | `Get` 0.92 of the B+ tree's ops/sec (met); `GetMT` 0.87 (not met) |
+| G3 | `engine_bench` `Get`, `GetMT` within 10% (buffer pool) | `Get` 0.86, `GetMT` 0.85 of the B+ tree's ops/sec (not met) |
 | G4 | `Put` NoSync within 10%, Sync within noise | +11% / noise |
 | G5 | Recovery within 1.5× | 1.75× (through the B+ tree) |
 
