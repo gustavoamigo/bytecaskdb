@@ -137,7 +137,10 @@ search reads only `meta`.
 
 The 24-bit fingerprint (`fp_lo`, `fp_hi`) is a hash of the full key, taken
 when the key is inserted and never recomputed: a multiply-xor over 8-byte
-little-endian words, inlined, since every lookup and write computes one. It is not used for ordering.
+words, inlined, since every lookup and write computes one. Words are loaded
+in native byte order, since fingerprints live only in memory and are rebuilt
+with the tree at recovery; a key of eight bytes or more hashes its tail as its
+last eight bytes, overlapping the word before. It is not used for ordering.
 It lets a lookup reject a candidate that is not the key without reading
 anything, with a false-match rate of 1 in 16.7 million.
 
@@ -227,6 +230,12 @@ the boundaries between it and the previous smaller one. Turning right at a
 boundary leaves every subtree to its left, so it clears `s`; turning left
 starts skipping that boundary's right subtree. It is 63 iterations at most,
 with no branch on data, over 256 contiguous bytes.
+
+"No branch on data" has to be enforced, not assumed. Clang compiles the
+inner ternary above, `right ? kNoCrit : p`, to a conditional jump on `right`,
+which is a coin flip for every entry scanned. The implementation writes it
+as `p | (0u - right)` (`kNoCrit` is all ones), which stays a select; the jump
+cost 2.3 mispredicts per `Get` (§G3 on hardware counters).
 
 A first draft kept `s` across a right turn. That skips boundaries of the
 subtree the search has just entered and returns a wrong candidate. A
@@ -1002,8 +1011,62 @@ instruction count. A fifth level lengthens that chain by one step, which
 costs more than the ~5 scan steps it saves. The branching walk lets the core
 speculate past a turn and start the next level's loads; right half the time,
 that beats a branch-free walk that must wait for every load. Callgrind counts
-instructions, so it pointed at the wrong lever. What is left of G3 lives in
-that chain and in the inner nodes; there is no further small change in view.
+instructions, so it pointed at the wrong lever. It also cannot see branch
+mispredictions, which is where most of the remaining gap turned out to be.
+
+### G3 on hardware counters
+
+Measured on an AMD Ryzen 7 3700X (Zen 2) with `perf stat`, per `Get` call:
+the 20M-iteration run minus a 1-iteration run, medians of three, both trees
+built `releasedbg`.
+
+| per call | B+ tree | Blind |
+|---|---:|---:|
+| Cycles | 998 | 1,252 |
+| Instructions | 2,292 | 2,761 |
+| Branch misses | 1.20 | 4.26 |
+| L1d misses | 8.3 | 7.7 |
+
+Cache misses are level, and AMD IBS shows the leaf's dependent loads
+hitting L1. What callgrind missed is three extra branch misses per call.
+Most of them came from one branch clang put in the scan, on the `right` bit
+(§Blind search in a leaf). Writing that update as a mask fixes it.
+
+`engine_bench`, 1M keys, buffer pool, pinned to one core, performance
+governor. Ops/sec as a fraction of the B+ tree's, medians of five
+interleaved runs. The ranges span separate sessions, one of them a rebuild
+with a different function layout.
+
+| | `Get` | `UUIDv4/Get` | `GetMT`, 16 threads | Branch misses/call |
+|---|---:|---:|---:|---:|
+| Before | 0.870–0.873 | 1.14 | 0.80 | 4.32 |
+| Scan `s` update as a select | 0.908–0.913 | 1.19 | 0.85–0.87 | 2.03 |
+| + fingerprint words as single loads | 0.916–0.918 | 1.19 | 0.87 | 2.03 |
+
+The select leaves the instruction count unchanged. It removes 2.3
+mispredicts per call, about 28 cycles each, and `Put` NoSync is unchanged.
+The fingerprint change is the one found within noise above: it takes 40
+instructions off a lookup, and its gain is small but was positive in every
+run. On random 16-byte keys (`UUIDv4/Get`) the blind tree was already ahead
+of the B+ tree, and the select widens that lead.
+
+Tried again on this machine, on top of the select, and dropped:
+
+| Variant | `Get` | `UUIDv4/Get` | `GetMT` 16 | Outcome |
+|---|---:|---:|---:|---|
+| Branch-free index walk | 0.886 | 1.16 | 0.83 | Misses fall to the B+ tree's (1.30/call), cycles rise 43: the walk's dependent loads, as argued above |
+| Fifth index level | 0.900 | 1.24 | 0.86 | Helps random keys, costs structured ones; saves no instructions on structured keys; +0.2 B/key |
+| `key_at` and `read_header` inlined | 0.898–0.909 | — | — | Instructions unchanged; within layout noise |
+
+The benchmark's wall-clock ratio (0.87 before) is above its cycle ratio
+(0.80). Both trees ran at the same clock, and CPU time per call tracks
+cycles exactly, but each B+ `Get` also spends ~48 ns off the CPU, against
+~34 ns for blind. The cause is not identified. G3 is judged on ops/sec.
+
+`GetMT` stays short of the gate. With two threads per core, issue slots are
+shared and instruction count matters more; the ratio sits near the
+instruction ratio (2,292 / 2,720 = 0.84). What remains is instructions in the
+leaf scan: about 20 for each of ~10 entries.
 
 ### Revised targets
 
@@ -1019,7 +1082,7 @@ change lands:
 |---|---|---|
 | G1 | ≤ 18 B/key random, ≤ 14 structured (`memory_profile`, 1M keys) | 25.9 / 17–18 |
 | G2 | `map_bench` `Get` within 2× of the B+ tree | 1.9–2.7× |
-| G3 | `engine_bench` `Get`, `GetMT` within 10% (buffer pool) | 1.48–1.62× |
+| G3 | `engine_bench` `Get`, `GetMT` within 10% (buffer pool) | `Get` 0.92 of the B+ tree's ops/sec (met); `GetMT` 0.87 (not met) |
 | G4 | `Put` NoSync within 10%, Sync within noise | +11% / noise |
 | G5 | Recovery within 1.5× | 1.75× (through the B+ tree) |
 

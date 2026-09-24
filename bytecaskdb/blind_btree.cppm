@@ -99,22 +99,33 @@ export inline auto crit(Bytes a, Bytes b) noexcept -> std::uint32_t {
 // A 24-bit hash of the whole key. Not used for ordering: it lets a lookup
 // reject a candidate that is not the key without reading it. Every lookup
 // and write computes one, so it is a few multiplies over 8-byte words,
-// inlined, rather than a library call; the bytes are read in little-endian
-// order so a fingerprint does not depend on the host.
+// inlined, rather than a library call. Words are loaded in native byte
+// order: fingerprints live only in memory, rebuilt with the tree at recovery.
 export inline auto fingerprint(Bytes k) noexcept -> std::uint32_t {
   constexpr std::uint64_t kMul = 0x9E37'79B9'7F4A'7C15u;
-  auto word = [](const std::byte *p, std::size_t n) {
+  auto short_word = [](const std::byte *p, std::size_t n) {
     std::uint64_t w = 0;
     for (std::size_t i = 0; i < n; ++i)
       w |= std::uint64_t{std::to_integer<std::uint8_t>(p[i])} << (8 * i);
     return w;
   };
+  auto load = [](const std::byte *p) {
+    std::uint64_t w;
+    std::memcpy(&w, p, sizeof w);
+    return w;
+  };
   std::uint64_t h = k.size() * kMul;
-  std::size_t i = 0;
-  for (; i + 8 <= k.size(); i += 8)
-    h = (h ^ word(k.data() + i, 8)) * kMul;
-  if (i < k.size())
-    h = (h ^ word(k.data() + i, k.size() - i)) * kMul;
+  if (k.size() < 8) {
+    h = (h ^ short_word(k.data(), k.size())) * kMul;
+  } else {
+    std::size_t i = 0;
+    for (; i + 8 <= k.size(); i += 8)
+      h = (h ^ load(k.data() + i)) * kMul;
+    // The tail as the key's last eight bytes, overlapping the word before:
+    // one load instead of assembling a short word byte by byte.
+    if (i < k.size())
+      h = (h ^ load(k.data() + k.size() - 8)) * kMul;
+  }
   h ^= h >> 29;
   h *= kMul;
   return static_cast<std::uint32_t>(h >> 40);
@@ -289,7 +300,11 @@ export template <std::size_t LeafBytes> struct Leaf {
       const auto right = (enc >> (8 - r)) & 1u;
       const bool on_path = p < s;
       c = (on_path && right != 0) ? i : c;
-      s = on_path ? (right != 0 ? kNoCrit : p) : s;
+      // p | -right is kNoCrit on a right turn and p on a left one. Written
+      // as a mask so it stays a select: right is a coin flip per entry, and
+      // clang compiles the equivalent ternary to a branch.
+      static_assert(kNoCrit == ~0u);
+      s = on_path ? (p | (0u - right)) : s;
     }
     return c;
   }
