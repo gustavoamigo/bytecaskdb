@@ -896,6 +896,25 @@ G3 still misses its 10%.
 Step 4, unchanged: removes the build-and-convert through the B+ tree (1.75×
 the B+ tree's recovery time, and its peak memory at open).
 
+**Done** (`DB::recovery_load_streams`, used by the blind build). Per file in
+parallel: range tombstones, sequence bounds, and a fence every 4 KiB, placed
+only on the first entry of a key so a seek never skips an older duplicate.
+Splitters come from the pooled fences; each range merges every file's slice
+(seeking to its last fence below the range) straight into a
+`BlindBulkLoader`, and `BlindBulkLoader::seal`/`concat` join the ranges
+through the B+ tree's `BulkLoader::concat_into`. Every file is merged in
+every range, so no tombstone map crosses threads; the newest entry of a key
+wins through `kde_newer`, so `SequenceOverlap` is still thrown. No
+intermediate tree is built. Seeking to the first fence at or above the range
+instead fails the `[model]` and recovery tests.
+
+`engine_bench` `Recovery`, 1M keys, three interleaved runs: 1 thread
+0.143–0.149 s against the B+ tree's 0.203–0.225 s (0.255–0.260 s through
+the B+ tree and conversion); 4 threads 0.053–0.056 s against 0.068–0.075 s
+(0.119–0.125 s). G5 passes: the blind tree now recovers faster than the B+
+tree. §Open questions asked whether the same path would speed up the B+
+tree; it is not measured yet.
+
 ### R8. Later
 
 Location-based guards (§Sequence without a sequence field) and resolving

@@ -1129,6 +1129,18 @@ public:
   [[nodiscard]] static auto concat(std::vector<LeafRun<V>> runs)
       -> PersistentBTree<V> {
     BulkLoader<V> out;
+    const auto publish_tag = concat_into(out, runs);
+    return std::move(out).assemble(publish_tag);
+  }
+
+  // The level-building and publishing half below is shared with loaders
+  // whose leaves have another layout (blind_btree.cppm).
+protected:
+  // Adds the runs' leaves to `out`'s leaf level in order, with the
+  // separators between runs, and returns the tag to publish under: at or
+  // above every node's.
+  static auto concat_into(BulkLoader &out, std::vector<LeafRun<V>> &runs)
+      -> std::uint64_t {
     auto publish_tag = out.session_.tag();
     std::vector<std::byte> prev_last;
     for (auto &run : runs) {
@@ -1147,12 +1159,9 @@ public:
       prev_last = std::move(run.last_key_);
       out.size_ += run.size_;
     }
-    return std::move(out).assemble(publish_tag);
+    return publish_tag;
   }
 
-  // The level-building and publishing half below is shared with loaders
-  // whose leaves have another layout (blind_btree.cppm).
-protected:
   // One built level: the children produced for it, and the separator that
   // sits between each child and the one before it (so seps[i] separates
   // children[i] from children[i + 1], and there are children.size() - 1).

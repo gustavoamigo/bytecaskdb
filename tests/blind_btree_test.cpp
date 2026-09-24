@@ -388,3 +388,27 @@ TEST_CASE("blind tree: 65535-byte keys", "[blind]") {
   REQUIRE_THROWS_AS(tr2.set(to_bytes(too_long), res.ref(too_long), res),
                     std::length_error);
 }
+
+TEST_CASE("blind tree: sealed slices concatenate into one tree", "[blind]") {
+  MemResolver res;
+  std::set<std::string> key_set;
+  std::mt19937_64 rng{5};
+  while (key_set.size() < 3'000)
+    key_set.insert(nasty_key(rng, 9));
+  const std::vector<std::string> keys(key_set.begin(), key_set.end());
+  // Three slices, one of them empty, as ranges without keys produce.
+  const std::size_t cuts[] = {0, 1'000, 1'000, 2'500, keys.size()};
+  std::vector<bytecask::btree_detail::LeafRun<BlindRef>> runs;
+  for (std::size_t r = 0; r + 1 < std::size(cuts); ++r) {
+    bytecask::BlindBulkLoader<640> loader;
+    for (auto i = cuts[r]; i < cuts[r + 1]; ++i)
+      loader.append(to_bytes(keys[i]), res.ref(keys[i]));
+    runs.push_back(std::move(loader).seal());
+  }
+  const auto t = bytecask::BlindBulkLoader<640>::concat(std::move(runs));
+  REQUIRE(t.size() == keys.size());
+  t.validate(res);
+  REQUIRE(keys_of(t, res) == keys);
+  for (const auto &k : keys)
+    REQUIRE(t.get(to_bytes(k), res).has_value());
+}

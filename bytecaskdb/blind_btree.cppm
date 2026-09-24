@@ -1145,6 +1145,8 @@ public:
     L::write(L::arrays(leaf_), leaf_->count, crit_bit,
              blind_detail::fingerprint(key), ref);
     ++leaf_->count;
+    if (this->size_ == 0)
+      first_.assign(key.begin(), key.end());
     ++this->size_;
     prev_.assign(key.begin(), key.end());
   }
@@ -1161,9 +1163,33 @@ public:
     return PersistentBlindBTree<LeafBytes>{root, size, tag};
   }
 
+  // Seals the leaves without building the tree above them, so loaders that
+  // ran in parallel over disjoint, ascending slices can be joined by
+  // concat(), as the B+ tree's are.
+  [[nodiscard]] auto seal() && -> btree_detail::LeafRun<BlindRef> {
+    seal_leaf();
+    this->first_key_ = std::move(first_);
+    this->prev_last_ = std::move(prev_);
+    return std::move(static_cast<Base &>(*this)).seal();
+  }
+
+  // The runs' keys must ascend from run to run.
+  [[nodiscard]] static auto concat(
+      std::vector<btree_detail::LeafRun<BlindRef>> runs)
+      -> PersistentBlindBTree<LeafBytes> {
+    BlindBulkLoader out;
+    const auto tag = Base::concat_into(out, runs);
+    const auto size = out.size_;
+    auto *root = std::move(out).assemble_root(tag);
+    if (!root)
+      return {};
+    return PersistentBlindBTree<LeafBytes>{root, size, tag};
+  }
+
 private:
   N *leaf_{nullptr};
-  std::vector<std::byte> prev_; // the last key appended
+  std::vector<std::byte> first_; // the first key appended
+  std::vector<std::byte> prev_;  // the last key appended
   std::vector<std::byte> sep_;  // separator before the leaf being filled
 
   void seal_leaf() {
