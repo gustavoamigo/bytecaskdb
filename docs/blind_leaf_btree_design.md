@@ -695,27 +695,209 @@ the engine before step 2; "B+" is the B+ tree behind the facade.
 - **Recovery is 1.75×**, the cost of building a B+ tree and converting it;
   peak memory at open is the B+ tree's. Step 4 replaces this.
 
+## Revision 2
+
+What steps 1–3 measured changes the plan. The tree already meets its memory
+goal against the B+ tree (17–26 B/key, 2–5× smaller); what it misses is G3
+(a warm `Get` is 1.62× the B+ tree's) and the proposal's 25 B/key on random
+keys at 1,280-byte leaves. Measured, the per-key cost on random keys is
+16 B / 0.69 fill + 2.1 B of the 104-byte shared header + 0.5 B of inner
+nodes ≈ 26 B, so there are three levers — the entry, the fill and the header
+— and the read path has one lookup too many. This revision adds seven
+changes, R1–R7, and moves location-based guards and resolving outside the
+commit group to later (R8).
+
+### Benchmark baseline
+
+The buffer pool is the reference back end: `engine_bench`'s `ByteCaskDB/*`
+rows (`IoBackend::BufferPool`, pool sized to hold the dataset, warmed before
+measuring). G3 and G4 are judged on those rows. The `_Pread` and `_Mmap`
+rows are recorded for context: they bound how much of the gap a system call
+hides. `memory_profile BC_INDEX_ONLY=…` stays the reference for G1 and
+`map_bench` for G2. Every change below reports the B+ tree's rows before and
+after as well, since R3 and R4 touch code the B+ tree runs.
+
+### R1. One lookup per record read
+
+The engine's `KeyReader` calls `DataFile::read_entry`, which on the pool back
+end fetches the header (one frame lookup and a copy) and then the whole
+entry (a second lookup and a second copy). `lend_entry` already serves an
+entry with one `pool.view()` and no copy. The resolver switches to a lending
+read, and one that takes the key and value sizes from the header rather than
+from the caller, which R2 needs:
+
+```cpp
+// Header, key and value of the record at offset, sizes from its header.
+// Spans valid until the next call with the same io_buf and lease.
+virtual auto lend_record(Offset offset, bool verify,
+                         std::vector<std::byte> &io_buf,
+                         FrameLease &lease) const -> DataEntryView = 0;
+```
+
+- **Buffer pool:** one `view()` of the frame, sizes parsed from the header in
+  place; a copy only when the entry straddles a frame boundary.
+- **mmap:** the mapping, no copy.
+- **pread:** one speculative read of the header, the key and a guessed value
+  length (the same over-read `read_entry_unverified` does today), then one
+  more `pread` for the remainder if the value is longer. The guess is a
+  per-file running estimate of recent value sizes, capped at a few KiB.
+
+`kd_read_value` takes the value from the same lease. Expected: the part of
+the 150 ns `Get` gap that is not the in-leaf scan (§Steps 2–3 results
+estimates it at about 70 ns). This change is independent of the rest and
+helps the current 16-byte entry as much as the 12-byte one.
+
+### R2. 12-byte leaf entry
+
+Drop the size field:
+
+```
+  meta = crit:20 | fp_lo:12                     u32
+  loc  = file_id:20 | offset:32 | fp_hi:12      u64
+```
+
+With R1 no read needs the size in advance. The places that used it:
+
+| Use | With the size field | Without it |
+|---|---|---|
+| `get`, value iterators | size tells the read length | the header in the same lookup (R1) |
+| put / erase, live bytes of the displaced record | size in the leaf | the record was just read to confirm the key; its header has it |
+| `del_range`, live bytes of each erased key | size in the leaf | estimated (R3), no read |
+| vacuum remap, resume | size from the scan | unchanged |
+
+Memory: 12 B per entry instead of 16, before fill and header. Leaf capacity
+at 1,280 bytes goes from 73 to about 98 entries, which lengthens the in-leaf
+scan by a third unless R6 lands first or the leaf shrinks to 960 bytes
+(about 71 entries).
+
+### R3. `live_keys` exact, `live_bytes` estimated for range deletes
+
+`FileStats` gains `live_keys`. Every path keeps it exact, including
+`del_range`, because every leaf entry names its record's `file_id`: a range
+delete knows which file each erased entry lived in without reading it.
+`live_bytes` stays exact everywhere except `del_range`, which subtracts the
+file's average live entry, `live_bytes / live_keys`, per erased entry; a file
+whose `live_keys` reaches 0 gets `live_bytes = 0`. A later exact decrement
+that exceeds an estimated total clamps at 0.
+
+Two things must change with it, on every tree:
+
+- **Vacuum's empty-file fast path** (`live_bytes == 0` → unlink without a
+  scan) tests `live_keys == 0`. On an estimate, `live_bytes` could reach 0
+  with keys still pointing into the file, and the fast path would delete
+  live data.
+- **`validate_state_consistency`** checks `live_keys` exactly, and
+  `live_bytes` exactly only for files no range delete has estimated since
+  their last exact count. `FileStats` carries that as a flag, cleared when
+  the count is exact again.
+
+Exact again at recovery (recomputed from the hint files, which carry value
+sizes) and when vacuum compacts the file. The error is bounded by how far the
+erased keys' sizes are from the file's average, and it steers only which file
+vacuum picks and when; compaction decides liveness per record, by location.
+The `[model]` recovery tests keep comparing exact stats.
+
+### R4. A 40-byte leaf header
+
+A blind leaf is a `btree_detail::Node` whose 104-byte header includes the B+
+tree's 64-byte search hints, which a blind leaf never uses: 1.4–2.1 B/key.
+Move `hints` out of the common header into the B+ tree's slotted layout
+(stored after the header, as the prefix is), so every node starts with the
+same 40-byte header (tag, first child, capacity, count, prefix length,
+heap floor, dead bytes, last insert position, leaf flag) and a blind leaf's
+arrays follow it directly. The B+
+tree's layout changes by position only; `map_bench` and `memory_profile` on
+the B+ tree must show no change. About −1.3 B/key on random keys, −0.9 on
+structured.
+
+### R5. Fuller leaves
+
+Random inserts fill leaves to 0.69, ordered ones to 1.0.
+
+1. **Bulk loads leave slack.** Recovery bulk-loads leaves 100% full, and
+   the first random insert into each one splits it into two halves, so a
+   freshly opened tree drops below 0.69 before it recovers. Loading to 0.8
+   avoids the dip. One constant.
+2. **Redistribute before splitting** (B*-style): move entries into a sibling
+   with room and split two full leaves into three. Fill about 0.8. For blind
+   leaves it costs about three key reads (the crit bit between the sibling's
+   last entry and the moved first one, and the new separator) and a path copy
+   of the sibling. Built only if (1) and the measured fill leave the random
+   shapes above target.
+
+### R6. Faster in-leaf search
+
+Tracked in #156. First the two-pass scan (extract the query's bits for every
+boundary, then walk the crit bits); then a top-of-trie index of about 16
+bytes in the leaf header (the root boundary and the next three levels'),
+which narrows the scan to the 5–10 entries of one subtree. R6 is what makes
+larger leaves affordable, and larger leaves are what makes R2 and R4 pay off.
+
+### R7. Recovery from sorted hint streams
+
+Step 4, unchanged: removes the build-and-convert through the B+ tree (1.75×
+the B+ tree's recovery time, and its peak memory at open).
+
+### R8. Later
+
+Location-based guards (§Sequence without a sequence field) and resolving
+candidates before joining the commit group (§Latency). Neither affects G1–G4
+on the benchmarks above; both matter for guard-heavy and cold-cache
+workloads.
+
+### Revised targets
+
+Estimates from the arithmetic above, to be replaced by measurements as each
+change lands:
+
+| | Today | After R2 + R4 | After R2 + R4 + R5 |
+|---|---:|---:|---:|
+| Random keys, B/key | 25.9 | ~19 | ~16–17 |
+| Structured keys, B/key | 17–18 | ~13–14 | ~13–14 |
+
+| Gate | Target | Today |
+|---|---|---|
+| G1 | ≤ 18 B/key random, ≤ 14 structured (`memory_profile`, 1M keys) | 25.9 / 17–18 |
+| G2 | `map_bench` `Get` within 2× of the B+ tree | 1.9–2.7× |
+| G3 | `engine_bench` `Get`, `GetMT` within 10% (buffer pool) | 1.48–1.62× |
+| G4 | `Put` NoSync within 10%, Sync within noise | +11% / noise |
+| G5 | Recovery within 1.5× | 1.75× (through the B+ tree) |
+
 ## Plan
+
+Done:
 
 1. Leaf node, blind search, insert, erase, split, iterators, bulk loader, in
    `bytecaskdb/blind_btree.cppm`, sharing the inner node and `BuildSession`
-   code with `btree.cppm` rather than copying it. Tree tests with the
-   in-memory resolver. G1, G2.
-2. The key directory facade in the engine, with the B+ tree behind it and no
-   change in behaviour. Engine suite green on both existing trees.
-3. The blind tree behind the facade: resolver, pending-batch resolution,
-   location-based guards, vacuum by location. Engine suite under
-   `BYTECASK_KEYDIR=blind`. G3, G4.
-4. Recovery from sorted hint streams. Model tests. G5.
-5. If G4 shows the reads under the mutex: resolve before joining the group.
+   code with `btree.cppm`. Tree tests with the in-memory resolver. G1, G2.
+2. The key directory facade (`kd_*`) in the engine, with the B+ tree behind
+   it and no change in behaviour. Engine suite green on both existing trees.
+3. The blind tree behind the facade, with sequences read rather than
+   location-based guards, and recovery through the B+ tree. Engine suite
+   under `BYTECASK_KEYDIR=blind`. G3, G4 measured.
+
+Next, in order (Revision 2). Each lands with its tests, the engine suite on
+all three trees, and before-and-after numbers on the buffer-pool rows:
+
+4. **R1** — `lend_record`, one lookup per record read; `kd_read_value` from
+   the same lease. G3 again.
+5. **R3** — `FileStats::live_keys`, the range-delete estimate, vacuum's fast
+   path on `live_keys`, the consistency check. All trees.
+6. **R2** — the 12-byte entry. G1, G2, G3, G4.
+7. **R4** — the 40-byte common node header. B+ tree unchanged in
+   `map_bench` and `memory_profile`; G1 on the blind tree.
+8. **R6** — the in-leaf search (#156). G2, G3; then pick the leaf size again.
+9. **R5** — bulk-load slack; redistribution only if the random shapes still
+   miss G1.
+10. **R7** — recovery from sorted hint streams. `[model]` tests. G5.
+11. **R8** — location-based guards; resolving before the commit group.
 
 ## Open questions
 
-- **Leaf size.** 64 entries is a guess that trades search length against
-  inner node count. Benchmark 32, 64, 128.
-- **12-byte entries.** Drop `entry_bytes` for `loc` plus fingerprint plus
-  crit bit: HOT's density, with a read per key in `del_range` and a
-  speculative first read in `get`.
+- **Leaf size.** Measured at 33, 73 and 153 entries (§Step 1 results):
+  1,280 bytes for now. R2 and R6 change the answer; pick again after R6.
+- **12-byte entries.** Adopted as R2, with R1 for the read length and R3 for
+  `del_range`'s live bytes.
 - **`contains_key`.** One read per present key is a regression for callers
   that use it as a cheap existence test. A 24-bit fingerprint cannot answer
   "present" on its own; a caller that tolerates 1-in-16.7M false positives
