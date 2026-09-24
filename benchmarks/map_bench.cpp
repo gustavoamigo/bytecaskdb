@@ -800,7 +800,8 @@ BENCHMARK(BM_SplitBuildMergeOverlapping<BTreeAdapter>)     ->Name("BTree/SplitBu
 BENCHMARK(BM_SplitBuildMergePrefixed<BTreeAdapter>)        ->Name("BTree/SplitBuildMergePrefixed")      SIZES;
 
 // Blind-leaf tree. The number is the leaf allocation in bytes (a jemalloc
-// size class): 640 = 33 entries, 1280 = 73, 2560 = 153.
+// size class): 640 = 48 entries, 1024 = 80 (the engine's), 1280 = 101,
+// 2560 = 208.
 #define BLIND_ROWS(BYTES)                                                                                        \
   BENCHMARK(BM_Build<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/PersistentSet") SIZES;                         \
   BENCHMARK(BM_TransientBuild<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/TransientSet") SIZES;                 \
@@ -818,6 +819,7 @@ BENCHMARK(BM_SplitBuildMergePrefixed<BTreeAdapter>)        ->Name("BTree/SplitBu
   BENCHMARK(BM_ReverseIterate<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/ReverseIterate") ITER_SIZES;          \
   BENCHMARK(BM_PrefixedMemory<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/PrefixedMemory") SIZES;
 BLIND_ROWS(640)
+BLIND_ROWS(1024)
 BLIND_ROWS(1280)
 BLIND_ROWS(2560)
 #undef BLIND_ROWS

@@ -11,8 +11,8 @@
 //
 // BC_INDEX_ONLY=btree|radix|blind builds only the in-memory key directory
 // from the key shape, without a DB, so the per-key cost of the index itself
-// can be read off directly. blind is the blind-leaf tree with 1280-byte
-// leaves; blind640 and blind2560 pick the other leaf sizes.
+// can be read off directly. blind is the blind-leaf tree at the engine's
+// leaf size (kBlindLeafBytes); blind640, blind1280 and blind2560 pick others.
 //
 // Available key formats (BC_KEY_FORMAT):
 //   prefixed (default), uniform, short, incremental, uuidv7, uuidv7_binary,
@@ -279,7 +279,7 @@ void profile_blind(const key_generators::KeyShape &shape, std::size_t n) {
 // fill, then inserts n / 2 more at random, reporting bytes per key as it goes.
 void profile_blind_growth(const key_generators::KeyShape &shape, std::size_t n,
                           double fill_min, double fill_max) {
-  using Tree = bytecask::PersistentBlindBTree<1280>;
+  using Tree = bytecask::PersistentBlindBTree<bytecask::kBlindLeafBytes>;
   const auto total = n + n / 2;
   ShapeResolver res{&shape, total, {}};
   Tree t;
@@ -297,7 +297,7 @@ void profile_blind_growth(const key_generators::KeyShape &shape, std::size_t n,
                              return a.first == b.first;
                            }),
                keys.end());
-    bytecask::BlindBulkLoader<1280> loader{fill_min, fill_max};
+    bytecask::BlindBulkLoader<bytecask::kBlindLeafBytes> loader{fill_min, fill_max};
     for (const auto &[k, j] : keys)
       loader.append(bc_key(k), bytecask::BlindRef{0, j});
     t = std::move(loader).finish();
@@ -364,7 +364,7 @@ int main() {
     } else if (index == "radix") {
       profile_index_only<bytecask::PersistentRadixTree<bytecask::KeyDirEntry>>(*shape, n);
     } else if (index == "blind") {
-      profile_blind<1280>(*shape, n);
+      profile_blind<bytecask::kBlindLeafBytes>(*shape, n);
     } else if (index == "blind_growth") {
       // BC_BULK_FILL=0.8, or a range 0.5:1.0 spread over the leaves.
       const char *f = std::getenv("BC_BULK_FILL");
@@ -375,10 +375,12 @@ int main() {
       profile_blind_growth(*shape, n, lo, hi);
     } else if (index == "blind640") {
       profile_blind<640>(*shape, n);
+    } else if (index == "blind1280") {
+      profile_blind<1280>(*shape, n);
     } else if (index == "blind2560") {
       profile_blind<2560>(*shape, n);
     } else {
-      std::fprintf(stderr, "Unknown BC_INDEX_ONLY: %s (btree|radix|blind|blind640|blind2560)\n", index.c_str());
+      std::fprintf(stderr, "Unknown BC_INDEX_ONLY: %s (btree|radix|blind|blind640|blind1280|blind2560)\n", index.c_str());
       return 1;
     }
     return 0;

@@ -60,7 +60,7 @@ struct MemResolver {
 // 33 entries per leaf: small leaves split often, so a few hundred keys make
 // a tree three or four levels deep.
 using SmallTree = bytecask::PersistentBlindBTree<640>;
-using Tree = bytecask::PersistentBlindBTree<1280>;
+using Tree = bytecask::PersistentBlindBTree<bytecask::kBlindLeafBytes>;
 using SmallLeaf = bd::Leaf<640>;
 
 auto to_string(std::span<const std::byte> bytes) -> std::string {

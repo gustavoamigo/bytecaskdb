@@ -344,7 +344,6 @@ export inline auto key_dir_from_recovered(RecoveryKeyDirTree t) -> KeyDirTree {
 
 #else // BYTECASK_KEYDIR_BLIND
 
-export inline constexpr std::size_t kBlindLeafBytes = 1280;
 // Recovery loads leaves between 60% and 100% full, spread so they do not all
 // reach capacity at once. Loaded full, every leaf splits within the first few
 // percent of random inserts after open: a burst of allocation on the write

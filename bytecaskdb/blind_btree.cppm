@@ -44,6 +44,11 @@ export struct BlindRef {
 
 export inline constexpr std::uint32_t kBlindMaxFileId = (1u << 20) - 1;
 
+// The leaf size the engine uses, in bytes: a jemalloc size class, 80 entries.
+// Chosen over 1,280 (101 entries) by measurement; see "Leaf size, revisited"
+// in docs/blind_leaf_btree_design.md.
+export inline constexpr std::size_t kBlindLeafBytes = 1024;
+
 // Reads the key of the record at a location. The returned span is valid until
 // the next call on the same resolver; the tree never holds two at once.
 export template <typename R>

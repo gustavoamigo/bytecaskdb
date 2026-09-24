@@ -156,7 +156,9 @@ The leaf size is a template parameter, in bytes, and the capacity follows
 from it: `(bytes − 104 − 4) / 16` entries. Sizes are jemalloc size classes so
 no allocation is rounded up: 640 bytes hold 33 entries, 1,280 hold 73 and
 2,560 hold 153. Blind search is linear in the leaf (§Search), so the leaf is
-smaller than the 4 KiB B+ tree leaf.
+smaller than the 4 KiB B+ tree leaf. The engine now uses 1,024-byte leaves,
+80 entries with the 12-byte entries and 40-byte header of R2 and R4
+(§Leaf size, revisited).
 
 ### Invariants
 
@@ -1069,6 +1071,50 @@ Tried again on this machine, on top of the select, and dropped. Cycles per
 What remains of G3 is per-call CPU cost: 1,167 cycles against 1,000. The
 gate needs about 1,110.
 
+### Leaf size, revisited
+
+With the in-leaf search settled, the leaf size was picked again. Each size
+built into the engine, `engine_bench` with 1M keys, buffer pool, not pinned,
+performance governor, medians of five interleaved runs, as a fraction of the
+B+ tree's ops/sec; memory from `memory_profile` (key directory only, built by
+inserts):
+
+| Leaf bytes (entries) | `Get` | `UUIDv4/Get` | `GetMT`, 16 threads | Cycles/`Get` | B/key structured | B/key random |
+|---|---:|---:|---:|---:|---:|---:|
+| 1,280 (101) | 0.855 | 1.10 | 0.89 | 1,174 | 13.4 | 18.8 |
+| 1,024 (80) | 0.896 | 1.11 | 0.92 | 1,121 | 13.7 | 19.0 |
+| 768 (59) | 0.848 | 1.08 | 0.89 | 1,187 | 14.2 | 19.8 |
+| 640 (48) | 0.857 | 1.10 | 0.89 | 1,171 | 14.7 | 20.3 |
+| 512 (38) | 0.811 | 1.09 | 0.85 | 1,240 | 15.7 | 21.1 |
+
+The curve is not monotonic: 768 and 640 cost memory and gain nothing, and
+branch misses rise as leaves shrink (2.0 to 3.4 per `Get`). Only 1,024
+gains. It holds across dataset sizes, 1,280 against 1,024:
+
+| Keys | `Get` | `UUIDv4/Get` |
+|---:|---:|---:|
+| 500K | 0.862 → 0.872 | 1.12 → 1.12 |
+| 1M | 0.855 → 0.896 | 1.10 → 1.11 |
+| 2M | 0.835 → 0.957 | 1.08 → 1.10 |
+| 10M | 0.880 → 0.906 | 1.12 → 1.12 |
+
+In the engine, 1,024 is never slower, on random keys or structured ones. The
+gain on structured keys ranges from 1% to 15% with the dataset size, so it
+depends on where leaf boundaries fall in the key set; +3% to +5% is the
+typical case.
+
+In memory at 100K keys (`map_bench` `Get`, nine key shapes), the picture is
+mixed: 1,024 is 5–13% faster on `clustered`, `many_partitions`,
+`hash_prefixed` and `incremental`, level on `prefixed` and `sha256_hex`, and
+2–8% slower on `uniform`, `uuidv4_text` and `uuidv7`. At that size the whole
+tree is in cache, and the blind tree already trails the B+ tree on uniform
+and random-UUID keys. It leads it at the key counts it is meant for, where
+the B+ tree's larger random-key footprint misses cache, and there 1,024
+costs random keys nothing.
+
+1,024 bytes is the leaf size. It spends about 0.3 B/key of G1 (0.2 on random
+keys) on read speed.
+
 ### Revised targets
 
 Estimates from the arithmetic above, to be replaced by measurements as each
@@ -1081,9 +1127,9 @@ change lands:
 
 | Gate | Target | Today |
 |---|---|---|
-| G1 | ≤ 18 B/key random, ≤ 14 structured (`memory_profile`, 1M keys) | 25.9 / 17–18 |
+| G1 | ≤ 18 B/key random, ≤ 14 structured (`memory_profile`, 1M keys) | 19.0 random (`uuidv4_binary`), 13.7 structured (`prefixed`), 1,024-byte leaves |
 | G2 | `map_bench` `Get` within 2× of the B+ tree | 1.9–2.7× |
-| G3 | `engine_bench` `Get`, `GetMT` within 10% (buffer pool) | `Get` 0.86, `GetMT` 0.85 of the B+ tree's ops/sec (not met) |
+| G3 | `engine_bench` `Get`, `GetMT` within 10% (buffer pool) | `Get` 0.90, `GetMT` 0.92 of the B+ tree's ops/sec at 1M keys (at the line); `Get` 0.87–0.96 over 0.5M–10M keys |
 | G4 | `Put` NoSync within 10%, Sync within noise | +11% / noise |
 | G5 | Recovery within 1.5× | 1.75× (through the B+ tree) |
 
@@ -1110,7 +1156,8 @@ all three trees, and before-and-after numbers on the buffer-pool rows:
 6. **R2** — the 12-byte entry. G1, G2, G3, G4.
 7. **R4** — the 40-byte common node header. B+ tree unchanged in
    `map_bench` and `memory_profile`; G1 on the blind tree.
-8. **R6** — the in-leaf search (#156). G2, G3; then pick the leaf size again.
+8. **R6** — the in-leaf search (#156). G2, G3; then pick the leaf size again:
+   1,024 bytes (§Leaf size, revisited).
 9. **R5** — bulk-load slack; redistribution only if the random shapes still
    miss G1.
 10. **R7** — recovery from sorted hint streams. `[model]` tests. G5.
@@ -1118,7 +1165,7 @@ all three trees, and before-and-after numbers on the buffer-pool rows:
 
 ## Open questions
 
-- **Leaf size.** 1,280 bytes (101 entries after R2, R4 and R6): at 2,560
+- **Leaf size.** 1,024 bytes (80 entries), §Leaf size, revisited. At 2,560
   the index leaves ranges too long to scan.
 - **12-byte entries.** Adopted as R2, with R1 for the read length and R3 for
   `del_range`'s live bytes.
