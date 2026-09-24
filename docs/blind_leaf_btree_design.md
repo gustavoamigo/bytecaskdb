@@ -574,17 +574,21 @@ that belongs to the pluggable-interface work, not to this tree.
 
 ## Gates
 
-In order; the design is abandoned or revised at the first gate that fails.
+These were the conditions for building on, in order, with the design to be
+abandoned or revised at the first that failed. They are kept as set, with
+where each ended; the tree became the default on 2026-09-24 (§Revised
+targets has the final numbers and the two shortfalls accepted).
 
-| # | Gate | Measure |
-|---|---|---|
-| G1 | Memory | `memory_profile` per key shape: at or below 25 B/key on every random shape, at or below the B+ tree on every shape |
-| G2 | In-memory search | `map_bench` `Get` and `LowerBound` with a resolver that does no I/O: within 2× of the B+ tree |
-| G3 | Point reads | `engine_bench` `Get` and `GetMT`: within 10% |
-| G4 | Writes | `engine_bench` `Put` NoSync and Sync, `MixedBatch`: record the cost; Sync within 10% |
-| G5 | Recovery | 10M keys, 16 threads: within 1.5× of the B+ tree |
+| # | Gate | Measure | Outcome |
+|---|---|---|---|
+| G1 | Memory | `memory_profile` per key shape: at or below 25 B/key on every random shape, at or below the B+ tree on every shape | Met as set (19.0 random, 13.7 structured); the tightened target of 18 on random keys missed by 1 B/key |
+| G2 | In-memory search | `map_bench` `Get` and `LowerBound` with a resolver that does no I/O: within 2× of the B+ tree | Met; `Get` level with the B+ tree after the fingerprint scan |
+| G3 | Point reads | `engine_bench` `Get` and `GetMT`: within 10% | Met; `Get` at parity, `GetMT` 0.99 |
+| G4 | Writes | `engine_bench` `Put` NoSync and Sync, `MixedBatch`: record the cost; Sync within 10% | Sync within noise; NoSync 0.89, 1% outside the 10% later set for it, accepted |
+| G5 | Recovery | 10M keys, 16 threads: within 1.5× of the B+ tree | Met; faster than the B+ tree since R7 |
 
-G1 is the reason to build this; if it fails, nothing else matters.
+G1 was the reason to build this; if it had failed, nothing else would have
+mattered.
 
 ## Step 1 results
 
@@ -1301,23 +1305,31 @@ then `engine_bench` `Get` against the B+ tree on that host.
   `branch-misses` skid across functions on Zen 2; the first profile of this
   gap relied on them and misattributed both.
 
-### Revised targets
+### Revised targets, and where they ended
 
-Estimates from the arithmetic above, to be replaced by measurements as each
-change lands:
+The estimates Revision 2 started from, against what landed:
 
-| | Today | After R2 + R4 | After R2 + R4 + R5 |
-|---|---:|---:|---:|
-| Random keys, B/key | 25.9 | ~19 | ~16–17 |
-| Structured keys, B/key | 17–18 | ~13–14 | ~13–14 |
+| | Before R2 | Estimated after R2 + R4 | Estimated after R5 | Measured (1,024-byte leaves, 1M keys) |
+|---|---:|---:|---:|---:|
+| Random keys, B/key | 25.9 | ~19 | ~16–17 | 19.0 (`uuidv4_binary`) |
+| Structured keys, B/key | 17–18 | ~13–14 | ~13–14 | 13.7 (`prefixed`) |
 
-| Gate | Target | Today |
+R5's ~16–17 holds for a recovered tree as loaded (16.3 B/key on random
+keys with the 0.6–1.0 spread, §R5); after random writes it settles at the
+insert-built figure, which is what G1 measures, plus 0.2 B/key for the
+1,024-byte leaves chosen for read speed (§Leaf size, revisited).
+
+| Gate | Revised target | Final |
 |---|---|---|
-| G1 | ≤ 18 B/key random, ≤ 14 structured (`memory_profile`, 1M keys) | 19.0 random (`uuidv4_binary`), 13.7 structured (`prefixed`), 1,024-byte leaves |
+| G1 | ≤ 18 B/key random, ≤ 14 structured (`memory_profile`, 1M keys) | 19.0 random, 13.7 structured: random keys miss by 1 B/key. Accepted: 2–7× below the keyed B+ tree either way |
 | G2 | `map_bench` `Get` within 2× of the B+ tree | Met: 0.85–1.0× on the default shape at 1k–100k keys (§Point lookups by fingerprint scan) |
 | G3 | `engine_bench` `Get`, `GetMT` within 10% (buffer pool) | Met: `Get` 1.01, `GetMT` 0.99 of the B+ tree's ops/sec at 1M keys, `Get` 0.96–1.05 over 0.5M–10M keys; `UUIDv4/Get` 1.25–1.31 (§Point lookups by fingerprint scan) |
-| G4 | `Put` NoSync within 10%, Sync within noise | +11% / noise |
-| G5 | Recovery within 1.5× | 1.75× (through the B+ tree) |
+| G4 | `Put` NoSync within 10%, Sync within noise | NoSync 0.89 (one record read per put), Sync within noise. Accepted: 1% outside, on the row `fdatasync` does not dominate |
+| G5 | Recovery within 1.5× | Met: 0.66–0.88× the B+ tree's time (§R7) |
+
+With G1 within 1 B/key of its target and G3 met, the tree became the
+default key directory (§Selection). G1's last byte is #159's, the bulk
+loader ending leaves at short separators.
 
 ## Plan
 
