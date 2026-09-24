@@ -839,6 +839,16 @@ tree's layout changes by position only; `map_bench` and `memory_profile` on
 the B+ tree must show no change. About −1.3 B/key on random keys, −0.9 on
 structured.
 
+**Done.** `Node` holds only the 40-byte header (a `static_assert` keeps it
+there); `hints()` points at the 64 bytes after it, and the prefix and slots
+follow as before, so a B+ node's bytes are where they were. The B+ tree's
+`memory_profile` heap is byte-for-byte unchanged. Its `map_bench` `Get/100000`
+measured a median of 93.3 ns before and 97.1 ns after over eight interleaved
+rounds (ranges 91–99 and 92–104, slower in five of the eight): at most about
+4%, not separable from this machine's noise. Blind leaves at 1,280 bytes hold
+103 entries; 1M keys take 18.5 B/key on random keys (was 19.6) and 13.0–13.1
+on structured ones (was 13.8–13.9).
+
 ### R5. Fuller leaves
 
 Random inserts fill leaves to 0.69, ordered ones to 1.0.

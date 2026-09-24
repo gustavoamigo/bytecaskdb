@@ -197,7 +197,7 @@ inline auto common_prefix_length(const KeyParts &x,
 // ---------------------------------------------------------------------------
 // Node<V> — the header of every node; the rest of the allocation follows it.
 //
-//   [header][prefix bytes][slots: count × u64 ->]  ...free...  [<- entries]
+//   [header 40][hints 64][prefix bytes][slots: count × u64 ->] ...free... [<- entries]
 //
 //   slot   = head << 32 | off        off: distance from the node end to the
 //                                    entry start (a multiple of kAlign)
@@ -220,10 +220,14 @@ export template <typename V> struct Node {
 
   std::uint16_t last_pos{kNoLastPos}; // where the last in-place insert went
   std::uint8_t is_leaf{1};
-  // Heads sampled every count/(kHints+1) slots. A search scans the hints
-  // (64 bytes) to find the run of slots that can hold the key, then scans
-  // that run: a few slots instead of the whole array.
-  std::uint32_t hints[kHints]{};
+  // The header ends here: 40 bytes, shared with every node shape built on
+  // it (blind_btree.cppm's leaves). What follows is the slotted page's.
+  //
+  // hints: heads sampled every count/(kHints+1) slots, stored right after the
+  // header. A search scans the hints (64 bytes) to find the run of slots that
+  // can hold the key, then scans that run: a few slots instead of the whole
+  // array.
+  static constexpr std::size_t kHintBytes = kHints * sizeof(std::uint32_t);
 
   static constexpr std::size_t kAlign =
       std::max({alignof(V), alignof(void *), std::size_t{8}});
@@ -231,11 +235,16 @@ export template <typename V> struct Node {
   static constexpr std::size_t kSlotBytes = 8;
 
   [[nodiscard]] static constexpr auto header_bytes() noexcept -> std::size_t {
+    static_assert(align_up(sizeof(Node), 8) == 40,
+                  "the node header is shared with blind leaves; keep it small");
     return align_up(sizeof(Node), 8);
+  }
+  [[nodiscard]] static constexpr auto prefix_offset() noexcept -> std::size_t {
+    return header_bytes() + kHintBytes;
   }
   [[nodiscard]] static auto slots_offset_for(std::size_t prefix) noexcept
       -> std::size_t {
-    return align_up(header_bytes() + prefix, kSlotBytes);
+    return align_up(prefix_offset() + prefix, kSlotBytes);
   }
   [[nodiscard]] static auto payload_size(bool leaf) noexcept -> std::size_t {
     return leaf ? sizeof(V) : sizeof(Node *);
@@ -262,8 +271,9 @@ export template <typename V> struct Node {
     n->capacity = static_cast<std::uint32_t>(capacity);
     n->prefix_len = static_cast<std::uint16_t>(pre.size());
     n->is_leaf = leaf ? 1 : 0;
+    std::memset(mem + header_bytes(), 0, kHintBytes);
     if (!pre.empty())
-      std::memcpy(mem + header_bytes(), pre.data(), pre.size());
+      std::memcpy(mem + prefix_offset(), pre.data(), pre.size());
     account_alloc<V>();
     return n;
   }
@@ -289,7 +299,13 @@ export template <typename V> struct Node {
     return static_cast<const std::byte *>(static_cast<const void *>(this));
   }
   [[nodiscard]] auto prefix() const noexcept -> Bytes {
-    return {bytes() + header_bytes(), prefix_len};
+    return {bytes() + prefix_offset(), prefix_len};
+  }
+  [[nodiscard]] auto hints() noexcept -> std::uint32_t * {
+    return as_ptr<std::uint32_t>(bytes() + header_bytes());
+  }
+  [[nodiscard]] auto hints() const noexcept -> const std::uint32_t * {
+    return as_ptr<std::uint32_t>(bytes() + header_bytes());
   }
   [[nodiscard]] auto slots() noexcept -> std::uint64_t * {
     return as_ptr<std::uint64_t>(bytes() + slots_offset_for(prefix_len));
@@ -386,8 +402,9 @@ export template <typename V> struct Node {
       // Hints below the head are runs of slots entirely below the key; the
       // first hint at or above it bounds the run that can hold it.
       std::uint32_t k = 0;
+      const auto *h = hints();
       for (std::uint32_t i = 0; i < kHints; ++i)
-        k += hints[i] < head ? 1u : 0u;
+        k += h[i] < head ? 1u : 0u;
       const auto dist = count / (kHints + 1);
       lo = k == 0 ? 0 : k * dist + 1;
       hi = k == kHints ? count : (k + 1) * dist + 1;
@@ -437,8 +454,9 @@ export template <typename V> struct Node {
       return;
     const auto dist = count / (kHints + 1);
     const auto *s = slots();
+    auto *h = hints();
     for (std::uint32_t i = 0; i < kHints; ++i)
-      hints[i] = slot_head(s[(i + 1) * dist]);
+      h[i] = slot_head(s[(i + 1) * dist]);
   }
 
   void remove_entry(std::uint32_t pos) noexcept {
@@ -712,7 +730,7 @@ protected:
         fresh->heap_floor = node->heap_floor;
         fresh->first_child = node->first_child;
         fresh->last_pos = node->last_pos;
-        std::memcpy(fresh->hints, node->hints, sizeof(node->hints));
+        std::memcpy(fresh->hints(), node->hints(), N::kHintBytes);
         discard(node);
         return fresh;
       }
