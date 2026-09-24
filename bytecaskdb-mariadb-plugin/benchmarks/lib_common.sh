@@ -88,18 +88,33 @@ init_datadir() {
 # True when mariadbd can be launched into its own systemd scope, which is what
 # makes per-instance cgroup I/O accounting possible. Probed once and cached;
 # without it the benchmark still runs, but reports no I/O figures.
-BYTECASK_SCOPE_OK=""
+#
+# Two ways to get a scope, tried in order:
+#   user — systemd-run --user --scope against a logind user session (desktop
+#          machines, or a machine with `loginctl enable-linger` for this user).
+#   sudo — systemd-run --scope against the system manager, run under sudo,
+#          with --uid/--gid so mariadbd still runs as the invoking user (its
+#          files stay user-owned and stop_mariadbd's plain `kill` still works).
+#          Needs passwordless sudo; probed with `sudo -n` so it can never block
+#          on a password prompt mid-benchmark. This is the path that works on
+#          headless VMs with no user session bus but a full system manager.
+BYTECASK_SCOPE_MODE=""
 scope_available() {
-  if [[ -z "$BYTECASK_SCOPE_OK" ]]; then
+  if [[ -z "$BYTECASK_SCOPE_MODE" ]]; then
     if command -v systemd-run >/dev/null 2>&1 &&
        systemd-run --user --scope --quiet -p IOAccounting=yes true >/dev/null 2>&1; then
-      BYTECASK_SCOPE_OK=yes
+      BYTECASK_SCOPE_MODE=user
+    elif command -v systemd-run >/dev/null 2>&1 &&
+       sudo -n systemd-run --scope --quiet -p IOAccounting=yes \
+         --uid="$(id -u)" --gid="$(id -g)" true >/dev/null 2>&1; then
+      BYTECASK_SCOPE_MODE=sudo
     else
-      BYTECASK_SCOPE_OK=no
-      echo "WARNING: systemd-run --user --scope unavailable; I/O columns will be empty." >&2
+      BYTECASK_SCOPE_MODE=none
+      echo "WARNING: systemd-run scope unavailable (no user session, no" \
+           "passwordless sudo); I/O columns will be empty." >&2
     fi
   fi
-  [[ "$BYTECASK_SCOPE_OK" == yes ]]
+  [[ "$BYTECASK_SCOPE_MODE" != none ]]
 }
 
 # Starts an ephemeral mariadbd instance and waits for it to accept connections.
@@ -134,9 +149,16 @@ start_mariadbd() {
   # actually wrote — measured at 9354 MiB against a device total of 86 MiB.
   local scope=()
   if scope_available; then
-    scope=(systemd-run --user --scope --quiet
-           --unit="bytecask-bench-${port}-$$-${RANDOM}"
-           -p IOAccounting=yes --)
+    local unit="bytecask-bench-${port}-$$-${RANDOM}"
+    case "$BYTECASK_SCOPE_MODE" in
+      user)
+        scope=(systemd-run --user --scope --quiet
+               --unit="$unit" -p IOAccounting=yes --) ;;
+      sudo)
+        scope=(sudo -n systemd-run --scope --quiet
+               --unit="$unit" -p IOAccounting=yes
+               --uid="$(id -u)" --gid="$(id -g)" --) ;;
+    esac
   fi
 
   local preload=()
