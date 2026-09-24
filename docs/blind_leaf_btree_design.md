@@ -952,6 +952,37 @@ candidates before joining the commit group (§Latency). Neither affects G1–G4
 on the benchmarks above; both matter for guard-heavy and cold-cache
 workloads.
 
+### Where `Get` loses (G3 profile)
+
+`engine_bench` `Get`, 1M keys, buffer pool, under callgrind with collection
+limited to `DB::get` (1.3M calls; `-march=x86-64-v3`, since valgrind cannot
+decode AVX-512). Per call:
+
+| | B+ tree | Blind |
+|---|---:|---:|
+| Instructions | 2,049 | 2,519 |
+| Simulated LL misses | 5.46 | 5.61 |
+| Node searches | 4 (3 inner + leaf), 324 instr. each | 3 inner, 374 each |
+| Leaf search | (in the 4th node search) | 453: 4 index tests, then ~10 entries scanned at ~27 instr. each |
+| Fingerprint of the query | — | ~100, most of it assembling the tail word byte by byte |
+| Record read and copy | `read_value` | `key_at` + `lend_record`: about the same |
+
+Cache misses are level; the gap is ~470 instructions, which at this
+machine's IPC is the ~20 ns by which the blind `Get` trails. Most of it is the
+leaf: the scan the index leaves (about 10 entries, not the 4–5 a balanced
+trie of ~70 keys would give, since a search lands more often in the larger
+ranges) and the fingerprint. Two changes aim at it:
+
+- A fifth index level: `top[31]`, 32 bytes, halves the scan (~−140
+  instructions) for 16 more bytes per leaf, about 0.2 B/key.
+- The fingerprint's tail read as one unaligned 8-byte load (the key's last
+  eight bytes, overlapping the previous word) when the key has at least eight
+  bytes, instead of a byte loop (~−50).
+
+Together about 40% of the gap. The rest is the inner nodes (374 against 324
+instructions each; the same code on different separators) and the resolver's
+bookkeeping.
+
 ### Revised targets
 
 Estimates from the arithmetic above, to be replaced by measurements as each
