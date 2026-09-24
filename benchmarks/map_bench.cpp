@@ -226,7 +226,7 @@ struct BenchResolver {
         index.try_emplace(k, static_cast<std::uint32_t>(store.size()));
     if (inserted)
       store.push_back(k);
-    return {0, it->second, static_cast<std::uint32_t>(k.size() + 20)};
+    return {0, it->second};
   }
   auto key_at(bytecask::BlindRef r) -> std::span<const std::byte> {
     return to_bytes(store[r.offset]);
@@ -307,11 +307,8 @@ template <std::size_t LeafBytes> struct BlindAdapter {
   static auto transient_update(const map_type &base,
                                const std::vector<key_type> &keys) -> map_type {
     auto tr = base.transient();
-    for (const auto &k : keys) {
-      auto ref = k.ref;
-      ++ref.size;
-      tr.set(to_bytes(k.s), ref, bench_resolver());
-    }
+    for (const auto &k : keys)
+      tr.set(to_bytes(k.s), k.ref, bench_resolver());
     return std::move(tr).persistent();
   }
 

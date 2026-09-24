@@ -43,7 +43,13 @@ struct MemResolver {
         index.try_emplace(k, static_cast<std::uint32_t>(store.size()));
     if (inserted)
       store.push_back(k);
-    return {1, it->second, static_cast<std::uint32_t>(k.size() + 20)};
+    return {1, it->second};
+  }
+  // A new record for k at a new location, as an overwrite writes.
+  auto fresh(const std::string &k) -> BlindRef {
+    store.push_back(k);
+    index[k] = static_cast<std::uint32_t>(store.size() - 1);
+    return {1, index[k]};
   }
   auto key_at(BlindRef r) -> std::span<const std::byte> {
     ++reads;
@@ -207,9 +213,7 @@ TEST_CASE("blind tree: random operations match std::map", "[blind]") {
         const auto dice = rng() % 10;
         if (dice < 6) {
           // Insert or overwrite; an overwrite moves the key to a new record.
-          auto ref = res.ref(k);
-          if (model.contains(k))
-            ref.size += 1 + static_cast<std::uint32_t>(rng() % 7);
+          const auto ref = model.contains(k) ? res.fresh(k) : res.ref(k);
           const auto displaced = tr.upsert(
               to_bytes(k), ref, res,
               [](const BlindRef &, const BlindRef &) { return true; });

@@ -323,8 +323,8 @@ public:
       const auto &dir_entry = *cur_;
       auto &file = *(*state_->files.get(dir_entry.file_id()));
       raw_cached_ = file.lend_record(dir_entry.file_offset(),
-                                     dir_entry.value_size(), verify_checksums_,
-                                     io_buf_, lease_);
+                                     value_size_hint(dir_entry),
+                                     verify_checksums_, io_buf_, lease_);
       cached_ = EntryView{.key = raw_cached_.key, .value = raw_cached_.value};
       has_cached_ = true;
     }
@@ -441,8 +441,8 @@ public:
       const auto &dir_entry = *cur_;
       auto &file = *(*state_->files.get(dir_entry.file_id()));
       raw_cached_ = file.lend_record(dir_entry.file_offset(),
-                                     dir_entry.value_size(), verify_checksums_,
-                                     io_buf_, lease_);
+                                     value_size_hint(dir_entry),
+                                     verify_checksums_, io_buf_, lease_);
       cached_ = EntryView{.key = raw_cached_.key, .value = raw_cached_.value};
       has_cached_ = true;
     }
@@ -678,10 +678,11 @@ private:
   // before the batch is written. A no-op for key directories that store
   // their keys.
   void note_pending(std::uint64_t offset, std::uint64_t sequence,
-                    std::span<const std::byte> key) {
+                    std::span<const std::byte> key, std::uint32_t value_size) {
     if constexpr (kKeyDirReadsKeys)
-      pending_.insert_or_assign(pending_slot(active_file_id_, offset),
-                                PendingRecord{sequence, {key.begin(), key.end()}});
+      pending_.insert_or_assign(
+          pending_slot(active_file_id_, offset),
+          PendingRecord{sequence, value_size, {key.begin(), key.end()}});
   }
 
   friend class DB;
@@ -1993,7 +1994,7 @@ void TransientEngineState::apply_writes(
           if constexpr (std::is_same_v<T, WritePlan::PointPut>) {
             const std::span<const std::byte> key_span{op.key};
             const auto val_size = narrow<std::uint32_t>(op.value.size());
-            note_pending(offsets[io_idx], next_seq_, key_span);
+            note_pending(offsets[io_idx], next_seq_, key_span, val_size);
             const auto existing = kd_put(
                 key_dir_, key_span,
                 KeyDirEntry::make(next_seq_, offsets[io_idx], active_file_id_,
@@ -2109,7 +2110,7 @@ void TransientEngineState::apply_ingest(
 
     case EntryType::Put: {
       const auto val_size = narrow<std::uint32_t>(e.value.size());
-      note_pending(offset, e.sequence, e.key);
+      note_pending(offset, e.sequence, e.key, val_size);
       const auto existing = kd_put(
           key_dir_, e.key,
           KeyDirEntry::make(e.sequence, offset, active_file_id_, val_size),

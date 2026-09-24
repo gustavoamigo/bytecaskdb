@@ -778,6 +778,27 @@ at 1,280 bytes goes from 73 to about 98 entries, which lengthens the in-leaf
 scan by a third unless R6 lands first or the leaf shrinks to 960 bytes
 (about 71 entries).
 
+**Done.** `BlindRef` is `{file_id, offset}`. Until R3, a range delete reads
+each erased key's record for its live bytes. A put or an erase takes the
+displaced record's value size from the read that confirmed the key (the
+reader checks it was that record); records the batch has not written carry
+their value size in the pending map. Measured with `memory_profile`, 1M keys,
+B/key:
+
+| Shape | 640 (44 entries) | 1,280 (97) | 2,560 (204) | before R2, 1,280 (73) |
+|---|---:|---:|---:|---:|
+| prefixed | 16.0 | 13.9 | 12.9 | 18.4 |
+| uuidv7 | 15.8 | 13.8 | 12.8 | 18.3 |
+| uniform | 21.4 | 18.8 | 17.5 | 24.8 |
+| sha256_hex | 22.2 | 19.6 | 18.6 | 25.9 |
+| uuidv4_binary | 22.1 | 19.7 | 18.9 | 26.0 |
+| many_partitions | 23.0 | 20.3 | 19.1 | 27.0 |
+| mixed | 20.0 | 17.6 | 16.6 | 23.5 |
+
+The longer leaf costs search time: `map_bench` `Get` at 1,280 bytes is
+184–226 ns against the B+ tree's 55–99 ns on this run (2.3–3.7×), and at 640
+bytes 108–181 ns (1.8–2.0×). R6 is what has to pay for it.
+
 ### R3. `live_keys` exact, `live_bytes` estimated for range deletes
 
 `FileStats` gains `live_keys`. Every path keeps it exact, including

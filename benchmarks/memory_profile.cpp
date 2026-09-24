@@ -240,9 +240,7 @@ void profile_blind(const key_generators::KeyShape &shape, std::size_t n) {
       auto end = std::min(i + kPopulateBatchSize, n);
       for (std::size_t j = i; j < end; ++j) {
         shape.make_key(j, n, key_buf);
-        const bytecask::BlindRef ref{
-            0, static_cast<std::uint32_t>(j),
-            static_cast<std::uint32_t>(key_buf.size() + kValueSize + 20)};
+        const bytecask::BlindRef ref{0, static_cast<std::uint32_t>(j)};
         tr.set(bc_key(key_buf), ref, res);
       }
       t = std::move(tr).persistent();

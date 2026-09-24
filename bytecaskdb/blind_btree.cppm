@@ -6,8 +6,8 @@
 // Inner nodes, path copying, BuildSession and the VersionChain are the B+
 // tree's (btree.cppm). A leaf stores no key bytes: each entry is a crit bit
 // (the first bit where the key differs from the previous key in the leaf), a
-// 24-bit fingerprint and the location and size of the record that holds the
-// key. A search in a leaf tests crit bits only and reaches one candidate,
+// 24-bit fingerprint and the location of the record that holds the key: 12
+// bytes. A search in a leaf tests crit bits only and reaches one candidate,
 // whose key a caller-supplied resolver reads to confirm the match or to find
 // the exact position. See docs/blind_leaf_btree_design.md.
 
@@ -33,20 +33,16 @@ import bytecask.version_chain;
 
 namespace bytecask {
 
-// Where the record holding a key lives, and a size the owner defines (the
-// engine keeps the value size: with the key length the caller has, it gives
-// both the read to issue and the live bytes to account). Within one process a
-// (file_id, offset) pair names at most one record, so equal locations mean
-// the same record.
+// Where the record holding a key lives. Within one process a (file_id,
+// offset) pair names at most one record, so equal locations mean the same
+// record. Sizes are the record's own business: its header has them.
 export struct BlindRef {
   std::uint32_t file_id{0};
   std::uint32_t offset{0};
-  std::uint32_t size{0};
   friend auto operator==(const BlindRef &, const BlindRef &) -> bool = default;
 };
 
 export inline constexpr std::uint32_t kBlindMaxFileId = (1u << 20) - 1;
-export inline constexpr std::uint32_t kBlindMaxSize = (1u << 29) - 1;
 
 // Reads the key of the record at a location. The returned span is valid until
 // the next call on the same resolver; the tree never holds two at once.
@@ -127,48 +123,41 @@ export inline auto fingerprint(Bytes k) noexcept -> std::uint32_t {
 // ---------------------------------------------------------------------------
 // Leaf<LeafBytes> — the layout of a blind leaf. A blind leaf is a btree Node
 // with is_leaf set (so the version chain and BuildSession handle it like any
-// other node) whose bytes after the header are three arrays instead of
-// slots and a heap:
+// other node) whose bytes after the header are two arrays instead of slots
+// and a heap, 12 bytes per entry:
 //
 //   meta[cap]  u32  crit:20 | fp_lo:12    crit against the previous entry;
 //                                        unused at index 0
 //   loc[cap]   u64  file_id:20 | offset:32 | fp_hi:12
-//   size[cap]  u32  BlindRef::size
 //
 // The search reads only meta. Capacity follows from the allocation size, so
 // LeafBytes should be a malloc size class.
 // ---------------------------------------------------------------------------
 export template <std::size_t LeafBytes> struct Leaf {
   static constexpr std::size_t kHeader = N::header_bytes();
-  static constexpr std::size_t kCap = (LeafBytes - kHeader - 4) / 16;
+  static constexpr std::size_t kCap = (LeafBytes - kHeader - 4) / 12;
   static constexpr std::size_t kMetaOff = kHeader;
   static constexpr std::size_t kLocOff = (kMetaOff + 4 * kCap + 7) / 8 * 8;
-  static constexpr std::size_t kSizeOff = kLocOff + 8 * kCap;
   static_assert(LeafBytes % 16 == 0);
-  static_assert(kSizeOff + 4 * kCap <= LeafBytes);
+  static_assert(kLocOff + 8 * kCap <= LeafBytes);
   static_assert(kCap >= 4 && kCap < N::kNoLastPos);
 
-  // Three parallel arrays: one leaf's, or a scratch copy during a split.
+  // Two parallel arrays: one leaf's, or a scratch copy during a split.
   struct Arrays {
     std::uint32_t *meta;
     std::uint64_t *loc;
-    std::uint32_t *size;
   };
 
   [[nodiscard]] static auto arrays(N *n) noexcept -> Arrays {
     auto *b = n->bytes();
     return {btree_detail::as_ptr<std::uint32_t>(b + kMetaOff),
-            btree_detail::as_ptr<std::uint64_t>(b + kLocOff),
-            btree_detail::as_ptr<std::uint32_t>(b + kSizeOff)};
+            btree_detail::as_ptr<std::uint64_t>(b + kLocOff)};
   }
   [[nodiscard]] static auto meta(const N *n) noexcept -> const std::uint32_t * {
     return btree_detail::as_ptr<std::uint32_t>(n->bytes() + kMetaOff);
   }
   [[nodiscard]] static auto loc(const N *n) noexcept -> const std::uint64_t * {
     return btree_detail::as_ptr<std::uint64_t>(n->bytes() + kLocOff);
-  }
-  [[nodiscard]] static auto size(const N *n) noexcept -> const std::uint32_t * {
-    return btree_detail::as_ptr<std::uint32_t>(n->bytes() + kSizeOff);
   }
 
   [[nodiscard]] static auto crit_at(const N *n, std::uint32_t i) noexcept
@@ -180,14 +169,13 @@ export template <std::size_t LeafBytes> struct Leaf {
     return static_cast<std::uint32_t>((loc(n)[i] & 0xFFFu) << 12) |
            (meta(n)[i] & 0xFFFu);
   }
-  [[nodiscard]] static auto ref_of(std::uint64_t l, std::uint32_t s) noexcept
-      -> BlindRef {
+  [[nodiscard]] static auto ref_of(std::uint64_t l) noexcept -> BlindRef {
     return {static_cast<std::uint32_t>(l >> 44),
-            static_cast<std::uint32_t>(l >> 12), s};
+            static_cast<std::uint32_t>(l >> 12)};
   }
   [[nodiscard]] static auto ref_at(const N *n, std::uint32_t i) noexcept
       -> BlindRef {
-    return ref_of(loc(n)[i], size(n)[i]);
+    return ref_of(loc(n)[i]);
   }
 
   static void write(Arrays a, std::uint32_t i, std::uint32_t crit_bit,
@@ -195,14 +183,12 @@ export template <std::size_t LeafBytes> struct Leaf {
     a.meta[i] = (crit_bit << 12) | (fp & 0xFFFu);
     a.loc[i] = (std::uint64_t{ref.file_id} << 44) |
                (std::uint64_t{ref.offset} << 12) | (fp >> 12);
-    a.size[i] = ref.size;
   }
   // Replaces the record, keeping the crit bit and the fingerprint.
   static void set_ref(N *n, std::uint32_t i, BlindRef ref) noexcept {
     auto a = arrays(n);
     a.loc[i] = (std::uint64_t{ref.file_id} << 44) |
                (std::uint64_t{ref.offset} << 12) | (a.loc[i] & 0xFFFu);
-    a.size[i] = ref.size;
   }
   static void set_crit(Arrays a, std::uint32_t i, std::uint32_t crit_bit) noexcept {
     a.meta[i] = (crit_bit << 12) | (a.meta[i] & 0xFFFu);
@@ -211,7 +197,6 @@ export template <std::size_t LeafBytes> struct Leaf {
                    std::uint32_t n) noexcept {
     std::memmove(dst.meta + to, src.meta + from, n * sizeof(std::uint32_t));
     std::memmove(dst.loc + to, src.loc + from, n * sizeof(std::uint64_t));
-    std::memmove(dst.size + to, src.size + from, n * sizeof(std::uint32_t));
   }
 
   // The blind search: a walk of the Patricia trie the sorted keys and their
@@ -337,8 +322,6 @@ inline void check_ref(Bytes key, BlindRef ref) {
     throw std::length_error{"BlindBTree: key exceeds 65535 bytes"};
   if (ref.file_id > kBlindMaxFileId)
     throw std::out_of_range{"BlindBTree: file_id exceeds 20 bits"};
-  if (ref.size > kBlindMaxSize)
-    throw std::out_of_range{"BlindBTree: size exceeds 29 bits"};
 }
 
 // ---------------------------------------------------------------------------
@@ -439,8 +422,7 @@ private:
     constexpr auto kCap = static_cast<std::uint32_t>(L::kCap);
     std::uint32_t meta[kCap + 1];
     std::uint64_t loc[kCap + 1];
-    std::uint32_t size[kCap + 1];
-    const typename L::Arrays tmp{meta, loc, size};
+    const typename L::Arrays tmp{meta, loc};
     L::copy(tmp, 0, L::arrays(leaf), 0, leaf->count);
     L::insert_into(tmp, leaf->count, p, fpq, ref);
     const auto total = kCap + 1;
@@ -483,7 +465,7 @@ private:
 
     const auto cut = std::size_t{meta[m] >> 12 >> kPosShift} + 1;
     const Bytes first_right =
-        m == p.idx ? key : res.key_at(L::ref_of(loc[m], size[m]));
+        m == p.idx ? key : res.key_at(L::ref_of(loc[m]));
     assert(cut <= first_right.size());
     sep_.assign(first_right.begin(),
                 first_right.begin() + static_cast<std::ptrdiff_t>(cut));

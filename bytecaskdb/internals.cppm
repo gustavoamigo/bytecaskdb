@@ -195,6 +195,7 @@ export class TransientEngineState;
 // ---------------------------------------------------------------------------
 export struct PendingRecord {
   std::uint64_t sequence{0};
+  std::uint32_t value_size{0};
   std::vector<std::byte> key;
 };
 export using PendingRecords = std::unordered_map<std::uint64_t, PendingRecord>;
@@ -275,6 +276,12 @@ export using KeyDirReverseValueIter = ReverseValueIterator<KeyDirEntry>;
 #endif
 export using KeyDirHit = KeyDirEntry;
 
+// The value size a value iterator's entry expects, as a read hint.
+export inline auto value_size_hint(const KeyDirEntry &e) noexcept
+    -> std::uint32_t {
+  return e.value_size();
+}
+
 // The trees that hold keys and full entries: every function forwards and the
 // context goes unused.
 export template <typename T>
@@ -341,9 +348,9 @@ export inline constexpr std::size_t kBlindLeafBytes = 1280;
 export using KeyDirTree = PersistentBlindBTree<kBlindLeafBytes>;
 export using KeyDirTransient = TransientBlindBTree<kBlindLeafBytes>;
 
-// What a blind key directory holds for a key: where its record is and its
-// value size. No sequence — reading one takes the record's header.
-export struct KeyDirHit {
+// What a blind key directory holds for a key: where its record is. Its sizes
+// and sequence are in the record's header.
+export struct KeyDirLoc {
   BlindRef ref;
   [[nodiscard]] auto file_id() const noexcept -> std::uint32_t {
     return ref.file_id;
@@ -351,14 +358,31 @@ export struct KeyDirHit {
   [[nodiscard]] auto file_offset() const noexcept -> std::uint64_t {
     return ref.offset;
   }
+};
+// A blind value iterator knows no size: the read takes it from the header.
+export inline auto value_size_hint(const KeyDirLoc &) noexcept
+    -> std::uint32_t {
+  return 0;
+}
+
+// What a put or an erase displaced: the record, and its value size, read
+// from its header when the operation confirmed the key.
+export struct KeyDirHit {
+  BlindRef ref;
+  std::uint32_t size;
+  [[nodiscard]] auto file_id() const noexcept -> std::uint32_t {
+    return ref.file_id;
+  }
+  [[nodiscard]] auto file_offset() const noexcept -> std::uint64_t {
+    return ref.offset;
+  }
   [[nodiscard]] auto value_size() const noexcept -> std::uint32_t {
-    return ref.size;
+    return size;
   }
 };
 
 inline auto to_blind_ref(const KeyDirEntry &e) -> BlindRef {
-  return {e.file_id(), static_cast<std::uint32_t>(e.file_offset()),
-          e.value_size()};
+  return {e.file_id(), static_cast<std::uint32_t>(e.file_offset())};
 }
 
 // Resolves a record to its key: from the batch being built if it is there,
@@ -371,14 +395,19 @@ export struct KeyReader {
   const KeyDirCtx &ctx;
   std::vector<std::byte> &buf;
   FrameLease &lease;
+  // Of the last record read.
+  BlindRef last{};
   std::uint64_t sequence{0};
-  std::span<const std::byte> value;
+  std::uint32_t value_size{0};
+  std::span<const std::byte> value; // empty for a record not yet written
 
   auto key_at(BlindRef r) -> std::span<const std::byte> {
+    last = r;
     if (ctx.pending) {
       if (auto it = ctx.pending->find(pending_slot(r.file_id, r.offset));
           it != ctx.pending->end()) {
         sequence = it->second.sequence;
+        value_size = it->second.value_size;
         value = {};
         return it->second.key;
       }
@@ -387,14 +416,24 @@ export struct KeyReader {
     if (!f)
       throw std::logic_error{
           "key directory references a data file missing from the registry"};
-    const auto v = f->lend_record(r.offset, r.size, ctx.verify, buf, lease);
+    const auto v = f->lend_record(r.offset, 0, ctx.verify, buf, lease);
     if (v.entry_type != EntryType::Put)
       throw std::runtime_error{
           "bytecask: corrupt database — key directory points at an entry "
           "that is not a put"};
     sequence = v.sequence;
+    value_size = static_cast<std::uint32_t>(v.value.size());
     value = v.value;
     return v.key;
+  }
+
+  // The size of `ref`'s value, which must be the record read last — as it
+  // is after a put or an erase that confirmed the key.
+  [[nodiscard]] auto displaced(BlindRef ref) const -> KeyDirHit {
+    if (!(ref == last))
+      throw std::logic_error{
+          "key directory: displaced record was not the one last read"};
+    return {ref, value_size};
   }
 };
 
@@ -424,7 +463,7 @@ public:
   using value_type =
       std::conditional_t<Keyed,
                          std::pair<std::span<const std::byte>, KeyDirEntry>,
-                         KeyDirHit>;
+                         KeyDirLoc>;
 
   BlindKeyDirIter() = default;
   BlindKeyDirIter(Inner cur, const KeyDirCtx &ctx) : cur_{std::move(cur)} {
@@ -443,9 +482,9 @@ public:
       KeyReader reader{ctx, buf_, lease_};
       const auto key = reader.key_at(ref);
       return {key, KeyDirEntry::make(reader.sequence, ref.offset, ref.file_id,
-                                     ref.size)};
+                                     reader.value_size)};
     } else {
-      return KeyDirHit{ref};
+      return KeyDirLoc{ref};
     }
   }
   // The iterator's key without the rest (one read).
@@ -528,7 +567,7 @@ public:
       : cur_{std::move(past_pos)} {
     --cur_;
   }
-  auto operator*() const -> KeyDirHit { return *cur_; }
+  auto operator*() const -> KeyDirLoc { return *cur_; }
   auto operator++() -> KeyDirReverseValueIter & {
     --cur_;
     return *this;
@@ -552,7 +591,7 @@ auto kd_get(const T &t, std::span<const std::byte> key, const KeyDirCtx &ctx)
   if (!ref)
     return std::nullopt;
   return KeyDirEntry::make(reader.sequence, ref->offset, ref->file_id,
-                           ref->size);
+                           reader.value_size);
 }
 export template <typename T>
 auto kd_contains(const T &t, std::span<const std::byte> key,
@@ -587,7 +626,7 @@ export inline auto kd_put(KeyDirTransient &t, std::span<const std::byte> key,
       [](const BlindRef &, const BlindRef &) { return true; });
   if (!displaced)
     return std::nullopt;
-  return KeyDirHit{*displaced};
+  return reader.displaced(*displaced);
 }
 export inline auto kd_erase(KeyDirTransient &t, std::span<const std::byte> key,
                             const KeyDirCtx &ctx) -> std::optional<KeyDirHit> {
@@ -596,7 +635,7 @@ export inline auto kd_erase(KeyDirTransient &t, std::span<const std::byte> key,
   const auto erased = t.erase(key, reader);
   if (!erased)
     return std::nullopt;
-  return KeyDirHit{*erased};
+  return reader.displaced(*erased);
 }
 export template <typename T>
 auto kd_lower_bound(const T &t, std::span<const std::byte> key,
