@@ -103,18 +103,26 @@ export inline auto crit(Bytes a, Bytes b) noexcept -> std::uint32_t {
 // order so a fingerprint does not depend on the host.
 export inline auto fingerprint(Bytes k) noexcept -> std::uint32_t {
   constexpr std::uint64_t kMul = 0x9E37'79B9'7F4A'7C15u;
-  auto word = [](const std::byte *p, std::size_t n) {
-    std::uint64_t w = 0;
-    for (std::size_t i = 0; i < n; ++i)
-      w |= std::uint64_t{std::to_integer<std::uint8_t>(p[i])} << (8 * i);
+  // Native byte order: fingerprints live only in memory.
+  auto word = [](const std::byte *p) {
+    std::uint64_t w;
+    std::memcpy(&w, p, sizeof w);
     return w;
   };
   std::uint64_t h = k.size() * kMul;
-  std::size_t i = 0;
-  for (; i + 8 <= k.size(); i += 8)
-    h = (h ^ word(k.data() + i, 8)) * kMul;
-  if (i < k.size())
-    h = (h ^ word(k.data() + i, k.size() - i)) * kMul;
+  if (k.size() < 8) {
+    std::uint64_t w = 0;
+    for (std::size_t i = 0; i < k.size(); ++i)
+      w |= std::uint64_t{std::to_integer<std::uint8_t>(k[i])} << (8 * i);
+    h = (h ^ w) * kMul;
+  } else {
+    std::size_t i = 0;
+    for (; i + 8 <= k.size(); i += 8)
+      h = (h ^ word(k.data() + i)) * kMul;
+    // The tail as the key's last eight bytes, overlapping the word before.
+    if (i < k.size())
+      h = (h ^ word(k.data() + k.size() - 8)) * kMul;
+  }
   h ^= h >> 29;
   h *= kMul;
   return static_cast<std::uint32_t>(h >> 40);
@@ -126,7 +134,7 @@ export inline auto fingerprint(Bytes k) noexcept -> std::uint32_t {
 // other node) whose bytes after the header are an index and two arrays
 // instead of slots and a heap, 12 bytes per entry:
 //
-//   top[15]    u8   the top four levels of the leaf's trie (below)
+//   top[31]    u8   the top five levels of the leaf's trie (below)
 //   meta[cap]  u32  crit:20 | fp_lo:12    crit against the previous entry;
 //                                        unused at index 0
 //   loc[cap]   u64  file_id:20 | offset:32 | fp_hi:12
@@ -136,17 +144,17 @@ export inline auto fingerprint(Bytes k) noexcept -> std::uint32_t {
 //
 // The sorted keys and their crit bits imply a Patricia trie whose root is the
 // boundary with the smallest crit bit, and every subtree of which is a
-// contiguous range of entries. top holds that trie's first four levels in
+// contiguous range of entries. top holds that trie's first five levels in
 // heap order (the children of slot k are 2k+1 and 2k+2): the index of the
 // boundary at the root of each range, 0 for a range of fewer than two
-// entries. A search walks them with four bit tests and scans only the range
-// it lands in — about a sixteenth of a leaf of random keys — instead of the
+// entries. A search walks them with five bit tests and scans only the range
+// it lands in — a handful of entries for random keys — instead of the
 // whole leaf.
 // ---------------------------------------------------------------------------
 export template <std::size_t LeafBytes> struct Leaf {
   static constexpr std::size_t kHeader = N::header_bytes();
-  static constexpr std::size_t kIndexSlots = 15;
-  static constexpr std::size_t kIndexBytes = 16;
+  static constexpr std::size_t kIndexSlots = 31;
+  static constexpr std::size_t kIndexBytes = 32;
   static constexpr std::size_t kIndexOff = kHeader;
   static constexpr std::size_t kMetaOff = kHeader + kIndexBytes;
   static constexpr std::size_t kCap =
@@ -253,7 +261,7 @@ export template <std::size_t LeafBytes> struct Leaf {
   }
 
   // The blind search: a walk of the Patricia trie the sorted keys and their
-  // crit bits imply. The index takes it down four levels; the range left is
+  // crit bits imply. The index takes it down five levels; the range left is
   // one subtree, walked in one branch-free pass. `s` is the crit bit of the
   // last left turn still in force; boundaries at or above it are that node's
   // right subtree, which the search did not enter. A right turn enters a
