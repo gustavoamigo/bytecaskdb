@@ -841,3 +841,114 @@ TEST_CASE("renameDataFileExclusive panics rather than replacing a live file",
 
   std::filesystem::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// lend_record — every back-end, writable and sealed
+// ---------------------------------------------------------------------------
+
+// Records of every shape the speculative first read can get wrong: a short
+// one, a key past the 256-byte key budget, a value past the page, and one
+// starting near the end of a page. Each is read with no size hint, with the
+// right one and with a wrong one, verified and not; the sizes always come
+// from the record's own header.
+TEST_CASE("DataFile::lend_record reads any record with or without a hint",
+          "[data_file]") {
+  const auto io_backend =
+      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap,
+               bytecask::IoBackend::BufferPool);
+  const bool sealed = GENERATE(false, true);
+  CAPTURE(static_cast<int>(io_backend), sealed);
+  const auto dir = std::filesystem::temp_directory_path();
+  const auto path = dir / "bc_test_lend_record.data";
+  std::filesystem::remove(path);
+
+  struct Rec {
+    std::string key;
+    std::string value;
+  };
+  const std::vector<Rec> recs{
+      {"k", "v"},
+      {std::string(300, 'K'), "long key"},
+      {"long value", std::string(10'000, 'V')},
+      {"after", std::string(4'000, 'x')},  // pushes the next one near a page end
+      {"near page end", std::string(90, 'y')},
+      {"", ""},
+  };
+
+  constexpr std::size_t kCapacity = 1 << 20;
+  auto pool = std::make_shared<bytecask::BufferPool>(
+      bytecask::BufferPoolOptions{.capacity_bytes = 8 * kCapacity});
+  auto writer = bytecask::createDataFileForWrite(
+      dir, "bc_test_lend_record", ".data", kCapacity, io_backend, pool,
+      /*file_id=*/7);
+  std::vector<bytecask::Offset> offsets;
+  for (std::size_t i = 0; i < recs.size(); ++i)
+    offsets.push_back(writer->append_entry(i + 1, bytecask::EntryType::Put,
+                                           to_bytes(recs[i].key),
+                                           to_bytes(recs[i].value)));
+  writer->sync();
+  std::shared_ptr<bytecask::DataFile> file = writer;
+  if (sealed) {
+    writer->shrink_to_fit();
+    writer.reset();
+    file.reset();
+    file = bytecask::openDataFileForRead(path, io_backend, pool, /*file_id=*/8);
+  }
+
+  std::vector<std::byte> io_buf;
+  bytecask::FrameLease lease;
+  for (std::size_t i = 0; i < recs.size(); ++i) {
+    const auto size = static_cast<std::uint32_t>(recs[i].value.size());
+    for (const std::uint32_t hint : {0u, size, size + 1'000u, 1u}) {
+      for (const bool verify : {true, false}) {
+        CAPTURE(i, hint, verify);
+        const auto view =
+            file->lend_record(offsets[i], hint, verify, io_buf, lease);
+        CHECK(view.sequence == i + 1);
+        CHECK(view.entry_type == bytecask::EntryType::Put);
+        CHECK(std::ranges::equal(view.key, to_bytes(recs[i].key)));
+        CHECK(std::ranges::equal(view.value, to_bytes(recs[i].value)));
+      }
+    }
+  }
+  lease.reset();
+  file.reset();
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("DataFile::lend_record rejects a damaged record when verifying",
+          "[data_file]") {
+  const auto io_backend =
+      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap,
+               bytecask::IoBackend::BufferPool);
+  CAPTURE(static_cast<int>(io_backend));
+  const auto dir = std::filesystem::temp_directory_path();
+  const auto path = dir / "bc_test_lend_record_crc.data";
+  std::filesystem::remove(path);
+  auto pool = std::make_shared<bytecask::BufferPool>(
+      bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20});
+  {
+    auto writer = bytecask::createDataFileForWrite(
+        dir, "bc_test_lend_record_crc", ".data", 1 << 20,
+        bytecask::IoBackend::Pread);
+    (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("key"),
+                               to_bytes("value"));
+    writer->sync();
+    writer->shrink_to_fit();
+  }
+  {
+    std::fstream f{path, std::ios::in | std::ios::out | std::ios::binary};
+    f.seekp(static_cast<std::streamoff>(bytecask::kHeaderSize + 1));  // "k[e]y"
+    f.put('E');
+  }
+  auto file = bytecask::openDataFileForRead(path, io_backend, pool, 9);
+  std::vector<std::byte> io_buf;
+  bytecask::FrameLease lease;
+  CHECK_THROWS_AS(file->lend_record(0, 0, true, io_buf, lease),
+                  std::runtime_error);
+  const auto view = file->lend_record(0, 0, false, io_buf, lease);
+  CHECK(view.key.size() == 3);
+  lease.reset();
+  file.reset();
+  std::filesystem::remove(path);
+}

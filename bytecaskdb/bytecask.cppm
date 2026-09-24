@@ -322,9 +322,9 @@ public:
     if (!has_cached_) {
       const auto &dir_entry = *cur_;
       auto &file = *(*state_->files.get(dir_entry.file_id()));
-      raw_cached_ = file.lend_entry(dir_entry.file_offset(),
-                                    dir_entry.value_size(), verify_checksums_,
-                                    io_buf_, lease_);
+      raw_cached_ = file.lend_record(dir_entry.file_offset(),
+                                     dir_entry.value_size(), verify_checksums_,
+                                     io_buf_, lease_);
       cached_ = EntryView{.key = raw_cached_.key, .value = raw_cached_.value};
       has_cached_ = true;
     }
@@ -440,9 +440,9 @@ public:
     if (!has_cached_) {
       const auto &dir_entry = *cur_;
       auto &file = *(*state_->files.get(dir_entry.file_id()));
-      raw_cached_ = file.lend_entry(dir_entry.file_offset(),
-                                    dir_entry.value_size(), verify_checksums_,
-                                    io_buf_, lease_);
+      raw_cached_ = file.lend_record(dir_entry.file_offset(),
+                                     dir_entry.value_size(), verify_checksums_,
+                                     io_buf_, lease_);
       cached_ = EntryView{.key = raw_cached_.key, .value = raw_cached_.value};
       has_cached_ = true;
     }

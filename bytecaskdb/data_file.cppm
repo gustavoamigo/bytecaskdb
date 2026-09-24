@@ -104,18 +104,21 @@ public:
       Offset offset, std::uint32_t value_size,
       std::vector<std::byte> &io_buf) const -> DataEntryView = 0;
 
-  // read_entry / read_entry_unverified for a caller that keeps the spans
-  // across its own work — an iterator — and can therefore hold a lease. A
-  // pool-backed file lends spans straight into the resident frame under
-  // lease, with no copy; every other back-end copies exactly as the two
-  // methods above do and leaves lease empty. Spans are valid until the next
-  // call with the same io_buf and lease, whichever of the two backs them.
-  // Each back-end implements it by name rather than through a base default,
-  // so the copying ones cost one virtual call, not two.
-  [[nodiscard]] virtual auto lend_entry(Offset offset, std::uint32_t value_size,
-                                        bool verify,
-                                        std::vector<std::byte> &io_buf,
-                                        FrameLease &lease) const
+  // The record at offset, its key and value sizes taken from its own header:
+  // one frame lookup and no copy on a pool-backed file, the mapping on an
+  // mmap one, and on a pread one a single speculative read that a record
+  // longer than it guessed completes with one more. value_size_hint sizes
+  // that guess — the value size the caller expects, or 0 when it does not
+  // know one. CRC-checked when verify. Spans point into the frame the lease
+  // pins, the mapping, or io_buf, and are valid until the next call with the
+  // same io_buf and lease. Each back-end implements it by name rather than
+  // through a base default, so the copying ones cost one virtual call, not
+  // two.
+  [[nodiscard]] virtual auto lend_record(Offset offset,
+                                         std::uint32_t value_size_hint,
+                                         bool verify,
+                                         std::vector<std::byte> &io_buf,
+                                         FrameLease &lease) const
       -> DataEntryView = 0;
 
   [[nodiscard]] auto path() const -> const std::filesystem::path & {
@@ -186,36 +189,91 @@ WritableDataFile::~WritableDataFile() = default;
 // mapping and uses only the append half.
 // ---------------------------------------------------------------------------
 
-// The zero-copy read behind lend_entry for the two pool-backed files: the
-// entry's spans point into the frame the lease pins when the whole entry —
+// Bytes of the whole record a header describes: header, key, value, CRC.
+constexpr auto record_bytes(const EntryHeader &hdr) noexcept -> std::size_t {
+  return kHeaderSize + hdr.key_size + hdr.value_size + kCrcSize;
+}
+
+// The record in `raw`, which holds exactly its bytes, header through CRC;
+// `hdr` is its header, already parsed. Throws std::runtime_error on a CRC
+// mismatch when verify.
+auto record_view(std::span<const std::byte> raw, const EntryHeader &hdr,
+                 bool verify) -> DataEntryView {
+  if (verify)
+    (void)parse_header_and_verify(raw);
+  const auto body = raw.subspan(kHeaderSize);
+  return DataEntryView{
+      .sequence = hdr.sequence,
+      .entry_type = hdr.entry_type,
+      .key = body.subspan(0, hdr.key_size),
+      .value = body.subspan(hdr.key_size, hdr.value_size),
+  };
+}
+
+// How much to read first for the record at offset: the header, a key budget
+// and the hinted value, or, with no hint, the rest of the page — a record's
+// header, key and a short value usually share it. Bounded by end.
+constexpr auto first_read_length(Offset offset, std::uint32_t value_size_hint,
+                                 Offset end) noexcept -> std::size_t {
+  constexpr std::size_t kKeyBudget = 256;
+  constexpr std::size_t kPage = 4096;
+  const auto len =
+      value_size_hint != 0
+          ? kHeaderSize + kKeyBudget + value_size_hint + kCrcSize
+          : std::max(kHeaderSize + kKeyBudget + kCrcSize,
+                     kPage - static_cast<std::size_t>(offset % kPage));
+  return static_cast<std::size_t>(
+      std::min<std::uint64_t>(len, end > offset ? end - offset : 0));
+}
+
+// A record read through fetch(offset, len, dst), which reads exactly len
+// bytes: one fetch of first_read_length(), then, only when the record is
+// longer than that, one for the rest. The spans point into io_buf.
+template <typename Fetch>
+auto fetch_record(Offset offset, std::uint32_t value_size_hint, Offset end,
+                  bool verify, std::vector<std::byte> &io_buf, Fetch &&fetch)
+    -> DataEntryView {
+  const auto first = first_read_length(offset, value_size_hint, end);
+  if (first < kHeaderSize)
+    throw std::runtime_error{"bytecask: record header past the end of file"};
+  io_buf.resize(first);
+  fetch(offset, first, io_buf.data());
+  const auto hdr = bytecask::read_header(
+      std::span<const std::byte>{io_buf.data(), kHeaderSize});
+  const auto total = record_bytes(hdr);
+  if (offset + total > end)
+    throw std::runtime_error{
+        "bytecask: corrupt data file — record extends past the end"};
+  if (total > first) {
+    io_buf.resize(total);
+    fetch(offset + first, total - first, io_buf.data() + first);
+  }
+  return record_view(std::span<const std::byte>{io_buf.data(), total}, hdr,
+                     verify);
+}
+
+// The zero-copy read behind lend_record for the two pool-backed files: the
+// record's spans point into the frame the lease pins when the whole record —
 // header through CRC — lies inside one resident frame below file_size.
 // nullopt otherwise, with nothing pinned; the caller copies instead. That
-// covers a straddling entry, a non-resident frame and a lost race alike.
+// covers a straddling record, a non-resident frame and a lost race alike.
 auto lend_from_pool(BufferPool &pool, std::uint32_t file_id,
-                    std::size_t file_size, Offset offset,
-                    std::uint32_t value_size, bool verify, FrameLease &lease)
-    -> std::optional<DataEntryView> {
+                    std::size_t file_size, Offset offset, bool verify,
+                    FrameLease &lease) -> std::optional<DataEntryView> {
   const auto bytes = pool.view(file_id, offset, file_size, lease);
   if (bytes.size() < kHeaderSize) {
     lease.reset();
     return std::nullopt;
   }
   const auto hdr = bytecask::read_header(bytes);
-  const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
+  const auto total = record_bytes(hdr);
   if (total > bytes.size()) {
     lease.reset();
     return std::nullopt;
   }
-  const auto entry = bytes.first(total);
-  const auto header = verify ? parse_header_and_verify(entry) : hdr;
+  auto view = record_view(bytes.first(total), hdr, verify);
   pool.note_hit();
-  const auto body = entry.subspan(kHeaderSize);
-  return DataEntryView{
-      .sequence = header.sequence,
-      .entry_type = header.entry_type,
-      .key = body.subspan(0, hdr.key_size),
-      .value = body.subspan(hdr.key_size, value_size),
-  };
+  return view;
 }
 
 // The point read behind read_value for the two pool-backed files: assigns
@@ -247,6 +305,20 @@ auto read_value_from_pool(BufferPool &pool, std::uint32_t file_id,
   return true;
 }
 
+// Reads exactly len bytes at offset; a short read is an error.
+void pread_exact(int fd, Offset offset, std::size_t len, std::byte *dst) {
+  std::size_t done = 0;
+  while (done < len) {
+    const auto n =
+        ::pread(fd, dst + done, len - done, narrow<off_t>(offset + done));
+    if (n <= 0) {
+      throw std::system_error{errno, std::generic_category(),
+                              "bytecask: pread failed"};
+    }
+    done += static_cast<std::size_t>(n);
+  }
+}
+
 // pread(2) back-end. Stateless: every publish() call compiles away.
 export struct PreadIo {
   // Each point read costs a syscall, so read_entry_unverified over-reads
@@ -257,16 +329,7 @@ export struct PreadIo {
 
   void fetch(int fd, Offset offset, std::size_t len, Offset /*logical_end*/,
              std::byte *dst) const {
-    std::size_t done = 0;
-    while (done < len) {
-      const auto n = ::pread(fd, dst + done, len - done,
-                             narrow<off_t>(offset + done));
-      if (n <= 0) {
-        throw std::system_error{errno, std::generic_category(),
-                                "PreadIo::fetch: pread failed"};
-      }
-      done += static_cast<std::size_t>(n);
-    }
+    pread_exact(fd, offset, len, dst);
   }
 
   // Nothing resident to lend or assign from: the file's read methods copy.
@@ -318,12 +381,12 @@ public:
   // Zero-copy entry and point read out of the frames the writer filled,
   // bounded by the active file's logical end. See lend_from_pool and
   // read_value_from_pool.
-  [[nodiscard]] auto lend(Offset offset, std::uint32_t value_size, bool verify,
-                          Offset logical_end, FrameLease &lease) const
+  [[nodiscard]] auto lend(Offset offset, bool verify, Offset logical_end,
+                          FrameLease &lease) const
       -> std::optional<DataEntryView> {
     return lend_from_pool(*pool_, file_id_,
                           static_cast<std::size_t>(logical_end), offset,
-                          value_size, verify, lease);
+                          verify, lease);
   }
   [[nodiscard]] auto read_value(Offset offset, std::uint16_t key_size,
                                 std::uint32_t value_size, bool verify,
@@ -732,13 +795,24 @@ public:
     return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf);
   }
 
-  [[nodiscard]] auto lend_entry(Offset offset, std::uint32_t value_size,
-                                bool verify, std::vector<std::byte> &io_buf,
-                                FrameLease &lease) const
+  [[nodiscard]] auto lend_record(Offset offset, std::uint32_t value_size_hint,
+                                 bool verify, std::vector<std::byte> &io_buf,
+                                 FrameLease &lease) const
       -> DataEntryView override {
     lease.reset();
-    return verify ? WritableMmapDataFile::read_entry(offset, value_size, io_buf)
-                  : WritableMmapDataFile::read_entry_unverified(offset, value_size, io_buf);
+    if (offset + kHeaderSize <= mmap_end()) {
+      const auto hdr = bytecask::read_header(
+          std::span<const std::byte>{mmap_base_ + offset, kHeaderSize});
+      const auto total = record_bytes(hdr);
+      if (offset + total <= mmap_end())
+        return record_view({mmap_base_ + offset, total}, hdr, verify);
+    }
+    // Past the mapped extent (a file that grew since it was mapped).
+    return fetch_record(offset, value_size_hint, ops_.logical_end(), verify,
+                        io_buf, [this](Offset at, std::size_t len,
+                                       std::byte *dst) {
+                          pread_exact(ops_.fd_, at, len, dst);
+                        });
   }
 
   [[nodiscard]] auto read_entry_unverified(
@@ -975,20 +1049,22 @@ public:
     }
   }
 
-  [[nodiscard]] auto lend_entry(Offset offset, std::uint32_t value_size,
-                                bool verify, std::vector<std::byte> &io_buf,
-                                FrameLease &lease) const
+  [[nodiscard]] auto lend_record(Offset offset, std::uint32_t value_size_hint,
+                                 bool verify, std::vector<std::byte> &io_buf,
+                                 FrameLease &lease) const
       -> DataEntryView override {
     if constexpr (Io::kResident) {
-      if (auto lent = ops_.io_.lend(offset, value_size, verify, ops_.logical_end(),
-                                    lease)) {
+      if (auto lent =
+              ops_.io_.lend(offset, verify, ops_.logical_end(), lease)) {
         return *lent;
       }
     }
     lease.reset();
-    return verify ? WritablePosixFile::read_entry(offset, value_size, io_buf)
-                  : WritablePosixFile::read_entry_unverified(offset, value_size,
-                                                             io_buf);
+    return fetch_record(offset, value_size_hint, ops_.logical_end(), verify,
+                        io_buf, [this](Offset at, std::size_t len,
+                                       std::byte *dst) {
+                          fetch(at, len, dst);
+                        });
   }
 
   [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
@@ -1200,13 +1276,15 @@ public:
     return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf);
   }
 
-  [[nodiscard]] auto lend_entry(Offset offset, std::uint32_t value_size,
-                                bool verify, std::vector<std::byte> &io_buf,
-                                FrameLease &lease) const
+  [[nodiscard]] auto lend_record(Offset offset, std::uint32_t value_size_hint,
+                                 bool verify, std::vector<std::byte> &io_buf,
+                                 FrameLease &lease) const
       -> DataEntryView override {
     lease.reset();
-    return verify ? ReadOnlyPosixDataFile::read_entry(offset, value_size, io_buf)
-                  : ReadOnlyPosixDataFile::read_entry_unverified(offset, value_size, io_buf);
+    return fetch_record(offset, value_size_hint, file_size_, verify, io_buf,
+                        [this](Offset at, std::size_t len, std::byte *dst) {
+                          pread_exact(fd_, at, len, dst);
+                        });
   }
 
   [[nodiscard]] auto read_entry_unverified(
@@ -1382,13 +1460,21 @@ public:
     return read_entry_with_key_size(offset, hdr.key_size, value_size);
   }
 
-  [[nodiscard]] auto lend_entry(Offset offset, std::uint32_t value_size,
-                                bool verify, std::vector<std::byte> &io_buf,
-                                FrameLease &lease) const
+  [[nodiscard]] auto lend_record(Offset offset,
+                                 std::uint32_t /*value_size_hint*/,
+                                 bool verify,
+                                 std::vector<std::byte> & /*io_buf*/,
+                                 FrameLease &lease) const
       -> DataEntryView override {
     lease.reset();
-    return verify ? ReadOnlyMmapDataFile::read_entry(offset, value_size, io_buf)
-                  : ReadOnlyMmapDataFile::read_entry_unverified(offset, value_size, io_buf);
+    if (offset + kHeaderSize > mmap_size_)
+      throw std::runtime_error{"bytecask: record header past the end of file"};
+    const auto hdr = read_header(offset);
+    const auto total = record_bytes(hdr);
+    if (offset + total > mmap_size_)
+      throw std::runtime_error{
+          "bytecask: corrupt data file — record extends past the end"};
+    return record_view({mmap_base_ + offset, total}, hdr, verify);
   }
 
   [[nodiscard]] auto read_entry_unverified(
@@ -1565,22 +1651,21 @@ public:
                                     Source::Pool);
   }
 
-  // No speculative over-read here, unlike the pread back-end: that exists to
-  // save a second syscall, and a pool hit has no syscall to save. Reading the
-  // header first is both simpler and usually free — it lands in the same frame.
-  [[nodiscard]] auto lend_entry(Offset offset, std::uint32_t value_size,
-                                bool verify, std::vector<std::byte> &io_buf,
-                                FrameLease &lease) const
+  // One frame lookup for a record inside one resident frame; otherwise the
+  // record is copied through the pool, which fills what is missing.
+  [[nodiscard]] auto lend_record(Offset offset, std::uint32_t value_size_hint,
+                                 bool verify, std::vector<std::byte> &io_buf,
+                                 FrameLease &lease) const
       -> DataEntryView override {
     if (auto lent = lend_from_pool(*pool_, file_id_, file_size_, offset,
-                                   value_size, verify, lease)) {
+                                   verify, lease)) {
       return *lent;
     }
     lease.reset();
-    return verify
-        ? ReadOnlyBufferPoolDataFile::read_entry(offset, value_size, io_buf)
-        : ReadOnlyBufferPoolDataFile::read_entry_unverified(offset, value_size,
-                                                            io_buf);
+    return fetch_record(offset, value_size_hint, file_size_, verify, io_buf,
+                        [this](Offset at, std::size_t len, std::byte *dst) {
+                          fetch(at, len, dst, Source::Pool);
+                        });
   }
 
   [[nodiscard]] auto read_entry_unverified(

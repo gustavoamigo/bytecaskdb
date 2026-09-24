@@ -24,6 +24,7 @@ export module bytecask:internals;
 
 import bytecask.blind_btree;
 import bytecask.btree;
+import bytecask.buffer_pool;
 import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.radix_tree;
@@ -361,13 +362,15 @@ inline auto to_blind_ref(const KeyDirEntry &e) -> BlindRef {
 }
 
 // Resolves a record to its key: from the batch being built if it is there,
-// otherwise by reading the whole entry (CRC-checked unless ctx.verify is
-// off). Keeps the entry's sequence and value from the last read, so a lookup
-// that confirms a key has what a KeyDirEntry or a get needs without a second
-// read. Spans are valid until the next key_at or until `buf` changes.
+// otherwise through DataFile::lend_record (one pool lookup; CRC-checked
+// unless ctx.verify is off). Keeps the entry's sequence and value from the
+// last read, so a lookup that confirms a key has what a KeyDirEntry or a get
+// needs without a second read. Spans are valid until the next key_at, or
+// until `buf` or `lease` changes.
 export struct KeyReader {
   const KeyDirCtx &ctx;
   std::vector<std::byte> &buf;
+  FrameLease &lease;
   std::uint64_t sequence{0};
   std::span<const std::byte> value;
 
@@ -384,8 +387,7 @@ export struct KeyReader {
     if (!f)
       throw std::logic_error{
           "key directory references a data file missing from the registry"};
-    const auto v = ctx.verify ? f->read_entry(r.offset, r.size, buf)
-                              : f->read_entry_unverified(r.offset, r.size, buf);
+    const auto v = f->lend_record(r.offset, r.size, ctx.verify, buf, lease);
     if (v.entry_type != EntryType::Put)
       throw std::runtime_error{
           "bytecask: corrupt database — key directory points at an entry "
@@ -438,7 +440,7 @@ public:
     const auto ref = *cur_;
     if constexpr (Keyed) {
       const auto ctx = context();
-      KeyReader reader{ctx, buf_};
+      KeyReader reader{ctx, buf_, lease_};
       const auto key = reader.key_at(ref);
       return {key, KeyDirEntry::make(reader.sequence, ref.offset, ref.file_id,
                                      ref.size)};
@@ -449,11 +451,29 @@ public:
   // The iterator's key without the rest (one read).
   [[nodiscard]] auto key() const -> std::span<const std::byte> {
     const auto ctx = context();
-    KeyReader reader{ctx, buf_};
+    KeyReader reader{ctx, buf_, lease_};
     return reader.key_at(*cur_);
   }
 
+  // A copy holds no lease: its first dereference reads again.
+  BlindKeyDirIter(const BlindKeyDirIter &o)
+      : cur_{o.cur_}, files_{o.files_}, owned_{o.owned_}, ctx_{o.ctx_} {}
+  auto operator=(const BlindKeyDirIter &o) -> BlindKeyDirIter & {
+    if (this != &o) {
+      lease_.reset();
+      cur_ = o.cur_;
+      files_ = o.files_;
+      owned_ = o.owned_;
+      ctx_ = o.ctx_;
+    }
+    return *this;
+  }
+  BlindKeyDirIter(BlindKeyDirIter &&) noexcept = default;
+  auto operator=(BlindKeyDirIter &&) noexcept -> BlindKeyDirIter & = default;
+  ~BlindKeyDirIter() = default;
+
   auto operator++() -> BlindKeyDirIter & {
+    lease_.reset();
     ++cur_;
     return *this;
   }
@@ -463,6 +483,7 @@ public:
     return tmp;
   }
   auto operator--() -> BlindKeyDirIter & {
+    lease_.reset();
     --cur_;
     return *this;
   }
@@ -484,6 +505,9 @@ private:
   bool owned_{false};
   KeyDirCtx ctx_;
   mutable std::vector<std::byte> buf_;
+  // Pins the pool frame the last key span points into. After buf_, so it is
+  // released first.
+  mutable FrameLease lease_;
 
   [[nodiscard]] auto context() const -> KeyDirCtx {
     auto c = ctx_;
@@ -522,7 +546,8 @@ private:
 export template <typename T>
 auto kd_get(const T &t, std::span<const std::byte> key, const KeyDirCtx &ctx)
     -> std::optional<KeyDirEntry> {
-  KeyReader reader{ctx, key_read_buffer()};
+  FrameLease lease;
+  KeyReader reader{ctx, key_read_buffer(), lease};
   const auto ref = t.get(key, reader);
   if (!ref)
     return std::nullopt;
@@ -532,7 +557,8 @@ auto kd_get(const T &t, std::span<const std::byte> key, const KeyDirCtx &ctx)
 export template <typename T>
 auto kd_contains(const T &t, std::span<const std::byte> key,
                  const KeyDirCtx &ctx) -> bool {
-  KeyReader reader{ctx, key_read_buffer()};
+  FrameLease lease;
+  KeyReader reader{ctx, key_read_buffer(), lease};
   return t.get(key, reader).has_value();
 }
 // Looks the key up and copies its value into `out`: the read that confirms
@@ -541,7 +567,8 @@ export inline auto kd_read_value(const KeyDirTree &t,
                                  std::span<const std::byte> key,
                                  const KeyDirCtx &ctx,
                                  std::vector<std::byte> &out) -> bool {
-  KeyReader reader{ctx, key_read_buffer()};
+  FrameLease lease;
+  KeyReader reader{ctx, key_read_buffer(), lease};
   const auto ref = t.get(key, reader);
   if (!ref)
     return false;
@@ -553,7 +580,8 @@ export inline auto kd_read_value(const KeyDirTree &t,
 export inline auto kd_put(KeyDirTransient &t, std::span<const std::byte> key,
                           const KeyDirEntry &e, const KeyDirCtx &ctx)
     -> std::optional<KeyDirHit> {
-  KeyReader reader{ctx, key_read_buffer()};
+  FrameLease lease;
+  KeyReader reader{ctx, key_read_buffer(), lease};
   const auto displaced = t.upsert(
       key, to_blind_ref(e), reader,
       [](const BlindRef &, const BlindRef &) { return true; });
@@ -563,7 +591,8 @@ export inline auto kd_put(KeyDirTransient &t, std::span<const std::byte> key,
 }
 export inline auto kd_erase(KeyDirTransient &t, std::span<const std::byte> key,
                             const KeyDirCtx &ctx) -> std::optional<KeyDirHit> {
-  KeyReader reader{ctx, key_read_buffer()};
+  FrameLease lease;
+  KeyReader reader{ctx, key_read_buffer(), lease};
   const auto erased = t.erase(key, reader);
   if (!erased)
     return std::nullopt;
@@ -572,7 +601,8 @@ export inline auto kd_erase(KeyDirTransient &t, std::span<const std::byte> key,
 export template <typename T>
 auto kd_lower_bound(const T &t, std::span<const std::byte> key,
                     const KeyDirCtx &ctx) -> KeyDirIter {
-  KeyReader reader{ctx, key_read_buffer()};
+  FrameLease lease;
+  KeyReader reader{ctx, key_read_buffer(), lease};
   return {t.lower_bound(key, reader), ctx};
 }
 export inline auto kd_begin(const KeyDirTree &t, const KeyDirCtx &ctx)
@@ -598,7 +628,8 @@ export inline auto kd_value_lower_bound(const KeyDirTree &t,
     -> KeyDirValueIter {
   if (from.empty())
     return {t.begin(), ctx};
-  KeyReader reader{ctx, key_read_buffer()};
+  FrameLease lease;
+  KeyReader reader{ctx, key_read_buffer(), lease};
   return {t.lower_bound(from, reader), ctx};
 }
 export inline auto kd_value_rlower_bound(const KeyDirTree &t,
@@ -608,7 +639,8 @@ export inline auto kd_value_rlower_bound(const KeyDirTree &t,
   if (from.empty())
     return KeyDirReverseValueIter{KeyDirValueIter{t.end_iter(), ctx}};
   // Start past the last key <= from: at the first key > from.
-  KeyReader reader{ctx, key_read_buffer()};
+  FrameLease lease;
+  KeyReader reader{ctx, key_read_buffer(), lease};
   auto fwd = KeyDirValueIter{t.lower_bound(from, reader), ctx};
   if (fwd != std::default_sentinel &&
       btree_detail::compare_bytes(fwd.key(), from) == 0)

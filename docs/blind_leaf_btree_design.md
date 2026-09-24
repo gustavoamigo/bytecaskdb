@@ -747,6 +747,14 @@ the 150 ns `Get` gap that is not the in-leaf scan (§Steps 2–3 results
 estimates it at about 70 ns). This change is independent of the rest and
 helps the current 16-byte entry as much as the 12-byte one.
 
+**Done.** `lend_record(offset, value_size_hint, verify, io_buf, lease)`
+replaces `lend_entry`: the entry iterators pass the size they know as the
+hint, the blind reader passes its own. Measured (1M keys, buffer pool, medians
+of three interleaved runs): blind `Get` 2.04 → 2.21 M ops/sec (+8%), still
+0.61 of the B+ tree — the leaf scan is most of what is left. The B+ tree's
+`Get`, `Range50` and `GetMT` are unchanged within noise over five more
+interleaved runs.
+
 ### R2. 12-byte leaf entry
 
 Drop the size field:
