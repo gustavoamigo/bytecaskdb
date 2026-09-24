@@ -296,6 +296,35 @@ engine_counters() {
   echo "${out:-0 0 0}"
 }
 
+# ---------------------------------------------------------------------------
+# Memory
+#
+# Resident set size of the server process, from /proc/<pid>/status. RSS counts
+# the engine's own memory — caches it allocates (InnoDB's buffer pool, the
+# ByteCaskDB key directory and buffer pool, RocksDB's block cache) and any
+# file pages it has mmap'd. It does NOT count the kernel page cache behind
+# plain read()/pread(), so an engine that leans on the page cache (ByteCaskDB
+# with io_backend=pread, RocksDB reading SSTs outside its block cache) uses
+# more memory than its RSS shows.
+# ---------------------------------------------------------------------------
+# Resets the peak-RSS mark (VmHWM) to the current RSS, so a later rss_sample
+# reports the peak over the window that follows rather than since startup.
+rss_reset() {
+  local pid_file="$1" pid=""
+  if [[ -f "$pid_file" ]]; then pid="$(cat "$pid_file" 2>/dev/null)" || true; fi
+  [[ -n "$pid" ]] && echo 5 > "/proc/$pid/clear_refs" 2>/dev/null || true
+}
+
+# Echoes "rss_mib,peak_rss_mib" (VmRSS now, VmHWM since the last rss_reset),
+# or "," when the process or /proc is unavailable (e.g. macOS).
+rss_sample() {
+  local pid_file="$1" pid=""
+  if [[ -f "$pid_file" ]]; then pid="$(cat "$pid_file" 2>/dev/null)" || true; fi
+  if [[ -z "$pid" || ! -r "/proc/$pid/status" ]]; then echo ","; return; fi
+  awk '/^VmRSS:/ { r = $2 } /^VmHWM:/ { h = $2 }
+       END { printf "%.1f,%.1f", r / 1024, h / 1024 }' "/proc/$pid/status"
+}
+
 io_sample() {
   local pid_file="$1" pid="" cg="" rb=0 wb=0 sc=0 sw=0
   if [[ -f "$pid_file" ]]; then pid="$(cat "$pid_file" 2>/dev/null)" || true; fi
