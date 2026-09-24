@@ -13,7 +13,7 @@ Read this before pointing an application written for InnoDB at the engine.
 - **Foreign keys are not enforced.** `FOREIGN KEY` clauses are accepted, stored, and listed in `information_schema`, so DDL round-trips through dump and restore, but no referential check runs on `INSERT`, `UPDATE` or `DELETE`, and there are no cascades.
 - **Transactions are buffered in RAM until commit.** A transaction that modifies millions of rows holds all of them in memory. `ALTER TABLE ... ALGORITHM=COPY` and `CREATE INDEX` are exempt: they flush in batches.
 - **Long-lived snapshots defer vacuum.** `mysqldump --single-transaction` and any long transaction pin the data files they can see; space from overwritten or deleted rows is reclaimed only after they finish.
-- **Every table's key directory lives in memory.** Budget roughly 50 bytes per row per index (primary and secondary) of resident memory, in addition to MariaDB's own.
+- **Every table's key directory lives in memory.** The engine's key directory holds no key bytes, so a row costs about 14–19 bytes per index (primary and secondary) whatever the key's length: 14 measured on structured keys, which index encodings are, 19 on random ones, both at 1M keys. Budget 20 bytes per row per index of resident memory, in addition to MariaDB's own and `bytecaskdb_buffer_pool_size` if the pool is on. The row data itself stays on disk.
 - **Not supported:** `FULLTEXT` and `SPATIAL` indexes, `LOCK TABLES` blocking semantics, `HANDLER`, `INSERT DELAYED`, table-level lock priorities, `CHECKSUM TABLE ... QUICK`.
 
 ## Configuration
