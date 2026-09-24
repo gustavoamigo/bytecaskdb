@@ -5519,7 +5519,8 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
     for (std::size_t i = 0; i < cursors.size(); ++i) heap[i] = i;
     std::ranges::make_heap(heap, ahead);
 
-    BlindBulkLoader<kBlindLeafBytes> out;
+    BlindBulkLoader<kBlindLeafBytes> out{kBlindRecoveryFillMin,
+                                         kBlindRecoveryFillMax};
     auto &live = outs[r].live;
     std::vector<std::size_t> matches;
     auto entry_of = [](const Cursor &c) {

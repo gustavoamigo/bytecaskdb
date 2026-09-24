@@ -345,6 +345,13 @@ export inline auto key_dir_from_recovered(RecoveryKeyDirTree t) -> KeyDirTree {
 #else // BYTECASK_KEYDIR_BLIND
 
 export inline constexpr std::size_t kBlindLeafBytes = 1280;
+// Recovery loads leaves between 60% and 100% full, spread so they do not all
+// reach capacity at once. Loaded full, every leaf splits within the first few
+// percent of random inserts after open: a burst of allocation on the write
+// path and a memory peak near twice the loaded size. Keys written in order
+// never refill the slack, so they keep ~26% more than a full load.
+export inline constexpr double kBlindRecoveryFillMin = 0.6;
+export inline constexpr double kBlindRecoveryFillMax = 1.0;
 export using KeyDirTree = PersistentBlindBTree<kBlindLeafBytes>;
 export using KeyDirTransient = TransientBlindBTree<kBlindLeafBytes>;
 
@@ -687,7 +694,8 @@ export inline auto kd_value_rlower_bound(const KeyDirTree &t,
   return KeyDirReverseValueIter{std::move(fwd)};
 }
 export inline auto key_dir_from_recovered(RecoveryKeyDirTree t) -> KeyDirTree {
-  BlindBulkLoader<kBlindLeafBytes> out;
+  BlindBulkLoader<kBlindLeafBytes> out{kBlindRecoveryFillMin,
+                                       kBlindRecoveryFillMax};
   for (auto it = t.begin(); it != std::default_sentinel; ++it) {
     auto [key, e] = *it;
     out.append(key, to_blind_ref(e));

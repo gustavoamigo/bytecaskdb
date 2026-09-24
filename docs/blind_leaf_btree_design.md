@@ -866,15 +866,15 @@ Random inserts fill leaves to 0.69, ordered ones to 1.0.
 
 **Measured, and (1) is a trade-off rather than a fix.** `BlindBulkLoader`
 takes a fill, or a range of fills spread over successive leaves with a
-golden-ratio sequence; recovery still loads full. `memory_profile
+golden-ratio sequence. `memory_profile
 BC_INDEX_ONLY=blind_growth BC_BULK_FILL=…` bulk-loads 1M keys of a shape and
 then inserts random keys of it. B/key:
 
 | Keys, load fill | at load | +1% | +5% | +10% | +25% | +50% |
 |---|---:|---:|---:|---:|---:|---:|
-| random, 1.0 (recovery today) | 12.9 | 20.9 | 24.6 | 23.7 | 20.8 | 17.4 |
+| random, 1.0 | 12.9 | 20.9 | 24.6 | 23.7 | 20.8 | 17.4 |
 | random, 0.8 | 16.3 | 16.2 | 15.5 | 14.8 | 17.9 | 21.9 |
-| random, 0.6–1.0 spread | 16.3 | 16.4 | 17.2 | 18.0 | 19.3 | 19.6 |
+| random, 0.6–1.0 spread (recovery) | 16.3 | 16.4 | 17.2 | 18.0 | 19.3 | 19.6 |
 | random, 0.5–1.0 spread | 17.3 | 17.5 | 18.0 | 18.5 | 19.3 | 19.1 |
 | structured (`uniform`), 1.0 | 12.9 | 13.0 | 13.2 | 13.5 | 14.1 | 14.9 |
 | structured (`uniform`), 0.6–1.0 spread | 16.3 | 16.3 | 16.3 | 16.4 | 16.6 | 16.8 |
@@ -884,8 +884,13 @@ writes: the directory nearly doubles (12.9 → 24.6 B/key) before it settles.
 A single slack value only moves that cliff (0.8 reaches it at +25%). A spread
 removes it: the peak stays at the steady state, 19.6. But keys written in
 order never split the leaves they loaded into, so for them the slack is paid
-for good (16.3–16.8 against 12.9–14.9). Which default recovery should use is
-open (§Open questions). (2) is not built: it needs the shared descent to reach
+for good (16.3–16.8 against 12.9–14.9). Recovery loads with the 0.6–1.0
+spread: the split storm is a burst of allocation on the write path and a
+memory peak to size RAM for, and predictable latency ranks above the smaller
+footprint. There is no `Options` field; if a workload needs the dense load,
+the merged hint stream carries each key's sequence, so the loader could fill
+full the ranges whose keys were written in key order. (2) is not built, and
+is not planned: it needs the shared descent to reach
 a leaf's sibling, a change to the B+ tree's insert path, for the 0.5 B/key by
 which insert-built random trees miss G1 (18.5 against 18).
 
@@ -998,12 +1003,6 @@ all three trees, and before-and-after numbers on the buffer-pool rows:
 
 - **Leaf size.** 1,280 bytes (101 entries after R2, R4 and R6): at 2,560
   the index leaves ranges too long to scan.
-- **Recovery's load fill** (R5). Full leaves: smallest at open, nearly 2×
-  after a few percent of random writes. Fill spread over 0.6–1.0: 26% more
-  at open, no spike, and permanent slack for keys written in order. A choice
-  by workload, possibly an `Options` field.
-- **Sibling redistribution** (R5 (2)): 0.5 B/key on insert-built random
-  trees, at the cost of a change to the shared descent.
 - **12-byte entries.** Adopted as R2, with R1 for the read length and R3 for
   `del_range`'s live bytes.
 - **`contains_key`.** One read per present key is a regression for callers

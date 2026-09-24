@@ -1105,8 +1105,8 @@ auto PersistentBlindBTree<LeafBytes>::erase(Bytes key, R &res) const
 // BlindBulkLoader<LeafBytes> — builds a tree from keys appended in strictly
 // ascending order. Every key's bytes are in hand, so crit bits, fingerprints
 // and separators come from the stream without a single read. Leaves are
-// filled to capacity; the levels above them are built by the B+ tree's
-// loader.
+// filled to capacity unless a fill is given; the levels above them are built
+// by the B+ tree's loader.
 // ---------------------------------------------------------------------------
 export template <std::size_t LeafBytes>
 class BlindBulkLoader : private btree_detail::BulkLoader<BlindRef> {

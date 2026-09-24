@@ -138,7 +138,7 @@ In the engine it changes what reads the data files:
 - The read that confirms a key also yields its sequence, so `kd_get` returns a full `KeyDirEntry` and the conflict checks, vacuum's remap and `resume()`'s replay are unchanged. `DB::get` and `Snapshot::get` take the value from that same read.
 - Reads the other trees never do: every put and erase reads one record (the candidate's, which may be another key's), plus one when a leaf splits; `contains_key` and every step of `keys_from` read one record. A read that fails — I/O error or CRC mismatch, including on a neighbouring key's record — fails the operation before anything is written.
 - Iterators over a published state hold their own handle on its file registry, so `keys_from` can outlive the call that made it.
-- Recovery (`recovery_load_streams`) merges the sorted hint files directly: per file, fences every 4 KiB; splitters from the pooled fences; per range, a k-way merge of every file's slice straight into blind leaves, which are then concatenated. No intermediate tree is built, and at 1M keys it recovers faster than the B+ tree's `recovery_load_ranged`.
+- Recovery (`recovery_load_streams`) merges the sorted hint files directly: per file, fences every 4 KiB; splitters from the pooled fences; per range, a k-way merge of every file's slice straight into blind leaves, which are then concatenated. No intermediate tree is built, and at 1M keys it recovers faster than the B+ tree's `recovery_load_ranged`. Leaves are loaded between 60% and 100% full, spread so they do not all split on the first random writes after open.
 
 ### Size Limits
 
