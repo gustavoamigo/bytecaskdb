@@ -177,7 +177,7 @@ def append_results(data: dict, git_commit: str, memory_gb: float) -> None:
         "memory_gb": memory_gb,
         "load_avg_1m": load_avg[0] if load_avg else "",
         "dataset_size": ctx.get("dataset_size", ""),
-        "key_dir": os.environ.get("BYTECASK_KEYDIR", "btree"),
+        "key_dir": os.environ.get("BYTECASK_KEYDIR", "blind"),
     }
 
     _migrate_csv_header()

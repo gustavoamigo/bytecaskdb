@@ -13,17 +13,17 @@ CI also publishes JUnit results directly in GitHub Checks for PR-native test sum
 
 **ByteCaskDB** is a fast, predictable embedded key-value store written in C++. Reads and writes have flat, predictable latency from thousands of keys to hundreds of millions.
 
-All keys in memory at all times — a deliberate design choice that removes an entire class of complexity that exists solely to minimise disk access and makes every point lookup O(1) with flat, predictable latency. At ~50 bytes per key, 128 GB of RAM holds close to 2.7 billion keys. Very few moving parts — an in-memory key directory and an append-only data file — is what keeps that latency flat whether you have 1,000 records or 100 million. 
+All keys in memory at all times — a deliberate design choice that removes an entire class of complexity that exists solely to minimise disk access and makes every point lookup O(1) with flat, predictable latency. The key directory holds no key bytes, so a key costs 14–19 bytes of RAM whatever its length (measured at 1M keys, structured to random): 128 GB holds on the order of six billion keys. Very few moving parts — an in-memory key directory and an append-only data file — is what keeps that latency flat whether you have 1,000 records or 100 million. 
 
-Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCaskDB replaces the original hash-table key directory with a **[persistent B+ tree](docs/persistent_btree_design.md)** — enabling ordered range queries, prefix scans, and prefix compaction, while keeping the simplicity that makes Bitcask fast. Snapshots are O(1) — just a root pointer copy. Full MVCC and serializable conflict detection are supported with no separate transaction type required.
+Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCaskDB replaces the original hash-table key directory with a **[persistent B+ tree with blind leaves](docs/blind_leaf_btree_design.md)** — inner nodes carry separators, each leaf entry is a crit bit, a fingerprint and a record location, and the key bytes live only in the data file. It gives ordered range queries, prefix scans, and prefix compaction, while keeping the simplicity that makes Bitcask fast. Snapshots are O(1) — just a root pointer copy. Full MVCC and serializable conflict detection are supported with no separate transaction type required.
 
 ## Features
 
-- **Sequential write path** — all I/O is sequential appends; no random writes. Every `put` and `del` is one append. `apply_batch` with N operations appends a begin marker, N entries, and an end marker in a single `pwritev` — still no WAL, no random writes.
-- **Ordered range iteration** — scan from any key prefix using the in-memory key directory; no disk I/O for key enumeration. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
+- **Sequential write path** — all I/O is sequential appends; no random writes. Every `put` and `del` is one append. `apply_batch` with N operations appends a begin marker, N entries, and an end marker in a single `pwritev` — still no WAL, no random writes. Because the key directory stores no key bytes, a `put` or `del` also reads one record (the key's own, or a neighbour's on an insert) to place the key; that read is served from the buffer pool or page cache, and if it fails the operation fails before anything is appended.
+- **Ordered range iteration** — scan from any key prefix in key order. Keys are read from their records as the iterator advances, values lazily. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
 - **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append. In-memory cleanup walks the key directory; disk cost is O(1) regardless of how many keys fall in the range. Available on `DB` and `WritePlan`.
 - **Atomic writes** — every `put`, `del`, and `del_range` is atomic. `apply_batch` makes multiple puts, deletes, and range deletes atomic as a group.
-- **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `nullopt` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. All precondition checks are in-memory key directory traversals — no disk I/O, no separate transaction type required.
+- **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `nullopt` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. Each precondition check is a key directory lookup plus one record read for the key's sequence — no separate transaction type required.
 - **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 510 ms on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex for their in-memory phase, with group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost. The commit is pipelined: while one flush is in flight, the next batch is validated, applied and appended, so the disk never waits on in-memory work. On the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
@@ -36,11 +36,11 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 
 Benchmarked at 1 M keys with [RocksDB](https://rocksdb.org/) as a reference point. The tables below include both engines for context.
 
-- **Point reads** reach 1.29 Mops/s at 1 M keys with flat, sub-microsecond latency (p50 728 ns, p99 1.01 µs). Latency stays flat as the dataset grows because every lookup is an in-memory key directory traversal followed by a single `pread` at a known offset.
+- **Point reads** reach 1.29 Mops/s at 1 M keys with flat, sub-microsecond latency (p50 728 ns, p99 1.01 µs). Latency stays flat as the dataset grows because every lookup is an in-memory key directory traversal followed by a single read at a known offset, which confirms the key and returns the value.
 - **Concurrent reads scale linearly** — lock-free snapshots with no shared mutex. 14.0 Mops/s at 32 threads.
 - **Sequential writes** sustain 134 Kops/s (NoSync) and 139 ops/s (Sync), limited by `fdatasync` round-trip latency. No write amplification from compaction.
 - **Concurrent sync writes scale via group commit** — writers share a single `fdatasync` call. 4.9 Kops/s at 64 threads.
-- **Range scans over values** fetch each value individually from disk. LSM-based engines pack values contiguously in sorted runs and perform better here. Key-only iteration (`keys_from`) is a pure in-memory tree walk with no disk I/O.
+- **Range scans over values** fetch each value individually from disk. LSM-based engines pack values contiguously in sorted runs and perform better here. Key-only iteration (`keys_from`) reads each key's record header and skips the value.
 - **Recovery is fast and parallel** — hint files replayed across all cores with per-file CRC verification. 1 M keys in ~58 ms, 10 M in ~506 ms at 16 threads.
 
 See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md) for the full benchmark report with all thread counts, dataset sizes, and hardware details.
@@ -127,7 +127,7 @@ Recovery runs when ByteCaskDB opens an existing database: it rebuilds the in-mem
 
 _Tested on AMD Ryzen 7 3700X (8C/16T), Samsung SSD 860 EVO SATA (463 MiB/s read), 31 GiB RAM. Each result is the mean of 5 runs. Benchmark source: [`benchmarks/engine_bench.cpp`](benchmarks/engine_bench.cpp)._
 
-_These figures were measured on the radix key directory, before the B+ tree became the default, and on the `mmap` read path, before `engine_bench` switched its default to the buffer pool. A head-to-head run of both trees on one engine put the B+ tree ahead on reads and batched writes and behind on unsynced single puts, but that run was on different hardware, so the absolute numbers above have not been re-measured on this machine and are not restated here. Reproduce either tree with [`scripts/compare_engine_bench.py`](scripts/compare_engine_bench.py)._
+_These figures were measured on the radix key directory, before the B+ tree became the default, and on the `mmap` read path, before `engine_bench` switched its default to the buffer pool. A head-to-head run of both trees on one engine put the B+ tree ahead on reads and batched writes and behind on unsynced single puts, but that run was on different hardware, so the absolute numbers above have not been re-measured on this machine and are not restated here. The blind-leaf tree, now the default, was then measured against the keyed B+ tree on one machine at 1M keys: level on `Get` and `GetMT`, 1.25–1.3× on random 16-byte keys, and 0.89× on unsynced single puts, with the key directory 2–7× smaller ([`docs/blind_leaf_btree_design.md`](docs/blind_leaf_btree_design.md)). Reproduce the keyed trees with [`scripts/compare_engine_bench.py`](scripts/compare_engine_bench.py)._
 
 ## Quick Start
 
@@ -181,18 +181,18 @@ if (!db.apply_batch({}, std::move(order))) {
     // price changed since snapshot — re-read price and recompute
 }
 
-// Prefix scan — in-memory key walk, values fetched lazily from disk.
+// Prefix scan — keys and values fetched lazily from disk as it advances.
 for (auto& [key, value] : db.iter_from({}, to_bytes("user:"))) {
     // Iterates all keys >= "user:" in ascending order.
 }
 
-// Keys-only prefix scan — pure in-memory, no disk I/O.
+// Keys-only prefix scan — reads each key's record header, skips the value.
 for (auto& key : db.keys_from({}, to_bytes("user:"))) { ... }
 
 // Reverse scan — descending key order. Starts at last key <= "user:~".
 for (auto& [key, value] : db.riter_from({}, to_bytes("user:~"))) { ... }
 
-// Reverse keys-only — pure in-memory, descending order.
+// Reverse keys-only — descending order.
 for (auto& key : db.rkeys_from({}, to_bytes("user:~"))) { ... }
 ```
 
@@ -468,7 +468,7 @@ ByteCaskDB is designed around four core tenets, in priority order:
 
 ```
   ByteCaskDB
-  ├── Key Directory  PersistentBTree<KeyDirEntry>       (all keys, in memory)
+  ├── Key Directory  PersistentBlindBTree               (every key, in memory, 12 bytes per leaf entry)
   ├── File Registry  map<file_id, DataFile>             (open file descriptors)
   ├── Active File    append-only .data file             (current writes)
   └── Sealed Files   read-only .data + .hint files      (older segments)
@@ -476,7 +476,7 @@ ByteCaskDB is designed around four core tenets, in priority order:
 
 **Write path**: all writes route through a single coordinator (`apply_batch`). Concurrent sync writers are batched via group commit — a writer that finds no leader becomes one and executes every pending write under one lock hold with a single `fdatasync`, then returns to its caller and hands leadership to the next waiting writer, so no client's commit is held to serve others. Each write appends CRC-32-verified, length-prefixed records to the active data file, then applies pure in-memory state transitions via `TransientEngineState`. The active file is zero-filled 4 MiB ahead of the write cursor, so each commit's `fdatasync` is a data-only flush with no filesystem journal traffic; the commit that crosses into a new 4 MiB chunk pays for flushing it. The key directory builder used for those transitions is single-use: it freezes into the published immutable snapshot and fails fast on accidental reuse. Durability before visibility: `state_.store()` happens after `fdatasync`.
 
-**Read path**: readers obtain an immutable snapshot of the engine state, look up the key in the key directory to find its file and offset, then read the value directly. Reads are lock-free and scale linearly across cores.
+**Read path**: readers obtain an immutable snapshot of the engine state, look up the key in the key directory to find its file and offset, then read the record: one read confirms the key (the leaf holds only its fingerprint) and returns the value. Reads are lock-free and scale linearly across cores.
 
 **Recovery**: on `open`, the engine generates a hint file for any data file that lacks one (including the most recent active file), then replays all hint files in parallel to rebuild the key directory. Hint files are compact per-file indexes written atomically (`write → fdatasync → rename`) by a background worker after each file rotation and synchronously at engine close. No raw data-file scan is performed — recovery reads only hint files.
 
@@ -499,6 +499,8 @@ python ./scripts/run_engine_bench.py
   --engines=bytecaskdb,innodb --workloads=oltp_insert --threads=1,16
 ```
 
+The key directory is chosen at build time. The default is the blind-leaf B+ tree; `BYTECASK_KEYDIR=btree` builds the engine on the B+ tree that keeps key bytes in its leaves (larger, and it never reads a record to place or enumerate a key), and `BYTECASK_KEYDIR=radix` on the radix tree. All three pass the same engine suite in CI, and the on-disk format is the same, so a database opens under any of them.
+
 A ready-to-use development environment is provided via the included [Dev Container](.devcontainer) (Fedora 43, Clang, xmake, LLVM tooling, and `nanobind` pre-installed).
 
 ## Want to hack on it?
@@ -517,8 +519,9 @@ If you want to take it in a different direction and fork it into your own thing,
 | [`docs/file_format.md`](docs/file_format.md) | On-disk file format reference: data file entries, hint file entries, CRC, byte order, naming |
 | [`docs/engine_api_design.md`](docs/engine_api_design.md) | Public API specification with usage examples |
 | [`docs/parallel_recovery_design.md`](docs/parallel_recovery_design.md) | Parallel recovery algorithm and fan-in merge strategy |
-| [`docs/persistent_btree_design.md`](docs/persistent_btree_design.md) | Persistent B+ tree data structure design — the key directory |
-| [`docs/persistent_radix_tree_design.md`](docs/persistent_radix_tree_design.md) | Persistent radix tree data structure design — the alternate key directory |
+| [`docs/blind_leaf_btree_design.md`](docs/blind_leaf_btree_design.md) | Blind-leaf B+ tree design — the key directory: leaves without key bytes, fingerprint lookups, measurements |
+| [`docs/persistent_btree_design.md`](docs/persistent_btree_design.md) | Persistent B+ tree design — the inner nodes of the key directory, and the keyed tree selectable with `BYTECASK_KEYDIR=btree` |
+| [`docs/persistent_radix_tree_design.md`](docs/persistent_radix_tree_design.md) | Persistent radix tree data structure design — the alternate key directory (`BYTECASK_KEYDIR=radix`) |
 | [`docs/correctness_validation.md`](docs/correctness_validation.md) | Write-path correctness validation: failure classes, proof test matrix, fault injection framework |
 | [`docs/failure_mode_comparison.md`](docs/failure_mode_comparison.md) | Write-path failure mode comparison: ByteCaskDB vs RocksDB, LevelDB, SQLite WAL, LMDB, WiredTiger |
 | [`docs/replication_primitives_design.md`](docs/replication_primitives_design.md) | Replication primitives: minimal API surface for building leader-follower replication on top of ByteCaskDB |

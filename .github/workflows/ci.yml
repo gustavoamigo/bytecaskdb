@@ -155,17 +155,19 @@ jobs:
           build/linux/x86_64/release/bytecask_tests
 
   # ---------------------------------------------------------------------------
-  # The blind-leaf tree (docs/blind_leaf_btree_design.md) is an experimental
-  # key directory: same engine suite, built with BYTECASK_KEYDIR=blind.
+  # The blind-leaf tree (docs/blind_leaf_btree_design.md) is the default key
+  # directory, so the main job covers it. The B+ tree that keeps its keys in
+  # the leaves stays selectable with BYTECASK_KEYDIR=btree; this job runs the
+  # same engine suite on it.
   # ---------------------------------------------------------------------------
-  blind-keydir:
+  btree-keydir:
     runs-on: ubuntu-latest
     container:
       image: fedora:43
     env:
       BYTECASK_MARCH: x86-64-v3
       XMAKE_ROOT: "y"
-      BYTECASK_KEYDIR: blind
+      BYTECASK_KEYDIR: btree
     steps:
       - uses: actions/checkout@v4
 
@@ -189,7 +191,7 @@ jobs:
             --cxflags="-resource-dir=${RESOURCE_DIR}" \
             -y
 
-      - name: Build and run the engine suite on the blind-leaf key directory
+      - name: Build and run the engine suite on the keyed B+ tree key directory
         run: |
           xmake build bytecask_tests
           build/linux/x86_64/release/bytecask_tests

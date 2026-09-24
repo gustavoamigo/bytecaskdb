@@ -177,7 +177,7 @@ class Snapshot;
 class WritePlan;
 
 // ---------------------------------------------------------------------------
-// KeyIterator — ascending key walk (in-memory, no disk I/O)
+// KeyIterator — ascending key walk (reads each key from its record header)
 // ---------------------------------------------------------------------------
 
 class KeyIterator {

@@ -100,9 +100,9 @@ The design follows these core tenets in order of priority:
 
 ### Key Directory
 
-ByteCaskDB uses `PersistentBTree<KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times.
+ByteCaskDB uses `PersistentBlindBTree<kBlindLeafBytes>` as the in-memory key directory: a B+ tree whose leaves hold no key bytes (below). All keys reside in memory at all times.
 
-The engine names the tree only through the aliases in `bytecaskdb/internals.cppm` (`KeyDirTree`, `KeyDirTransient`, `KeyDirIter`, …) and reaches it only through the `kd_*` functions there: `kd_get`, `kd_contains`, `kd_put` and `kd_erase` (each returning what it displaced, so a put is one descent), `kd_lower_bound`, `kd_upper_bound`, `kd_begin`, `kd_end`, and the value iterators. Each takes a `KeyDirCtx`: the file registry of the version the tree belongs to, and on the write path the records the batch being built has placed but not yet written. Trees that store their keys ignore it. `BYTECASK_KEYDIR=radix` builds the engine on the radix tree instead and `BYTECASK_KEYDIR=blind` on the blind-leaf tree (below); CI runs the full engine suite on the B+ tree and the radix tree.
+The engine names the tree only through the aliases in `bytecaskdb/internals.cppm` (`KeyDirTree`, `KeyDirTransient`, `KeyDirIter`, …) and reaches it only through the `kd_*` functions there: `kd_get`, `kd_contains`, `kd_put` and `kd_erase` (each returning what it displaced, so a put is one descent), `kd_lower_bound`, `kd_upper_bound`, `kd_begin`, `kd_end`, and the value iterators. Each takes a `KeyDirCtx`: the file registry of the version the tree belongs to, and on the write path the records the batch being built has placed but not yet written. Trees that store their keys ignore it. `BYTECASK_KEYDIR=btree` builds the engine on the B+ tree that keeps key bytes in its leaves and `BYTECASK_KEYDIR=radix` on the radix tree; CI runs the full engine suite on all three.
 
 Recovery builds a `RecoveryKeyDirTree` — the B+ tree, or the radix tree in the radix build — and `key_dir_from_recovered()` hands it to the engine. It is the identity for those two; the blind build converts, as described below.
 
@@ -126,9 +126,9 @@ Internal (non-leaf) nodes are tiered by fanout across four fixed-capacity tiers,
 
 **Historical note**: the original key directory used `PersistentOrderedMap<Key, KeyDirEntry>`, backed by `immer::flex_vector<Entry>`. The radix tree replacement (BC-030) delivers O(k) lookups vs O(n log n) binary search, lower memory overhead via prefix compression and intrusive refcounting, and faster batch mutations via the transient API's in-place path copying. `PersistentOrderedMap` is retained in the codebase for benchmarking purposes (`benchmarks/map_bench.cpp`).
 
-The radix tree replaced that map (BC-030) and was in turn replaced as the default by the B+ tree, which measured faster on point reads, range scans and batched writes, and rebuilds the key directory from sorted hint files faster as well. It remains in the codebase, builds from the same engine under `BYTECASK_KEYDIR=radix`, and passes the same engine suite in CI. `docs/persistent_btree_design.md` records the head-to-head measurements, including where the B+ tree is behind: unsynced single puts.
+The radix tree replaced that map (BC-030) and was in turn replaced as the default by the B+ tree, which measured faster on point reads, range scans and batched writes, and rebuilds the key directory from sorted hint files faster as well; the B+ tree with blind leaves then replaced that as the default (below). Both earlier trees remain in the codebase, build from the same engine under `BYTECASK_KEYDIR=radix` and `BYTECASK_KEYDIR=btree`, and pass the same engine suite in CI. `docs/persistent_btree_design.md` records the head-to-head measurements, including where the B+ tree is behind: unsynced single puts.
 
-#### The blind-leaf key directory (`BYTECASK_KEYDIR=blind`, experimental)
+#### The blind-leaf key directory (the default)
 
 A B+ tree whose leaves store no key bytes: each entry is a crit bit, a 24-bit fingerprint and the record's location, 12 bytes in all. A point lookup compares the leaf's fingerprints with the query's in vector registers and reads the record behind each match to confirm the key; an insert walks the leaf's crit bits to one candidate and reads that record to place the key. The key directory's size no longer depends on key length (13.7–19 B/key at 1M keys, against 33–133 for the B+ tree). Inner nodes, path copying and reclamation are the B+ tree's. Implemented in `bytecask.blind_btree` (`bytecaskdb/blind_btree.cppm`); `docs/blind_leaf_btree_design.md` is the design and has the measurements.
 

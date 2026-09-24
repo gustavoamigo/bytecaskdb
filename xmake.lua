@@ -125,17 +125,21 @@ end
 -- LTO and target CPU applied per-target to avoid polluting dependency package builds.
 -- Set BYTECASK_MARCH to override (e.g. "x86-64-v3" for portable wheels).
 -- Defaults to "native" for local development.
--- Key directory tree selection: the engine is built on the persistent B+ tree
--- (docs/persistent_btree_design.md). BYTECASK_KEYDIR=radix builds it on the
--- radix tree instead, which both trees' test suites still exercise. Applies to
--- every target so tests and benchmarks agree.
-if os.getenv("BYTECASK_KEYDIR") ~= "radix" then
+-- Key directory tree selection: the engine is built on the blind-leaf B+
+-- tree (docs/blind_leaf_btree_design.md), which stores no key bytes.
+-- BYTECASK_KEYDIR=btree builds it on the B+ tree that keeps its keys in the
+-- leaves (docs/persistent_btree_design.md), and BYTECASK_KEYDIR=radix on the
+-- radix tree; CI runs the engine suite on all three. Applies to every target
+-- so tests and benchmarks agree.
+local keydir = os.getenv("BYTECASK_KEYDIR")
+if keydir == nil or keydir == "" then
+    keydir = "blind"
+end
+if keydir ~= "radix" then
+    -- The blind tree's inner nodes and BuildSession are the B+ tree's.
     add_defines("BYTECASK_USE_BTREE")
 end
--- BYTECASK_KEYDIR=blind builds the engine on the blind-leaf B+ tree
--- (docs/blind_leaf_btree_design.md). Recovery still builds a B+ tree and
--- converts it, so the B+ tree stays compiled in.
-if os.getenv("BYTECASK_KEYDIR") == "blind" then
+if keydir ~= "radix" and keydir ~= "btree" then
     add_defines("BYTECASK_KEYDIR_BLIND")
 end
 

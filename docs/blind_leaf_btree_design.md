@@ -1,12 +1,14 @@
 # Blind-leaf B+ tree key directory — design
 
-> **Status: steps 1–3 built and measured; experimental.** It describes a
-> third key directory beside the B+ tree and the radix tree, for deployments
-> where the number of keys, not the value data, is what runs out of RAM. The
-> tree (`bytecaskdb/blind_btree.cppm`) is tested, and `BYTECASK_KEYDIR=blind`
-> builds the engine on it with recovery going through a B+ tree (§Steps 2–3
-> results). §Step 1 results has G1 and G2; the numbers elsewhere in this
-> document are the estimates the proposal started from.
+> **Status: built, measured, and the engine's default key directory**
+> (2026-09-24). It describes a key directory beside the keyed B+ tree
+> (`BYTECASK_KEYDIR=btree`) and the radix tree (`BYTECASK_KEYDIR=radix`),
+> for deployments where the number of keys, not the value data, is what
+> runs out of RAM. The tree (`bytecaskdb/blind_btree.cppm`) is tested, the
+> default build puts the engine on it, and recovery merges the hint files
+> straight into its leaves (§R7). The gate results are under §Revised
+> targets and §Point lookups by fingerprint scan; the numbers in the design
+> sections are the estimates the proposal started from.
 
 Baseline for code references: `main` at the time of writing
 (`bytecaskdb/btree.cppm`, `bytecaskdb/bytecask.cppm`,
@@ -537,9 +539,12 @@ engine instantiations, so the hot path stays inlined.
 
 ## Selection
 
-Build-time, as the radix tree is: `BYTECASK_KEYDIR=blind`, and CI runs the
-engine suite on it. A runtime `Options::key_directory` is a follow-up that
-belongs to the pluggable-interface work, not to this tree.
+Build-time. The blind tree is the default; `BYTECASK_KEYDIR=btree` selects
+the keyed B+ tree and `BYTECASK_KEYDIR=radix` the radix tree, and CI runs
+the engine suite on all three. The on-disk format is the same for all of
+them: the blind build recovers from the same hint files, so a database
+opens under any tree. A runtime `Options::key_directory` is a follow-up
+that belongs to the pluggable-interface work, not to this tree.
 
 ## Tests
 
