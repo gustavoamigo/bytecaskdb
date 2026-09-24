@@ -952,3 +952,151 @@ TEST_CASE("DataFile::lend_record rejects a damaged record when verifying",
   file.reset();
   std::filesystem::remove(path);
 }
+
+namespace {
+
+// A record placed so a buffer-pool frame boundary falls inside it: `before`
+// is how many of its bytes come before the boundary.
+struct Straddler {
+  const char *part;
+  std::string key;
+  std::string value;
+  std::size_t before;
+};
+
+// Writes each straddler across its own frame boundary, with a filler record
+// before it to put it there. Returns each straddler's offset.
+auto write_straddlers(bytecask::WritableDataFile &writer,
+                      const std::vector<Straddler> &recs)
+    -> std::vector<bytecask::Offset> {
+  constexpr std::size_t kFrame = bytecask::kPoolFrameBytes;
+  constexpr std::size_t kOverhead = bytecask::kHeaderSize + bytecask::kCrcSize;
+  std::vector<bytecask::Offset> offsets;
+  std::uint64_t seq = 1;
+  std::size_t cur = 0;
+  for (std::size_t i = 0; i < recs.size(); ++i) {
+    const auto boundary = (4 * i + 1) * kFrame;
+    const auto start = boundary - recs[i].before;
+    const auto filler = start - cur - kOverhead - 1;  // key "f"
+    (void)writer.append_entry(seq++, bytecask::EntryType::Put, to_bytes("f"),
+                              to_bytes(std::string(filler, '.')));
+    offsets.push_back(writer.append_entry(seq++, bytecask::EntryType::Put,
+                                          to_bytes(recs[i].key),
+                                          to_bytes(recs[i].value)));
+    REQUIRE(offsets.back() == start);
+    cur = start + kOverhead + recs[i].key.size() + recs[i].value.size();
+  }
+  return offsets;
+}
+
+auto straddlers() -> std::vector<Straddler> {
+  constexpr std::size_t kFrame = bytecask::kPoolFrameBytes;
+  constexpr std::size_t kH = bytecask::kHeaderSize;
+  return {
+      {"header", "hkey", std::string(100, 'h'), 7},
+      {"key", std::string(40, 'k'), std::string(100, 'v'), kH + 20},
+      {"value", "vkey", std::string(300, 'w'), kH + 4 + 150},
+      {"crc", "ckey", std::string(50, 'c'), kH + 4 + 50 + 2},
+      {"several frames", "big", std::string(2 * kFrame + 100, 'b'), 30},
+  };
+}
+
+}  // namespace
+
+// A record or value that crosses a buffer-pool frame boundary — in its
+// header, key, value or CRC, or across several frames — reads the same through
+// lend_record and read_value, verified or not, from a writable file (resident
+// as it was written) and a sealed one (resident after the first pass).
+TEST_CASE("DataFile: records across buffer pool frames read whole",
+          "[data_file][buffer_pool]") {
+  const bool sealed = GENERATE(false, true);
+  CAPTURE(sealed);
+  const auto dir = std::filesystem::temp_directory_path();
+  const auto path = dir / "bc_test_straddle.data";
+  std::filesystem::remove(path);
+  auto pool = std::make_shared<bytecask::BufferPool>(
+      bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20});
+  const auto recs = straddlers();
+  auto writer = bytecask::createDataFileForWrite(
+      dir, "bc_test_straddle", ".data", 1 << 20,
+      bytecask::IoBackend::BufferPool, pool, /*file_id=*/21);
+  const auto offsets = write_straddlers(*writer, recs);
+  writer->sync();
+  std::shared_ptr<bytecask::DataFile> file = writer;
+  if (sealed) {
+    writer->shrink_to_fit();
+    writer.reset();
+    file.reset();
+    file = bytecask::openDataFileForRead(path, bytecask::IoBackend::BufferPool,
+                                         pool, /*file_id=*/22);
+  }
+
+  std::vector<std::byte> io_buf;
+  bytecask::FrameLease lease;
+  for (int pass = 0; pass < 2; ++pass) {
+    for (std::size_t i = 0; i < recs.size(); ++i) {
+      for (const bool verify : {true, false}) {
+        CAPTURE(pass, recs[i].part, verify);
+        const auto view = file->lend_record(offsets[i], 0, verify, io_buf, lease);
+        CHECK(std::ranges::equal(view.key, to_bytes(recs[i].key)));
+        CHECK(std::ranges::equal(view.value, to_bytes(recs[i].value)));
+        lease.reset();
+        std::vector<std::byte> out(3, std::byte{0x5A});  // stale contents
+        file->read_value(offsets[i],
+                         static_cast<std::uint16_t>(recs[i].key.size()),
+                         static_cast<std::uint32_t>(recs[i].value.size()),
+                         verify, io_buf, out);
+        CHECK(std::ranges::equal(out, to_bytes(recs[i].value)));
+      }
+    }
+  }
+  file.reset();
+  std::filesystem::remove(path);
+}
+
+// Damage after the frame boundary is caught by the CRC on the copy that
+// joins the two frames, through lend_record and read_value alike, cold and
+// with the pool warm.
+TEST_CASE("DataFile: a damaged record across pool frames fails verification",
+          "[data_file][buffer_pool]") {
+  const auto dir = std::filesystem::temp_directory_path();
+  const auto path = dir / "bc_test_straddle_crc.data";
+  std::filesystem::remove(path);
+  const std::vector<Straddler> recs{
+      {"value", "vkey", std::string(300, 'w'), bytecask::kHeaderSize + 4 + 150}};
+  bytecask::Offset offset = 0;
+  {
+    auto writer = bytecask::createDataFileForWrite(
+        dir, "bc_test_straddle_crc", ".data", 1 << 20,
+        bytecask::IoBackend::Pread);
+    offset = write_straddlers(*writer, recs)[0];
+    writer->sync();
+    writer->shrink_to_fit();
+  }
+  {
+    // A value byte 10 bytes past the frame boundary.
+    std::fstream f{path, std::ios::in | std::ios::out | std::ios::binary};
+    f.seekp(static_cast<std::streamoff>(bytecask::kPoolFrameBytes + 10));
+    f.put('X');
+  }
+  auto pool = std::make_shared<bytecask::BufferPool>(
+      bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20});
+  auto file = bytecask::openDataFileForRead(
+      path, bytecask::IoBackend::BufferPool, pool, /*file_id=*/23);
+  std::vector<std::byte> io_buf;
+  std::vector<std::byte> out;
+  bytecask::FrameLease lease;
+  for (int pass = 0; pass < 2; ++pass) {
+    CAPTURE(pass);
+    CHECK_THROWS_AS(file->lend_record(offset, 0, true, io_buf, lease),
+                    std::runtime_error);
+    lease.reset();
+    CHECK_THROWS_AS(file->read_value(offset, 4, 300, true, io_buf, out),
+                    std::runtime_error);
+    const auto view = file->lend_record(offset, 0, false, io_buf, lease);
+    CHECK(view.value.size() == 300);
+    lease.reset();
+  }
+  file.reset();
+  std::filesystem::remove(path);
+}
