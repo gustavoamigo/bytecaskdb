@@ -1059,14 +1059,18 @@ the blind tree. Unpinned, the ops ratio equals the cycle ratio, on `Get` and
 `GetMT` alike. The numbers above are unpinned, and so is
 `scripts/run_engine_bench.py`.
 
-Tried again on this machine, on top of the select, and dropped. Cycles per
-`Get` against the select alone, which pinning does not bias:
+Tried on this machine and dropped. Cycles per `Get` against the version each
+was tried on (1,280-byte leaves, the select in place), which pinning does not
+bias:
 
 | Variant | Cycles/call | Outcome |
 |---|---:|---|
 | Branch-free index walk | +43 | Misses fall to the B+ tree's (1.30/call), but the walk's dependent loads can no longer overlap, as argued above |
-| Fifth index level | +35 | Faster on random keys (+4.5% ops), slower on structured ones; +0.2 B/key |
+| Fifth index level | +35 | Halves the scan (10.0 → 4.9 entries; `Leaf::find` −70 instructions), but the inner-node searches gain 100: 102 → 100 entries per leaf moves every split point, and with it the separators the inner nodes search |
 | `key_at` and `read_header` inlined | +6 to +21 | Instructions unchanged |
+| Split leaves at the smallest crit bit within ±16 entries | −13 | −133 instructions and a shorter scan (10.0 → 7.0 entries), but +0.48 branch misses, and leaf fill drops: +11% B/key on random keys, +33% on incremental ones. For recovery's bulk loader, which already chooses fills between 60% and 100%, see #159 |
+| Fixed-length scan, 16 masked steps | +90 | Branch misses −0.27; the wasted steps cost far more |
+| 64-byte function and loop alignment | −6 | Op-cache delivery 36% → 56% of macro-ops; the front end is not the limit. The same flags cost the B+ tree 26 cycles: code layout alone moves it 2–3% |
 
 What remains of G3 is per-call CPU cost: 1,167 cycles against 1,000. The
 gate needs about 1,110.
@@ -1114,6 +1118,70 @@ costs random keys nothing.
 
 1,024 bytes is the leaf size. It spends about 0.3 B/key of G1 (0.2 on random
 keys) on read speed.
+
+### What is left, at 1,024-byte leaves
+
+Instructions per `Get`, sampled on retired instructions over the read loop:
+
+| | B+ tree | Blind |
+|---|---:|---:|
+| `Node::search` | 773 (4 searches, 193 each) | 563 (3 inner searches, 188 each) |
+| `Leaf::find` | — | 295 |
+| `memcmp` | 279 | 285 |
+| All of `Get` | 1,912 | 2,161 |
+
+Inner-node searches now cost what the B+ tree's do: the smaller leaves
+changed the separators they search. What differs is the leaf. AMD IBS,
+which tags single ops and does not skid, puts `Leaf::find` at ~118 cycles
+per `Get`: the index walk ~44, the scan ~61 (6.5 entries on average), the
+fingerprint check and key confirmation ~13. With `find_ref` (descent and
+fingerprint, ~45) the leaf path comes to ~163 cycles, against ~85 for a B+
+tree node search: the largest single part of the ~120 cycles still between
+the trees. The
+rest is spread outside the tree in pieces of about 15 cycles: loading the
+read state, the record read, and the benchmark's clock reads absorbing the
+lookup's tail latency.
+
+**A vectorised scan, tried and dropped.** The query's bit at each boundary's
+crit position does not depend on the other boundaries, so AVX2 can compute
+16 of them at once into a mask (two gathers of 4-byte windows that end at the
+byte needed, so no load leaves the key), leaving only the selection per
+entry: 16 instructions per entry instead of 30. At 6.5 entries that barely
+pays for the vector setup, and the gathers are microcoded on Zen 2: −31
+instructions, +28 cycles, −2.7% ops.
+
+**A HOT-style search, not built.** HOT (Binna et al., SIGMOD 2018) finds
+the match in a node with one extraction of the query's discriminating bits
+and a SIMD comparison against a partial key stored per entry: no chain of
+dependent steps and no data-dependent branches. Replacing the walk and the
+scan (~105 cycles) with a ~40-cycle step would bring `Get` to about 0.95 of
+the B+ tree, and that is the ceiling. It cannot search an 80-entry leaf in
+one step: every boundary adds a discriminating bit, and HOT caps nodes at 32
+entries for that reason. It would mean a leaf of small HOT nodes, with 1–4
+bytes of partial key per entry, +8% to +35% on G1, and gather-free extraction
+on this machine. Not pursued.
+
+**Reads across two buffer-pool frames, tried and dropped** (#158). Serving a
+record or value that straddles 4 KiB frames from the frames' views, without
+the copying fallback, gains the B+ tree 0.4% (within noise) and costs the
+blind tree 1.4%: a straddling read's cost is the per-frame lookups, pins and
+copies, which any correct path keeps (`docs/buffer_pool_design.md`, §9).
+
+### How these were measured
+
+- `engine_bench` with 1M keys and the buffer pool, not pinned to a core.
+  Pinned, another task on the same core takes time from both trees, more
+  per call from the B+ tree, and the ratio comes out 6–8% too high.
+  Unpinned, the ops ratio equals the cycle ratio.
+- Ops/sec: medians of five interleaved runs, all variants built from the
+  same tree, since code layout alone moves a build by 2–3%. Release (LTO)
+  and `releasedbg` builds agree within ~1% per call.
+- Counters per call: the 20M-iteration run minus a 1-iteration run, divided
+  by 20M − 1, which takes the 1M-key populate out.
+- Attribution: AMD IBS for cycles per instruction, and sampling on retired
+  instructions for instructions per function. Sampled `cycles` and
+  `branch-misses` skid across functions on Zen 2; the first profile of this
+  gap relied on them and misattributed both.
 
 ### Revised targets
 
@@ -1174,6 +1242,10 @@ all three trees, and before-and-after numbers on the buffer-pool rows:
   "present" on its own; a caller that tolerates 1-in-16.7M false positives
   could have a separate `probably_contains`, but that is a new API, not a
   change to this one.
+- **Leaf boundaries at short separators in recovery** (#159). The bulk
+  loader could end each leaf at the smallest crit bit within its fill
+  allowance: shorter separators and a shorter scan, without the fill cost
+  that ruled the same rule out for inserts.
 - **Hint-stream recovery for the other trees.** Phase 1–4 of §Bulk load and
   recovery never builds per-worker trees and may beat today's recovery on the
   B+ tree too. Worth measuring once it exists.
