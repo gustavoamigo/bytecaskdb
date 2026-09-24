@@ -872,6 +872,25 @@ bytes in the leaf header (the root boundary and the next three levels'),
 which narrows the scan to the 5–10 entries of one subtree. R6 is what makes
 larger leaves affordable, and larger leaves are what makes R2 and R4 pay off.
 
+**Done: the index, not the two-pass scan.** Each leaf keeps `top[15]`, one
+byte per slot, after the header: the root boundary of each range of the
+leaf's first four trie levels, in heap order, rebuilt after every change to
+the leaf's entries (four passes over its crit bits). A search takes four bit
+tests down it and scans only the range it lands in. The index costs 16 bytes
+per leaf (a 1,280-byte leaf holds 101 entries). `validate()` recomputes it;
+swapping the two children in the walk fails six of the seven tree tests.
+
+`map_bench` at 1,280 bytes, B+ tree in parentheses: `Get` 80 / 81 / 111 ns
+at 1k / 10k / 100k keys (71 / 54 / 89), was 184 / 207 / 226; `LowerBound`
+124 / 113 / 141 (152 / 128 / 166) — faster than the B+ tree. At 2,560 bytes
+four levels leave ranges of about 13 entries and `Get/10000` stays at
+231 ns, so 1,280 stays the leaf size.
+
+`engine_bench`, 1M keys, buffer pool, medians of three interleaved runs,
+ops/sec as a fraction of the B+ tree's: `Get` 0.82 (0.62 before R1),
+`GetMT` 0.82–0.84, `Range50` 0.88, `Put` NoSync 0.91, through `pread` 0.95.
+G3 still misses its 10%.
+
 ### R7. Recovery from sorted hint streams
 
 Step 4, unchanged: removes the build-and-convert through the B+ tree (1.75×

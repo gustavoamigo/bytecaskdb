@@ -123,24 +123,38 @@ export inline auto fingerprint(Bytes k) noexcept -> std::uint32_t {
 // ---------------------------------------------------------------------------
 // Leaf<LeafBytes> — the layout of a blind leaf. A blind leaf is a btree Node
 // with is_leaf set (so the version chain and BuildSession handle it like any
-// other node) whose bytes after the header are two arrays instead of slots
-// and a heap, 12 bytes per entry:
+// other node) whose bytes after the header are an index and two arrays
+// instead of slots and a heap, 12 bytes per entry:
 //
+//   top[15]    u8   the top four levels of the leaf's trie (below)
 //   meta[cap]  u32  crit:20 | fp_lo:12    crit against the previous entry;
 //                                        unused at index 0
 //   loc[cap]   u64  file_id:20 | offset:32 | fp_hi:12
 //
-// The search reads only meta. Capacity follows from the allocation size, so
-// LeafBytes should be a malloc size class.
+// The search reads only top and meta. Capacity follows from the allocation
+// size, so LeafBytes should be a malloc size class.
+//
+// The sorted keys and their crit bits imply a Patricia trie whose root is the
+// boundary with the smallest crit bit, and every subtree of which is a
+// contiguous range of entries. top holds that trie's first four levels in
+// heap order (the children of slot k are 2k+1 and 2k+2): the index of the
+// boundary at the root of each range, 0 for a range of fewer than two
+// entries. A search walks them with four bit tests and scans only the range
+// it lands in — about a sixteenth of a leaf of random keys — instead of the
+// whole leaf.
 // ---------------------------------------------------------------------------
 export template <std::size_t LeafBytes> struct Leaf {
   static constexpr std::size_t kHeader = N::header_bytes();
-  static constexpr std::size_t kCap = (LeafBytes - kHeader - 4) / 12;
-  static constexpr std::size_t kMetaOff = kHeader;
+  static constexpr std::size_t kIndexSlots = 15;
+  static constexpr std::size_t kIndexBytes = 16;
+  static constexpr std::size_t kIndexOff = kHeader;
+  static constexpr std::size_t kMetaOff = kHeader + kIndexBytes;
+  static constexpr std::size_t kCap =
+      (LeafBytes - kMetaOff - 4) / 12;
   static constexpr std::size_t kLocOff = (kMetaOff + 4 * kCap + 7) / 8 * 8;
   static_assert(LeafBytes % 16 == 0);
   static_assert(kLocOff + 8 * kCap <= LeafBytes);
-  static_assert(kCap >= 4 && kCap < N::kNoLastPos);
+  static_assert(kCap >= 4 && kCap < 256, "top indexes entries with a byte");
 
   // Two parallel arrays: one leaf's, or a scratch copy during a split.
   struct Arrays {
@@ -159,6 +173,45 @@ export template <std::size_t LeafBytes> struct Leaf {
   [[nodiscard]] static auto loc(const N *n) noexcept -> const std::uint64_t * {
     return btree_detail::as_ptr<std::uint64_t>(n->bytes() + kLocOff);
   }
+  [[nodiscard]] static auto top(N *n) noexcept -> std::uint8_t * {
+    return btree_detail::as_ptr<std::uint8_t>(n->bytes() + kIndexOff);
+  }
+  [[nodiscard]] static auto top(const N *n) noexcept -> const std::uint8_t * {
+    return btree_detail::as_ptr<std::uint8_t>(n->bytes() + kIndexOff);
+  }
+
+  // The index `top` should hold for the leaf's current entries.
+  static void compute_index(const N *n, std::uint8_t *out) noexcept {
+    const auto *m = meta(n);
+    std::uint32_t lo[kIndexSlots]{};
+    std::uint32_t hi[kIndexSlots]{};
+    hi[0] = n->count;
+    for (std::size_t k = 0; k < kIndexSlots; ++k) {
+      out[k] = 0;
+      if (hi[k] - lo[k] < 2)
+        continue;
+      // The root of [lo, hi) is its boundary with the smallest crit bit;
+      // within one subtree that boundary is unique.
+      auto r = lo[k] + 1;
+      auto best = m[r] >> 12;
+      for (auto i = r + 1; i < hi[k]; ++i) {
+        const auto p = m[i] >> 12;
+        if (p < best) {
+          best = p;
+          r = i;
+        }
+      }
+      out[k] = static_cast<std::uint8_t>(r);
+      if (2 * k + 2 < kIndexSlots) {
+        lo[2 * k + 1] = lo[k];
+        hi[2 * k + 1] = r;
+        lo[2 * k + 2] = r;
+        hi[2 * k + 2] = hi[k];
+      }
+    }
+  }
+  // Called after every change to a leaf's entries.
+  static void build_index(N *n) noexcept { compute_index(n, top(n)); }
 
   [[nodiscard]] static auto crit_at(const N *n, std::uint32_t i) noexcept
       -> std::uint32_t {
@@ -200,20 +253,34 @@ export template <std::size_t LeafBytes> struct Leaf {
   }
 
   // The blind search: a walk of the Patricia trie the sorted keys and their
-  // crit bits imply, done in one branch-free pass. `s` is the crit bit of the
+  // crit bits imply. The index takes it down four levels; the range left is
+  // one subtree, walked in one branch-free pass. `s` is the crit bit of the
   // last left turn still in force; boundaries at or above it are that node's
   // right subtree, which the search did not enter. A right turn enters a
   // subtree and resets it.
   [[nodiscard]] static auto candidate(const N *n, Bytes q) noexcept
       -> std::uint32_t {
     const auto *m = meta(n);
+    const auto *t = top(n);
+    std::uint32_t lo = 0;
+    std::uint32_t hi = n->count;
+    for (std::size_t k = 0; k < kIndexSlots && t[k] != 0;) {
+      const std::uint32_t r = t[k];
+      if (bit(q, m[r] >> 12) != 0) {
+        lo = r;
+        k = 2 * k + 2;
+      } else {
+        hi = r;
+        k = 2 * k + 1;
+      }
+    }
     const std::size_t len = q.size();
     const std::byte zero{};
     const std::byte *d = len > 0 ? q.data() : &zero;
     const std::size_t last = len > 0 ? len - 1 : 0;
-    std::uint32_t c = 0;
+    std::uint32_t c = lo;
     std::uint32_t s = kNoCrit;
-    for (std::uint32_t i = 1; i < n->count; ++i) {
+    for (std::uint32_t i = lo + 1; i < hi; ++i) {
       const auto p = m[i] >> 12;
       const std::size_t bi = p >> kPosShift;
       const auto r = p & 15u;
@@ -309,6 +376,7 @@ export template <std::size_t LeafBytes> struct Leaf {
     copy(a, i, a, i + 1, n->count - i - 1);
     --n->count;
     n->last_pos = N::kNoLastPos;
+    build_index(n);
   }
 
   [[nodiscard]] static auto allocate(std::uint64_t tag) -> N * {
@@ -346,6 +414,7 @@ public:
       auto *leaf = L::allocate(tag_);
       L::write(L::arrays(leaf), 0, 0, fpq, ref);
       leaf->count = 1;
+      L::build_index(leaf);
       return {leaf, nullptr, true, true};
     }
     auto step = [&](N *leaf) {
@@ -384,6 +453,7 @@ private:
       return leaf;
     auto *fresh = L::allocate(tag_);
     L::copy(L::arrays(fresh), 0, L::arrays(leaf), 0, leaf->count);
+    std::memcpy(L::top(fresh), L::top(leaf), L::kIndexBytes);
     fresh->count = leaf->count;
     fresh->last_pos = leaf->last_pos;
     discard(leaf);
@@ -408,6 +478,7 @@ private:
       L::insert_into(L::arrays(n), n->count, p, fpq, ref);
       ++n->count;
       n->last_pos = static_cast<std::uint16_t>(p.idx);
+      L::build_index(n);
       return {n, nullptr, true, true};
     }
     return split_leaf(leaf, p, key, fpq, ref, res);
@@ -458,6 +529,8 @@ private:
     L::copy(L::arrays(right), 0, tmp, m, total - m);
     right->count = total - m;
     L::set_crit(L::arrays(right), 0, 0);
+    L::build_index(left);
+    L::build_index(right);
     if (p.idx < m)
       left->last_pos = static_cast<std::uint16_t>(p.idx);
     else
@@ -840,6 +913,10 @@ private:
         }
         prev.assign(k.begin(), k.end());
       }
+      std::uint8_t expected[L::kIndexSlots];
+      L::compute_index(n, expected);
+      if (std::memcmp(expected, L::top(n), L::kIndexSlots) != 0)
+        fail("leaf index does not match its crit bits");
       if (leaf_depth == 0)
         leaf_depth = depth;
       else if (leaf_depth != depth)
@@ -1092,6 +1169,7 @@ private:
   void seal_leaf() {
     if (!leaf_)
       return;
+    L::build_index(leaf_);
     this->add_child(0, leaf_, sep_);
     leaf_ = nullptr;
     sep_.clear();
