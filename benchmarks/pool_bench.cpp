@@ -68,6 +68,10 @@ struct Config {
   std::size_t value_bytes = 512;
   std::size_t ops = 200'000;
   double zipf_s = 0.99;
+  // Spread Zipf ranks over the key space. Without it rank i is key i, and the
+  // dataset is written in key order, so the hottest keys share frames and
+  // blocks — a layout that flatters block fills and that no real workload has.
+  bool scramble = false;
   std::uint64_t max_file_bytes = 4ULL * 1024 * 1024;
   std::vector<double> ratios = {0.1, 0.25, 0.5, 1.0, 2.0};
   // Thread counts for the multi-reader arm (§8's GetMT criterion). Empty
@@ -112,7 +116,12 @@ auto key_for(std::size_t i) -> std::string { return std::format("key{:09d}", i);
 // trust.
 class Zipf {
 public:
-  Zipf(std::size_t n, double s) : cdf_(n) {
+  Zipf(std::size_t n, double s, bool scramble = false) : cdf_(n) {
+    if (scramble) {
+      // Multiplicative permutation of [0, n): any multiplier coprime with n.
+      mul_ = 2654435761ULL % n;
+      while (std::gcd(mul_, static_cast<std::uint64_t>(n)) != 1) ++mul_;
+    }
     double sum = 0.0;
     for (std::size_t i = 0; i < n; ++i) {
       sum += 1.0 / std::pow(static_cast<double>(i + 1), s);
@@ -123,12 +132,14 @@ public:
 
   auto operator()(std::mt19937_64 &rng) const -> std::size_t {
     const auto u = std::uniform_real_distribution<double>{0.0, 1.0}(rng);
-    return static_cast<std::size_t>(
+    const auto rank = static_cast<std::uint64_t>(
         std::lower_bound(cdf_.begin(), cdf_.end(), u) - cdf_.begin());
+    return static_cast<std::size_t>(rank * mul_ % cdf_.size());
   }
 
 private:
   std::vector<double> cdf_;
+  std::uint64_t mul_{1};
 };
 
 // Page-cache residency of the data files, via mincore. This is the number
@@ -242,7 +253,7 @@ auto measure_impl(const Config &cfg, bytecask::IoBackend backend,
   // A fresh open gives every configuration a cold pool.
   auto db = bytecask::DB::open(cfg.dir, opts);
 
-  const Zipf zipf{cfg.keys, cfg.zipf_s};
+  const Zipf zipf{cfg.keys, cfg.zipf_s, cfg.scramble};
   std::mt19937_64 rng{42};
 
   // Warm to the steady state: a cold-cache transient is a different
@@ -325,7 +336,7 @@ auto measure_mt_impl(const Config &cfg, bytecask::IoBackend backend,
     opts.buffer_pool.direct_io = false;
   }
   auto db = bytecask::DB::open(cfg.dir, opts);
-  const Zipf zipf{cfg.keys, cfg.zipf_s};
+  const Zipf zipf{cfg.keys, cfg.zipf_s, cfg.scramble};
   const auto per_thread = cfg.ops / threads;
 
   // Warm on one thread so every thread starts against the same resident set.
@@ -527,6 +538,7 @@ auto main(int argc, char **argv) -> int {
     else if (a == "--max-file-bytes") cfg.max_file_bytes = parse_size(next());
     else if (a == "--dir") cfg.dir = std::string{next()};
     else if (a == "--zipf") cfg.zipf_s = std::stod(std::string{next()});
+    else if (a == "--scramble") cfg.scramble = true;
     else if (a == "--ratios") {
       cfg.ratios.clear();
       std::string list{next()};
@@ -585,7 +597,7 @@ auto main(int argc, char **argv) -> int {
       }
     } else if (a == "--help") {
       std::puts(
-          "pool_bench [--keys N] [--value-bytes N] [--ops N] [--zipf S]\n"
+          "pool_bench [--keys N] [--value-bytes N] [--ops N] [--zipf S] [--scramble]\n"
           "           [--max-file-bytes N] [--ratios a,b,c] [--dir PATH]\n"
           "           [--mt-threads a,b,c]  (multi-reader arm at ratio 1.0)\n"
           "           [--ryow N]            (N put/get pairs; gets timed)\n"
