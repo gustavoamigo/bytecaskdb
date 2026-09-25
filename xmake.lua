@@ -12,11 +12,11 @@ add_requires("benchmark", {optional = true})
 -- add_requires("leveldb", {optional = true})
 add_requires("rocksdb", {system = true, optional = true})
 
--- Sanitizer option: `xmake f --sanitizer=address`, `--sanitizer=thread`, or `--sanitizer=memory`
+-- Sanitizer option: `xmake f --sanitizer=address`, `--sanitizer=thread`, `--sanitizer=memory`, or `--sanitizer=undefined`
 option("sanitizer")
     set_default("")
     set_showmenu(true)
-    set_description("Enable sanitizer (address, thread, memory, or empty to disable)")
+    set_description("Enable sanitizer (address, thread, memory, undefined, or empty to disable)")
 option_end()
 
 -- MemorySanitizer requires every translation unit — including the C++
@@ -69,6 +69,12 @@ local function apply_sanitizer(t)
         end
         if san == "address" then
             t:add("cxflags", "-fno-omit-frame-pointer", {force = true})
+        end
+        if san == "undefined" then
+            -- UBSan reports and carries on by default; a report must fail
+            -- the run.
+            t:add("cxflags", "-fno-sanitize-recover=undefined", {force = true})
+            t:add("ldflags", "-fno-sanitize-recover=undefined", {force = true})
         end
         if san:find("memory", 1, true) then
             -- Track allocation-site origins for actionable reports; see
