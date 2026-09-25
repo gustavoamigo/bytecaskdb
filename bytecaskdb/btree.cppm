@@ -1081,6 +1081,13 @@ public:
   BulkLoader() = default;
   BulkLoader(const BulkLoader &) = delete;
   auto operator=(const BulkLoader &) -> BulkLoader & = delete;
+  // A loader dropped before finish() or seal() — abandoned, or unwound by an
+  // append that threw — frees the nodes it sealed: no version holds them.
+  ~BulkLoader() {
+    for (auto &level : levels_)
+      for (auto *n : level.children)
+        free_node_subtree_if<ChainTraits<V>>(n, [](N *) { return true; });
+  }
 
   void append(Bytes key, const V &value) {
     if (key.size() > kBTreeMaxKeyBytes)

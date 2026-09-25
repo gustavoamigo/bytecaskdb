@@ -4041,30 +4041,51 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
       new_state->degraded && !old_state->degraded;
 
 #ifndef NDEBUG
-  // Debug-only O(n) checks, sharing one walk: next_seq > max(all key_dir
-  // sequences), and every entry inside its file's committed extent
-  // (invariant P — see "View and span lifetimes" in CONTRACT.md).
-  std::uint64_t max_seq = 0;
-  for (auto it = kd_begin(new_state->key_dir, new_state->kd_ctx(/*verify=*/false));
-       it != std::default_sentinel; ++it) {
-    auto [key_span, entry] = *it;
-    if (entry.sequence() > max_seq) max_seq = entry.sequence();
-    const auto entry_end = entry.file_offset() +
-                           entry_size(key_span.size(), entry.value_size());
-    if (const auto *fs = new_state->file_stats.get(entry.file_id());
-        fs != nullptr && entry_end > fs->total_bytes) {
+  if constexpr (kKeyDirReadsKeys) {
+    // A blind key directory holds locations only: sequences and sizes are
+    // in the records, and reading every one on every publish would make
+    // each debug commit O(n) in disk reads (and fill the buffer pool from
+    // files no reader asked for). What the locations alone show is checked:
+    // every entry starts inside its file's committed extent (invariant P).
+    for (auto it = kd_value_lower_bound(new_state->key_dir, {},
+                                        new_state->kd_ctx(/*verify=*/false));
+         it != std::default_sentinel; ++it) {
+      const auto loc = *it;
+      if (const auto *fs = new_state->file_stats.get(loc.file_id());
+          fs != nullptr && loc.file_offset() >= fs->total_bytes) {
+        deem_as_degraded(std::format(
+            "invariant violation: key in file_id {} starts at {} but the "
+            "file's committed extent is {}",
+            loc.file_id(), loc.file_offset(), fs->total_bytes));
+        return;
+      }
+    }
+  } else {
+    // Debug-only O(n) checks, sharing one walk: next_seq > max(all key_dir
+    // sequences), and every entry inside its file's committed extent
+    // (invariant P — see "View and span lifetimes" in CONTRACT.md).
+    std::uint64_t max_seq = 0;
+    for (auto it = kd_begin(new_state->key_dir, new_state->kd_ctx(/*verify=*/false));
+         it != std::default_sentinel; ++it) {
+      auto [key_span, entry] = *it;
+      if (entry.sequence() > max_seq) max_seq = entry.sequence();
+      const auto entry_end = entry.file_offset() +
+                             entry_size(key_span.size(), entry.value_size());
+      if (const auto *fs = new_state->file_stats.get(entry.file_id());
+          fs != nullptr && entry_end > fs->total_bytes) {
+        deem_as_degraded(std::format(
+            "invariant violation: key in file_id {} ends at {} but the file's "
+            "committed extent is {}",
+            entry.file_id(), entry_end, fs->total_bytes));
+        return;
+      }
+    }
+    if (max_seq > 0 && new_state->next_seq <= max_seq) {
       deem_as_degraded(std::format(
-          "invariant violation: key in file_id {} ends at {} but the file's "
-          "committed extent is {}",
-          entry.file_id(), entry_end, fs->total_bytes));
+          "invariant violation: next_seq {} <= max key_dir sequence {}",
+          new_state->next_seq, max_seq));
       return;
     }
-  }
-  if (max_seq > 0 && new_state->next_seq <= max_seq) {
-    deem_as_degraded(std::format(
-        "invariant violation: next_seq {} <= max key_dir sequence {}",
-        new_state->next_seq, max_seq));
-    return;
   }
 #endif
 

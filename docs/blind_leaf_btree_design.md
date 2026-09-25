@@ -199,8 +199,11 @@ The tree takes the resolver as an argument to each operation that needs one
 and never stores it; the tree module stays free of file I/O and the tests
 drive it with an in-memory resolver.
 
-The engine's resolver reads the header and key of the entry at `loc` through
-the `DataFile` in the state's file registry, so a snapshot resolves against
+The engine's resolver reads the whole record at `loc` through the
+`DataFile` in the state's file registry, and on the write path CRC-checks it.
+The CRC covers header, key and value together, so there is no verified read
+of the key alone: confirming a key reads its value too (§Latency). It resolves
+through the state's file registry, so a snapshot resolves against
 the files it pins. One case needs more: phase 1 of a commit (validate and
 apply) runs **before** the batch's `pwritev`
 (`docs/commit_pipeline_design.md`), so the writer's transient can hold
@@ -378,10 +381,15 @@ preference:
 
 ### Range erase (`del_range`)
 
-Two seeks, `lower_bound(from)` and `lower_bound(to)`, one read each. Every
-entry between the two positions is erased without reading its key, and
-`entry_bytes` gives each one's live-bytes decrement. The disk cost of
-`del_range` stays O(1) in the number of keys it removes.
+Designed: two seeks, `lower_bound(from)` and `lower_bound(to)`, one read
+each. Every entry between the two positions is erased without reading its
+key, and `entry_bytes` gives each one's live-bytes decrement, so the disk
+cost stays O(1) in the number of keys removed.
+
+As built, that is R3 and deferred (#162): the engine walks the range with a keyed
+iterator, which reads each key (to find the range's end and the record's
+size for `live_bytes`), then erases each key by name, which reads it again.
+Two reads per key in the range. The data file still takes one append.
 
 ### Iteration
 
@@ -438,7 +446,7 @@ bounded by `max_file_bytes`, as hint generation does.
 | Vacuum remap (`apply_vacuum`) | Remap when the key still resolves to its old location. The mapping gains the old offset. No read. |
 | `apply_resume`, sequence-wins replay | Read the existing entry's header. `resume()` is rare and already reads the file. |
 | Recovery resolution | From the hint streams, which carry sequences. |
-| Debug invariant "next_seq > max key_dir sequence" | Debug-only walk that reads every header, or dropped. |
+| Debug invariant "next_seq > max key_dir sequence" | Dropped. The debug walk in `DB::store_state` checks only what locations show — every entry starts inside its file's committed extent — and reads nothing. |
 
 The location comparison makes the common path of every guard free of I/O:
 the only reads are on keys that did change, or that vacuum moved in between.
@@ -454,12 +462,13 @@ the only reads are on keys that did change, or that vacuum moved in between.
 | `put`, overwrite | 0 | **1** |
 | `del`, present / absent | 0 / 0 | **1** / 0 |
 | `ensure_unchanged`, W-W, unchanged | 0 | 0 |
-| `del_range` | 0 | **2** |
+| `del_range` | 0 | **2 per key in the range** (2 in all after R3) |
 | `iter_from`, per key | 1 | 1 |
 | `keys_from`, per key | 0 | **1** |
 | vacuum liveness and remap | 0 | 0 |
 
-The reads land on records the writer or a reader touched recently, often in
+Each read is of the whole record, value included (§Key resolution). The
+reads land on records the writer or a reader touched recently, often in
 the active file, which is resident in the page cache and in the buffer pool.
 
 ## Memory
@@ -492,6 +501,14 @@ a cold SATA SSD it is about 100 µs, and a batch of 64 cold reads is several
 milliseconds of serial I/O before the `fdatasync`. The cost per write is
 constant, one read, so latency stays predictable; its variance is the cache
 hit ratio's.
+
+The read is of the whole record, not its header and key, because the CRC
+covers the value too. An overwrite or delete of a key with a large value
+therefore reads and checks that value under the mutex, and an insert does
+the same to its neighbour's: up to `max_value_bytes` (4 MiB by default) per
+write. `engine_bench`'s puts use small values, so its numbers do not show
+this. Reading only the header and key would mean confirming a key without
+verifying it; that trade-off is open (§Open questions).
 
 The fix, if §Gates shows the need: resolve candidates *before* joining the
 group, against the latest published version, and at apply time check that
@@ -1363,6 +1380,13 @@ all three trees, and before-and-after numbers on the buffer-pool rows:
 11. **R8** — location-based guards; resolving before the commit group.
 
 ## Open questions
+
+- **The write path reads whole records.** A key is confirmed by reading and
+  CRC-checking its record, value included (§Latency). A header-and-key read
+  would bound the cost, but it confirms the key without verifying it; a
+  record whose key bytes are damaged would then compare unequal and the
+  write would add a second entry for the key instead of failing. Tracked
+  in #163.
 
 - **Leaf size.** 1,024 bytes (80 entries), §Leaf size, revisited. At 2,560
   the index leaves ranges too long to scan.

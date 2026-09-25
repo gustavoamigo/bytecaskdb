@@ -86,9 +86,11 @@ export inline constexpr std::uint32_t kNoCrit = 0xFFFF'FFFFu;
 // by 9, and the largest (65,534 << 4 | 8) fits the 20 bits a leaf stores.
 export inline constexpr std::uint32_t kPosShift = 4;
 
+// `p` must be an encodable position (r <= 8): every crit bit is.
 export inline auto bit(Bytes k, std::uint32_t p) noexcept -> std::uint32_t {
   const std::size_t i = p >> kPosShift;
   const auto r = p & 15u;
+  assert(r <= 8 && "bit position with r > 8 is not encodable");
   if (i >= k.size())
     return 0;
   if (r == 0)
@@ -761,8 +763,11 @@ private:
       stack_.push_back({cur, idx});
       cur = cur->child(idx);
     }
-    if (!cur || cur->count == 0)
+    if (!cur || cur->count == 0) {
+      // An empty leaf is the end; inner frames left above it would not be.
+      stack_.clear();
       return;
+    }
     const auto p = L::position(cur, target, blind_detail::fingerprint(target),
                                res);
     stack_.push_back({cur, p.idx});
@@ -953,7 +958,7 @@ public:
       if (n->is_leaf) {
         ++st.leaves;
         st.entries += n->count;
-        st.used_bytes += L::kHeader + 16 * std::size_t{n->count};
+        st.used_bytes += L::kMetaOff + 12 * std::size_t{n->count};
         st.leaf_counts.push_back(n->count);
         continue;
       }

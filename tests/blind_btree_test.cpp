@@ -57,7 +57,7 @@ struct MemResolver {
   }
 };
 
-// 33 entries per leaf: small leaves split often, so a few hundred keys make
+// 48 entries per leaf: small leaves split often, so a few hundred keys make
 // a tree three or four levels deep.
 using SmallTree = bytecask::PersistentBlindBTree<640>;
 using Tree = bytecask::PersistentBlindBTree<bytecask::kBlindLeafBytes>;
@@ -142,8 +142,10 @@ TEST_CASE("blind encoding: crit bits agree with byte order", "[blind]") {
       REQUIRE(c == bd::kNoCrit);
       continue;
     }
+    // Only r = 0..8 encode a bit; 9..15 are gaps in the numbering.
     for (std::uint32_t p = 0; p < c; ++p)
-      REQUIRE(bd::bit(to_bytes(a), p) == bd::bit(to_bytes(b), p));
+      if ((p & 15u) <= 8)
+        REQUIRE(bd::bit(to_bytes(a), p) == bd::bit(to_bytes(b), p));
     REQUIRE(bd::bit(to_bytes(a), c) != bd::bit(to_bytes(b), c));
     // The key with the 1 at the crit bit sorts after the other.
     REQUIRE((bd::bit(to_bytes(b), c) == 1) == (a < b));
@@ -392,6 +394,99 @@ TEST_CASE("blind tree: bulk load matches inserting", "[blind]") {
                     std::invalid_argument);
   REQUIRE_THROWS_AS(bad.append(to_bytes("b"), res.ref("b")),
                     std::invalid_argument);
+}
+
+TEST_CASE("blind bulk load: an abandoned loader frees what it sealed",
+          "[blind]") {
+  MemResolver res;
+  const auto foreign = foreign_nodes();
+  std::vector<std::string> keys;
+  for (int i = 0; i < 2'000; ++i)
+    keys.push_back("k" + std::to_string(100'000 + i));
+  {
+    // Out of order after many leaves have been sealed, as a mis-sorted hint
+    // stream would be during recovery.
+    bytecask::BlindBulkLoader<640> loader;
+    for (const auto &k : keys)
+      loader.append(to_bytes(k), res.ref(k));
+    REQUIRE_THROWS_AS(loader.append(to_bytes("a"), res.ref("a")),
+                      std::invalid_argument);
+  }
+  check_accounting(foreign, {});
+  {
+    bytecask::BlindBulkLoader<640> loader{0.6, 1.0};
+    for (const auto &k : keys)
+      loader.append(to_bytes(k), res.ref(k));
+  }
+  check_accounting(foreign, {});
+}
+
+TEST_CASE("blind tree: a refused replacement changes nothing", "[blind]") {
+  MemResolver res;
+  SmallTree t;
+  auto tr = t.transient();
+  const auto first = res.ref("k");
+  tr.set(to_bytes("k"), first, res);
+  const auto refused = tr.upsert(
+      to_bytes("k"), res.fresh("k"), res,
+      [](const BlindRef &, const BlindRef &) { return false; });
+  REQUIRE_FALSE(refused.has_value());
+  REQUIRE(tr.size() == 1);
+  REQUIRE(tr.get(to_bytes("k"), res) == first);
+  t = std::move(tr).persistent();
+  t.validate(res);
+  REQUIRE(t.get(to_bytes("k"), res) == first);
+}
+
+TEST_CASE("blind tree: stepping back from the end of an empty tree",
+          "[blind]") {
+  MemResolver res;
+  SmallTree empty;
+  auto it = empty.end_iter();
+  --it;
+  REQUIRE(it == std::default_sentinel);
+  // Emptied by erasing every key, rather than never filled.
+  auto tr = empty.transient();
+  for (int i = 0; i < 500; ++i)
+    tr.set(to_bytes("k" + std::to_string(1'000 + i)),
+           res.ref("k" + std::to_string(1'000 + i)), res);
+  for (int i = 0; i < 500; ++i)
+    REQUIRE(tr.erase(to_bytes("k" + std::to_string(1'000 + i)), res));
+  const auto emptied = std::move(tr).persistent();
+  emptied.validate(res);
+  auto it2 = emptied.end_iter();
+  --it2;
+  REQUIRE(it2 == std::default_sentinel);
+  REQUIRE(emptied.begin() == std::default_sentinel);
+}
+
+TEST_CASE("blind tree: default-size leaves split on varied keys", "[blind]") {
+  // The engine's leaf size, with keys of mixed length and shared prefixes,
+  // inserted at random: splits at every crit-bit depth.
+  std::mt19937_64 rng{11};
+  MemResolver res;
+  std::map<std::string, BlindRef> model;
+  Tree t;
+  for (int batch = 0; batch < 20; ++batch) {
+    auto tr = t.transient();
+    for (int op = 0; op < 1'000; ++op) {
+      auto k = nasty_key(rng, 24);
+      if (rng() % 5 == 0) {
+        REQUIRE(tr.erase(to_bytes(k), res).has_value() == model.contains(k));
+        model.erase(k);
+      } else {
+        const auto ref = model.contains(k) ? res.fresh(k) : res.ref(k);
+        tr.set(to_bytes(k), ref, res);
+        model[k] = ref;
+      }
+    }
+    t = std::move(tr).persistent();
+    t.validate(res);
+  }
+  REQUIRE(t.size() == model.size());
+  REQUIRE(t.stats().height >= 2);
+  for (const auto &[k, v] : model)
+    REQUIRE(t.get(to_bytes(k), res) == v);
 }
 
 TEST_CASE("blind tree: reads per operation", "[blind]") {
