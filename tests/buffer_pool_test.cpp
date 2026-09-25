@@ -358,8 +358,8 @@ auto rchar() -> long long {
 
 TEST_CASE("BufferPool: a partial miss reads only the missing frames",
           "[buffer_pool]") {
-  // CLOCK evicts frames, not values, so a multi-frame value routinely loses
-  // one frame while the rest stay resident. Re-reading it must fetch the
+  // Eviction takes frames, not values, so a multi-frame value routinely loses
+  // some frames while the rest stay resident. Re-reading it must fetch the
   // frames that are gone and no others; the first version re-read the whole
   // value, which at 2 MiB a value was the difference between a 4 KiB read
   // and a 2 MiB one on every partial miss. The pool is too small for a fill
@@ -380,8 +380,18 @@ TEST_CASE("BufferPool: a partial miss reads only the missing frames",
   pool.read_at(1, file.fd(), 0, v_len, file.size(), v.data());
   REQUIRE(pool.counters().fills.load() == kVFrames);
 
-  // Fill the rest of the pool with one frame each, then keep going so
-  // CLOCK evicts a good fraction of everything — including some of V.
+  // Read the first half of V again, so SIEVE's hand passes those frames and
+  // evicts the unread half — V is the oldest data, and read only once it
+  // would go whole.
+  constexpr std::size_t kKept = kVFrames / 2;
+  for (std::size_t f = 0; f < kKept; ++f) {
+    std::vector<std::byte> head(16);
+    pool.read_at(1, file.fd(), f * bytecask::kPoolFrameBytes, head.size(),
+                 file.size(), head.data());
+  }
+
+  // Fill the rest of the pool with one frame each, then keep going so the
+  // hand evicts a good fraction of everything — including V's unread half.
   std::vector<std::byte> one(16);
   const auto singles = (frames - kVFrames) + frames * 3 / 8;
   for (std::size_t i = 0; i < singles; ++i) {
@@ -401,8 +411,7 @@ TEST_CASE("BufferPool: a partial miss reads only the missing frames",
   // The case this test exists for: some of V went, some stayed. If either
   // bound fails, the eviction pattern changed and the counts below need
   // re-tuning, not the pool.
-  REQUIRE(refilled >= 1);
-  REQUIRE(refilled < static_cast<std::int64_t>(kVFrames));
+  REQUIRE(refilled == static_cast<std::int64_t>(kVFrames - kKept));
   INFO("frames of V refilled: " << refilled << " of " << kVFrames);
   // Only the missing frames were read (+ the /proc read that measured it).
   CHECK(bytes_read <= refilled * static_cast<long long>(bytecask::kPoolFrameBytes) + 4096);
@@ -702,4 +711,41 @@ TEST_CASE("BufferPool: a full pool fills only the frames a miss needs",
   CHECK(one == file.expected(offset, one.size()));
   CHECK(pool.counters().fills.load() - fills_before == 1);
   CHECK(bytes_read <= 2 * static_cast<long long>(bytecask::kPoolFrameBytes));
+}
+
+TEST_CASE("BufferPool: SIEVE keeps a re-read frame and evicts the oldest "
+          "frame read once",
+          "[buffer_pool]") {
+  // Below 8 blocks the pool fills frames only, so admission order is exactly
+  // read order. Every frame is admitted unvisited; a second read marks it.
+  // The hand starts at the oldest frame, passes the marked one (clearing its
+  // mark), and evicts the next — a frame read once and never again.
+  const std::size_t capacity = 512 * 1024;
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
+  const auto n = pool.frame_count();
+  ScratchFile file{(n + 2) * bytecask::kPoolFrameBytes};
+  std::vector<std::byte> one(1);
+  const auto read_frame = [&](std::size_t f) {
+    pool.read_at(1, file.fd(), f * bytecask::kPoolFrameBytes, one.size(),
+                 file.size(), one.data());
+    CHECK(one == file.expected(f * bytecask::kPoolFrameBytes, one.size()));
+  };
+
+  for (std::size_t f = 0; f < n; ++f) read_frame(f);
+  REQUIRE(pool.counters().frames_resident.load() ==
+          static_cast<std::int64_t>(n));
+  REQUIRE(pool.counters().evictions.load() == 0);
+
+  read_frame(0);  // hit: frame 0 is now visited
+  CHECK(pool.counters().hits.load() == 1);
+
+  read_frame(n);  // miss on a full pool: one eviction
+  CHECK(pool.counters().evictions.load() == 1);
+
+  const auto misses = pool.counters().misses.load();
+  read_frame(0);  // survived: the hand cleared its mark and moved on
+  CHECK(pool.counters().misses.load() == misses);
+  read_frame(1);  // the victim: oldest frame never read again
+  CHECK(pool.counters().misses.load() == misses + 1);
 }

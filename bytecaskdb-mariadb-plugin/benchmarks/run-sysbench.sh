@@ -48,8 +48,15 @@
 # The CSV gains read_mib/write_mib — block-layer bytes over the measured run,
 # taken from the instance's cgroup io.stat — plus syscr/syscw, which count
 # read()/write() on every descriptor, client sockets included, and so describe
-# workload shape rather than disk traffic. I/O columns are empty when
-# systemd-run --user --scope is unavailable.
+# workload shape rather than disk traffic. Getting per-instance cgroup
+# accounting needs mariadbd launched into its own systemd scope: either
+# `systemd-run --user --scope` (a logind user session) or, on headless hosts
+# without one, `sudo systemd-run --scope` (passwordless sudo required — see
+# scope_available() in lib_common.sh). I/O columns are empty when neither is
+# available.
+# rss_mib/peak_rss_mib are the server's resident memory at the end of the
+# measured run and its peak during it (the peak mark is reset after the
+# warm-up).
 
 set -euo pipefail
 
@@ -304,6 +311,7 @@ run_bench() {
   # Sample either side of the measured run only, so prepare and warm-up I/O
   # stay out of the numbers.
   local io_before io_after io_cols output eng_before eng_after eng_cols
+  rss_reset "$dir/mariadbd.pid"
   io_before="$(io_sample "$dir/mariadbd.pid")"
   eng_before="$(engine_counters "$engine" "$dir/mysql.sock")"
   # shellcheck disable=SC2086
@@ -312,6 +320,8 @@ run_bench() {
   # Engine counters must be read while the server is still up.
   eng_after="$(engine_counters "$engine" "$dir/mysql.sock")"
   io_after="$(io_sample "$dir/mariadbd.pid")"
+  local rss_cols
+  rss_cols="$(rss_sample "$dir/mariadbd.pid")"
   io_cols="$(io_delta "$io_before" "$io_after")"
   eng_cols="$(eng_delta "$eng_before" "$eng_after")"
 
@@ -340,7 +350,7 @@ run_bench() {
     echo "$output" | tail -20 >&2
   fi
 
-  echo "$engine,$workload,$threads,$tps,$qps,$avg_lat,$p95,$err,$io_cols,$eng_cols,$flush_mib"
+  echo "$engine,$workload,$threads,$tps,$qps,$avg_lat,$p95,$err,$io_cols,$eng_cols,$flush_mib,$rss_cols"
 }
 
 # Echoes the collected CSV row for a cell, or nothing.
@@ -379,7 +389,7 @@ done
 echo ""
 
 echo "=== Phase 2: running workloads ==="
-echo "engine,workload,threads,tps,qps,avg_lat_ms,p95_ms,err_per_s,read_mib,write_mib,syscr,syscw,eng_write_mib,eng_fsyncs,flush_mib" > "$RESULTS_CSV"
+echo "engine,workload,threads,tps,qps,avg_lat_ms,p95_ms,err_per_s,read_mib,write_mib,syscr,syscw,eng_write_mib,eng_fsyncs,flush_mib,rss_mib,peak_rss_mib" > "$RESULTS_CSV"
 declare -a ALL_RESULTS=()
 
 for workload in $WORKLOADS; do
@@ -390,10 +400,11 @@ for workload in $WORKLOADS; do
       result="$(run_bench "$engine" "$workload" "$t")"
       echo "$result" >> "$RESULTS_CSV"
       ALL_RESULTS+=("$result")
-      printf '%8s tps | read %8s MiB | write %8s MiB\n' \
+      printf '%8s tps | read %8s MiB | write %8s MiB | rss %8s MiB\n' \
         "$(cut -d, -f4 <<< "$result")" \
         "$(cut -d, -f9 <<< "$result")" \
-        "$(cut -d, -f10 <<< "$result")"
+        "$(cut -d, -f10 <<< "$result")" \
+        "$(cut -d, -f16 <<< "$result")"
     done
     echo ""
   done
@@ -402,11 +413,18 @@ done
 # ---------------------------------------------------------------------------
 # Throughput / latency table
 # ---------------------------------------------------------------------------
+# Width of an engine's first column: wide enough for its "<engine> <metric>"
+# label, so header and rows line up whichever engines are enabled.
+first_col_width() {
+  local label="$(engine_short "$1") $2" min="$3"
+  echo $(( ${#label} > min ? ${#label} : min ))
+}
+
 echo ""
 header_fmt="%-22s %4s"
 header_args=("Workload" "Thr")
 for engine in "${ACTIVE_ENGINES[@]}"; do
-  header_fmt+=" | %10s %10s %8s %8s"
+  header_fmt+=" | %$(first_col_width "$engine" tps 10)s %10s %8s %8s"
   header_args+=("$(engine_short "$engine") tps" "qps" "avg" "p95")
 done
 # shellcheck disable=SC2059
@@ -418,7 +436,7 @@ for workload in $WORKLOADS; do
     row_args=("$workload" "$t")
     for engine in "${ACTIVE_ENGINES[@]}"; do
       line="$(find_result "$engine" "$workload" "$t")"
-      row_fmt+=" | %10s %10s %8s %8s"
+      row_fmt+=" | %$(first_col_width "$engine" tps 10)s %10s %8s %8s"
       row_args+=("$(cut -d, -f4 <<< "$line")" "$(cut -d, -f5 <<< "$line")" \
                  "$(cut -d, -f6 <<< "$line")" "$(cut -d, -f7 <<< "$line")")
     done
@@ -452,7 +470,7 @@ echo ""
 io_fmt="%-22s %4s"
 io_args=("Workload" "Thr")
 for engine in "${ACTIVE_ENGINES[@]}"; do
-  io_fmt+=" | %8s %8s %8s %8s"
+  io_fmt+=" | %$(first_col_width "$engine" rMiB 8)s %8s %8s %8s"
   io_args+=("$(engine_short "$engine") rMiB" "wMiB" "flMiB" "engMiB")
 done
 # shellcheck disable=SC2059
@@ -464,9 +482,41 @@ for workload in $WORKLOADS; do
     row_args=("$workload" "$t")
     for engine in "${ACTIVE_ENGINES[@]}"; do
       line="$(find_result "$engine" "$workload" "$t")"
-      row_fmt+=" | %8s %8s %8s %8s"
+      row_fmt+=" | %$(first_col_width "$engine" rMiB 8)s %8s %8s %8s"
       row_args+=("$(cut -d, -f9 <<< "$line")" "$(cut -d, -f10 <<< "$line")" \
                  "$(cut -d, -f15 <<< "$line")" "$(cut -d, -f13 <<< "$line")")
+    done
+    # shellcheck disable=SC2059
+    printf "$row_fmt\n" "${row_args[@]}"
+  done
+done
+
+# ---------------------------------------------------------------------------
+# Memory, from /proc/<pid>/status (Linux only; blank elsewhere).
+#   RSS   — resident at the end of the measured run.
+#   peak  — high-water mark during the measured run only: the mark is reset
+#           after the warm-up, so loading and warm-up do not set it.
+# RSS excludes the kernel page cache behind read()/pread(); see rss_sample in
+# lib_common.sh for which engines that understates.
+# ---------------------------------------------------------------------------
+echo ""
+mem_fmt="%-22s %4s"
+mem_args=("Workload" "Thr")
+for engine in "${ACTIVE_ENGINES[@]}"; do
+  mem_fmt+=" | %$(first_col_width "$engine" "RSS MiB" 8)s %8s"
+  mem_args+=("$(engine_short "$engine") RSS MiB" "peak")
+done
+# shellcheck disable=SC2059
+printf "$mem_fmt\n" "${mem_args[@]}"
+
+for workload in $WORKLOADS; do
+  for t in "${THREAD_LIST[@]}"; do
+    row_fmt="%-22s %4s"
+    row_args=("$workload" "$t")
+    for engine in "${ACTIVE_ENGINES[@]}"; do
+      line="$(find_result "$engine" "$workload" "$t")"
+      row_fmt+=" | %$(first_col_width "$engine" "RSS MiB" 8)s %8s"
+      row_args+=("$(cut -d, -f16 <<< "$line")" "$(cut -d, -f17 <<< "$line")")
     done
     # shellcheck disable=SC2059
     printf "$row_fmt\n" "${row_args[@]}"

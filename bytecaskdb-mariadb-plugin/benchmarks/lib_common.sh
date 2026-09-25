@@ -88,18 +88,33 @@ init_datadir() {
 # True when mariadbd can be launched into its own systemd scope, which is what
 # makes per-instance cgroup I/O accounting possible. Probed once and cached;
 # without it the benchmark still runs, but reports no I/O figures.
-BYTECASK_SCOPE_OK=""
+#
+# Two ways to get a scope, tried in order:
+#   user — systemd-run --user --scope against a logind user session (desktop
+#          machines, or a machine with `loginctl enable-linger` for this user).
+#   sudo — systemd-run --scope against the system manager, run under sudo,
+#          with --uid/--gid so mariadbd still runs as the invoking user (its
+#          files stay user-owned and stop_mariadbd's plain `kill` still works).
+#          Needs passwordless sudo; probed with `sudo -n` so it can never block
+#          on a password prompt mid-benchmark. This is the path that works on
+#          headless VMs with no user session bus but a full system manager.
+BYTECASK_SCOPE_MODE=""
 scope_available() {
-  if [[ -z "$BYTECASK_SCOPE_OK" ]]; then
+  if [[ -z "$BYTECASK_SCOPE_MODE" ]]; then
     if command -v systemd-run >/dev/null 2>&1 &&
        systemd-run --user --scope --quiet -p IOAccounting=yes true >/dev/null 2>&1; then
-      BYTECASK_SCOPE_OK=yes
+      BYTECASK_SCOPE_MODE=user
+    elif command -v systemd-run >/dev/null 2>&1 &&
+       sudo -n systemd-run --scope --quiet -p IOAccounting=yes \
+         --uid="$(id -u)" --gid="$(id -g)" true >/dev/null 2>&1; then
+      BYTECASK_SCOPE_MODE=sudo
     else
-      BYTECASK_SCOPE_OK=no
-      echo "WARNING: systemd-run --user --scope unavailable; I/O columns will be empty." >&2
+      BYTECASK_SCOPE_MODE=none
+      echo "WARNING: systemd-run scope unavailable (no user session, no" \
+           "passwordless sudo); I/O columns will be empty." >&2
     fi
   fi
-  [[ "$BYTECASK_SCOPE_OK" == yes ]]
+  [[ "$BYTECASK_SCOPE_MODE" != none ]]
 }
 
 # Starts an ephemeral mariadbd instance and waits for it to accept connections.
@@ -134,9 +149,16 @@ start_mariadbd() {
   # actually wrote — measured at 9354 MiB against a device total of 86 MiB.
   local scope=()
   if scope_available; then
-    scope=(systemd-run --user --scope --quiet
-           --unit="bytecask-bench-${port}-$$-${RANDOM}"
-           -p IOAccounting=yes --)
+    local unit="bytecask-bench-${port}-$$-${RANDOM}"
+    case "$BYTECASK_SCOPE_MODE" in
+      user)
+        scope=(systemd-run --user --scope --quiet
+               --unit="$unit" -p IOAccounting=yes --) ;;
+      sudo)
+        scope=(sudo -n systemd-run --scope --quiet
+               --unit="$unit" -p IOAccounting=yes
+               --uid="$(id -u)" --gid="$(id -g)" --) ;;
+    esac
   fi
 
   local preload=()
@@ -272,6 +294,35 @@ engine_counters() {
         awk '{ v[$1] = $2 } END { print v["Rocksdb_bytes_written"] + 0, 0, 0 }')" ;;
   esac
   echo "${out:-0 0 0}"
+}
+
+# ---------------------------------------------------------------------------
+# Memory
+#
+# Resident set size of the server process, from /proc/<pid>/status. RSS counts
+# the engine's own memory — caches it allocates (InnoDB's buffer pool, the
+# ByteCaskDB key directory and buffer pool, RocksDB's block cache) and any
+# file pages it has mmap'd. It does NOT count the kernel page cache behind
+# plain read()/pread(), so an engine that leans on the page cache (ByteCaskDB
+# with io_backend=pread, RocksDB reading SSTs outside its block cache) uses
+# more memory than its RSS shows.
+# ---------------------------------------------------------------------------
+# Resets the peak-RSS mark (VmHWM) to the current RSS, so a later rss_sample
+# reports the peak over the window that follows rather than since startup.
+rss_reset() {
+  local pid_file="$1" pid=""
+  if [[ -f "$pid_file" ]]; then pid="$(cat "$pid_file" 2>/dev/null)" || true; fi
+  [[ -n "$pid" ]] && echo 5 > "/proc/$pid/clear_refs" 2>/dev/null || true
+}
+
+# Echoes "rss_mib,peak_rss_mib" (VmRSS now, VmHWM since the last rss_reset),
+# or "," when the process or /proc is unavailable (e.g. macOS).
+rss_sample() {
+  local pid_file="$1" pid=""
+  if [[ -f "$pid_file" ]]; then pid="$(cat "$pid_file" 2>/dev/null)" || true; fi
+  if [[ -z "$pid" || ! -r "/proc/$pid/status" ]]; then echo ","; return; fi
+  awk '/^VmRSS:/ { r = $2 } /^VmHWM:/ { h = $2 }
+       END { printf "%.1f,%.1f", r / 1024, h / 1024 }' "/proc/$pid/status"
 }
 
 io_sample() {
