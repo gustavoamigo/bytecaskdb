@@ -153,17 +153,27 @@ so `pending()` is always 0 and backpressure never waits.
 
 ## Measurement
 
-The sweep numbers are above. `engine_bench` could not be run for this
-change: it links RocksDB, which is not installed in the environment the
-change was made in. Its benchmarks also do not exercise hint generation;
-`Recovery` opens a database whose hint files already exist. The sysbench
-`oltp_read_write` scenario from the issue has not been re-run.
+The sweep numbers are above.
 
-## Docs
+`engine_bench` was run on `main` (694b568) and on this change, built with
+`BYTECASK_NO_ROCKSDB=1`, at 50k keys: 5 rounds of each binary, alternated
+so both see the same machine state, on a 4-vCPU VM. It was run twice:
 
-- `docs/bytecask_design.md`: the new scan, the backpressure rule and its
-  invariant, and the new counters.
-- `README.md`: the new option in the API Reference, and the new counters in
-  the operational counters list.
-- `docs/correctness_validation.md`: a short section on lifecycle time bounds
-  that points to this design.
+- With the default 64 MiB files. The dataset is ~14.5 MB, so no timed loop
+  rotates a file, and neither the sweep nor backpressure runs in them.
+  This is the check that nothing else moved.
+- With `BC_MAX_FILE_BYTES=1MiB`, so each timed write loop rotates about 14
+  times and hint sweeps and backpressure run alongside the writes.
+
+No row moved beyond its run-to-run spread in either run. The medians
+differ by -20% to +38%, in both directions, but a single row's five runs
+vary by 10–90% on this machine (widest on `Sync` rows, where `fdatasync`
+dominates). The two runs do not agree on which rows are faster or slower,
+and the timed read loops (`Get`, `GetMT`), which never call the changed
+code, vary as much as the write loops. `Recovery` is the one family that
+came out lower in every thread count in both runs, by 0–6%, inside its
+2–28% spread. Its timed open reads hint files that already exist, and the
+only data file it sweeps is the empty one the previous open left, so the
+change is not expected to move it.
+
+The sysbench `oltp_read_write` scenario from the issue has not been re-run.
