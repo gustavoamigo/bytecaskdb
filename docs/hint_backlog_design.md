@@ -172,8 +172,10 @@ dominates). The two runs do not agree on which rows are faster or slower,
 and the timed read loops (`Get`, `GetMT`), which never call the changed
 code, vary as much as the write loops. `Recovery` is the one family that
 came out lower in every thread count in both runs, by 0–6%, inside its
-2–28% spread. Its timed open reads hint files that already exist, and the
-only data file it sweeps is the empty one the previous open left, so the
+2–28% spread. Its timed opens read hint files that already exist. Apart
+from the very first one, which sweeps the setup's last active file (the
+new scan makes that faster), the only data file an open sweeps is the
+empty one the previous open left, where both versions stop at once. So the
 change is not expected to move it.
 
 The sysbench `oltp_read_write` scenario from the issue has not been re-run.
