@@ -8022,6 +8022,45 @@ TEST_CASE("io_backend=BufferPool: put/get round-trip across rotation",
   CHECK(stats.at("bytecask.pool_hits") > 0);
 }
 
+// Found by the chaos soak (#92). A point read of the active file fetches
+// past the record it wants — a first read sized by a key budget or to the
+// page end — so it reads frame bytes a concurrent append is writing. The
+// file's logical end was stored and loaded relaxed, which ordered nothing,
+// so ThreadSanitizer reported the frame copy racing the read. Under TSan
+// this fails without the release/acquire on WritableFileOps::offset_;
+// elsewhere it is a smoke test of reads against a moving active file.
+TEST_CASE("io_backend=BufferPool: reads of the active file race no append",
+          "[bytecask][buffer_pool][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path, {.max_file_bytes = 8 * 1024 * 1024,
+                .io_backend = bytecask::IoBackend::BufferPool,
+                .buffer_pool = {.capacity_bytes = 32 * 1024 * 1024}});
+  constexpr int kKeys = 64;
+  for (int i = 0; i < kKeys; ++i)
+    db.put({.sync = false}, to_bytes(std::format("k{:03d}", i)),
+           to_bytes(std::format("v{}", i)));
+
+  std::atomic<bool> stop{false};
+  std::thread writer([&] {
+    for (int n = 0; n < 4000; ++n)
+      db.put({.sync = false}, to_bytes(std::format("k{:03d}", n % kKeys)),
+             to_bytes(std::format("v{}", n)));
+    stop.store(true);
+  });
+  bytecask::Bytes out;
+  int reads = 0;
+  while (!stop.load()) {
+    // The most recently written keys: their records sit just below the end
+    // the writer is appending at.
+    CHECK(db.get({.verify_checksums = (reads % 2) == 0},
+                 to_bytes(std::format("k{:03d}", reads % kKeys)), out));
+    ++reads;
+  }
+  writer.join();
+  CHECK(reads > 0);
+}
+
 TEST_CASE("io_backend=BufferPool: values survive recovery",
           "[bytecask][buffer_pool]") {
   TempDir td;
@@ -8749,6 +8788,9 @@ TEST_CASE("pipeline: fdatasync failure fails every writer appended since the "
   CHECK_THROWS_AS(std::rethrow_exception(ea), std::system_error);
   CHECK_THROWS_AS(std::rethrow_exception(eb), std::system_error);
   CHECK(db.is_degraded());
+  // A failed flush publishes its degraded state directly, not through the
+  // checked store; it is still one transition.
+  CHECK(db.stats().at("bytecask.degraded_transitions") == 1);
   CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
   CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
   CHECK(db.contains_key({}, to_bytes("seed")));
@@ -8894,6 +8936,71 @@ TEST_CASE("pipeline: rotation waits for the in-flight flush and then runs as "
   auto v = get_val(db, to_bytes("k2"));
   REQUIRE(v.has_value());
   CHECK(to_string(*v) == big);
+}
+
+// Found by the chaos soak (#92). A rotating batch quiesces behind another
+// writer's flush; when that flush failed, the rotation used to publish its
+// own state — built on the head the failed flush left behind — clearing the
+// degrade without resume() while flush_error_ stayed set. Every later sync
+// writer then got the stale I/O error back, and a conflicting apply_batch
+// waited forever for entries nothing would publish.
+TEST_CASE("pipeline: rotation behind a failed flush stays degraded",
+          "[pipeline][rotation][degraded][resume][concurrency]") {
+  TempDir td;
+  const std::string big(8192, 'x');
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 4096});
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+
+  bytecask::testing::FaultInjector inj;
+  inj.fail_at_name = "io_data_file_sync";
+  FlushGate gate;
+  gate.after_release = [&] { bytecask::testing::active_injector = &inj; };
+  db.test_before_flush_sync_ = gate.hook();
+
+  std::exception_ptr ea;
+  std::exception_ptr eb;
+  std::thread ta([&] {
+    try {
+      (void)db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    } catch (...) {
+      ea = std::current_exception();
+    }
+    bytecask::testing::active_injector = nullptr;
+  });
+  gate.wait_in_flush();
+  // Crosses the threshold: quiesces behind A's flush, which will fail.
+  std::thread tb([&] {
+    try {
+      (void)db.put({.sync = true}, to_bytes("k2"), to_bytes(big));
+    } catch (...) {
+      eb = std::current_exception();
+    }
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+
+  gate.open();
+  ta.join();
+  tb.join();
+  db.test_before_flush_sync_ = nullptr;
+
+  REQUIRE(ea);
+  REQUIRE(eb);
+  CHECK_THROWS_AS(std::rethrow_exception(ea), std::system_error);
+  CHECK_THROWS_AS(std::rethrow_exception(eb), std::system_error);
+  CHECK(db.is_degraded());
+  CHECK(db.stats().at("bytecask.degraded_transitions") == 1);
+  CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
+  CHECK_THROWS_AS(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")),
+                  bytecask::DbDegraded);
+
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  CHECK(db.contains_key({}, to_bytes("k1")));
+  CHECK(db.contains_key({}, to_bytes("k2")));
+  auto r = db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+  CHECK(r.durable);
+  CHECK(db.contains_key({}, to_bytes("k3")));
 }
 
 TEST_CASE("pipeline: a lone writer flushes on its own thread and never blocks",

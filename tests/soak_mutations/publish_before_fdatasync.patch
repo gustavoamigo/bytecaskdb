@@ -1,0 +1,30 @@
+Moves the commit flush's state publication ahead of its fdatasync,
+breaking durability-before-visibility. Named in #92's acceptance list.
+Expected: caught.
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -2896,6 +2896,9 @@
+   if (head->next_seq <= published->next_seq) return;  // nothing pending
+ 
+   const bool need_sync = head->sync_requested_seq > published->durable_seq;
++  auto pub = std::make_shared<EngineState>(*head);
++  pub->durable_seq = need_sync ? head->next_seq - 1 : published->durable_seq;
++  store_state(published, std::move(pub));
+   if (need_sync) {
+ #ifdef BYTECASK_TESTING
+     if (test_before_flush_sync_) test_before_flush_sync_();
+@@ -2909,14 +2912,6 @@
+       return;
+     }
+   }
+-
+-  // Publish the head as it stood before the fdatasync. Entries appended
+-  // since are not claimed: the next flush covers them. O(1): persistent
+-  // roots are shared, only the integers differ. durable_seq is assigned
+-  // here; the head's own value is whatever state it was derived from.
+-  auto pub = std::make_shared<EngineState>(*head);
+-  pub->durable_seq = need_sync ? head->next_seq - 1 : published->durable_seq;
+-  store_state(published, std::move(pub));
+ }
+ 
+ void DB::flush_failed(std::exception_ptr ex,

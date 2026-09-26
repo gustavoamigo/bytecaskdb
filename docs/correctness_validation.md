@@ -1488,6 +1488,135 @@ history are kept under `<dir>/failure/`. `crash-nightly.yml` runs 400
 iterations every night in release and under ASan (with a 5 s kill ceiling,
 since the ASan child is several times slower).
 
+### Chaos soak
+
+The proof matrix covers what can be enumerated. Two things cannot:
+
+- **Interleaving.** Every proof cell is single-threaded. TSan reports
+  only races that execute, so a suite with no overlap between the write
+  path and `vacuum`, `resume`, `set_mode` or `create_manifest` gives it
+  nothing to find there. The exclusion rules between those paths
+  (`WriteBarrier`, the flush role, `vacuum_mu_`) are never exercised by
+  a cell.
+- **Volume.** A cell mints a handful of files. State that only builds up
+  under sustained load — file churn at one write per file, hint worker
+  backlog, key-directory versions pinned by live snapshots — has no cell
+  shape.
+
+`tests/soak_test.cpp` (`[soak]`, hidden from the default run) runs
+readers, writers and a lifecycle thread against one DB for a time
+budget, in epochs. Each epoch draws its configuration from the run seed:
+thread counts, `io_backend`, `max_file_bytes` (including 1),
+`verify_checksums`, `staleness_tolerance`, key and value limits with
+keys and values at those limits, then closes, checks and reopens.
+
+| Thread | Does |
+|---|---|
+| Writers | `put`, `del`, `del_range`, `apply_batch` with and without a snapshot and guards, `sync` and `solo` varied; a snapshot read on each side of its own write |
+| Readers | `get`, `contains_key`, `iter_from`, `riter_from`, `keys_from`, `rkeys_from` on `DB`, and the same through a `Snapshot` whose iterators outlive it; each `EntryView` held across a loop body that does other engine work; now and then one goes idle for over a second, so the read-cache scrape takes its cached state while others write, and its next read races the scrape |
+| Lifecycle | `vacuum`, snapshot churn, `set_mode` round trips, `create_manifest`, an injected fault (commit or rotation `fdatasync`, rotation file creation) held degraded under load, then `resume()`; `stats()`, `durable_sequence()` waits, its own writes |
+
+Each writer owns its keys, so it knows what each one holds except after
+a write that threw an I/O-shaped error, whose bytes `resume()` may or
+may not replay; that key is unknown until the writer's next confirmed
+write to it. Values carry their key, writer, counter and a derived
+payload, so any thread can check any value without coordination. The
+checks: every value is well formed, belongs to the key it was read
+under, and was attempted; a confirmed write reads back exactly; `del`
+and guarded `apply_batch` return what the model predicts; a sync write
+is durable on return, and no reader sees one while `durable_sequence()`
+is below its sequence; `get` never goes back in time on one thread;
+iterators yield ordered keys and held spans keep their bytes; a snapshot
+answers the same way twice and outlives its `DB`; the engine is never
+degraded outside an injected fault, `resume()` always clears one, and
+`degraded_transitions` counts exactly those; reopen with a different
+`recovery_threads` yields exactly what was there before close.
+
+```
+BYTECASK_SOAK_SECONDS=60 BYTECASK_SOAK_SEED=1234 bytecask_tests "[soak]"
+```
+
+`BYTECASK_SOAK_EPOCH` starts at the epoch a failure names,
+`BYTECASK_SOAK_LIFECYCLE=vacuum,degrade,...` narrows the lifecycle
+thread when bisecting, and `BYTECASK_SOAK_KEEP=1` leaves a failed
+epoch's directory on disk. A seed fixes each epoch's configuration and
+every thread's operation sequence, not the interleaving, so it
+reproduces a failure's shape; the failures below recurred when their
+seed and epoch were rerun. `soak-nightly.yml` runs it for 25
+minutes per sanitizer (ASan, TSan) with the run id as the seed.
+
+#### What it found
+
+Its first runs, on `main`, found five engine bugs the proof matrix had
+executed around without being able to fail on, and a sixth the day the
+blind-leaf key directory (#160) merged. Each has a regression test that
+fails without its fix — under TSan, for the last. Five are fixed with
+the soak (#170); the vacuum one is fixed by #171:
+
+| Bug | Symptom | Regression test |
+|---|---|---|
+| A rotating batch quiesced behind another writer's failed flush and published its own state over the degrade, leaving `flush_error_` set under a healthy state | every later sync write got the stale I/O error back; a conflicting `apply_batch` waited forever for entries nothing would publish | `pipeline: rotation behind a failed flush stays degraded` |
+| `vacuum` dropped every file with no live keys without a scan — tombstones included, which never count as live | a key deleted by a tombstone in that file came back at the next open, from a Put in an older file | fixed separately in #171 (#166), which the process-crash harness above (#93, #172) found at the same time; its tests cover it |
+| B+ tree `place()` judged room in an oversized leaf by its capacity, then compacted it into a node sized back down to 4 KiB | heap overflow, then a corrupt key directory (4 KiB keys through `del_range`) | `BTree insert into a compacted oversized leaf` |
+| B+ tree `pack()` took an emptied inner node's prefix from an entry it did not have | garbage prefix, then a crash on the next rebuild | `BTree rebuild of an inner node with no entries` |
+| `degraded_transitions` counted only degrades published through the checked `store_state`; a failed flush, append or rotation sync publishes directly | the counter read 44 after 166 degrades | assertions added to the flush-failure pipeline tests |
+| The active file's logical end was stored and loaded relaxed, but `fetch_record` (new with #160) reads past the record it wants up to that end — into buffer-pool frame bytes a concurrent append is writing | a data race: the blind tree confirms every lookup by reading its record, so every `get` against a busy active file raced the appender | `io_backend=BufferPool: reads of the active file race no append` |
+
+The B+ tree bugs are single-threaded; nothing in the matrix or in
+`btree_test.cpp` put keys near the 4 KiB node size through erase and
+reinsert. `BTree model: keys near the leaf size` now does. Both sit in
+the build session the blind-leaf tree (#160, now the default key
+directory) shares for its inner nodes, where a 4 KiB key becomes a 4 KiB
+separator; the leaf case of the first is specific to
+`BYTECASK_KEYDIR=btree`, which CI still runs.
+
+#### Mutations
+
+A soak earns its nightly cost only if it catches what the matrix
+cannot. `tests/soak_mutations/` holds one-line mutations of the
+engine's synchronization, and `scripts/soak_mutation_check.sh <san>
+[seconds]` applies each, runs the soak under that sanitizer, and fails
+if a mutation expected to be caught survives.
+
+| Mutation | Result |
+|---|---|
+| `publish_before_fdatasync` — the commit flush publishes before its `fdatasync` | caught |
+| `resume_without_write_barrier` — `resume()` without its `WriteBarrier` | caught |
+| `read_cache_release_relaxed` — `ReadCacheSlot::release` store weakened to relaxed | caught, under TSan (a data race); ASan cannot see it |
+| `mmap_end_relaxed` — `mmap_end_` weakened from release/acquire to relaxed | survives, by construction |
+
+Both caught mutations surface first as the engine refusing to derive a
+key-directory version that already has a successor, which the soak
+reports as an unexpected exception from a writer or from `resume()`.
+The soak's durability check did not fire before that on
+`publish_before_fdatasync`: moving the publication moves the published
+`durable_seq` with it, so `durable_sequence()` agrees with what a reader
+sees, and the damage shows only when that flush then fails.
+
+`mmap_end_relaxed` was in #92's acceptance list and is out of reach for
+the same reason BC-122 was for #103's observer axis: not a coverage gap.
+`mmap_end_` orders nothing. The mapping's address and length are fixed
+at construction, and the bytes behind them are written by `pwritev`,
+which no sanitizer models as a memory write. What makes a lowered bound
+safe is offset containment (P in `CONTRACT.md`), which holds whatever
+ordering the load uses, so relaxed is a correct ordering and there is
+nothing to report. `read_cache_release_relaxed` replaces it as the
+weakened-release mutation: that store publishes a reader's writes to its
+read-cache entry to the scrape, which runs on a writer's thread and may
+delete the entry, and only concurrent execution reaches it. It survived
+the first version of the soak, whose threads never went quiet long
+enough for the scrape to take anything (an entry is taken after about a
+second idle); the idle reader was added for it.
+
+#### TSan and shared exceptions
+
+The engine hands one failed flush's exception object to every writer it
+failed, through `exception_ptr`. libstdc++ frees that object, and the
+message buffer its copies share, under a reference count in the
+uninstrumented runtime, so TSan reports a read of it on one thread and
+its release on another as a race. The soak classifies exceptions by type
+and reads `what()` only when reporting a failure.
+
 ---
 
 ## Output Structure

@@ -331,6 +331,100 @@ TEST_CASE("BTree giant keys", "[btree]") {
   check_accounting({&t, &t2});
 }
 
+// Found by the chaos soak (#92) through del_range over 4 KiB keys. A leaf
+// grown past kBTreeLeafBytes for one large key, with an erased entry's dead
+// bytes in it, was judged to have room for a new entry by its own capacity,
+// then compacted by rebuild() into a node sized back down to
+// kBTreeLeafBytes — without the room — and insert_entry wrote past its end.
+TEST_CASE("BTree insert into a compacted oversized leaf", "[btree]") {
+  const std::string big = "k19" + std::string(3961, 'z');  // 3964 bytes
+  SECTION("within one session") {
+    auto tr = Tree{}.transient();
+    tr.set(to_bytes("k23"), 1);
+    tr.set(to_bytes("k19"), 2);
+    tr.set(to_bytes(big), 3);
+    CHECK(tr.erase(to_bytes("k23")));
+    tr.set(to_bytes("k23"), 4);
+    auto t = std::move(tr).persistent();
+    (void)t.validate();
+    CHECK(keys_of(t) == std::vector<std::string>{"k19", big, "k23"});
+    CHECK(t.get(to_bytes("k23")) == 4);
+    check_accounting({&t});
+  }
+  SECTION("into a published, foreign node") {
+    auto tr = Tree{}.transient();
+    tr.set(to_bytes("k23"), 1);
+    tr.set(to_bytes("k19"), 2);
+    tr.set(to_bytes(big), 3);
+    CHECK(tr.erase(to_bytes("k23")));
+    const auto t1 = std::move(tr).persistent();
+    auto tr2 = t1.transient();
+    tr2.set(to_bytes("k23"), 4);
+    const auto t2 = std::move(tr2).persistent();
+    (void)t1.validate();
+    (void)t2.validate();
+    CHECK(keys_of(t1) == std::vector<std::string>{"k19", big});
+    CHECK(keys_of(t2) == std::vector<std::string>{"k19", big, "k23"});
+    check_accounting({&t1, &t2});
+  }
+}
+
+// Also found through the soak: an inner node erased down to its first child
+// keeps its prefix, and rebuilding it — compacting its dead bytes, or
+// shrinking that prefix for a new separator — took the prefix from entry 0,
+// which an empty node does not have. Reduced from the model test below.
+TEST_CASE("BTree rebuild of an inner node with no entries", "[btree]") {
+  const auto k = [](std::string base, std::size_t len) {
+    base.resize(std::max(len, base.size()), 'z');
+    return base;
+  };
+  auto tr = Tree{}.transient();
+  int i = 0;
+  for (const auto &key : {k("k3", 2), k("k12", 3), k("k10", 3926), k("k8", 2),
+                          k("k10", 3924), k("k0", 2), k("k8", 3924),
+                          k("k11", 3), k("k1", 2), k("k10", 3)})
+    tr.set(to_bytes(key), ++i);
+  CHECK(tr.erase(to_bytes("k1")));
+  CHECK(tr.erase(to_bytes("k0")));
+  const auto t1 = std::move(tr).persistent();
+  (void)t1.validate();
+  auto tr2 = t1.transient();
+  tr2.set(to_bytes(k("k0", 3899)), ++i);
+  const auto t2 = std::move(tr2).persistent();
+  (void)t2.validate();
+  CHECK(t2.size() == t1.size() + 1);
+  CHECK(t2.get(to_bytes(k("k0", 3899))) == i);
+  check_accounting({&t1, &t2});
+}
+
+TEST_CASE("BTree model: keys near the leaf size", "[btree]") {
+  for (std::uint64_t seed = 1; seed <= 40; ++seed) {
+    std::mt19937_64 rng{seed};
+    std::map<std::string, int> oracle;
+    Tree t;
+    for (int round = 0; round < 60; ++round) {
+      auto tr = t.transient();
+      for (auto n = rng() % 4 + 1; n > 0; --n) {
+        auto key = "k" + std::to_string(rng() % 24);
+        if (rng() % 3 == 0)
+          key.resize(static_cast<std::size_t>(3900 + rng() % 200), 'z');
+        if (rng() % 3 != 0) {
+          tr.set(to_bytes(key), round);
+          oracle[key] = round;
+        } else {
+          CHECK(tr.erase(to_bytes(key)) == (oracle.erase(key) > 0));
+        }
+      }
+      t = std::move(tr).persistent();
+      (void)t.validate();
+      REQUIRE(t.size() == oracle.size());
+    }
+    std::vector<std::string> want;
+    for (const auto &[k, v] : oracle) want.push_back(k);
+    CHECK(keys_of(t) == want);
+  }
+}
+
 TEST_CASE("BTree ascending inserts fill nodes", "[btree]") {
   std::vector<std::string> keys;
   for (int i = 0; i < 100000; ++i) {

@@ -421,17 +421,23 @@ struct WritableFileOps {
   // Logical end: the next append lands here. Written only under write_mu_,
   // but every point read of the active file loads it (the pool bounds
   // admission by it, and fetch passes it to every back-end alike), so it is
-  // atomic: relaxed on both sides, since a reader only ever asks for offsets
-  // a published state names and needs an untorn value, not an ordering.
+  // atomic. Release/acquire, not relaxed: fetch_record reads past the record
+  // it was asked for — a first read sized by a key budget or to the page
+  // end, bounded only by this — so a reader touches bytes no published state
+  // names, and under the buffer pool those bytes are frame memory an append
+  // wrote. The release in advance() orders that append's frame copy before
+  // any reader that sees the new end (found by the chaos soak, #92). Both
+  // are plain moves on x86.
   std::atomic<Offset> offset_{0};
   [[nodiscard]] auto logical_end() const noexcept -> Offset {
-    return offset_.load(std::memory_order_relaxed);
+    return offset_.load(std::memory_order_acquire);
   }
   void advance(Offset bytes) noexcept {
-    offset_.store(logical_end() + bytes, std::memory_order_relaxed);
+    offset_.store(offset_.load(std::memory_order_relaxed) + bytes,
+                  std::memory_order_release);
   }
   void set_logical_end(Offset end) noexcept {
-    offset_.store(end, std::memory_order_relaxed);
+    offset_.store(end, std::memory_order_release);
   }
   Offset zeroed_end_{0};   // physical end: zeros written through here
   std::size_t capacity_{0};  // zero-fill never extends past this (0 = off)

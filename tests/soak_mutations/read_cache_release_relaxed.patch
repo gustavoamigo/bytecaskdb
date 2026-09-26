@@ -1,0 +1,17 @@
+Weakens ReadCacheSlot::release from release to relaxed. The store publishes
+a reader's writes to its cache entry to the scrape, which runs on a writer's
+thread and may delete the entry. The replacement for the mmap_end_ mutation:
+same class (a weakened release/acquire pair), but one that carries data, so
+only a concurrent run can see it. Expected: caught.
+Sanitizer: thread
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -795,7 +795,7 @@
+     return is_entry(e) ? e : nullptr;
+   }
+   void release(ReadCacheEntry *e) noexcept {
+-    ptr_.store(e, std::memory_order_release);
++    ptr_.store(e, std::memory_order_relaxed);
+   }
+ 
+ private:
