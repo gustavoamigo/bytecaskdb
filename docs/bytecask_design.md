@@ -450,7 +450,7 @@ The two modes follow the same naming conventions used by Azure Cosmos DB and dis
 
 | Mode | `staleness_tolerance` | Same-thread `put` → `get` | Cross-thread staleness | Hot-path cost |
 |------|----------------------|--------------------------|------------------------|---------------|
-| **Session** (default) | `0` | Always sees the put. Refreshes whenever `state_time_` changes — i.e. after any new write, including one just performed by this thread. | None once the write has returned. A read that overlaps the write may miss it (see below). | Single `MOV` + integer compare when cached |
+| **Session** (default) | `0` | Always sees the put. Refreshes whenever a publication is in progress or has completed since the cache was filled, including one just performed by this thread. | None for a write that has returned or that any reader has already seen. A read that overlaps the publication itself may miss it (see below). | Two `MOV`s + integer compares when cached |
 | **Bounded staleness** | `> 0` | **May not see the put.** If a previous write occurred within `staleness_tolerance`, the cached snapshot is returned — even for the thread that just called `put()`. | Up to `staleness_tolerance` after each write. | Single `MOV` + integer compare when cached |
 
 This is analogous to RocksDB's built-in `SuperVersion` thread-local caching, which always provides session consistency with no user-facing knob. ByteCaskDB adds bounded staleness as an opt-in for write-heavy workloads where read throughput matters more than freshness.
@@ -487,31 +487,39 @@ Use this mode when write throughput is high and readers can tolerate bounded sta
 
 ##### Mechanism
 
-The writer timestamps every state publication. After every `state_.store()`, the writer calls `steady_clock::now()` and stores the result in `atomic<int64_t> state_time_` with `memory_order_release`. The read hot path is a single `relaxed` load of `state_time_` (plain `MOV` on x86) — no clock call on the reader side, no locked instruction, no refcount traffic until a refresh is needed.
+Every publication passes through one raw store, which brackets the store of the new state:
 
 ```
-  Writer:  state_.store(S1, seq_cst)             ← new immutable snapshot
-           state_time_.store(now_ns(), release)   ← timestamp the publication
+  Writer:  publishing_.fetch_add(1)                  ← a publication is in progress
+           state_.store(S1, seq_cst)                  ← new immutable snapshot
+           state_gen_.store(next_state_gen(), release) ← process-wide unique generation
+           publishing_.fetch_sub(1, release)
+           state_time_.store(now_ns(), release)       ← (checked publications) for bounded staleness
 
-  Reader:  wt = state_time_.load(relaxed)         ← single MOV on x86
-           if wt - tl.last_write_time > tolerance:
-               tl.snapshot = state_.load()        ← refresh (refcount bump)
-               tl.last_write_time = wt
+  Reader, session (tolerance 0):
+           busy = publishing_.load(acquire); gen = state_gen_.load(acquire)   ← two MOVs on x86
+           if busy != 0 or gen != tl.gen:
+               tl.snapshot = state_.load()            ← refresh (refcount bump)
+               tl.gen = busy ? none : gen
            return tl.snapshot
+
+  Reader, bounded staleness (tolerance > 0):
+           wt = state_time_.load(relaxed)
+           if wt - tl.last_write_time > tolerance: refresh, tl.last_write_time = wt
 ```
 
-##### Cross-thread staleness window (session mode)
+No clock call on the reader side, no locked instruction, no refcount traffic until a refresh is needed.
 
-The writer performs two separate stores in sequence:
+##### Why session mode needs more than a timestamp
 
-```
-  state_.store(S1)                ← step A: publish new state
-  state_time_.store(T1, release)  ← step B: publish new timestamp
-```
+A timestamp stored after the state cannot tell a reader that a publication it has not yet seen finish is already visible elsewhere. Two failures followed from that, and the Elle isolation check found both:
 
-A reader that samples `state_time_` between steps A and B sees the old timestamp `T0`, computes `T0 − T0 = 0 > 0` as false, and returns the old snapshot — even though `S1` is already visible in `state_`. This window is a few nanoseconds wide (two consecutive stores on the same CPU). `memory_order_release` on step B ensures that once a reader observes `T1`, `state_.load()` is guaranteed to see `S1` (via acquire semantics).
+- **A writer returned inside a publication.** With the commit pipeline, the thread that publishes `S1` is whichever thread holds the flush role. A writer polling `state_` in `commit_wait` could see its write covered and return before the publisher stored `state_time_`. Reads that started after the return, on other threads, then served their cached pre-write state. This was fixed in #180 by advancing `state_time_` in `commit_wait`.
+- **A reader saw a publication another reader then missed.** A reader with nothing cached loads `state_` directly and sees `S1`. A reader on another thread, which starts after the first one has finished, compares timestamps, finds nothing new, and serves its cached `S0`. No writer has returned, so nothing on the write side can close this gap. Elle reported it as `G-single-item-realtime` on the leader in the replication check ([`replication_checking_design.md`](replication_checking_design.md)).
 
-That argument holds only while the write is still in flight. With the commit pipeline the thread that publishes `S1` is whichever thread holds the flush role, and a writer waiting in `commit_wait` learns that its write is covered by polling `state_` directly, so it can return to its caller between steps A and B. Every read that starts after that return, on the writer's thread or any other, would compare timestamps, find nothing new, and serve its cached pre-write snapshot, although the write is acknowledged and the contract says it is visible to subsequent reads. So `commit_wait` advances `state_time_` to now (a CAS that never moves it back) before returning a covered write. Once the write has returned, every read refreshes to at least `S1`. The window that remains is between steps A and B for reads that overlap the write itself, before it has returned, which no ordering promises anything about. The Elle isolation check found the cross-thread case as a real-time anomaly ([`isolation_checking_design.md`](isolation_checking_design.md)). Before that, `commit_wait` seeded only the writer's own read cache.
+`publishing_` closes both. It is raised before `state_` is stored. So anyone who has seen `S1`, whether a reader that loaded it or a writer whose commit it covers, happens-after the raise. A read that starts after them therefore finds `publishing_` raised, or finds `state_gen_` moved on because the publication has finished, and reloads. This subsumes #180's fix, which is gone. What remains is the ordinary overlap: a read that runs concurrently with a publication may see either state, as it may under any ordering.
+
+Generations come from a single process-wide counter. A read cache knows its DB only by address, and a new DB can reuse the address of one that was destroyed. A per-DB counter would restart at 0 and could hand the new DB a generation that the cache still holds for the old DB. The cache would then serve the old DB's state. A test sequence that opens a DB at the same stack address in every case reproduced exactly that.
 
 With `staleness_tolerance > 0` the window is irrelevant: the snapshot is held for at least `staleness_tolerance` regardless.
 

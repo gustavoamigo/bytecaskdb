@@ -13,6 +13,7 @@ module;
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <exception>
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
@@ -783,10 +784,25 @@ export struct FileManifest;
 // ---------------------------------------------------------------------------
 export class DB;
 
+inline constexpr auto kNoStateGen = std::numeric_limits<std::uint64_t>::max();
+
+// State generations come from one process-wide counter. A read cache knows
+// its DB only by address, and a new DB can reuse a destroyed one's; a
+// per-DB counter would restart at 0 and could hand the new DB a generation
+// the cache still holds for the old one, which would then serve the old
+// DB's state.
+inline auto next_state_gen() -> std::uint64_t {
+  static std::atomic<std::uint64_t> gen{0};
+  return gen.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 struct ReadCacheEntry {
   const DB *owner{nullptr};  // compared, never dereferenced
   std::shared_ptr<const EngineState> state;
   std::int64_t last_write_time{0};
+  // state_gen_ when state was loaded with no publication in progress;
+  // kNoStateGen otherwise, which never matches.
+  std::uint64_t gen{kNoStateGen};
   // The scrape epoch this entry was last used in. Written by its reader,
   // read by the scrape, hence atomic; nothing else in the entry is touched
   // by anyone but the holder of the claim.
@@ -1190,12 +1206,6 @@ private:
   // One function-local thread_local slot shared by every DB the thread
   // touches, so its entry records its owner.
   [[nodiscard]] static auto read_cache() -> ReadCacheSlot &;
-  // Moves state_time_ forward to now, never back. commit_wait calls it
-  // before returning a covered write: the state covering it may have been
-  // published by another thread that has not yet stored state_time_, and
-  // until then every thread's read cache would keep serving the state from
-  // before the write.
-  void advance_state_time();
   // Claims this thread's slot and returns the guard; the entry behind it
   // holds this DB's state, refreshed when the staleness rule says so.
   [[nodiscard]] auto load_state_for_read(const ReadOptions &opts) const
@@ -1358,9 +1368,22 @@ private:
   // Every publication passes through here — the checked store_state and
   // the degrade paths that publish a degraded copy directly — so this is
   // where a transition into degraded is counted, once.
+  //
+  // It is also where readers learn that the state moved. publishing_ is
+  // raised before the store and state_gen_ bumped after it, so anyone who
+  // has seen the new state (a reader that loaded it, a writer whose commit
+  // it covers) happens-after the raise: a read that starts after them finds
+  // publishing_ raised or state_gen_ moved, and reloads instead of serving
+  // its cached state (see load_state_for_read).
   void store_state(std::shared_ptr<EngineState> s) {
     const bool degraded = s->degraded;
+    publishing_.fetch_add(1, std::memory_order_acq_rel);
     const auto old = std::atomic_exchange(&state_, std::move(s));
+#ifdef BYTECASK_TESTING
+    if (test_between_publish_stores_) test_between_publish_stores_();
+#endif
+    state_gen_.store(next_state_gen(), std::memory_order_release);
+    publishing_.fetch_sub(1, std::memory_order_release);
     if (degraded && old && !old->degraded) {
       counters_.degraded_transitions.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1391,10 +1414,15 @@ private:
   // available in all libc++ versions (e.g. Homebrew LLVM). Use the C++11
   // free-function overloads instead.
   std::shared_ptr<EngineState> state_;
-  // Written (release) by every state_.store() with steady_clock::now().
-  // Stale readers compare this against a thread-local timestamp with a
-  // single relaxed load (plain MOV on x86) to decide whether to refresh.
+  // Written (release) by the checked store_state with steady_clock::now().
+  // Bounded-staleness readers compare it against their cached timestamp.
   std::atomic<std::int64_t> state_time_{0};
+  // Session-mode readers (staleness_tolerance 0) serve their cached state
+  // only while publishing_ is 0 and state_gen_ is the value they cached it
+  // under. Both are maintained by the raw store_state; generations are
+  // unique across DB instances (next_state_gen).
+  std::atomic<std::uint32_t> publishing_{0};
+  std::atomic<std::uint64_t> state_gen_{0};
   // Long-poll condvar for durable_seq advances. Notified by store_state
   // when new_state->durable_seq > old_state->durable_seq.
   mutable std::mutex durable_mu_;
@@ -1443,7 +1471,8 @@ public:
   // append behind it.
   std::function<void()> test_before_flush_sync_;
   // Called by store_state on the publishing thread between the state store
-  // and the state_time_ store. Lets a test hold a publication in that gap.
+  // and the state_gen_ bump, while publishing_ is raised. Lets a test hold a
+  // publication in that gap.
   std::function<void()> test_between_publish_stores_;
   // Called by apply_batch on the writer thread after stage 1, just before
   // commit_wait. Lets a test hold a writer whose entries are already in the
@@ -3048,12 +3077,10 @@ void DB::commit_wait(EngineSlot &slot) {
         : published->next_seq > target;
     if (covered) {
       result.durable = published->durable_seq >= target;
-      // Another thread may have published this state and not yet stored
-      // state_time_. A read that starts after this return, on any thread,
-      // would then compare timestamps, find nothing new and serve its
-      // cached pre-write state, though the write is acknowledged: visible
-      // to subsequent reads is the contract (CONTRACT.md, Consistency).
-      advance_state_time();
+      // Another thread may still be inside the publication that covers this
+      // write. Reads that start after this return reload all the same: this
+      // thread saw the state, so it happens-after the publisher raised
+      // publishing_ (see the raw store_state).
       return;
     }
     {
@@ -3965,11 +3992,12 @@ auto DB::create_manifest() -> FileManifest {
 }
 
 // Returns the engine state from a thread-local cache (read path only).
-// The hot path is a single relaxed load of state_time_ (plain MOV on x86)
-// plus an owner-pointer compare. The snapshot is refreshed only when the
-// last write timestamp exceeds staleness_tolerance (session mode:
-// tolerance=0, refreshes on every write), or when this thread's cache
-// currently holds a different DB instance's generation. Returns a
+// The hot path is three plain loads (state_time_, publishing_, state_gen_;
+// MOVs on x86) plus an owner-pointer compare. Session mode (tolerance 0)
+// refreshes whenever a publication is in progress or has completed since
+// the cache was filled; bounded staleness refreshes when the last write
+// timestamp exceeds the tolerance. An entry holding a different DB
+// instance's state is always refreshed. Returns a
 // reference to the thread-local snapshot. The snapshot stays alive until
 // the same thread calls load_state_for_read again, so callers must not
 // stash the reference across a second load_state_for_read call.
@@ -3981,16 +4009,6 @@ auto DB::read_cache() -> ReadCacheSlot & {
   thread_local ReadCacheSlot tl;
 #pragma clang diagnostic pop
   return tl;
-}
-
-void DB::advance_state_time() {
-  const auto now = now_ns();
-  auto cur = state_time_.load(std::memory_order_relaxed);
-  while (cur < now &&
-         !state_time_.compare_exchange_weak(cur, now,
-                                            std::memory_order_release,
-                                            std::memory_order_relaxed)) {
-  }
 }
 
 auto DB::load_state_for_read(const ReadOptions &opts) const
@@ -4009,15 +4027,29 @@ auto DB::load_state_for_read(const ReadOptions &opts) const
     }
     e->owner = this;
     e->last_write_time = 0;
+    e->gen = kNoStateGen;
   }
   const auto wt = state_time_.load(std::memory_order_relaxed);
   const auto tolerance =
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           opts.staleness_tolerance)
           .count();
-  if (wt - e->last_write_time > tolerance) {
+  if (tolerance <= 0) {
+    // Session mode. A read must see every state published before it began,
+    // and every state another thread has already seen: a timestamp stored
+    // after the state cannot tell a reader that a publication it has not
+    // finished is already visible to others. publishing_ can.
+    const auto busy = publishing_.load(std::memory_order_acquire);
+    const auto gen = state_gen_.load(std::memory_order_acquire);
+    if (busy != 0 || gen != e->gen) {
+      e->state = load_state();
+      e->last_write_time = wt;
+      e->gen = busy != 0 ? kNoStateGen : gen;
+    }
+  } else if (wt - e->last_write_time > tolerance) {
     e->state = load_state();
     e->last_write_time = wt;
+    e->gen = kNoStateGen;
   }
   e->used_epoch.store(ReadCacheRegistry::instance().epoch(),
                       std::memory_order_relaxed);
@@ -4133,9 +4165,6 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
 #endif
 
   store_state(std::move(new_state));
-#ifdef BYTECASK_TESTING
-  if (test_between_publish_stores_) test_between_publish_stores_();
-#endif
   state_time_.store(now_ns(), std::memory_order_release);
 
   // The version this publish superseded is freed once nothing holds it;
