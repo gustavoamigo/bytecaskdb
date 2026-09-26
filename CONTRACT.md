@@ -698,6 +698,7 @@ Applies pre-sequenced entries from a leader to a follower's storage.
 | **Atomicity** | If ingest throws, no partial state is published to readers. |
 | **Causality** | Entries are applied in the sequence order provided by `changes_since`. If entry A has a lower sequence than entry B, A is applied before B. The follower's state reflects the same causal ordering as the leader's write history. |
 | **I/O failure safety** | If any I/O operation throws, the published key directory reflects zero entries from this call. The engine degrades; `resume()` restores normal operation. After resume, re-delivery from `follower.durable_sequence()` proceeds normally. |
+| **Slices end at batch boundaries (caller obligation)** | `ingest` publishes what it is given. A slice that ends between a `BulkBegin` and its `BulkEnd` makes part of an atomic batch visible on the follower until the next slice arrives. The caller must cut slices after a `BulkEnd` or a standalone entry. Not enforced by the engine today ([#188](https://github.com/gustavoamigo/bytecaskdb/issues/188)). |
 
 ## `set_mode` / `mode`
 
@@ -706,6 +707,7 @@ Controls which write paths are available.
 | Property | Contract |
 |----------|----------|
 | **`set_mode(Mode)`** | Acquires `write_mu_` to ensure no in-flight write straddles the transition. Stores mode with release semantics. |
+| **Stepping down is durable** | `set_mode(Follower)` on a leader first `fdatasync`s the active file, so on return `durable_sequence()` covers every write acknowledged before the call, `sync=false` ones included, and `changes_since` can ship them all to the next leader. A failed `fdatasync` degrades the engine and throws; the mode is unchanged. |
 | **`mode()`** | Lock-free atomic read with acquire semantics. Same pattern as `is_degraded()`. |
 | **Leader mode** | Normal writes allowed; `ingest` throws `std::logic_error`. |
 | **Follower mode** | Normal writes (`put`, `del`, `del_range`, `apply_batch`) throw `DbFollowerMode`; `ingest` allowed. Reads, snapshots, vacuum, and `resume()` work in both modes. |

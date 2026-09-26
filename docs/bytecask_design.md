@@ -1696,6 +1696,8 @@ enum class Mode { Leader, Follower };
 
 `set_mode(Mode)` acquires the write mutex to ensure no in-flight write straddles the transition. `mode()` is a lock-free atomic read (acquire semantics), same pattern as `is_degraded()`.
 
+A leader stepping down (`set_mode(Mode::Follower)` from `Leader`) calls `fdatasync` on the active file before it publishes the new mode, and raises `durable_seq` to the last assigned sequence. `changes_since` ships only up to `durable_seq`, so without the sync a write acknowledged with `sync = false` stays unshippable: a planned transfer would complete without it, and the new leader would reuse its sequence (found by the topology replication check, #178). The sync is skipped when nothing is above `durable_seq`. A failed `fdatasync` degrades the engine, publishes nothing else, and rethrows; the mode stays `Leader`, and `resume()` recovers as after any failed commit sync.
+
 ### Leader-side: `durable_sequence`, `create_manifest`, `changes_since`
 
 - `durable_sequence(min_sequence, timeout)` — the single sequence primitive (renamed from `current_sequence` — BC-231). Blocks until the durable sequence reaches at least `min_sequence` or the timeout expires, then returns the durable sequence; `min_sequence = 0`/an already-reached target/a nonpositive timeout return immediately without blocking (useful for polling replicas or waking a replication loop only when the leader is genuinely ahead).

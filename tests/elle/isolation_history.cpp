@@ -96,6 +96,7 @@ struct RunOptions {
   bool lag{false};         // pause replication threads at random
   bool force_vacuum{false}; // leader vacuum on whatever the seed draws
   bool topology{false};     // planned transfers, promotions, re-bootstraps
+  bool promote_least{false}; // unplanned promotion takes the least advanced
 };
 
 // Per-run engine and nemesis configuration, derived from the seed.
@@ -893,29 +894,72 @@ auto planned_transfer(std::vector<std::unique_ptr<Node>> &nodes,
                .durable = target_durable, .other_durable = old_durable});
 }
 
-// Unplanned promotion (Follower Promotion): the target stops tailing and
-// becomes leader where it stands. The old leader is abandoned (writes to
-// it are refused from then on) and re-bootstrapped later. Every other
-// serving node re-targets the new leader; one that is ahead of it is the
-// fork case, recorded with both durable sequences.
+// Unplanned promotion (Follower Promotion). The old leader is taken as
+// lost: every follower is cut off from it, it refuses writes from then on,
+// and any ingest in flight is let finish; then the most advanced follower
+// is promoted where it stands, so no follower holds an entry the new
+// leader lacks. The old leader is abandoned and re-bootstrapped later;
+// the writes it acknowledged above the promoted node's durable sequence
+// are lost. promote_least takes the least advanced follower instead, the
+// protocol with the rule inverted: a follower ahead of the target forks.
 auto unplanned_promotion(std::vector<std::unique_ptr<Node>> &nodes,
-                         ClusterView &view, int target, ClusterStats &stats)
-    -> void {
+                         ClusterView &view, bool promote_least,
+                         ClusterStats &stats) -> void {
   const auto old = view.get().leader;
   auto &on = *nodes[static_cast<std::size_t>(old)];
+  view.update([&](View &v) {
+    v.serving[static_cast<std::size_t>(old)] = false;
+    std::ranges::fill(v.source, -1);
+  });
+  // The old leader stops taking writes now, as a crashed one would. What it
+  // acknowledged beyond what reached a follower is lost.
+  {
+    auto g = enter(on);
+    if (g.owns_lock()) on.holder->db.set_mode(bytecask::Mode::Follower);
+  }
+  // replicate() reads the view under the node's gate: once the gate has
+  // been held exclusively, no ingest from the old leader is left running.
+  std::vector<int> candidates;
+  std::vector<std::uint64_t> durables;
+  for (std::size_t i = 0; i < nodes.size(); ++i) {
+    const auto id = static_cast<int>(i);
+    if (id == old) continue;
+    NodeExclusive x{*nodes[i]};
+    if (!nodes[i]->holder) continue;
+    candidates.push_back(id);
+    durables.push_back(nodes[i]->holder->db.durable_sequence());
+  }
+  if (candidates.empty()) {
+    // Nothing to promote: the old leader is still the only one up.
+    {
+      auto g = enter(on);
+      if (g.owns_lock()) on.holder->db.set_mode(bytecask::Mode::Leader);
+    }
+    view.update([&](View &v) {
+      v.serving[static_cast<std::size_t>(old)] = true;
+      for (std::size_t i = 0; i < v.source.size(); ++i) {
+        if (static_cast<int>(i) != old && v.serving[i]) v.source[i] = old;
+      }
+    });
+    return;
+  }
+  std::size_t pick = 0;
+  for (std::size_t i = 1; i < candidates.size(); ++i) {
+    if (promote_least ? durables[i] < durables[pick]
+                      : durables[i] > durables[pick])
+      pick = i;
+  }
+  const auto target = candidates[pick];
   auto &tn = *nodes[static_cast<std::size_t>(target)];
   int epoch = 0;
   std::uint64_t promoted_at = 0;
   {
     NodeExclusive x{tn};
-    view.update([&](View &v) { at(v.source, target) = -1; });
     promoted_at = tn.holder->db.durable_sequence();
     tn.holder->db.set_mode(bytecask::Mode::Leader);
     view.update([&](View &v) {
       v.leader = target;
       epoch = ++v.epoch;
-      v.serving[static_cast<std::size_t>(old)] = false;
-      at(v.source, old) = -1;
       for (std::size_t i = 0; i < v.source.size(); ++i) {
         if (static_cast<int>(i) != target && v.serving[i])
           v.source[i] = target;
@@ -924,10 +968,6 @@ auto unplanned_promotion(std::vector<std::unique_ptr<Node>> &nodes,
   }
   stats.event({.kind = "unplanned", .epoch = epoch, .from = old, .to = target,
                .durable = promoted_at, .other_durable = 0});
-  {
-    auto g = enter(on);
-    if (g.owns_lock()) on.holder->db.set_mode(bytecask::Mode::Follower);
-  }
   const auto v = view.get();
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto id = static_cast<int>(i);
@@ -1019,6 +1059,8 @@ auto parse_args(int argc, char **argv) -> RunOptions {
       o.force_vacuum = true;
     } else if (a == "--topology") {
       o.topology = true;
+    } else if (a == "--promote-least") {
+      o.promote_least = true;
     } else {
       throw std::runtime_error{std::format("unknown argument {}", a)};
     }
@@ -1040,13 +1082,14 @@ auto run(const RunOptions &o) -> int {
 
   std::printf("isolation_history: config=%s seed=%llu threads=%d txns=%d "
               "backend=%s max_file_bytes=%llu sync%%=%d vacuum=%d degrade=%d "
-              "followers=%d lag=%d topology=%d\n",
+              "followers=%d lag=%d topology=%d promote_least=%d\n",
               mode_name(o.mode).data(),
               static_cast<unsigned long long>(o.seed), o.threads, o.txns,
               backend_name(cfg.backend).data(),
               static_cast<unsigned long long>(cfg.max_file_bytes),
               cfg.sync_percent, cfg.vacuum ? 1 : 0, cfg.degrade ? 1 : 0,
-              o.followers, o.lag ? 1 : 0, o.topology ? 1 : 0);
+              o.followers, o.lag ? 1 : 0, o.topology ? 1 : 0,
+              o.promote_least ? 1 : 0);
   std::fflush(stdout);
 
   // Node 0 opens as the leader; every other node is bootstrapped from the
@@ -1236,9 +1279,9 @@ auto run(const RunOptions &o) -> int {
     }
   }
 
-  // Topology: once every follower is up, planned transfers and unplanned
-  // promotions to a random serving node, and re-bootstrap of any node an
-  // unplanned promotion abandoned.
+  // Topology: once every follower is up, planned transfers to a random
+  // node and unplanned promotions of the most advanced one, and
+  // re-bootstrap of any node an unplanned promotion abandoned.
   auto rebootstrap_abandoned = [&] {
     const auto v = view.get();
     for (int i = 0; i < node_count; ++i) {
@@ -1271,15 +1314,15 @@ auto run(const RunOptions &o) -> int {
           rebootstrap_abandoned();
           continue;
         }
-        const auto v = view.get();
-        std::vector<int> candidates;
-        for (int i = 0; i < node_count; ++i)
-          if (i != v.leader) candidates.push_back(i);
-        const auto target = candidates[orng() % candidates.size()];
         if (orng() % 2 == 0) {
+          const auto v = view.get();
+          std::vector<int> candidates;
+          for (int i = 0; i < node_count; ++i)
+            if (i != v.leader) candidates.push_back(i);
+          const auto target = candidates[orng() % candidates.size()];
           planned_transfer(nodes, view, target, cluster);
         } else {
-          unplanned_promotion(nodes, view, target, cluster);
+          unplanned_promotion(nodes, view, o.promote_least, cluster);
         }
       }
     }};
@@ -1340,10 +1383,22 @@ auto run(const RunOptions &o) -> int {
       const auto deadline = Clock::now() + std::chrono::seconds(20);
       while (durable_of(node(i)).value_or(0) < target) {
         if (Clock::now() >= deadline) {
+          // What the leader would send it: the first entries past where it
+          // stands, to tell a stream that is empty from one that is refused.
+          const auto at_seq = durable_of(node(i)).value_or(0);
+          std::string head;
+          std::int64_t count = 0;
+          auto snap = leader_db.snapshot();
+          for (const auto &e : leader_db.changes_since(snap, at_seq)) {
+            if (count < 8)
+              head += std::format(" {}:{}", e.sequence,
+                                  static_cast<int>(e.entry_type));
+            ++count;
+          }
           cluster.error(std::format(
               "node {}: stuck at durable sequence {} below the leader's {} "
-              "(node {}) after 20s",
-              i, durable_of(node(i)).value_or(0), target, final_leader));
+              "(node {}) after 20s; changes_since yields {} entries:{}",
+              i, at_seq, target, final_leader, count, head));
           break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));

@@ -8,7 +8,7 @@ docs/replication_checking_design.md.
 Usage:
     python3 scripts/run_isolation_check.py --binary PATH [--elle-jar PATH]
         [--seed S] [--rounds N] [--txns N] [--threads N] [--out DIR]
-        [--no-vacuum] [--no-degrade] [--cluster]
+        [--no-vacuum] [--no-degrade] [--cluster] [--topology]
 
 Each round runs the three configurations from one seed:
 
@@ -34,6 +34,19 @@ and restarts, and read from), in two configurations:
                     over the run: a follower resuming below a compacted file
                     receives a batch with entries missing.
 
+With --topology each round runs the same cluster while leadership moves:
+planned transfers to a random node, unplanned promotions, re-targeting of
+every follower to the new leader, and re-bootstrap of the abandoned one. The
+old leader's writes that an unplanned promotion lost are relabelled :info.
+
+    topology         an unplanned promotion takes the most advanced follower.
+                     Must pass everything the cluster configuration does.
+    topology-behind  an unplanned promotion takes the least advanced
+                     follower. A follower ahead of the new leader keeps writes
+                     the leader lost, and at least one round over the run has
+                     to detect that fork. Once the forked node leads in turn, the fork
+                     reaches the leader history, so any finding counts.
+
 Without --elle-jar only the cross-check runs. Exit status is non-zero on any
 failed expectation. Histories and Elle's output stay under --out.
 """
@@ -52,7 +65,7 @@ from pathlib import Path
 
 CONFIGS = ("guarded", "unguarded", "blind")
 CLUSTER_CONFIGS = ("cluster", "cluster-vacuum")
-TOPOLOGY_CONFIGS = ("topology",)
+TOPOLOGY_CONFIGS = ("topology", "topology-behind")
 
 # Anomalies write skew may show up as under strict-serializable. Anything
 # else in the unguarded configuration is a bug in the implicit W-W check or
@@ -191,8 +204,10 @@ def relabel_lost_writes(history: list[dict], summary: dict) -> int:
     durable_sequence() in its last term are lost by design, and so is
     anything its clients read of them. Those :ok operations become :info
     with their reads cleared, which Elle and the cross-checks accept either
-    way. A lost write that shows up on another node is still caught: only
-    operations on the old leader are relabelled. Returns how many.
+    way. A session read there that waited above that sequence waited on the
+    lost branch, so its wait is capped at it. A lost write that shows up on
+    another node is still caught: only operations on the old leader are
+    relabelled. Returns how many.
     """
     changed = 0
     for ev in summary.get("events", []):
@@ -208,6 +223,11 @@ def relabel_lost_writes(history: list[dict], summary: dict) -> int:
                 lost_elements.update(
                     m[2] for m in op["value"] if m[0] == "append")
         for op in tenure:
+            # A session read there waited on the lost branch: sequences above
+            # durable were reassigned by the new leader. What it waited for
+            # still holds up to durable.
+            if op.get("wait", 0) > durable:
+                op["wait"] = durable
             wrote_lost = any(m[0] == "append" and m[2] in lost_elements
                              for m in op["value"])
             read_lost = any(m[0] == "r" and set(m[2] or []) & lost_elements
@@ -352,8 +372,10 @@ def check_cluster_round(args: argparse.Namespace, seed: int,
                "--out", str(history_path)]
         cmd.append("--force-vacuum" if config == "cluster-vacuum"
                    else "--no-vacuum")
-        if config == "topology":
+        if config.startswith("topology"):
             cmd.append("--topology")
+        if config == "topology-behind":
+            cmd.append("--promote-least")
         if args.no_degrade:
             cmd.append("--no-degrade")
         subprocess.run(cmd, check=True)
@@ -402,6 +424,11 @@ def check_cluster_round(args: argparse.Namespace, seed: int,
             if leader_problems or not leader_valid:
                 raise CheckFailed(f"{config}: leader checks failed")
             args.v168_seen |= bool(problems) or elle_found
+        elif config == "topology-behind":
+            # A forked follower can later lead, so the fork may show in the
+            # leader history too: any finding counts.
+            args.fork_seen |= (bool(leader_problems) or not leader_valid
+                               or bool(problems) or elle_found)
         elif leader_problems or not leader_valid or problems or elle_found:
             raise CheckFailed(f"{config}: checks failed")
 
@@ -499,6 +526,7 @@ def main() -> int:
     shutil.rmtree(args.out, ignore_errors=True)
     args.write_skew_seen = False
     args.v168_seen = False
+    args.fork_seen = False
     rng = random.Random(seed)
     try:
         for r in range(args.rounds):
@@ -513,6 +541,10 @@ def main() -> int:
             raise CheckFailed(
                 "cluster-vacuum: no round detected #168; the harness is not "
                 "shown to be sensitive to gaps in changes_since")
+        if args.topology and not args.fork_seen:
+            raise CheckFailed(
+                "topology-behind: no round detected a fork; the harness is "
+                "not shown to be sensitive to a follower ahead of its leader")
         if (args.elle_jar and not args.cluster and not args.topology
                 and not args.write_skew_seen):
             raise CheckFailed(

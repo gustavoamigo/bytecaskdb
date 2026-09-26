@@ -7445,6 +7445,47 @@ TEST_CASE("set_mode transitions: leader -> follower -> leader", "[replication]")
   REQUIRE(db.get({}, to_bytes("k"), out));
 }
 
+TEST_CASE("set_mode(Follower) makes unsynced acknowledged writes durable",
+          "[replication]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+
+  db.put({.sync = true}, to_bytes("a"), to_bytes("1"));
+  const auto synced = db.durable_sequence();
+  const auto r = db.put({.sync = false}, to_bytes("b"), to_bytes("2"));
+  REQUIRE_FALSE(r.durable);
+  REQUIRE(db.durable_sequence() < r.sequence);
+
+  db.set_mode(bytecask::Mode::Follower);
+  CHECK(db.durable_sequence() >= r.sequence);
+  CHECK(db.durable_sequence() > synced);
+
+  // What stepping down made durable is what a new leader can be sent.
+  auto snap = db.snapshot();
+  auto shipped = false;
+  for (const auto &e : db.changes_since(snap, synced)) {
+    if (e.sequence == r.sequence) shipped = true;
+  }
+  CHECK(shipped);
+}
+
+TEST_CASE("set_mode(Follower): a failed fdatasync degrades and keeps the mode",
+          "[replication]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto r = db.put({.sync = false}, to_bytes("b"), to_bytes("2"));
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    CHECK_THROWS_AS(db.set_mode(bytecask::Mode::Follower), std::system_error);
+  }
+  CHECK(db.is_degraded());
+  CHECK(db.mode() == bytecask::Mode::Leader);
+  CHECK(db.durable_sequence() < r.sequence);
+  REQUIRE_NOTHROW(db.resume());
+  db.set_mode(bytecask::Mode::Follower);
+  CHECK(db.mode() == bytecask::Mode::Follower);
+}
+
 TEST_CASE("basic ingest: entries from changes_since are ingested correctly",
           "[replication]") {
   TempDir td;
