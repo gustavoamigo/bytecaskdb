@@ -1,0 +1,132 @@
+# SPDX-License-Identifier: MIT
+# Nightly isolation check: tests/elle/isolation_history.cpp records concurrent
+# list-append transaction histories, and scripts/run_isolation_check.py checks
+# them with Elle (elle-cli) and a direct commit-sequence cross-check. See
+# docs/isolation_checking_design.md.
+#
+# ci.yml only compiles the generator on every push/PR. The timed run lives
+# here, on a schedule plus manual dispatch, and on every update of a PR that
+# changes the harness itself. The run's seed is printed first; rerun with
+# --seed to replay the same workloads (thread interleaving still varies).
+
+name: Isolation check (nightly)
+
+on:
+  schedule:
+    - cron: "10 4 * * *"
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "Rounds per job (three histories each)"
+        default: "4"
+      seed:
+        description: "Seed to replay (empty = random)"
+        default: ""
+  pull_request:
+    branches: [main]
+    paths:
+      - "tests/elle/**"
+      - "scripts/run_isolation_check.py"
+      - ".github/workflows/isolation-nightly.yml"
+
+permissions:
+  contents: read
+
+env:
+  # elle-cli publishes no releases; the jar is built from this commit and
+  # cached on it.
+  ELLE_CLI_REF: 9c2a18b3719f573dab06ae05c955c9c9d5225673
+
+jobs:
+  isolation:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+      CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            mode: releasedbg
+            sanitizer: ""
+            txns: 50000
+          - name: asan
+            mode: debug
+            sanitizer: address
+            # ASan runs the engine several times slower; a smaller history
+            # keeps the job inside the same budget.
+            txns: 20000
+    name: isolation (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel \
+            xmake \
+            python3-pip python3-devel \
+            git ninja-build \
+            java-21-openjdk-headless \
+            graphviz
+          # xmake f loads every target, and bytecaskdb_python's on_load asks
+          # nanobind for its include dir. graphviz: elle-cli renders every
+          # cycle it finds with dot, including the write skew the unguarded
+          # configuration is expected to show, and crashes without it.
+          pip3 install nanobind
+
+      - name: Cache elle-cli
+        id: elle-cache
+        uses: actions/cache@v4
+        with:
+          path: elle-cli.jar
+          key: elle-cli-${{ env.ELLE_CLI_REF }}
+
+      - name: Build elle-cli
+        if: steps.elle-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSLo /usr/local/bin/lein \
+            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein
+          chmod +x /usr/local/bin/lein
+          git clone https://github.com/ligurio/elle-cli "$RUNNER_TEMP/elle-cli"
+          cd "$RUNNER_TEMP/elle-cli"
+          git checkout "$ELLE_CLI_REF"
+          lein uberjar
+          cp target/elle-cli-*-standalone.jar "$GITHUB_WORKSPACE/elle-cli.jar"
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          SAN=""
+          if [ -n "${{ matrix.sanitizer }}" ]; then SAN="--sanitizer=${{ matrix.sanitizer }}"; fi
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            $SAN -m ${{ matrix.mode }} -y
+
+      - name: Build
+        run: xmake build isolation_history
+
+      - name: Run isolation check
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          ROUNDS: ${{ github.event.inputs.rounds || '4' }}
+          SEED: ${{ github.event.inputs.seed || '' }}
+        run: |
+          ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
+          ARGS="$ARGS --elle-jar elle-cli.jar --rounds $ROUNDS"
+          ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation"
+          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
+          python3 scripts/run_isolation_check.py $ARGS
+
+      - name: Upload histories and Elle output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolation-failure-${{ matrix.name }}
+          path: ${{ runner.temp }}/isolation
+          if-no-files-found: ignore

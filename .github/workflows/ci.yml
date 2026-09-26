@@ -56,8 +56,10 @@ jobs:
           xmake build btree_tests
           xmake build radix_tree_memory_tests
           xmake build unordered_view_tests
-          # Built here so a break shows up on the PR; it runs in crash-nightly.yml.
+          # Built here so a break shows up on the PR; they run in
+          # crash-nightly.yml and isolation-nightly.yml.
           xmake build crash_consistency
+          xmake build isolation_history
 
       - name: Run tests and generate JUnit reports
         run: |

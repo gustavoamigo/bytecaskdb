@@ -1188,10 +1188,14 @@ private:
   // State access helpers — raw state_ / state_time_ access is confined here.
   // Per-thread read cache behind load_state_for_read (see ReadCacheSlot).
   // One function-local thread_local slot shared by every DB the thread
-  // touches, so its entry records its owner. commit_wait seeds it with the
-  // state that covered the thread's own write — see there for why the
-  // timestamp alone is not enough.
+  // touches, so its entry records its owner.
   [[nodiscard]] static auto read_cache() -> ReadCacheSlot &;
+  // Moves state_time_ forward to now, never back. commit_wait calls it
+  // before returning a covered write: the state covering it may have been
+  // published by another thread that has not yet stored state_time_, and
+  // until then every thread's read cache would keep serving the state from
+  // before the write.
+  void advance_state_time();
   // Claims this thread's slot and returns the guard; the entry behind it
   // holds this DB's state, refreshed when the staleness rule says so.
   [[nodiscard]] auto load_state_for_read(const ReadOptions &opts) const
@@ -3045,25 +3049,11 @@ void DB::commit_wait(EngineSlot &slot) {
     if (covered) {
       result.durable = published->durable_seq >= target;
       // Another thread may have published this state and not yet stored
-      // state_time_: a read on this thread would compare timestamps, find
-      // nothing new and serve its cached pre-write snapshot. Seed the
-      // cache with the covering state instead. last_write_time is left as
-      // is: once the timestamp lands the next read refreshes as usual.
-      {
-        auto &slot = read_cache();
-        auto *e = slot.claim();
-        if (e == nullptr) {
-          e = new ReadCacheEntry();
-        }
-        if (e->owner != this) {
-          e->owner = this;
-          e->last_write_time = 0;
-        }
-        e->state = std::move(published);
-        e->used_epoch.store(ReadCacheRegistry::instance().epoch(),
-                            std::memory_order_relaxed);
-        slot.release(e);
-      }
+      // state_time_. A read that starts after this return, on any thread,
+      // would then compare timestamps, find nothing new and serve its
+      // cached pre-write state, though the write is acknowledged: visible
+      // to subsequent reads is the contract (CONTRACT.md, Consistency).
+      advance_state_time();
       return;
     }
     {
@@ -3991,6 +3981,16 @@ auto DB::read_cache() -> ReadCacheSlot & {
   thread_local ReadCacheSlot tl;
 #pragma clang diagnostic pop
   return tl;
+}
+
+void DB::advance_state_time() {
+  const auto now = now_ns();
+  auto cur = state_time_.load(std::memory_order_relaxed);
+  while (cur < now &&
+         !state_time_.compare_exchange_weak(cur, now,
+                                            std::memory_order_release,
+                                            std::memory_order_relaxed)) {
+  }
 }
 
 auto DB::load_state_for_read(const ReadOptions &opts) const

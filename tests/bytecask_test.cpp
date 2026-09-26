@@ -9322,6 +9322,75 @@ TEST_CASE("pipeline: a writer whose write another thread published sees it "
   CHECK(db.contains_key({}, to_bytes("t")));
 }
 
+// Found by the Elle isolation check (docs/isolation_checking_design.md) as
+// G-single-item-realtime: a transaction that began after another returned
+// read state from before that write. The gap is the one above, seen from a
+// third thread: a write is "visible to subsequent reads" (CONTRACT.md), and
+// a read that starts after put() returned is subsequent, whichever thread
+// makes it.
+TEST_CASE("pipeline: a write another thread published is visible to every "
+          "thread once put returns, even before state_time_ is stored",
+          "[pipeline][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+
+  FlushGate before_wait;
+  FlushGate between_stores;
+  db.test_before_commit_wait_ = before_wait.hook();
+  db.test_between_publish_stores_ = between_stores.hook();
+
+  // R warms its read cache with the pre-put state, then reads once T's put
+  // has returned.
+  std::mutex mu;
+  std::condition_variable cv;
+  bool t_returned = false;
+  bool r_warm = false;
+  bool r_get_saw = false;
+  bool r_snapshot_saw = false;
+  std::thread tr([&] {
+    (void)db.contains_key({}, to_bytes("seed"));
+    std::unique_lock<std::mutex> lk{mu};
+    r_warm = true;
+    cv.notify_all();
+    cv.wait(lk, [&] { return t_returned; });
+    r_get_saw = get_val(db, to_bytes("t")).has_value();
+    r_snapshot_saw = db.snapshot().contains_key({}, to_bytes("t"));
+  });
+  {
+    std::unique_lock<std::mutex> lk{mu};
+    cv.wait(lk, [&] { return r_warm; });
+  }
+
+  std::optional<bytecask::CommitResult> rt;
+  std::thread tt([&] { rt = db.put({.sync = true}, to_bytes("t"), to_bytes("vt")); });
+  before_wait.wait_in_flush();
+
+  std::optional<bytecask::CommitResult> rf;
+  std::thread tf([&] { rf = db.put({.sync = true}, to_bytes("f"), to_bytes("vf")); });
+  between_stores.wait_in_flush();
+
+  // T returns while F is parked between the state store and the
+  // state_time_ store; only then does R read.
+  before_wait.open();
+  tt.join();
+  {
+    std::lock_guard<std::mutex> lk{mu};
+    t_returned = true;
+  }
+  cv.notify_all();
+  tr.join();
+  between_stores.open();
+  tf.join();
+  db.test_before_commit_wait_ = nullptr;
+  db.test_between_publish_stores_ = nullptr;
+
+  REQUIRE(rt.has_value());
+  REQUIRE(rf.has_value());
+  CHECK(r_get_saw);
+  CHECK(r_snapshot_saw);
+}
+
 TEST_CASE("pipeline: a plan that loses to a write not yet published reports "
           "the conflict once a retry can see that write",
           "[pipeline][concurrency]") {
