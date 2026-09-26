@@ -27,16 +27,17 @@ namespace bytecask {
 //   Offset 21: key_len     (u16) — full key length in bytes
 //   Offset 23: key_data    (key_len bytes)
 //   ─────────────────────────────────────────
-//   File trailer: crc32 (u32) — CRC-32C over all entry bytes; written once
-//                               at end of file by HintFile::close().
+//   Entries are stored in zstd frames, behind a header and before a CRC
+//   trailer: see hint_file.cppm for the file layout.
 
 export constexpr std::size_t kHintHeaderSize =
     23; // sequence(8) + entry_type(1) + file_offset(8) + value_size(4) +
         // key_len(2)
 
 // Parsed hint file entry (zero-copy).
-// key and end_key are spans into the backing file buffer; valid for the
-// lifetime of the HintFile that owns the buffer.
+// key and end_key are spans into the buffer the entry was parsed from. From a
+// HintFile::Scanner they are valid only until the scanner's next call to
+// next() or seek().
 export struct HintEntry {
   std::uint64_t sequence{};
   EntryType entry_type{};

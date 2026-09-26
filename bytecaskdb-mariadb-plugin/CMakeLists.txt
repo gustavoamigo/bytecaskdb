@@ -220,6 +220,20 @@ if(NOT CRC32C_LIB)
     "copy under ~/.xmake/packages is available.")
 endif()
 
+# Hint files are zstd-framed, so the engine needs libzstd too. xmake.lua builds
+# zstd itself (add_requires("zstd", {system = false})) and compiles the engine
+# against that copy, so link the same static archive: the plugin then carries
+# no libzstd runtime dependency. A system libzstd is the fallback.
+file(GLOB ZSTD_XMAKE_HINTS "$ENV{HOME}/.xmake/packages/z/zstd/*/*/lib")
+find_library(ZSTD_LIB NAMES libzstd.a zstd
+  HINTS ${ZSTD_XMAKE_HINTS} /usr/lib64 /usr/lib /usr/local/lib /usr/local/lib64)
+if(NOT ZSTD_LIB)
+  message(FATAL_ERROR
+    "zstd not found. Run 'xmake build bytecask' first so its zstd under "
+    "~/.xmake/packages is available, or install libzstd-devel / libzstd-dev.")
+endif()
+message(STATUS "zstd library        : ${ZSTD_LIB}")
+
 # When ON, embed libstdc++ and libgcc statically so the .so has no C++ runtime
 # version dependency at all — only glibc symbols remain.  Use for portable builds
 # (e.g. Docker) where the runtime image may ship an older libstdc++.
@@ -279,6 +293,7 @@ target_compile_options(ha_bytecaskdb PRIVATE
 target_link_libraries(ha_bytecaskdb PRIVATE
   bytecask_static
   "${CRC32C_LIB}"
+  "${ZSTD_LIB}"
   m
   dl
 )
@@ -384,6 +399,7 @@ target_link_libraries(mariadb_txn_tests PRIVATE
   Catch2::Catch2WithMain
   bytecask_static
   "${CRC32C_LIB}"
+  "${ZSTD_LIB}"
 )
 
 # ---------------------------------------------------------------------------
@@ -427,6 +443,7 @@ target_link_libraries(mariadb_proof_tests PRIVATE
   Catch2::Catch2WithMain
   "${BYTECASK_TESTING_LIB}"
   "${CRC32C_LIB}"
+  "${ZSTD_LIB}"
 )
 
 include(CTest)

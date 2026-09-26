@@ -486,9 +486,9 @@ jobs:
           cd /opt/emsdk && ./emsdk install latest && ./emsdk activate latest
 
       # wasm_embind (and every other WASM xmake target) links a prebuilt
-      # crc32c-wasm the xmake targets don't build themselves — only
-      # wasm/build.sh does (cross-compiling crc32c, Google Benchmark, and
-      # Catch2 for WASM, via emcmake/emmake). Cache it keyed on build.sh's own
+      # crc32c-wasm and zstd-wasm the xmake targets don't build themselves —
+      # only wasm/build.sh does (cross-compiling crc32c, zstd, Google
+      # Benchmark, and Catch2 for WASM, via emcmake/emmake). Cache it keyed on build.sh's own
       # contents so a future change to the cross-compile recipe invalidates
       # the cache.
       #
@@ -499,7 +499,7 @@ jobs:
       # it only inside this one step's `run:` block keeps that prepended
       # PATH scoped to this step's subshell — it never reaches the later
       # "Configure xmake" step, which starts fresh from the job's own env.
-      - name: Cache WASM dependencies (crc32c, Google Benchmark, Catch2)
+      - name: Cache WASM dependencies (crc32c, zstd, Google Benchmark, Catch2)
         id: wasm-deps-cache
         uses: actions/cache@v4
         with:

@@ -49,6 +49,9 @@
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 // LevelDB
 #ifndef BENCH_NO_LEVELDB
 #include <leveldb/db.h>
@@ -1396,7 +1399,9 @@ void BM_CasMT(benchmark::State &state) {
 
 
 // ──────────── Parallel Recovery ──────────────────────────────────────────────
-// Measures startup recovery with varying thread counts.
+// Measures a cold start with varying thread counts: every file of the
+// database is evicted from the page cache before each timed open, so the hint
+// files come off the device, as they do after a reboot or on a new node.
 // Uses kDatasetSize keys with 1-byte values so hint-file parsing dominates.
 
 static constexpr std::uint64_t kParRecoveryThreshold = 4ULL * 1024 * 1024;
@@ -1433,6 +1438,20 @@ struct ParRecoverySetup {
   }
 };
 
+// Drops every file in dir from the page cache. posix_fadvise needs no
+// privileges, unlike /proc/sys/vm/drop_caches, but it only drops clean pages
+// that no process maps: each file is synced first, and the DB is closed.
+// `fincore <dir>/*` shows what is still resident.
+void evict_from_page_cache(const std::filesystem::path &dir) {
+  for (const auto &e : std::filesystem::directory_iterator{dir}) {
+    const auto fd = ::open(e.path().c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) continue;
+    (void)::fdatasync(fd);
+    (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    ::close(fd);
+  }
+}
+
 auto &par_recovery_setup() {
   static ParRecoverySetup instance;
   return instance;
@@ -1452,27 +1471,16 @@ void BM_RecoveryParallel(benchmark::State &state) {
 
   std::unique_ptr<Handle> handle;
 
-  // BC_DROP_CACHES=1 evicts the page cache before each timed open, so the
-  // hint files are read from the device instead of from RAM. Without it a
-  // dataset that fits in memory measures parsing and index build only.
-  static const bool drop_caches = [] {
-    const char *e = std::getenv("BC_DROP_CACHES");
-    return e && *e == '1';
-  }();
-
+  // Eviction runs inside the pause that closing the DB already needs: a
+  // PauseTiming/ResumeTiming pair of its own costs 30-45 ms per measurement
+  // at these iteration counts.
+  evict_from_page_cache(setup.dir.path);
   for (auto _ : state) {
-    // Only pause when there is something to do: an unconditional
-    // PauseTiming/ResumeTiming pair here costs 30-45 ms per measurement at
-    // these iteration counts, which is a third of the thing being measured.
-    if (drop_caches) {
-      state.PauseTiming();
-      std::system("sync; echo 3 > /proc/sys/vm/drop_caches");
-      state.ResumeTiming();
-    }
     handle = std::make_unique<Handle>(setup.dir.path,
                                      kParRecoveryThreshold, threads);
     state.PauseTiming();
     handle.reset();
+    evict_from_page_cache(setup.dir.path);
     state.ResumeTiming();
   }
 
