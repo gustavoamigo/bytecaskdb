@@ -1,6 +1,7 @@
 # Xmake cache
 .xmake/
 build/
+build*/
 
 # Node.js dependencies
 node_modules/
