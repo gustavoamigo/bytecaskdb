@@ -33,7 +33,7 @@
 #include <vector>
 
 #ifdef __EMSCRIPTEN__
-#include <mimalloc.h>
+#include <malloc.h>
 #else
 #include <jemalloc/jemalloc.h>
 #include <sys/resource.h>
@@ -88,17 +88,10 @@ void print_mib(const char *label, std::size_t bytes) {
 }
 
 #ifdef __EMSCRIPTEN__
+// Bytes in live allocations, as dlmalloc (the WASM build's allocator) counts
+// them.
 auto measure_heap_allocated() -> std::size_t {
-  std::size_t total = 0;
-  mi_heap_visit_blocks(
-      mi_heap_get_default(), false,
-      [](const mi_heap_t *, const mi_heap_area_t *area, void *, size_t,
-         void *arg) -> bool {
-        *static_cast<std::size_t *>(arg) += area->used * area->block_size;
-        return true;
-      },
-      &total);
-  return total;
+  return static_cast<std::size_t>(mallinfo().uordblks);
 }
 
 auto measure_wasm_memory() -> std::size_t {

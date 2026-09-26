@@ -642,7 +642,11 @@ local function add_wasm_ldflags(t)
     t:add("ldflags",
         "-fwasm-exceptions",
         "-sNODERAWFS=1", "-sENVIRONMENT=node", "-lnoderawfs.js",
-        "-sMALLOC=mimalloc", "-sALLOW_MEMORY_GROWTH", "-sEXIT_RUNTIME=1",
+        -- dlmalloc, not mimalloc: WASM memory never shrinks, and mimalloc
+        -- does not reuse freed large blocks there, so each data file
+        -- rotation's hint-building buffers grew it by 70-140 MiB for good.
+        "-sMALLOC=dlmalloc", "-sALLOW_MEMORY_GROWTH", "-sMAXIMUM_MEMORY=4GB",
+        "-sEXIT_RUNTIME=1",
         "--pre-js", path.join(wasm_dir, "pre.js"),
         "--js-library", path.join(wasm_dir, "syscall_overrides.js"),
         "-L" .. path.join(wasm_crc32c, "lib"),
@@ -699,7 +703,8 @@ target("wasm_embind")
             -- lossy double at the JS boundary.
             "-sWASM_BIGINT",
             "-sNODERAWFS=1", "-sENVIRONMENT=node", "-lnoderawfs.js",
-            "-sMALLOC=mimalloc", "-sALLOW_MEMORY_GROWTH",
+            -- dlmalloc and the 4 GiB cap: see add_wasm_ldflags.
+            "-sMALLOC=dlmalloc", "-sALLOW_MEMORY_GROWTH", "-sMAXIMUM_MEMORY=4GB",
             "-sMODULARIZE=1", "-sEXPORT_NAME=createByteCask",
             "--pre-js", path.join(wasm_dir, "pre.js"),
             "--js-library", path.join(wasm_dir, "syscall_overrides.js"),
