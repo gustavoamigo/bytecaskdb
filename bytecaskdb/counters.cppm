@@ -105,6 +105,11 @@ export struct Counters {
   // -- Files --
   std::atomic<std::int64_t> files_opened{0};
 
+  // -- Hint backlog: rotations that waited for the background worker, and
+  // for how long in total (Options::max_hint_backlog). --
+  std::atomic<std::int64_t> hint_backpressure_stalls{0};
+  std::atomic<std::int64_t> hint_backpressure_stall_us{0};
+
   // -- Errors --
   std::atomic<std::int64_t> crc_failures{0};
   std::atomic<std::int64_t> io_errors{0};

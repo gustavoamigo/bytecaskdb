@@ -6962,12 +6962,9 @@ TEST_CASE("vacuum preserves BulkBegin/BulkEnd markers", "[vacuum][batch]") {
   for (const auto &entry : std::filesystem::directory_iterator{db_path}) {
     if (entry.path().extension() != ".data") continue;
     auto df_ptr = bytecask::openDataFileForRead(entry.path()); auto &df = *df_ptr;
-    bytecask::Offset off = 0;
-    while (auto sr = df.scan(off)) {
-      const auto &[de, next] = *sr;
+    for (const auto &[de, off] : bytecask::scan_entries(df)) {
       if (de.entry_type == bytecask::EntryType::BulkBegin) found_begin = true;
       if (de.entry_type == bytecask::EntryType::BulkEnd) found_end = true;
-      off = next;
     }
   }
   CHECK(found_begin);
@@ -7011,14 +7008,11 @@ TEST_CASE("vacuum drops batch when all entries are stale",
   for (const auto &entry : std::filesystem::directory_iterator{db_path}) {
     if (entry.path().extension() != ".data") continue;
     auto df_ptr = bytecask::openDataFileForRead(entry.path()); auto &df = *df_ptr;
-    bytecask::Offset off = 0;
-    while (auto sr = df.scan(off)) {
-      const auto &[de, next] = *sr;
+    for (const auto &[de, off] : bytecask::scan_entries(df)) {
       if (de.entry_type == bytecask::EntryType::BulkBegin ||
           de.entry_type == bytecask::EntryType::BulkEnd) {
         found_marker = true;
       }
-      off = next;
     }
   }
   CHECK_FALSE(found_marker);
@@ -8425,13 +8419,154 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.crc_failures",
       "bytecask.io_errors",
       "bytecask.degraded_transitions",
+      "bytecask.hint_backpressure_stalls",
+      "bytecask.hint_backpressure_stall_us",
       "bytecask.degraded",
+      "bytecask.hint_backlog",
       "bytecask.open_files",
   };
   for (const auto &name : expected) {
     CHECK(s.contains(name));
   }
   CHECK(s.size() == expected.size());
+}
+
+// ---------------------------------------------------------------------------
+// Hint backlog backpressure (#146)
+//
+// Every rotation queues a hint task. With max_hint_backlog set, a rotation
+// that finds that many tasks pending waits for the worker before it seals,
+// so the backlog — what close must write and what an open after a crash must
+// rebuild — never exceeds the limit. The worker is held with
+// test_before_hint_ to build a backlog on demand.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Holds every hint task at its start until open() is called.
+struct HintGate {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool is_open{false};
+
+  void wait() {
+    std::unique_lock<std::mutex> lk{mu};
+    cv.wait(lk, [this] { return is_open; });
+  }
+  void open() {
+    {
+      std::lock_guard<std::mutex> lk{mu};
+      is_open = true;
+    }
+    cv.notify_all();
+  }
+};
+
+// Opens the gate on scope exit. Declared after the DB, so it runs before
+// ~DB drains the worker — a closed gate there would never let it return.
+struct OpenGateOnExit {
+  HintGate &gate;
+  ~OpenGateOnExit() { gate.open(); }
+};
+
+// Polls stats() until pred holds or two seconds pass.
+template <typename Pred>
+auto eventually(const bytecask::DB &db, Pred pred) -> bool {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (pred(db.stats())) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return pred(db.stats());
+}
+
+auto hintless_data_files(const std::filesystem::path &dir) -> int {
+  int n = 0;
+  for (const auto &e : std::filesystem::directory_iterator{dir}) {
+    if (e.path().extension() != ".data") continue;
+    auto hint = e.path();
+    hint.replace_extension(".hint");
+    if (!std::filesystem::exists(hint)) ++n;
+  }
+  return n;
+}
+
+} // namespace
+
+// [concurrency]: the single-threaded WASM build runs hint tasks inline, so a
+// held worker would hold the writer too.
+TEST_CASE("hint backlog: a rotation past max_hint_backlog waits for the worker",
+          "[hint_backlog][concurrency]") {
+  constexpr std::uint32_t kLimit = 2;
+  constexpr int kPuts = 12;
+  TempDir td;
+  HintGate gate;
+  // max_file_bytes = 1: every put seals its file and queues a hint.
+  auto db = bytecask::DB::open(
+      td.path / "db", {.max_file_bytes = 1, .max_hint_backlog = kLimit});
+  OpenGateOnExit release{gate};
+  db.test_before_hint_ = [&gate] { gate.wait(); };
+
+  std::atomic<int> done{0};
+  std::thread writer{[&] {
+    for (int i = 0; i < kPuts; ++i) {
+      db.put({}, to_bytes(std::format("k{:02d}", i)), to_bytes("v"));
+      done.fetch_add(1);
+    }
+  }};
+
+  // The writer fills the backlog, then stalls before sealing the next file.
+  REQUIRE(eventually(db, [&](const auto &st) {
+    return st.at("bytecask.hint_backlog") == kLimit;
+  }));
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  const auto stalled_at = done.load();
+  CHECK(stalled_at < kPuts);
+  CHECK(db.stats().at("bytecask.hint_backlog") == kLimit);
+  CHECK(db.stats().at("bytecask.hint_backpressure_stalls") == 0);
+
+  SECTION("an open after a crash here rebuilds at most limit + 1 hints") {
+    // Copy the directory as a kill would leave it: the backlog and the
+    // active file are the only data files without a hint.
+    const auto crash = td.path / "crash";
+    std::filesystem::copy(td.path / "db", crash);
+    CHECK(hintless_data_files(crash) <= static_cast<int>(kLimit) + 1);
+    // Every acknowledged put survives the crash.
+    auto db2 = bytecask::DB::open(crash);
+    for (int i = 0; i < stalled_at; ++i)
+      CHECK(get_val(db2, to_bytes(std::format("k{:02d}", i))).has_value());
+  }
+
+  gate.open();
+  writer.join();
+  CHECK(done.load() == kPuts);
+  const auto st = db.stats();
+  CHECK(st.at("bytecask.hint_backlog") <= kLimit);
+  CHECK(st.at("bytecask.hint_backpressure_stalls") >= 1);
+  CHECK(st.at("bytecask.hint_backpressure_stall_us") > 0);
+}
+
+TEST_CASE("hint backlog: max_hint_backlog = 0 never waits",
+          "[hint_backlog][concurrency]") {
+  constexpr int kPuts = 12;
+  TempDir td;
+  HintGate gate;
+  auto db = bytecask::DB::open(td.path,
+                               {.max_file_bytes = 1, .max_hint_backlog = 0});
+  OpenGateOnExit release{gate};
+  db.test_before_hint_ = [&gate] { gate.wait(); };
+
+  // With the worker held, every put still returns.
+  for (int i = 0; i < kPuts; ++i)
+    db.put({}, to_bytes(std::format("k{:02d}", i)), to_bytes("v"));
+  const auto st = db.stats();
+  CHECK(st.at("bytecask.hint_backlog") >= kPuts - 1);
+  CHECK(st.at("bytecask.hint_backpressure_stalls") == 0);
+
+  gate.open();
+  CHECK(eventually(db, [](const auto &s) {
+    return s.at("bytecask.hint_backlog") == 0;
+  }));
 }
 
 // ---------------------------------------------------------------------------

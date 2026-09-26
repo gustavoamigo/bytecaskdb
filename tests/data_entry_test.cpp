@@ -9,10 +9,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 import bytecask.data_entry;
 import bytecask.data_file;
@@ -45,6 +48,14 @@ auto read_file_bytes(const std::filesystem::path &p)
 
 auto to_bytes(std::string_view sv) -> std::span<const std::byte> {
   return std::as_bytes(std::span{sv.data(), sv.size()});
+}
+
+// The entry at offset and the offset past it, read the way every sweep reads.
+auto scan_at(const bytecask::DataFile &file, bytecask::Offset offset)
+    -> std::optional<std::pair<bytecask::DataEntry, bytecask::Offset>> {
+  bytecask::DataFileIterator it{file, offset};
+  if (it == std::default_sentinel) return std::nullopt;
+  return std::pair{(*it).first, it.next_offset()};
 }
 
 auto to_string(const std::vector<std::byte> &bytes) -> std::string {
@@ -171,14 +182,14 @@ TEST_CASE("DataFile::read round-trips entries at recorded offsets",
       df->append_entry(8, bytecask::EntryType::Put, to_bytes("foo"), to_bytes("bar"));
   df->sync();
 
-  const auto r0 = df->scan(off0);
+  const auto r0 = scan_at(*df, off0);
   REQUIRE(r0.has_value());
   CHECK(r0->first.sequence == 7U);
   CHECK(r0->first.entry_type == bytecask::EntryType::Put);
   CHECK(to_string(r0->first.key) == "hello");
   CHECK(to_string(r0->first.value) == "world");
 
-  const auto r1 = df->scan(off1);
+  const auto r1 = scan_at(*df, off1);
   REQUIRE(r1.has_value());
   CHECK(r1->first.sequence == 8U);
   CHECK(r1->first.entry_type == bytecask::EntryType::Put);

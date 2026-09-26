@@ -48,7 +48,7 @@ public:
 
   auto operator++() -> CommittedEntryIterator& {
     ++emit_idx_;
-    if (emit_idx_ >= pending_.size()) {
+    if (emit_idx_ >= pending_size_) {
       advance();
     }
     return *this;
@@ -57,7 +57,7 @@ public:
   void operator++(int) { ++*this; }
 
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
-    return emit_idx_ >= pending_.size();
+    return emit_idx_ >= pending_size_;
   }
 
   // Byte offset past the last committed entry or batch yielded.
@@ -68,8 +68,24 @@ public:
   }
 
 private:
+  // pending_ keeps its slots across advances and stage() assigns into them,
+  // so a sweep does not allocate per entry once the slots have grown.
+  void stage(const value_type& e) {
+    if (pending_size_ == pending_.size()) {
+      pending_.push_back(e);
+    } else {
+      auto& [entry, off] = pending_[pending_size_];
+      entry.sequence = e.first.sequence;
+      entry.entry_type = e.first.entry_type;
+      entry.key.assign(e.first.key.begin(), e.first.key.end());
+      entry.value.assign(e.first.value.begin(), e.first.value.end());
+      off = e.second;
+    }
+    ++pending_size_;
+  }
+
   void advance() {
-    pending_.clear();
+    pending_size_ = 0;
     emit_idx_ = 0;
     if (step_pending_) {
       step_pending_ = false;
@@ -77,17 +93,16 @@ private:
     }
 
     while (!(cur_ == std::default_sentinel)) {
-      const auto& [entry, entry_off] = *cur_;
+      const auto& entry = (*cur_).first;
 
       if (entry.entry_type == EntryType::BulkBegin) {
         // Buffer entries until matching BulkEnd or EOF.
-        pending_.emplace_back(entry, entry_off);
+        stage(*cur_);
         ++cur_;
 
         while (!(cur_ == std::default_sentinel)) {
-          const auto& [inner, inner_off] = *cur_;
-          pending_.emplace_back(inner, inner_off);
-          if (inner.entry_type == EntryType::BulkEnd) {
+          stage(*cur_);
+          if ((*cur_).first.entry_type == EntryType::BulkEnd) {
             committed_offset_ = cur_.next_offset();
             step_pending_ = true;
             return;
@@ -95,13 +110,13 @@ private:
           ++cur_;
         }
         // EOF before BulkEnd — discard incomplete batch.
-        pending_.clear();
+        pending_size_ = 0;
         continue;
       }
 
       // Standalone entry (Put, Delete, RangeDel).
       committed_offset_ = cur_.next_offset();
-      pending_.emplace_back(entry, entry_off);
+      stage(*cur_);
       step_pending_ = true;
       return;
     }
@@ -109,6 +124,7 @@ private:
 
   DataFileIterator cur_;
   std::vector<value_type> pending_;
+  std::size_t pending_size_{0};  // live prefix of pending_
   std::size_t emit_idx_{0};
   Offset committed_offset_{};
   // The scan past the last committed entry or batch is deferred to the next

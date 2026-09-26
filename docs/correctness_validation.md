@@ -338,8 +338,8 @@ And one for the window a completed rename opens:
 
 And one on the read side, for the scan `resume()` runs:
 
-14. `io_data_file_scan` — before the header `pread()` in the active file's
-    `scan()`. An I/O error there says nothing about the bytes, so
+14. `io_data_file_scan` — before the `pread()` in the active file's
+    `read_raw()`, which every sweep of it goes through. An I/O error there says nothing about the bytes, so
     `resume()` must rethrow it rather than read it as the end of the file
     and truncate; `[degraded][resume]` holds it to that.
 
@@ -1796,6 +1796,13 @@ control:
   syscall layer only. The process-crash harness kills the process at
   arbitrary points, but the page cache survives it, so it does not stand
   in for power loss either.
+- **Time bounds on close and open** — the failure classes are about what a
+  failure does to data. A close or open that is correct but too slow for
+  the supervisor holding the stopwatch damages nothing, so no class here
+  models it. The one lifecycle bound the engine keeps is the hint backlog
+  (`Options::max_hint_backlog`, #146): close writes at most that many hint
+  files, and an open after a kill rebuilds at most one more.
+  `[hint_backlog]` in `tests/bytecask_test.cpp` checks both ends of it.
 
 ---
 
