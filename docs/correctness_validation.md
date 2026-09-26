@@ -1484,7 +1484,8 @@ workloads and kill delays, but the operation a kill lands on still depends on
 timing. `--no-vacuum` isolates the write path. On failure the directory as
 the child found it, the directory the kill left, and the full operation
 history are kept under `<dir>/failure/`. `crash-nightly.yml` runs 400
-iterations (release) and 100 (ASan) every night.
+iterations every night in release and under ASan (with a 5 s kill ceiling,
+since the ASan child is several times slower).
 
 ---
 

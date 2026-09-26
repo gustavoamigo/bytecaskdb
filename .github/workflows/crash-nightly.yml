@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       iterations:
-        description: "Iterations per job (release; the ASan job runs a quarter)"
+        description: "Iterations per job"
         default: "400"
       seed:
         description: "Seed to replay (empty = random)"
@@ -44,11 +44,13 @@ jobs:
           - name: release
             mode: releasedbg
             sanitizer: ""
-            divisor: 1
+            max_delay_ms: 1500
           - name: asan
             mode: debug
             sanitizer: address
-            divisor: 4
+            # ASan runs the child several times slower; a longer ceiling
+            # lets kills land past open and the first rotations.
+            max_delay_ms: 5000
     name: crash (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v4
@@ -83,8 +85,7 @@ jobs:
           ITERATIONS: ${{ github.event.inputs.iterations || '400' }}
           SEED: ${{ github.event.inputs.seed || '' }}
         run: |
-          N=$(( ITERATIONS / ${{ matrix.divisor }} ))
-          ARGS="--iterations $N --dir $RUNNER_TEMP/crash"
+          ARGS="--iterations $ITERATIONS --max-delay-ms ${{ matrix.max_delay_ms }} --dir $RUNNER_TEMP/crash"
           if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
           build/linux/x86_64/${{ matrix.mode }}/crash_consistency $ARGS
 
