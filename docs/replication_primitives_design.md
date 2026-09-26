@@ -97,6 +97,8 @@ Implementation:
 
 The iterator holds a reference to the `Snapshot`, which keeps file descriptors open for the duration of the scan. Vacuum may unlink files from the filesystem mid-iteration, but POSIX guarantees `pread` succeeds on unlinked files as long as the fd is open. Unlike `create_manifest()` — which ships files by path and requires the caller to serialize with vacuum — `changes_since` is safe to run concurrently with vacuum because it never accesses files by path.
 
+Vacuum does remove history: dead Puts, whole files of them, and the tombstones recovery found no longer hide a Put in another file. A follower resuming from a sequence older than such a vacuum receives a stream with those entries missing, and nothing tells it so; for a dropped tombstone, a follower that already holds the Put never learns of the delete. See #168.
+
 ```cpp
 auto changes_since(const Snapshot& snap, uint64_t from_sequence) const -> ChangeIterator;
 ```
