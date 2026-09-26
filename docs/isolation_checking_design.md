@@ -1,8 +1,8 @@
 # Isolation Checking with Elle
 
 Status: implemented, runs nightly. Tracks [#94](https://github.com/gustavoamigo/bytecaskdb/issues/94).
-Follow-ups that extend this harness: [#178](https://github.com/gustavoamigo/bytecaskdb/issues/178)
-(replication), [#176](https://github.com/gustavoamigo/bytecaskdb/issues/176) (SIGKILL).
+Follow-ups that extend this harness, both implemented: [#178](https://github.com/gustavoamigo/bytecaskdb/issues/178)
+(replication) and [#176](https://github.com/gustavoamigo/bytecaskdb/issues/176) (SIGKILL, see *Kill*).
 
 ## Purpose
 
@@ -149,9 +149,63 @@ Each run draws from these per seed:
   entries for writes refused at entry.
 - **I/O backend.** `Pread`, `Mmap`, or `BufferPool`, drawn per run.
 
-Replication and SIGKILL are not nemeses here. #178 adds replication, and
-[`replication_checking_design.md`](replication_checking_design.md) designs
-it. #176 adds SIGKILL.
+Replication is not a nemesis here: #178 adds it, in
+[`replication_checking_design.md`](replication_checking_design.md). SIGKILL
+has its own mode, below.
+
+## Kill
+
+`crash_consistency` kills a single writer and checks an exact prefix of its
+commit order. It never kills the process while several sync writers share
+one `fdatasync` through group commit, with the pipelined next batch already
+appended: there the parent does not know which writes were in flight or in
+what order. Inferring that order is Elle's job, so the kill is a mode of this
+harness (#176): `isolation_history --kill-epochs N`, and
+`run_isolation_check.py --kill` for guarded and unguarded.
+
+**A child per epoch.** A SIGKILL takes the history in memory with it, so the
+writers run in a child process, as in `crash_consistency`, and stream every
+operation to the parent over a pipe as it happens: an invoke line before the
+call, a completion line after it (type, reads, `CommitResult.sequence` and
+`durable`), and `durable_sequence()` from a watcher thread. Lines are
+written whole under a mutex; one the kill cut short is dropped. The parent
+kills the child once it has reported a random 10–95% of its share of
+transactions, which puts the kill inside the workload on any machine, then
+starts the next child on the same directory, so every epoch after the first
+begins with a recovery. After the last, the parent reopens the directory
+itself and reads every key as one final transaction.
+
+**Encoding.**
+
+- Invoked, not completed at the kill: `:info`.
+- Acknowledged with `durable`, or with a sequence at or below a
+  `durable_sequence()` the child reported: `:ok`.
+- Acknowledged, not known durable: `:info`. A crash may lose it; SIGKILL in
+  practice does not, since the page cache survives, and `:info` allows both.
+- `nullopt`: `:fail`.
+
+Every epoch uses fresh Elle process ids (a process with an `:info` cannot
+go on), elements unique across the run, and the keys the last epoch was
+appending to, so reads after a recovery see what the kill left. Times are
+`CLOCK_MONOTONIC`, one clock for every process, so real-time order holds
+across kills.
+
+**Configuration.** Engine settings come from the seed as usual, with the
+sync share raised to 50–90% so writers do share flushes, and no degrade
+nemesis. The vacuum nemesis runs in the child, so kills also land inside a
+compaction.
+
+**Reaching the case.** SIGKILL cannot lose an acknowledged write (the page
+cache survives it), so there is no failure to provoke on purpose, as `blind`
+does for lost updates. The run instead has to show that it reached the
+window it is for: at least one kill with two or more sync writers in flight.
+Each child writes `<out>.kill.json` with that count.
+
+**Result.** 3 rounds, 10 epochs each, 16 threads: guarded strict-serializable
+and unguarded snapshot-isolated (write skew only) in every round, with the
+cross-check clean. Every kill had about 15 transactions in flight and caught
+two or more sync writers; one landed inside a compaction and the next open
+removed the half-done copy.
 
 ## Implementation
 

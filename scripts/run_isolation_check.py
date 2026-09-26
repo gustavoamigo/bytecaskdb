@@ -51,6 +51,14 @@ old leader's writes that an unplanned promotion lost are relabelled :info.
                      to detect that fork. Once the forked node leads in turn, the fork
                      reaches the leader history, so any finding counts.
 
+With --kill each round runs guarded and unguarded as above, but the writers
+run in a child process that is SIGKILLed at a random point of its workload
+and replaced,
+--kill-epochs times, each child recovering what the last left; a final read
+of every key follows one more recovery. Operations in flight at a kill, and
+acknowledged writes not known durable then, are :info. At least one kill
+over the run has to land with two or more sync writers in flight.
+
 Without --elle-jar only the cross-check runs. Exit status is non-zero on any
 failed expectation. Histories and Elle's output stay under --out.
 """
@@ -68,6 +76,7 @@ from collections import defaultdict
 from pathlib import Path
 
 CONFIGS = ("guarded", "unguarded", "blind")
+KILL_CONFIGS = ("guarded", "unguarded")
 CLUSTER_CONFIGS = ("cluster", "cluster-vacuum", "cluster-vacuum-unretained")
 TOPOLOGY_CONFIGS = ("topology", "topology-behind")
 
@@ -440,7 +449,7 @@ def check_cluster_round(args: argparse.Namespace, seed: int,
 
 
 def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> None:
-    for config in CONFIGS:
+    for config in KILL_CONFIGS if args.kill else CONFIGS:
         history_path = round_dir / f"{config}.json"
         cmd = [str(args.binary), "--config", config, "--seed", str(seed),
                "--txns", str(args.txns), "--threads", str(args.threads),
@@ -450,8 +459,14 @@ def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> None:
             cmd.append("--no-vacuum")
         if args.no_degrade:
             cmd.append("--no-degrade")
+        if args.kill:
+            cmd += ["--kill-epochs", str(args.kill_epochs)]
         subprocess.run(cmd, check=True)
         shutil.rmtree(round_dir / f"db-{config}", ignore_errors=True)
+        if args.kill:
+            kill = json.loads(
+                Path(str(history_path) + ".kill.json").read_text())
+            args.group_kills += kill["group_kills"]
 
         history = json.loads(history_path.read_text())
         problems = cross_check(history)
@@ -515,7 +530,13 @@ def main() -> int:
     parser.add_argument("--topology", action="store_true",
                         help="cluster with planned transfers, unplanned "
                              "promotions, re-targeting and re-bootstrap")
+    parser.add_argument("--kill", action="store_true",
+                        help="SIGKILL the writer process and reopen, "
+                             "--kill-epochs times per history (#176)")
+    parser.add_argument("--kill-epochs", type=int, default=10)
     args = parser.parse_args()
+    if args.kill and (args.cluster or args.topology):
+        parser.error("--kill runs a single node")
 
     seed = args.seed if args.seed is not None else random.SystemRandom().getrandbits(63)
     print(f"run_isolation_check: seed={seed} rounds={args.rounds} "
@@ -526,13 +547,16 @@ def main() -> int:
           f"--threads {args.threads}"
           + (f" --elle-jar {args.elle_jar}" if args.elle_jar else "")
           + (" --cluster" if args.cluster else "")
-          + (" --topology" if args.topology else ""))
+          + (" --topology" if args.topology else "")
+          + (f" --kill --kill-epochs {args.kill_epochs}"
+             if args.kill else ""))
     sys.stdout.flush()
 
     shutil.rmtree(args.out, ignore_errors=True)
     args.write_skew_seen = False
     args.v168_seen = False
     args.fork_seen = False
+    args.group_kills = 0
     rng = random.Random(seed)
     try:
         for r in range(args.rounds):
@@ -552,6 +576,10 @@ def main() -> int:
             raise CheckFailed(
                 "topology-behind: no round detected a fork; the harness is "
                 "not shown to be sensitive to a follower ahead of its leader")
+        if args.kill and args.group_kills == 0:
+            raise CheckFailed(
+                "kill: no kill landed with two or more sync writers in "
+                "flight; the run never reached a shared fdatasync")
         if (args.elle_jar and not args.cluster and not args.topology
                 and not args.write_skew_seen):
             raise CheckFailed(

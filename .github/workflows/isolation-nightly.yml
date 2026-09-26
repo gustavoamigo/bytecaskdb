@@ -25,6 +25,9 @@ on:
       topology_rounds:
         description: "Topology rounds per job (two histories each)"
         default: "6"
+      kill_rounds:
+        description: "Kill rounds per job (two histories each)"
+        default: "4"
       seed:
         description: "Seed to replay (empty = random)"
         default: ""
@@ -129,6 +132,21 @@ jobs:
           if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
           python3 scripts/run_isolation_check.py $ARGS
 
+      # Guarded and unguarded with the writer process SIGKILLed and reopened
+      # ten times per history (#176): recovery under concurrent group-commit
+      # writers.
+      - name: Run kill check
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          ROUNDS: ${{ github.event.inputs.kill_rounds || '4' }}
+          SEED: ${{ github.event.inputs.seed || '' }}
+        run: |
+          ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
+          ARGS="$ARGS --elle-jar elle-cli.jar --kill --rounds $ROUNDS"
+          ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation-kill"
+          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
+          python3 scripts/run_isolation_check.py $ARGS
+
       # Leader plus two followers through bootstrap and tailing
       # (docs/replication_checking_design.md). cluster-vacuum vacuums with
       # retain_after and must pass; cluster-vacuum-unretained must detect
@@ -170,4 +188,5 @@ jobs:
             ${{ runner.temp }}/isolation
             ${{ runner.temp }}/isolation-cluster
             ${{ runner.temp }}/isolation-topology
+            ${{ runner.temp }}/isolation-kill
           if-no-files-found: ignore

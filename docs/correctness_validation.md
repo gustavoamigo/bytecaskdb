@@ -1493,6 +1493,16 @@ reopen. The harness failed on it about once every ten iterations. Since the
 fix (#171, which counts tombstones in `FileStats` and keeps any file that
 holds one), 400 iterations with vacuum running pass.
 
+**Concurrent writers are covered by the Elle run, not here.** This harness
+kills a single writer, so it knows the exact commit order and checks an exact
+prefix. It never kills the process while several sync writers share one
+`fdatasync` through group commit, with the next batch already appended; the
+in-flight set and its order are not known to the parent there. The
+isolation check's kill mode (`run_isolation_check.py --kill`, #176) covers
+that window: 16 writer threads, a SIGKILL at a random point of the workload,
+a reopen, ten times per history, and Elle infers the order
+([`isolation_checking_design.md`](isolation_checking_design.md), *Kill*).
+
 Run: `xmake build crash_consistency && xmake run crash_consistency --iterations 200`.
 The seed and a rerun line are printed first. `--seed` replays the same
 workloads and kill delays, but the operation a kill lands on still depends on
