@@ -715,10 +715,14 @@ auto match_prefix(const State &base, const History &h,
   for (const auto &[k, v] : model) recheck(k);
   for (const auto &[k, v] : recovered) recheck(k);
 
+  // Operations that change nothing (a del_range over no keys, a batch of
+  // deletes on absent keys) make several prefixes match. The longest one is
+  // reported, so `applied` does not undercount what survived.
+  std::optional<std::size_t> longest;
   std::size_t best = mismatches;
   std::size_t best_at = min_prefix;
   for (std::size_t k = min_prefix;; ++k) {
-    if (mismatches == 0) return {.applied = k, .committed = committed};
+    if (mismatches == 0) longest = k;
     if (mismatches < best) {
       best = mismatches;
       best_at = k;
@@ -728,6 +732,7 @@ auto match_prefix(const State &base, const History &h,
     (void)apply(model, applied_ops[k]->op, &touched);
     for (const auto &key : touched) recheck(key);
   }
+  if (longest) return {.applied = *longest, .committed = committed};
 
   // Describe the closest prefix to make the report actionable.
   State closest = base;
