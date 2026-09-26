@@ -41,6 +41,9 @@ import bytecask.batch_iterator;
 import bytecask.buffer_pool;
 import bytecask.data_entry;
 import bytecask.data_file;
+import bytecask.hint_entry;
+import bytecask.hint_file;
+import bytecask.serialization;
 import bytecask.types;
 
 namespace {
@@ -1918,6 +1921,193 @@ TEST_CASE("Recovery model-based: wide workers with range deletes",
                             std::filesystem::copy_options::recursive);
       auto db = bytecask::DB::open(p, {.recovery_threads = threads});
       verify(std::format("threads/{}", threads), collect(db));
+      CHECK(collect_stats(db) == serial_stats_vals);
+    }
+  }
+}
+
+// Rewrites a hint file in the layout written before hints were compressed —
+// the entries back to back, then a plain CRC-32C — as a database created by an
+// older version holds them.
+static void rewrite_hint_uncompressed(const std::filesystem::path &path) {
+  std::vector<std::byte> out;
+  {
+    auto hint = bytecask::HintFile::OpenForRead(path);
+    auto scanner = hint.make_scanner();
+    while (auto he = scanner.next()) {
+      const auto bytes =
+          he->entry_type == bytecask::EntryType::RangeDel
+              ? bytecask::serialize_range_del_entry(
+                    he->sequence, he->file_offset, he->key, he->end_key)
+              : bytecask::serialize_entry(he->sequence, he->entry_type,
+                                          he->file_offset, he->value_size,
+                                          he->key);
+      out.insert(out.end(), bytes.begin(), bytes.end());
+    }
+  }
+  bytecask::Crc32 crc{};
+  crc.update(out);
+  std::array<std::byte, 4> trailer{};
+  bytecask::ByteWriter w{trailer};
+  w.put(crc.finalize());
+  out.insert(out.end(), trailer.begin(), trailer.end());
+  std::ofstream f{path, std::ios::binary | std::ios::trunc};
+  f.write(reinterpret_cast<const char *>(out.data()), std::ssize(out));
+  REQUIRE(f.good());
+}
+
+// ---------------------------------------------------------------------------
+// Model-based recovery: hint files cut into many frames.
+//
+// Hint files are zstd frames, and a scanner's entries point into the frame it
+// has decoded until its next call. Tiny frames put every scan, seek and merge
+// across frame boundaries, and hot keys overwritten many times in one file
+// spread one key's duplicates over several frames: the case where a reader
+// that kept a key from an earlier frame would read a buffer since reused.
+// Recovery must also read a directory where some hints still have the
+// uncompressed layout.
+// ---------------------------------------------------------------------------
+TEST_CASE("Recovery model-based: hints split into many frames",
+          "[bytecask][recovery][parallel][model]") {
+  struct FrameBytes {
+    explicit FrameBytes(std::size_t n) {
+      bytecask::set_hint_frame_bytes_for_testing(n);
+    }
+    ~FrameBytes() { bytecask::set_hint_frame_bytes_for_testing(0); }
+    FrameBytes(const FrameBytes &) = delete;
+    FrameBytes &operator=(const FrameBytes &) = delete;
+  } frame_bytes{64};
+
+  std::mt19937 gen(97531);
+  auto pick = [&](int lo, int hi) {
+    return std::uniform_int_distribution<int>(lo, hi)(gen);
+  };
+  // A key's length depends on its number, so keys differ in length and
+  // share prefixes; the eight hot keys are rewritten throughout.
+  auto key_of = [](int n) {
+    return std::format("k{:04d}{}", n, std::string(static_cast<std::size_t>(n % 17), 'x'));
+  };
+  auto rand_key = [&]() -> std::string {
+    if (pick(0, 4) == 0) return std::format("hot:{}", pick(0, 7));
+    return key_of(pick(0, 999));
+  };
+  auto rand_value = [&] {
+    return std::string(static_cast<std::size_t>(pick(1, 64)),
+                       static_cast<char>(pick('A', 'z')));
+  };
+
+  TempDir td;
+  const auto db_path = td.path / "db";
+  std::map<std::string, std::string> oracle;
+  {
+    // 8 KiB files hold a hundred or so entries: dozens of 64-byte frames.
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 8 * 1024});
+    const bytecask::WriteOptions wo{.sync = false};
+    for (int i = 0; i < 6000; ++i) {
+      const auto op = pick(0, 99);
+      if (op < 60) {
+        auto key = rand_key();
+        auto val = rand_value();
+        db.put(wo, to_bytes(key), to_bytes(val));
+        oracle[key] = val;
+      } else if (op < 80) {
+        auto key = rand_key();
+        std::ignore = db.del(wo, to_bytes(key));
+        oracle.erase(key);
+      } else if (op < 97) {
+        bytecask::WritePlan plan;
+        for (int b = pick(2, 6); b > 0; --b) {
+          auto key = rand_key();
+          if (pick(0, 3) == 0) {
+            plan.del(to_bytes(key));
+            oracle.erase(key);
+          } else {
+            auto val = rand_value();
+            plan.put(to_bytes(key), to_bytes(val));
+            oracle[key] = val;
+          }
+        }
+        (void)db.apply_batch(wo, std::move(plan));
+      } else {
+        const auto a = pick(0, 990);
+        const auto from = std::format("k{:04d}", a);
+        const auto to = std::format("k{:04d}", a + pick(1, 30));
+        db.del_range(wo, to_bytes(from), to_bytes(to));
+        for (auto it = oracle.lower_bound(from); it != oracle.end();)
+          it = it->first < to ? oracle.erase(it) : oracle.end();
+      }
+    }
+  }
+
+  auto collect = [](bytecask::DB &db) {
+    std::map<std::string, std::string> kv;
+    for (auto &entry : db.iter_from({}))
+      kv[to_string(entry.key)] = to_string(entry.value);
+    return kv;
+  };
+  auto verify = [&](const std::string &label,
+                    const std::map<std::string, std::string> &recovered) {
+    INFO(label);
+    REQUIRE(recovered.size() == oracle.size());
+    for (const auto &[k, v] : oracle) {
+      INFO("key=\"" << k << "\"");
+      auto it = recovered.find(k);
+      REQUIRE(it != recovered.end());
+      CHECK(it->second == v);
+    }
+  };
+  auto collect_stats = [](bytecask::DB &db) {
+    std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                           std::uint64_t, std::uint64_t>> vals;
+    for (const auto &[fid, fs] : db.file_stats())
+      vals.emplace_back(fs.live_bytes, fs.total_bytes,
+                        fs.min_sequence, fs.max_sequence);
+    std::ranges::sort(vals);
+    return vals;
+  };
+  auto hints_in = [](const std::filesystem::path &dir) {
+    std::vector<std::filesystem::path> hints;
+    for (const auto &e : std::filesystem::directory_iterator{dir})
+      if (e.path().extension() == ".hint") hints.push_back(e.path());
+    std::ranges::sort(hints);
+    return hints;
+  };
+
+  REQUIRE(hints_in(db_path).size() > 8);
+
+  std::vector<std::tuple<std::uint64_t, std::uint64_t,
+                         std::uint64_t, std::uint64_t>> serial_stats_vals;
+  {
+    const auto p = td.path / "serial_baseline";
+    std::filesystem::copy(db_path, p,
+                          std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.recovery_threads = 1});
+    verify("serial_baseline", collect(db));
+    serial_stats_vals = collect_stats(db);
+  }
+
+  for (const unsigned threads : {1U, 2U, 5U, 8U}) {
+    DYNAMIC_SECTION("recovery_threads = " << threads) {
+      const auto p = td.path / std::format("t{}", threads);
+      std::filesystem::copy(db_path, p,
+                            std::filesystem::copy_options::recursive);
+      auto db = bytecask::DB::open(p, {.recovery_threads = threads});
+      verify(std::format("threads/{}", threads), collect(db));
+      CHECK(collect_stats(db) == serial_stats_vals);
+    }
+  }
+
+  for (const unsigned threads : {1U, 4U}) {
+    DYNAMIC_SECTION("uncompressed and compressed hints mixed, recovery_threads = "
+                    << threads) {
+      const auto p = td.path / std::format("mixed{}", threads);
+      std::filesystem::copy(db_path, p,
+                            std::filesystem::copy_options::recursive);
+      const auto hints = hints_in(p);
+      for (std::size_t i = 0; i < hints.size(); i += 2)
+        rewrite_hint_uncompressed(hints[i]);
+      auto db = bytecask::DB::open(p, {.recovery_threads = threads});
+      verify(std::format("mixed/{}", threads), collect(db));
       CHECK(collect_stats(db) == serial_stats_vals);
     }
   }

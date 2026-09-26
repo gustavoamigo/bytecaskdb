@@ -191,20 +191,49 @@ one describe the same key directory.
 
 ### File Layout
 
+The entries are stored in zstd frames, between a header and a trailer:
+
 ```
  ┌──────────────────────────────────────────────────────┐
- │  Entry 0  (23-byte header + key_len bytes)           │
+ │  Header  (16 bytes)                                  │
  ├──────────────────────────────────────────────────────┤
- │  Entry 1  (23-byte header + key_len bytes)           │
+ │  zstd frame 0  (entries, ~16 KiB before compression) │
+ ├──────────────────────────────────────────────────────┤
+ │  zstd frame 1                                        │
  ├──────────────────────────────────────────────────────┤
  │  ...                                                 │
  ├──────────────────────────────────────────────────────┤
- │  File CRC-32C  (4 bytes, file trailer)               │
+ │  Trailer: ~CRC-32C  (4 bytes)                        │
  └──────────────────────────────────────────────────────┘
 ```
 
-The 4-byte trailer covers all entry bytes. It is verified eagerly by
-`OpenForRead` before any parsing begins.
+| Offset | Size | Field      | Value |
+|--------|------|------------|-------|
+| 0      | 8    | `magic`    | `"BCHINTZ"` followed by `0x81` |
+| 8      | 1    | `version`  | 1 |
+| 9      | 1    | `codec`    | 1 = zstd |
+| 10     | 6    | reserved   | zero |
+
+Each frame is a standard zstd frame (level 1) holding a whole number of
+entries, cut once the entries reach 16 KiB (`kHintFrameBytes`), and recording
+its decompressed size in its frame header. Frames are not indexed: a reader
+walks them one after another. Decompressed back to back, the frames are the
+entries below, in the order above; compression changes how a hint file is
+stored, not what it says.
+
+The trailer is verified eagerly by `OpenForRead` and `OpenForMerge` before any
+parsing begins. A file whose version or codec the reader does not know is
+refused like a damaged one, and rebuilt from its data file.
+
+**Uncompressed layout.** Hint files written before compression hold the
+entries back to back from offset 0, followed by a plain CRC-32C trailer over
+them. They are still read. The first 8 bytes of such a file are the sequence
+of its first entry, which never reaches 2^63; the magic's last byte, `0x81`,
+sets that bit, so the two layouts cannot be confused. The compressed layout's
+trailer is inverted so that a reader that knows only the uncompressed layout
+fails its CRC and rebuilds the hint from the data file, instead of parsing
+frames as entries. Hint files are never rewritten in place, so a database
+holds a mix of both until vacuum turns its older files over.
 
 ### Entry Layout
 
@@ -240,7 +269,7 @@ Total entry size: `23 + key_len` bytes.
 
 | Offset from file start | Size | Type   | Description |
 |------------------------|------|--------|-------------|
-| `file_size - 4`        | 4    | u32 LE | CRC-32C (Castagnoli) over all bytes that precede this field |
+| `file_size - 4`        | 4    | u32 LE | Bitwise NOT of the CRC-32C (Castagnoli) over all bytes that precede this field; the plain CRC-32C in the uncompressed layout |
 
 Reading a hint file with a mismatched trailer CRC is a hard error. The engine
 discards the hint file and regenerates it from the raw data file during recovery.
@@ -250,6 +279,8 @@ discards the hint file and regenerates it from the raw data file during recovery
 | Constant          | Value | Meaning |
 |-------------------|-------|---------|
 | `kHintHeaderSize` | 23    | Fixed header fields per entry |
+| File header       | 16    | Magic, version, codec, reserved |
+| `kHintFrameBytes` | 16384 | Entry bytes after which a frame is closed |
 | File trailer      | 4     | CRC-32C trailer (one per file, not per entry) |
 
 ### RangeDel Hint Entry Extension
@@ -285,9 +316,11 @@ Does not cover: the 4-byte CRC field itself.
 
 ### Hint files — per-file CRC
 
-Covers: all entry bytes from the start of the file up to (but not including)
-the 4-byte trailer.  
-There is no per-entry CRC in hint files.
+Covers: every byte from the start of the file up to (but not including) the
+4-byte trailer: the header and the compressed frames. It is stored inverted.  
+There is no per-entry or per-frame CRC in hint files, and zstd's own frame
+checksum is not enabled: the file CRC catches the same damage, and a missing
+frame as well, before any frame is decoded.
 
 ---
 

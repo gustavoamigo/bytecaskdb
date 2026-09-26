@@ -80,7 +80,8 @@ Cross-compiles ByteCaskDB to WebAssembly and runs under Node.js using NODEFS for
 ## Prerequisites
 
 - Emscripten SDK activated (`source emsdk_env.sh`)
-- Internet access on first run (clones `google/crc32c` and `google/benchmark`)
+- Internet access on first run (clones `google/crc32c`, `facebook/zstd`,
+  `google/benchmark` and `catchorg/Catch2`)
 
 ## Build
 
@@ -90,7 +91,7 @@ cd ../..
 xmake build wasm_embind
 ```
 
-`build.sh` cross-compiles **crc32c**, **Google Benchmark**, and **Catch2** to
+`build.sh` cross-compiles **crc32c**, **zstd**, **Google Benchmark**, and **Catch2** to
 WASM (cached after first run — a no-op on subsequent runs). It does not build
 ByteCaskDB itself; the actual WASM targets are xmake targets, built from the
 repository root:
@@ -249,7 +250,7 @@ this table describes those, not the Node.js `createNativeBackend`/`createWasmBac
 |------|-------------|
 | `native/bytecask_napi.cpp` | N-API binding layer — exposes DB, Snapshot, WritePlan, iterators, FileManifest to JS |
 | `native/smoke_test.cjs` | Minimal Node.js smoke test for the compiled native addon |
-| `wasm/build.sh` | Cross-compiles WASM dependencies (crc32c, Google Benchmark, Catch2); the WASM targets themselves are built by xmake — see the WASM Backend "Build" section above |
+| `wasm/build.sh` | Cross-compiles WASM dependencies (crc32c, zstd, Google Benchmark, Catch2); the WASM targets themselves are built by xmake — see the WASM Backend "Build" section above |
 | `wasm/bytecask_embind.cpp` | Embind binding layer — exposes DB, Snapshot, WritePlan, iterators to JS |
 | `wasm/test_node.cpp` | Minimal C++ smoke test: write, read, recovery |
 | `wasm/pre.js` | Emscripten pre-run hook: env propagation, memory-usage reporting |

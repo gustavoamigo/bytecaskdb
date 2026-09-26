@@ -74,10 +74,10 @@ python3 -c 'import nanobind' >/dev/null 2>&1 || {
   pip install --quiet --break-system-packages nanobind >&2
 }
 
-# Configure now so the four xmake packages (crc32c, catch2, benchmark,
+# Configure now so the xmake packages (crc32c, zstd, catch2, benchmark,
 # jemalloc) are fetched into the cached container state rather than on first
 # build. GitHub archive downloads 403 here; xmake falls back to git clone.
-log "configuring xmake (fetches crc32c, catch2, benchmark, jemalloc)"
+log "configuring xmake (fetches crc32c, zstd, catch2, benchmark, jemalloc)"
 cd "$project_dir"
 xmake f --toolchain=clang \
         --cxflags="-resource-dir=$(clang --print-resource-dir)" \

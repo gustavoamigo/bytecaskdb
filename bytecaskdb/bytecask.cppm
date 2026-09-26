@@ -4864,13 +4864,16 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   };
 
   // One cursor per hint file, parked on its next Put or Delete. The scanner
-  // spans into the hint file's own buffer, so the files must outlive the
-  // merge and the vector must not reallocate under them.
+  // reads the hint file's own buffer or mapping, so the files must outlive
+  // the merge. A scanner's entries last only until its next call, so the
+  // cursor owns the entries it keeps.
   struct Cursor {
     HintFile::Scanner scanner;
-    std::optional<HintEntry> cur;       // best entry for the key it sits on
-    std::optional<HintEntry> lookahead; // first entry of the following key
     std::uint32_t file_id;
+    HintRecord cur;       // best entry for the key it sits on
+    HintRecord lookahead; // first entry of the following key
+    bool has_cur{false};
+    bool has_lookahead{false};
   };
   std::vector<HintFile> open_hints;
   std::vector<Cursor> cursors;
@@ -4884,9 +4887,8 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
     try {
       open_hints.push_back(
           open_hint_or_rebuild(data_file, hint_path, &HintFile::OpenForMerge));
-      auto scanner = open_hints.back().make_scanner();
-      std::optional<HintEntry> first;
-      while (auto he = scanner.next()) {
+      Cursor c{open_hints.back().make_scanner(), file_id, {}, {}, false, false};
+      while (auto he = c.scanner.next()) {
         note(file_id, *he);
         if (he->entry_type == EntryType::RangeDel) {
           range_tombstones.push_back(
@@ -4897,10 +4899,11 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
             he->entry_type == EntryType::BulkEnd) {
           continue;
         }
-        first = *he;
+        c.lookahead.assign(*he);
+        c.has_lookahead = true;
         break;
       }
-      cursors.push_back({std::move(scanner), std::nullopt, first, file_id});
+      cursors.push_back(std::move(c));
     } catch (const std::exception &e) {
       if (strict) throw;
       std::fprintf(stderr,
@@ -4941,27 +4944,31 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   // Hints are no longer deduplicated, so one key can repeat within a run;
   // collapsing here is what keeps the merged stream strictly ascending.
   auto load = [&](Cursor &c) {
-    auto best = c.lookahead ? c.lookahead : next_data(c);
-    c.lookahead.reset();
-    if (!best) {
-      c.cur.reset();
+    if (c.has_lookahead) {
+      std::swap(c.cur, c.lookahead);
+      c.has_lookahead = false;
+    } else if (auto he = next_data(c)) {
+      c.cur.assign(*he);
+    } else {
+      c.has_cur = false;
       return;
     }
+    c.has_cur = true;
     while (auto he = next_data(c)) {
-      const auto ord = recovery_key_cmp(he->key, best->key);
+      const auto ord = recovery_key_cmp(he->key, c.cur.key);
       if (ord < 0) {
         throw std::runtime_error{
             "bytecask: hint file is not sorted — recovery_build_sorted needs "
             "the sorted hint files flush_hints_for writes"};
       }
       if (ord == 0) {
-        if (he->sequence > best->sequence) best = he;
+        if (he->sequence > c.cur.sequence) c.cur.assign(*he);
         continue;
       }
-      c.lookahead = he;
+      c.lookahead.assign(*he);
+      c.has_lookahead = true;
       break;
     }
-    c.cur = best;
   };
   for (auto &c : cursors) load(c);
 
@@ -4971,12 +4978,12 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   // ~180 files made recovery 3x slower than the radix tree; the heap makes
   // it O(log files).
   const auto ahead = [&](std::size_t a, std::size_t b) {
-    return recovery_key_cmp(cursors[a].cur->key, cursors[b].cur->key) > 0;
+    return recovery_key_cmp(cursors[a].cur.key, cursors[b].cur.key) > 0;
   };
   std::vector<std::size_t> heap;
   heap.reserve(cursors.size());
   for (std::size_t i = 0; i < cursors.size(); ++i)
-    if (cursors[i].cur) heap.push_back(i);
+    if (cursors[i].has_cur) heap.push_back(i);
   std::ranges::make_heap(heap, ahead);
 
   while (!heap.empty()) {
@@ -4984,31 +4991,32 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
     const auto best = heap.back();
     heap.pop_back();
 
-    const auto key = cursors[best].cur->key;
-    auto winner = *cursors[best].cur;
-    auto winner_file = cursors[best].file_id;
+    // `key` is the cursor's own copy: valid until that cursor is loaded,
+    // which happens only once this key is done.
+    const auto key = std::span<const std::byte>{cursors[best].cur.key};
+    auto winner_at = best;
     matches.clear();
     matches.push_back(best);
     // Every other cursor sitting on the same key is adjacent at the top.
     while (!heap.empty() &&
-           recovery_key_cmp(cursors[heap.front()].cur->key, key) == 0) {
+           recovery_key_cmp(cursors[heap.front()].cur.key, key) == 0) {
       std::ranges::pop_heap(heap, ahead);
       const auto i = heap.back();
       heap.pop_back();
       matches.push_back(i);
-      if (cursors[i].cur->sequence > winner.sequence) {
-        winner = *cursors[i].cur;
-        winner_file = cursors[i].file_id;
-      }
+      if (cursors[i].cur.sequence > cursors[winner_at].cur.sequence)
+        winner_at = i;
     }
+    const auto &winner = cursors[winner_at].cur;
+    const auto winner_file = cursors[winner_at].file_id;
     // A Delete that wins its file is recorded even when another file's Put
     // outranks it here, so workers that never saw this key still learn of it.
     // A Delete that loses within its own file cannot matter: the entry that
     // beat it is newer and lives in the same file.
     for (const auto i : matches) {
-      if (cursors[i].cur->entry_type != EntryType::Delete) continue;
+      if (cursors[i].cur.entry_type != EntryType::Delete) continue;
       auto &slot = tombstones[Key{key}];
-      if (cursors[i].cur->sequence > slot) slot = cursors[i].cur->sequence;
+      if (cursors[i].cur.sequence > slot) slot = cursors[i].cur.sequence;
     }
 
     if (winner.entry_type == EntryType::Put) {
@@ -5034,7 +5042,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
 
     for (const auto i : matches) {
       load(cursors[i]);
-      if (cursors[i].cur) {
+      if (cursors[i].has_cur) {
         heap.push_back(i);
         std::ranges::push_heap(heap, ahead);
       }
@@ -5323,8 +5331,9 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
 //
 //   1. Per file, in parallel: open it (rebuilding a damaged hint), collect its
 //      range tombstones and sequence bounds, and record a fence — the key and
-//      offset of an entry — every 4 KiB. A fence sits only on the first entry
-//      of a key, so seeking to one never skips an older duplicate of it.
+//      position of an entry — at the start of every frame and every 4 KiB
+//      inside one. A fence sits only on the first entry of a key, so seeking
+//      to one never skips an older duplicate of it.
 //   2. Pool the fence keys and cut them into one range per thread.
 //   3. Per range, in parallel: seek every file to its last fence below the
 //      range and k-way merge its slice. The newest entry of a key wins
@@ -5352,13 +5361,14 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
 #endif
   constexpr std::size_t kFenceStep = 4096;
 
+  using Position = HintFile::Scanner::Position;
   struct Fence {
-    std::span<const std::byte> key; // into the file's mapping
-    std::size_t offset;
+    std::vector<std::byte> key; // a copy: the scanner's frame is reused
+    Position at;
   };
   struct FileRun {
     std::optional<HintFile> hint; // empty: skipped (lenient open)
-    std::size_t data_start{0};    // offset of the first Put or Delete
+    Position data_start;          // where the first Put or Delete starts
     std::vector<Fence> fences;
     std::vector<RangeTombstone> range_tombstones;
     FileStats stats;
@@ -5384,10 +5394,11 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
     }
     auto scanner = run.hint->make_scanner();
     bool in_data = false;
-    std::size_t next_fence = 0;
-    std::span<const std::byte> prev_key;
+    Position next_fence{};
+    std::vector<std::byte> prev_key;
+    bool have_prev = false;
     for (;;) {
-      const auto at = scanner.offset();
+      const auto at = scanner.position();
       const auto he = scanner.next();
       if (!he) break;
       if (run.stats.min_sequence == 0 || he->sequence < run.stats.min_sequence)
@@ -5417,14 +5428,18 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
         run.data_start = at;
       }
       const bool new_key =
-          prev_key.data() == nullptr || recovery_key_cmp(he->key, prev_key) != 0;
-      if (new_key && at >= next_fence) {
-        run.fences.push_back({he->key, at});
-        next_fence = (at / kFenceStep + 1) * kFenceStep;
+          !have_prev || recovery_key_cmp(he->key, prev_key) != 0;
+      if (!new_key) continue;
+      // A new frame always passes: its position sorts after any fence
+      // target inside the previous one.
+      if (at >= next_fence) {
+        run.fences.push_back({{he->key.begin(), he->key.end()}, at});
+        next_fence = {at.frame, (at.offset / kFenceStep + 1) * kFenceStep};
       }
-      prev_key = he->key;
+      prev_key.assign(he->key.begin(), he->key.end());
+      have_prev = true;
     }
-    if (!in_data) run.data_start = scanner.offset();
+    if (!in_data) run.data_start = scanner.position();
   };
   auto scan_worker = [&](unsigned w) {
     for (std::size_t f = w; f < files.size(); f += W) scan_file(f);
@@ -5486,11 +5501,15 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
         rts.push_back(&rt);
     }
 
+    // A scanner's entries last only until its next call, so the cursor owns
+    // the entries it keeps.
     struct Cursor {
       HintFile::Scanner scanner;
       std::uint32_t file_id;
-      std::optional<HintEntry> cur;       // newest entry of the key it sits on
-      std::optional<HintEntry> lookahead; // first entry of the following key
+      HintRecord cur;       // newest entry of the key it sits on
+      HintRecord lookahead; // first entry of the following key
+      bool has_cur{false};
+      bool has_lookahead{false};
     };
     std::vector<Cursor> cursors;
     cursors.reserve(files.size());
@@ -5508,26 +5527,31 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
     // Parks the cursor on the newest entry of its next distinct key inside
     // the range, or empties it.
     auto load = [&](Cursor &c) {
-      auto best = c.lookahead ? c.lookahead : next_data(c);
-      c.lookahead.reset();
-      if (!best || !below_hi(best->key)) {
-        c.cur.reset();
+      c.has_cur = false;
+      if (c.has_lookahead) {
+        std::swap(c.cur, c.lookahead);
+        c.has_lookahead = false;
+      } else if (auto he = next_data(c)) {
+        c.cur.assign(*he);
+      } else {
         return;
       }
+      if (!below_hi(c.cur.key)) return;
+      c.has_cur = true;
       while (auto he = next_data(c)) {
-        const auto ord = recovery_key_cmp(he->key, best->key);
+        const auto ord = recovery_key_cmp(he->key, c.cur.key);
         if (ord < 0)
           throw std::runtime_error{
               "bytecask: hint file is not sorted — recovery needs the sorted "
               "hint files flush_hints_for writes"};
         if (ord == 0) {
-          if (he->sequence > best->sequence) best = he;
+          if (he->sequence > c.cur.sequence) c.cur.assign(*he);
           continue;
         }
-        c.lookahead = he;
+        c.lookahead.assign(*he);
+        c.has_lookahead = true;
         break;
       }
-      c.cur = best;
     };
 
     for (std::size_t f = 0; f < files.size(); ++f) {
@@ -5537,29 +5561,31 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
       auto start = run.data_start;
       if (!lo.empty()) {
         const auto it = std::ranges::lower_bound(
-            run.fences, lo, [](auto a, auto b) {
+            run.fences, lo,
+            [](std::span<const std::byte> a, std::span<const std::byte> b) {
               return recovery_key_cmp(a, b) < 0;
             },
             &Fence::key);
-        if (it != run.fences.begin()) start = std::prev(it)->offset;
+        if (it != run.fences.begin()) start = std::prev(it)->at;
       }
-      Cursor c{run.hint->make_scanner(), files[f].file_id, {}, {}};
+      Cursor c{run.hint->make_scanner(), files[f].file_id, {}, {}, false, false};
       c.scanner.seek(start);
       // Step over the keys below lo.
       if (!lo.empty()) {
         while (auto he = next_data(c)) {
           if (recovery_key_cmp(he->key, lo) >= 0) {
-            c.lookahead = he;
+            c.lookahead.assign(*he);
+            c.has_lookahead = true;
             break;
           }
         }
       }
       load(c);
-      if (c.cur) cursors.push_back(std::move(c));
+      if (c.has_cur) cursors.push_back(std::move(c));
     }
 
     const auto ahead = [&](std::size_t a, std::size_t b) {
-      return recovery_key_cmp(cursors[a].cur->key, cursors[b].cur->key) > 0;
+      return recovery_key_cmp(cursors[a].cur.key, cursors[b].cur.key) > 0;
     };
     std::vector<std::size_t> heap(cursors.size());
     for (std::size_t i = 0; i < cursors.size(); ++i) heap[i] = i;
@@ -5570,19 +5596,21 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
     auto &live = outs[r].live;
     std::vector<std::size_t> matches;
     auto entry_of = [](const Cursor &c) {
-      return KeyDirEntry::make(c.cur->sequence, c.cur->file_offset, c.file_id,
-                               c.cur->value_size);
+      return KeyDirEntry::make(c.cur.sequence, c.cur.file_offset, c.file_id,
+                               c.cur.value_size);
     };
     while (!heap.empty()) {
       std::ranges::pop_heap(heap, ahead);
       const auto first = heap.back();
       heap.pop_back();
-      const auto key = cursors[first].cur->key;
+      // The cursor's own copy: valid until that cursor is loaded, which
+      // happens only once this key is done.
+      const auto key = std::span<const std::byte>{cursors[first].cur.key};
       auto winner = first;
       auto winner_entry = entry_of(cursors[first]);
       matches.assign(1, first);
       while (!heap.empty() &&
-             recovery_key_cmp(cursors[heap.front()].cur->key, key) == 0) {
+             recovery_key_cmp(cursors[heap.front()].cur.key, key) == 0) {
         std::ranges::pop_heap(heap, ahead);
         const auto i = heap.back();
         heap.pop_back();
@@ -5594,7 +5622,7 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
         }
       }
 
-      auto keep = cursors[winner].cur->entry_type == EntryType::Put;
+      auto keep = cursors[winner].cur.entry_type == EntryType::Put;
       for (const auto *rt : rts) {
         if (!keep) break;
         if (winner_entry.sequence() >= rt->seq) continue;
@@ -5610,10 +5638,9 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
             entry_size(key.size(), winner_entry.value_size());
       }
 
-      // `key` spans into the mapping, not a cursor: advancing is safe.
       for (const auto i : matches) {
         load(cursors[i]);
-        if (cursors[i].cur) {
+        if (cursors[i].has_cur) {
           heap.push_back(i);
           std::ranges::push_heap(heap, ahead);
         }

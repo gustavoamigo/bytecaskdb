@@ -24,7 +24,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append, whatever the size of the range. Removing the keys from the key directory reads each of them back from its data file (twice, today), so that part grows with the number of keys removed. Available on `DB` and `WritePlan`.
 - **Atomic writes** — every `put`, `del`, and `del_range` is atomic. `apply_batch` makes multiple puts, deletes, and range deletes atomic as a group.
 - **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `nullopt` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. Each precondition check is a key directory lookup plus one record read for the key's sequence — no separate transaction type required.
-- **Fast recovery** — parallelised index reconstruction from hint files; 10 M keys recover in under 510 ms on a SATA SSD.
+- **Fast recovery** — parallelised index reconstruction from zstd-compressed hint files; from a cold start, with nothing in the page cache, 10 M keys recover in 0.33 s on a SATA SSD.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex for their in-memory phase, with group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost. The commit is pipelined: while one flush is in flight, the next batch is validated, applied and appended, so the disk never waits on in-memory work. On the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
 - **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. Hint files are an index, not the record: one that fails its CRC is rebuilt from its data file at recovery rather than dropped, so a damaged index costs the time to rebuild it and not the keys behind it. A process killed in the middle of a vacuum leaves the file being compacted and its compacted copy side by side; the next open deletes the copy once it has checked that every entry in it is also in the original, and refuses to open on any other pair of files that share sequence numbers. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a degraded state: reads remain available, all writes throw `DbDegraded`, and the service calls `resume()` to recover without a restart. Corruption of data already acknowledged is refused rather than repaired: `resume()` throws instead of cutting the file back to the last entry it can parse, and `open` refuses a data file holding an entry that fails its CRC.
@@ -41,7 +41,7 @@ Benchmarked at 1 M keys with [RocksDB](https://rocksdb.org/) as a reference poin
 - **Sequential writes** sustain 134 Kops/s (NoSync) and 139 ops/s (Sync), limited by `fdatasync` round-trip latency. No write amplification from compaction.
 - **Concurrent sync writes scale via group commit** — writers share a single `fdatasync` call. 4.9 Kops/s at 64 threads.
 - **Range scans over values** fetch each value individually from disk. LSM-based engines pack values contiguously in sorted runs and perform better here. Key-only iteration (`keys_from`) reads each key's record header and skips the value.
-- **Recovery is fast and parallel** — hint files replayed across all cores with per-file CRC verification. 1 M keys in ~58 ms, 10 M in ~506 ms at 16 threads.
+- **Recovery is fast and parallel** — compressed hint files replayed across all cores with per-file CRC verification. From a cold start: 1 M keys in 37 ms, 10 M in 0.33 s at 16 threads.
 
 See [`docs/bytecask_benchmark_showcase.md`](docs/bytecask_benchmark_showcase.md) for the full benchmark report with all thread counts, dataset sizes, and hardware details.
 
@@ -110,24 +110,28 @@ Latency stays flat as the dataset grows: every read resolves to a known file off
 
 ### Recovery
 
-Recovery runs when ByteCaskDB opens an existing database: it rebuilds the in-memory key directory by reading compact hint files from disk. Each hint file is verified by a file-level CRC-32C trailer before parsing. This is parallelised across all available CPU cores — each core processes a disjoint set of hint files independently, and the results are merged before the database becomes available.
+Recovery runs when ByteCaskDB opens an existing database: it rebuilds the in-memory key directory by reading compact hint files from disk. Each hint file holds its entries in zstd frames and is verified by a file-level CRC-32C trailer before parsing. This is parallelised across all available CPU cores — each core processes a disjoint set of hint files independently, and the results are merged before the database becomes available.
+
+Measured from a cold start: every file of the database is evicted from the page cache before each open, so the hint files come off the SSD, as after a reboot or on a new node.
 
 | Keys | Threads | Recovery Time | Speedup vs 1T |
 |---:|---:|---:|---:|
-| 1M | 1 | 297 ms | — |
-| 1M | 4 | 93 ms | 3.2× |
-| 1M | 8 | 64 ms | 4.6× |
-| 1M | 16 | 58 ms | 5.1× |
-| 10M | 1 | 3.00 s | — |
-| 10M | 4 | 0.91 s | 3.3× |
-| 10M | 8 | 0.58 s | 5.2× |
-| 10M | 16 | 0.51 s | 5.9× |
+| 1M | 1 | 206 ms | — |
+| 1M | 4 | 63 ms | 3.3× |
+| 1M | 8 | 42 ms | 4.9× |
+| 1M | 16 | 37 ms | 5.6× |
+| 10M | 1 | 2.24 s | — |
+| 10M | 4 | 0.63 s | 3.6× |
+| 10M | 8 | 0.37 s | 6.1× |
+| 10M | 16 | 0.33 s | 6.9× |
+
+The benchmark's keys — prefixed UUID text written in order, with 1-byte values — compress 14×: at 10M keys the hint files hold 675 MB of entries in 47 MB. Keys with less in common compress less (2.4× for random 16-hex-digit ids with realistic values, 1.6× for random binary keys), and a cold start then reads more; [`docs/hint_compression_design.md`](docs/hint_compression_design.md) has the measurements.
 
 ---
 
 _Tested on AMD Ryzen 7 3700X (8C/16T), Samsung SSD 860 EVO SATA (463 MiB/s read), 31 GiB RAM. Each result is the mean of 5 runs. Benchmark source: [`benchmarks/engine_bench.cpp`](benchmarks/engine_bench.cpp)._
 
-_These figures were measured on the radix key directory, before the B+ tree became the default, and on the `mmap` read path, before `engine_bench` switched its default to the buffer pool. A head-to-head run of both trees on one engine put the B+ tree ahead on reads and batched writes and behind on unsynced single puts, but that run was on different hardware, so the absolute numbers above have not been re-measured on this machine and are not restated here. The blind-leaf tree, now the default, was then measured against the keyed B+ tree on one machine at 1M keys: level on `Get` and `GetMT`, 1.25–1.3× on random 16-byte keys, and 0.89× on unsynced single puts, with the key directory 2–7× smaller ([`docs/blind_leaf_btree_design.md`](docs/blind_leaf_btree_design.md)). Reproduce the keyed trees with [`scripts/compare_engine_bench.py`](scripts/compare_engine_bench.py)._
+_The recovery figures were measured on the default blind-leaf key directory, on the machine above, in September 2026. The other figures were measured on the radix key directory, before the B+ tree became the default, and on the `mmap` read path, before `engine_bench` switched its default to the buffer pool. A head-to-head run of both trees on one engine put the B+ tree ahead on reads and batched writes and behind on unsynced single puts, but that run was on different hardware, so the absolute numbers above have not been re-measured on this machine and are not restated here. The blind-leaf tree, now the default, was then measured against the keyed B+ tree on one machine at 1M keys: level on `Get` and `GetMT`, 1.25–1.3× on random 16-byte keys, and 0.89× on unsynced single puts, with the key directory 2–7× smaller ([`docs/blind_leaf_btree_design.md`](docs/blind_leaf_btree_design.md)). Reproduce the keyed trees with [`scripts/compare_engine_bench.py`](scripts/compare_engine_bench.py)._
 
 ## Quick Start
 
@@ -478,7 +482,7 @@ ByteCaskDB is designed around four core tenets, in priority order:
 
 **Read path**: readers obtain an immutable snapshot of the engine state, look up the key in the key directory to find its file and offset, then read the record: one read confirms the key (the leaf holds only its fingerprint) and returns the value. Reads are lock-free and scale linearly across cores.
 
-**Recovery**: on `open`, the engine generates a hint file for any data file that lacks one (including the most recent active file), then replays all hint files in parallel to rebuild the key directory. Hint files are compact per-file indexes written atomically (`write → fdatasync → rename`) by a background worker after each file rotation and synchronously at engine close. No raw data-file scan is performed — recovery reads only hint files.
+**Recovery**: on `open`, the engine generates a hint file for any data file that lacks one (including the most recent active file), then replays all hint files in parallel to rebuild the key directory. Hint files are compact per-file indexes, sorted by key and compressed with zstd, written atomically (`write → fdatasync → rename`) by a background worker after each file rotation and synchronously at engine close. No raw data-file scan is performed — recovery reads only hint files.
 
 Start with [`docs/bytecask_intro.md`](docs/bytecask_intro.md) for a first-pass happy-path overview, then use [`docs/bytecask_design.md`](docs/bytecask_design.md) as the full design reference.
 
@@ -522,6 +526,7 @@ If you want to take it in a different direction and fork it into your own thing,
 | [`docs/file_format.md`](docs/file_format.md) | On-disk file format reference: data file entries, hint file entries, CRC, byte order, naming |
 | [`docs/engine_api_design.md`](docs/engine_api_design.md) | Public API specification with usage examples |
 | [`docs/parallel_recovery_design.md`](docs/parallel_recovery_design.md) | Parallel recovery algorithm and fan-in merge strategy |
+| [`docs/hint_compression_design.md`](docs/hint_compression_design.md) | zstd-framed hint files: why cold-start recovery is bound by the SSD, the frame layout, compatibility, and measurements |
 | [`docs/blind_leaf_btree_design.md`](docs/blind_leaf_btree_design.md) | Blind-leaf B+ tree design — the key directory: leaves without key bytes, fingerprint lookups, measurements |
 | [`docs/persistent_btree_design.md`](docs/persistent_btree_design.md) | Persistent B+ tree design — the inner nodes of the key directory, and the keyed tree selectable with `BYTECASK_KEYDIR=btree` |
 | [`docs/persistent_radix_tree_design.md`](docs/persistent_radix_tree_design.md) | Persistent radix tree data structure design — the alternate key directory (`BYTECASK_KEYDIR=radix`) |

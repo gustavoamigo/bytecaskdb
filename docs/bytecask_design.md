@@ -138,7 +138,7 @@ In the engine it changes what reads the data files:
 - The read that confirms a key also yields its sequence, so `kd_get` returns a full `KeyDirEntry` and the conflict checks, vacuum's remap and `resume()`'s replay are unchanged. `DB::get` and `Snapshot::get` take the value from that same read.
 - Reads the other trees never do: every put and erase reads one record (the candidate's, which may be another key's), plus one when a leaf splits; `contains_key` and every step of `keys_from` read one record. A read that fails — I/O error or CRC mismatch, including on a neighbouring key's record — fails the operation before anything is written.
 - Iterators over a published state hold their own handle on its file registry, so `keys_from` can outlive the call that made it.
-- Recovery (`recovery_load_streams`) merges the sorted hint files directly: per file, fences every 4 KiB; splitters from the pooled fences; per range, a k-way merge of every file's slice straight into blind leaves, which are then concatenated. No intermediate tree is built, and at 1M keys it recovers faster than the B+ tree's `recovery_load_ranged`. Leaves are loaded between 60% and 100% full, spread so they do not all split on the first random writes after open.
+- Recovery (`recovery_load_streams`) merges the sorted hint files directly: per file, a fence at the start of every frame and every 4 KiB inside one; splitters from the pooled fences; per range, a k-way merge of every file's slice straight into blind leaves, which are then concatenated. No intermediate tree is built, and at 1M keys it recovers faster than the B+ tree's `recovery_load_ranged`. Leaves are loaded between 60% and 100% full, spread so they do not all split on the first random writes after open.
 
 ### Size Limits
 
@@ -976,10 +976,13 @@ On WASM/Emscripten builds, mmap is disabled (`#ifndef __EMSCRIPTEN__`). Emscript
 
 Write and read modes have different I/O strategies.
 
-- **`OpenForWrite(path)`** — opens the file immediately. Each `append()` serializes one entry and writes it directly to the fd, updating a running CRC-32C accumulator. `close()` writes the 4-byte CRC trailer, calls `fdatasync()`, and closes the fd. If the HintFile is destroyed without calling `close()` (e.g. exception path), the fd is closed without writing the CRC — the `.hint.tmp` file is cleaned up on next startup.
-- **`OpenForRead(path)`** — reads the entire file into an in-memory buffer via a single `pread` and immediately closes the fd. `scan()` operates on the buffer.
+- **`OpenForWrite(path)`** — opens the file and writes its 16-byte header. Each `append()` serializes one entry into the open frame; once the frame holds `kHintFrameBytes` (16 KiB) it is compressed with zstd in one call and written to the fd, updating a running CRC-32C accumulator. `close()` writes the last frame and the inverted CRC trailer, calls `fdatasync()`, and closes the fd. If the HintFile is destroyed without calling `close()` (e.g. exception path), the fd is closed without writing the CRC — the `.hint.tmp` file is cleaned up on next startup.
+- **`OpenForRead(path)`** — reads the entire file into an in-memory buffer via a single `pread` and immediately closes the fd.
+- **`OpenForMerge(path)`** — maps the file read-only instead, for the k-way merges that hold every file open at once: the compressed bytes stay in the page cache, file-backed and reclaimable.
 
-`HintEntry.key` is a `std::span<const std::byte>` into the backing buffer — zero allocation per entry, valid for the lifetime of the `HintFile`. All callers (recovery and tests) use `scan()`.
+Both read modes verify the trailer before any parsing and read either layout: the zstd-framed one, and the uncompressed one written before compression (see [Hint File Format](#hint-file-format-hint)).
+
+`HintEntry.key` is a `std::span<const std::byte>` with no allocation per entry. In a framed file it points into the frame the scanner has decoded, so it is valid only until the scanner's next `next()` or `seek()`. A reader that keeps an entry longer copies it into a `HintRecord`, which owns its key and reuses its capacity: the merge cursors of `recovery_build_sorted` and `recovery_load_streams` hold their current entry and lookahead that way, and a blind fence owns its key. Testing builds give every decoded frame a fresh allocation, so a reader that breaks the rule reads freed memory, and ASan reports it instead of the reader silently seeing the next frame's bytes.
 
 ## Hint File Format (.hint)
 
@@ -987,25 +990,29 @@ Write and read modes have different I/O strategies.
 
 Hint files are compact companion files to sealed (rotated) data files. Each hint entry summarises one data file entry — just enough metadata and the full key — so that the in-memory Key Directory can be rebuilt at startup by scanning the smaller hint files instead of the raw data files. Only sealed data files have a corresponding hint file; the active data file is recovered by scanning its raw bytes if needed.
 
-### Entry Structure
+### File Structure
 
-`flush_hints_for()` writes the keyless batch markers and the range tombstones first in data-file append order, then the Put and Delete entries sorted by key. See [Sorted Hint Files](#sorted-hint-files).
+A hint file is a 16-byte header, the entries in zstd frames, and a 4-byte trailer:
 
 ```
 +------------------+
-| Hint Header      | 23 bytes
+| Header           | 16 bytes: magic "BCHINTZ" 0x81, version, codec
 +------------------+
-| Key Data         | key_len bytes
+| zstd frame       | ~16 KiB of entries before compression
 +------------------+
-     ...repeated for each entry...
+     ...repeated...
 +------------------+
-| File CRC32       | 4 bytes (file trailer)
+| ~CRC32C          | 4 bytes (file trailer)
 +------------------+
 ```
 
-Total fixed overhead per entry: **23 bytes** (header). A single 4-byte CRC-32C trailer at the end of the file covers all entry bytes.
+A frame holds whole entries and records its decompressed size, so a reader walks frames one after another without an index. Decompressed back to back, the frames are the entries below. zstd level 1: on the recovery benchmark's keys, level 3 compressed no better. Compressed, a hint file is 1.6–9× smaller than the entries it holds, depending on how much the keys have in common, and a cold start reads that many fewer bytes; see [`hint_compression_design.md`](hint_compression_design.md) for the measurements. The byte-level layout is in [`file_format.md`](file_format.md).
 
-> `BulkBegin`/`BulkEnd` data file entries are **never** written to hint files — only `Put` and `Delete` entries are included.
+Files written before compression hold the entries back to back and a plain CRC-32C, and are still read. Their first 8 bytes are the first entry's sequence, below 2^63; the magic sets the top bit, so the layouts cannot be confused. The framed trailer is inverted so that a reader that knows only the old layout fails its CRC and rebuilds the hint from the data file instead of parsing frames as entries: downgrading costs one hint rebuild per file.
+
+`flush_hints_for()` writes the `BulkBegin`/`BulkEnd` markers (keyless) and the range tombstones first in data-file append order, then the Put and Delete entries sorted by key. See [Sorted Hint Files](#sorted-hint-files).
+
+Each entry is a 23-byte header followed by the key:
 
 ### Hint Header (23 bytes)
 
@@ -1023,7 +1030,9 @@ Total fixed overhead per entry: **23 bytes** (header). A single 4-byte CRC-32C t
 
 | Offset from file start | Size | Field  | Type   | Description                                       |
 |------------------------|------|--------|--------|---------------------------------------------------|
-| end - 4                | 4    | CRC32  | u32 LE | CRC-32C (Castagnoli) over all preceding entry bytes |
+| end - 4                | 4    | CRC32  | u32 LE | Bitwise NOT of the CRC-32C (Castagnoli) over all preceding bytes, header and frames; the plain CRC-32C in the uncompressed layout |
+
+The file CRC is the only integrity check. zstd detects little on its own — a flipped bit in a frame of real hint entries decoded to wrong bytes without error 83–93% of the time — and its per-frame checksum is not enabled: it would catch the same flips, but not a missing frame, and only partway through decoding.
 
 `OpenForRead` and `OpenForMerge` both verify the trailer CRC eagerly, before parsing any entries, and reject the whole file by throwing `std::runtime_error` on mismatch. Verifying at open is what makes the file's replacement safe: the throw lands before any entry has been applied to the key directory, so the rebuild below has no partial state to undo.
 
@@ -1032,17 +1041,20 @@ A hint file is a derived index, not the records it points at, so a CRC failure i
 ### Size Constants
 
 - `kHintHeaderSize = 23` — fixed header fields (no per-entry CRC)
-- Total entry size: `kHintHeaderSize + key_len` (variable)
-- File overhead: 4 bytes (file CRC trailer)
+- Total entry size: `kHintHeaderSize + key_len` (variable), before compression
+- `kHintFrameBytes = 16 KiB` — entry bytes after which a frame is closed
+- File overhead: 16-byte header, 4-byte file CRC trailer
 
 ### Scanner API
 
-`HintFile::make_scanner()` returns a `Scanner` object that iterates over entries sequentially. `HintEntry.key` is a `span<const byte>` into the backing file buffer, valid for the lifetime of the `HintFile`.
+`HintFile::make_scanner()` returns a `Scanner` object that iterates over entries sequentially, decoding one frame at a time into a buffer it owns; each thread shares one zstd decompression context among all its scanners. `HintEntry.key` is valid until the scanner's next `next()` or `seek()`.
 
 ```cpp
 auto scanner = hint.make_scanner();
 while (auto he = scanner.next()) { /* use he->key, he->sequence, … */ }
 ```
+
+`position()` names where the next entry starts — its frame and its offset in the decoded frame; an uncompressed file is one frame — and `seek()` returns there. Positions order like the entries they name. The blind recovery path records its fences as positions.
 
 ### Recovery
 
@@ -1080,6 +1092,8 @@ See `docs/parallel_recovery_design.md` §11 for the full v1 algorithm.
 | 16      | 52          | 5.04×   | 503          | 5.68×   |
 
 Scaling is sub-linear due to fan-in merge overhead and memory bandwidth saturation beyond 8 threads. At 10M keys, recovery drops from 2.86s (serial) to 503ms (16 threads).
+
+These figures predate two changes and were read from a warm page cache: the benchmark evicted nothing unless run as root. `BM_RecoveryParallel` now measures a cold start, evicting every file of the database with `posix_fadvise` before each open, and hint files are zstd-framed; [`hint_compression_design.md`](hint_compression_design.md) has the cold before/after (10M keys at 16 threads: 1.57 s to 0.33 s).
 
 ### Range-Partitioned Recovery (B+ tree)
 
