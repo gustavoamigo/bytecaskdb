@@ -181,8 +181,9 @@ struct ReadOptions {
 ```cpp
 // Controls which sealed files are eligible for vacuum.
 struct VacuumOptions {
-    // Minimum fragmentation ratio (1 − live_bytes / total_bytes) a sealed
-    // file must exceed to be eligible. Range [0.0, 1.0]. Default 0.5.
+    // Minimum fragmentation ratio a sealed file must exceed to be eligible:
+    // 1 − (live + tombstone bytes) / total bytes, the share compaction can
+    // reclaim. Range [0.0, 1.0]. Default 0.5.
     double fragmentation_threshold{0.5};
 };
 ```

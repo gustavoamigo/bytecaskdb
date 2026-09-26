@@ -342,6 +342,7 @@ inline void assert_matches_recovery(const std::filesystem::path &dir,
     CHECK(it->second.total_bytes == fs.total_bytes);
     CHECK(it->second.min_sequence == fs.min_sequence);
     CHECK(it->second.max_sequence == fs.max_sequence);
+    CHECK(it->second.tombstone_bytes == fs.tombstone_bytes);
   }
 }
 
@@ -545,8 +546,9 @@ inline auto find_vacuum_target(const DB &db) -> std::uint32_t {
   for (const auto [file_id, fs] : state->file_stats) {
     if (file_id == state->active_file_id) continue;
     if (fs.total_bytes == 0) continue;
-    const double frag = 1.0 - static_cast<double>(fs.live_bytes) /
-                                  static_cast<double>(fs.total_bytes);
+    const double frag =
+        1.0 - static_cast<double>(fs.live_bytes + fs.tombstone_bytes) /
+                  static_cast<double>(fs.total_bytes);
     if (frag > worst_frag) {
       worst_frag = frag;
       target_id = file_id;

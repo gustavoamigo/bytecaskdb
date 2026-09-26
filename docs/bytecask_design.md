@@ -569,22 +569,23 @@ ByteeCask implements a **conservative online vacuum**: the engine continues to s
 - Only sealed (immutable) data files are considered — the active file is never touched.
 - Only files whose fragmentation exceeds a configurable threshold are processed; files below the threshold are left alone.
 - One file is processed per `vacuum()` call. Callers that want to process multiple files call in a loop.
-- A file that compaction cannot shrink is declined: the staged copy is discarded and `vacuum()` returns `false`. Tombstones and batch markers are preserved by every compaction but can never count towards `live_bytes` (hint files carry no markers, so recovery could not reproduce it), so a file holding either would otherwise stay eligible at `fragmentation_threshold = 0` forever and a vacuum-to-convergence loop would never terminate.
+- A file that compaction cannot shrink is declined: the staged copy is discarded and `vacuum()` returns `false`. Tombstones are preserved by every compaction and are counted as kept bytes (`tombstone_bytes`), so they never make a file look reclaimable. Batch markers are preserved too but are not tracked, so a file whose only dead bytes are markers could otherwise stay eligible at `fragmentation_threshold = 0` forever and a vacuum-to-convergence loop would never terminate.
 - Tombstones (Delete entries) are never dropped during partial compaction (see **Tombstone handling** below).
 - A new compacted file is fully written and `fdatasync`-ed before any old file is removed.
 - **Sequence-disjoint files**: vacuum must preserve the invariant that all data files have non-overlapping sequence ranges. Compacted files maintain disjoint sequence ranges from other files.
 
 #### Fragmentation
 
-The fragmentation of a sealed data file is the fraction of disk space occupied by dead entries:
+The fragmentation of a sealed data file is the fraction of disk space compaction can reclaim:
 
 ```
-fragmentation = 1 − live_bytes / total_bytes
+fragmentation = 1 − (live_bytes + tombstone_bytes) / total_bytes
 ```
 
 - `total_bytes` — physical file size: all appended bytes, including dead puts, tombstones, and BulkBegin/BulkEnd markers.
 - `live_bytes` — sum of entry sizes (`kHeaderSize + key_size + value_size + kCrcSize`) for Put entries currently referenced by the key directory.
-- Tombstones always contribute to `total_bytes` but never to `live_bytes` — they genuinely increase fragmentation. BulkBegin/BulkEnd markers likewise contribute only to `total_bytes`; vacuum strips them from the compacted output.
+- `tombstone_bytes` — sum of entry sizes for Delete and RangeDel entries in the file. Tombstones are never live, but compaction copies every one of them (see **Tombstone handling**), so they count as kept. A file holding nothing but tombstones has fragmentation 0 and is never selected.
+- BulkBegin/BulkEnd markers contribute only to `total_bytes`.
 
 A file qualifies for vacuum when `fragmentation >= VacuumOptions::fragmentation_threshold` (default `0.5`).
 
@@ -598,6 +599,7 @@ struct FileStats {
   std::uint64_t total_bytes{0};
   std::uint64_t min_sequence{0};  // lowest sequence in this file (0 = no entries)
   std::uint64_t max_sequence{0};  // highest sequence in this file (0 = no entries)
+  std::uint64_t tombstone_bytes{0};  // Delete + RangeDel entries: not live, never reclaimable
 };
 ```
 
@@ -610,7 +612,8 @@ The helper `entry_size(key_size, value_size)` returns `kHeaderSize + key_size + 
 All stats updates happen inside `TransientEngineState::apply_writes`:
 
 - **On Put**: if the key already exists (overwrite), subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats[old_entry.file_id].live_bytes`. Add `entry_size(key.size(), value.size())` to `file_stats[active_file_id].live_bytes` and to `.total_bytes`.
-- **On Del**: if the key exists, subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats[old_entry.file_id].live_bytes`. Add the tombstone size (`kHeaderSize + key.size() + kCrcSize`) to `file_stats[active_file_id].total_bytes`. The tombstone is never added to `live_bytes` — tombstones are never referenced by the key directory.
+- **On Del**: if the key exists, subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats[old_entry.file_id].live_bytes`. Add the tombstone size (`kHeaderSize + key.size() + kCrcSize`) to `file_stats[active_file_id].total_bytes` and `.tombstone_bytes`. The tombstone is never added to `live_bytes` — tombstones are never referenced by the key directory.
+- **On DelRange**: subtract each erased key's entry size from its file's `live_bytes`, and add the range tombstone's size (`entry_size(from.size(), to.size())`) to the active file's `total_bytes` and `tombstone_bytes`.
 - **BulkBegin/BulkEnd markers**: each add `kHeaderSize + kCrcSize` to the active file's `total_bytes` only — they are never referenced by the key directory.
 - **On rotation**: `apply_rotate_file` inserts `FileStats{0, 0}` for the new active file.
 
@@ -623,6 +626,7 @@ The active file's `live_bytes` may be non-zero (it holds the current live writes
 `file_stats` must be rebuilt on startup. Both `total_bytes` and `live_bytes` are reconstructed without scanning data files or traversing the key directory:
 
 - **`total_bytes`**: computed via `std::filesystem::file_size(path)` per sealed file in `open_and_prepare_files()`. Exact for append-only files. O(1) per file, no I/O beyond a `stat` call.
+- **`tombstone_bytes`**: summed per file from its hint file's Delete and RangeDel entries, in every recovery path, as the sequence bounds are. Hint files carry both, so this needs no data file read. `apply_resume` rebuilds it for the resumed file from the committed entries it scans.
 - **`live_bytes`**: reconstructed as a side-effect of the existing hint-file recovery pass. The hint entry carries `key_size` (from `key.size()`) and `value_size`, so `entry_size(key_size, value_size)` is computable without touching the data file.
 
 The displacement logic mirrors write-path updates:
@@ -661,7 +665,7 @@ Invariant: both are zero (no entries yet) or both are non-zero with `min_sequenc
 
 #### Vacuum primitives
 
-Vacuum uses two self-contained, independently testable paths. The `vacuum()` caller picks exactly one per target file based on whether the file has live entries.
+Vacuum uses two self-contained, independently testable paths. The `vacuum()` caller picks exactly one per target file based on whether the file holds anything that must be kept: live entries or tombstones.
 
 ##### `vacuum_compact_file(file_id)` — rewrite a sealed file, dropping dead entries
 
@@ -682,9 +686,11 @@ Used when the file's live data is too large to fit into the active file. Produce
 5. **Release `write_mu_`**.
 6. **Unlink old file** — the old file is removed from the registry and its `.data` and `.hint` files are unlinked from the filesystem immediately after the commit. Existing readers continue via their open file descriptors — POSIX guarantees that `pread` on an unlinked file succeeds as long as the fd is open. Disk blocks are freed when the last `shared_ptr<DataFile>` is destroyed, closing the fd.
 
-##### `vacuum_remove_file(file_id)` — delete a file with zero live entries
+##### `vacuum_remove_file(file_id)` — delete a file with nothing to keep
 
-Used when `live_bytes == 0` — the file contains only dead entries (tombstones or superseded puts). No I/O is required.
+Used when `live_bytes == 0` and `tombstone_bytes == 0` — the file holds only superseded puts and batch markers. No I/O is required.
+
+A file with no live entries but with tombstones goes through `vacuum_compact_file` instead, which copies the tombstones. Dropping it whole would drop them, and a Put they shadow in an older file would come back at the next open (#166).
 
 1. **Snapshot the key directory** — call `state_.load()` to obtain the current `EngineState`.
 2. **Commit the removal** under `write_mu_`:
@@ -722,9 +728,9 @@ Deleting C is safe on exactly what step 2 checks: everything in C is also in S. 
 The public `vacuum()` method orchestrates file selection and dispatches to exactly one primitive:
 
 1. **Acquire `vacuum_mu_`** — prevents two `vacuum()` calls from running concurrently.
-2. **Select a target file** — copy `file_stats_` under a brief `write_mu_` acquisition (O(sealed files), then release). Iterate sealed files, compute `fragmentation = 1 − live_bytes / total_bytes` (O(1) per file, no I/O), pick the highest-fragmentation sealed file above `fragmentation_threshold`. If no file qualifies, return immediately.
+2. **Select a target file** — copy `file_stats_` under a brief `write_mu_` acquisition (O(sealed files), then release). Iterate sealed files, compute `fragmentation = 1 − (live_bytes + tombstone_bytes) / total_bytes` (O(1) per file, no I/O), pick the highest-fragmentation sealed file above `fragmentation_threshold`. If no file qualifies, return immediately.
 3. **Branch**:
-   - If `file_stats_[target].live_bytes == 0` → call `vacuum_remove_file(target)` (fast path, no I/O).
+   - If `file_stats_[target].live_bytes == 0` and `tombstone_bytes == 0` → call `vacuum_remove_file(target)` (fast path, no I/O).
    - Otherwise → call `vacuum_compact_file(target)` (sealed→sealed compaction).
 4. **Release `vacuum_mu_`**.
 
@@ -1661,7 +1667,7 @@ Counters are per-DB instance (`Counters` struct owned by `DB`). Two open databas
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
 | D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1 and standard C++ practice). |
 | D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. MVCC and snapshot isolation are not provided. |
-| D10 | **Vacuum**: Two independently testable paths — `vacuum_compact_file` (rewrite sealed file into a new sealed file, dropping dead entries) and `vacuum_remove_file` (delete files with zero live entries, no I/O required). `vacuum()` selects a target file above `fragmentation_threshold`, then branches: `vacuum_remove_file` if `live_bytes == 0`, otherwise `vacuum_compact_file`. Returns `true` if a file was processed, `false` if nothing qualified. No compound paths. All vacuum-related identifiers use a `vacuum_` prefix. One sealed file per `vacuum()` call. Engine continues serving reads and writes. For `vacuum_compact_file`, `write_mu_` is held only for the commit step (I/O writes to a private temp file). For `vacuum_remove_file`, `write_mu_` is held only for the brief metadata update. `vacuum_commit` itself does not acquire `write_mu_` — the caller is responsible for holding it. Tombstones are always copied (never elided) during partial vacuum. File selection uses `fragmentation >= fragmentation_threshold` computed from incrementally maintained `FileStats` — O(1) per file. Stats are reconstructed during recovery as a side-effect of the hint-file pass. |
+| D10 | **Vacuum**: Two independently testable paths — `vacuum_compact_file` (rewrite sealed file into a new sealed file, dropping dead entries) and `vacuum_remove_file` (delete files with no live entries and no tombstones, no I/O required). `vacuum()` selects a target file above `fragmentation_threshold`, then branches: `vacuum_remove_file` if `live_bytes == 0 && tombstone_bytes == 0`, otherwise `vacuum_compact_file`. Returns `true` if a file was processed, `false` if nothing qualified. No compound paths. All vacuum-related identifiers use a `vacuum_` prefix. One sealed file per `vacuum()` call. Engine continues serving reads and writes. For `vacuum_compact_file`, `write_mu_` is held only for the commit step (I/O writes to a private temp file). For `vacuum_remove_file`, `write_mu_` is held only for the brief metadata update. `vacuum_commit` itself does not acquire `write_mu_` — the caller is responsible for holding it. Tombstones are always copied (never elided) during partial vacuum. File selection uses `fragmentation >= fragmentation_threshold`, with fragmentation `1 − (live_bytes + tombstone_bytes) / total_bytes`, computed from incrementally maintained `FileStats` — O(1) per file. Stats are reconstructed during recovery as a side-effect of the hint-file pass. |
 | D11 | **File naming**: `data_{YYYYMMDDHHmmss}_{RRRRRRRR}_V{XX}`. Timestamp is UTC second precision — a human-readable creation-time hint, not content age (compaction produces new files with old entries). `RRRRRRRR` is a 4-byte random hex salt for collision avoidance. `V{XX}` is the file format version (`V01` initially). Filename ordering carries no semantic meaning; entry sequence numbers are authoritative. |
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be discarded with a logged warning. No partial-batch entries enter the key directory. |
