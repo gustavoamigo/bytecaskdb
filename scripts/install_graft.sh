@@ -28,7 +28,9 @@ git clone -q --depth 1 --branch "$GRAFT_REF" "$GRAFT_REPO" "$WORK/graft"
 cd "$WORK/graft"
 npm install --include dev --no-audit --no-fund --silent
 npm run build --silent
-TGZ="$(npm pack --silent)"
+# npm pack runs the fork's prepack build, which logs to stdout; the tarball
+# name is the last line.
+TGZ="$(npm pack --silent | tail -n 1)"
 
 mkdir -p "$NPM_PREFIX"
 npm install -g --prefix "$NPM_PREFIX" --no-audit --no-fund --silent "./$TGZ"

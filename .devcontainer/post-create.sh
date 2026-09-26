@@ -25,7 +25,7 @@ export PATH="${NPM_PREFIX}/bin:${PATH}"
 if ! command -v graft >/dev/null 2>&1; then
   NPM_PREFIX="${NPM_PREFIX}" ./scripts/install_graft.sh
 fi
-graft init --agents copilot --agents claude -y
+graft init --agents claude -y
 
 echo 'export NPM_PREFIX="${HOME}/.npm-global"' >> ~/.bashrc
 echo 'export PATH=$NPM_PREFIX/bin:$PATH' >> ~/.bashrc 
