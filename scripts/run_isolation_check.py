@@ -14,7 +14,7 @@ Each round runs the three configurations from one seed:
     guarded    must pass the cross-check and be valid under
                strict-serializable.
     unguarded  must pass the cross-check and be valid under
-               strong-snapshot-isolation. Under strict-serializable it must be
+               snapshot-isolation. Under strict-serializable it must be
                invalid with only write skew (G2-item) reported: that shows the
                checker can see the anomaly the guards exist to prevent.
     blind      must fail: the cross-check or Elle has to find a lost or
@@ -118,6 +118,12 @@ def run_elle(jar: Path, history: Path, models: str, out_dir: Path) -> dict:
         start = proc.stdout.find("\n{")
         start = start + 1 if start >= 0 else -1
     if start < 0 or proc.returncode not in (0, 1):
+        for name, text in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+            tail = text.strip().splitlines()[-20:]
+            if tail:
+                print(f"  elle-cli {name} (last {len(tail)} lines):")
+                for line in tail:
+                    print(f"    {line}")
         raise CheckFailed(
             f"elle-cli failed (exit {proc.returncode}) on {history}; "
             f"see {out_dir}")
@@ -167,9 +173,9 @@ def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> None:
                     raise CheckFailed("guarded: not strict-serializable")
             elif config == "unguarded":
                 a = run_elle(args.elle_jar, history_path,
-                             "strong-snapshot-isolation",
+                             "snapshot-isolation",
                              round_dir / "elle-unguarded-si")
-                print(f"  unguarded: strong-snapshot-isolation {describe(a)}")
+                print(f"  unguarded: snapshot-isolation {describe(a)}")
                 if a.get("valid?") is not True:
                     raise CheckFailed("unguarded: not snapshot isolation")
                 a = run_elle(args.elle_jar, history_path,

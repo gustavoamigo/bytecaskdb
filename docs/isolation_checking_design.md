@@ -86,7 +86,7 @@ plan is built:
 | Config | Plan | Expected |
 |---|---|---|
 | `guarded` | `WritePlan(snap)`, `ensure_unchanged` on every key read but not appended | Valid under `strict-serializable` |
-| `unguarded` | `WritePlan(snap)`, no `ensure_unchanged` | Valid under `strong-snapshot-isolation`. Under `strict-serializable`, the only reported anomalies are `G2-item` variants |
+| `unguarded` | `WritePlan(snap)`, no `ensure_unchanged` | Valid under `snapshot-isolation`. Under `strict-serializable`, the only reported anomalies are `G2-item` variants |
 | `blind` | Read with `db.get`, write with a snapshot-less `WritePlan()` | Invalid: committed appends go missing |
 
 `guarded` is the claim under test. `unguarded` and `blind` show that the
@@ -100,12 +100,14 @@ boundary: a G1 or G-single there is a bug in the implicit W-W check, not
 expected write skew. Before trusting a run, the harness requires `unguarded`
 to report `G2-item` at least once over the run.
 
-`strict-serializable` rather than plain `serializable`, and
-`strong-snapshot-isolation` rather than `snapshot-isolation`: once
-`apply_batch` returns, a snapshot taken later must see the write
-(`state_.store()` happens before return). Real-time edges check that too.
-If they prove too strict for a legitimate reason, that becomes a documented
-finding, and the check drops to the non-real-time model.
+`strict-serializable` rather than plain `serializable`: once `apply_batch`
+returns, a snapshot taken later must see the write (`state_.store()`
+happens before return). Real-time edges check that too. `unguarded` gets
+the same real-time check from its `strict-serializable` pass, which admits
+only `G2-item` variants, so its snapshot-isolation pass uses the plain
+model. If real-time edges prove too strict for a legitimate reason, that
+becomes a documented finding, and the check drops to the non-real-time
+model.
 
 ## Commit-sequence cross-check
 
@@ -230,7 +232,7 @@ them reaches this part of the engine.
 ## Acceptance
 
 - `guarded` is valid under `strict-serializable` on every nightly run.
-- `unguarded` is valid under `strong-snapshot-isolation` and reports only
+- `unguarded` is valid under `snapshot-isolation` and reports only
   `G2-item` variants under `strict-serializable`, at least once per run.
   `blind` is invalid.
 - The commit-sequence cross-check passes in all three configurations.
